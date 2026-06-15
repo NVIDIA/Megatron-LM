@@ -1793,7 +1793,7 @@ class TextGenerationController:
 
         if getattr(context, "request_update_has_waiting_requests", False):
             return "waiting_requests"
-        if getattr(context, "request_update_has_stop_word_requests", False):
+        if active_request_count > 0 and context.request_has_stop_words[active_slice].any().item():
             return "stop_words"
         if self.num_speculative_tokens > 0:
             return "speculative_tokens"
@@ -1844,20 +1844,6 @@ class TextGenerationController:
                 f"decode-only vanilla GPT greedy steps without extra lifecycle events; "
                 f"unsupported feature: {reason}."
             )
-
-    def _get_async_scheduling_fallback_reason(
-        self, prepared_update: Optional[Dict] = None
-    ) -> Optional[str]:
-        """Return why async-shaped scheduling cannot run, or None if eligible."""
-        context = self.inference_wrapped_model.inference_context
-
-        if self._get_request_update_mode() != AsyncSchedulingMode.ASYNC:
-            return "disabled"
-        if not context.is_decode_only():
-            return "non_decode"
-        return self._get_decode_request_update_unsupported_reason(
-            AsyncSchedulingMode.ASYNC, prepared_update
-        )
 
     def _dynamic_step_context_bookkeeping_for_mode(self) -> Dict[str, Tensor]:
         """Route post-sampling request updates to legacy or the new serial path."""

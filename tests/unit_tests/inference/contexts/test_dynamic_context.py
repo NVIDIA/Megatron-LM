@@ -36,7 +36,7 @@ def rounder_override(n):
         DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
 
 
-class TestDynamicInferenceContext:
+class TestDynamicContext:
 
     @classmethod
     def setup_class(cls):

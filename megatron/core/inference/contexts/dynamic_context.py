@@ -298,7 +298,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # in a previous resolve phase and must be filtered before compaction.
         self._pending_finished_rows: Optional[PendingFinishedRows] = None
         self.request_update_has_waiting_requests = False
-        self.request_update_has_stop_word_requests = False
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -2462,7 +2461,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.paused_speculative_tokens = None
         self.clear_pending_finished_rows()
         self.request_update_has_waiting_requests = False
-        self.request_update_has_stop_word_requests = False
         self.request_has_stop_words.fill_(False)
 
         # Reset attention, mamba, and block allocator state.

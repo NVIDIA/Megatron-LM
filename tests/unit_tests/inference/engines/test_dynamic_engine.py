@@ -605,20 +605,14 @@ class DynamicInferenceEngineTestBase:
 
 
 class TestAsyncSchedulingEligibilityState:
-    def test_stop_word_eligibility_uses_context_tensor(self):
+    def test_waiting_request_eligibility_uses_engine_queue(self):
         engine = object.__new__(DynamicInferenceEngine)
-        engine.waiting_request_ids = []
+        engine.waiting_request_ids = [1]
         engine.context = mock.Mock()
-        engine.context.paused_request_count = 1
-        engine.context.total_request_count = 4
-        engine.context.request_has_stop_words = torch.tensor(
-            [False, False, True, False], device='cpu'
-        )
 
         engine._update_request_update_mode_state()
 
-        assert not engine.context.request_update_has_waiting_requests
-        assert engine.context.request_update_has_stop_word_requests
+        assert engine.context.request_update_has_waiting_requests
 
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):

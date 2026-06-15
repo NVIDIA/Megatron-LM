@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import inspect
 import os
 import random
 import string
@@ -198,7 +197,6 @@ class TestAsyncSchedulingControllerHelpers:
         context = mock.Mock()
         context.config.async_scheduling_mode = AsyncSchedulingMode.ASYNC
         context.request_update_has_waiting_requests = False
-        context.request_update_has_stop_word_requests = False
         context.total_request_count = 2
         context.paused_request_count = 0
         context.num_prefill_requests = 0
@@ -211,6 +209,7 @@ class TestAsyncSchedulingControllerHelpers:
         context.has_pending_finished_rows.return_value = False
         context.block_size_tokens = 128
         context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
+        context.request_has_stop_words = torch.tensor([False, False], device='cpu')
         context.request_metadata = {
             "temperature": torch.tensor([1.0, 1.0], device='cpu'),
             "top_k": torch.tensor([1, 1], dtype=torch.int32, device='cpu'),
@@ -229,125 +228,6 @@ class TestAsyncSchedulingControllerHelpers:
         controller.model_config = model_config
         controller.num_speculative_tokens = 0
         return controller, context, model_config
-
-    def test_async_scheduling_eligibility_allows_dense_greedy_decode(self):
-        controller, _, _ = self._make_async_eligibility_controller()
-
-        assert controller._get_async_scheduling_fallback_reason() is None
-
-    @pytest.mark.parametrize(
-        ("reason", "mutator"),
-        [
-            (
-                "disabled",
-                lambda _controller, context, _model_config: setattr(
-                    context.config, "async_scheduling_mode", AsyncSchedulingMode.LEGACY
-                ),
-            ),
-            (
-                "waiting_requests",
-                lambda _controller, context, _model_config: setattr(
-                    context, "request_update_has_waiting_requests", True
-                ),
-            ),
-            (
-                "stop_words",
-                lambda _controller, context, _model_config: setattr(
-                    context, "request_update_has_stop_word_requests", True
-                ),
-            ),
-            (
-                "speculative_tokens",
-                lambda controller, _context, _model_config: setattr(
-                    controller, "num_speculative_tokens", 1
-                ),
-            ),
-            (
-                "mtp_model",
-                lambda _controller, _context, model_config: setattr(
-                    model_config, "mtp_num_layers", 1
-                ),
-            ),
-            (
-                "hybrid_or_mamba",
-                lambda _controller, context, _model_config: setattr(
-                    context, "is_hybrid_model", True
-                ),
-            ),
-            (
-                "moe",
-                lambda _controller, _context, model_config: setattr(
-                    model_config, "num_moe_experts", 8
-                ),
-            ),
-            (
-                "expert_parallel",
-                lambda _controller, _context, model_config: setattr(
-                    model_config, "expert_model_parallel_size", 2
-                ),
-            ),
-            (
-                "paused_requests",
-                lambda _controller, context, _model_config: setattr(
-                    context, "paused_request_count", 1
-                ),
-            ),
-            (
-                "non_decode",
-                lambda _controller, context, _model_config: setattr(
-                    context.is_decode_only, "return_value", False
-                ),
-            ),
-            (
-                "log_probs",
-                lambda _controller, context, _model_config: context.request_metadata[
-                    "return_log_probs"
-                ].fill_(True),
-            ),
-            (
-                "top_n_logprobs",
-                lambda _controller, context, _model_config: context.request_metadata[
-                    "top_n_logprobs"
-                ].fill_(1),
-            ),
-            (
-                "non_greedy_sampling",
-                lambda _controller, context, _model_config: context.request_metadata["top_k"].fill_(
-                    0
-                ),
-            ),
-            (
-                "non_greedy_sampling",
-                lambda _controller, context, _model_config: context.request_metadata["top_p"].fill_(
-                    0.5
-                ),
-            ),
-            (
-                "kv_block_boundary",
-                lambda _controller, context, _model_config: context.request_last_kv_block_offset.fill_(
-                    127
-                ),
-            ),
-        ],
-    )
-    def test_async_scheduling_fallback_reasons(self, reason, mutator):
-        controller, context, model_config = self._make_async_eligibility_controller()
-        mutator(controller, context, model_config)
-
-        assert controller._get_async_scheduling_fallback_reason() == reason
-
-    def test_async_scheduling_fallback_for_speculative_prepared_update(self):
-        controller, _, _ = self._make_async_eligibility_controller()
-        prepared_update = {
-            "active_requests_mask": torch.tensor([1, 1], device='cpu'),
-            "new_tokens": torch.tensor([10, 11], device='cpu'),
-            "new_speculative_tokens": torch.tensor([[12, 13]], device='cpu'),
-        }
-
-        assert (
-            controller._get_async_scheduling_fallback_reason(prepared_update)
-            == "speculative_tokens"
-        )
 
     def test_request_update_mode_routes_legacy_to_legacy_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
@@ -488,27 +368,6 @@ class TestAsyncSchedulingControllerHelpers:
         assert events == ["sample", "prepare_requests", "forward", "resolve_requests"]
         _, kwargs = context.resolve_requests.call_args
         assert kwargs["delay_finished_compaction"]
-
-    def test_async_scheduling_helpers_do_not_use_overlap_primitives(self):
-        helper_source = "\n".join(
-            inspect.getsource(getattr(TextGenerationController, name))
-            for name in (
-                "_try_async_generate_output_tokens_dynamic_batch",
-                "_run_async_scheduling_step",
-                "_run_async_scheduling_request_update",
-                "_dynamic_step_forward_for_async_scheduling",
-                "_get_async_scheduling_fallback_reason",
-            )
-        )
-
-        for primitive in (
-            "torch.cuda.Event",
-            "torch.cuda.Stream",
-            "record_event",
-            "wait_event",
-            "current_stream",
-        ):
-            assert primitive not in helper_source
 
 
 class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):

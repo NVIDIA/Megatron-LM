@@ -1854,11 +1854,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _update_request_update_mode_state(self) -> None:
         """Update context flags used by request-update mode routing."""
-        active_slice = slice(self.context.paused_request_count, self.context.total_request_count)
         self.context.request_update_has_waiting_requests = len(self.waiting_request_ids) > 0
-        self.context.request_update_has_stop_word_requests = (
-            self.context.request_has_stop_words[active_slice].any().item()
-        )
 
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
