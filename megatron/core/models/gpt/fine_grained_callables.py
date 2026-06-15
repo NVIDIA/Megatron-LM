@@ -319,6 +319,26 @@ class TransformerLayerNode(ScheduleNode):
         """Implements the backward pass for the transformer layer node."""
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
+
+        # For non-last MTP postprocess nodes with mtp_num_layers > 1: the last MTP postprocess
+        # node's forward detaches intermediate MTP outputs before torch.cat to avoid double
+        # traversal of their autograd graphs (keep_graph=False frees ctx after first traversal).
+        # The detached leaves accumulate the MTP-loss-path gradient in .grad; we add it here so
+        # ctx_k is traversed exactly once in this node's default_backward_func call.
+        if (
+            self.is_mtp
+            and not self.is_last_layer
+            and hasattr(self, 'mtp_postprocess_idx')
+            and hasattr(self.chunk_state, 'mtp_postprocess_extra_grads')
+        ):
+            idx = self.mtp_postprocess_idx
+            srcs = self.chunk_state.mtp_postprocess_extra_grads
+            if idx in srcs and srcs[idx] is not None:
+                extra_grad = srcs[idx].grad
+                if extra_grad is not None:
+                    g0 = grads[0]
+                    grads = ((g0 + extra_grad) if g0 is not None else extra_grad,) + grads[1:]
+
         self.default_backward_func(outputs + self.before_detached, grads)
 
         # return grads for record stream
@@ -756,10 +776,39 @@ def build_mtp_layer_callables(layer):
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
         hidden_states = layer._postprocess(hidden_states)
-        node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
-            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
+            node.chunk_state.mtp_hidden_states.append(hidden_states)
+            # When mtp_num_layers > 1, intermediate MTP outputs (indices 1..N-2 in
+            # mtp_hidden_states, where index 0 is the decoder output and index N-1
+            # is this layer's output) have their autograd graphs rooted at detached
+            # leaves from earlier postprocess nodes.  If we include them directly in
+            # torch.cat, the cat's backward (keep_graph=False) traverses and frees
+            # their ctx objects before those nodes' own backward_impl runs, causing:
+            #   AttributeError: ctx must have .tensor_objects to restore saved tensors
+            # Fix: detach intermediate entries for use in cat; store the detached
+            # leaves in chunk_state so backward_impl can read their .grad and inject
+            # the MTP-loss-path gradient before traversing the original ctx.
+            node.chunk_state.mtp_postprocess_extra_grads = {}
+            cat_tensors = []
+            mtp_hs = node.chunk_state.mtp_hidden_states
+            for i, hs in enumerate(mtp_hs):
+                if 0 < i < len(mtp_hs) - 1:
+                    # i-1 is the MTP layer index (i=1 → layer 0, i=2 → layer 1, ...)
+                    hs_d = hs.detach().requires_grad_(hs.requires_grad)
+                    node.chunk_state.mtp_postprocess_extra_grads[i - 1] = hs_d
+                    cat_tensors.append(hs_d)
+                else:
+                    cat_tensors.append(hs)
+            hidden_states = torch.cat(cat_tensors, dim=0)
             node.chunk_state.mtp_hidden_states = None
+        else:
+            node.chunk_state.mtp_hidden_states.append(hidden_states)
+            # Record this node's position in the MTP sequence so backward_impl can
+            # look up the matching entry in mtp_postprocess_extra_grads.
+            if not hasattr(node.chunk_state, 'mtp_postprocess_node_count'):
+                node.chunk_state.mtp_postprocess_node_count = 0
+            node.mtp_postprocess_idx = node.chunk_state.mtp_postprocess_node_count
+            node.chunk_state.mtp_postprocess_node_count += 1
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
