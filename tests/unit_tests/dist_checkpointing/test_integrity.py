@@ -25,6 +25,15 @@ def init_model_parallel():
     Utils.destroy_model_parallel()
 
 
+def _write_json_on_rank0(path: Path, data):
+    if torch.distributed.get_rank() == 0:
+        with open(path, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+    torch.distributed.barrier()
+
+
 class TestIntegrity:
     def test_save_verify_integrity_manifest_with_ckpt(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
@@ -64,9 +73,7 @@ class TestIntegrity:
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
         ) as ckpt_dir:
             metadata_file = Path(ckpt_dir / "metadata.json")
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 1}
-                json.dump(data, f)
+            _write_json_on_rank0(metadata_file, {"test_metadata": 1})
 
             if torch.distributed.get_rank() == 0:
                 save_integrity_manifest(ckpt_dir)
@@ -88,18 +95,13 @@ class TestIntegrity:
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_error', sync=True
         ) as ckpt_dir:
             metadata_file = Path(ckpt_dir / "metadata.json")
-
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 1}
-                json.dump(data, f)
+            _write_json_on_rank0(metadata_file, {"test_metadata": 1})
 
             if torch.distributed.get_rank() == 0:
                 save_integrity_manifest(ckpt_dir)
             torch.distributed.barrier()
 
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 11}
-                json.dump(data, f)
+            _write_json_on_rank0(metadata_file, {"test_metadata": 11})
 
             # CheckpointingException, hash mismatch
             with pytest.raises(CheckpointingException):
