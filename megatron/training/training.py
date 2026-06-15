@@ -2287,7 +2287,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2378,8 +2389,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
+    )
 
 
 def training_log(
@@ -3537,6 +3561,8 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            seqlen_sum_this_global_batch = None
+            seqlen_squared_sum_this_global_batch = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -3548,6 +3574,8 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
@@ -3645,14 +3673,23 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        # Drain the per-iteration packed-sequence stats so the FLOPs computation
-        # reflects THD per-chunk causal attention AND excludes padding tokens
-        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
-        # runs (no collective issued), letting ``num_floating_point_operations``
-        # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
-        )
+        if config.sequence_packing_scheduler is not None and not args.skip_train:
+            # Scheduler-based packing does not feed the packed-sequence accumulator.
+            # The scheduler already computed these from the real per-sample lengths
+            # before CP padding/rerouting, so use them directly here.
+            assert seqlen_sum_this_global_batch is not None
+            assert seqlen_squared_sum_this_global_batch is not None
+            total_real_tokens_in_batch = seqlen_sum_this_global_batch
+            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
+        else:
+            # Drain the per-iteration packed-sequence stats so the FLOPs computation
+            # reflects THD per-chunk causal attention AND excludes padding tokens
+            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+            # runs (no collective issued), letting ``num_floating_point_operations``
+            # fall back to its closed-form defaults.
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+                consume_seqlen_stats_in_iteration()
+            )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
