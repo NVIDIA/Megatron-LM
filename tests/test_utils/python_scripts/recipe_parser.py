@@ -392,6 +392,7 @@ def _apply_local_image_source(
 
     local_path = _format_image_source_value(workload_local_image_path, workload, container_tag)
     workload.spec["image_source"] = {"local_path": local_path}
+    workload.spec.pop("build", None)
 
 
 def resolve_workload_local_image_sources(
