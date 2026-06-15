@@ -426,18 +426,16 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
                 packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-                use_fused_mrope = False
-                use_raw_mrope_freqs = (
-                    self.config.apply_rope_fusion and not self.config.rotary_interleaved
-                )
-                if self.config.fused_single_qkv_rope:
-                    use_raw_mrope_freqs = False
                 # Inference indexes rotary_pos_emb as seq-major materialized embeddings.
-                # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path.
-                if in_inference_mode:
-                    use_raw_mrope_freqs = False
-                if use_raw_mrope_freqs:
-                    use_fused_mrope = self._fused_mrope_available
+                # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path,
+                # and fused_single_qkv_rope consumes the materialized embeddings instead.
+                use_raw_mrope_freqs = (
+                    self.config.apply_rope_fusion
+                    and not self.config.rotary_interleaved
+                    and not self.config.fused_single_qkv_rope
+                    and not in_inference_mode
+                )
+                use_fused_mrope = use_raw_mrope_freqs and self._fused_mrope_available
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,

@@ -385,6 +385,7 @@ def _fused_mrope_kernel(
     INTERLEAVED_MROPE: tl.constexpr,
     ROTARY_INTERLEAVED: tl.constexpr,
     INVERSE: tl.constexpr,
+    FP32_COMPUTE: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
     BLOCK_PASS: tl.constexpr,
 ):
@@ -397,11 +398,14 @@ def _fused_mrope_kernel(
 
     axis = _mrope_axis(k, SEC_T, SEC_H, SEC_W, INTERLEAVED_MROPE)
 
+    # Pick the arithmetic dtype once: fp32 when fp32 accumulation is requested, otherwise the
+    # output dtype so intermediates round exactly like PyTorch's pointwise RoPE.
+    compute_ty = tl.float32 if FP32_COMPUTE else OUT.dtype.element_ty
+
     freqs_offset = axis * f_s_axis + batch_idx * f_s_batch + seq_idx * f_s_seq + k * f_s_dim
     freqs = tl.load(FREQS + freqs_offset, mask=mask, other=0.0)
-    # Match PyTorch pointwise dtype semantics: cast cos/sin before the multiply.
-    cos_v = tl.cos(freqs).to(OUT.dtype.element_ty)
-    sin_v = tl.sin(freqs).to(OUT.dtype.element_ty)
+    cos_v = tl.cos(freqs).to(compute_ty)
+    sin_v = tl.sin(freqs).to(compute_ty)
     if INVERSE:
         sin_v = -sin_v
 
@@ -419,13 +423,13 @@ def _fused_mrope_kernel(
         out_lo_offset = k * o_s_dim
         out_hi_offset = (k + HALF_ROTARY_DIM) * o_s_dim
 
-    t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(OUT.dtype.element_ty)
-    t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(OUT.dtype.element_ty)
+    t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(compute_ty)
+    t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(compute_ty)
 
-    lo_cos = (t_lo * cos_v).to(OUT.dtype.element_ty)
-    hi_sin = (t_hi * sin_v).to(OUT.dtype.element_ty)
-    hi_cos = (t_hi * cos_v).to(OUT.dtype.element_ty)
-    lo_sin = (t_lo * sin_v).to(OUT.dtype.element_ty)
+    lo_cos = (t_lo * cos_v).to(compute_ty)
+    hi_sin = (t_hi * sin_v).to(compute_ty)
+    hi_cos = (t_hi * cos_v).to(compute_ty)
+    lo_sin = (t_lo * sin_v).to(compute_ty)
 
     out_lo = (lo_cos - hi_sin).to(OUT.dtype.element_ty)
     out_hi = (hi_cos + lo_sin).to(OUT.dtype.element_ty)
@@ -505,14 +509,14 @@ def _fused_mrope_thd_kernel(
     mask = k < HALF_ROTARY_DIM
     axis = _mrope_axis(k, SEC_T, SEC_H, SEC_W, INTERLEAVED_MROPE)
 
+    # Pick the arithmetic dtype once: fp32 when fp32 accumulation is requested, otherwise the
+    # output dtype so intermediates round exactly like PyTorch's pointwise RoPE.
+    compute_ty = tl.float32 if FP32_COMPUTE else OUT.dtype.element_ty
+
     freqs_offset = axis * f_s_axis + freq_seq_idx * f_s_seq + k * f_s_dim
     freqs = tl.load(FREQS + freqs_offset, mask=mask, other=0.0)
-    if FP32_COMPUTE:
-        cos_v = tl.cos(freqs)
-        sin_v = tl.sin(freqs)
-    else:
-        cos_v = tl.cos(freqs).to(OUT.dtype.element_ty)
-        sin_v = tl.sin(freqs).to(OUT.dtype.element_ty)
+    cos_v = tl.cos(freqs).to(compute_ty)
+    sin_v = tl.sin(freqs).to(compute_ty)
     if INVERSE:
         sin_v = -sin_v
 
@@ -530,30 +534,16 @@ def _fused_mrope_thd_kernel(
         out_lo_offset = k * o_s_dim
         out_hi_offset = (k + HALF_ROTARY_DIM) * o_s_dim
 
-    if FP32_COMPUTE:
-        t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(tl.float32)
-        t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(tl.float32)
-    else:
-        t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(OUT.dtype.element_ty)
-        t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(OUT.dtype.element_ty)
+    t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(compute_ty)
+    t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(compute_ty)
 
-    if FP32_COMPUTE:
-        lo_cos = t_lo * cos_v
-        hi_sin = t_hi * sin_v
-        hi_cos = t_hi * cos_v
-        lo_sin = t_lo * sin_v
-    else:
-        lo_cos = (t_lo * cos_v).to(OUT.dtype.element_ty)
-        hi_sin = (t_hi * sin_v).to(OUT.dtype.element_ty)
-        hi_cos = (t_hi * cos_v).to(OUT.dtype.element_ty)
-        lo_sin = (t_lo * sin_v).to(OUT.dtype.element_ty)
+    lo_cos = (t_lo * cos_v).to(compute_ty)
+    hi_sin = (t_hi * sin_v).to(compute_ty)
+    hi_cos = (t_hi * cos_v).to(compute_ty)
+    lo_sin = (t_lo * sin_v).to(compute_ty)
 
-    if FP32_COMPUTE:
-        out_lo = lo_cos - hi_sin
-        out_hi = hi_cos + lo_sin
-    else:
-        out_lo = (lo_cos - hi_sin).to(OUT.dtype.element_ty)
-        out_hi = (hi_cos + lo_sin).to(OUT.dtype.element_ty)
+    out_lo = (lo_cos - hi_sin).to(OUT.dtype.element_ty)
+    out_hi = (hi_cos + lo_sin).to(OUT.dtype.element_ty)
 
     tl.store(out_base + out_lo_offset, out_lo, mask=mask)
     tl.store(out_base + out_hi_offset, out_hi, mask=mask)
@@ -573,6 +563,7 @@ def _launch_fused_mrope(
     interleaved_mrope: bool,
     rotary_interleaved: bool,
     inverse: bool,
+    fp32_compute: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     unavailable_reason = get_fused_mrope_unavailable_reason(t, freqs, rotary_interleaved)
@@ -620,6 +611,7 @@ def _launch_fused_mrope(
         INTERLEAVED_MROPE=interleaved_mrope,
         ROTARY_INTERLEAVED=rotary_interleaved,
         INVERSE=inverse,
+        FP32_COMPUTE=fp32_compute,
         BLOCK_HALF=block_half,
         BLOCK_PASS=block_pass,
         num_warps=4,
@@ -711,11 +703,12 @@ class _FusedMRoPE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, t, freqs, mrope_section, interleaved_mrope, rotary_interleaved):
+    def forward(ctx, t, freqs, mrope_section, interleaved_mrope, rotary_interleaved, fp32_compute):
         assert not freqs.requires_grad, "fused mRoPE expects non-gradient raw frequency tensors"
         ctx.mrope_section = tuple(int(section) for section in mrope_section)
         ctx.interleaved_mrope = bool(interleaved_mrope)
         ctx.rotary_interleaved = bool(rotary_interleaved)
+        ctx.fp32_compute = bool(fp32_compute)
         ctx.save_for_backward(freqs)
         return _launch_fused_mrope(
             t,
@@ -724,6 +717,7 @@ class _FusedMRoPE(torch.autograd.Function):
             ctx.interleaved_mrope,
             ctx.rotary_interleaved,
             inverse=False,
+            fp32_compute=ctx.fp32_compute,
         )
 
     @staticmethod
@@ -736,8 +730,9 @@ class _FusedMRoPE(torch.autograd.Function):
             ctx.interleaved_mrope,
             ctx.rotary_interleaved,
             inverse=True,
+            fp32_compute=ctx.fp32_compute,
         )
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None, None, None
 
 
 class _FusedMRoPETHD(torch.autograd.Function):
@@ -801,6 +796,7 @@ def fused_apply_mrope(
     mrope_section: List[int],
     interleaved_mrope: bool = False,
     rotary_interleaved: bool = False,
+    fp32_compute: bool = False,
 ) -> torch.Tensor:
     """Apply multimodal RoPE with a fused Triton kernel.
 
@@ -812,11 +808,14 @@ def fused_apply_mrope(
             Qwen2-VL section layout when False.
         rotary_interleaved: Must be False. The integrated fused mRoPE path
             currently supports split-half RoPE layout.
+        fp32_compute: Apply the rotary math in fp32 and cast directly to output dtype.
 
     Returns:
         Rotated tensor with the same shape and dtype as ``t``.
     """
-    return _FusedMRoPE.apply(t, freqs, mrope_section, interleaved_mrope, rotary_interleaved)
+    return _FusedMRoPE.apply(
+        t, freqs, mrope_section, interleaved_mrope, rotary_interleaved, fp32_compute
+    )
 
 
 def fused_apply_mrope_thd(
