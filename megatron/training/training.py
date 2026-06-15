@@ -2236,11 +2236,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             (
                 data_iterator,
                 num_microbatches,
-                _,
-                _,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
         else:
             num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
