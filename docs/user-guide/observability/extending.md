@@ -1,7 +1,7 @@
 # Extending Instrumentation
 
 To add new spans or metrics to Megatron code, use the instrumentation primitives from `nemo.lens`. The primitives themselves are documented in
-[lens: instrumentation](../../../../lens/docs/user-guide/instrumentation.md).
+[lens: instrumentation](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/instrumentation.md).
 This page covers Megatron conventions.
 
 ## Adding a custom span
@@ -52,7 +52,7 @@ except ImportError:
 
 `megatron/core/telemetry/_fallbacks.py` re-exports from `nemo.lens.fallbacks` when lens is installed, otherwise provides inline no-ops.
 
-See [lens: optional dependency](../../../../lens/docs/design/optional-dependency.md).
+See [lens: optional dependency](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/design/optional-dependency.md).
 
 ## Naming conventions
 
@@ -137,7 +137,7 @@ def record_training_metrics(meter, *, my_new_value_ms=None, ...):
 
 Call `record_training_metrics(meter=handle.meter, my_new_value_ms=42.0)` only on the export rank (check `handle.is_exporting`).
 
-See [lens: metrics](../../../../lens/docs/user-guide/metrics.md) for the pattern rationale.
+See [lens: metrics](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/metrics.md) for the pattern rationale.
 
 ## Testing new instrumentation
 
@@ -149,12 +149,12 @@ When adding a span:
 2. Use `InMemorySpanExporter` (from lens's `conftest.py`, shared via `sys.path` or a test utility) to capture spans.
 3. Assert on span name, attributes, and parent relationships.
 
-See [lens: testing](../../../../lens/docs/developer/testing.md) for fixture patterns.
+See [lens: testing](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/developer/testing.md) for fixture patterns.
 
 ## When not to add instrumentation
 
 - **Inside a tight inner loop** (per-token, per-parameter). Even `managed_span`'s frozenset lookup adds up over trillions of invocations.
 - **On code that runs on all ranks with unbounded cardinality**. If the span attribute includes something like a tensor shape with high variance, you get cardinality explosion at the backend.
-- **As a replacement for logging**. Structured logs belong in logs (and can be correlated via the [log bridge](../../../../lens/docs/user-guide/logging-bridge.md)). Spans describe bounded operations, not every interesting event.
+- **As a replacement for logging**. Structured logs belong in logs (and can be correlated via the [log bridge](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/logging-bridge.md)). Spans describe bounded operations, not every interesting event.
 
 When in doubt, start with a coarse span at the boundary of the subsystem, not a fine-grained one at every internal call.

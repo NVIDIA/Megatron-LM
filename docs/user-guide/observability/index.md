@@ -1,6 +1,6 @@
 # Observability
 
-Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA/nemo-lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
+Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
 
 Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Weave, Honeycomb, Datadog, ...).
 
@@ -21,7 +21,7 @@ extending
 
 This documentation covers **Megatron-specific** usage: CLI flags, environment variables, span names, metric names, and the pipeline-parallel trace correlation integration.
 
-For general concepts — span groups, instrumentation primitives, configuration model, custom exporters, resource detection — see the [lens documentation](https://nvidia.github.io/nemo-lens/) (or `../lens/docs/` in this repository). This section links to lens docs when relevant rather than duplicating content.
+For general concepts — span groups, instrumentation primitives, configuration model, custom exporters, resource detection — see the [lens documentation](https://github.com/NVIDIA-NeMo/Lens). This section links to lens docs when relevant rather than duplicating content.
 
 ## Quick start
 
@@ -60,6 +60,6 @@ By default, only **one rank** exports (the last rank). For multi-rank telemetry,
 
 ## Related
 
-- Lens configuration model and env vars: [lens/docs/user-guide/configuration](../../../lens/docs/user-guide/configuration.md)
-- Instrumentation primitives (`managed_span`, `trace_fn`, `span_cm`): [lens/docs/user-guide/instrumentation](../../../lens/docs/user-guide/instrumentation.md)
+- Lens configuration model and env vars: [lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md)
+- Instrumentation primitives (`managed_span`, `trace_fn`, `span_cm`): [lens: instrumentation](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/instrumentation.md)
 - Observability stack (docker-compose): [Observability Stack](observability-stack.md)

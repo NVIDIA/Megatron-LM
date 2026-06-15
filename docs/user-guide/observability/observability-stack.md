@@ -4,7 +4,7 @@ Megatron ships a `docker-compose.otel.yml` at the repository root as a **proof o
 
 This is **not** a recommended production deployment and not something Megatron is opinionated about. Choosing an observability solution — retention, scale, auth, alerting, dashboards — is the user's decision, driven by your organisation's existing stack. The demo is here to help you get started, not to tell you what to run long-term.
 
-For production, see [lens: sending telemetry to a backend](../../../../lens/docs/observability/backends.md).
+For production, see [lens: sending telemetry to a backend](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.md).
 
 ## Start the stack
 
@@ -26,7 +26,7 @@ docker compose -f docker-compose.otel.yml up -d
 | Node Exporter | 9100 | InfiniBand + network metrics |
 
 For the general stack components and flow, see
-[lens: observability stack](../../../../lens/docs/observability/stack.md).
+[lens: observability stack](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/stack.md).
 
 ## Configure Megatron
 
@@ -100,7 +100,7 @@ Open port 4317 (gRPC) or 4318 (HTTP) on the observability host, or use an SSH tu
 ## Production setup
 
 For production runs, point at a hosted backend (W&B Weave, Grafana Cloud, Honeycomb, Datadog) or a shared internal collector instead of the docker-compose stack. See
-[lens: observability backends](../../../../lens/docs/observability/backends.md)
+[lens: observability backends](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.md)
 for endpoint configuration for each backend.
 
 ## Grafana dashboard

@@ -3,7 +3,7 @@
 When pipeline parallel size > 1, each rank normally creates an independent trace per iteration — making cross-stage causality invisible in Jaeger. Megatron solves this by broadcasting rank 0's trace context to all ranks and linking each stage's receive operation to that context.
 
 The generic primitives (`broadcast_trace_context`, `create_linked_span`) live in lens; see
-[lens: distributed tracing](../../../../lens/docs/user-guide/distributed-tracing.md)
+[lens: distributed tracing](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/distributed-tracing.md)
 for how they work.
 
 This page covers Megatron's specific integration.
@@ -146,4 +146,4 @@ Parent-child implies sequential dependency: "the parent was running, spawned thi
 
 Links model "these are related" without implying temporal ordering. This is the correct shape for concurrent distributed work.
 
-See [lens: distributed tracing](../../../../lens/docs/user-guide/distributed-tracing.md) for a deeper discussion.
+See [lens: distributed tracing](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/distributed-tracing.md) for a deeper discussion.

@@ -81,7 +81,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "nemo-lens>=0.1.0",
+    "nemo-lens @ git+https://github.com/NVIDIA-NeMo/Lens.git@ecb0d15a93a49c45cb7189e792a91087f8fe1ace",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
@@ -100,7 +100,7 @@ dev = [
 ]
 
 otel = [
-    "nemo-lens[sdk]>=0.1.0",
+    "nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@ecb0d15a93a49c45cb7189e792a91087f8fe1ace",
 ]
 
 lts = [
@@ -109,7 +109,7 @@ lts = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "nemo-lens>=0.1.0",
+    "nemo-lens @ git+https://github.com/NVIDIA-NeMo/Lens.git@ecb0d15a93a49c45cb7189e792a91087f8fe1ace",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
