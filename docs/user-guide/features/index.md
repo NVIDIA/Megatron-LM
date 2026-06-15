@@ -20,6 +20,7 @@ moe
 context_parallel
 megatron_fsdp
 mtp_loss_split
+mtp_multilayer_ep_overlap
 dist_optimizer
 optimizer_cpu_offload
 paged_stash
