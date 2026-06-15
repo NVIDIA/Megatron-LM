@@ -375,24 +375,24 @@ class TestAsyncSchedulingControllerHelpers:
             "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
         }
         context.prepare_requests.return_value = (filtered_update, filtered_bookkeeping)
-        context.bookkeep_requests.return_value = {
+        context.resolve_requests.return_value = {
             "newly_paused_request_ids": None,
             "evict_request_ids": None,
         }
         controller._dynamic_step_forward_for_async_scheduling = mock.Mock(return_value=None)
 
-        actual_bookkeeping, update_result = controller._run_async_scheduling_request_update(
+        actual_bookkeeping, resolve_result = controller._run_async_scheduling_request_update(
             prepared_update, request_bookkeeping
         )
 
         context.prepare_requests.assert_called_once_with(
             **prepared_update, request_bookkeeping=request_bookkeeping
         )
-        context.bookkeep_requests.assert_called_once_with(
+        context.resolve_requests.assert_called_once_with(
             filtered_update, delay_finished_compaction=True
         )
         assert actual_bookkeeping is filtered_bookkeeping
-        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+        assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
 
     def test_serial_async_scheduling_call_order(self):
         controller, context, _ = self._make_async_eligibility_controller()
@@ -410,8 +410,8 @@ class TestAsyncSchedulingControllerHelpers:
             )
 
         context.prepare_requests.side_effect = prepare_side_effect
-        context.bookkeep_requests.side_effect = lambda *_args, **_kwargs: events.append(
-            "bookkeep_requests"
+        context.resolve_requests.side_effect = lambda *_args, **_kwargs: events.append(
+            "resolve_requests"
         ) or {
             "newly_paused_request_ids": None,
             "evict_request_ids": None,
@@ -445,9 +445,9 @@ class TestAsyncSchedulingControllerHelpers:
             "sample",
             "prepare_requests",
             "forward",
-            "bookkeep_requests",
+            "resolve_requests",
         ]
-        _, kwargs = context.bookkeep_requests.call_args
+        _, kwargs = context.resolve_requests.call_args
         assert kwargs["delay_finished_compaction"]
 
     def test_async_scheduling_helpers_do_not_use_overlap_primitives(self):

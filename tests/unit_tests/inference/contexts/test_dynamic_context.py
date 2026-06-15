@@ -889,7 +889,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_bookkeep_requests_delayed_finish_only_records_without_compacting(self):
+    def test_resolve_requests_delayed_finish_only_records_without_compacting(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -910,11 +910,11 @@ class TestDynamicContext:
             new_tokens=torch.tensor([100, 101], device='cpu'),
         )
 
-        update_result = dynamic_context.bookkeep_requests(
+        resolve_result = dynamic_context.resolve_requests(
             prepared_update, delay_finished_compaction=True
         )
 
-        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+        assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
         assert dynamic_context.has_pending_finished_rows()
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.request_ids[:2].tolist() == [10, 11]

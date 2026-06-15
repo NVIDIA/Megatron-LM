@@ -294,7 +294,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
 
         # Pending finished-row state. This tracks only active rows that finished
-        # in a previous bookkeep phase and must be filtered before compaction.
+        # in a previous resolve phase and must be filtered before compaction.
         self._pending_finished_rows: Optional[PendingFinishedRows] = None
         self.async_scheduling_has_waiting_requests = False
         self.async_scheduling_has_stop_word_requests = False
@@ -2986,7 +2986,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def _filter_pending_finished_rows(self, step_result: Dict) -> Dict:
-        """Filter rows that already finished in the previous delayed bookkeep."""
+        """Filter rows that already finished in the previous delayed resolve."""
         pending_finished_rows = self.pending_finished_rows()
         if pending_finished_rows is None:
             return step_result
@@ -3612,13 +3612,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             return prepared_update, request_bookkeeping
         return prepared_update
 
-    def bookkeep_requests(
+    def resolve_requests(
         self,
         prepared_update: Dict[str, Optional[Tensor]],
         *,
         delay_finished_compaction: bool = False,
     ) -> Optional[Dict[str, Optional[Tensor]]]:
-        """Apply request lifecycle bookkeeping from a prepared update."""
+        """Resolve request lifecycle changes from a prepared update."""
 
         active_requests_mask = prepared_update["active_requests_mask"]
         new_tokens = prepared_update["new_tokens"]
@@ -3636,7 +3636,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         prepared_update["new_speculative_tokens"] = new_speculative_tokens
 
         if delay_finished_compaction:
-            return self._bookkeep_requests_delayed_finish_only(active_requests_mask)
+            return self._resolve_requests_delayed_finish_only(active_requests_mask)
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
@@ -3955,12 +3955,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             "new_tokens": new_tokens,
             "new_speculative_tokens": new_speculative_tokens,
         }
-        update_result = self.bookkeep_requests(prepared_update)
-        if update_result is not None:
+        resolve_result = self.resolve_requests(prepared_update)
+        if resolve_result is not None:
             self.prepare_requests(**prepared_update)
-        return update_result
+        return resolve_result
 
-    def _bookkeep_requests_delayed_finish_only(
+    def _resolve_requests_delayed_finish_only(
         self, active_requests_mask: Tensor
     ) -> Dict[str, Optional[Tensor]]:
         """Release finished requests but delay row compaction for async-shaped decode."""
