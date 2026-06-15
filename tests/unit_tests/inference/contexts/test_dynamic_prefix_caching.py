@@ -233,7 +233,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc3.block_hashes[db0].item() != -1 and alloc3.block_hashes[db1].item() == -1
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
-        ctx3.update_requests(active_mask, new_tokens)
+        ctx3.update_requests_legacy(active_mask, new_tokens)
         assert alloc3.block_hashes[db1].item() == -1
 
         # second request finds registered blocks
@@ -1328,7 +1328,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         valid_blocks = blocks[blocks >= 0]
         active_mask = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
-        ctx.update_requests(active_mask, new_tokens)
+        ctx.update_requests_legacy(active_mask, new_tokens)
 
         # Second request with same prefix should match
         req2 = self._req(ctx, prompt.clone(), request_id=2)

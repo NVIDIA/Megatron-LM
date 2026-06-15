@@ -980,7 +980,7 @@ class TestDynamicContext:
             dynamic_context.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
             dynamic_context.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
 
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
@@ -1017,7 +1017,7 @@ class TestDynamicContext:
         # Total req count should be equal to paused + num elements in active request mask.
         # So here it will raise an assertion error
         with pytest.raises(AssertionError) as error:
-            dynamic_context.update_requests(
+            dynamic_context.update_requests_legacy(
                 active_requests_mask=active_requests_mask, new_tokens=next_tokens
             )
 
@@ -1062,7 +1062,7 @@ class TestDynamicContext:
             dynamic_context.mamba_conv_states[:, 0:total_request_count, :, :] = 1.0
             dynamic_context.mamba_ssm_states[:, 0:total_request_count, :, :, :] = 1.0
 
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
@@ -1198,7 +1198,7 @@ class TestDynamicContext:
         active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device='cpu')
 
         # Call update_requests with these parameters
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=torch.tensor([10, 11, 12, 13, 14], device='cpu'),
         )
@@ -1287,7 +1287,7 @@ class TestDynamicContext:
         active_requests_mask = torch.tensor([0, 0, 0], device='cpu')
 
         # Call update_requests with these parameters
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=torch.tensor([10, 11, 12], device='cpu'),
         )
@@ -1474,7 +1474,7 @@ class TestDynamicContext:
         # All requests are active, so the mask will be all ones for the current active requests
         active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cpu').int()
 
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
 
@@ -1501,7 +1501,7 @@ class TestDynamicContext:
             assert decode_log_probs[i][0] == expected_decode_log_probs[i, token].item()
 
         # Simulate mixed prefill and decode step (adding a new request to existing context)
-        dynamic_context.update_requests(
+        dynamic_context.update_requests_legacy(
             active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
 
@@ -2102,7 +2102,7 @@ class TestDynamicContext:
         # Step 1: Forward pass for all 3 requests
         active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cpu')
-        dynamic_context.update_requests(active_requests_mask, new_tokens)
+        dynamic_context.update_requests_legacy(active_requests_mask, new_tokens)
 
         # At this point, req 999 is hidden at index 2. total_request_count is 2 (req 10, 11).
         assert dynamic_context.total_request_count == 2
@@ -2111,7 +2111,7 @@ class TestDynamicContext:
         # Step 2: Forward pass where req 10 finishes, req 11 continues. Req 999 is NOT scheduled.
         active_requests_mask = torch.tensor([0, 1], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cpu')
-        dynamic_context.update_requests(active_requests_mask, new_tokens)
+        dynamic_context.update_requests_legacy(active_requests_mask, new_tokens)
 
         # At this point, req 10 is evicted. Req 11 shifts to index 0. total_request_count becomes 1.
         # Req 999 should be pulled from index 2 down to index 1 (the new boundary).
@@ -2200,7 +2200,7 @@ class TestDynamicContext:
         # Step 1: All 3 requests are active, process forward pass
         active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cpu')
-        dynamic_context.update_requests(active_requests_mask, new_tokens)
+        dynamic_context.update_requests_legacy(active_requests_mask, new_tokens)
 
         # Chunked prefill is now hidden at position 2, total_request_count = 2
         assert dynamic_context.total_request_count == 2
@@ -2210,7 +2210,7 @@ class TestDynamicContext:
         # This must NOT crash even though active_request_count becomes 0.
         active_requests_mask = torch.tensor([0, 0], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cpu')
-        dynamic_context.update_requests(active_requests_mask, new_tokens)
+        dynamic_context.update_requests_legacy(active_requests_mask, new_tokens)
 
         # total_request_count should be 0 (both finished, chunked prefill hidden)
         assert dynamic_context.total_request_count == 0
@@ -2262,7 +2262,7 @@ class TestDynamicContext:
             [[991, 1001], [992, 1002]], device='cpu'
         )  # Spec tokens
 
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -2328,7 +2328,7 @@ class TestDynamicContext:
         # 2. Clone the prev_last_block_ids internally.
         # 3. Resume the request, allocating the new block.
         # 4. Map the 3 new tokens across the boundary.
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -2403,7 +2403,7 @@ class TestDynamicContext:
 
         # In update_requests, request 0 will be paused to allocate a new block.
         # Since total_avail is 0, it will stay paused and its tokens will be cached.
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -2507,7 +2507,7 @@ class TestDynamicContext:
         new_tokens = torch.tensor([99, 100, 101], device='cpu')
         new_speculative_tokens = torch.tensor([[991, 1001, 1011], [992, 1002, 1012]], device='cpu')
 
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -2577,7 +2577,7 @@ class TestDynamicContext:
             [[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cpu'
         )
 
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_spec,
@@ -2649,7 +2649,7 @@ class TestDynamicContext:
 
         # Trigger update_requests.
         # It must detect ID 42 is at index 0, and swap it with index 1.
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -2911,7 +2911,7 @@ class TestDynamicContext:
         new_tokens = torch.tensor([50, 50], device='cpu')
         new_spec = torch.tensor([[51, 51], [52, 52]], device='cpu')
 
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
 
@@ -2979,7 +2979,7 @@ class TestDynamicContext:
         active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cpu')
         new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cpu')
-        ctx.update_requests(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
+        ctx.update_requests_legacy(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
 
         # Capture active tokens before chunk 2 (which should just be the 3 tokens of req_first)
         tokens_before_chunk_2 = ctx.active_token_count
@@ -3235,7 +3235,7 @@ class TestDynamicContext:
         new_spec = torch.tensor([[100, 200], [101, 201]], device='cpu')
 
         # Run update requests
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
 
@@ -3303,7 +3303,7 @@ class TestDynamicContext:
         # This will pause the request (offset 13 >= 13), then resume it by
         # allocating a 3rd block at col_idx=2. Without the fix, this raises
         # an IndexError because request_to_kv_block_ids only has 2 columns.
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
             new_speculative_tokens=new_speculative_tokens,
@@ -3427,7 +3427,7 @@ class TestDynamicContext:
         new_spec = torch.arange(num_spec * num_requests, device='cuda').reshape(
             num_spec, num_requests
         )
-        ctx.update_requests(
+        ctx.update_requests_legacy(
             active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
         return ctx
@@ -3546,7 +3546,7 @@ class TestDynamicContext:
         ctx.initialize_attention_state()
         active_mask = torch.ones(1, device='cuda', dtype=torch.int32)
         new_tokens = torch.tensor([42], device='cuda')
-        ctx.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
+        ctx.update_requests_legacy(active_requests_mask=active_mask, new_tokens=new_tokens)
 
         prefill_lengths = [20, 30]
         for i, pl in enumerate(prefill_lengths):

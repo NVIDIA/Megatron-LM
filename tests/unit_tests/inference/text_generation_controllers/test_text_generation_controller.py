@@ -15,7 +15,11 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    AsyncSchedulingMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
@@ -194,9 +198,9 @@ class TestAsyncSchedulingControllerHelpers:
     def _make_async_eligibility_controller(self):
         controller = object.__new__(TextGenerationController)
         context = mock.Mock()
-        context.config.enable_async_scheduling = True
-        context.async_scheduling_has_waiting_requests = False
-        context.async_scheduling_has_stop_word_requests = False
+        context.config.async_scheduling_mode = AsyncSchedulingMode.ASYNC
+        context.request_update_has_waiting_requests = False
+        context.request_update_has_stop_word_requests = False
         context.total_request_count = 2
         context.paused_request_count = 0
         context.num_prefill_requests = 0
@@ -204,6 +208,7 @@ class TestAsyncSchedulingControllerHelpers:
         context.expert_model_parallel_group = None
         context.chunked_prefill_request_id = -1
         context.is_chunked_prefill_enabled.return_value = False
+        context.is_decode_only.return_value = True
         context.pending_finished_rows.return_value = None
         context.has_pending_finished_rows.return_value = False
         context.block_size_tokens = 128
@@ -238,19 +243,19 @@ class TestAsyncSchedulingControllerHelpers:
             (
                 "disabled",
                 lambda _controller, context, _model_config: setattr(
-                    context.config, "enable_async_scheduling", False
+                    context.config, "async_scheduling_mode", AsyncSchedulingMode.LEGACY
                 ),
             ),
             (
                 "waiting_requests",
                 lambda _controller, context, _model_config: setattr(
-                    context, "async_scheduling_has_waiting_requests", True
+                    context, "request_update_has_waiting_requests", True
                 ),
             ),
             (
                 "stop_words",
                 lambda _controller, context, _model_config: setattr(
-                    context, "async_scheduling_has_stop_word_requests", True
+                    context, "request_update_has_stop_word_requests", True
                 ),
             ),
             (
@@ -290,15 +295,9 @@ class TestAsyncSchedulingControllerHelpers:
                 ),
             ),
             (
-                "prefill",
+                "non_decode",
                 lambda _controller, context, _model_config: setattr(
-                    context, "num_prefill_requests", 1
-                ),
-            ),
-            (
-                "chunked_prefill",
-                lambda _controller, context, _model_config: setattr(
-                    context.is_chunked_prefill_enabled, "return_value", True
+                    context.is_decode_only, "return_value", False
                 ),
             ),
             (
@@ -351,6 +350,51 @@ class TestAsyncSchedulingControllerHelpers:
             controller._get_async_scheduling_fallback_reason(prepared_update)
             == "speculative_tokens"
         )
+
+    def test_request_update_mode_routes_legacy_to_legacy_bookkeeping(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.LEGACY
+        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
+            return_value={"path": "legacy"}
+        )
+        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+
+        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
+        controller._dynamic_step_context_bookkeeping_legacy.assert_called_once()
+        controller._dynamic_step_context_bookkeeping.assert_not_called()
+
+    def test_request_update_mode_routes_serial_decode_to_new_bookkeeping(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
+            return_value={"path": "legacy"}
+        )
+        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+
+        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "serial"}
+        controller._dynamic_step_context_bookkeeping_legacy.assert_not_called()
+        controller._dynamic_step_context_bookkeeping.assert_called_once()
+
+    def test_request_update_mode_routes_non_decode_to_legacy_bookkeeping(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.is_decode_only.return_value = False
+        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
+            return_value={"path": "legacy"}
+        )
+        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+
+        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
+        controller._dynamic_step_context_bookkeeping_legacy.assert_called_once()
+        controller._dynamic_step_context_bookkeeping.assert_not_called()
+
+    def test_request_update_mode_rejects_unsupported_serial_decode(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.request_update_has_waiting_requests = True
+
+        with pytest.raises(RuntimeError, match="waiting_requests"):
+            controller._dynamic_step_context_bookkeeping_for_mode()
 
     def test_async_scheduling_prepare_uses_context_adjusted_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
@@ -486,7 +530,7 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
     def teardown_method(self, method):
         InferenceMode.unset_active()
 
-    def _run_dense_greedy_dynamic_generation(self, enable_async_scheduling: bool):
+    def _run_dense_greedy_dynamic_generation(self, async_scheduling_mode: AsyncSchedulingMode):
         if not is_fa_min_version("2.7.3"):
             pytest.skip(reason="Need latest flash attn for dynamic batching")
 
@@ -502,7 +546,7 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
             max_requests=4,
         )
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.config.enable_async_scheduling = enable_async_scheduling
+        context.config.async_scheduling_mode = async_scheduling_mode
 
         requests = [
             DynamicInferenceRequest(
@@ -538,8 +582,8 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
         return generated_tokens
 
     def test_async_scheduling_matches_sync_dense_greedy_decode(self):
-        sync_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=False)
-        async_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=True)
+        sync_tokens = self._run_dense_greedy_dynamic_generation(AsyncSchedulingMode.LEGACY)
+        async_tokens = self._run_dense_greedy_dynamic_generation(AsyncSchedulingMode.ASYNC)
 
         assert async_tokens == sync_tokens
 

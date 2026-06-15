@@ -615,10 +615,10 @@ class TestAsyncSchedulingEligibilityState:
             [False, False, True, False], device='cpu'
         )
 
-        engine._update_async_scheduling_eligibility_state()
+        engine._update_request_update_mode_state()
 
-        assert not engine.context.async_scheduling_has_waiting_requests
-        assert engine.context.async_scheduling_has_stop_word_requests
+        assert not engine.context.request_update_has_waiting_requests
+        assert engine.context.request_update_has_stop_word_requests
 
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):

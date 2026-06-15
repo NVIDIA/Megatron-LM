@@ -20,6 +20,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.config import AsyncSchedulingMode
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -1693,20 +1694,32 @@ class TextGenerationController:
         }
         return prepared_update, request_bookkeeping
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling."""
+    def _dynamic_step_context_bookkeeping_legacy(self) -> Dict[str, Tensor]:
+        """Update the dynamic inference context through the preserved legacy path."""
         context = self.inference_wrapped_model.inference_context
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
-        range_push("update_requests")
-        resolve_result = context.resolve_requests(prepared_update)
-        if resolve_result is not None:
-            context.prepare_requests(**prepared_update)
+        range_push("update_requests_legacy")
+        update_result = context.update_requests_legacy(**prepared_update)
         range_pop()
 
         return {
             **request_bookkeeping,
-            **(resolve_result or {}),
+            **(update_result or {}),
+        }
+
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+        """Update the dynamic inference context through the split resolve/prepare path."""
+        context = self.inference_wrapped_model.inference_context
+        prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
+
+        range_push("update_requests")
+        update_result = context.update_requests(**prepared_update)
+        range_pop()
+
+        return {
+            **request_bookkeeping,
+            **(update_result or {}),
         }
 
     def _dynamic_step_forward_for_async_scheduling(self) -> Optional[int]:
@@ -1771,20 +1784,24 @@ class TextGenerationController:
         self._async_schedule_forward_primed = True
         return request_bookkeeping, resolve_result or {}
 
-    def _get_async_scheduling_fallback_reason(
-        self, prepared_update: Optional[Dict] = None
+    def _get_request_update_mode(self) -> AsyncSchedulingMode:
+        """Return the configured dynamic request-update mode."""
+        context = self.inference_wrapped_model.inference_context
+
+        return AsyncSchedulingMode(context.config.async_scheduling_mode)
+
+    def _get_decode_request_update_unsupported_reason(
+        self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
     ) -> Optional[str]:
-        """Return why async-shaped scheduling must fall back, or None if eligible."""
+        """Return why the new request-update path is unsupported for this decode-only step."""
         context = self.inference_wrapped_model.inference_context
         model_config = self.model_config
         active_slice = slice(context.paused_request_count, context.total_request_count)
         active_request_count = context.total_request_count - context.paused_request_count
 
-        if not context.config.enable_async_scheduling:
-            return "disabled"
-        if getattr(context, "async_scheduling_has_waiting_requests", False):
+        if getattr(context, "request_update_has_waiting_requests", False):
             return "waiting_requests"
-        if getattr(context, "async_scheduling_has_stop_word_requests", False):
+        if getattr(context, "request_update_has_stop_word_requests", False):
             return "stop_words"
         if self.num_speculative_tokens > 0:
             return "speculative_tokens"
@@ -1800,10 +1817,6 @@ class TextGenerationController:
             return "expert_parallel"
         if context.paused_request_count != 0:
             return "paused_requests"
-        if context.num_prefill_requests != 0:
-            return "prefill"
-        if context.is_chunked_prefill_enabled() or context.chunked_prefill_request_id != -1:
-            return "chunked_prefill"
         if prepared_update is not None and prepared_update["new_speculative_tokens"] is not None:
             return "speculative_tokens"
         if active_request_count == 0:
@@ -1817,41 +1830,69 @@ class TextGenerationController:
         if (context.request_metadata["top_p"][active_slice] > 0.0).any().item():
             return "non_greedy_sampling"
 
-        block_boundary_threshold = self.inference_wrapped_model.inference_context.block_size_tokens
-        block_boundary_threshold -= 1 + self.num_speculative_tokens
-        if (
-            context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold
-        ).any().item():
-            return "kv_block_boundary"
+        if mode == AsyncSchedulingMode.ASYNC:
+            block_boundary_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
+            if (
+                context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold
+            ).any().item():
+                return "kv_block_boundary"
 
         return None
 
+    def _raise_if_decode_request_update_unsupported(
+        self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
+    ) -> None:
+        """Raise when a decode-only step requests the new path with unsupported features."""
+        reason = self._get_decode_request_update_unsupported_reason(mode, prepared_update)
+        if reason is not None:
+            raise RuntimeError(
+                f"Dynamic batching request-update mode '{mode.value}' only supports "
+                f"decode-only vanilla GPT greedy steps without extra lifecycle events; "
+                f"unsupported feature: {reason}."
+            )
+
+    def _get_async_scheduling_fallback_reason(
+        self, prepared_update: Optional[Dict] = None
+    ) -> Optional[str]:
+        """Return why async-shaped scheduling cannot run, or None if eligible."""
+        context = self.inference_wrapped_model.inference_context
+
+        if self._get_request_update_mode() != AsyncSchedulingMode.ASYNC:
+            return "disabled"
+        if not context.is_decode_only():
+            return "non_decode"
+        return self._get_decode_request_update_unsupported_reason(
+            AsyncSchedulingMode.ASYNC, prepared_update
+        )
+
+    def _dynamic_step_context_bookkeeping_for_mode(self) -> Dict[str, Tensor]:
+        """Route post-sampling request updates to legacy or the new serial path."""
+        context = self.inference_wrapped_model.inference_context
+        mode = self._get_request_update_mode()
+
+        if mode == AsyncSchedulingMode.LEGACY or not context.is_decode_only():
+            return self._dynamic_step_context_bookkeeping_legacy()
+
+        if mode == AsyncSchedulingMode.SERIAL:
+            self._raise_if_decode_request_update_unsupported(mode)
+            return self._dynamic_step_context_bookkeeping()
+
+        self._raise_if_decode_request_update_unsupported(mode)
+        return self._dynamic_step_context_bookkeeping_legacy()
+
     def _run_async_scheduling_step(self) -> Tuple[Dict, Dict]:
         """Run sample(N) -> prepare(N+1) -> forward(N+1) -> resolve(N)."""
-        context = self.inference_wrapped_model.inference_context
         range_push("sampling")
         self._dynamic_step_sample_logits()
         range_pop()
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
-        fallback_reason = self._get_async_scheduling_fallback_reason(prepared_update)
-        if fallback_reason is not None:
-            if context.has_pending_finished_rows():
-                request_bookkeeping, resolve_result = self._run_async_scheduling_request_update(
-                    prepared_update, request_bookkeeping, run_forward=False
-                )
-            else:
-                range_push("update_requests")
-                resolve_result = context.resolve_requests(prepared_update)
-                if resolve_result is not None:
-                    context.prepare_requests(**prepared_update)
-                range_pop()
-                self._async_schedule_forward_primed = False
-                self._async_schedule_primed_cuda_graph_request_count = None
-        else:
-            request_bookkeeping, resolve_result = self._run_async_scheduling_request_update(
-                prepared_update, request_bookkeeping
-            )
+        self._raise_if_decode_request_update_unsupported(
+            AsyncSchedulingMode.ASYNC, prepared_update
+        )
+        request_bookkeeping, resolve_result = self._run_async_scheduling_request_update(
+            prepared_update, request_bookkeeping
+        )
 
         return request_bookkeeping, resolve_result or {}
 
@@ -1860,11 +1901,12 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        if (
-            not self._async_schedule_forward_primed
-            and self._get_async_scheduling_fallback_reason() is not None
-        ):
+        if self._get_request_update_mode() != AsyncSchedulingMode.ASYNC:
             return None
+        if not context.is_decode_only():
+            return None
+        if not self._async_schedule_forward_primed:
+            self._raise_if_decode_request_update_unsupported(AsyncSchedulingMode.ASYNC)
         if context.active_token_count == 0 and active_request_count == 0:
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
@@ -2019,7 +2061,7 @@ class TextGenerationController:
                         )
             range_pop()
 
-            # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
+            # Capture before update_requests (called by context bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
             # always equal to the full active count.
             num_decode_requests = context.num_decode_requests
@@ -2037,7 +2079,7 @@ class TextGenerationController:
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                request_bookkeeping = self._dynamic_step_context_bookkeeping_for_mode()
 
             ret = {
                 "accepted_tokens": (

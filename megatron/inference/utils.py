@@ -9,6 +9,7 @@ import torch
 from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
+    AsyncSchedulingMode,
     CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
@@ -371,7 +372,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
-        enable_async_scheduling=args.inference_dynamic_batching_async_scheduling,
+        async_scheduling_mode=AsyncSchedulingMode(
+            args.inference_dynamic_batching_async_scheduling_mode
+        ),
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
         prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),

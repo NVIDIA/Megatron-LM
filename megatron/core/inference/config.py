@@ -133,6 +133,19 @@ class CudaGraphSizingDistribution(str, Enum):
     LINEAR = "linear"
 
 
+class AsyncSchedulingMode(str, Enum):
+    """Request-update scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Use the preserved mainline request-update path for every step."""
+
+    SERIAL = "serial"
+    """Use the new resolve/prepare request-update path for eligible decode-only steps."""
+
+    ASYNC = "async"
+    """Use the async-shaped prepare/forward/resolve path for eligible decode-only steps."""
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -275,8 +288,8 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
-    enable_async_scheduling: bool = False
-    """Whether to use async-shaped dynamic decode scheduling."""
+    async_scheduling_mode: AsyncSchedulingMode = AsyncSchedulingMode.LEGACY
+    """Request-update scheduling mode for dynamic batching."""
 
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""

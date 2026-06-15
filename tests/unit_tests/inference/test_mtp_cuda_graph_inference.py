@@ -724,7 +724,7 @@ class TestMTPCudaGraphInference:
             new_spec = torch.arange(num_spec * active_decode_count, device='cuda').reshape(
                 num_spec, active_decode_count
             )
-            context.update_requests(
+            context.update_requests_legacy(
                 active_requests_mask=active_mask,
                 new_tokens=new_tokens,
                 new_speculative_tokens=new_spec,
