@@ -656,6 +656,33 @@ class TestArgumentGroupFactoryArgparseMeta:
             args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
 
 
+class TestMegatronNetworkArgumentGeneration:
+    """Test Megatron's TransformerConfig-derived argument group."""
+
+    def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
+        """Callback fields are runtime hooks, not CLI-provided values."""
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        destinations = {action.dest for action in parser._actions}
+        callback_fields = {
+            "timers",
+            "finalize_model_grads_func",
+            "grad_scale_func",
+            "moe_grad_scale_func",
+            "no_sync_func",
+            "grad_sync_func",
+            "param_sync_func",
+        }
+
+        assert destinations.isdisjoint(callback_fields)
+        args = parser.parse_args([])
+        for field_name in callback_fields:
+            assert not hasattr(args, field_name)
+
+
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------
