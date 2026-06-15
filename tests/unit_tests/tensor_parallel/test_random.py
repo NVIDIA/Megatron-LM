@@ -11,6 +11,16 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
+    _CP_MAX,
+    _CP_RNG_SEED_OFFSET,
+    _EP_ETP_STRIDE,
+    _EP_MAX,
+    _ETP_MAX,
+    _EP_RNG_SEED_OFFSET,
+    _TPCP_MAX,
+    _TP_MAX,
+    _TP_RNG_SEED_OFFSET,
+    _TPCP_RNG_SEED_OFFSET,
     checkpoint,
     convert_cuda_rng_state,
     ensure_context_parallel_rng_tracker_states,
@@ -196,20 +206,19 @@ def test_model_parallel_cuda_manual_seed():
     Utils.destroy_model_parallel()
 
 
-@mock.patch("megatron.core.tensor_parallel.random.get_context_parallel_rank", return_value=1)
 @mock.patch("megatron.core.tensor_parallel.random.get_context_parallel_world_size", return_value=2)
-@mock.patch("megatron.core.tensor_parallel.random.get_tensor_and_context_parallel_rank", return_value=3)
-def test_cp_only_and_tpxcp_tracker_seed_semantics(
-    mock_tpcp_rank, mock_cp_world_size, mock_cp_rank
-):
+def test_cp_only_and_tpxcp_tracker_seed_semantics(mock_cp_world_size):
+    """cp_rank and tc_rank are now explicit parameters; no need to mock them."""
     Utils.initialize_model_parallel(4, 1)
-    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+    model_parallel_cuda_manual_seed(123, cp_rank=1, tc_rank=3, force_reset_rng=True)
     tracker_states = get_cuda_rng_tracker().get_states()
     assert get_context_parallel_rng_tracker_name() in tracker_states
     assert get_model_and_context_parallel_rng_tracker_name() in tracker_states
 
-    expected_context_seed = 123 + 2718 + 2048 + 1
-    expected_tpcp_seed = 123 + 2718 + 4 + 3
+    # CP seed    = base_seed + _CP_RNG_SEED_OFFSET   + cp_rank
+    # TPxCP seed = base_seed + _TPCP_RNG_SEED_OFFSET + tc_rank
+    expected_context_seed = 123 + _CP_RNG_SEED_OFFSET + 1
+    expected_tpcp_seed    = 123 + _TPCP_RNG_SEED_OFFSET + 3
 
     expected_context_tracker = CudaRNGStatesTracker()
     expected_context_tracker.add(get_context_parallel_rng_tracker_name(), expected_context_seed)
@@ -225,6 +234,43 @@ def test_cp_only_and_tpxcp_tracker_seed_semantics(
         expected_tpcp_tracker.get_states()[get_model_and_context_parallel_rng_tracker_name()],
     )
     Utils.destroy_model_parallel()
+
+
+def test_all_rng_tracker_seed_slots_are_non_overlapping():
+    """Verify that every pair of RNG tracker seed slots is non-overlapping.
+
+    Each tracker is assigned a BASE offset and a SLOT_SIZE.  This test
+    asserts that [BASE_i, BASE_i + SLOT_SIZE_i - 1] and [BASE_j, BASE_j +
+    SLOT_SIZE_j - 1] are disjoint for every pair (i, j).  The design bounds
+    (max ranks) are the ones documented in random.py.
+    """
+    # Design bounds — read directly from the module so the test stays in sync
+    # automatically when _TP_MAX / _EP_MAX / _ETP_MAX / etc. are updated.
+    assert _EP_ETP_STRIDE == _ETP_MAX, (
+        f"_EP_ETP_STRIDE={_EP_ETP_STRIDE} != _ETP_MAX={_ETP_MAX}: "
+        "EP encoding stride must equal the ETP upper bound."
+    )
+
+    # Each slot is (base, max_rank_index) — the slot occupies [base, base+max_rank_index].
+    slots = {
+        "DP":    (0,                    0),
+        "TP":    (_TP_RNG_SEED_OFFSET,  _TP_MAX - 1),
+        "CP":    (_CP_RNG_SEED_OFFSET,  _CP_MAX - 1),
+        "TPxCP": (_TPCP_RNG_SEED_OFFSET, _TPCP_MAX - 1),
+        "EP":    (_EP_RNG_SEED_OFFSET,  (_EP_MAX - 1) * _EP_ETP_STRIDE + (_ETP_MAX - 1)),
+    }
+
+    # Assert every slot is strictly ordered (non-overlapping) when sorted by base.
+    ordered = sorted(slots.items(), key=lambda kv: kv[1][0])
+    for i in range(len(ordered) - 1):
+        name_lo, (base_lo, max_lo) = ordered[i]
+        name_hi, (base_hi, _)      = ordered[i + 1]
+        end_lo = base_lo + max_lo
+        assert end_lo < base_hi, (
+            f"Seed slot '{name_lo}' [base={base_lo}, end={end_lo}] overlaps "
+            f"slot '{name_hi}' [base={base_hi}]: "
+            f"adjust the offset constants in random.py."
+        )
 
 
 def test_ensure_context_parallel_rng_tracker_states_uses_data_parallel_fallback():

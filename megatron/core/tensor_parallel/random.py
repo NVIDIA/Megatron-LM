@@ -24,7 +24,6 @@ from megatron.core.parallel_state import (
     get_expert_tensor_parallel_rank,
     get_tensor_and_context_parallel_rank,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
@@ -97,6 +96,41 @@ _CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'context-parallel-rng'
 _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'model-and-context-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+
+# Seed-space layout — each tracker occupies an exclusive, non-overlapping slot.
+# All values are relative to the user-supplied base seed.
+#
+# Step 1: declare upper bounds for each parallel dimension.
+#   Raising a bound automatically shifts the derived BASE and keeps all slots
+#   non-overlapping — no other constant needs to change.
+_TP_MAX = 1 << 10   # 1,024      TP_world_size upper bound
+_CP_MAX = 1 << 10   # 1,024      CP_world_size upper bound
+_TPCP_MAX = _TP_MAX * _CP_MAX   # 1,048,576  TP×CP upper bound (tc_rank ∈ [0, TP*CP-1])
+_EP_MAX = 1 << 13   # 8,192      EP_world_size upper bound
+_ETP_MAX = 1 << 10   # 1,024      expert_tensor_parallel upper bound (also the ETP stride)
+#
+# Step 2: derive non-overlapping BASEs as a cumulative sum.
+#   BASE[i] = BASE[i-1] + slot_size[i-1],  i.e. each slot starts immediately
+#   after the previous one ends.  Non-overlap proof:
+#     END[i-1] = BASE[i-1] + slot_size[i-1] - 1 = BASE[i] - 1 < BASE[i] 
+#
+#   Tracker  slot size         BASE (cumulative)
+#   ──────── ──────────────    ─────────────────────────────────────────
+#   DP       1                 0
+#   TP       _TP_MAX           1
+#   CP       _CP_MAX           1 + _TP_MAX
+#   TPxCP    _TP_MAX*_CP_MAX   1 + _TP_MAX + _CP_MAX
+#   EP       _EP_MAX*_ETP_MAX  1 + _TP_MAX + _CP_MAX + _TPCP_MAX
+#
+# EP rank is encoded as ep_rank * _ETP_MAX + etp_rank (= ep_rank * _EP_ETP_STRIDE).
+# The stride equals _ETP_MAX, ensuring distinct (ep_rank, etp_rank) pairs never
+# collide.  PyTorch CUDA seeds are uint64; these offsets have no effect on RNG quality.
+_EP_ETP_STRIDE = _ETP_MAX
+
+_TP_RNG_SEED_OFFSET = 1
+_CP_RNG_SEED_OFFSET = _TP_RNG_SEED_OFFSET + _TP_MAX
+_TPCP_RNG_SEED_OFFSET = _CP_RNG_SEED_OFFSET + _CP_MAX
+_EP_RNG_SEED_OFFSET = _TPCP_RNG_SEED_OFFSET + _TPCP_MAX
 
 
 def _get_cuda_rng_state(
@@ -537,6 +571,8 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+    tc_rank: Optional[int] = None,
     force_reset_rng: bool = False,
 ):
     """Initialize model parallel cuda seed.
@@ -568,11 +604,13 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
-    # 2718 is just for fun and any POSITIVE value will work.
-    offset = seed + 2718
-    tensor_model_parallel_seed = offset + tp_rank
-    # Data parallel gets the original seed.
+    if cp_rank is None:
+        cp_rank = get_context_parallel_rank()
+    if tc_rank is None:
+        tc_rank = get_tensor_and_context_parallel_rank()
+    # Each tracker occupies a non-overlapping slot; see the seed-space layout comment above.
     data_parallel_seed = seed
+    tensor_model_parallel_seed = seed + _TP_RNG_SEED_OFFSET + tp_rank
 
     initialize_rng_tracker(
         te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng, force_reset=force_reset_rng
@@ -589,7 +627,7 @@ def model_parallel_cuda_manual_seed(
 
     context_parallel_world_size = get_context_parallel_world_size()
     context_parallel_seed = (
-        offset + 2048 + get_context_parallel_rank()
+        seed + _CP_RNG_SEED_OFFSET + cp_rank
         if context_parallel_world_size > 1
         else None
     )
@@ -602,7 +640,7 @@ def model_parallel_cuda_manual_seed(
 
     # TPxCP forward/dropout state.
     tensor_and_context_parallel_seed = (
-        offset + get_tensor_model_parallel_world_size() + get_tensor_and_context_parallel_rank()
+        seed + _TPCP_RNG_SEED_OFFSET + tc_rank
         if context_parallel_world_size > 1
         else None
     )
@@ -613,7 +651,7 @@ def model_parallel_cuda_manual_seed(
         clone_from_name=_MODEL_PARALLEL_RNG_TRACKER_NAME,
     )
 
-    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
+    expert_parallel_seed = seed + _EP_RNG_SEED_OFFSET + ep_rank * _EP_ETP_STRIDE + etp_rank
     rng_tracker.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
