@@ -1602,7 +1602,7 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_prepare_bookkeeping(self) -> Tuple[Dict, Dict[str, Tensor]]:
+    def _build_dynamic_step_request_update(self) -> Tuple[Dict, Dict[str, Tensor]]:
         """Prepare request bookkeeping inputs and return data after sampling.
 
         Args:
@@ -1696,12 +1696,12 @@ class TextGenerationController:
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling."""
         context = self.inference_wrapped_model.inference_context
-        prepared_update, request_bookkeeping = self._dynamic_step_context_prepare_bookkeeping()
+        prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
         range_push("update_requests")
-        update_result = context.update_requests_bookkeep(prepared_update)
+        update_result = context.bookkeep_requests(prepared_update)
         if update_result is not None:
-            context.update_requests_prepare(**prepared_update)
+            context.prepare_requests(**prepared_update)
         range_pop()
 
         return {
@@ -1732,14 +1732,14 @@ class TextGenerationController:
         range_pop()
         return cuda_graph_request_count
 
-    def _async_scheduling_prepare_forward_bookkeep(
+    def _run_async_scheduling_request_update(
         self, prepared_update: Dict, request_bookkeeping: Dict, *, run_forward: bool = True
     ) -> Tuple[Dict, Dict[str, Optional[Tensor]]]:
         """Run prepare(N+1) -> forward(N+1) -> bookkeep(N) serially."""
         context = self.inference_wrapped_model.inference_context
 
-        range_push("update_requests_prepare")
-        prepared_update, request_bookkeeping = context.update_requests_prepare(
+        range_push("prepare_requests")
+        prepared_update, request_bookkeeping = context.prepare_requests(
             **prepared_update, request_bookkeeping=request_bookkeeping
         )
         range_pop()
@@ -1751,8 +1751,8 @@ class TextGenerationController:
             or active_requests_mask.numel() == 0
             or (active_requests_mask == 0).all()
         ):
-            range_push("update_requests_bookkeep")
-            update_result = context.update_requests_bookkeep(prepared_update)
+            range_push("bookkeep_requests")
+            update_result = context.bookkeep_requests(prepared_update)
             range_pop()
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
@@ -1762,8 +1762,8 @@ class TextGenerationController:
             self._dynamic_step_forward_for_async_scheduling()
         )
 
-        range_push("update_requests_bookkeep")
-        update_result = context.update_requests_bookkeep(
+        range_push("bookkeep_requests")
+        update_result = context.bookkeep_requests(
             prepared_update, delay_finished_compaction=True
         )
         range_pop()
@@ -1826,30 +1826,30 @@ class TextGenerationController:
 
         return None
 
-    def _async_scheduling_sample_prepare_forward_bookkeep(self) -> Tuple[Dict, Dict]:
+    def _run_async_scheduling_step(self) -> Tuple[Dict, Dict]:
         """Run sample(N) -> prepare(N+1) -> forward(N+1) -> bookkeep(N)."""
         context = self.inference_wrapped_model.inference_context
         range_push("sampling")
         self._dynamic_step_sample_logits()
         range_pop()
-        prepared_update, request_bookkeeping = self._dynamic_step_context_prepare_bookkeeping()
+        prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
         fallback_reason = self._get_async_scheduling_fallback_reason(prepared_update)
         if fallback_reason is not None:
-            if context.has_async_finished_request_rows():
-                request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+            if context.has_pending_finished_rows():
+                request_bookkeeping, update_result = self._run_async_scheduling_request_update(
                     prepared_update, request_bookkeeping, run_forward=False
                 )
             else:
                 range_push("update_requests")
-                update_result = context.update_requests_bookkeep(prepared_update)
+                update_result = context.bookkeep_requests(prepared_update)
                 if update_result is not None:
-                    context.update_requests_prepare(**prepared_update)
+                    context.prepare_requests(**prepared_update)
                 range_pop()
                 self._async_schedule_forward_primed = False
                 self._async_schedule_primed_cuda_graph_request_count = None
         else:
-            request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+            request_bookkeeping, update_result = self._run_async_scheduling_request_update(
                 prepared_update, request_bookkeeping
             )
 
@@ -1868,7 +1868,7 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
-            context.clear_async_finished_request_rows()
+            context.clear_pending_finished_rows()
             return None
 
         with torch.inference_mode():
@@ -1886,7 +1886,7 @@ class TextGenerationController:
 
             cuda_graph_request_count = self._async_schedule_primed_cuda_graph_request_count
             request_bookkeeping, update_result = (
-                self._async_scheduling_sample_prepare_forward_bookkeep()
+                self._run_async_scheduling_step()
             )
 
             ret = {

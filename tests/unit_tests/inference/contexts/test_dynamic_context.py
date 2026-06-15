@@ -687,7 +687,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_filter_async_finished_request_rows(self):
+    def test_filter_pending_finished_rows(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -700,9 +700,9 @@ class TestDynamicContext:
         )
         dynamic_context.total_request_count = 3
         dynamic_context.request_ids[:3] = torch.tensor([10, 11, 12], device='cpu')
-        dynamic_context.record_async_finished_request_rows(torch.tensor([False, True, False]))
+        dynamic_context.record_pending_finished_rows(torch.tensor([False, True, False]))
 
-        filtered = dynamic_context.filter_async_finished_request_rows(
+        filtered = dynamic_context._filter_pending_finished_rows(
             {
                 "active_request_ids": torch.tensor([10, 11, 12], device='cpu'),
                 "sample": torch.tensor([100, 101, 102], device='cpu'),
@@ -754,7 +754,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_compact_async_finished_request_rows(self):
+    def test_compact_pending_finished_rows(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -771,13 +771,13 @@ class TestDynamicContext:
             [False, True, True, False], device='cpu'
         )
         next_tokens = torch.tensor([100, 101, 102, 103], device='cpu')
-        dynamic_context.record_async_finished_request_rows(
+        dynamic_context.record_pending_finished_rows(
             torch.tensor([False, True, False, True])
         )
 
-        dynamic_context.compact_async_finished_request_rows(next_tokens=next_tokens)
+        dynamic_context._compact_pending_finished_rows(next_tokens=next_tokens)
 
-        assert not dynamic_context.has_async_finished_request_rows()
+        assert not dynamic_context.has_pending_finished_rows()
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.active_token_count == 2
         assert dynamic_context.request_ids[:4].tolist() == [10, 12, -1, -1]
@@ -791,7 +791,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_compact_async_finished_request_rows_all_finished(self):
+    def test_compact_pending_finished_rows_all_finished(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -806,11 +806,11 @@ class TestDynamicContext:
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
         dynamic_context.request_has_stop_words[:2] = torch.tensor([True, False], device='cpu')
         dynamic_context.active_token_count = 2
-        dynamic_context.record_async_finished_request_rows(torch.tensor([True, True]))
+        dynamic_context.record_pending_finished_rows(torch.tensor([True, True]))
 
-        dynamic_context.compact_async_finished_request_rows()
+        dynamic_context._compact_pending_finished_rows()
 
-        assert not dynamic_context.has_async_finished_request_rows()
+        assert not dynamic_context.has_pending_finished_rows()
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
         assert dynamic_context.request_ids[:2].tolist() == [-1, -1]
@@ -818,7 +818,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_update_requests_prepare_consumes_pending_async_finished_rows(self):
+    def test_prepare_requests_consumes_pending_finished_rows(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -835,9 +835,9 @@ class TestDynamicContext:
         dynamic_context.request_kv_length_offsets[:3] = torch.tensor([5, 6, 7], device='cpu')
         dynamic_context.request_last_kv_block_offset[:3] = torch.tensor([5, 6, 7], device='cpu')
         dynamic_context.request_last_kv_block_id[:3] = torch.tensor([20, 21, 22], device='cpu')
-        dynamic_context.record_async_finished_request_rows(torch.tensor([False, True, False]))
+        dynamic_context.record_pending_finished_rows(torch.tensor([False, True, False]))
 
-        prepared_update, filtered_bookkeeping = dynamic_context.update_requests_prepare(
+        prepared_update, filtered_bookkeeping = dynamic_context.prepare_requests(
             active_requests_mask=torch.tensor([1, 1, 0], device='cpu'),
             new_tokens=torch.tensor([100, 101, 102], device='cpu'),
             request_bookkeeping={
@@ -847,7 +847,7 @@ class TestDynamicContext:
             },
         )
 
-        assert not dynamic_context.has_async_finished_request_rows()
+        assert not dynamic_context.has_pending_finished_rows()
         assert dynamic_context.request_ids[:3].tolist() == [10, 12, -1]
         assert prepared_update["active_requests_mask"].tolist() == [1, 0]
         assert prepared_update["new_tokens"].tolist() == [100, 102]
@@ -859,7 +859,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_update_requests_prepare_decode_tokens(self):
+    def test_prepare_requests_decode_tokens(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -876,7 +876,7 @@ class TestDynamicContext:
         dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 6], device='cpu')
         dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 6], device='cpu')
         dynamic_context.request_last_kv_block_id[:2] = torch.tensor([20, 21], device='cpu')
-        dynamic_context.update_requests_prepare(
+        dynamic_context.prepare_requests(
             active_requests_mask=torch.tensor([1, 1], device='cpu'),
             new_tokens=torch.tensor([100, 101], device='cpu'),
         )
@@ -889,7 +889,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_update_requests_bookkeep_delayed_finish_only_records_without_compacting(self):
+    def test_bookkeep_requests_delayed_finish_only_records_without_compacting(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -905,24 +905,24 @@ class TestDynamicContext:
         dynamic_context.request_kv_block_counts[:2] = 1
         new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
         dynamic_context.request_to_kv_block_ids[:2, 0] = new_block_ids
-        prepared_update = dynamic_context.update_requests_prepare(
+        prepared_update = dynamic_context.prepare_requests(
             active_requests_mask=torch.tensor([0, 1], device='cpu'),
             new_tokens=torch.tensor([100, 101], device='cpu'),
         )
 
-        update_result = dynamic_context.update_requests_bookkeep(
+        update_result = dynamic_context.bookkeep_requests(
             prepared_update, delay_finished_compaction=True
         )
 
         assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
-        assert dynamic_context.has_async_finished_request_rows()
+        assert dynamic_context.has_pending_finished_rows()
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.request_ids[:2].tolist() == [10, 11]
         assert dynamic_context.request_to_kv_block_ids[0, 0] == -1
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_async_finished_request_rows_avoid_duplicate_or_row_map_state(self):
+    def test_pending_finished_rows_avoid_duplicate_or_row_map_state(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -935,17 +935,17 @@ class TestDynamicContext:
         )
         dynamic_context.total_request_count = 2
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
-        dynamic_context.record_async_finished_request_rows(torch.tensor([True, False]))
-        pending_finished_rows = dynamic_context.pending_async_finished_rows()
+        dynamic_context.record_pending_finished_rows(torch.tensor([True, False]))
+        pending_finished_rows = dynamic_context.pending_finished_rows()
 
         with pytest.raises(AssertionError):
-            dynamic_context.record_async_finished_request_rows(torch.tensor([False, True]))
+            dynamic_context.record_pending_finished_rows(torch.tensor([False, True]))
 
         assert pending_finished_rows is not None
         assert pending_finished_rows.active_mask.tolist() == [True, False]
         assert pending_finished_rows.request_ids.tolist() == [10]
         state_names = vars(dynamic_context).keys()
-        assert "_pending_async_finished_rows" in state_names
+        assert "_pending_finished_rows" in state_names
         assert "_async_prior_finished_active_mask" not in state_names
         assert "_async_prior_finished_request_ids" not in state_names
         assert not any("row_map" in name or "row_mapping" in name for name in state_names)

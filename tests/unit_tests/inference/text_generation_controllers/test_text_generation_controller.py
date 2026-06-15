@@ -204,8 +204,8 @@ class TestAsyncSchedulingControllerHelpers:
         context.expert_model_parallel_group = None
         context.chunked_prefill_request_id = -1
         context.is_chunked_prefill_enabled.return_value = False
-        context.pending_async_finished_rows.return_value = None
-        context.has_async_finished_request_rows.return_value = False
+        context.pending_finished_rows.return_value = None
+        context.has_pending_finished_rows.return_value = False
         context.block_size_tokens = 128
         context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
         context.request_metadata = {
@@ -374,21 +374,21 @@ class TestAsyncSchedulingControllerHelpers:
             "sample": torch.tensor([101], device='cpu'),
             "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
         }
-        context.update_requests_prepare.return_value = (filtered_update, filtered_bookkeeping)
-        context.update_requests_bookkeep.return_value = {
+        context.prepare_requests.return_value = (filtered_update, filtered_bookkeeping)
+        context.bookkeep_requests.return_value = {
             "newly_paused_request_ids": None,
             "evict_request_ids": None,
         }
         controller._dynamic_step_forward_for_async_scheduling = mock.Mock(return_value=None)
 
-        actual_bookkeeping, update_result = controller._async_scheduling_prepare_forward_bookkeep(
+        actual_bookkeeping, update_result = controller._run_async_scheduling_request_update(
             prepared_update, request_bookkeeping
         )
 
-        context.update_requests_prepare.assert_called_once_with(
+        context.prepare_requests.assert_called_once_with(
             **prepared_update, request_bookkeeping=request_bookkeeping
         )
-        context.update_requests_bookkeep.assert_called_once_with(
+        context.bookkeep_requests.assert_called_once_with(
             filtered_update, delay_finished_compaction=True
         )
         assert actual_bookkeeping is filtered_bookkeeping
@@ -399,7 +399,7 @@ class TestAsyncSchedulingControllerHelpers:
         events = []
 
         def prepare_side_effect(**kwargs):
-            events.append("update_requests_prepare")
+            events.append("prepare_requests")
             return (
                 {
                     "active_requests_mask": kwargs["active_requests_mask"],
@@ -409,9 +409,9 @@ class TestAsyncSchedulingControllerHelpers:
                 kwargs["request_bookkeeping"],
             )
 
-        context.update_requests_prepare.side_effect = prepare_side_effect
-        context.update_requests_bookkeep.side_effect = lambda *_args, **_kwargs: events.append(
-            "update_requests_bookkeep"
+        context.prepare_requests.side_effect = prepare_side_effect
+        context.bookkeep_requests.side_effect = lambda *_args, **_kwargs: events.append(
+            "bookkeep_requests"
         ) or {
             "newly_paused_request_ids": None,
             "evict_request_ids": None,
@@ -420,7 +420,7 @@ class TestAsyncSchedulingControllerHelpers:
         controller._async_schedule_forward_primed = True
         controller._async_schedule_primed_cuda_graph_request_count = None
         controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: events.append("sample"))
-        controller._dynamic_step_context_prepare_bookkeeping = mock.Mock(
+        controller._build_dynamic_step_request_update = mock.Mock(
             side_effect=lambda: (
                 {
                     "active_requests_mask": torch.tensor([1], device='cpu'),
@@ -439,15 +439,15 @@ class TestAsyncSchedulingControllerHelpers:
         ), mock.patch(
             "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
         ):
-            controller._async_scheduling_sample_prepare_forward_bookkeep()
+            controller._run_async_scheduling_step()
 
         assert events == [
             "sample",
-            "update_requests_prepare",
+            "prepare_requests",
             "forward",
-            "update_requests_bookkeep",
+            "bookkeep_requests",
         ]
-        _, kwargs = context.update_requests_bookkeep.call_args
+        _, kwargs = context.bookkeep_requests.call_args
         assert kwargs["delay_finished_compaction"]
 
     def test_async_scheduling_helpers_do_not_use_overlap_primitives(self):
@@ -455,8 +455,8 @@ class TestAsyncSchedulingControllerHelpers:
             inspect.getsource(getattr(TextGenerationController, name))
             for name in (
                 "_try_async_generate_output_tokens_dynamic_batch",
-                "_async_scheduling_sample_prepare_forward_bookkeep",
-                "_async_scheduling_prepare_forward_bookkeep",
+                "_run_async_scheduling_step",
+                "_run_async_scheduling_request_update",
                 "_dynamic_step_forward_for_async_scheduling",
                 "_get_async_scheduling_fallback_reason",
             )

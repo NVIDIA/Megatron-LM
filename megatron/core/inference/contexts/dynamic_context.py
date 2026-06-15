@@ -125,8 +125,8 @@ class ContextOverflowError(Exception):
 
 
 @dataclass(frozen=True)
-class PendingAsyncFinishedRows:
-    """Finished active rows awaiting async-shaped filtering and compaction."""
+class PendingFinishedRows:
+    """Finished active rows awaiting delayed filtering and compaction."""
 
     active_mask: Tensor
     request_ids: Tensor
@@ -293,10 +293,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
-        # Minimal async-shaped decode state. This tracks only active rows that
-        # finished in the previous bookkeep phase and must be filtered before
-        # the next compaction.
-        self._pending_async_finished_rows: Optional[PendingAsyncFinishedRows] = None
+        # Pending finished-row state. This tracks only active rows that finished
+        # in a previous bookkeep phase and must be filtered before compaction.
+        self._pending_finished_rows: Optional[PendingFinishedRows] = None
         self.async_scheduling_has_waiting_requests = False
         self.async_scheduling_has_stop_word_requests = False
 
@@ -2456,7 +2455,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = 0
         self.paused_tokens = None
         self.paused_speculative_tokens = None
-        self.clear_async_finished_request_rows()
+        self.clear_pending_finished_rows()
         self.async_scheduling_has_waiting_requests = False
         self.async_scheduling_has_stop_word_requests = False
         self.request_has_stop_words.fill_(False)
@@ -2951,22 +2950,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
-    def clear_async_finished_request_rows(self) -> None:
-        """Clear pending async-shaped finish filtering and compaction state."""
-        self._pending_async_finished_rows = None
+    def clear_pending_finished_rows(self) -> None:
+        """Clear pending finished-row filtering and compaction state."""
+        self._pending_finished_rows = None
 
-    def has_async_finished_request_rows(self) -> bool:
+    def has_pending_finished_rows(self) -> bool:
         """Return whether there are prior-finished active rows awaiting compaction."""
-        return self._pending_async_finished_rows is not None
+        return self._pending_finished_rows is not None
 
-    def pending_async_finished_rows(self) -> Optional[PendingAsyncFinishedRows]:
-        """Return pending async-shaped finished rows awaiting compaction."""
-        return self._pending_async_finished_rows
+    def pending_finished_rows(self) -> Optional[PendingFinishedRows]:
+        """Return pending finished rows awaiting compaction."""
+        return self._pending_finished_rows
 
-    def record_async_finished_request_rows(self, finished_active_mask: Tensor) -> None:
+    def record_pending_finished_rows(self, finished_active_mask: Tensor) -> None:
         """Record active rows that finished and must be compacted after the next sample."""
-        if self.has_async_finished_request_rows():
-            raise AssertionError("prior async finished rows must be compacted before recording more")
+        if self.has_pending_finished_rows():
+            raise AssertionError("prior pending finished rows must be compacted before recording more")
 
         if finished_active_mask.is_cuda:
             finished_active_mask = finished_active_mask.cpu()
@@ -2974,21 +2973,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert finished_active_mask.dim() == 1
 
         if not finished_active_mask.any():
-            self.clear_async_finished_request_rows()
+            self.clear_pending_finished_rows()
             return
 
         active_request_count = self.total_request_count - self.paused_request_count
         assert finished_active_mask.numel() == active_request_count
 
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        self._pending_async_finished_rows = PendingAsyncFinishedRows(
+        self._pending_finished_rows = PendingFinishedRows(
             active_mask=finished_active_mask.clone(),
             request_ids=self.request_ids[active_slice][finished_active_mask].clone(),
         )
 
-    def filter_async_finished_request_rows(self, step_result: Dict) -> Dict:
-        """Filter rows that already finished in the previous async-shaped bookkeep."""
-        pending_finished_rows = self.pending_async_finished_rows()
+    def _filter_pending_finished_rows(self, step_result: Dict) -> Dict:
+        """Filter rows that already finished in the previous delayed bookkeep."""
+        pending_finished_rows = self.pending_finished_rows()
         if pending_finished_rows is None:
             return step_result
 
@@ -3037,13 +3036,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return filtered_result
 
-    def compact_async_finished_request_rows(
+    def _compact_pending_finished_rows(
         self,
         next_tokens: Optional[Tensor] = None,
         new_speculative_tokens: Optional[Tensor] = None,
     ) -> None:
         """Compact active rows after their prior-finished samples have been filtered."""
-        pending_finished_rows = self.pending_async_finished_rows()
+        pending_finished_rows = self.pending_finished_rows()
         if pending_finished_rows is None:
             return
 
@@ -3065,7 +3064,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.request_to_mamba_state_idx[active_start:active_end] = -1
                 if self.paused_request_count == 0:
                     self.reset_mamba_state()
-            self.clear_async_finished_request_rows()
+            self.clear_pending_finished_rows()
             return
 
         src_idxs = torch.nonzero(keep_mask, as_tuple=True)[0] + active_start
@@ -3089,15 +3088,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[new_active_end:active_end] = -1
 
-        self.clear_async_finished_request_rows()
+        self.clear_pending_finished_rows()
 
-    def _consume_async_finished_request_rows_for_prepare(
+    def _consume_pending_finished_rows_for_prepare(
         self,
         prepared_update: Dict[str, Optional[Tensor]],
         request_bookkeeping: Optional[Dict],
     ) -> Tuple[Dict[str, Optional[Tensor]], Optional[Dict]]:
-        """Consume pending async-finished rows before preparing the next forward."""
-        pending_finished_rows = self.pending_async_finished_rows()
+        """Consume pending finished rows before preparing the next forward."""
+        pending_finished_rows = self.pending_finished_rows()
         if pending_finished_rows is None:
             return prepared_update, request_bookkeeping
 
@@ -3105,12 +3104,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         keep_mask = ~finished_mask
         remaining_request_count = keep_mask.sum().item()
         filtered_bookkeeping = (
-            self.filter_async_finished_request_rows(request_bookkeeping)
+            self._filter_pending_finished_rows(request_bookkeeping)
             if request_bookkeeping is not None
             else None
         )
 
-        self.compact_async_finished_request_rows(
+        self._compact_pending_finished_rows(
             next_tokens=prepared_update["new_tokens"],
             new_speculative_tokens=prepared_update["new_speculative_tokens"],
         )
@@ -3441,7 +3440,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def update_requests_prepare(
+    def prepare_requests(
         self,
         active_requests_mask: Tensor,
         new_tokens: Tensor,
@@ -3465,7 +3464,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             "new_speculative_tokens": new_speculative_tokens,
             "prev_last_block_ids": prev_last_block_ids,
         }
-        prepared_update, request_bookkeeping = self._consume_async_finished_request_rows_for_prepare(
+        prepared_update, request_bookkeeping = self._consume_pending_finished_rows_for_prepare(
             prepared_update, request_bookkeeping
         )
         new_tokens = prepared_update["new_tokens"]
@@ -3613,7 +3612,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return prepared_update, request_bookkeeping
         return prepared_update
 
-    def update_requests_bookkeep(
+    def bookkeep_requests(
         self,
         prepared_update: Dict[str, Optional[Tensor]],
         *,
@@ -3637,7 +3636,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         prepared_update["new_speculative_tokens"] = new_speculative_tokens
 
         if delay_finished_compaction:
-            return self._update_requests_bookkeep_delayed_finish_only(active_requests_mask)
+            return self._bookkeep_requests_delayed_finish_only(active_requests_mask)
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
@@ -3882,7 +3881,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         new_speculative_tokens=None,
                     )
 
-        # 7. Store the token order that update_requests_prepare() will use for next-forward setup.
+        # 7. Store the token order that prepare_requests() will use for next-forward setup.
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
@@ -3956,12 +3955,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             "new_tokens": new_tokens,
             "new_speculative_tokens": new_speculative_tokens,
         }
-        update_result = self.update_requests_bookkeep(prepared_update)
+        update_result = self.bookkeep_requests(prepared_update)
         if update_result is not None:
-            self.update_requests_prepare(**prepared_update)
+            self.prepare_requests(**prepared_update)
         return update_result
 
-    def _update_requests_bookkeep_delayed_finish_only(
+    def _bookkeep_requests_delayed_finish_only(
         self, active_requests_mask: Tensor
     ) -> Dict[str, Optional[Tensor]]:
         """Release finished requests but delay row compaction for async-shaped decode."""
@@ -3973,9 +3972,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if finished_request_count > 0:
             finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
             self.release_memory_blocks_from_request_indexes(finished_idxs)
-            self.record_async_finished_request_rows(active_requests_mask == 0)
+            self.record_pending_finished_rows(active_requests_mask == 0)
         else:
-            self.clear_async_finished_request_rows()
+            self.clear_pending_finished_rows()
 
         return {
             "newly_paused_request_ids": None,
