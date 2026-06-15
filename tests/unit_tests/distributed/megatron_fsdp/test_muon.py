@@ -58,9 +58,17 @@ from tests.unit_tests.distributed.megatron_fsdp.conftest import DistributedSetup
 QKV_SPLIT_SHAPES = (1024, 128, 128)
 
 
-SPEC_DIR = pathlib.Path(__file__).parent / "muon_inputs_fsdp4_tp2"
-EXPECTED_WORLD_SIZE = 8
+# Fixture dirs by WORLD_SIZE — one dump capture per parallelism config.
+_SPEC_DIR_BY_WORLD_SIZE = {
+    8: "muon_inputs_fsdp4_tp2",  # 2-node: (dp_cp=4, tp=2)
+    128: "muon_inputs_outer2_fsdp32_tp2",  # 32-node HSDP: (outer_fsdp_dp=2, dp_cp=32, tp=2)
+}
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
+SPEC_DIR = (
+    pathlib.Path(__file__).parent / _SPEC_DIR_BY_WORLD_SIZE[WORLD_SIZE]
+    if WORLD_SIZE in _SPEC_DIR_BY_WORLD_SIZE
+    else None
+)
 
 
 pytestmark = [
@@ -72,9 +80,9 @@ pytestmark = [
         not HAVE_EMERGING_OPTIMIZERS, reason="Muon tests require the emerging-optimizers package"
     ),
     pytest.mark.skipif(
-        WORLD_SIZE != EXPECTED_WORLD_SIZE,
-        reason=f"Dump captured at WORLD_SIZE={EXPECTED_WORLD_SIZE}, "
-        f"got WORLD_SIZE={WORLD_SIZE}",
+        WORLD_SIZE not in _SPEC_DIR_BY_WORLD_SIZE,
+        reason=f"No fixture for WORLD_SIZE={WORLD_SIZE}; "
+        f"supported: {sorted(_SPEC_DIR_BY_WORLD_SIZE)}",
     ),
     pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA is required for the Muon microbenchmark."
