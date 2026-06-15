@@ -1551,8 +1551,9 @@ def wrap_model_chunks_with_ddp(
             to DDP. ``False`` keeps LayerWise on its legacy sync path.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
-        pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
-            FSDP-style DPs only.
+        pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
+            forwarded to both standard DDP and FSDP variants, and used to source
+            DP world sizes for layout computation.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -1583,10 +1584,17 @@ def wrap_model_chunks_with_ddp(
         else:
             compute_layout = None
         if compute_layout is not None:
-            data_parallel_world_size = mpu.get_data_parallel_world_size(
-                with_context_parallel=True
+            layout_pgs = (
+                pg_collection
+                if pg_collection is not None
+                else ProcessGroupCollection.use_mpu_process_groups()
             )
-            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            assert layout_pgs.dp_cp is not None, (
+                "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
+                "the distributed-optimizer parameter layout"
+            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1603,7 +1611,8 @@ def wrap_model_chunks_with_ddp(
         model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
     ):
         chunk_kwargs = {}
-        if pg_collection is not None and DP is not DDP:
+        # TorchFSDP takes process_group, not pg_collection.
+        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
@@ -1698,6 +1707,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if not isinstance(model, list):
         model = [model]
+
+    # For rare operations like post-training logits saving
+    if args.freeze_all_layers:
+        for model_module in model:
+            model_module.requires_grad_(False)
+            # Additionally freeze expert biases of routers
+            for module in model_module.modules():
+                if hasattr(module, "frozen_expert_bias"):
+                    module.frozen_expert_bias = True
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1953,6 +1971,24 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+
+    if args.logits_save_dir is not None:
+        from megatron.training.distillation import LogitsSaverHooks
+
+        logits_saver = LogitsSaverHooks(
+            save_dir=args.logits_save_dir,
+            k=args.logits_save_top_k,
+            p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
+            save_dtype=args.logits_save_dtype,
+        )
+        logits_saver.attach_hooks(unwrapped_model[-1])
+
+    if args.logits_load_dir is not None:
+        from megatron.training.distillation import StudentLogitsCapture
+
+        student_logits_capture = StudentLogitsCapture()
+        student_logits_capture.attach_hooks(unwrapped_model[-1])
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
@@ -2469,6 +2505,8 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    if learning_rate is None and args.freeze_all_layers:
+        learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2828,11 +2866,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    
+
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
-    
+
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -3403,7 +3441,7 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
-        if (args.profile 
+        if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
