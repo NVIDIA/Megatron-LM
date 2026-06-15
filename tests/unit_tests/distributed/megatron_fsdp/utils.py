@@ -19,6 +19,7 @@ from megatron.training.global_vars import destroy_global_vars, set_global_variab
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
+from tests.unit_tests.test_utilities import Utils
 
 
 def pretrain_forward_backward(
@@ -93,6 +94,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     model, optimizer, _ = setup_model_and_optimizer(
         model_provider_func=partial(model_provider, gpt_builder),
         model_type=ModelType.encoder_or_decoder,
+        cfg_container=Utils.pretrain_config_from_global_args(),
     )
     return model, optimizer
 

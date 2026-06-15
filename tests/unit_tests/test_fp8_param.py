@@ -256,7 +256,9 @@ class TestFP8Param:
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                self.model_provider,
+                ModelType.encoder_or_decoder,
+                cfg_container=Utils.pretrain_config_from_global_args(),
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 

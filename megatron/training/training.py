@@ -5,6 +5,7 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.training_config import OptimizerConfigOverrideProviderContext
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -160,12 +161,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -1229,7 +1224,10 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1898,7 +1896,7 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+def get_megatron_optimizer_config(args: Any) -> tuple[OptimizerConfig, Dict[ParamKey, Any] | None]:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     kwargs = {}
@@ -1957,6 +1955,8 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
+    *,
+    cfg_container: PretrainConfigContainer,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -1997,7 +1997,14 @@ def setup_model_and_optimizer(
         if args.perform_rl_step:
             update_train_iters(args)
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
+        config = cfg_container.optimizer
+        config_overrides = cfg_container.optimizer_config_override_provider.build_config_overrides(
+            OptimizerConfigOverrideProviderContext(
+                scheduler_config=cfg_container.scheduler,
+                optimizer_config=config,
+                model=model,
+            )
+        )
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
