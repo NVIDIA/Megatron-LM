@@ -943,7 +943,7 @@ def initialize_model_parallel(
         group = create_group(
             gtp_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("ps", nccl_comm_cfgs),
+            pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
             group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
         )
         if rank in gtp_ranks:
