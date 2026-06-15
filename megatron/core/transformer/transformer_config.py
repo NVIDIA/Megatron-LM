@@ -998,7 +998,7 @@ class TransformerConfig(ModelParallelConfig):
 
     batch_invariant_kernel_backend: str = "deepgemm"
     """Backend used by `batch_invariant_mode` for mm / addmm dispatch.
-       - "deepgemm" (default): DeepGEMM `bf16_gemm_nt`. Requires bf16 CUDA
+       - "deepgemm" (default): DeepGEMM `bf16_gemm_nn`. Requires bf16 CUDA
          inputs and DeepGEMM with bf16 bindings (Hopper / Blackwell).
          Bitwise-identical to `torch.mm`.
        - "triton": BIK Triton `matmul_persistent` kernel. Works on any

@@ -36,7 +36,7 @@ try:
         for name in (
             "m_grouped_bf16_gemm_nt_contiguous",
             "k_grouped_bf16_gemm_tn_contiguous",
-            "bf16_gemm_nt",
+            "bf16_gemm_nn",
         )
     )
 except ImportError:
@@ -552,7 +552,7 @@ def deterministic_index_add(
 
 # Kernel backend for mm / addmm. Selected at `enable_batch_invariant_mode` time
 # from `TransformerConfig.batch_invariant_kernel_backend`.
-#   "deepgemm" (default): DeepGEMM `bf16_gemm_nt` — bitwise-identical to
+#   "deepgemm" (default): DeepGEMM `bf16_gemm_nn` — bitwise-identical to
 #       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
 #   "triton": BIK Triton `matmul_persistent` — works on any CUDA device with
 #       bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
@@ -1637,7 +1637,7 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     Args:
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
             "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
-            `bf16_gemm_nt`. "triton" routes through the BIK Triton
+            `bf16_gemm_nn`. "triton" routes through the BIK Triton
             `matmul_persistent` kernel (works for bf16/fp16/fp32 and on
             any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
     """
