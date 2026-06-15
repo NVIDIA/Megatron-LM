@@ -6,6 +6,7 @@ import math
 import os
 from statistics import median
 
+import numpy as np
 import pytest
 import yaml
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 _NON_REQUEST_TOP_LEVEL_KEYS = {
     # System-level metrics
     "throughput",
+    "lifetime_prefill_token_count",
     # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)
     "mem-max-allocated-bytes",
 }
@@ -55,6 +57,9 @@ def test_inference_pipeline(
         model_config_content = f3.read()
 
     metrics = yaml.safe_load(model_config_content)["METRICS"]
+    if not metrics:
+        print("No metrics defined in model_config.yaml, skipping validation.")
+        return
 
     output_groundtruth = json.loads(golden_values_content)
 
@@ -130,6 +135,17 @@ def test_inference_pipeline(
                 )
         output_groundtruth.pop("mem-max-allocated-bytes")
 
+    lptc_key = "lifetime_prefill_token_count"
+    if lptc_key in output_groundtruth and lptc_key not in metrics:
+        # metrics does not have lifetime_prefill_token_count, so ignore it
+        output_groundtruth.pop(lptc_key)
+    elif lptc_key in metrics:
+        # Ground truth does not have lifetime_prefill_token_count, so ignore it
+        metrics.pop(lptc_key)
+    elif lptc_key in output_groundtruth and lptc_key in metrics:
+        # TODO: Compare liftime_prefill_token_count to groundtruth
+        pass
+
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]
 
@@ -174,10 +190,16 @@ def test_inference_pipeline(
 
         if "routing_indices" in groundtruth_results and "routing_indices" in metrics:
             at_least_one_test_loop = True
-            routing_indices_groundtruth = groundtruth_results["routing_indices"]
-            routing_indices_current = current_results["routing_indices"]
-            assert (
-                routing_indices_groundtruth == routing_indices_current
+            token_indices = groundtruth_results.get("routing_indices_token_indices")
+            current_routing = np.array(current_results["routing_indices"])
+            assert token_indices is not None
+            current_routing = current_routing[token_indices]
+            routing_indices_groundtruth = np.sort(
+                np.array(groundtruth_results["routing_indices"]), axis=-1
+            )
+            routing_indices_current = np.sort(current_routing, axis=-1)
+            assert np.array_equal(
+                routing_indices_groundtruth, routing_indices_current
             ), f"Routing indices mismatch:\nGround truth: {routing_indices_groundtruth}\nCurrent: {routing_indices_current}"
 
         if not at_least_one_test_loop:

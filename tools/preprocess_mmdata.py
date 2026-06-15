@@ -101,17 +101,19 @@ def get_args():
                        help='Language to use for NLTK-powered sentence splitting.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='sentencepeice tokenizer model.')
-    group.add_argument('--tokenizer-metadata', type=str, default=None,
+    group.add_argument('--metadata-path', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
-    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
+    group.add_argument('--special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
                        help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
-                       help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument("--pad-vocab-size", action="store_true", default=False,
+                       help='Whether to pad vocab size of the model automatically if padded_vocab_size is not provided.')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,

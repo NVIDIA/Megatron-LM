@@ -1,7 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
+import numpy as np
 import pytest
 import torch
 
@@ -26,6 +30,7 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
     delete_cuda_graphs,
 )
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
@@ -80,6 +85,27 @@ class MockTokenizer:
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
+
+
+class DummyLangModule:
+    def __init__(self, config):
+        self.config = config
+        self.rotary_pos_emb = None
+        self.eval = MagicMock()
+        self.train = MagicMock()
+
+    def modules(self):
+        return iter(())
+
+
+class DummyMoELayer:
+    def __init__(self, use_partial_cudagraphs):
+        self.use_partial_cudagraphs = use_partial_cudagraphs
+        self.transition_calls = []
+
+    def transition_cudagraph_scope(self, mode):
+        self.transition_calls.append(mode)
+        self.use_partial_cudagraphs = mode == "partial"
 
 
 @pytest.fixture
@@ -138,6 +164,73 @@ class TestRLUtils:
         args = validate_args(args)
         set_global_variables(args, False)
         return args
+
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args):
+        interface = MagicMock()
+        interface.resume.return_value = object()
+        interface.suspend.return_value = object()
+        loop = SimpleNamespace(run_until_complete=MagicMock())
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        monkeypatch.setattr(
+            rl_utils,
+            "unwrap_model",
+            lambda model: model.module if hasattr(model, "module") else model,
+        )
+        monkeypatch.setattr(
+            rl_utils, "_maybe_prefetch_separate_inference_model_weights", MagicMock()
+        )
+        monkeypatch.setattr(rl_utils, "set_decode_expert_padding", MagicMock())
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        return interface, loop
+
+    def _make_toggle_cuda_graphs_mock(self):
+        def _toggle(lang_module, set_to):
+            assert set_to in {"none", "local"}, f"Invalid CUDA graph implementation: {set_to}"
+            lang_module.config.cuda_graph_impl = set_to
+
+        return MagicMock(side_effect=_toggle)
+
+    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(self, monkeypatch):
+        config = SimpleNamespace(
+            cuda_graph_impl="none",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+        )
+        lang_module = DummyLangModule(config)
+        model = [SimpleNamespace(config=config, module=lang_module)]
+        args = SimpleNamespace(
+            rl_training_cuda_graphs=False,
+            num_experts=None,
+            curr_iteration=11,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+        )
+        interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
+        monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
+
+        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+            assert result is interface
+            assert config.cuda_graph_impl == "local"
+            assert config.cuda_graph_modules == []
+            assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+        assert toggle_cuda_graphs.call_args_list == [
+            call(lang_module, "local"),
+            call(lang_module, "none"),
+        ]
+        assert config.cuda_graph_impl == "local"
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        lang_module.eval.assert_called_once()
+        lang_module.train.assert_called_once()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -314,6 +407,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=[[1, 2, 3, 4]],
@@ -322,6 +418,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
 
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -340,6 +439,9 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
@@ -348,9 +450,12 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
-        data_iter = rl_utils.prepare_data_for_update(
+        data_iter, _, _ = rl_utils.prepare_data_for_update(
             [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
 
@@ -381,6 +486,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
             trajectory=[[4, 5, 6, 7, tokenizer.eod]] * num_turns,
@@ -389,6 +497,9 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
             trajectory=[[8, 9, tokenizer.eod]] * num_turns,
@@ -397,6 +508,9 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
 
         rollouts = [r1, r2, r3]
@@ -685,7 +799,7 @@ class TestRLUtils:
         """
 
         world_size, dp, tp, pp = initialize_model_parallel
-        micro_batch_size = 2
+        micro_batch_size = 1
         self.create_test_args(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
@@ -865,3 +979,71 @@ class TestRLUtils:
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prep_wandb_metrics(self, initialize_model_parallel):
+        # This tests the computation and makes us fail noisily if
+        # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
+        traj_lens = [[3, 3], [1, 2]]
+        turn_lens = [[1, 2, 1, 1, 1], [1, 2]]
+        rewards = [[1, 1], [-1, 2]]
+        num_turns = [[42, 2], [10, 8]]
+        advantages = [0, 1]
+        # Per-token epoch stamps, grouped by group then rollout
+        policy_epoch = [[[4, 5], [2, 3]], [[5], [0, 1]]]
+        kv_cache_epoch = [[[4, 5], [3, 4]], [[5], [1, 2]]]
+        # Per-turn max epoch stamps (when each turn completed)
+        completed_epochs = [[5, 3], [5, 1]]
+        num_evictions = [[0, 1], [0, 0]]
+        current_iteration = 6
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
+            completed_epochs=completed_epochs,
+            num_evictions=num_evictions,
+            current_iteration=current_iteration,
+        )
+        assert metrics["mean_reward"] == 0.75
+        assert metrics["mean_advantage"] == 0.5
+        assert metrics["nonzero_groups_ratio"] == 0.5
+        assert metrics["max_traj_length"] == 3
+        assert metrics["min_traj_length"] == 1
+        assert metrics["mean_traj_length"] == 2.25
+        assert metrics["mean_traj_length_std"] == 0.25
+        assert metrics["max_turn_length"] == 2
+        assert metrics["min_turn_length"] == 1
+        assert metrics["mean_turn_length"] == 1.35
+        assert np.isclose(metrics["mean_turn_length_std"], 0.45)
+        assert metrics["mean_num_turns"] == 15.5
+        assert metrics["max_num_turns"] == 42
+        assert metrics["min_num_turns"] == 2
+        # true_policy_staleness = [6-4, 6-2, 6-5, 6-0] = [2, 4, 1, 6] -> mean=3.25, max=6, min=1
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 1, 6])
+        assert metrics["max_policy_staleness"] == 6
+        assert metrics["min_policy_staleness"] == 1
+        # true_kv_staleness = [6-4, 6-3, 6-5, 6-1] = [2, 3, 1, 5] -> mean=2.75, max=5, min=1
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 1, 5])
+        assert metrics["max_kv_cache_staleness"] == 5
+        assert metrics["min_kv_cache_staleness"] == 1
+        # last_token (max epoch per rollout): policy=[5, 3, 5, 1] -> staleness=[1, 3, 1, 5]
+        assert metrics["mean_policy_last_token_staleness"] == np.mean([1, 3, 1, 5])
+        assert metrics["max_policy_last_token_staleness"] == 5
+        assert metrics["min_policy_last_token_staleness"] == 1
+        # last_token (max epoch per rollout): kv=[5, 4, 5, 2] -> staleness=[1, 2, 1, 4]
+        assert metrics["mean_kv_cache_last_token_staleness"] == np.mean([1, 2, 1, 4])
+        assert metrics["max_kv_cache_last_token_staleness"] == 4
+        assert metrics["min_kv_cache_last_token_staleness"] == 1
+        assert metrics["total_eviction_count"] == 1
+        assert metrics["max_num_evictions"] == 1
+        # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
+        assert metrics["mean_completion_gap"] == 2.5

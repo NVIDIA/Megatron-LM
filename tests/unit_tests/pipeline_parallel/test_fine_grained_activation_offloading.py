@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -73,7 +73,6 @@ def _build_gpt_model(
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
-            moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
         ),
         vocab_size=vocab_size,
@@ -92,6 +91,19 @@ def _make_gpt_inputs(
         device
     )
     return input_ids, position_ids, attention_mask
+
+
+def _capture_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    params: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        params[name] = p.detach().cpu().clone()
+    return params
+
+
+def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> None:
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            p.copy_(params[name].to(device=p.device, dtype=p.dtype))
 
 
 def _run_one_iter_and_capture(
@@ -114,9 +126,12 @@ def _run_one_iter_and_capture(
     if enable_offload_reset:
         off_interface.reset()
 
-    # for p in model.parameters():
-    #     if p.grad is not None:
-    #         p.grad = None
+    # Keep warmup-created grad buffers resident so the peak-memory check still
+    # compares the steady-state allocator footprint, but remove accumulated
+    # warmup values before capturing correctness grads.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
 
     torch.cuda.reset_peak_memory_stats()
     logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
@@ -200,6 +215,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             is_mla=is_mla,
         ).cuda()
         base_model.train()
+        base_params = _capture_params(base_model)
 
         # Warmup baseline once for allocator stability
         _run_one_iter_and_capture(
@@ -235,6 +251,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
         ).cuda()
+        _restore_params(off_model, base_params)
         off_model.train()
 
         # Warmup 1 iter to populate cached chunks, then reset to finish warmup bookkeeping.
@@ -435,10 +452,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts,
-                    moe_grouped_gemm=True,
-                    moe_use_legacy_grouped_gemm=False,
-                    multi_latent_attention=is_mla,
+                    num_experts=num_experts, moe_grouped_gemm=True, multi_latent_attention=is_mla
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,

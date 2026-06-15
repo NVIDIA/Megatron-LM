@@ -26,12 +26,14 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
         and (bias is None or not bias.requires_grad)
     )
 
-    # If we want to train mixed precision, then the output of this function
-    # should be half precision. However, in AMP O1, the input (residual) is
-    # in fp32, and it will up-cast the result to fp32, causing pipeline parallel
-    # GPU communication to hang. Therefore, we need to cast residual to the same
-    # dtype as x.
-    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
+    # For fp32 residual connections: upcast x (and bias) to residual's dtype so that
+    # the addition and output remain in fp32, preserving numerical precision in the
+    # residual stream across layers. When fp32_residual_connection is enabled,
+    # pipeline parallel communication dtype should be set to fp32 accordingly.
+    if x.dtype != residual.dtype:
+        x = x.to(residual.dtype)
+        if bias is not None:
+            bias = bias.to(residual.dtype)
 
     # The Dropout operation, Residual Addition and the tensor returning can be
     # done generically outside the if statement, but that stops fusing of Bias

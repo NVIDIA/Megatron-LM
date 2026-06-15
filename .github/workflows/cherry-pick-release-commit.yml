@@ -26,5 +26,5 @@ jobs:
       target-branches-pattern: 'core_(*dev_)?r[0-9]+\.[0-9]+\.[0-9]+'
     secrets:
       PAT: ${{ secrets.PAT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}

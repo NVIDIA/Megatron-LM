@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # dist_checkpointing package
 
 A library for saving and loading the distributed checkpoints.
@@ -113,6 +122,48 @@ You can combine formats to optimize both flexibility and performance:
 
    3. Save at least one checkpoint under the new model parallel configuration.
    4. (Optional) To continue the training with updated model parallelism and better checkpointing performance, stop training and switch back to ``dp_reshardable`` format by removing ``--dist-ckpt-optim-fully-reshardable``.
+
+## Async Checkpoint Saving Strategy
+
+The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations. 
+
+We are transitioning to a new async saving implementation based on the **NVRx (NVIDIA Resiliency Extension)** package. The legacy async strategy (referred to as **mcore**) is being deprecated.
+
+### Migration to NVRx
+
+- The **NVRx-based async strategy** will become the **default** in mcore v0.17.
+- The existing **mcore async strategy** is **deprecated** and will be removed in future versions.
+- A deprecation warning is emitted when using the mcore strategy.
+
+### Selecting Async Strategy
+
+`--async-strategy` flag is introduced to control the async strategy. To use legacy async strategy (**mcore**), set:
+
+```bash
+--async-strategy mcore
+```
+
+### NVRx Dependency
+
+To use the NVRx-based async strategy, you must install the `nvidia-resiliency-ext` package.
+
+```bash
+git clone https://github.com/NVIDIA/nvidia-resiliency-ext
+cd nvidia-resiliency-ext
+pip install .
+```
+
+> NOTE
+
+- If `nvidia-resiliency-ext` is not installed, the NVRx async strategy will not be available.
+- The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
+- It is strongly recommended to migrate to the NVRx strategy as soon as possible.
+
+### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
+
+Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
+
+Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
 
 ## Subpackages
 

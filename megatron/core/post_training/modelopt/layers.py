@@ -6,29 +6,23 @@ from typing import TYPE_CHECKING, Callable, List, Optional, cast
 
 import torch
 
-from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.typed_torch import copy_signature
 
 logger = logging.getLogger(__name__)
 
-try:
-    import transformer_engine as te
+if HAVE_TE or TYPE_CHECKING:
+    import transformer_engine as te  # type: ignore[import]
 
-    HAVE_TE = True
-except ImportError:
-    if TYPE_CHECKING:
-        # Unambiguously treat transformer_engine as available during type checking.
-        import transformer_engine as te  # type: ignore[import]
-
-        HAVE_TE = True
-    else:
-        HAVE_TE = False
-
-logger = logging.getLogger(__name__)
+    from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
+else:
+    te = None
+    _get_extra_te_kwargs = None
 
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
@@ -130,6 +124,7 @@ class Linear(torch.nn.Linear):
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,  # Not used
     ):
         self.config = config
         self.tp_group = tp_group
@@ -202,6 +197,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     verbose: bool = False
     real_quant_cfg: str = "None"
 
+    @copy_signature(TransformerLayer.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

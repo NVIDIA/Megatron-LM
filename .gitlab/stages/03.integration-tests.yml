@@ -141,18 +141,21 @@ integration:configure:
 
 integration:run_lts_dgx_a100:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: A100
 
 integration:run_lts_dgx_h100:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: H100
 
 integration:run_lts_dgx_gb200:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: GB200

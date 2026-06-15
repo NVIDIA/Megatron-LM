@@ -1,5 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
+import os
 from unittest import mock
 
 import pytest
@@ -16,20 +18,31 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    _build_head_perm_for_split_sections,
+    _build_thd_cp_a2a_perm,
+    tensor_a2a_cp2hp,
+    tensor_a2a_hp2cp,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
+from tests.unit_tests.transformer.test_multi_latent_attention import (
+    make_test_packed_seq_params,
+    make_test_packed_seq_params_with_padding,
+)
 
 try:
     import fla
@@ -38,15 +51,26 @@ try:
 except ImportError:
     HAVE_FLA = False
 
+# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
+# NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
+os.environ.update({"NCCL_NVLS_ENABLE": "0"})
+
+
+def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
+    unpacked_x = []
+    cu_seqlens_list = cu_seqlens.tolist()
+    num_seqs = len(cu_seqlens_list) - 1
+    for i in range(num_seqs):
+        idx_start = cu_seqlens_list[i]
+        idx_end = cu_seqlens_list[i + 1]
+        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
+        unpacked_x.append(x[tuple(chunked_index)])
+    return unpacked_x
+
 
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
-    [
-        (1, False, 1),
-        (2, False, 1),
-        (2, True, 1),
-        # GDN does not support CP for now. Leave it for future work.
-    ],
+    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
@@ -70,19 +94,20 @@ class TestGatedDeltaNet:
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
-        # Initialize model
+        # Initialize model, with the same config as Qwen Next except `num_layers`
         self.transformer_config = TransformerConfig(
-            hidden_size=256,
-            linear_conv_kernel_dim=2,
-            linear_key_head_dim=64,
-            linear_value_head_dim=64,
-            linear_num_key_heads=4,
-            linear_num_value_heads=8,
+            hidden_size=2048,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
             num_layers=1,
             normalization="RMSNorm",
             use_cpu_initialization=True,
             layernorm_zero_centered_gamma=True,
-            num_attention_heads=8,
+            num_attention_heads=16,
+            num_query_groups=2,
             activation_func=F.silu,
             bf16=True,
             tensor_model_parallel_size=tp_size,
@@ -141,58 +166,310 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_selective_recompute_norm_out(self):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
+        def build_gdn(config):
+            gdn_submodules = get_experimental_attention_variant_module_spec(
+                config=config
+            ).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hidden_states):
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            input_grad = hidden_states.grad.detach().clone()
+            return output.detach(), grads, input_grad
+
+        micro_batch_size = 2
+        seq_length = 64
+        base_config = copy.deepcopy(self.transformer_config)
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_norm_out"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline (no recompute) ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_norm_out is False
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        hidden_states.grad = None
+        assert base_gdn.norm_out_checkpoint is None
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        # --- Recompute ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_norm_out is True
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+        assert rec_gdn.norm_out_checkpoint is not None
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
+
+    def test_jit_compiled_helpers(self):
+        import torch._dynamo
+
+        gdn = self.gdn
+        batch = 2
+        seq_len = 16
+
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
+        qkv = torch.randn(
+            batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        gate = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            gdn.value_head_dim,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        beta = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        alpha = torch.randn(
+            batch,
+            seq_len,
+            num_v_heads_local,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        # Disable dynamo so coverage.py can trace through the method bodies,
+        # which are normally wrapped by @jit_fuser (torch.compile).
+        with torch._dynamo.config.patch(disable=True):
+            query, key, value, gate_out, beta_out, alpha_out = (
+                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+            )
+
+        assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+        assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+        assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
+        assert query.is_contiguous()
+        assert key.is_contiguous()
+        assert value.is_contiguous()
+
+        A_log_mock = torch.randn(
+            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        dt_bias_mock = torch.randn(
+            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+
+        with torch._dynamo.config.patch(disable=True):
+            g, beta_sig = gdn._compute_g_and_beta(A_log_mock, dt_bias_mock, alpha, beta)
+
+        assert g.dtype == torch.float32
+        assert g.shape == alpha.shape
+        assert beta_sig.shape == beta.shape
+
+    def test_gpu_forward_thd_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
+
+        atol, rtol = 3e-4, 3e-4
+
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
+        )
+        attention_mask_sbhd = None
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask_thd = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+
+        # THD format
+        output_thd, _ = self.gdn(
+            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+        )
+        # SBHD format
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
+        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
+
+        rank = torch.distributed.get_rank()
+        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
+        assert output_thd.shape[1] == 1
+        assert output_thd.shape[2] == self.gdn.config.hidden_size
+        torch.testing.assert_close(
+            output_sbhd_T,
+            output_thd,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
+        )
+
+    def test_gpu_forward_thd_padding_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
+
+        atol, rtol = 3e-4, 3e-4
+        sequence_length = 32
+        micro_batch_size = 4
+
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, None)
+
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        output_bshd = output_sbhd.transpose(0, 1).contiguous()
+
+        rank = torch.distributed.get_rank()
+
+        # A) padded branch: prefer *_padded when available.
+        padded_params = make_test_packed_seq_params_with_padding(
+            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
+        )
+        output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
+        output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
+        torch.testing.assert_close(
+            output_bshd[:, :30, :],
+            output_thd2bshd[:, :30, :],
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"THD padded output mismatch ({rank=}): {msg}",
+        )
+
+        # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
+        no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        output_thd_no_padding, _ = self.gdn(
+            hidden_states_thd, None, packed_seq_params=no_padding_params
+        )
+        assert output_thd_no_padding.shape == output_thd_padded.shape
+
+        # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
+        padded_mismatch_params = make_test_packed_seq_params_with_padding(
+            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
+        )
+        with pytest.raises(ValueError, match="does not match"):
+            self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
+
+        # D) actual mismatch branch without *_padded: should raise.
+        actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        with pytest.raises(ValueError, match="does not match"):
+            self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+class TestGDNCuSeqlensResolve:
+
+    @pytest.fixture
+    def mock_gdn(self):
+        class MockGDN:
+            _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
+
+        return MockGDN()
+
+    def test_padded_preferred_when_available(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        padded = torch.tensor([0, 504, 1008], dtype=torch.int32)
+        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
+        assert torch.equal(result, padded)
+
+    def test_actual_used_when_no_padding(self, mock_gdn):
+        actual = torch.tensor([0, 504, 1008], dtype=torch.int32)
+        result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
+        assert torch.equal(result, actual)
+
+    def test_raises_when_padding_mismatch(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        with pytest.raises(ValueError, match="does not match"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_raises_when_padded_mismatches_total(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        padded = torch.tensor([0, 504, 1004], dtype=torch.int32)
+        with pytest.raises(ValueError, match="does not match"):
+            mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_raises_when_not_divisible_by_cp_size(self, mock_gdn):
+        actual = torch.tensor([0, 505, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match="must be divisible by cp_size"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_cp1_still_validates_total(self, mock_gdn):
+        mock_gdn.cp_size = 1
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        with pytest.raises(ValueError, match="does not match"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+
+@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
         (4, False, 1),  # TP w/o SP
         (4, True, 1),  # TP w/ SP
-        # CP does not support GDN for now. Add it once it is supported.
+        (1, False, 2),  # CP
+        (2, False, 2),  # TP w/o SP + CP
+        (2, True, 2),  # TP w/ SP + CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
-    # Constants
-    seed = 123
-    sequence_length = 256
-    micro_batch_size = 4
-    hidden_size = 128
-
-    # Model initialization function
-    def initialize_gpt_model(
-        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
-    ):
-        layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
-            config=config, vp_stage=None, pp_rank=None
-        )
-        gpt_model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=128,
-            max_sequence_length=sequence_length,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-            pg_collection=pg_collection,
-        )
-        return gpt_model
-
-    # Initialize baseline parallel state
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
-    )
-
-    # Initialize input hidden states
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
-    input_hidden_states = (
-        torch.rand((sequence_length, micro_batch_size, hidden_size))
-        .cuda()
-        .bfloat16()
-        .requires_grad_(True)
-    )
-
-    # Initialize transformer config
+def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -212,118 +489,196 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         transformer_impl="transformer_engine",
     )
 
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_gdn', sync=True) as ckpt_dir:
-        # Set argument
-        mock_args = parse_args(ignore_unknown_args=True)
-        set_args(mock_args)
+    transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config=transformer_config, vp_stage=None, pp_rank=0
+    )
 
-        # Initialize baseline model
-        init_basic_mock_args(mock_args, 1, 1, bf16=True)
-        mock_args.context_parallel_size = 1
-        mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
+    if cp:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 5e-4, 5e-4
 
-        # Initialize args and save checkpoint
-        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
-        mock_args.no_save_optim = True
-        mock_args.no_save_rng = True
-        mock_args.no_load_optim = True
-        mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0)
+    _test_parallel_attention_correctness(
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
+        micro_batch_size=4,
+        sequence_packing=sequence_packing,
+    )
 
-        # Calculate baseline output
-        attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_baseline, bias_hidden_states_baseline = attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_baseline.sum().backward()
 
-        # Save baseline output
-        input_grad_baseline = input_hidden_states.grad.detach()
-        output_hidden_states_baseline = output_hidden_states_baseline.detach()
+@pytest.mark.parametrize("cp_size", [2, 4], scope="class")
+@pytest.mark.internal
+class TestFusedThdAllToAll:
+    """Verify fused 1 AllToAll + permute matches the per-sequence, per-channel loop in GDN."""
 
-        # Initialize parallel model
-        Utils.destroy_model_parallel()
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request, cp_size):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
         )
-        torch.manual_seed(seed)
-        model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
-        transformer_config.tensor_model_parallel_size = tp
-        transformer_config.sequence_parallel = sp
-        init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
-        mock_args.sequence_parallel = sp
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.embd = parallel_state.get_embedding_group()
-        gpt_model = unwrap_model(
-            get_model(initialize_gpt_model, config=transformer_config, pg_collection=pg_collection)
-        )
-        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None)
-
-        # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-        def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
-            if tp > 1 and sp:
-                sp_seg = sequence_length // tp // cp
-                tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
-            return tensor
-
-        # Calculate parallel model output
-        input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
-        input_hidden_states = input_hidden_states.detach().requires_grad_(True)
-        parallel_attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_parallel.sum().backward()
-        input_grad_parallel = input_hidden_states.grad.detach()
-
-        # Check if the output is the same
-        if cp:
-            atol, rtol = 5e-3, 5e-3
-        else:
-            atol, rtol = 5e-4, 5e-4
-        output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
-        input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
-
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
-        assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
-        assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
-
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
-
+        model_parallel_cuda_manual_seed(123)
+        # Attach on the class so every test method can read self.cp_*.
+        request.cls.cp_size = cp_size
+        request.cls.cp_group = parallel_state.get_context_parallel_group()
+        yield
         Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _per_seq_a2a_cp2hp(local_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        unpacked = _unpack_sequence(local_t, cu_seqlens // cp_size, dim=0)
+        outputs = []
+        for x in unpacked:
+            outputs.append(
+                tensor_a2a_cp2hp(
+                    x,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group,
+                    split_sections=split_sections,
+                    undo_attention_load_balancing=True,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _per_seq_a2a_hp2cp(global_t, cu_seqlens, cp_group, split_sections=None):
+        unpacked = _unpack_sequence(global_t, cu_seqlens, dim=0)
+        outputs = []
+        for x in unpacked:
+            outputs.append(
+                tensor_a2a_hp2cp(
+                    x,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group,
+                    split_sections=split_sections,
+                    redo_attention_load_balancing=True,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    # ---- Optimized: single a2a + production permutation helper ----
+
+    @staticmethod
+    def _batched_a2a_cp2hp(local_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        t_global = int(cu_seqlens[-1].item())
+        if split_sections is not None and cp_size > 1:
+            head_perm = _build_head_perm_for_split_sections(split_sections, cp_size, local_t.device)
+            local_t = local_t.index_select(-1, head_perm)
+        naive = tensor_a2a_cp2hp(
+            local_t,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            split_sections=None,  # always single fused a2a
+            undo_attention_load_balancing=False,
+        )
+        idx, _ = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global)
+        return naive.index_select(0, idx)
+
+    @staticmethod
+    def _batched_a2a_hp2cp(global_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        t_global = int(cu_seqlens[-1].item())
+        _, inv = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global)
+        permuted = global_t.index_select(0, inv)
+        return tensor_a2a_hp2cp(
+            permuted,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            split_sections=split_sections,
+            redo_attention_load_balancing=False,
+        )
+
+    @pytest.mark.parametrize(
+        "cu_seqlens",
+        [
+            (0, 32, 64),  # 2 equal sequences
+            (0, 32, 64, 96, 128),  # 4 equal sequences (matches existing THD test)
+            (0, 16, 48, 80),  # 3 unequal sequences
+        ],
+    )
+    @pytest.mark.parametrize("split_sections", [(8, 8, 4, 16, 32, 4)])
+    def test_cp2hp_batched_matches_per_seq(self, cu_seqlens, split_sections):
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if (torch.diff(cu) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        T_local = T_global // self.cp_size
+        hidden = sum(split_sections)
+        torch.manual_seed(42)
+        local_t = (
+            torch.rand(T_local, 1, hidden, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        out_ref = self._per_seq_a2a_cp2hp(local_t, cu, self.cp_group, split_sections=split_sections)
+        out_fused = self._batched_a2a_cp2hp(
+            local_t, cu, self.cp_group, split_sections=split_sections
+        )
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(out_fused, out_ref), (
+            f"Batched CP->HP mismatch on rank={rank} " f"(split_sections={split_sections})"
+        )
+
+    @pytest.mark.parametrize("cu_seqlens", [(0, 32, 64), (0, 32, 64, 96, 128), (0, 16, 48, 80)])
+    def test_hp2cp_batched_matches_per_seq(self, cu_seqlens):
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        hidden = 32
+        # Hidden must be divisible by cp_size for the HP-sharded input layout.
+        assert hidden % self.cp_size == 0
+        h_local = hidden // self.cp_size
+        torch.manual_seed(42)
+        global_t = (
+            torch.rand(T_global, 1, h_local, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        out_ref = self._per_seq_a2a_hp2cp(global_t, cu, self.cp_group)
+        out_fused = self._batched_a2a_hp2cp(global_t, cu, self.cp_group)
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(out_fused, out_ref), f"Batched HP->CP mismatch on rank={rank}"
+
+    @pytest.mark.parametrize("cu_seqlens", [(0, 32, 64, 96, 128)])
+    def test_cp2hp_hp2cp_round_trip(self, cu_seqlens):
+        """cp2hp followed by hp2cp on the batched path should be the identity."""
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        T_local = T_global // self.cp_size
+        hidden = 32
+        torch.manual_seed(7)
+        local_t = (
+            torch.rand(T_local, 1, hidden, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        mid = self._batched_a2a_cp2hp(local_t, cu, self.cp_group)
+        back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
+
+        assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"

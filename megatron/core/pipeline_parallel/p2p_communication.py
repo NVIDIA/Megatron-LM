@@ -12,6 +12,7 @@ except ImportError:
     from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
 
 # Types
@@ -166,6 +167,26 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
+
+    @property
+    def is_pp_first_stage(self) -> bool:
+        """Return True if pp first stage."""
+        return is_pp_first_stage(self.pp_group)
+
+    @property
+    def is_pp_last_stage(self) -> bool:
+        """Return True if pp last stage."""
+        return is_pp_last_stage(self.pp_group)
+
+    @property
+    def total_stages(self) -> int:
+        """Return total number of pipeline stages."""
+        return self.pp_group.size()
+
+    @property
+    def current_stage(self) -> int:
+        """Return current pipeline stage index (0-indexed)."""
+        return self.pp_group.rank()
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
