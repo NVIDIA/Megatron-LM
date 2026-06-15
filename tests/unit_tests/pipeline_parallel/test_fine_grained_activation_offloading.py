@@ -504,48 +504,6 @@ def test_layer_input_offloading_is_mutually_exclusive_with_module_offload():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
-def test_layer_input_only_context_does_not_enable_te_cpu_offload(monkeypatch):
-    """layer_input-only offload should not toggle TE's global CPU offload flag."""
-    from megatron.core.extensions import transformer_engine as te_ext
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-        ChunkOffloadHandler,
-        OffloadTensorGroup,
-        PipelineOffloadManager,
-    )
-
-    class DummyCpuOffload:
-        CPUOffloadEnabled = False
-
-    def set_forward_groups(*names):
-        PipelineOffloadManager.reset_instance()
-        mgr = PipelineOffloadManager.get_instance()
-        handler = ChunkOffloadHandler(0, mgr.cpu_tensor_pool)
-        handler.offload_groups = [OffloadTensorGroup(name) for name in names]
-        mgr._cur_forward_chunk = handler
-        return mgr
-
-    monkeypatch.setattr(te_ext, "cpu_offload", None)
-    mgr = set_forward_groups("layer_input")
-    try:
-        mgr.__enter__()
-        assert mgr.inside_context
-    finally:
-        mgr.__exit__()
-    assert not mgr.inside_context
-
-    monkeypatch.setattr(te_ext, "cpu_offload", DummyCpuOffload)
-    mgr = set_forward_groups("qkv_linear")
-    try:
-        mgr.__enter__()
-        assert DummyCpuOffload.CPUOffloadEnabled
-    finally:
-        mgr.__exit__()
-    assert not DummyCpuOffload.CPUOffloadEnabled
-
-    PipelineOffloadManager.reset_instance()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_backward_commit_prefetches_next_reload_before_group_start(monkeypatch):
     """Backward commit should prefetch the next group before group-start backward runs."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (

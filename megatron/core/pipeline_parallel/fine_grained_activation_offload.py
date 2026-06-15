@@ -785,19 +785,17 @@ class PipelineOffloadManager:
         if tensor is not None:
             tensor._do_not_offload = True
 
-    def __enter__(self):
+    def __enter__(self, name: Optional[str] = None):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
         cur_forward_chunk = self.cur_forward_chunk()
         if cur_forward_chunk is None or not cur_forward_chunk.do_offload:
             return
 
-        # Only TE-backed FGAO groups need CPUOffloadEnabled so TE ops mark their
-        # saved activations. layer_input uses PyTorch saved-tensor hooks around
-        # full-recompute checkpoint inputs; turning on the TE flag for
-        # layer_input-only chunks makes TE ops (e.g. GroupedLinear) disable bulk
-        # allocation without providing any offload benefit.
-        enable_te_cpu_offload = cur_forward_chunk.has_transformer_engine_activation_offload_group()
+        # layer_input offloads checkpoint inputs through PyTorch saved-tensor hooks,
+        # not TE activation markers. Keep TE's global flag off for that mode so TE
+        # ops such as GroupedLinear keep bulk allocation enabled.
+        enable_te_cpu_offload = name != "layer_input"
         if enable_te_cpu_offload:
             from megatron.core.extensions.transformer_engine import cpu_offload
 
@@ -939,10 +937,6 @@ class ChunkOffloadHandler:
         if name is not None:
             return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
-
-    def has_transformer_engine_activation_offload_group(self) -> bool:
-        """Return whether this chunk has groups that require TE activation-offload markers."""
-        return any(group._name != "layer_input" for group in self.offload_groups)
 
     def finish_all_groups(self, name=None) -> bool:
         """Finish all groups."""
@@ -1409,7 +1403,7 @@ class FineGrainedActivationOffloadingInterface:
             self.tensor = fine_grained_offloading_group_start(
                 self.tensor, self.name, self.max_offloaded_tensors
             )
-            PipelineOffloadManager.get_instance().__enter__()
+            PipelineOffloadManager.get_instance().__enter__(self.name)
         return self.tensor
 
     def __exit__(self, *args: Any):
