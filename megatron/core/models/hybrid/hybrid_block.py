@@ -26,6 +26,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
@@ -175,17 +176,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         if self._inner_is_partial_moe_capture():
             hidden_states = args[0] if args else kwargs["hidden_states"]
-            aggregated, h_res, h_post = self.hyper_connection(hidden_states)
+            aggregated, h_res, h_post, residual = self.hyper_connection(hidden_states)
             inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated))
             # inner_out = router/preprocess intermediates ending in the inner residual;
-            # append the mHC state AND the n-stream residual. Routing `residual` through
-            # the graph as an output (rather than reusing args[0] directly in the eager BDA)
-            # mirrors HyperConnectionTransformerLayer: it keeps the residual's backward grad
-            # flowing into the graph's backward, instead of creating a second autograd path
-            # on the graph INPUT (args[0]) that the captured backward does not account for.
-            # The experts' raw mlp_output_with_bias (produced on replay) is the layer delta,
-            # so `aggregated` need not be captured.
-            return tuple(inner_out) + (h_post, h_res, hidden_states)
+            # append the mHC state AND the n-stream `residual` returned by the (graphed)
+            # hyper_connection. Routing `residual` through the graph as an output keeps its
+            # backward grad flowing into the graph's backward (mirrors
+            # HyperConnectionTransformerLayer), instead of a second autograd path the captured
+            # backward does not account for. The experts' raw mlp_output_with_bias (produced
+            # on replay) is the layer delta, so `aggregated` need not be captured.
+            return tuple(inner_out) + (h_post, h_res, residual)
 
         hidden_states, context = self.forward(*args, **kwargs)
         cuda_graph_outputs = [hidden_states]
