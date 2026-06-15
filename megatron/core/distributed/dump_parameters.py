@@ -82,10 +82,10 @@ def _dump_param(p: DTensor) -> dict[str, Any]:
         "local_shape": tuple(int(s) for s in local.shape),
         "mesh_shape": tuple(int(s) for s in mesh.shape),
         "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
-        # Global rank IDs that form this param's mesh, nested per mesh_shape.
+        # Global rank IDs that form this param's mesh, flat in row-major order.
         # Lets consumers identify exactly which devices participate (e.g., for
-        # a (2,) EP-pair mesh, [r_A, r_B]).
-        "mesh_ranks": mesh.mesh.tolist(),
+        # a (2,) EP-pair mesh, [r_A, r_B]). ``mesh_shape`` gives the reshape.
+        "mesh_ranks": mesh.mesh.flatten().tolist(),
         "placements": [repr(pl) for pl in p.placements],
     }
 
