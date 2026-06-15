@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import sys
+import types
+
 import prepare_jet_sqsh_image
 import recipe_parser
 
@@ -67,16 +70,63 @@ def test_resolve_local_image_prepare_cluster_uses_same_site_cpu_cluster():
     assert recipe_parser.resolve_local_image_prepare_cluster("cpu_coreweave") == "cpu_coreweave"
 
 
-def test_prepare_workload_uses_build_and_image_source():
+def test_prepare_workload_uses_image_source_without_build():
     workload = prepare_jet_sqsh_image.build_prepare_workload(
-        build="mcore-pyt-dev",
         source_image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345",
         local_path="/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh",
         time_limit=1800,
     )
 
     spec = workload["spec"]
-    assert spec["build"] == "mcore-pyt-dev"
+    assert "build" not in spec
     assert spec["image_source"] == {
+        "image_tag": "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
+    }
+
+
+def test_submit_prepare_workload_passes_raw_image_source_workload(monkeypatch):
+    captured = {}
+
+    class FakePipeline:
+        jet_id = 123
+
+        def get_status(self):
+            return "success"
+
+    class FakeWorkloads:
+        def submit(self, **kwargs):
+            captured.update(kwargs)
+            return FakePipeline()
+
+    class FakeJETClient:
+        def __init__(self, **kwargs):
+            self.workloads = FakeWorkloads()
+
+    fake_pipeline_module = types.SimpleNamespace(PipelineStatus=types.SimpleNamespace(SUBMISSION_FAILED="failed"))
+    fake_jetclient = types.SimpleNamespace(
+        JETClient=FakeJETClient,
+        clients=types.SimpleNamespace(gitlab=types.SimpleNamespace(GitlabAPIError=Exception)),
+        facades=types.SimpleNamespace(
+            objects=types.SimpleNamespace(util=types.SimpleNamespace(WaitTimeExceeded=Exception))
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "jetclient", fake_jetclient)
+    monkeypatch.setitem(sys.modules, "jetclient.services", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "jetclient.services.dtos", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "jetclient.services.dtos.pipeline", fake_pipeline_module)
+
+    pipeline = prepare_jet_sqsh_image.submit_prepare_workload(
+        source_image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345",
+        local_path="/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh",
+        cluster="cpu_coreweave",
+        account="coreai_dlalgo_ci",
+        partition=None,
+        time_limit=1800,
+    )
+
+    assert pipeline.jet_id == 123
+    workload = captured["workloads"][0]
+    assert "build" not in workload["spec"]
+    assert workload["spec"]["image_source"] == {
         "image_tag": "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
     }
