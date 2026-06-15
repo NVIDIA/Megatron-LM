@@ -545,13 +545,19 @@ def model_parallel_cuda_manual_seed(
     initialized. Also, no torch.cuda.manual_seed should be called
     after this function. Basically, this is replacement for that
     function.
-    Three set of RNG states are tracked:
+    Five set of RNG states are tracked:
     default state: This is for data parallelism and is the same among a set of model parallel GPUs
     but different across different model parallel groups. This is used for example for dropout
     in the non-tensor-model-parallel regions.
     tensor-model-parallel state: This state is different among a set of model parallel GPUs,
     but the same across data parallel groups. This is used for example for dropout
     in model parallel regions.
+    context-parallel state: This state is different among a set of context parallel GPUs,
+    but the same across context-data parallel groups. This is used for example for dropout
+    in context parallel regions.
+    tensor-and-context-parallel state: This state is different among a set of tensor and context
+    parallel GPUs, but the same across the remaining data parallel groups. This is used for
+    example for dropout in regions that span both tensor and context parallelism.
     expert-parallel-seed: This state is only used for the expert layer of MoE models.
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
@@ -608,7 +614,7 @@ def model_parallel_cuda_manual_seed(
     )
 
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
-    _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
+    rng_tracker.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
