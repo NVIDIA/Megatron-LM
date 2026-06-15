@@ -895,16 +895,13 @@ class TestCanonicalShardedStateDict:
     def _keys(self, sharded_state_dict):
         return {v.key for v in sharded_state_dict.values()}
 
-    def _run_hybrid_stack_sharded_state_dict(
-        self, layer_type_list, layers, physical_offset=0, sub_layer_offset=0
-    ):
+    def _run_hybrid_stack_sharded_state_dict(self, layer_type_list, layers, sub_layer_offset=0):
         from megatron.core.models.hybrid.hybrid_block import HybridStack
 
         stack = object.__new__(HybridStack)
         torch.nn.Module.__init__(stack)
         stack.layer_type_list = layer_type_list
         stack.layers = torch.nn.ModuleList(layers)
-        stack.physical_layer_offset = physical_offset
         stack.sub_layer_offset = sub_layer_offset
         stack.tp_group = None
         return HybridStack.sharded_state_dict(stack)
@@ -944,9 +941,7 @@ class TestCanonicalShardedStateDict:
         fused = self._fake_numbered_layer(
             5, ["self_attention.in_proj.weight", "mlp.linear_fc1.weight"]
         )
-        state_dict = self._run_hybrid_stack_sharded_state_dict(
-            ["M-"], [fused], physical_offset=4, sub_layer_offset=7
-        )
+        state_dict = self._run_hybrid_stack_sharded_state_dict(["M-"], [fused], sub_layer_offset=7)
         assert self._keys(state_dict) == {
             "layers.7.mixer.in_proj.weight",
             "layers.8.mlp.linear_fc1.weight",
@@ -962,9 +957,7 @@ class TestCanonicalShardedStateDict:
                 "mlp.linear_fc1.weight",
             ],
         )
-        state_dict = self._run_hybrid_stack_sharded_state_dict(
-            ["M-"], [fused], physical_offset=2, sub_layer_offset=4
-        )
+        state_dict = self._run_hybrid_stack_sharded_state_dict(["M-"], [fused], sub_layer_offset=4)
         assert self._keys(state_dict) == {
             "layers.4.norm.weight",
             "layers.4.mixer.in_proj.weight",
