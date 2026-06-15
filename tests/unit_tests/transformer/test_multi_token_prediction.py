@@ -223,6 +223,7 @@ class TestMultiTokenPredictionLayer:
             self,
             hidden_states,
             decoder_input,
+            input_ids=None,
             attention_mask=None,
             padding_mask=None,
             context=None,
