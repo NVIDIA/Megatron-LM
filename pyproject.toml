@@ -202,7 +202,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b84005"
+version = "2.16.0+4220403e"
 requires-dist = [
     # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
     # RunnablePassthrough() instantiation, which is imported transitively in
