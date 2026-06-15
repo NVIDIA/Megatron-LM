@@ -1,0 +1,242 @@
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile: |
+    # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+    # IMAGE_NAME: dsv4-gb200-torch2604
+    #
+    # DeepSeek-V4 training container for GB200 (arm64).
+    #
+
+    FROM nvcr.io/nvidia/pytorch:26.04-py3 AS base
+
+    ENV SHELL=/bin/bash
+
+    # System packages + yq
+    RUN bash -ex <<"EOF"
+        rm -rf /opt/megatron-lm
+        apt-get update
+        apt-get install -y --no-install-recommends \
+            sudo gdb bash-builtins git zsh autojump tmux curl gettext libfabric-dev
+        wget https://github.com/mikefarah/yq/releases/download/v4.27.5/yq_linux_arm64 -O /usr/bin/yq
+        chmod +x /usr/bin/yq
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    EOF
+
+    # Python deps (mcore + dev + test + one-logger + cutlass-dsl pin)
+    RUN unset PIP_CONSTRAINT && pip install --no-cache-dir \
+        debugpy dm-tree torch_tb_profiler einops wandb \
+        sentencepiece tokenizers transformers==4.57.1 torchvision ftfy modelcards datasets tqdm pydantic omegaconf \
+        nvidia-pytriton py-spy yapf darker \
+        tiktoken flask-restful \
+        nltk wrapt pytest pytest_asyncio pytest-cov pytest_mock pytest-random-order \
+        black==24.4.2 isort==5.13.2 flake8==7.1.0 pylint==3.2.6 coverage mypy \
+        one-logger --index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple \
+        setuptools==69.5.1 nvidia-cutlass-dsl==4.5.2
+
+    # TransformerEngine pinned to release_v2.9-based commit with CPU/quantization fixes
+    ARG TE_COMMIT="3bca93857a9103ee7869d57c464936547573860a"
+    RUN pip install --no-cache-dir flash-attn-4==4.0.0b4 nvidia-mathdx==25.1.1 && \
+        unset PIP_CONSTRAINT && \
+        NVTE_CUDA_ARCHS="100a;103a" NVTE_BUILD_THREADS_PER_JOB=8 NVTE_FRAMEWORK=pytorch \
+        pip install --no-build-isolation --no-cache-dir \
+        "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
+
+    # HybridEP
+    WORKDIR /home/
+    RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git && \
+        cd DeepEP && git checkout 1b8f467965bb818bf2f6511e06993f5607e1721f && \
+        TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
+
+    # Fast Hadamard Transform (used by DSA indexer)
+    WORKDIR /home/
+    RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git && \
+        cd fast-hadamard-transform && \
+        pip install --no-build-isolation .
+
+    # Emerging-Optimizers (Muon)
+    WORKDIR /home/
+    RUN git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git && \
+        cd Emerging-Optimizers && \
+        pip install --no-build-isolation .
+
+    # FlashMLA (DSA kernels)
+    WORKDIR /opt/
+    RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
+        cd FlashMLA && \
+        FLASH_MLA_DISABLE_SM90=1 \
+        NVCC_THREADS=16 \
+        CFLAGS="-I/usr/local/cuda/include/cccl" \
+        CXXFLAGS="-I/usr/local/cuda/include/cccl" \
+        pip install --no-build-isolation .
+
+    # cudnn_frontend
+    RUN pip install apache-tvm-ffi && \
+        pip install --force-reinstall --no-deps --no-build-isolation git+https://github.com/NVIDIA/cudnn-frontend.git && \
+        pip install --force-reinstall 'nvidia-cutlass-dsl[cu13]==4.5.2'
+
+    RUN unset PIP_CONSTRAINT && \
+        pip install --no-cache-dir nvidia-resiliency-ext==0.6.0
+
+    # Cleanup
+    RUN rm -rf /root/.cache /tmp/*
+    WORKDIR /home/
+
+ENV_VARS:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True
+  NCCL_NVLS_ENABLE: '0'
+  NVTE_FUSED_ATTN: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  PYTHONWARNINGS: ignore
+  NCCL_DEBUG: VERSION
+  NCCL_GRAPH_REGISTER: '0'
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+  NVTE_CPU_OFFLOAD_V1: '1'
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+  NUM_OF_STAGES_DISPATCH_API: '10'
+  NUM_OF_IN_FLIGHT_S2G_DISPATCH_API: '8'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: unsloth/DeepSeek-V3
+  num_layers: 43
+  hidden_size: 4096
+  num_attention_heads: 64
+  kv_channels: 512
+  max_position_embeddings: 4096
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  swiglu: true
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  position_embedding_type: rope
+  rotary_base: 10000
+  make_vocab_size_divisible_by: 3232
+  multi_latent_attention: true
+  q_lora_rank: 1024
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 512
+  rotary_scaling_factor: 4
+  mscale: 1.0
+  mscale_all_dim: 1.0
+  qk_layernorm: true
+  o_groups: 8
+  o_lora_rank: 1024
+  original_max_position_embeddings: 65536
+  experimental_attention_variant: dsv4_hybrid
+  csa_window_size: 128
+  csa_compress_ratios: ([0,0,4]+[128,4]*20+[0])
+  csa_compress_rotary_base: 40000
+  dsa_indexer_n_heads: 64
+  dsa_indexer_head_dim: 128
+  dsa_indexer_topk: 512
+  dsa_indexer_loss_coeff: 1e-2
+  dsa_indexer_use_sparse_loss: true
+  num_experts: 256
+  moe_n_hash_layers: 3
+  moe_ffn_hidden_size: 2048
+  moe_shared_expert_intermediate_size: 2048
+  moe_router_load_balancing_type: seq_aux_loss
+  moe_router_topk: 6
+  moe_aux_loss_coeff: 1e-4
+  moe_router_topk_scaling_factor: 1.5
+  moe_router_score_function: sqrtsoftplus
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: 1e-3
+  activation_func_clamp_value: 10.0
+  enable_hyper_connections: true
+  num_residual_streams: 4
+  mhc_sinkhorn_iterations: 20
+  use_fused_mhc: true
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  mock_data: true
+  seq_length: 4096
+  moe_router_force_load_balancing: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 64
+  context_parallel_size: 1
+  expert_tensor_parallel_size: 1
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  recompute_granularity: selective
+  recompute_modules:
+  - mla_up_proj
+  use_transformer_engine_op_fuser: true
+  moe_mlp_glu_interleave_size: 32
+  moe_paged_stash: true
+  moe_paged_stash_page_size: 64
+  moe_paged_stash_buffer_size_factor_cuda: 1.2
+  moe_paged_stash_buffer_size_factor_cpu: 0.0
+  moe_pad_experts_for_cuda_graph_inference: true
+  moe_expert_rank_capacity_factor: 1.5
+  cuda_graph_impl: local
+  cuda_graph_scope: full_iteration
+  use_mcore_models: true
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  micro_batch_size: 1
+  global_batch_size: 2048
+  train_samples: 585937500
+  exit_duration_in_mins: 220
+  no_save_optim: true
+  no_check_for_nan_in_loss_and_grad: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  no_create_attention_mask_in_dataloader: true
+  manual_gc: true
+  manual_gc_interval: 10
+  lr: 3.9e-06
+  min_lr: 3.9e-07
+  lr_warmup_init: 3.9e-07
+  lr_decay_style: cosine
+  lr_decay_samples: 584765624
+  lr_warmup_samples: 1536000
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  bf16: true
+  fp8_recipe: mxfp8
+  fp8_format: e4m3
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: fp32
+  main_params_dtype: fp32
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+  moe_router_padding_for_quantization: true
+  init_method_std: 0.02
+  eval_iters: 32
+  eval_interval: 200
+  finetune: false
+  no_load_optim: true
+  no_load_rng: true
+  auto_detect_ckpt_format: true
+  load: ${LOAD_PATH}
+  save_interval: 500
+  dist_ckpt_strictness: log_all
+  log_throughput: true
+  log_interval: 1
+  logging_level: 20
+  log_timers_to_tensorboard: true
+  log_memory_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  tensorboard_dir: ${OUTPUT_PATH}/tensorboard
+  wandb_exp_name: DeepSeek-V4-Flash-GB200-MXFP8-TP1PP1EP64-GBS2048SEQLEN4096
+  enable_experimental: true

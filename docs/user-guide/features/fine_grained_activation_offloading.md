@@ -48,7 +48,7 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 # Optional: cap inflight D2H offloads per offload group to N (omit or None in most setups).
 # Required as a non-None non-negative integer when fine-grained activation offloading is used with
 # full-iteration CUDA graphs (--cuda-graph-impl full_iteration); see prose below.
---fine_grained_offloading_max_inflight_offloads <N>
+--fine-grained-offloading-max-inflight-offloads <N>
 ```
 
 TransformerConfig.fine_grained_offloading_max_inflight_offloads caps, per offload group (for example `moe_act`, `qkv_linear`), how many D2H copies may be in flight before a main-stream wait_event. 0 waits after each offload; larger values allow more overlap; None skips these joins.
