@@ -122,6 +122,30 @@ def _validate_mrope_thd_inputs(
     return tokens, heads, head_dim, half_rotary_dim, sec_t, sec_h, sec_w
 
 
+def _fused_mrope_dtype_capability_reason(t: torch.Tensor, freqs: torch.Tensor) -> Optional[str]:
+    """Return why the input/freqs dtypes or CUDA compute capability are unsupported.
+
+    Returns None when both are fine. ``t`` is assumed to be a CUDA tensor (callers check
+    device placement first).
+    """
+    if freqs.dtype != torch.float32:
+        return f"raw mRoPE freqs must be float32, got {freqs.dtype}"
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return f"input dtype {t.dtype} is not supported"
+    try:
+        capability = torch.cuda.get_device_capability(t.device)
+    except RuntimeError as exc:
+        return f"could not query CUDA device capability: {exc}"
+    if capability < (7, 0):
+        return f"requires CUDA compute capability >= 7.0, got {capability[0]}.{capability[1]}"
+    if t.dtype == torch.bfloat16 and capability < (8, 0):
+        return (
+            "requires CUDA compute capability >= 8.0 for bfloat16 inputs, "
+            f"got {capability[0]}.{capability[1]}"
+        )
+    return None
+
+
 def get_fused_mrope_unavailable_reason(
     t: Optional[torch.Tensor] = None,
     freqs: Optional[torch.Tensor] = None,
@@ -141,23 +165,11 @@ def get_fused_mrope_unavailable_reason(
             "Triton fused mRoPE requires t and freqs on the same device, "
             f"got {t.device} and {freqs.device}"
         )
-    if freqs.dtype != torch.float32:
-        return f"raw mRoPE freqs must be float32, got {freqs.dtype}"
-    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        return f"input dtype {t.dtype} is not supported"
+    reason = _fused_mrope_dtype_capability_reason(t, freqs)
+    if reason is not None:
+        return reason
     if t.stride(-1) != 1:
         return f"input head dimension must be contiguous, got stride {t.stride()}"
-    try:
-        capability = torch.cuda.get_device_capability(t.device)
-    except RuntimeError as exc:
-        return f"could not query CUDA device capability: {exc}"
-    if capability < (7, 0):
-        return f"requires CUDA compute capability >= 7.0, got {capability[0]}.{capability[1]}"
-    if t.dtype == torch.bfloat16 and capability < (8, 0):
-        return (
-            "requires CUDA compute capability >= 8.0 for bfloat16 inputs, "
-            f"got {capability[0]}.{capability[1]}"
-        )
     return None
 
 
@@ -198,10 +210,9 @@ def get_fused_mrope_thd_unavailable_reason(
             "Triton fused THD mRoPE requires t, freqs, and cu_seqlens on the same device, "
             f"got {t.device}, {freqs.device}, and {cu_seqlens.device}"
         )
-    if freqs.dtype != torch.float32:
-        return f"raw mRoPE freqs must be float32, got {freqs.dtype}"
-    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        return f"input dtype {t.dtype} is not supported"
+    reason = _fused_mrope_dtype_capability_reason(t, freqs)
+    if reason is not None:
+        return reason
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         return f"cu_seqlens dtype {cu_seqlens.dtype} is not supported"
     if t.stride(-1) != 1:
@@ -230,17 +241,6 @@ def get_fused_mrope_thd_unavailable_reason(
         return (
             "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "
             f"got freqs.shape[2]={freqs.shape[2]}, tokens={t.shape[0]}, cp_size={cp_size}"
-        )
-    try:
-        capability = torch.cuda.get_device_capability(t.device)
-    except RuntimeError as exc:
-        return f"could not query CUDA device capability: {exc}"
-    if capability < (7, 0):
-        return f"requires CUDA compute capability >= 7.0, got {capability[0]}.{capability[1]}"
-    if t.dtype == torch.bfloat16 and capability < (8, 0):
-        return (
-            "requires CUDA compute capability >= 8.0 for bfloat16 inputs, "
-            f"got {capability[0]}.{capability[1]}"
         )
     return None
 
