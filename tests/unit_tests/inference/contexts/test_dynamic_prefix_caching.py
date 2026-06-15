@@ -126,6 +126,7 @@ class _StubEngine(DynamicInferenceEngine):
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
