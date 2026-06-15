@@ -428,12 +428,15 @@ class GPTModel(LanguageModule):
                 packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 # Inference indexes rotary_pos_emb as seq-major materialized embeddings.
                 # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path,
-                # and fused_single_qkv_rope consumes the materialized embeddings instead.
+                # and fused_single_qkv_rope consumes the materialized embeddings instead. A
+                # provided inference_context counts as inference even when the global
+                # InferenceMode flag is not active.
+                in_inference = in_inference_mode or inference_context is not None
                 use_raw_mrope_freqs = (
                     self.config.apply_rope_fusion
                     and not self.config.rotary_interleaved
                     and not self.config.fused_single_qkv_rope
-                    and not in_inference_mode
+                    and not in_inference
                 )
                 use_fused_mrope = use_raw_mrope_freqs and self._fused_mrope_available
                 rotary_pos_emb = self.rotary_pos_emb(
