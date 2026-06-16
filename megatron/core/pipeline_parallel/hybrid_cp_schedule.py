@@ -549,6 +549,8 @@ def hybrid_context_parallel_forward_backward(
             partner_cp_size = 0
             new_data_iterator = None
 
+        # Keep this int32 to match the hybrid-CP batch metadata dtype
+        # (`local_cp_size`) used by get_batch_on_this_cp_rank.
         partner_cp_size_tensor = torch.tensor(
             [partner_cp_size], dtype=torch.int32, device=torch.cuda.current_device()
         )
