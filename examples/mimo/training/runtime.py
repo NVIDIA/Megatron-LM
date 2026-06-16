@@ -22,19 +22,7 @@ from megatron.training.utils import print_rank_0
 
 
 class _EncoderFloat16Module(Float16Module):
-    """Float16Module variant whose outputs stay in model precision (bf16/fp16).
-
-    The stock :class:`Float16Module` upcasts last-PP-stage outputs to fp32 (its
-    ``forward`` default ``fp32_output=True``). For a MIMO encoder that is wrong: the
-    encoder's last-stage output is the projected modality activation that flows over the
-    cross-grid bridge into the language model, and the bridge expects model-precision
-    (bf16) activations. ``MimoModel._forward_encoders`` calls the submodule as
-    ``submodule.forward(encoder_inputs=..., hidden_states=...)`` and does not thread
-    ``fp32_output`` through, and the flag is forward-only (not a constructor argument), so
-    this thin subclass pins the default to ``False`` for encoder submodules. The language
-    model keeps the stock ``fp32_output=True`` (its label-mode output is the loss, already
-    fp32 from the cross-entropy upcast, so the upcast is a no-op).
-    """
+    """Float16Module that keeps encoder outputs in model precision for the bridge."""
 
     def forward(self, *inputs, fp32_output=False, **kwargs):  # noqa: D102
         return super().forward(*inputs, fp32_output=fp32_output, **kwargs)
@@ -85,15 +73,7 @@ def _module_config(module: torch.nn.Module):
 
 
 def _maybe_float16_wrap(module: torch.nn.Module, config, is_encoder: bool) -> torch.nn.Module:
-    """Wrap a submodule in Float16Module when its config requests fp16/bf16, else pass through.
-
-    Mirrors :func:`megatron.training.get_model`, which wraps each model chunk in
-    ``Float16Module`` (params cast to model precision, fp32 inputs cast at the PP-first
-    stage, last-stage outputs upcast to fp32) before the DDP wrap. Encoders use
-    :class:`_EncoderFloat16Module` so their bridge activations stay in model precision.
-    Under ``--fp32`` neither ``config.fp16`` nor ``config.bf16`` is set, so the module is
-    returned unwrapped.
-    """
+    """Wrap a submodule in Float16Module when fp16/bf16 is enabled; encoders keep bf16 outputs."""
     if not (getattr(config, "fp16", False) or getattr(config, "bf16", False)):
         return module
     cls = _EncoderFloat16Module if is_encoder else Float16Module
