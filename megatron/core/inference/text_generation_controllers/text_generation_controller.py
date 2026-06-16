@@ -1709,55 +1709,39 @@ class TextGenerationController:
         }
         return prepared_update, request_bookkeeping
 
-    def _dynamic_step_context_bookkeeping_legacy(self) -> Dict[str, Tensor]:
-        """Update the dynamic context through the preserved legacy path.
+    def _dynamic_step_context_bookkeeping(self, *, use_legacy: bool) -> Dict[str, Tensor]:
+        """Update the dynamic context through the selected request-update path.
 
-        This is the controller wrapper around `context.update_requests_legacy`.
+        This is the controller wrapper around either the preserved legacy
+        `context.update_requests_legacy` path or the new split
+        `context.update_requests` path.
 
         Steps:
             1. Build the sampled-step update payload.
-            2. Call the preserved legacy context update and merge its result.
+            2. Select the legacy or split context update.
+            3. Call the selected context update and merge its result.
 
         Example:
             route:
-                legacy or non-decode
-                  -> update_requests_legacy
+                legacy or non-decode -> update_requests_legacy
+                serial decode        -> resolve_requests -> prepare_requests
         """
         context = self.inference_wrapped_model.inference_context
 
         # Step 1: Build the sampled-step update payload.
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
-        # Step 2: Call the preserved legacy context update and merge its result.
-        range_push("update_requests_legacy")
-        update_result = context.update_requests_legacy(**prepared_update)
-        range_pop()
+        # Step 2: Select the legacy or split context update.
+        if use_legacy:
+            update_fn = context.update_requests_legacy
+            range_name = "update_requests_legacy"
+        else:
+            update_fn = context.update_requests
+            range_name = "update_requests"
 
-        return {**request_bookkeeping, **(update_result or {})}
-
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic context through the split serial path.
-
-        This is the controller wrapper around the new `context.update_requests`.
-
-        Steps:
-            1. Build the sampled-step update payload.
-            2. Call the split context update and merge its result.
-
-        Example:
-            route:
-                serial decode
-                  -> resolve_requests
-                  -> prepare_requests
-        """
-        context = self.inference_wrapped_model.inference_context
-
-        # Step 1: Build the sampled-step update payload.
-        prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
-
-        # Step 2: Call the split context update and merge its result.
-        range_push("update_requests")
-        update_result = context.update_requests(**prepared_update)
+        # Step 3: Call the selected context update and merge its result.
+        range_push(range_name)
+        update_result = update_fn(**prepared_update)
         range_pop()
 
         return {**request_bookkeeping, **(update_result or {})}
@@ -1911,7 +1895,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         # Step 1: Check request-queue, stop-word, and controller speculative state.
-        if getattr(context, "request_update_has_waiting_requests", False):
+        if context.request_update_has_waiting_requests:
             return "waiting_requests"
         if active_request_count > 0 and context.request_has_stop_words[active_slice].any().item():
             return "stop_words"
@@ -1919,13 +1903,13 @@ class TextGenerationController:
             return "speculative_tokens"
 
         # Step 2: Reject unsupported model families and parallelism modes.
-        if getattr(model_config, "mtp_num_layers", None):
+        if model_config.mtp_num_layers:
             return "mtp_model"
-        if context.is_hybrid_model or getattr(model_config, "is_hybrid_model", False):
+        if context.is_hybrid_model or model_config.is_hybrid_model:
             return "hybrid_or_mamba"
-        if getattr(model_config, "num_moe_experts", None) is not None:
+        if model_config.num_moe_experts is not None:
             return "moe"
-        if getattr(model_config, "expert_model_parallel_size", 1) > 1:
+        if model_config.expert_model_parallel_size > 1:
             return "expert_parallel"
         if context.expert_model_parallel_group is not None:
             return "expert_parallel"
@@ -2014,18 +1998,18 @@ class TextGenerationController:
 
         # Step 1: Route legacy mode and non-decode steps to legacy update.
         if mode == AsyncSchedulingMode.LEGACY or not context.is_decode_only():
-            return self._dynamic_step_context_bookkeeping_legacy()
+            return self._dynamic_step_context_bookkeeping(use_legacy=True)
 
         # Step 2: Route eligible serial decode steps to split update.
         if mode == AsyncSchedulingMode.SERIAL:
             self._raise_if_decode_request_update_unsupported(mode)
-            return self._dynamic_step_context_bookkeeping()
+            return self._dynamic_step_context_bookkeeping(use_legacy=False)
 
         # Step 3: Validate async-mode decode eligibility.
         self._raise_if_decode_request_update_unsupported(mode)
 
         # Step 4: Use legacy fallback for async mode in the normal loop.
-        return self._dynamic_step_context_bookkeeping_legacy()
+        return self._dynamic_step_context_bookkeeping(use_legacy=True)
 
     def _run_async_scheduling_step(self) -> Tuple[Dict, Dict]:
         """Run one async-shaped decode step after the prior forward is available.

@@ -230,39 +230,83 @@ class TestAsyncSchedulingControllerHelpers:
     def test_request_update_mode_routes_legacy_to_legacy_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.LEGACY
-        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
-            return_value={"path": "legacy"}
-        )
-        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "legacy"})
 
         assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
-        controller._dynamic_step_context_bookkeeping_legacy.assert_called_once()
-        controller._dynamic_step_context_bookkeeping.assert_not_called()
+        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=True)
 
     def test_request_update_mode_routes_serial_decode_to_new_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
-        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
-            return_value={"path": "legacy"}
-        )
         controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
 
         assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "serial"}
-        controller._dynamic_step_context_bookkeeping_legacy.assert_not_called()
-        controller._dynamic_step_context_bookkeeping.assert_called_once()
+        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=False)
 
     def test_request_update_mode_routes_non_decode_to_legacy_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
         context.is_decode_only.return_value = False
-        controller._dynamic_step_context_bookkeeping_legacy = mock.Mock(
-            return_value={"path": "legacy"}
-        )
-        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "legacy"})
 
         assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
-        controller._dynamic_step_context_bookkeeping_legacy.assert_called_once()
-        controller._dynamic_step_context_bookkeeping.assert_not_called()
+        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=True)
+
+    def test_dynamic_step_context_bookkeeping_uses_legacy_update(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([1, 0], device='cpu'),
+            "new_tokens": torch.tensor([8, 9], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        request_bookkeeping = {"active_request_ids": torch.tensor([10, 11], device='cpu')}
+        controller._build_dynamic_step_request_update = mock.Mock(
+            return_value=(prepared_update, request_bookkeeping)
+        )
+        context.update_requests_legacy.return_value = {"finished_request_ids": torch.tensor([11])}
+
+        with (
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+            ),
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+            ),
+        ):
+            result = controller._dynamic_step_context_bookkeeping(use_legacy=True)
+
+        context.update_requests_legacy.assert_called_once_with(**prepared_update)
+        context.update_requests.assert_not_called()
+        assert result["active_request_ids"] is request_bookkeeping["active_request_ids"]
+        assert torch.equal(result["finished_request_ids"], torch.tensor([11]))
+
+    def test_dynamic_step_context_bookkeeping_uses_split_update(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([1, 0], device='cpu'),
+            "new_tokens": torch.tensor([8, 9], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        request_bookkeeping = {"active_request_ids": torch.tensor([10, 11], device='cpu')}
+        controller._build_dynamic_step_request_update = mock.Mock(
+            return_value=(prepared_update, request_bookkeeping)
+        )
+        context.update_requests.return_value = {"finished_request_ids": torch.tensor([11])}
+
+        with (
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+            ),
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+            ),
+        ):
+            result = controller._dynamic_step_context_bookkeeping(use_legacy=False)
+
+        context.update_requests.assert_called_once_with(**prepared_update)
+        context.update_requests_legacy.assert_not_called()
+        assert result["active_request_ids"] is request_bookkeeping["active_request_ids"]
+        assert torch.equal(result["finished_request_ids"], torch.tensor([11]))
 
     def test_request_update_mode_rejects_unsupported_serial_decode(self):
         controller, context, _ = self._make_async_eligibility_controller()
