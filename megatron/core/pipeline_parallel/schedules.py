@@ -738,7 +738,7 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             check_first_val_step,
-            model_type,
+            pg_collection,
         )
     else:
         with no_sync_func():

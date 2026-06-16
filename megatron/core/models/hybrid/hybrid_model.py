@@ -548,6 +548,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
+                # For Dynamic context parallel, use the dynamic CP sub-group
+                if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                    self.pg_collection.cp = packed_seq_params.cp_group
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
