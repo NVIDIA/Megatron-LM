@@ -79,6 +79,31 @@ def test_chunk_offload_handler_respects_tensor_offloading_activation_opt_out():
     assert not handler.tensor_need_offloading_checker(tensor)
 
 
+def test_chunk_offload_handler_respects_te_do_not_offload_on_wrapper_data_tensors():
+    handler = _make_chunk_handler_for_offload_checker()
+
+    class TensorLikeWrapper:
+        device = torch.device("cuda")
+
+        def __init__(self, data_tensors):
+            self._data_tensors = data_tensors
+
+        def numel(self):
+            return 1024
+
+        def get_data_tensors(self):
+            return self._data_tensors
+
+    class DataTensor:
+        pass
+
+    wrapper = TensorLikeWrapper([DataTensor(), DataTensor()])
+    assert handler.tensor_need_offloading_checker(wrapper)
+
+    wrapper.get_data_tensors()[1]._TE_do_not_offload = True
+    assert not handler.tensor_need_offloading_checker(wrapper)
+
+
 def _build_gpt_model(
     *,
     seed: int,
