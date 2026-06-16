@@ -46,20 +46,20 @@ except ImportError:
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "sp", "cp_size", "cp_comm_type"),
+    ("tp_size", "sp", "cp_size", "linear_cp_mode"),
     [
-        # cp_size=1: the CP path is inactive, so cp_comm_type choice is irrelevant.
-        # Cover the "all_gather" default and skip the "a2a" variants for brevity.
+        # cp_size=1: the CP path is inactive, so linear_cp_mode choice is irrelevant.
+        # Cover the "chunkwise" default and skip the "headwise" variants for brevity.
         (1, False, 1, None),
         (2, False, 1, None),
         (2, True, 1, None),
         # cp_size=2: exercise both CP paths.
-        (1, False, 2, "a2a"),
-        (2, False, 2, "a2a"),
-        (2, True, 2, "a2a"),
-        (1, False, 2, "all_gather"),
-        (2, False, 2, "all_gather"),
-        (2, True, 2, "all_gather"),
+        (1, False, 2, "headwise"),
+        (2, False, 2, "headwise"),
+        (2, True, 2, "headwise"),
+        (1, False, 2, "chunkwise"),
+        (2, False, 2, "chunkwise"),
+        (2, True, 2, "chunkwise"),
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -67,7 +67,7 @@ except ImportError:
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size, cp_comm_type):
+    def setup_method(self, tp_size, sp, cp_size, linear_cp_mode):
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -78,18 +78,18 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
-        self.cp_comm_type = cp_comm_type
-        if self.cp_comm_type == "a2a":
-            self.cp_size_all_gather = 1
-            self.cp_size_a2a = self.cp_size
-        elif self.cp_comm_type == "all_gather":
-            self.cp_size_all_gather = self.cp_size
-            self.cp_size_a2a = 1
+        self.linear_cp_mode = linear_cp_mode
+        if self.linear_cp_mode == "headwise":
+            self.cp_size_chunkwise = 1
+            self.cp_size_headwise = self.cp_size
+        elif self.linear_cp_mode == "chunkwise":
+            self.cp_size_chunkwise = self.cp_size
+            self.cp_size_headwise = 1
         elif self.cp_size == 1:
-            self.cp_size_all_gather = 1
-            self.cp_size_a2a = 1
+            self.cp_size_chunkwise = 1
+            self.cp_size_headwise = 1
         else:
-            raise ValueError(f"Invalid CP communication type: {self.cp_comm_type}")
+            raise ValueError(f"Invalid linear CP mode: {self.linear_cp_mode}")
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -116,7 +116,7 @@ class TestGatedDeltaNet:
             context_parallel_size=cp_size,
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[1],
-            linear_cp_comm_type=self.cp_comm_type,
+            linear_cp_mode=self.linear_cp_mode,
             transformer_impl="transformer_engine",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -142,9 +142,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = (
-            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
-        )
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -181,9 +179,7 @@ class TestGatedDeltaNet:
         gdn = self.gdn
         gdn.train()
 
-        micro_batch_size = (
-            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
-        )
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         torch.manual_seed(1234)
         base_input = torch.randn(
@@ -224,9 +220,9 @@ class TestGatedDeltaNet:
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
-    def test_gpu_forward_rejects_sbhd_all_gather_cp_batch_gt_one(self):
-        if not (self.cp_comm_type == "all_gather" and self.cp_size > 1):
-            pytest.skip("Only all-gather CP with CP>1 uses the FLA CP batch guard.")
+    def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):
+        if not (self.linear_cp_mode == "chunkwise" and self.cp_size > 1):
+            pytest.skip("Only chunkwise CP with CP>1 uses the FLA CP batch guard.")
 
         gdn = self.gdn
 
@@ -245,9 +241,7 @@ class TestGatedDeltaNet:
         gdn = self.gdn
         gdn.config.gdn_conv_pad_alignment = 4096
 
-        micro_batch_size = (
-            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
-        )
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -265,9 +259,9 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
-        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_a2a
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_headwise
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_a2a
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_headwise
         qkv = torch.randn(
             batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
         )
@@ -299,7 +293,7 @@ class TestGatedDeltaNet:
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
                 gdn._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len, cp_size_a2a=self.cp_size_a2a
+                    qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=self.cp_size_headwise
                 )
             )
 
@@ -327,8 +321,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
-        if self.cp_size > 1 and self.cp_comm_type == "all_gather":
-            pytest.skip("All-gather CP is not supported for this test case.")
+        if self.cp_size > 1 and self.linear_cp_mode == "chunkwise":
+            pytest.skip("Chunkwise CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
 
@@ -372,8 +366,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
-        if self.cp_size > 1 and self.cp_comm_type == "all_gather":
-            pytest.skip("All-gather CP is not supported for this test case.")
+        if self.cp_size > 1 and self.linear_cp_mode == "chunkwise":
+            pytest.skip("Chunkwise CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
         sequence_length = 32
@@ -489,23 +483,24 @@ class TestGDNCuSeqlensResolve:
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
+
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp", "cp_comm_type"),
+    ("tp", "sp", "cp", "linear_cp_mode"),
     [
         (4, False, 1, None),  # TP w/o SP
         (4, True, 1, None),  # TP w/ SP
-        (1, False, 2, "a2a"),  # A2A CP
-        (2, False, 2, "a2a"),  # TP w/o SP + A2A CP
-        (2, True, 2, "a2a"),  # TP w/ SP + A2A CP
-        (1, False, 2, "all_gather"),  # All-gather CP
-        (2, False, 2, "all_gather"),  # TP w/o SP + all-gather CP
-        (2, True, 2, "all_gather"),  # TP w/ SP + all-gather CP
+        (1, False, 2, "headwise"),  # Headwise CP
+        (2, False, 2, "headwise"),  # TP w/o SP + Headwise CP
+        (2, True, 2, "headwise"),  # TP w/ SP + Headwise CP
+        (1, False, 2, "chunkwise"),  # Chunkwise CP
+        (2, False, 2, "chunkwise"),  # TP w/o SP + chunkwise CP
+        (2, True, 2, "chunkwise"),  # TP w/ SP + chunkwise CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, cp_comm_type
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
 ):
     transformer_config = TransformerConfig(
         hidden_size=128,
@@ -523,7 +518,7 @@ def test_parallel_gated_delta_net_correctness(
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
-        linear_cp_comm_type=cp_comm_type,
+        linear_cp_mode=linear_cp_mode,
         transformer_impl="transformer_engine",
     )
 
@@ -551,6 +546,6 @@ def test_parallel_gated_delta_net_correctness(
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=1 if (cp_comm_type == "all_gather" and cp > 1) else 4,
+        micro_batch_size=1 if (linear_cp_mode == "chunkwise" and cp > 1) else 4,
         sequence_packing=sequence_packing,
     )
