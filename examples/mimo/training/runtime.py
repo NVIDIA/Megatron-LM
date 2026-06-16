@@ -16,9 +16,29 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training.training import resolve_ddp_bucket_size, wrap_model_chunks_with_ddp
 from megatron.training.utils import print_rank_0
+
+
+class _EncoderFloat16Module(Float16Module):
+    """Float16Module variant whose outputs stay in model precision (bf16/fp16).
+
+    The stock :class:`Float16Module` upcasts last-PP-stage outputs to fp32 (its
+    ``forward`` default ``fp32_output=True``). For a MIMO encoder that is wrong: the
+    encoder's last-stage output is the projected modality activation that flows over the
+    cross-grid bridge into the language model, and the bridge expects model-precision
+    (bf16) activations. ``MimoModel._forward_encoders`` calls the submodule as
+    ``submodule.forward(encoder_inputs=..., hidden_states=...)`` and does not thread
+    ``fp32_output`` through, and the flag is forward-only (not a constructor argument), so
+    this thin subclass pins the default to ``False`` for encoder submodules. The language
+    model keeps the stock ``fp32_output=True`` (its label-mode output is the loss, already
+    fp32 from the cross-entropy upcast, so the upcast is a no-op).
+    """
+
+    def forward(self, *inputs, fp32_output=False, **kwargs):  # noqa: D102
+        return super().forward(*inputs, fp32_output=fp32_output, **kwargs)
 
 
 def configure_module_rng(
@@ -91,10 +111,26 @@ def _module_config(module: torch.nn.Module):
     raise ValueError("Cannot resolve a config for DDP wrapping from module")
 
 
+def _maybe_float16_wrap(module: torch.nn.Module, config, is_encoder: bool) -> torch.nn.Module:
+    """Wrap a submodule in Float16Module when its config requests fp16/bf16, else pass through.
+
+    Mirrors :func:`megatron.training.get_model`, which wraps each model chunk in
+    ``Float16Module`` (params cast to model precision, fp32 inputs cast at the PP-first
+    stage, last-stage outputs upcast to fp32) before the DDP wrap. Encoders use
+    :class:`_EncoderFloat16Module` so their bridge activations stay in model precision.
+    Under ``--fp32`` neither ``config.fp16`` nor ``config.bf16`` is set, so the module is
+    returned unwrapped.
+    """
+    if not (getattr(config, "fp16", False) or getattr(config, "bf16", False)):
+        return module
+    cls = _EncoderFloat16Module if is_encoder else Float16Module
+    return cls(config, module)
+
+
 def wrap_active_modules_with_ddp(
     args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
 ) -> None:
-    """Freeze (per --freeze-* flags) and DDP-wrap each active local MIMO module."""
+    """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     pad_buckets = getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False)
     grad_reduce_in_fp32 = getattr(args, "accumulate_allreduce_grads_in_fp32", True)
 
@@ -118,10 +154,12 @@ def wrap_active_modules_with_ddp(
                 use_distributed_optimizer=True,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
             )
+            lm_config = _module_config(mimo_model.language_model)
+            lm_module = _maybe_float16_wrap(mimo_model.language_model, lm_config, is_encoder=False)
             print_rank_0("wrapping language model in DDP")
             mimo_model.language_model = wrap_model_chunks_with_ddp(
-                [mimo_model.language_model],
-                _module_config(mimo_model.language_model),
+                [lm_module],
+                lm_config,
                 ddp_config,
                 DP=DistributedDataParallel,
                 pg_collection=topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
@@ -142,10 +180,12 @@ def wrap_active_modules_with_ddp(
                 use_distributed_optimizer=True,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
             )
+            enc_config = _module_config(submodule)
+            enc_module = _maybe_float16_wrap(submodule, enc_config, is_encoder=True)
             print_rank_0(f"wrapping modality submodule {name!r} in DDP")
             mimo_model.modality_submodules[name] = wrap_model_chunks_with_ddp(
-                [submodule],
-                _module_config(submodule),
+                [enc_module],
+                enc_config,
                 ddp_config,
                 DP=DistributedDataParallel,
                 pg_collection=topology.module_pgs[name],
