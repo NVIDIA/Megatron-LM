@@ -2411,7 +2411,18 @@ def train_step(
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2494,6 +2505,8 @@ def train_step(
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
     return (
         {},
@@ -2504,6 +2517,8 @@ def train_step(
         grad_norm,
         num_zeros_in_grad,
         log_max_attention_logit,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
     )
 
 
@@ -2927,13 +2942,17 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model_chunks, param_sync=True):
+def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
+    if param_sync and optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP]) -> None:
+def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+    if optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
@@ -2960,7 +2979,7 @@ def save_checkpoint_and_time(
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+        force_param_sync(model, optimizer=optimizer)
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
@@ -3073,7 +3092,7 @@ def post_training_step_callbacks(
         and iteration % args.check_weight_hash_across_dp_replicas_interval == 0
     ):
         if should_disable_forward_pre_hook(args):
-            disable_forward_pre_hook(model)
+            disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
@@ -3691,6 +3710,8 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            seqlen_sum_this_global_batch = None
+            seqlen_squared_sum_this_global_batch = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -3702,6 +3723,8 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = train_step(
                 forward_step_func,
                 train_data_iterator,
@@ -3807,14 +3830,23 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        # Drain the per-iteration packed-sequence stats so the FLOPs computation
-        # reflects THD per-chunk causal attention AND excludes padding tokens
-        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
-        # runs (no collective issued), letting ``num_floating_point_operations``
-        # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
-        )
+        if config.sequence_packing_scheduler is not None and not args.skip_train:
+            # Scheduler-based packing does not feed the packed-sequence accumulator.
+            # The scheduler already computed these from the real per-sample lengths
+            # before CP padding/rerouting, so use them directly here.
+            assert seqlen_sum_this_global_batch is not None
+            assert seqlen_squared_sum_this_global_batch is not None
+            total_real_tokens_in_batch = seqlen_sum_this_global_batch
+            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
+        else:
+            # Drain the per-iteration packed-sequence stats so the FLOPs computation
+            # reflects THD per-chunk causal attention AND excludes padding tokens
+            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+            # runs (no collective issued), letting ``num_floating_point_operations``
+            # fall back to its closed-form defaults.
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+                consume_seqlen_stats_in_iteration()
+            )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -3866,16 +3898,8 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
-                # Copy the main params to param buffer before the forced AllGather.
-                for model_chunk in model:
-                    model_chunk.zero_grad_buffer()
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model)
+                disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
@@ -3979,7 +4003,7 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
     # This will finalize all unfinalized async request and terminate

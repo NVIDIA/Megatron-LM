@@ -1,0 +1,3 @@
+# Reference VERL release for the Megatron Lite VERL example.
+# Latest GitHub release checked on 2026-06-06: v0.8.0.
+verl @ git+https://github.com/verl-project/verl.git@v0.8.0

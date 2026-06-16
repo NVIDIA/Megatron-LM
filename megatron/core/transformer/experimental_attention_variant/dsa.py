@@ -73,8 +73,19 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
+        # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
+        # each MTP depth contains multiple hybrid layers) don't index out of bounds.
+        # Grow lazily; with PP=1 every rank takes the same path, so sizes stay consistent.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -102,15 +113,42 @@ class DSAIndexerLossLoggingHelper:
                 tracker on ranks where no indexer layer ran.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        # Agree on a consistent tracker size across the PP group BEFORE the collective.
+        # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
+        # (e.g. an MTP layer whose layer_number exceeds num_layers), while ranks without any
+        # indexer layer have only a num_layers-sized (or absent) tracker. all_reduce requires
+        # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
+        # (otherwise PP>1 hangs / errors on mismatched sizes).
+        # The agreed size (max over the PP group) is constant across iterations (num_layers and
+        # the layer numbering don't change), so compute it once and cache it. This avoids a
+        # per-iteration CPU-GPU sync (.item()); the size-negotiation all_reduce + .item() runs
+        # only on the first call. Every PP rank caches on the same (first) call, so later steps
+        # all skip it consistently.
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            size = int(size_t.item())
+            tracker["agreed_size"] = size
+        if size == 0:
+            return
         if "values" not in tracker:
-            if num_layers is None:
-                return
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -1235,10 +1273,18 @@ class DSAttention(MegatronModule):
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
+                # On HybridModel, each MTP depth can contain multiple hybrid layers
+                # (e.g. `/MD-E` is 4 layers per depth), so `num_layers + mtp_num_layers`
+                # is an undercount when mtp_num_layers is depth, not layer count. Take
+                # the max with self.layer_number so the tracker grows to cover the
+                # largest layer index seen on this rank.
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
-                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    num_layers=max(
+                        self.layer_number,
+                        self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    ),
                 )
 
             # ===================================
