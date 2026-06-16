@@ -418,7 +418,22 @@ def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
-        pass  # we're using torch.compile for jit fusion
+        # we're using torch.compile for jit fusion.
+        # DSv4 hybrid: MoE-routing-driven fused ops (clamped_weighted_swiglu /
+        # bias_dropout_add_fused_train) see many distinct per-expert token counts and
+        # otherwise hit torch._dynamo's default cache_size_limit (8) -> eager fallback.
+        # Env-gated raise of the recompile cache limit; no-op when unset.
+        import os
+
+        _dynamo_lim = os.environ.get("DYNAMO_CACHE_SIZE_LIMIT")
+        if _dynamo_lim:
+            import torch._dynamo
+
+            _lim = int(_dynamo_lim)
+            torch._dynamo.config.cache_size_limit = _lim
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                _lim, torch._dynamo.config.accumulated_cache_size_limit
+            )
     elif is_torch_min_version("1.10.0a0"):
         # nvfuser
         torch._C._jit_set_profiling_executor(True)

@@ -363,6 +363,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
         )
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
         self.moment2_method = moment2_method
 
         for group in self.param_groups:

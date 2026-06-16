@@ -299,9 +299,6 @@ class OptimizerConfig:
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 
-    soap_precondition_frequency: int = 1
-    """The frequency of the Shampoo preconditioner."""
-
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
@@ -425,6 +422,12 @@ class OptimizerConfig:
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
                     "recommended for mxfp8 training."
                 )
+
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
 
         if self.use_precision_aware_optimizer:
             assert (

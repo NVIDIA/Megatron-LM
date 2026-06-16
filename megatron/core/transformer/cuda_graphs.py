@@ -1728,11 +1728,42 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
+    # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
+    # MoE inner layers use partial capture: the wrapper graphs the deterministic prefix
+    # (mHC aggregate + router/preprocess) and runs the expert all-to-all + mHC BDA eagerly
+    # (the all-to-all is not graph-safe), mirroring the GPT HyperConnectionTransformerLayer.
+    if isinstance(layer, HyperConnectionHybridLayer):
+        inner = layer.inner_layer
+        if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
+            return True
+        if isinstance(inner, TransformerLayer):
+            if isinstance(inner.mlp, MoELayer):
+                # MoE inner: graphable via partial (router/preprocess) capture.
+                if (
+                    CudaGraphModule.moe in config.cuda_graph_modules
+                    or CudaGraphModule.moe_router in config.cuda_graph_modules
+                    or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+                ):
+                    return True
+                # attn-only scope on an MoE inner: the (identity) attention prefix has
+                # nothing graph-worthy, so leave eager.
+                return False
+            if CudaGraphModule.attn in config.cuda_graph_modules and not (
+                isinstance(inner.self_attention, IdentityOp)
+                and isinstance(inner.cross_attention, IdentityOp)
+            ):
+                return True
+            if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
+                return True
+        return False
 
     if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.

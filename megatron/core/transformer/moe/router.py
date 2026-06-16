@@ -176,6 +176,7 @@ class TopKRouter(Router):
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+        self.mtp_layer_number: Optional[int] = None
 
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
@@ -497,7 +498,12 @@ class TopKRouter(Router):
             num_layers += self.config.mtp_num_layers
 
         if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
+            # Hybrid MTP depths can contain multiple internal sublayers (for example `/WE`).
+            # Metrics are allocated per MTP depth, not per internal hybrid sublayer.
+            mtp_layer_number = self.mtp_layer_number or self.layer_number
+            if self.config.mtp_num_layers is not None:
+                mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+            layer_number = mtp_layer_number + self.config.num_layers
         else:
             layer_number = self.layer_number
 

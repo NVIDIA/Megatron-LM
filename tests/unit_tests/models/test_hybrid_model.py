@@ -275,7 +275,7 @@ class TestHybridModel:
             aggregated = hidden_states.view(s, b, n, c).mean(dim=2)
             h_res = torch.empty(s, b, n, n, dtype=hidden_states.dtype)
             h_post = torch.empty(s, b, n, dtype=hidden_states.dtype)
-            return aggregated, h_res, h_post
+            return aggregated, h_res, h_post, hidden_states
 
         def fake_fused_h_res_h_post_bda(
             h_res,

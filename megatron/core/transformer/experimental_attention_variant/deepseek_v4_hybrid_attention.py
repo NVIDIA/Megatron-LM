@@ -71,6 +71,7 @@ class DSv4HybridAttention(Attention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        compress_ratio: Optional[int] = None,
         name: str | None = None,
     ) -> None:
 
@@ -113,11 +114,14 @@ class DSv4HybridAttention(Attention):
 
         self.softmax_scale = None
 
-        if is_mtp_layer:
-            layer_idx = self.config.num_layers + layer_number - 1
-            compress_ratio = self.config.csa_compress_ratios[layer_idx]
-        else:
-            compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
+        # Per-layer compress ratio. When set explicitly (e.g. hybrid 'C'/'H' layer symbols
+        # pass compress_ratio=4/128 via the spec), use it directly; otherwise fall back to the
+        # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
+        _ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
+        if compress_ratio is None:
+            compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
+        # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
+        # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
         use_compressed_yarn = compress_ratio > 1
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
@@ -416,8 +420,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        pp_layer_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
         name: str | None = None,
     ):
         if pg_collection is None:
@@ -431,8 +436,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
-            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            pp_layer_offset=pp_layer_offset,
+            compress_ratio=compress_ratio,
             name=name,
         )
 
