@@ -374,12 +374,7 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
         num_layers=1, hidden_size=4, num_attention_heads=1, use_cpu_initialization=True
     )
     linear = Linear(
-        4,
-        4,
-        config=config,
-        init_method=config.init_method,
-        bias=False,
-        parallel_mode="duplicated",
+        4, 4, config=config, init_method=config.init_method, bias=False, parallel_mode="duplicated"
     )
 
     assert linear.parallel_mode == "duplicated"
@@ -387,10 +382,4 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
     assert linear.weight.tensor_model_parallel is False
 
     with pytest.raises(ValueError, match="only supports parallel_mode"):
-        Linear(
-            4,
-            4,
-            config=config,
-            init_method=config.init_method,
-            parallel_mode="column",
-        )
+        Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")

@@ -147,9 +147,7 @@ def _get_hybrid_stack_local_spec(
             self_attention=ModuleSpec(
                 module=GatedDeltaNet,
                 submodules=GatedDeltaNetSubmodules(
-                    in_proj=ColumnParallelLinear,
-                    out_norm=Norm,
-                    out_proj=RowParallelLinear,
+                    in_proj=ColumnParallelLinear, out_norm=Norm, out_proj=RowParallelLinear
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
