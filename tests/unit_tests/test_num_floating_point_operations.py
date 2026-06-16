@@ -644,3 +644,133 @@ class TestAccumulatorTopology:
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
+
+
+def _make_dsv4_args():
+    """Minimal args for a DSv4-hybrid MLA model with sparse attention.
+
+    4 layers with compress_ratios [0, 4, 128, 128] (1 r0, 1 r4, 2 r128).
+    No MoE / MTP to keep the golden reference simple.
+    """
+    args = _make_gpt_args(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.q_lora_rank = 128
+    args.qk_head_dim = 64
+    args.qk_pos_emb_head_dim = 32
+    args.kv_lora_rank = 64
+    args.v_head_dim = 64
+    args.o_lora_rank = 64
+    args.o_groups = 2
+    args.experimental_attention_variant = "dsv4_hybrid"
+    args.csa_window_size = 64
+    args.csa_compress_ratios = [0, 4, 128, 128]
+    args.dsa_indexer_n_heads = 4
+    args.dsa_indexer_head_dim = 32
+    args.dsa_indexer_topk = 16
+    return args
+
+
+def _dsv4_golden_flops(args, total_tokens, seqlen_squared_sum):
+    """Independent golden calculator for DSv4-hybrid FLOPs.
+
+    Reimplements the formula from ``num_floating_point_operations`` so that the
+    test does not just call the same code twice. Assumes no MoE / MTP.
+    """
+    fwd_bwd = 3
+    fma = 2
+    ffn_exp = 3 if args.swiglu else 2
+
+    # ---- MLA projections (token-linear, per layer) ----
+    q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * args.v_head_dim + 1)
+    kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim
+    o_term = (
+        args.num_attention_heads * args.v_head_dim * args.o_lora_rank
+        + args.o_groups * args.o_lora_rank * args.hidden_size
+    )
+    mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
+
+    # ---- DSv4 sparse attention extra (token-linear + L^2) ----
+    ratios = args.csa_compress_ratios
+    n_r0 = sum(1 for r in ratios if r == 0)
+    n_r4 = sum(1 for r in ratios if r == 4)
+    n_r128 = sum(1 for r in ratios if r == 128)
+    nh = args.num_attention_heads
+    vhd = args.v_head_dim
+    w = args.csa_window_size
+
+    # Token-linear sparse attention
+    sparse_r0 = n_r0 * nh * w * vhd * 2
+    sparse_r128_win = n_r128 * nh * w * vhd * 2
+    if n_r4 > 0:
+        eff_topk = min(args.dsa_indexer_topk, args.seq_length // 4)
+        avg_comp_4 = eff_topk * (1 - eff_topk * 4 / (2 * args.seq_length))
+        sparse_r4 = n_r4 * nh * (w + avg_comp_4) * vhd * 2
+        idx_tok = (
+            n_r4 * args.hidden_size * (2 * args.dsa_indexer_head_dim) * 2
+            + n_r4 * args.q_lora_rank * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+            + n_r4 * args.hidden_size * args.dsa_indexer_n_heads
+        )
+        idx_core = n_r4 * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim / 4
+    else:
+        sparse_r4, idx_tok, idx_core = 0, 0, 0
+
+    compressor = n_r4 * args.hidden_size * (2 * vhd) * 2 + n_r128 * args.hidden_size * (1 * vhd) * 2
+    dsv4_token = fwd_bwd * fma * (sparse_r0 + sparse_r4 + sparse_r128_win + compressor + idx_tok)
+    # L^2 core: r=128 compressed-KV + r=4 indexer scoring
+    r128_core = n_r128 * nh * vhd / 128
+    dsv4_core = fwd_bwd * fma * (r128_core + idx_core)
+
+    # ---- Aggregation ----
+    num_layers = args.num_layers
+    self_attn_term = mla_proj_per_layer * num_layers + dsv4_token
+    self_attn_core_term = dsv4_core  # standard core is 0 for DSv4
+
+    mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+
+    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+
+
+class TestDSv4Hybrid:
+    """DSv4 hybrid sparse-attention FLOPs against an independent golden calculator."""
+
+    def test_bshd(self):
+        """BSHD (uniform sequences) must match the golden calculator."""
+        args = _make_dsv4_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        expected = _dsv4_golden_flops(args, total_tokens, sum_sq)
+        assert flops == expected
+
+    def test_thd(self):
+        """THD (packed variable-length subsequences) must match the golden
+        calculator and be strictly less than BSHD due to the L^2 sparse-attention
+        components (r=128 compressed-KV, r=4 indexer scoring)."""
+        args = _make_dsv4_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        thd_sum_sq = sum(L**2 for L in packed_lengths)
+
+        flops = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=total_tokens,
+        )
+        expected = _dsv4_golden_flops(args, total_tokens, thd_sum_sq)
+        assert flops == expected
+        # THD must be strictly less than BSHD.
+        bshd_flops = num_floating_point_operations(args, batch_size)
+        assert flops < bshd_flops
