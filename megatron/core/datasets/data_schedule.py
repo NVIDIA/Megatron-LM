@@ -307,7 +307,9 @@ class HybridCPDataLoaderWrapper:
             mod_token_count = sharded_tensor_shape % sharded_pad_granularity
             sharded_pad_len = 0
             if mod_token_count != 0:
-                sharded_pad_len = (sharded_pad_granularity - mod_token_count) * (local_cp_size * tp_size)
+                sharded_pad_len = (sharded_pad_granularity - mod_token_count) * (
+                    local_cp_size * tp_size
+                )
 
             return sharded_pad_len + seq_pad_len
 

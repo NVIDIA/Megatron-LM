@@ -619,9 +619,7 @@ def hybrid_context_parallel_forward_backward(
                 current_microbatch += 1
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
-                    backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, config
-                    )
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():
