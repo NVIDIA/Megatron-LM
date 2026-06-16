@@ -571,7 +571,7 @@ class CompressedSparseAttention(MegatronModule):
     provides compressor and indexer submodule specs; this ``__init__`` inspects
     ``config.csa_compress_ratios[layer_idx]`` and conditionally builds them:
 
-    * ``ratio == 0``:  window-only (compressor and indexer NOT built)
+    * ``ratio == 0``:  window-only (compressor and indexer NOT built) — the 'W' layer symbol
     * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
@@ -617,7 +617,7 @@ class CompressedSparseAttention(MegatronModule):
         # Learnable attention sink per head
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
 
-        # Conditionally build Compressor (ratio > 1)
+        # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
             self.compressor = build_module(
                 submodules.compressor,
@@ -631,7 +631,7 @@ class CompressedSparseAttention(MegatronModule):
         else:
             self.compressor = None
 
-        # Conditionally build Indexer (ratio == 4)
+        # Conditionally build Indexer (ratio == 4). ratio == 0 is window-only ('W'): not built.
         if (
             self.compress_ratio == 4
             and not config.csa_dense_mode

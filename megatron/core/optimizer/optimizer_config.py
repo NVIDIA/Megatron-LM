@@ -299,9 +299,6 @@ class OptimizerConfig:
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 
-    soap_precondition_frequency: int = 1
-    """The frequency of the Shampoo preconditioner."""
-
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 

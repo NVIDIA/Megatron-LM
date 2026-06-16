@@ -2011,12 +2011,28 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
-                )
+                # nemo_26.04 ships TE 2.14.0+71bbefbf whose GroupedLinear.__init__ does NOT
+                # yet accept single_grouped_{weight,bias}, even though the version string
+                # passes is_te_min_version("2.14.0"). Introspect the signature instead of
+                # version-gating, mirroring the patch in dsv4_fused_attn / main_megatron.
+                # The GroupedLinear.__init__ signature is constant for a given TE install, so
+                # introspect once and cache at module scope rather than on every TEGroupedLinear
+                # instantiation (matters for large MoE models with many expert groups).
+                global _TE_GROUPED_LINEAR_INIT_PARAMS
+                try:
+                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                except NameError:
+                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                        inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                    )
+                if "single_grouped_weight" in _gl_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in _gl_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
