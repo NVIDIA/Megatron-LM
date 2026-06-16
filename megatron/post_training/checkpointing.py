@@ -225,4 +225,4 @@ def restore_sharded_modelopt_state(model: list[nn.Module], checkpoint_name: str 
     print(f"nvidia-modelopt ckpt/inst version: {modelopt_load_version}/{modelopt.__version__}")
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
-    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name)
+    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix="")
