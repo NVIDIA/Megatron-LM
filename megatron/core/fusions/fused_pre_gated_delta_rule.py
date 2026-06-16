@@ -174,9 +174,7 @@ def _conv_silu_project_kernel(
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
-        w_tap = tl.load(
-            weight_ptr + chan * weight_c_stride + i * weight_w_stride
-        ).to(tl.float32)
+        w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
 
     acc += bias[None, :]
@@ -206,9 +204,7 @@ def _conv_silu_project_kernel(
                 + s_offs[:, None] * silu_save_s_stride
             )
             tl.store(
-                silu_save_ptrs,
-                silu_out.to(silu_save_ptr.dtype.element_ty),
-                mask=s_mask[:, None],
+                silu_save_ptrs, silu_out.to(silu_save_ptr.dtype.element_ty), mask=s_mask[:, None]
             )
         norm_sq = tl.sum(silu_out * silu_out, axis=1)
         rstd = 1.0 / tl.sqrt(norm_sq + eps)
@@ -340,9 +336,7 @@ def _conv_silu_project_thd_kernel(
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
-        w_tap = tl.load(
-            weight_ptr + chan * weight_c_stride + i * weight_w_stride
-        ).to(tl.float32)
+        w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
 
     acc += bias[None, :]
@@ -365,9 +359,7 @@ def _conv_silu_project_thd_kernel(
                 + s_offs[:, None] * silu_save_s_stride
             )
             tl.store(
-                silu_save_ptrs,
-                silu_out.to(silu_save_ptr.dtype.element_ty),
-                mask=s_mask[:, None],
+                silu_save_ptrs, silu_out.to(silu_save_ptr.dtype.element_ty), mask=s_mask[:, None]
             )
         norm_sq = tl.sum(silu_out * silu_out, axis=1)
         rstd = 1.0 / tl.sqrt(norm_sq + eps)
@@ -500,10 +492,7 @@ def _compute_g_and_beta_kernel(
     beta_sig = tl.sigmoid(beta)
 
     g_ptr = (
-        g_out_ptr
-        + pid_b * g_b_stride
-        + s_offs[:, None] * g_s_stride
-        + h_offs[None, :] * g_h_stride
+        g_out_ptr + pid_b * g_b_stride + s_offs[:, None] * g_s_stride + h_offs[None, :] * g_h_stride
     )
     beta_out_ptr_calc = (
         beta_out_ptr
@@ -596,12 +585,8 @@ def _qk_l2norm_repeat_backward_kernel(
             + v_head * dk_h_stride
             + chan_off[None, :]
         )
-        d_normed += tl.load(
-            dq_ptrs, mask=s_mask[:, None] & is_query, other=0.0
-        ).to(tl.float32)
-        d_normed += tl.load(
-            dk_ptrs, mask=s_mask[:, None] & is_key, other=0.0
-        ).to(tl.float32)
+        d_normed += tl.load(dq_ptrs, mask=s_mask[:, None] & is_query, other=0.0).to(tl.float32)
+        d_normed += tl.load(dk_ptrs, mask=s_mask[:, None] & is_key, other=0.0).to(tl.float32)
 
     silu_ptrs = (
         silu_bf16_ptr
@@ -628,11 +613,11 @@ def _qk_l2norm_repeat_backward_kernel(
 
 @triton.jit
 def _v_layout_to_conv_kernel(
-    dv_ptr,                # (b, s, num_v_heads, value_head_dim)
-    d_silu_conv_ptr,        # (b, conv_dim, s) — write into V channel slice
+    dv_ptr,  # (b, s, num_v_heads, value_head_dim)
+    d_silu_conv_ptr,  # (b, conv_dim, s) — write into V channel slice
     seq_len,
     num_v_heads,
-    v_channel_offset,       # = 2 * qk_channels
+    v_channel_offset,  # = 2 * qk_channels
     dv_b_stride,
     dv_s_stride,
     dv_h_stride,
@@ -683,11 +668,11 @@ def _v_layout_to_conv_kernel(
 
 @triton.jit
 def _z_layout_to_qkvzba_kernel(
-    dgate_ptr,             # (b, s, num_v_heads, value_head_dim)
-    d_qkvzba_ptr,           # (s, b, total_channels) — write into z channel slice
+    dgate_ptr,  # (b, s, num_v_heads, value_head_dim)
+    d_qkvzba_ptr,  # (s, b, total_channels) — write into z channel slice
     seq_len,
     num_v_heads,
-    z_channel_offset,       # = 2 * qk_channels + v_channels
+    z_channel_offset,  # = 2 * qk_channels + v_channels
     dgate_b_stride,
     dgate_s_stride,
     dgate_h_stride,
@@ -864,12 +849,8 @@ def _g_beta_backward_kernel(
         + pid_b * qkvzba_b_stride
         + (beta_channel_offset + h_offs[None, :]) * qkvzba_c_stride
     )
-    tl.store(
-        d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask
-    )
-    tl.store(
-        d_beta_ptrs, d_beta_raw.to(d_qkvzba_ptr.dtype.element_ty), mask=mask
-    )
+    tl.store(d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
+    tl.store(d_beta_ptrs, d_beta_raw.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
 
     # ----- Atomic-add (b, s) partials into per-head accumulators -----
     tl.atomic_add(d_A_log_ptr + h_offs, d_A_log_partial, mask=h_mask)
@@ -923,10 +904,7 @@ def _triton_qk_l2norm_repeat_backward(
     repeat = num_value_heads // num_key_heads
     device = dq.device
 
-    grid = lambda meta: (
-        batch * 2 * num_key_heads,
-        triton.cdiv(seq_len, meta["BLOCK_S"]),
-    )
+    grid = lambda meta: (batch * 2 * num_key_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
 
     with _launch_context(device, stream):
         _qk_l2norm_repeat_backward_kernel[grid](
@@ -1112,10 +1090,7 @@ class _NullContext:
         return False
 
 
-def _launch_context(
-    device: torch.device,
-    stream: Optional["torch.cuda.Stream"],
-):
+def _launch_context(device: torch.device, stream: Optional["torch.cuda.Stream"]):
     """Return a CUDA launch context after wiring the optional side stream."""
 
     if stream is None:
@@ -1124,18 +1099,13 @@ def _launch_context(
     return torch.cuda.stream(stream)
 
 
-def _wait_for_streams(
-    dst_stream: "torch.cuda.Stream",
-    *src_streams: "torch.cuda.Stream",
-) -> None:
+def _wait_for_streams(dst_stream: "torch.cuda.Stream", *src_streams: "torch.cuda.Stream") -> None:
     for stream in src_streams:
         dst_stream.wait_stream(stream)
 
 
 def _resolve_packed_seq_idx(
-    cu_seqlens: Optional[Tensor],
-    seq_idx: Optional[Tensor],
-    total_tokens: int,
+    cu_seqlens: Optional[Tensor], seq_idx: Optional[Tensor], total_tokens: int
 ) -> Optional[Tensor]:
     """Return the token-level sequence-id buffer for causal-conv backward."""
 
@@ -1186,8 +1156,7 @@ def _triton_pre_gated_delta_rule_forward(
     is_packed_thd = cu_seqlens is not None
     if is_packed_thd:
         assert batch == 1, (
-            "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; "
-            f"got {batch=}."
+            "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; " f"got {batch=}."
         )
         num_packed_seqs = cu_seqlens.shape[0] - 1
     else:
@@ -1207,9 +1176,9 @@ def _triton_pre_gated_delta_rule_forward(
     )
 
     expected_channels = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
-    assert total_channels == expected_channels, (
-        f"qkvzba last-dim mismatch: got {total_channels}, expected {expected_channels}."
-    )
+    assert (
+        total_channels == expected_channels
+    ), f"qkvzba last-dim mismatch: got {total_channels}, expected {expected_channels}."
 
     out_dtype = qkvzba.dtype
     device = qkvzba.device
@@ -1249,7 +1218,9 @@ def _triton_pre_gated_delta_rule_forward(
     # backward can feed it directly into the l2norm backward.
     silu_qk_save = torch.empty(
         (batch, seq_len, 2 * qk_channels), dtype=out_dtype, device=device
-    ).permute(0, 2, 1)  # → (b, 2*qk_c, s) with stride(1)==1
+    ).permute(
+        0, 2, 1
+    )  # → (b, 2*qk_c, s) with stride(1)==1
     silu_save_b_stride = silu_qk_save.stride(0)
     silu_save_c_stride = silu_qk_save.stride(1)
     silu_save_s_stride = silu_qk_save.stride(2)
@@ -1265,10 +1236,7 @@ def _triton_pre_gated_delta_rule_forward(
         stream.wait_stream(main_stream)
 
     # --- QK conv + silu + l2norm + repeat ---
-    qk_grid = lambda meta: (
-        batch * 2 * num_key_heads,
-        triton.cdiv(seq_len, meta["BLOCK_S"]),
-    )
+    qk_grid = lambda meta: (batch * 2 * num_key_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
     with torch.cuda.stream(qk_stream):
         if is_packed_thd:
             _conv_silu_project_thd_kernel[qk_grid](
@@ -1608,10 +1576,7 @@ def _triton_pre_gated_delta_rule_backward(
     # causal_conv1d_bwd_function write d_x directly into the right cells.
     seq_stride = qkvzba.stride(0)
     batch_stride = qkvzba.stride(1)
-    d_x_conv_view = d_qkvzba.as_strided(
-        (batch, conv_dim, seq_len),
-        (batch_stride, 1, seq_stride),
-    )
+    d_x_conv_view = d_qkvzba.as_strided((batch, conv_dim, seq_len), (batch_stride, 1, seq_stride))
 
     # Hand-tuned C++ conv backward. Internally folds the silu' factor and
     # computes both d_x and d_w in fp32; writes d_x directly into the
@@ -1619,14 +1584,14 @@ def _triton_pre_gated_delta_rule_backward(
     _, d_weight_fp32, _, _ = _causal_conv1d_bwd_function(
         qkvzba_conv,
         weight_2d,
-        None,              # no bias
+        None,  # no bias
         d_silu_conv,
         seq_idx,
-        None,              # initial_states
-        None,              # dfinal_states
-        d_x_conv_view,     # dx pre-allocated into d_qkvzba's conv slice
-        False,             # return_dinitial_states
-        True,              # activation (silu)
+        None,  # initial_states
+        None,  # dfinal_states
+        d_x_conv_view,  # dx pre-allocated into d_qkvzba's conv slice
+        False,  # return_dinitial_states
+        True,  # activation (silu)
     )
 
     d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
@@ -1662,22 +1627,22 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         key_head_dim,
         value_head_dim,
     ):
+        """Run the fused pre-GDR forward path and stash tensors for backward."""
+
         ctx.num_key_heads = num_key_heads
         ctx.num_value_heads = num_value_heads
         ctx.key_head_dim = key_head_dim
         ctx.value_head_dim = value_head_dim
-        query, key, value, gate, beta, g, silu_qk_save = (
-            _triton_pre_gated_delta_rule_forward(
-                qkvzba,
-                conv1d_weight,
-                A_log,
-                dt_bias,
-                num_key_heads=num_key_heads,
-                num_value_heads=num_value_heads,
-                key_head_dim=key_head_dim,
-                value_head_dim=value_head_dim,
-                cu_seqlens=cu_seqlens,
-            )
+        query, key, value, gate, beta, g, silu_qk_save = _triton_pre_gated_delta_rule_forward(
+            qkvzba,
+            conv1d_weight,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            cu_seqlens=cu_seqlens,
         )
         ctx.has_seq_idx = seq_idx is not None
         if ctx.has_seq_idx:
@@ -1688,6 +1653,8 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dq, dk, dv, dgate, dbeta, dg):
+        """Run the fused pre-GDR backward path from saved forward tensors."""
+
         if ctx.has_seq_idx:
             qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx = ctx.saved_tensors
         else:
@@ -1715,18 +1682,7 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         # cu_seqlens, seq_idx, num_key_heads, num_value_heads,
         # key_head_dim, value_head_dim).
         # Non-tensor args get None.
-        return (
-            d_qkvzba,
-            d_weight,
-            d_A_log,
-            d_dt_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return (d_qkvzba, d_weight, d_A_log, d_dt_bias, None, None, None, None, None, None)
 
 
 def fused_streamed_pre_gated_delta_rule(
@@ -1769,8 +1725,7 @@ def fused_streamed_pre_gated_delta_rule(
     """
 
     assert qkvzba.is_cuda, (
-        "fused_pre_gated_delta_rule requires CUDA inputs; "
-        f"got qkvzba.device={qkvzba.device}."
+        "fused_pre_gated_delta_rule requires CUDA inputs; " f"got qkvzba.device={qkvzba.device}."
     )
     assert conv1d_bias is None, (
         "Conv bias is not supported by fused_pre_gated_delta_rule "
@@ -1780,9 +1735,9 @@ def fused_streamed_pre_gated_delta_rule(
         "use_qk_l2norm=False is not supported by fused_pre_gated_delta_rule "
         "(the backward closes over the l2norm path)."
     )
-    assert num_value_heads % num_key_heads == 0, (
-        f"{num_value_heads=} must be a multiple of {num_key_heads=}."
-    )
+    assert (
+        num_value_heads % num_key_heads == 0
+    ), f"{num_value_heads=} must be a multiple of {num_key_heads=}."
     if cu_seqlens is not None:
         assert cu_seqlens.is_cuda, (
             "Packed fused_pre_gated_delta_rule requires CUDA cu_seqlens; "
@@ -1793,8 +1748,7 @@ def fused_streamed_pre_gated_delta_rule(
             f"got {cu_seqlens.dtype=}."
         )
         assert cu_seqlens.dim() == 1, (
-            "Packed fused_pre_gated_delta_rule expects 1-D cu_seqlens; "
-            f"got {cu_seqlens.shape=}."
+            "Packed fused_pre_gated_delta_rule expects 1-D cu_seqlens; " f"got {cu_seqlens.shape=}."
         )
         assert qkvzba.shape[1] == 1, (
             "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; "
