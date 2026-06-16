@@ -2,12 +2,12 @@
 
 import os
 import queue
+from contextlib import nullcontext
 from typing import Literal, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-from contextlib import nullcontext
-from unittest.mock import MagicMock
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -504,13 +504,9 @@ def test_te_attention_dropout_ctx_uses_tpxcp_tracker_when_sp_disabled(monkeypatc
         self.unfused_attention = MagicMock(attention_dropout_ctx=None)
 
     monkeypatch.setattr(
-        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
-        lambda: FakeTracker(),
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker", lambda: FakeTracker()
     )
-    monkeypatch.setattr(
-        "transformer_engine.pytorch.DotProductAttention.__init__",
-        fake_te_init,
-    )
+    monkeypatch.setattr("transformer_engine.pytorch.DotProductAttention.__init__", fake_te_init)
 
     config = TransformerConfig(
         num_layers=2,
@@ -552,13 +548,9 @@ def test_te_attention_backends_share_overridden_dropout_ctx(monkeypatch):
         self.unfused_attention = MagicMock(attention_dropout_ctx=None)
 
     monkeypatch.setattr(
-        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
-        lambda: FakeTracker(),
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker", lambda: FakeTracker()
     )
-    monkeypatch.setattr(
-        "transformer_engine.pytorch.DotProductAttention.__init__",
-        fake_te_init,
-    )
+    monkeypatch.setattr("transformer_engine.pytorch.DotProductAttention.__init__", fake_te_init)
 
     config = TransformerConfig(
         num_layers=2,
@@ -604,13 +596,9 @@ def test_te_attention_does_not_override_dropout_ctx_when_sequence_parallel_enabl
         self.unfused_attention = MagicMock(attention_dropout_ctx=default_ctx)
 
     monkeypatch.setattr(
-        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
-        lambda: FakeTracker(),
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker", lambda: FakeTracker()
     )
-    monkeypatch.setattr(
-        "transformer_engine.pytorch.DotProductAttention.__init__",
-        fake_te_init,
-    )
+    monkeypatch.setattr("transformer_engine.pytorch.DotProductAttention.__init__", fake_te_init)
 
     config = TransformerConfig(
         num_layers=2,
@@ -634,5 +622,11 @@ def test_te_attention_does_not_override_dropout_ctx_when_sequence_parallel_enabl
         pass
 
     assert tracker_names == []
-    assert attention.flash_attention.attention_dropout_ctx is attention.fused_attention.attention_dropout_ctx
-    assert attention.flash_attention.attention_dropout_ctx is attention.unfused_attention.attention_dropout_ctx
+    assert (
+        attention.flash_attention.attention_dropout_ctx
+        is attention.fused_attention.attention_dropout_ctx
+    )
+    assert (
+        attention.flash_attention.attention_dropout_ctx
+        is attention.unfused_attention.attention_dropout_ctx
+    )

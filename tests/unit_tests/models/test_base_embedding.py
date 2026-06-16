@@ -85,7 +85,11 @@ def test_embedding_dropout_uses_context_parallel_tracker():
 
         batch_size = 4
         seq_len = embedding.max_sequence_length
-        input_ids = torch.arange(seq_len, device='cuda', dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+        input_ids = (
+            torch.arange(seq_len, device='cuda', dtype=torch.long)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
         position_ids = input_ids.clone()
         output = embedding(input_ids, position_ids)
         dropout_mask = output.eq(0).cpu()
@@ -93,10 +97,7 @@ def test_embedding_dropout_uses_context_parallel_tracker():
         assert dropout_mask.any()
         assert (~dropout_mask).any()
 
-        payload = {
-            "cp_rank": parallel_state.get_context_parallel_rank(),
-            "mask": dropout_mask,
-        }
+        payload = {"cp_rank": parallel_state.get_context_parallel_rank(), "mask": dropout_mask}
         gathered = [None for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather_object(gathered, payload)
 
@@ -111,10 +112,7 @@ def test_embedding_dropout_uses_context_parallel_tracker():
 
         cp_ranks = sorted(masks_by_cp_rank)
         assert len(cp_ranks) == 2
-        assert not torch.equal(
-            masks_by_cp_rank[cp_ranks[0]][0],
-            masks_by_cp_rank[cp_ranks[1]][0],
-        )
+        assert not torch.equal(masks_by_cp_rank[cp_ranks[0]][0], masks_by_cp_rank[cp_ranks[1]][0])
     finally:
         Utils.destroy_model_parallel()
 
@@ -146,7 +144,11 @@ def test_embedding_dropout_uses_model_and_context_parallel_tracker_when_sequence
 
         batch_size = 4
         seq_len = embedding.max_sequence_length
-        input_ids = torch.arange(seq_len, device='cuda', dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+        input_ids = (
+            torch.arange(seq_len, device='cuda', dtype=torch.long)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
         position_ids = input_ids.clone()
         output = embedding(input_ids, position_ids)
         dropout_mask = output.eq(0).cpu()

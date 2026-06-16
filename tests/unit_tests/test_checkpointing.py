@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
-import pytest
-import torch
-import torch.distributed.checkpoint
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
+
+import pytest
+import torch
+import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
@@ -432,7 +433,9 @@ def test_fsdp_load_rng_state_dict_backfills_context_and_model_context_trackers(i
     rng_state_dict = _get_rng_state_dict()
     rng_state_dict["rng_tracker_states"] = dict(rng_state_dict["rng_tracker_states"])
     rng_state_dict["rng_tracker_states"].pop(get_context_parallel_rng_tracker_name(), None)
-    rng_state_dict["rng_tracker_states"].pop(get_model_and_context_parallel_rng_tracker_name(), None)
+    rng_state_dict["rng_tracker_states"].pop(
+        get_model_and_context_parallel_rng_tracker_name(), None
+    )
 
     model_parallel_cuda_manual_seed(888, force_reset_rng=True)
     _load_rng_state_dict(rng_state_dict)

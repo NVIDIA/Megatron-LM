@@ -103,16 +103,16 @@ _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 # Step 1: declare upper bounds for each parallel dimension.
 #   Raising a bound automatically shifts the derived BASE and keeps all slots
 #   non-overlapping — no other constant needs to change.
-_TP_MAX = 1 << 10   # 1,024      TP_world_size upper bound
-_CP_MAX = 1 << 10   # 1,024      CP_world_size upper bound
-_TPCP_MAX = _TP_MAX * _CP_MAX   # 1,048,576  TP×CP upper bound (tc_rank ∈ [0, TP*CP-1])
-_EP_MAX = 1 << 13   # 8,192      EP_world_size upper bound
-_ETP_MAX = 1 << 10   # 1,024      expert_tensor_parallel upper bound (also the ETP stride)
+_TP_MAX = 1 << 10  # 1,024      TP_world_size upper bound
+_CP_MAX = 1 << 10  # 1,024      CP_world_size upper bound
+_TPCP_MAX = _TP_MAX * _CP_MAX  # 1,048,576  TP×CP upper bound (tc_rank ∈ [0, TP*CP-1])
+_EP_MAX = 1 << 13  # 8,192      EP_world_size upper bound
+_ETP_MAX = 1 << 10  # 1,024      expert_tensor_parallel upper bound (also the ETP stride)
 #
 # Step 2: derive non-overlapping BASEs as a cumulative sum.
 #   BASE[i] = BASE[i-1] + slot_size[i-1],  i.e. each slot starts immediately
 #   after the previous one ends.  Non-overlap proof:
-#     END[i-1] = BASE[i-1] + slot_size[i-1] - 1 = BASE[i] - 1 < BASE[i] 
+#     END[i-1] = BASE[i-1] + slot_size[i-1] - 1 = BASE[i] - 1 < BASE[i]
 #
 #   Tracker  slot size         BASE (cumulative)
 #   ──────── ──────────────    ─────────────────────────────────────────
@@ -242,7 +242,7 @@ def convert_cuda_rng_state(
 
 
 def clone_cuda_rng_state(
-    state: Union[torch.Tensor, torch.Generator],
+    state: Union[torch.Tensor, torch.Generator]
 ) -> Union[torch.Tensor, torch.Generator]:
     """Clone a CUDA RNG state tensor or graph-safe generator."""
     if isinstance(state, torch.Tensor):
@@ -315,7 +315,7 @@ def ensure_context_parallel_rng_tracker_states(
 
 
 def ensure_model_and_context_parallel_rng_tracker_states(
-    states: dict[str, Union[torch.Tensor, torch.Generator]],
+    states: dict[str, Union[torch.Tensor, torch.Generator]]
 ) -> dict[str, Union[torch.Tensor, torch.Generator]]:
     """Backfill the TPxCP RNG tracker state when loading older checkpoints."""
     if (
@@ -650,9 +650,7 @@ def model_parallel_cuda_manual_seed(
 
     context_parallel_world_size = get_context_parallel_world_size()
     context_parallel_seed = (
-        seed + _CP_RNG_SEED_OFFSET + cp_rank
-        if context_parallel_world_size > 1
-        else None
+        seed + _CP_RNG_SEED_OFFSET + cp_rank if context_parallel_world_size > 1 else None
     )
     _initialize_rng_tracker_state(
         rng_tracker,
@@ -663,9 +661,7 @@ def model_parallel_cuda_manual_seed(
 
     # TPxCP forward/dropout state.
     tensor_and_context_parallel_seed = (
-        seed + _TPCP_RNG_SEED_OFFSET + tc_rank
-        if context_parallel_world_size > 1
-        else None
+        seed + _TPCP_RNG_SEED_OFFSET + tc_rank if context_parallel_world_size > 1 else None
     )
     _initialize_rng_tracker_state(
         rng_tracker,

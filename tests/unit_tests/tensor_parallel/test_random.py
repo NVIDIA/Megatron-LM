@@ -1,26 +1,25 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import contextmanager
 from unittest import mock
 
 import pytest
 import torch
-from contextlib import contextmanager
-
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutput,
-    CudaRNGStatesTracker,
     _CP_MAX,
     _CP_RNG_SEED_OFFSET,
     _EP_ETP_STRIDE,
     _EP_MAX,
-    _ETP_MAX,
     _EP_RNG_SEED_OFFSET,
-    _TPCP_MAX,
+    _ETP_MAX,
     _TP_MAX,
     _TP_RNG_SEED_OFFSET,
+    _TPCP_MAX,
     _TPCP_RNG_SEED_OFFSET,
+    CheckpointWithoutOutput,
+    CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
     ensure_context_parallel_rng_tracker_states,
@@ -218,7 +217,7 @@ def test_cp_only_and_tpxcp_tracker_seed_semantics(mock_cp_world_size):
     # CP seed    = base_seed + _CP_RNG_SEED_OFFSET   + cp_rank
     # TPxCP seed = base_seed + _TPCP_RNG_SEED_OFFSET + tc_rank
     expected_context_seed = 123 + _CP_RNG_SEED_OFFSET + 1
-    expected_tpcp_seed    = 123 + _TPCP_RNG_SEED_OFFSET + 3
+    expected_tpcp_seed = 123 + _TPCP_RNG_SEED_OFFSET + 3
 
     expected_context_tracker = CudaRNGStatesTracker()
     expected_context_tracker.add(get_context_parallel_rng_tracker_name(), expected_context_seed)
@@ -253,18 +252,18 @@ def test_all_rng_tracker_seed_slots_are_non_overlapping():
 
     # Each slot is (base, max_rank_index) — the slot occupies [base, base+max_rank_index].
     slots = {
-        "DP":    (0,                    0),
-        "TP":    (_TP_RNG_SEED_OFFSET,  _TP_MAX - 1),
-        "CP":    (_CP_RNG_SEED_OFFSET,  _CP_MAX - 1),
+        "DP": (0, 0),
+        "TP": (_TP_RNG_SEED_OFFSET, _TP_MAX - 1),
+        "CP": (_CP_RNG_SEED_OFFSET, _CP_MAX - 1),
         "TPxCP": (_TPCP_RNG_SEED_OFFSET, _TPCP_MAX - 1),
-        "EP":    (_EP_RNG_SEED_OFFSET,  (_EP_MAX - 1) * _EP_ETP_STRIDE + (_ETP_MAX - 1)),
+        "EP": (_EP_RNG_SEED_OFFSET, (_EP_MAX - 1) * _EP_ETP_STRIDE + (_ETP_MAX - 1)),
     }
 
     # Assert every slot is strictly ordered (non-overlapping) when sorted by base.
     ordered = sorted(slots.items(), key=lambda kv: kv[1][0])
     for i in range(len(ordered) - 1):
         name_lo, (base_lo, max_lo) = ordered[i]
-        name_hi, (base_hi, _)      = ordered[i + 1]
+        name_hi, (base_hi, _) = ordered[i + 1]
         end_lo = base_lo + max_lo
         assert end_lo < base_hi, (
             f"Seed slot '{name_lo}' [base={base_lo}, end={end_lo}] overlaps "
@@ -409,6 +408,7 @@ def _rng_context_from_config(sequence_parallel, context_parallel_size):
 def test_checkpoint_recompute_preserves_context_parallel_rng_behavior():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
     try:
+
         def dropout_forward(input_, sequence_parallel=False):
             with _rng_context_from_config(sequence_parallel, context_parallel_size=2):
                 return torch.nn.functional.dropout(input_, p=0.5, training=True)
@@ -430,10 +430,7 @@ def test_checkpoint_recompute_preserves_context_parallel_rng_behavior():
         torch.testing.assert_close(input_plain.grad, input_ckpt.grad)
 
         dropout_mask = plain_output.eq(0).cpu()
-        payload = {
-            "cp_rank": parallel_state.get_context_parallel_rank(),
-            "mask": dropout_mask,
-        }
+        payload = {"cp_rank": parallel_state.get_context_parallel_rank(), "mask": dropout_mask}
         gathered = [None for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather_object(gathered, payload)
 
@@ -448,10 +445,7 @@ def test_checkpoint_recompute_preserves_context_parallel_rng_behavior():
 
         cp_ranks = sorted(masks_by_cp_rank)
         assert len(cp_ranks) == 2
-        assert not torch.equal(
-            masks_by_cp_rank[cp_ranks[0]][0],
-            masks_by_cp_rank[cp_ranks[1]][0],
-        )
+        assert not torch.equal(masks_by_cp_rank[cp_ranks[0]][0], masks_by_cp_rank[cp_ranks[1]][0])
     finally:
         Utils.destroy_model_parallel()
 
@@ -460,6 +454,7 @@ def test_checkpoint_recompute_preserves_context_parallel_rng_behavior():
 def test_checkpoint_recompute_preserves_model_and_context_parallel_rng_behavior():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
     try:
+
         def dropout_forward(input_):
             with _rng_context_from_config(sequence_parallel=True, context_parallel_size=2):
                 return torch.nn.functional.dropout(input_, p=0.5, training=True)
@@ -513,7 +508,9 @@ def test_ensure_model_and_context_parallel_rng_tracker_states_clones_model_paral
 
     existing_target = CudaRNGStatesTracker()
     existing_target.add(get_model_and_context_parallel_rng_tracker_name(), 321)
-    expected_target_state = existing_target.get_states()[get_model_and_context_parallel_rng_tracker_name()]
+    expected_target_state = existing_target.get_states()[
+        get_model_and_context_parallel_rng_tracker_name()
+    ]
     states_with_target = {
         get_model_parallel_rng_tracker_name(): source_state,
         get_model_and_context_parallel_rng_tracker_name(): expected_target_state,
