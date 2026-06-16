@@ -2375,9 +2375,7 @@ class TECudaGraphHelper:
                 overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
             )
             _probe_st = _probe_get_st(
-                probe_num_microbatches,
-                self.num_model_chunks,
-                microbatch_group_size_per_vp_stage,
+                probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
             )
             _probe_order = convert_schedule_table_to_order(
                 _probe_warmup, self.num_model_chunks, _probe_st
@@ -2434,9 +2432,7 @@ class TECudaGraphHelper:
             p2p_communicator=self.p2p_communicator,
         )
         schedule_table = get_schedule_table(
-            self.num_microbatches,
-            self.num_model_chunks,
-            microbatch_group_size_per_vp_stage,
+            self.num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
         )
         order = convert_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table

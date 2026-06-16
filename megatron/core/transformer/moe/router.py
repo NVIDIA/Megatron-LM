@@ -597,7 +597,9 @@ class TopKRouter(Router):
                     valid_token_count if valid_token_count is not None else activation.shape[0]
                 )
                 if torch.is_tensor(num_local_tokens):
-                    aux_loss_scale_num_tokens = num_local_tokens.clone().to(device=activation.device)
+                    aux_loss_scale_num_tokens = num_local_tokens.clone().to(
+                        device=activation.device
+                    )
                 else:
                     aux_loss_scale_num_tokens = torch.tensor(
                         num_local_tokens, device=activation.device
@@ -654,10 +656,7 @@ class TopKRouter(Router):
                 # token count. Attach the local z-loss numerator directly so the final
                 # objective is a token-weighted z-loss over valid tokens.
                 z_loss = z_loss_sum * self.config.moe_z_loss_coeff / mtp_loss_scale
-                logits = MoEAuxLossAutoScaler.apply(
-                    logits,
-                    z_loss,
-                )
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             else:
                 moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
                 z_loss = z_loss_mean * moe_z_loss_coeff / mtp_loss_scale

@@ -55,8 +55,7 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
 
     assert torch.equal(
-        padding_mask,
-        torch.tensor([False, False, False, True, False, False, True, True]),
+        padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
     )
 
 

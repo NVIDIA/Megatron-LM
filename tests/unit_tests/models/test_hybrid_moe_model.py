@@ -351,10 +351,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = {
-    "pad_packed_seq_alignment",
-    "pad_packed_seq_by_appending_dummy_seq",
-}
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "pad_packed_seq_by_appending_dummy_seq"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

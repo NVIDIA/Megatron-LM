@@ -29,7 +29,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 
 
-def _build_thd_padding_mask(cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor) -> torch.Tensor:
+def _build_thd_padding_mask(
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
+) -> torch.Tensor:
     """Build a 1D THD padding mask from scheduler sequence metadata."""
     assert cu_seqlens.dim() == 1
     assert cu_seqlens_padded.dim() == 1
@@ -56,12 +58,7 @@ def _build_thd_padding_mask(cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.T
 def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
     """Replace padded token-like slots with safe neutral values in-place."""
     assert padding_mask.dim() == 1
-    pad_values = {
-        'tokens': 0,
-        'labels': 0,
-        'loss_mask': 0.0,
-        'position_ids': 0,
-    }
+    pad_values = {'tokens': 0, 'labels': 0, 'loss_mask': 0.0, 'position_ids': 0}
     for key, pad_value in pad_values.items():
         tensor = batch.get(key)
         if tensor is None:

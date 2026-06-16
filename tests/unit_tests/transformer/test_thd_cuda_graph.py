@@ -451,9 +451,7 @@ class TestPadSequenceForThd:
         """Existing THD padding and appended tail padding are merged in one helper."""
         seqlens, total_T, max_seqlen = [4, 4], 8, 10
         padding_mask = torch.tensor(
-            [[False, False, False, True, False, False, True, True]],
-            dtype=torch.bool,
-            device="cuda",
+            [[False, False, False, True, False, False, True, True]], dtype=torch.bool, device="cuda"
         )
 
         _, _, _, _, _, m = pad_sequence_for_thd(
