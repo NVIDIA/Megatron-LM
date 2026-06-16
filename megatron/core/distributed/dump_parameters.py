@@ -75,19 +75,25 @@ def _dump_param(p: DTensor) -> dict[str, Any]:
     """Convert one optimizer param to a JSON-serializable dict."""
     local = p.to_local()
     mesh = p.device_mesh
-    return {
+    out: dict[str, Any] = {
         "global_shape": tuple(int(s) for s in p.shape),
         "dtype": str(p.dtype),
         "is_qkv": _is_qkv(p),
         "local_shape": tuple(int(s) for s in local.shape),
         "mesh_shape": tuple(int(s) for s in mesh.shape),
         "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
-        # Global rank IDs that form this param's mesh, flat in row-major order.
-        # Lets consumers identify exactly which devices participate (e.g., for
-        # a (2,) EP-pair mesh, [r_A, r_B]). ``mesh_shape`` gives the reshape.
-        "mesh_ranks": mesh.mesh.flatten().tolist(),
         "placements": [repr(pl) for pl in p.placements],
     }
+    # Record the global rank IDs that form this param's mesh, flat in row-major
+    # order — only when they aren't the canonical ``range(mesh.numel())``. The
+    # full-world mesh always uses canonical ranks; sub-meshes (EP groups, etc.)
+    # generally don't. Omitting the canonical case keeps the dump compact while
+    # still letting consumers reconstruct the exact device assignment.
+    # ``mesh_shape`` gives the reshape when present.
+    mesh_ranks = mesh.mesh.flatten().tolist()
+    if mesh_ranks != list(range(len(mesh_ranks))):
+        out["mesh_ranks"] = mesh_ranks
+    return out
 
 
 def _is_qkv(p: torch.Tensor) -> bool:
