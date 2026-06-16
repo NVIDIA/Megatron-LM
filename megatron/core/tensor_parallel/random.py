@@ -608,6 +608,29 @@ def model_parallel_cuda_manual_seed(
         cp_rank = get_context_parallel_rank()
     if tc_rank is None:
         tc_rank = get_tensor_and_context_parallel_rank()
+    # Guard: ensure every rank fits within the design bounds declared in the seed-space
+    # layout above.  An out-of-range rank would push the seed into a neighbouring slot
+    # and cause a duplicate-seed collision (the very bug this layout was designed to fix).
+    assert 0 <= tp_rank < _TP_MAX, (
+        f"tp_rank={tp_rank} is outside the supported range [0, {_TP_MAX}). "
+        f"Increase _TP_MAX in random.py if a larger TP degree is needed."
+    )
+    assert 0 <= cp_rank < _CP_MAX, (
+        f"cp_rank={cp_rank} is outside the supported range [0, {_CP_MAX}). "
+        f"Increase _CP_MAX in random.py if a larger CP degree is needed."
+    )
+    assert 0 <= tc_rank < _TPCP_MAX, (
+        f"tc_rank={tc_rank} is outside the supported range [0, {_TPCP_MAX}). "
+        f"Increase _TP_MAX or _CP_MAX in random.py if a larger TP×CP degree is needed."
+    )
+    assert 0 <= ep_rank < _EP_MAX, (
+        f"ep_rank={ep_rank} is outside the supported range [0, {_EP_MAX}). "
+        f"Increase _EP_MAX in random.py if a larger EP degree is needed."
+    )
+    assert 0 <= etp_rank < _ETP_MAX, (
+        f"etp_rank={etp_rank} is outside the supported range [0, {_ETP_MAX}). "
+        f"Increase _ETP_MAX in random.py if a larger ETP degree is needed."
+    )
     # Each tracker occupies a non-overlapping slot; see the seed-space layout comment above.
     data_parallel_seed = seed
     tensor_model_parallel_seed = seed + _TP_RNG_SEED_OFFSET + tp_rank
