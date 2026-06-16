@@ -62,14 +62,11 @@ def _is_pg_member(pg) -> bool:
 
 def _is_token_source_rank(language_pg) -> bool:
     """Whether this rank is on the LLM (last PP stage, TP rank 0) coordinate that sums
-    the global token count over the DP/CP group.
+    the global token count over DP/CP.
 
-    These ranks (one per DP/CP position) collectively all-reduce the count over DP/CP;
-    only DP/CP rank 0 then holds the value and serves as the broadcast root. Sourcing
-    from this single coordinate avoids double-counting across TP/PP replicas. In
-    non-colocated, language_pg is the LLM collection seen on every rank, so encoder-grid
-    ranks reach here with non-member (None) pp/tp groups — the _is_pg_member guards
-    short-circuit so they never participate.
+    Sourcing from this single coordinate avoids double-counting across TP/PP replicas.
+    The _is_pg_member guards short-circuit encoder-grid ranks (non-member pp/tp groups)
+    so they never participate.
     """
     if language_pg is None:
         return False
@@ -84,19 +81,12 @@ def _is_token_source_rank(language_pg) -> bool:
 
 
 def _token_source_global_rank(language_grid) -> int:
-    """Global (default-group) rank of the single LLM token-source coordinate.
+    """Global rank of the single LLM token-source coordinate (tp=0, cp=0, dp=0, pp=last).
 
-    The source is the language coordinate (tp=0, cp=0, dp=0, pp=last). It is derived
-    statically from the grid's rank enumeration (identical on every rank), so even the
-    non-colocated encoder grid — which is not a member of any LLM group — can name this
-    global rank as the broadcast root.
-
-    ``get_rank_enum("pp")`` returns the authoritative PP rank lists that ``create_pg``
-    uses for this grid; each list is one (tp, cp, dp) coordinate ordered along PP and
-    already accounts for ``rank_offset``. Rather than assume which list is the all-zero
-    coordinate, the source line is read directly from the enumeration: the global minimum
-    rank belongs to (tp=0, cp=0, dp=0), so its PP line is the source line and that line's
-    last entry is the (pp=last) source rank.
+    Derived statically from ``get_rank_enum("pp")`` (the grid's authoritative rank
+    enumeration, identical on every rank), so encoder-grid ranks in no LLM group can name
+    it. The global minimum rank is (tp=0, cp=0, dp=0), so its PP line is the source line
+    and that line's last entry is the (pp=last) source rank.
     """
     pp_lines = language_grid.get_rank_enum("pp")
     min_rank = min(rank for line in pp_lines for rank in line)
@@ -143,10 +133,8 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     """
     module_pgs = topology.module_pgs
     language_pg = module_pgs.get(MIMO_LANGUAGE_MODULE_KEY)
-    # Static (collective-free) derivation of the token source's global rank, used as the
-    # broadcast root that publishes N_global to every rank — including the non-colocated
-    # encoder grid, which belongs to no LLM group and therefore cannot name the root via
-    # any LLM process group.
+    # Broadcast root for N_global; derived statically so encoder-grid ranks (in no LLM
+    # group) can still name it.
     src_global_rank = _token_source_global_rank(topology.grids[MIMO_LANGUAGE_MODULE_KEY])
     correct_vision_grad = bool(
         getattr(args, "correct_encoder_grad_for_partial_participation", False)
