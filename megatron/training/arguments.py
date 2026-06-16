@@ -1280,6 +1280,27 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
+        if args.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert args.data_parallel_sharding_strategy == "optim_grads_params", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                'with --data-parallel-sharding-strategy optim_grads_params.'
+            )
+            assert args.recompute_granularity == "full", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                "with full activation recomputation."
+            )
+            assert not args.overlap_moe_expert_parallel_comm, (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
+                "with --overlap-moe-expert-parallel-comm."
+            )
+    else:
+        assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
+            "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
+        )
+        assert not args.megatron_fsdp_cache_param_bucket_views, (
+            "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
+        )
+
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -4927,6 +4948,27 @@ def _add_experimental_args(parser):
         "model gradients during FSDP. If 'auto', then the main gradient data-type will "
         "be used for the gradient communication / reduction data-type. When using NCCL "
         "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.",
+    )
+    group.add_argument(
+        '--megatron-fsdp-prefetch-recompute-forward-weights',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_prefetch_recompute_forward_weights',
+        help=(
+            'If set, Megatron-FSDP prefetches rowwise weights needed by activation '
+            'recomputation during backward before prefetching backward transpose '
+            'weights.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-cache-param-bucket-views',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_cache_param_bucket_views',
+        help=(
+            'If set, Megatron-FSDP caches parameter bucket views to reduce repeated '
+            'Python-side view setup when attaching module parameters to all-gather buckets.'
+        ),
     )
     group.add_argument(
         '--megatron-fsdp-enable-fine-grained-param-gather',
