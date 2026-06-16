@@ -33,16 +33,26 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
@@ -414,7 +424,7 @@ class TestMTPCudaGraphInference:
             )
             dist.broadcast(full_hidden, src=0)
             local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-            unwrapped._decoder_hidden_states_cache = local_hidden
+            context.mtp_decoder_hidden_states = local_hidden
 
             ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
             ctrl._mtp_resolved_padded_count = padded_count
@@ -435,7 +445,7 @@ class TestMTPCudaGraphInference:
                 assert sampled.dtype == torch.int64
                 assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
-            assert not hasattr(unwrapped, '_decoder_hidden_states_cache')
+            assert context.mtp_decoder_hidden_states is None
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
@@ -517,7 +527,7 @@ class TestMTPCudaGraphInference:
                 )
                 dist.broadcast(full_hidden, src=0)
                 local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-                unwrapped._decoder_hidden_states_cache = local_hidden
+                context.mtp_decoder_hidden_states = local_hidden
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
                 # Greedy sampling for all active requests.
@@ -1096,3 +1106,279 @@ class TestMTPCudaGraphExpertParallel:
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)
         assert logits.shape == (tp_size, 1, self.VOCAB_SIZE)
+
+
+# --------------------------------------------------------------------------- #
+#  TestMTPBlockScopeCudaGraph (TP = 1)
+# --------------------------------------------------------------------------- #
+
+
+def _build_hybrid_stack_spec():
+    """Build a minimal HybridStack spec using local (non-TE) modules."""
+    attention_layer_spec = get_gpt_layer_local_spec()
+
+    backend = LocalSpecProvider()
+    norm_impl = backend.layer_norm()
+    col_linear_impl = backend.column_parallel_linear()
+
+    mtp_layer_spec = ModuleSpec(
+        module=MultiTokenPredictionLayer,
+        submodules=MultiTokenPredictionLayerSubmodules(
+            enorm=norm_impl,
+            hnorm=norm_impl,
+            eh_proj=col_linear_impl,
+            mtp_model_layer=None,
+            layer_norm=norm_impl,
+        ),
+    )
+    mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer_spec]),
+    )
+
+    return ModuleSpec(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
+            attention_layer=attention_layer_spec, mtp_block_spec=mtp_block_spec
+        ),
+    )
+
+
+class TestMTPBlockScopeCudaGraph:
+    """Tests that block-scope CUDA graphs correctly propagate decoder hidden
+    states for MTP inference.
+
+    When ``inference_cuda_graph_scope='block'``, the entire model forward is
+    captured as a single CUDA graph. ``context.mtp_decoder_hidden_states``
+    holds a pre-allocated buffer that is written via ``copy_()`` during every
+    graph replay so that it is available on every replay, not just during capture.
+    """
+
+    HIDDEN_SIZE = 32
+    VOCAB_SIZE = 100
+    MAX_SEQ_LEN = 64
+    NUM_LAYERS = 4
+    NUM_ATTN_HEADS = 4
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        delete_cuda_graphs()
+
+    def _build_model(self, *, inference_cuda_graph_scope='block'):
+        """Build a HybridModel with MTP and block-scope CUDA graph support."""
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = TransformerConfig(
+            num_layers=self.NUM_LAYERS,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.NUM_ATTN_HEADS,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            pipeline_dtype=torch.bfloat16,
+            mtp_num_layers=1,
+            cuda_graph_impl="local",
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
+        )
+        hybrid_stack_spec = _build_hybrid_stack_spec()
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            hybrid_layer_pattern="****/*",
+            position_embedding_type='rope',
+        ).cuda()
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+        return model
+
+    def _build_engine(self, *, inference_cuda_graph_scope='block'):
+        """Build a DynamicInferenceEngine with block-scope CUDA graphs."""
+        delete_cuda_graphs()
+        model = self._build_model(inference_cuda_graph_scope=inference_cuda_graph_scope)
+        config = model.config
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.5,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=1,
+                block_size_tokens=256,
+                max_requests=16,
+                num_cuda_graphs=-1,
+                sampling_backend='torch',
+            ),
+        )
+        wrapped = GPTInferenceWrapper(model, context)
+        wrapped.model_is_pipeline_parallel = False
+        mock_tokenizer = mock.Mock()
+        ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
+        engine = DynamicInferenceEngine(ctrl, context)
+        return engine
+
+    @pytest.mark.parametrize("inference_cuda_graph_scope", ['block', 'layer'])
+    @torch.inference_mode()
+    def test_decoder_hidden_states_set_after_forward(self, inference_cuda_graph_scope):
+        """Decoder hidden states are accessible via the context after each forward pass.
+
+        Block-scope CUDA graphs: forward() writes via copy_() into the pre-allocated
+        context buffer, captured once and replayed to the same GPU address each step.
+        Layer-scope (non-block) CUDA graphs: forward() assigns the tensor directly to
+        the context attribute; the controller sets it back to None after reading to allow GC.
+        Both scopes are valid with cuda_graph_impl='local'.
+        """
+        engine = self._build_engine(inference_cuda_graph_scope=inference_cuda_graph_scope)
+        ctrl = engine.controller
+        context = engine.context
+
+        prompt_length = 10
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.arange(prompt_length, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=20),
+        )
+        context.add_request(req)
+        context.initialize_attention_state()
+
+        active_mask = torch.ones(1, device='cuda', dtype=torch.int32)
+        new_tokens = torch.zeros(1, device='cuda', dtype=torch.int64)
+        new_spec = torch.zeros(1, 1, device='cuda', dtype=torch.int64)
+        context.update_requests(
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
+        )
+        context.initialize_attention_state()
+
+        for step in range(3):
+            # Simulate the controller consuming hidden states from the previous step.
+            if inference_cuda_graph_scope != 'block':
+                context.mtp_decoder_hidden_states = None
+
+            input_ids, position_ids = ctrl._dynamic_step_context_init()
+            ctrl._dynamic_step_forward_logits(input_ids, position_ids)
+
+            assert context.mtp_decoder_hidden_states is not None, (
+                f"Step {step}: context.mtp_decoder_hidden_states is None "
+                f"(scope={inference_cuda_graph_scope})"
+            )
+            assert context.mtp_decoder_hidden_states.shape[-1] == self.HIDDEN_SIZE
+
+    @torch.inference_mode()
+    def test_mtp_forward_with_runtime_tokens_below_max(self):
+        """Block-scope MTP forward is correct when runtime tokens < ``max_tokens``.
+
+        The decoder hidden-states buffer is pre-allocated to the worst-case
+        ``(max_tokens, 1, hidden_size)`` so the block CUDA graph can write into a
+        fixed GPU address, but a real decode step only fills the ``[:n]`` prefix
+        (``n = active_request_count`` rows, far below ``max_tokens``).
+
+        This verifies two things in one shot:
+        1. **No shape issues** — the controller gathers ``[:n]`` rows from the
+           ``max_tokens``-sized buffer and the downstream MTP layer forward runs
+           without any shape mismatch.
+        2. **Forward correctness** — the unused buffer tail does not leak into the
+           computation. The tail is poisoned with NaN; the sampled MTP tokens must
+           still match a reference run against an exactly ``(n, 1, H)``-sized
+           buffer (and stay finite/in-range). If the MTP forward read past the
+           valid prefix, the NaNs would change the result.
+        """
+        engine = self._build_engine(inference_cuda_graph_scope='block')
+        ctrl = engine.controller
+        context = engine.context
+
+        num_spec = ctrl.num_speculative_tokens
+        assert num_spec > 0 and ctrl.num_mtp_depths > 0
+
+        # The block-scope buffer is sized to the worst case; pick an active count
+        # that is comfortably below capacity to exercise the partial-fill path.
+        active_request_count = 3
+        assert active_request_count < context.max_tokens
+
+        buffer = context.mtp_decoder_hidden_states
+        assert buffer is not None
+        assert buffer.shape == (context.max_tokens, 1, self.HIDDEN_SIZE)
+
+        # Deterministic hidden states for the valid prefix, shared by both runs.
+        torch.manual_seed(42)
+        prefix_hidden = torch.randn(
+            active_request_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+        )
+
+        def _run_eager_mtp(decoder_hidden_states):
+            """Set up decode state and run eager MTP, returning sampled tokens."""
+            context.reset()
+            context.total_request_count = active_request_count
+            context.paused_request_count = 0
+            context.request_kv_length_offsets[:active_request_count] = torch.arange(
+                active_request_count, dtype=torch.int32, device='cuda'
+            )
+            context.request_query_lengths[:active_request_count] = torch.ones(
+                active_request_count, dtype=torch.int32, device='cuda'
+            )
+
+            ctrl.num_speculative_tokens = num_spec
+            ctrl._init_mtp_sampling_tensors()
+            ctrl._mtp_token_ids_buf.zero_()
+            ctrl._mtp_position_ids_buf.zero_()
+            ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+                torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
+            )
+
+            # Eager path (no CUDA graph, no SP padding for TP=1).
+            ctrl._mtp_resolved_padded_count = None
+            context._using_cuda_graph_this_step = False
+
+            context.mtp_decoder_hidden_states = decoder_hidden_states
+            ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+
+            # Greedy sampling for all active requests.
+            context.active_request_metadata["temperature"][:active_request_count] = 1.0
+            context.active_request_metadata["top_k"][:active_request_count] = 1
+            context.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+            ctrl._compute_serial_mtp_and_sample()
+
+            return [
+                ctrl._sampled_mtp_tokens_cuda[d, :active_request_count].clone()
+                for d in range(ctrl.num_mtp_depths)
+            ]
+
+        # Run 1: max_tokens-sized buffer with only the [:n] prefix valid; poison
+        # the unused tail with NaN so any over-read corrupts the result.
+        buffer.fill_(float('nan'))
+        buffer[:active_request_count].copy_(prefix_hidden)
+        oversized_tokens = _run_eager_mtp(buffer)
+
+        # Run 2: reference buffer sized exactly to the runtime token count.
+        exact_buffer = prefix_hidden.clone()
+        reference_tokens = _run_eager_mtp(exact_buffer)
+
+        for depth in range(ctrl.num_mtp_depths):
+            sampled = oversized_tokens[depth]
+            assert sampled.shape == (active_request_count,), (
+                f"depth={depth}: expected shape ({active_request_count},), "
+                f"got {tuple(sampled.shape)}"
+            )
+            assert sampled.dtype == torch.int64
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
+            assert torch.equal(sampled, reference_tokens[depth]), (
+                f"depth={depth}: MTP tokens from the max_tokens-sized buffer "
+                f"{sampled.tolist()} != reference {reference_tokens[depth].tolist()}; "
+                "the unused buffer tail leaked into the MTP forward"
+            )

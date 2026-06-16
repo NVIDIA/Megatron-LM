@@ -1419,7 +1419,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock the MTP computation to record the position_ids it receives
         unwrapped_model = self.text_generation_controller.inference_wrapped_model.model
-        unwrapped_model._decoder_hidden_states_cache = torch.randn(2, 1, 32, device='cuda')
+        ctx.mtp_decoder_hidden_states = torch.randn(2, 1, 32, device='cuda')
         self.text_generation_controller._last_accepted_seq_indices = torch.tensor(
             [0, 1], device='cuda'
         )
@@ -1507,7 +1507,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-        unwrapped_model._decoder_hidden_states_cache = local_hidden
+        ctx.mtp_decoder_hidden_states = local_hidden
 
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
@@ -1527,7 +1527,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             assert torch.all(sampled >= 0) and torch.all(sampled < self.vocab_size)
 
         # Verify decoder hidden states cache was cleaned up.
-        assert not hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        assert ctx.mtp_decoder_hidden_states is None
 
     def test_mtp_sp_padding_dummy_ranks(self):
         """Test _dummy_serial_mtp_forward with real MTP layers and sequence parallelism.
@@ -1552,8 +1552,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         ctrl = self.text_generation_controller
         unwrapped_model = ctrl.inference_wrapped_model.model
-        # The attribute just needs to exist so the has_mtp check passes.
-        unwrapped_model._decoder_hidden_states_cache = True
+        ctx = ctrl.inference_wrapped_model.inference_context
+        ctx.mtp_decoder_hidden_states = torch.empty(
+            1, 1, self.hidden_size, device='cuda', dtype=torch.float32
+        )
 
         # Run the dummy MTP forward path end-to-end.
         ctrl._dummy_serial_mtp_forward()
