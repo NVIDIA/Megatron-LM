@@ -23,16 +23,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -59,16 +49,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -93,16 +73,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -126,16 +96,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -188,16 +148,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -221,16 +171,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -656,16 +596,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -689,16 +619,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -726,16 +646,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -760,16 +670,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -793,16 +693,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -855,16 +745,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -888,16 +768,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -1323,16 +1193,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -1356,16 +1216,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -1393,16 +1243,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -1427,16 +1267,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -1460,16 +1290,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -1522,16 +1342,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -1555,16 +1365,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -1990,16 +1790,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2023,16 +1813,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2060,16 +1840,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2093,16 +1863,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2128,16 +1888,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=1)"
@@ -2189,16 +1939,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2222,16 +1962,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2657,16 +2387,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2690,16 +2410,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2727,16 +2437,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2760,16 +2460,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2795,16 +2485,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=1)"
@@ -2829,16 +2509,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=1)"
@@ -2862,16 +2532,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -2924,16 +2584,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -2957,16 +2607,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3392,16 +3032,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -3426,16 +3056,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=1)"
@@ -3459,16 +3079,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3496,15 +3106,27 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ]
+        },
+        {
+          "global_shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "is_qkv": false,
+          "local_shape": [
+            128
+          ],
+          "mesh_shape": [
             4,
-            5,
-            6,
-            7
+            2
+          ],
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3528,16 +3150,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -3559,48 +3171,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
-          "placements": [
-            "Shard(dim=0)",
-            "Shard(dim=0)"
-          ]
-        },
-        {
-          "global_shape": [
-            256
-          ],
-          "dtype": "torch.float32",
-          "is_qkv": false,
-          "local_shape": [
-            128
-          ],
-          "mesh_shape": [
-            4,
-            2
-          ],
-          "mesh_dim_names": [
-            "dp_cp",
-            "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3648,16 +3218,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3706,15 +3266,27 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ]
+        },
+        {
+          "global_shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "is_qkv": false,
+          "local_shape": [
+            128
+          ],
+          "mesh_shape": [
             4,
-            5,
-            6,
-            7
+            2
+          ],
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3738,16 +3310,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -3769,48 +3331,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
-          "placements": [
-            "Shard(dim=0)",
-            "Shard(dim=0)"
-          ]
-        },
-        {
-          "global_shape": [
-            256
-          ],
-          "dtype": "torch.float32",
-          "is_qkv": false,
-          "local_shape": [
-            128
-          ],
-          "mesh_shape": [
-            4,
-            2
-          ],
-          "mesh_dim_names": [
-            "dp_cp",
-            "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3858,16 +3378,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3916,15 +3426,27 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ]
+        },
+        {
+          "global_shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "is_qkv": false,
+          "local_shape": [
+            128
+          ],
+          "mesh_shape": [
             4,
-            5,
-            6,
-            7
+            2
+          ],
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
           ],
           "placements": [
             "Shard(dim=0)",
@@ -3948,16 +3470,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -3979,48 +3491,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
-          "placements": [
-            "Shard(dim=0)",
-            "Shard(dim=0)"
-          ]
-        },
-        {
-          "global_shape": [
-            256
-          ],
-          "dtype": "torch.float32",
-          "is_qkv": false,
-          "local_shape": [
-            128
-          ],
-          "mesh_shape": [
-            4,
-            2
-          ],
-          "mesh_dim_names": [
-            "dp_cp",
-            "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4068,16 +3538,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4126,15 +3586,27 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ]
+        },
+        {
+          "global_shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "is_qkv": false,
+          "local_shape": [
+            128
+          ],
+          "mesh_shape": [
             4,
-            5,
-            6,
-            7
+            2
+          ],
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4158,16 +3630,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -4189,48 +3651,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
-          "placements": [
-            "Shard(dim=0)",
-            "Shard(dim=0)"
-          ]
-        },
-        {
-          "global_shape": [
-            256
-          ],
-          "dtype": "torch.float32",
-          "is_qkv": false,
-          "local_shape": [
-            128
-          ],
-          "mesh_shape": [
-            4,
-            2
-          ],
-          "mesh_dim_names": [
-            "dp_cp",
-            "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4278,16 +3698,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4336,15 +3746,27 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ]
+        },
+        {
+          "global_shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "is_qkv": false,
+          "local_shape": [
+            128
+          ],
+          "mesh_shape": [
             4,
-            5,
-            6,
-            7
+            2
+          ],
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4368,16 +3790,6 @@
             "dp_cp",
             "tp"
           ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
           "placements": [
             "Shard(dim=0)",
             "Shard(dim=0)"
@@ -4399,48 +3811,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
-          ],
-          "placements": [
-            "Shard(dim=0)",
-            "Shard(dim=0)"
-          ]
-        },
-        {
-          "global_shape": [
-            256
-          ],
-          "dtype": "torch.float32",
-          "is_qkv": false,
-          "local_shape": [
-            128
-          ],
-          "mesh_shape": [
-            4,
-            2
-          ],
-          "mesh_dim_names": [
-            "dp_cp",
-            "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",
@@ -4488,16 +3858,6 @@
           "mesh_dim_names": [
             "dp_cp",
             "tp"
-          ],
-          "mesh_ranks": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7
           ],
           "placements": [
             "Shard(dim=0)",

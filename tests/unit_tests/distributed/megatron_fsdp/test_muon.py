@@ -30,6 +30,7 @@ Launch:
 """
 
 import json
+import math
 import os
 import pathlib
 import re
@@ -175,14 +176,16 @@ MeshKey = tuple[tuple[int, ...], tuple[str, ...], tuple[int, ...]]
 def _mesh_key(param_spec: dict[str, Any]) -> MeshKey:
     """Hashable identity of one param's mesh: (shape, dim_names, flat_ranks).
 
-    `mesh_ranks` is recorded flat (row-major) by `dump_optimizer_parameters`;
-    `mesh_shape` gives the reshape used to build the DeviceMesh.
+    `mesh_ranks` is recorded flat (row-major) by `dump_optimizer_parameters`
+    only when it isn't `range(mesh.numel())`; canonical ranks are omitted from
+    the dump and reconstructed here. `mesh_shape` gives the reshape used to
+    build the DeviceMesh.
     """
-    return (
-        tuple(param_spec["mesh_shape"]),
-        tuple(param_spec["mesh_dim_names"]),
-        tuple(param_spec["mesh_ranks"]),
-    )
+    shape = tuple(param_spec["mesh_shape"])
+    mesh_ranks = param_spec.get("mesh_ranks")
+    if mesh_ranks is None:
+        mesh_ranks = range(math.prod(shape))
+    return (shape, tuple(param_spec["mesh_dim_names"]), tuple(mesh_ranks))
 
 
 def _build_mesh_cache(
