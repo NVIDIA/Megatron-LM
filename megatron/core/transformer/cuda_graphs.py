@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -1798,7 +1799,14 @@ class TECudaGraphHelper:
     """
 
     def __init__(
-        self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
+        self,
+        model,
+        config,
+        seq_length,
+        micro_batch_size,
+        optimizers=[],
+        pg_collection=None,
+        thd_sequence_length_upper_bound=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
@@ -1814,12 +1822,14 @@ class TECudaGraphHelper:
         self.model = model
         self.config = config
         self.seq_length = seq_length
+        self.thd_sequence_length_upper_bound = thd_sequence_length_upper_bound
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
         if self.pg_collection is None:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.tp_group = self.pg_collection.tp
+        self.dp_group = self.pg_collection.dp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp
         from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -2024,6 +2034,12 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
+            if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
+                local_slen = self.config.max_seqlen_per_dp_cp_rank
+                static_inputs["padding_mask"] = torch.zeros(
+                    1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
+                )
+
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -2195,6 +2211,160 @@ class TECudaGraphHelper:
                 assert self.pg_collection.tp is not None
                 return self.pg_collection.tp
 
+    def _should_use_dynamic_microbatch_slots(self) -> bool:
+        """Whether to capture a bounded number of graph slots and reuse them by modulo."""
+        return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
+
+    def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
+        """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
+
+        For the post_process chunk (last PP/VPP chunk that holds labels),
+        padding_mask arrives at the full CP-local length because:
+          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
+          2. pre_process=False  -> _preprocess does not scatter under SP.
+        Other non-pre_process chunks (intermediate VPP) have no data, so their
+        captured padding_mask stays at the default scattered size from
+        `get_layer_static_inputs` (~max_seqlen/CP/TP).
+
+        Returns True only for that post_process-with-data case under THD CUDA
+        Graph + SP + PP>1.
+        """
+        return (
+            hasattr(layer, "_is_thd_cuda_graph")
+            and layer._is_thd_cuda_graph()
+            and self.config.sequence_parallel
+            and self.config.pipeline_model_parallel_size > 1
+            and not getattr(chunk, "pre_process", True)
+            and getattr(chunk, "post_process", False)
+            and "padding_mask" in static_inputs
+        )
+
+    @staticmethod
+    def _get_required_num_microbatch_slots_from_order(order, num_model_chunks):
+        """Infer the minimum safe slot count from a PP/VPP order.
+
+        The slot count is defined as the maximum number of real microbatches whose forward has
+        happened but whose corresponding backward for the same chunk has not completed yet.
+        This is the exact liveness condition for whether a static buffer/graph slot can be reused.
+        """
+        outstanding = [0] * num_model_chunks
+        max_outstanding = [0] * num_model_chunks
+
+        for c_id in order:
+            if ceil(c_id) != c_id:
+                continue
+            model_chunk_idx = abs(int(ceil(c_id))) - 1
+            if c_id > 0:
+                outstanding[model_chunk_idx] += 1
+                max_outstanding[model_chunk_idx] = max(
+                    max_outstanding[model_chunk_idx], outstanding[model_chunk_idx]
+                )
+            else:
+                outstanding[model_chunk_idx] -= 1
+                assert outstanding[model_chunk_idx] >= 0, (
+                    "Invalid PP/VPP schedule: negative outstanding microbatches while "
+                    f"inferring CUDA graph slots for chunk {model_chunk_idx}."
+                )
+
+        assert all(count == 0 for count in outstanding), (
+            "Invalid PP/VPP schedule: outstanding microbatches did not drain to zero when "
+            f"inferring CUDA graph slots. outstanding={outstanding}"
+        )
+        return max(1, max(max_outstanding, default=1))
+
+    def _get_probe_num_microbatches_for_dynamic_slots(self):
+        """Return a topology-only probe microbatch count for slot inference."""
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        if pipeline_parallel_size == 1 and not self.config.overlap_moe_expert_parallel_comm:
+            return 1
+
+        group_size = self.config.microbatch_group_size_per_vp_stage
+        if group_size is None:
+            group_size = pipeline_parallel_size
+
+        return max(
+            pipeline_parallel_size * max(1, self.num_model_chunks) * 4,
+            group_size * max(1, self.num_model_chunks) * 2,
+            1,
+        )
+
+    @staticmethod
+    def _get_dp_balanced_thd_max_num_microbatches(
+        global_batch_size,
+        dp_size,
+        cp_size,
+        max_seqlen_per_dp_cp_rank,
+        max_sequence_length,
+        microbatch_group_size_per_vp_stage=None,
+        max_num_seqs=None,
+    ):
+        """Return the packed-microbatch upper bound for dp_balanced THD packing."""
+        assert global_batch_size >= 1
+        assert dp_size >= 1
+        assert cp_size >= 1
+        assert max_seqlen_per_dp_cp_rank >= 1
+        assert max_sequence_length >= 1
+
+        max_seq_len_all_ranks = max_seqlen_per_dp_cp_rank * cp_size
+        seqs_per_pack = max(1, max_seq_len_all_ranks // max_sequence_length)
+        if max_num_seqs is not None:
+            seqs_per_pack = min(seqs_per_pack, max(1, int(max_num_seqs)))
+
+        num_packed_sequences = math.ceil(global_batch_size / seqs_per_pack)
+        multiple = dp_size * (
+            microbatch_group_size_per_vp_stage
+            if microbatch_group_size_per_vp_stage is not None
+            else 1
+        )
+        num_packed_sequences = math.ceil(num_packed_sequences / multiple) * multiple
+        return max(1, num_packed_sequences // dp_size)
+
+    def _get_thd_varlen_max_num_microbatches(
+        self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
+    ):
+        """Return the THD packing upper bound used for dynamic CUDA graph capture."""
+        if self.config.sequence_packing_scheduler != 'dp_balanced':
+            return runtime_num_microbatches, "runtime"
+        if self.config.max_seqlen_per_dp_cp_rank is None:
+            return runtime_num_microbatches, "runtime"
+
+        dp_size = self.dp_group.size()
+        cp_size = self.dp_cp_group.size() // dp_size
+        global_batch_size = runtime_num_microbatches * self.micro_batch_size * dp_size
+        # Use the dataset-produced padded sequence length upper bound when available.
+        # Do not use max_seqlen_per_dp_cp_rank here: under CP it is only the per-rank
+        # token budget, not the max length of one input sample before packing.
+        max_sequence_length = (
+            self.thd_sequence_length_upper_bound
+            if self.thd_sequence_length_upper_bound is not None
+            else self.seq_length
+        )
+
+        max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
+        if max_num_seqs is not None:
+            max_num_seqs = int(max_num_seqs)
+            if getattr(self.config, 'pad_packed_seq_alignment', None) is not None and getattr(
+                self.config, 'pad_packed_seq_by_appending_dummy_seq', True
+            ):
+                max_num_seqs -= 1
+
+        return (
+            self._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size,
+                dp_size,
+                cp_size,
+                int(self.config.max_seqlen_per_dp_cp_rank),
+                int(max_sequence_length),
+                microbatch_group_size_per_vp_stage=(
+                    None
+                    if self.config.virtual_pipeline_model_parallel_size is None
+                    else microbatch_group_size_per_vp_stage
+                ),
+                max_num_seqs=max_num_seqs,
+            ),
+            "thd_varlen_upper_bound",
+        )
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -2207,26 +2377,93 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
+        microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
+        if microbatch_group_size_per_vp_stage is None:
+            microbatch_group_size_per_vp_stage = (
+                parallel_state.get_pipeline_model_parallel_world_size()
+            )
+
         # If PP is not enabled, we only need to capture one microbatch.
         if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
+        elif self._should_use_dynamic_microbatch_slots():
+            probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
+            from megatron.core.pipeline_parallel.schedules import (
+                get_pp_rank_microbatches as _probe_get_pp,
+            )
+            from megatron.core.pipeline_parallel.schedules import (
+                get_schedule_table as _probe_get_st,
+            )
+
+            _, _, _probe_warmup, _ = _probe_get_pp(
+                probe_num_microbatches,
+                self.num_model_chunks,
+                microbatch_group_size_per_vp_stage,
+                False,
+                overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+            )
+            _probe_st = _probe_get_st(
+                probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
+            )
+            _probe_order = convert_schedule_table_to_order(
+                _probe_warmup, self.num_model_chunks, _probe_st
+            )
+            auto_num_slots = self._get_required_num_microbatch_slots_from_order(
+                _probe_order, self.num_model_chunks
+            )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            if pp_group is not None and pp_group.size() > 1:
+                auto_num_slots_tensor = torch.tensor(
+                    [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                torch.distributed.all_reduce(
+                    auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                )
+                auto_num_slots = int(auto_num_slots_tensor.item())
+            runtime_num_microbatches = get_num_microbatches()
+            max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
+                runtime_num_microbatches, microbatch_group_size_per_vp_stage
+            )
+            if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+                self.num_microbatches = runtime_num_microbatches
+                capture_mode = "runtime"
+                fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
+            else:
+                # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
+                # slot liveness. THD varlen packing can produce different real microbatch
+                # counts across iterations, so capture uses the THD/GBS-derived upper
+                # bound instead of the reduced slot count for safety. Currently TE cuda
+                # graph backend may crash if use the auto_num_slots.
+                self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
+                fallback_reason = None
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.INFO,
+                msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots '
+                f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'auto_num_slots={auto_num_slots}, '
+                f'max_num_microbatches={max_num_microbatches}, '
+                f'capture_num_microbatches={self.num_microbatches}, '
+                f'capture_mode={capture_mode}'
+                + (f', fallback_reason={fallback_reason}' if fallback_reason else ''),
+            )
         else:
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
             self.num_microbatches,
             self.num_model_chunks,
-            self.config.microbatch_group_size_per_vp_stage,
+            microbatch_group_size_per_vp_stage,
             forward_only=False,
             p2p_communicator=self.p2p_communicator,
         )
         schedule_table = get_schedule_table(
-            self.num_microbatches,
-            self.num_model_chunks,
-            self.config.microbatch_group_size_per_vp_stage,
+            self.num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
         )
         order = convert_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table

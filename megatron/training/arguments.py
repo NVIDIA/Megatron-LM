@@ -17,6 +17,7 @@ from packaging.version import Version as PkgVersion
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -1591,6 +1592,44 @@ def validate_args(args, defaults={}):
             f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
+
+    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
+        args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+            args.pad_packed_seq_alignment
+        )
+        if args.max_seqlen_per_dp_cp_rank is None:
+            raise ValueError(
+                '--max-seqlen-per-dp-cp-rank must be set when '
+                '--pad-packed-seq-alignment is enabled.'
+            )
+        if args.pad_packed_seq_alignment != 'max':
+            if args.pad_packed_seq_alignment <= 0:
+                raise ValueError(
+                    "--pad-packed-seq-alignment must be 'max' or a positive integer "
+                    "alignment."
+                )
+            if args.pad_packed_seq_alignment > args.max_seqlen_per_dp_cp_rank:
+                raise ValueError(
+                    '--pad-packed-seq-alignment must not exceed '
+                    f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                    f'got {args.pad_packed_seq_alignment}.'
+                )
+
+    if args.cuda_graph_impl != "none" and (
+        args.sequence_packing_scheduler is not None or args.dynamic_context_parallel
+    ):
+        if getattr(args, 'pad_packed_seq_alignment', None) is None:
+            raise ValueError('THD CUDA Graph requires --pad-packed-seq-alignment to be set.')
+        if (
+            args.pad_packed_seq_alignment != 'max'
+            and args.pad_packed_seq_alignment != args.max_seqlen_per_dp_cp_rank
+        ):
+            raise ValueError(
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                'or --pad-packed-seq-alignment equal to '
+                f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                f'got {args.pad_packed_seq_alignment}.'
+            )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled

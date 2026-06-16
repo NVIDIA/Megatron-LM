@@ -222,6 +222,13 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def _is_thd_cuda_graph(self):
+        """Check if THD format with CUDA Graph is being used."""
+        return (
+            getattr(self.config, 'sequence_packing_scheduler', None) is not None
+            and self.config.cuda_graph_impl != "none"
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the layer.
@@ -229,26 +236,47 @@ class GraphableMegatronModule(MegatronModule):
         from the seq_length, micro_batch_size, and parallel config.
         Override this method if the module has other inputs.
 
+        For THD + CUDA Graph, hidden_states uses the padded max sequence length with
+        micro_batch_size=1 (packed sequence format).
+
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         # Calculate data shape related values.
         context_parallel_size = self.config.context_parallel_size
-        slen_per_cp = seq_length // context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
-        slen_per_cptp = (
-            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
-        )
 
-        static_inputs = {}
-        static_inputs["hidden_states"] = torch.ones(
-            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-            device=torch.cuda.current_device(),
-        )
-        return static_inputs
+        if self._is_thd_cuda_graph():
+            # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
+            assert (
+                self.config.max_seqlen_per_dp_cp_rank is not None
+            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            slen_full = self.config.max_seqlen_per_dp_cp_rank
+            batch = 1
+        else:
+            # SBHD path: per-rank seq is split by CP and (optionally) by TP under SP.
+            slen_full = seq_length // context_parallel_size
+            batch = micro_batch_size
+        slen_per_cptp = slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
+
+        # Static input dtype must match the runtime activation dtype that flows
+        # through the captured graph.
+        if self.config.bf16:
+            dtype = torch.bfloat16
+        elif self.config.fp16:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        return {
+            "hidden_states": torch.ones(
+                (slen_per_cptp, batch, self.config.hidden_size),
+                dtype=dtype,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
+        }
 
     def setup_manual_hooks(self, make_hook_func):
         """
