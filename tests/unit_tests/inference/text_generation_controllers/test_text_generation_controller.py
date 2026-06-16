@@ -205,8 +205,6 @@ class TestAsyncSchedulingControllerHelpers:
         context.chunked_prefill_request_id = -1
         context.is_chunked_prefill_enabled.return_value = False
         context.is_decode_only.return_value = True
-        context.pending_finished_rows.return_value = None
-        context.has_pending_finished_rows.return_value = False
         context.block_size_tokens = 128
         context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
         context.request_has_stop_words = torch.tensor([False, False], device='cpu')
@@ -274,6 +272,14 @@ class TestAsyncSchedulingControllerHelpers:
         with pytest.raises(RuntimeError, match="waiting_requests"):
             controller._dynamic_step_context_bookkeeping_for_mode()
 
+    def test_request_update_mode_rejects_serial_kv_block_boundary(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.request_last_kv_block_offset = torch.tensor([127, 2], device='cpu')
+
+        with pytest.raises(RuntimeError, match="kv_block_boundary"):
+            controller._dynamic_step_context_bookkeeping_for_mode()
+
     def test_async_scheduling_prepare_uses_context_adjusted_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
         prepared_update = {
@@ -310,9 +316,7 @@ class TestAsyncSchedulingControllerHelpers:
         context.prepare_requests.assert_called_once_with(
             **prepared_update, request_bookkeeping=request_bookkeeping
         )
-        context.resolve_requests.assert_called_once_with(
-            filtered_update, delay_finished_compaction=True
-        )
+        context.resolve_requests.assert_called_once_with(filtered_update)
         assert actual_bookkeeping is filtered_bookkeeping
         assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
 
@@ -367,7 +371,54 @@ class TestAsyncSchedulingControllerHelpers:
 
         assert events == ["sample", "prepare_requests", "forward", "resolve_requests"]
         _, kwargs = context.resolve_requests.call_args
-        assert kwargs["delay_finished_compaction"]
+        assert kwargs == {}
+
+    def test_async_scheduling_all_finished_consumes_without_forward(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([0, 0], device='cpu'),
+            "new_tokens": torch.tensor([100, 101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        request_bookkeeping = {
+            "active_request_ids": torch.tensor([10, 11], device='cpu'),
+            "sample": torch.tensor([100, 101], device='cpu'),
+            "finished_request_ids": torch.tensor([10, 11], device='cpu'),
+        }
+        context.prepare_requests.side_effect = [
+            (prepared_update, request_bookkeeping),
+            prepared_update,
+        ]
+        context.resolve_requests.return_value = {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
+        }
+        controller._dynamic_step_forward_for_async_scheduling = mock.Mock()
+
+        actual_bookkeeping, resolve_result = controller._run_async_scheduling_request_update(
+            prepared_update, request_bookkeeping
+        )
+
+        assert context.prepare_requests.call_count == 2
+        first_prepare_kwargs = context.prepare_requests.call_args_list[0].kwargs
+        second_prepare_kwargs = context.prepare_requests.call_args_list[1].kwargs
+        assert (
+            first_prepare_kwargs["active_requests_mask"]
+            is prepared_update["active_requests_mask"]
+        )
+        assert first_prepare_kwargs["new_tokens"] is prepared_update["new_tokens"]
+        assert first_prepare_kwargs["request_bookkeeping"] is request_bookkeeping
+        assert (
+            second_prepare_kwargs["active_requests_mask"]
+            is prepared_update["active_requests_mask"]
+        )
+        assert second_prepare_kwargs["new_tokens"] is prepared_update["new_tokens"]
+        assert "request_bookkeeping" not in second_prepare_kwargs
+        context.resolve_requests.assert_called_once()
+        assert context.resolve_requests.call_args.args[0] is prepared_update
+        controller._dynamic_step_forward_for_async_scheduling.assert_not_called()
+        assert actual_bookkeeping is request_bookkeeping
+        assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
 
 
 class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):

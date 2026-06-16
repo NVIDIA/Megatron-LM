@@ -1805,21 +1805,20 @@ class TextGenerationController:
         return cuda_graph_request_count
 
     def _run_async_scheduling_request_update(
-        self, prepared_update: Dict, request_bookkeeping: Dict, *, run_forward: bool = True
+        self, prepared_update: Dict, request_bookkeeping: Dict
     ) -> Tuple[Dict, Dict[str, Optional[Tensor]]]:
         """Run the future async-overlap order serially.
 
-        This prepares the next forward from the sampled tokens, optionally runs
-        that forward, then resolves lifecycle changes from the sampled step. If
-        all rows finished or forwarding is disabled, it resolves immediately and
-        clears the primed-forward state. Otherwise it records that the next
-        forward has already been run for async-shaped result handling.
+        This prepares the next forward from the sampled tokens, runs that
+        forward when active rows remain, then resolves lifecycle changes from
+        the sampled step. If all rows finished, it resolves and immediately lets
+        prepare consume those rows because no forward will use them.
 
         Steps:
             1. Prepare next-forward bookkeeping from the sampled update.
-            2. Resolve immediately if no forward should run.
+            2. Resolve and consume immediately when no forward should run.
             3. Run the prepared forward when active rows remain.
-            4. Resolve the sampled step with delayed finish compaction.
+            4. Resolve the sampled step.
             5. Record whether a forward is primed for result handling.
 
         Example:
@@ -1840,16 +1839,13 @@ class TextGenerationController:
 
         active_requests_mask = prepared_update["active_requests_mask"]
         assert active_requests_mask is not None
-        if (
-            not run_forward
-            or active_requests_mask.numel() == 0
-            or (active_requests_mask == 0).all()
-        ):
+        if active_requests_mask.numel() == 0 or (active_requests_mask == 0).all():
 
-            # Step 2: Resolve immediately if no forward should run.
+            # Step 2: Resolve and consume immediately when no forward should run.
             range_push("resolve_requests")
             resolve_result = context.resolve_requests(prepared_update)
             range_pop()
+            context.prepare_requests(**prepared_update)
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
             return request_bookkeeping, resolve_result or {}
@@ -1859,9 +1855,9 @@ class TextGenerationController:
             self._dynamic_step_forward_for_async_scheduling()
         )
 
-        # Step 4: Resolve the sampled step with delayed finish compaction.
+        # Step 4: Resolve the sampled step.
         range_push("resolve_requests")
-        resolve_result = context.resolve_requests(prepared_update, delay_finished_compaction=True)
+        resolve_result = context.resolve_requests(prepared_update)
         range_pop()
 
         # Step 5: Record whether a forward is primed for result handling.
@@ -1890,7 +1886,7 @@ class TextGenerationController:
         vanilla GPT greedy decode while the legacy path preserves all features.
         This method centralizes checks for waiting requests, stop words,
         speculative/MTP/Mamba/MoE/EP state, paused rows, logprobs, non-greedy
-        sampling, and async KV block boundaries. A `None` result means the step
+        sampling, and KV block boundaries. A `None` result means the step
         is eligible for the requested mode.
 
         Steps:
@@ -1898,7 +1894,7 @@ class TextGenerationController:
             2. Reject unsupported model families and parallelism modes.
             3. Reject paused rows, prepared speculative tokens, and extra output features.
             4. Reject non-greedy sampling settings.
-            5. Apply async-only KV block-boundary protection.
+            5. Reject KV block-boundary allocation.
 
         Example:
             active decode:
@@ -1948,15 +1944,14 @@ class TextGenerationController:
         if (context.request_metadata["top_p"][active_slice] > 0.0).any().item():
             return "non_greedy_sampling"
 
-        # Step 5: Apply async-only KV block-boundary protection.
-        if mode == AsyncSchedulingMode.ASYNC:
-            block_boundary_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
-            if (
-                (context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold)
-                .any()
-                .item()
-            ):
-                return "kv_block_boundary"
+        # Step 5: Reject KV block-boundary allocation.
+        block_boundary_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
+        if (
+            (context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold)
+            .any()
+            .item()
+        ):
+            return "kv_block_boundary"
 
         return None
 

@@ -682,8 +682,9 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
 
-        assert update_result is None
+        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
         assert dynamic_context.total_request_count == 0
+        assert (dynamic_context.request_to_kv_block_ids[:3] == -1).all()
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -775,7 +776,7 @@ class TestDynamicContext:
 
         dynamic_context._compact_pending_finished_rows(next_tokens=next_tokens)
 
-        assert not dynamic_context.has_pending_finished_rows()
+        assert dynamic_context._pending_finished_rows is None
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.active_token_count == 2
         assert dynamic_context.request_ids[:4].tolist() == [10, 12, -1, -1]
@@ -803,7 +804,7 @@ class TestDynamicContext:
 
         dynamic_context._compact_pending_finished_rows()
 
-        assert not dynamic_context.has_pending_finished_rows()
+        assert dynamic_context._pending_finished_rows is None
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
         assert dynamic_context.request_ids[:2].tolist() == [-1, -1]
@@ -840,7 +841,7 @@ class TestDynamicContext:
             },
         )
 
-        assert not dynamic_context.has_pending_finished_rows()
+        assert dynamic_context._pending_finished_rows is None
         assert dynamic_context.request_ids[:3].tolist() == [10, 12, -1]
         assert prepared_update["active_requests_mask"].tolist() == [1, 0]
         assert prepared_update["new_tokens"].tolist() == [100, 102]
@@ -882,7 +883,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_resolve_requests_delayed_finish_only_records_without_compacting(self):
+    def test_resolve_requests_records_finished_rows_without_releasing_or_compacting(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -895,23 +896,34 @@ class TestDynamicContext:
         )
         dynamic_context.total_request_count = 2
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.request_query_lengths[:2] = 1
+        dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 6], device='cpu')
+        dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 6], device='cpu')
+        dynamic_context.request_last_kv_block_id[:2] = torch.tensor([20, 21], device='cpu')
         dynamic_context.request_kv_block_counts[:2] = 1
         new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
         dynamic_context.request_to_kv_block_ids[:2, 0] = new_block_ids
-        prepared_update = dynamic_context.prepare_requests(
-            active_requests_mask=torch.tensor([0, 1], device='cpu'),
-            new_tokens=torch.tensor([100, 101], device='cpu'),
-        )
+        prepared_update = {
+            "active_requests_mask": torch.tensor([0, 1], device='cpu'),
+            "new_tokens": torch.tensor([100, 101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
 
-        resolve_result = dynamic_context.resolve_requests(
-            prepared_update, delay_finished_compaction=True
-        )
+        resolve_result = dynamic_context.resolve_requests(prepared_update)
 
         assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
-        assert dynamic_context.has_pending_finished_rows()
+        assert dynamic_context._pending_finished_rows is not None
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.request_ids[:2].tolist() == [10, 11]
-        assert dynamic_context.request_to_kv_block_ids[0, 0] == -1
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == new_block_ids[0].item()
+
+        dynamic_context.prepare_requests(**prepared_update)
+
+        assert dynamic_context._pending_finished_rows is None
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.request_ids[:2].tolist() == [11, -1]
+        assert dynamic_context.request_to_kv_block_ids[0, 0].item() == new_block_ids[1].item()
+        assert dynamic_context.request_to_kv_block_ids[1, 0].item() == -1
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -929,7 +941,7 @@ class TestDynamicContext:
         dynamic_context.total_request_count = 2
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
         dynamic_context.record_pending_finished_rows(torch.tensor([True, False]))
-        pending_finished_rows = dynamic_context.pending_finished_rows()
+        pending_finished_rows = dynamic_context._pending_finished_rows
 
         with pytest.raises(AssertionError):
             dynamic_context.record_pending_finished_rows(torch.tensor([False, True]))

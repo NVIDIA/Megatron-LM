@@ -127,13 +127,13 @@ class ContextOverflowError(Exception):
 
 @dataclass(frozen=True)
 class PendingFinishedRows:
-    """Finished active rows awaiting delayed filtering and compaction."""
+    """Finished active rows waiting for the next prepare to consume them."""
 
     active_mask: Tensor
     request_ids: Tensor
 
     def __post_init__(self) -> None:
-        """Validate the shape and dtype invariants for delayed finished-row state.
+        """Validate the shape and dtype invariants for pending finished-row state.
 
         The active mask is indexed in active-row order, while request IDs contain
         only the rows marked finished by that mask.
@@ -2964,9 +2964,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_prefill_requests += 1
 
     def clear_pending_finished_rows(self) -> None:
-        """Clear any delayed finished-row state after it has been consumed.
+        """Clear any pending finished-row state after it has been consumed.
 
-        This resets the handoff between delayed resolve and the next prepare.
+        This resets the handoff between resolve and the next prepare.
 
         Example:
             before: pending -> [11]
@@ -2974,36 +2974,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self._pending_finished_rows = None
 
-    def has_pending_finished_rows(self) -> bool:
-        """Return whether delayed finished rows are waiting for prepare to consume them.
-
-        Callers use this as a cheap guard before filtering or compacting rows.
-
-        Example:
-            pending -> none  => False
-            pending -> [11]  => True
-        """
-        return self._pending_finished_rows is not None
-
-    def pending_finished_rows(self) -> Optional[PendingFinishedRows]:
-        """Return the delayed finished-row state without consuming it.
-
-        This lets helpers share one stored mask/id pair until prepare clears it.
-
-        Example:
-            rows:  [10] [11] [12]
-            mask:     F    T    F
-            ids:          [11]
-        """
-        return self._pending_finished_rows
-
     def record_pending_finished_rows(self, finished_active_mask: Tensor) -> None:
-        """Record active rows that finished but cannot be compacted yet.
+        """Record active rows that finished in the latest resolve.
 
-        Async-shaped decode uses this after releasing finished request memory so
-        the next prepare can filter wasted samples and compact rows consistently.
-        A second pending record is rejected because only one delayed finish window
-        may be outstanding.
+        `prepare_requests` consumes this record before it builds the next
+        forward layout, so row compaction and resource release stay in one
+        place. A second pending record is rejected because each resolve must be
+        followed by prepare before another finish set can be recorded.
 
         Steps:
             1. Reject recording if an earlier pending finish is still unconsumed.
@@ -3018,7 +2995,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # Step 1: Reject recording if an earlier pending finish is still unconsumed.
-        if self.has_pending_finished_rows():
+        if self._pending_finished_rows is not None:
             raise AssertionError(
                 "prior pending finished rows must be compacted before recording more"
             )
@@ -3045,15 +3022,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def _filter_pending_finished_rows(self, step_result: Dict) -> Dict:
-        """Remove outputs for rows that already finished in delayed resolve.
+        """Remove outputs for rows that already finished in the prior resolve.
 
         The next forward may have produced one wasted sample for a row whose
-        request was already released, so result tensors and per-row lists are
-        filtered to the kept rows. Duplicate finished IDs and routing records for
-        those prior-finished requests are also dropped.
+        request already finished, so result tensors and per-row lists are
+        filtered to the kept rows. Duplicate finished IDs and routing records
+        for those prior-finished requests are also dropped.
 
         Steps:
-            1. Return unchanged when no delayed finished rows exist.
+            1. Return unchanged when no pending finished rows exist.
             2. Build a keep mask from the stored finished-row mask.
             3. Filter per-row tensor, list, and top-logprob outputs.
             4. Remove duplicate finished IDs and routing records.
@@ -3064,8 +3041,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             result rows: [10]      [12]
         """
 
-        # Step 1: Return unchanged when no delayed finished rows exist.
-        pending_finished_rows = self.pending_finished_rows()
+        # Step 1: Return unchanged when no pending finished rows exist.
+        pending_finished_rows = self._pending_finished_rows
         if pending_finished_rows is None:
             return step_result
 
@@ -3120,15 +3097,16 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _compact_pending_finished_rows(
         self, next_tokens: Optional[Tensor] = None, new_speculative_tokens: Optional[Tensor] = None
     ) -> None:
-        """Compact active request rows after delayed-finished outputs are filtered.
+        """Release and compact active request rows after finished outputs are filtered.
 
-        Kept rows move left to fill holes left by prior-finished requests, and
-        stale request metadata past the new active boundary is cleared. If every
-        active row finished, the active region is emptied instead of moved.
+        Finished rows release their resources here, immediately before the row
+        layout changes for the next forward. Kept rows move left to fill holes
+        left by prior-finished requests, and stale request metadata past the new
+        active boundary is cleared.
 
         Steps:
-            1. Return unchanged when no delayed finished rows exist.
-            2. Compute kept rows and the new active boundary.
+            1. Return unchanged when no pending finished rows exist.
+            2. Compute kept rows and release finished-row resources.
             3. Clear the active region when every active row finished.
             4. Move kept request metadata left when needed.
             5. Clear stale metadata and pending-finish state.
@@ -3138,12 +3116,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             after:  [10] [12]      [empty]
         """
 
-        # Step 1: Return unchanged when no delayed finished rows exist.
-        pending_finished_rows = self.pending_finished_rows()
+        # Step 1: Return unchanged when no pending finished rows exist.
+        pending_finished_rows = self._pending_finished_rows
         if pending_finished_rows is None:
             return
 
-        # Step 2: Compute kept rows and the new active boundary.
+        # Step 2: Compute kept rows and release finished-row resources.
         finished_mask = pending_finished_rows.active_mask
         keep_mask = ~finished_mask
         active_request_count = finished_mask.numel()
@@ -3151,6 +3129,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_start = self.paused_request_count
         active_end = active_start + active_request_count
         assert active_end <= self.total_request_count
+
+        finished_idxs = torch.nonzero(finished_mask, as_tuple=True)[0] + active_start
+        self.release_memory_blocks_from_request_indexes(finished_idxs)
 
         # Step 3: Clear the active region when every active row finished.
         if remaining_request_count == 0:
@@ -3194,7 +3175,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _consume_pending_finished_rows_for_prepare(
         self, prepared_update: Dict[str, Optional[Tensor]], request_bookkeeping: Optional[Dict]
     ) -> Tuple[Dict[str, Optional[Tensor]], Optional[Dict]]:
-        """Consume delayed finished rows before next-forward preparation.
+        """Consume pending finished rows before next-forward preparation.
 
         This is the single entry point that filters returned bookkeeping,
         compacts context rows, and trims the prepared update to the remaining
@@ -3202,7 +3183,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         `prepare_requests` advances request state.
 
         Steps:
-            1. Return inputs unchanged when no delayed rows exist.
+            1. Return inputs unchanged when no pending rows exist.
             2. Filter response bookkeeping to kept rows.
             3. Compact context bookkeeping rows.
             4. Trim prepared-update tensors to the remaining active rows.
@@ -3214,8 +3195,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             after consume:   [10]      [12]
         """
 
-        # Step 1: Return inputs unchanged when no delayed rows exist.
-        pending_finished_rows = self.pending_finished_rows()
+        # Step 1: Return inputs unchanged when no pending rows exist.
+        pending_finished_rows = self._pending_finished_rows
         if pending_finished_rows is None:
             return prepared_update, request_bookkeeping
 
@@ -3571,7 +3552,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> Union[Dict[str, Optional[Tensor]], Tuple[Dict[str, Optional[Tensor]], Dict]]:
         """Prepare request and token bookkeeping for the next forward pass.
 
-        This first consumes any delayed finished rows so the active request
+        This first consumes any pending finished rows so the active request
         region and sampled tokens refer to the same rows. It then advances decode
         offsets, query lengths, token-to-request mappings, token positions, and
         KV block indices for the requests that will participate in the next
@@ -3580,7 +3561,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Steps:
             1. Move sampled-token inputs to CPU bookkeeping tensors.
-            2. Consume any delayed finished rows.
+            2. Consume any pending finished rows.
             3. Advance active request offsets and query lengths.
             4. Write token-to-request, position, and block mappings.
             5. Return adjusted prepared update and optional bookkeeping.
@@ -3607,7 +3588,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             "prev_last_block_ids": prev_last_block_ids,
         }
 
-        # Step 2: Consume any delayed finished rows.
+        # Step 2: Consume any pending finished rows.
         prepared_update, request_bookkeeping = self._consume_pending_finished_rows_for_prepare(
             prepared_update, request_bookkeeping
         )
@@ -3760,30 +3741,25 @@ class DynamicInferenceContext(BaseInferenceContext):
     def resolve_requests(
         self,
         prepared_update: Dict[str, Optional[Tensor]],
-        *,
-        delay_finished_compaction: bool = False,
-    ) -> Optional[Dict[str, Optional[Tensor]]]:
-        """Resolve lifecycle changes represented by a prepared update.
+    ) -> Dict[str, Optional[Tensor]]:
+        """Record finished rows represented by a prepared update.
 
-        In normal mode this handles finished requests, request pausing, resumed
-        requests, overflow eviction, and hidden chunked-prefill bookkeeping
-        before the next prepare runs. In delayed-finish mode it only releases
-        finished decode rows and records their positions so a later prepare can
-        filter and compact them. The returned dictionary reports newly paused
-        and evicted request IDs, or `None` when no active work remains.
+        The split request-update path is finish-only: `resolve_requests` decides
+        which active rows finished, and `prepare_requests` later applies the row
+        layout change. Keeping compaction and resource release in prepare gives
+        serial and async-shaped scheduling the same ownership model.
 
         Steps:
             1. Normalize prepared-update tensors onto CPU.
-            2. Optionally take the delayed finish-only path.
-            3. Release finished requests and update active/paused layout.
-            4. Pause, resume, evict, and hide chunked-prefill rows as needed.
-            5. Return lifecycle IDs for controller/engine bookkeeping.
+            2. Count active and finished rows in the decode-only active region.
+            3. Record finished rows for the next prepare.
+            4. Return empty lifecycle IDs for unsupported pause/evict events.
 
         Example:
             rows:    [10] [11] [12]
             active:    1    0    1
-            normal: [10] [12]
-            delayed pending: [11]
+            pending:     [11]
+            prepare: [10]      [12]
         """
 
         # Step 1: Normalize prepared-update tensors onto CPU.
@@ -3802,274 +3778,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         prepared_update["new_tokens"] = new_tokens
         prepared_update["new_speculative_tokens"] = new_speculative_tokens
 
-        # Step 2: Optionally take the delayed finish-only path.
-        if delay_finished_compaction:
-            return self._resolve_requests_delayed_finish_only(active_requests_mask)
-
-        # Step 3: Release finished requests and update active/paused layout.
-        # The active token mask tells us which requests are still active and which are completed.
-        # active_request_count -> This corresponds to requests that have not reached EOD or max length
-        # finished_request_count are requests that have reached the termination criterion
-
-        self.num_prefill_requests = 0  # all turns to decode
-        # All request that were in prefill become decode requests.
-        # For the chunked prefill request we will overwrite this the next time add_request
-        # is called on that request.
-        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
-
-        if (
-            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
-        ) != -1:
-            # Chunked prefill request was active this step.
-            # We must keep it active so that the next iteration will add a new chunk to it.
-            active_requests_mask[-1] = 1
-
+        # Step 2: Count active and finished rows in the decode-only active region.
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
-            active_request_count + finished_request_count + self.paused_request_count
-            == self.total_request_count
+            active_request_count + finished_request_count
+            == self.total_request_count - self.paused_request_count
         )
 
-        # Update total_request_count.
-        self.total_request_count = active_request_count + self.paused_request_count
+        # Step 3: Record finished rows for the next prepare.
+        self.record_pending_finished_rows(active_requests_mask == 0)
 
-        # If no paused requests are present and no active requests, release memory and reset.
-        # Note that this requires no pending chunked prefill request
-        if (
-            active_request_count + self.paused_request_count == 0
-            and self.get_index_of_chunked_prefill_request(safe=False) == -1
-        ):
-            if finished_request_count > 0:
-                finished_idxs = (
-                    torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-                    + self.paused_request_count
-                )
-                self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            # Reset request/token counts.
-            self.request_to_kv_block_ids.fill_(-1)
-            self.total_request_count = 0
-            self.active_token_count = 0
-
-            # Reset Mamba state.
-            self.reset_mamba_state()
-            return
-
-        # Concatenate the paused tokens to the active tokens if present.
-        if self.paused_request_count != 0:
-            assert self.paused_tokens is not None
-            next_tokens = torch.cat((self.paused_tokens, new_tokens))
-            if new_speculative_tokens is not None and self.paused_speculative_tokens is not None:
-                new_speculative_tokens = torch.cat(
-                    (self.paused_speculative_tokens, new_speculative_tokens), dim=1
-                )
-        else:
-            next_tokens = new_tokens
-
-        # Release finished request memory and move finished rows to the right:
-        # - Release all their memory.
-        # - Swap them to the right, so that we have this order [Paused, Active, Finished].
-        if finished_request_count > 0:
-            finished_idxs = (
-                torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-                + self.paused_request_count
-            )
-            self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            if active_request_count > 0:
-                finished_idxs_on_left = (
-                    torch.nonzero(active_requests_mask[:active_request_count] == 0, as_tuple=True)[
-                        0
-                    ]
-                    + self.paused_request_count
-                )
-                active_idxs_on_right = (
-                    torch.nonzero(active_requests_mask[active_request_count:], as_tuple=True)[0]
-                    + active_request_count
-                    + self.paused_request_count
-                )
-
-                self._move_book_keeping_tensors(
-                    src_idxs=active_idxs_on_right,
-                    dst_idxs=finished_idxs_on_left,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-
-                # Reset chunk ids for recently moved requests.
-                self.request_to_kv_block_ids[active_idxs_on_right] = -1
-                if self.is_hybrid_model:
-                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
-
-        # Step 4: Pause, resume, evict, and hide chunked-prefill rows as needed.
-        # Identify requests that require a new block and move them into the paused region:
-        # - Put requests that filled their current block and require a new one in a pause state.
-        # - Move paused requests left and active requests right.
-        # - Update paused and active request counts.
-        newly_paused_request_ids = None
-        if active_request_count > 0:
-            num_tokens_in_last_block = self.request_last_kv_block_offset[
-                self.paused_request_count : (active_request_count + self.paused_request_count)
-            ]
-            active_requests_requiring_new_block = (
-                num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).byte()
-
-            # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-            if (
-                chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
-            ) != -1:
-                active_requests_requiring_new_block[
-                    chunked_prefill_request_idx - self.paused_request_count
-                ] = 0  # chunked prefill should not be paused
-            else:
-                max_allowed_active = min(
-                    self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
-                )
-                if active_request_count > max_allowed_active:
-                    # Force-pause excess requests in a decode-only batch
-                    active_requests_requiring_new_block[max_allowed_active:] = 1
-
-            active_requests_requiring_new_block_count = (
-                (active_requests_requiring_new_block == 1).sum().item()
-            )
-
-            if active_requests_requiring_new_block_count > 0:
-                newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
-                ]
-
-            # Swap unfinished active requests on the left side with paused requests on the right side
-            # NOTE : We add paused request count because we concatenate
-            # paused tokens to the left at the beginning of update requests
-            if (
-                active_requests_requiring_new_block_count > 0
-                and active_requests_requiring_new_block_count != active_request_count
-            ):
-                active_request_ids_on_left = (
-                    torch.nonzero(
-                        active_requests_requiring_new_block[
-                            :active_requests_requiring_new_block_count
-                        ]
-                        == 0,
-                        as_tuple=True,
-                    )[0]
-                    + self.paused_request_count
-                )
-                paused_requests_idxs_on_right = (
-                    torch.nonzero(
-                        active_requests_requiring_new_block[
-                            active_requests_requiring_new_block_count:
-                        ],
-                        as_tuple=True,
-                    )[0]
-                    + active_requests_requiring_new_block_count
-                    + self.paused_request_count
-                )
-                dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
-                src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
-                self._move_book_keeping_tensors(
-                    src_idxs=src_idxs,
-                    dst_idxs=dst_idxs,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-
-            self.paused_request_count += active_requests_requiring_new_block_count
-            active_request_count -= active_requests_requiring_new_block_count
-
-        # With requests ordered as [Paused, Active, Finished], resume what can run.
-
-        # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
-        # This allows us to know which block tokens should go to if they don't cross the boundary.
-        # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
-        # for resumed requests, but we need the OLD block for tokens that don't cross.
-        prev_last_block_ids = None
-        if self.num_speculative_tokens > 0:
-            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
-            # (assigns new block IDs), but we need the old values later to determine
-            # which block tokens should go to when they don't cross a block boundary.
-            prev_last_block_ids = self.request_last_kv_block_id.clone()
-
-        # First, resume temporarily paused requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
-
-        # Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(
-            active_request_count, next_tokens, new_speculative_tokens
-        )
-
-        # Resume any additional requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
-
-        assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
-            "active_request_count == %d with no hidden chunked prefill." % active_request_count
-        )
-
-        # Swap the chunked prefill request to the end of the active requests to obey the invariant.
-        if (
-            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=False)
-        ) != -1:
-            if chunked_prefill_request_idx < self.total_request_count:
-                # Chunked prefill request was active this step.
-                # Swap to the end of active, then hide it out of bounds.
-                self._swap_book_keeping_tensors(
-                    src_idxs=torch.tensor(
-                        [chunked_prefill_request_idx], device=self.request_ids.device
-                    ),
-                    dst_idxs=torch.tensor(
-                        [self.total_request_count - 1], device=self.request_ids.device
-                    ),
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-
-                # Explicitly decrement the active and total request counts here so that the chunked
-                # prefill request metadata is not updated. This will all be restored when the next
-                # chunk is added through add_request.
-                active_request_count -= 1
-                self.total_request_count -= 1
-            else:
-                # Chunked prefill request was inactive/hidden this step.
-                # Pull it to the new boundary so it doesn't drift.
-                if chunked_prefill_request_idx != self.total_request_count:
-                    self._swap_book_keeping_tensors(
-                        src_idxs=torch.tensor(
-                            [chunked_prefill_request_idx], device=self.request_ids.device
-                        ),
-                        dst_idxs=torch.tensor(
-                            [self.total_request_count], device=self.request_ids.device
-                        ),
-                        next_tokens=None,  # Do not swap next_tokens as these indices are out of bounds
-                        new_speculative_tokens=None,
-                    )
-
-        # Store the token order that prepare_requests() will use for next-forward setup.
-        assert self.total_request_count == active_request_count + self.paused_request_count
-
-        if self.paused_request_count > 0:
-            # Clone needed: next_tokens is a shared buffer that will be overwritten in
-            # the next iteration; paused_tokens must persist independently.
-            self.paused_tokens = next_tokens[: self.paused_request_count].clone()
-            if new_speculative_tokens is not None:
-                # Clone needed: same reason as paused_tokens above.
-                self.paused_speculative_tokens = new_speculative_tokens[
-                    :, : self.paused_request_count
-                ].clone()
-
-        prepared_update["new_tokens"] = next_tokens
-        prepared_update["new_speculative_tokens"] = new_speculative_tokens
-        prepared_update["prev_last_block_ids"] = prev_last_block_ids
-
-        # Step 5: Return lifecycle IDs for controller/engine bookkeeping.
+        # Step 4: Return empty lifecycle IDs for unsupported pause/evict events.
         return {
-            "newly_paused_request_ids": newly_paused_request_ids,
-            "evict_request_ids": evict_request_ids,
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
         }
 
     def update_requests(
@@ -4077,7 +3800,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_requests_mask: Tensor,
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
-    ) -> Optional[Dict[str, Optional[Tensor]]]:
+    ) -> Dict[str, Optional[Tensor]]:
         """Run the new serial request-update composition.
 
         This wraps `resolve_requests` followed by `prepare_requests` so the
@@ -4088,7 +3811,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Steps:
             1. Package sampled outputs into a prepared update.
             2. Resolve lifecycle changes for the sampled step.
-            3. Prepare next-forward bookkeeping if active work remains.
+            3. Prepare next-forward bookkeeping.
 
         Example:
             flow:
@@ -4108,55 +3831,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Step 2: Resolve lifecycle changes for the sampled step.
         resolve_result = self.resolve_requests(prepared_update)
 
-        # Step 3: Prepare next-forward bookkeeping if active work remains.
-        if resolve_result is not None:
-            self.prepare_requests(**prepared_update)
+        # Step 3: Prepare next-forward bookkeeping.
+        self.prepare_requests(**prepared_update)
         return resolve_result
-
-    def _resolve_requests_delayed_finish_only(
-        self, active_requests_mask: Tensor
-    ) -> Dict[str, Optional[Tensor]]:
-        """Resolve only finished decode rows while delaying compaction.
-
-        Async-shaped scheduling may already have run the next forward with rows
-        that finished on the previous sample. This releases memory for finished
-        requests immediately, records their active-row positions, and leaves row
-        compaction for the next `prepare_requests` call.
-
-        Steps:
-            1. Count active and finished rows in the decode-only active region.
-            2. Release memory for finished rows.
-            3. Record or clear delayed finished-row state for later prepare.
-
-        Example:
-            resolve(N):
-                rows:    [10] [11] [12]
-                active:     1    0    1
-                pending:      [11]
-            prepare(N+2):
-                rows:    [10]      [12]
-        """
-        assert self.paused_request_count == 0
-
-        # Step 1: Count active and finished rows in the decode-only active region.
-        active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
-        assert active_request_count + finished_request_count == self.total_request_count
-
-        if finished_request_count > 0:
-
-            # Step 2: Release memory for finished rows.
-            finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-            self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            # Step 3: Record delayed finished-row state for later prepare.
-            self.record_pending_finished_rows(active_requests_mask == 0)
-        else:
-
-            # Step 3: Clear delayed finished-row state when no rows finished.
-            self.clear_pending_finished_rows()
-
-        return {"newly_paused_request_ids": None, "evict_request_ids": None}
 
     def update_requests_legacy(
         self,
