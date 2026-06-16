@@ -225,10 +225,12 @@ def _apply_rotary_pos_emb_thd(
     has_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == total_seqlen
 
     # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
-    #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
-    #    -> Use traditional mapping without offsets (map first :seqlen part)
+    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains positions for the whole packed
+    #    batch. Each sequence must therefore use its cu_seqlens offset when selecting the local CP
+    #    front/back slices. For example, with cu_seqlens=[0, 4, 8], cp_size=2, rank 0 should use
+    #    positions [0, 3, 4, 7], not [0, 3, 0, 3].
+    # 2. Otherwise: freqs contains only max sequence length positions. Each packed sequence should
+    #    reuse positions starting from 0, preserving the legacy THD behavior.
     if has_packed_freqs:
         # CASE 1: Exact mapping with offsets
         local_freqs = []
@@ -247,7 +249,8 @@ def _apply_rotary_pos_emb_thd(
             mscale=mscale,
         ).squeeze(1)
 
-    # CASE 2: Traditional mapping without offsets
+    # CASE 2: Traditional mapping without offsets. Apply RoPE one sequence at a time so the second
+    # and later packed sequences do not look like continuations of the first sequence.
     output = torch.empty_like(t)
     output_offset = 0
     for x in sequence_splits:
