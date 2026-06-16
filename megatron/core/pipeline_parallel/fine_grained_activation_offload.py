@@ -748,7 +748,7 @@ class PipelineOffloadManager:
         Hook called when autograd retrieves a saved tensor during backward pass.
         Returns the actual tensor (potentially reloading from CPU).
         """
-        debug_rank(f"----on_get_saved_tensor {saved_state}")
+        debug_rank("----on_get_saved_tensor")
         return self.cur_backward_chunk().tensor_pop(saved_state)
 
 
