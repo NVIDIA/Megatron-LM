@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import types
 import unittest
 from unittest.mock import MagicMock
 
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 
 # Assume the provided class is in mamba_mixer.py
+from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
 from megatron.core.ssm.mamba_mixer import MambaMixer
 
 
@@ -126,9 +128,9 @@ class TestMambaDynamicInference(unittest.TestCase):
         and that padding request states remain untouched.
 
         _ssm_prefill expects inputs pre-stripped to real tokens only
-        (stripping is done by _dynamic_inference_prefill). This test
-        passes only the real tokens and verifies that only the active
-        request's state is modified.
+        (stripping is done by the shared dynamic-inference orchestration).
+        This test passes only the real tokens and verifies that only the
+        active request's state is modified.
         """
         num_requests = 48
         real_seq_len = 6
@@ -137,13 +139,6 @@ class TestMambaDynamicInference(unittest.TestCase):
         dim_inputs = self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads
         zxBCdt = torch.randn(real_seq_len, 1, dim_inputs, device=self.device, dtype=torch.float32)
 
-        # Metadata: single real request
-        seq_idx = torch.zeros((1, real_seq_len), dtype=torch.int32, device=self.device)
-
-        cu_seqlens = torch.tensor([0, real_seq_len], dtype=torch.int32, device=self.device)
-
-        batch_indices = torch.tensor([0], dtype=torch.long, device=self.device)
-
         # States
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         conv_state = torch.zeros(num_requests, conv_dim, self.d_conv, device=self.device)
@@ -151,15 +146,33 @@ class TestMambaDynamicInference(unittest.TestCase):
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
 
+        # Build a real MambaMetadata and populate the varlen fields for a single request.
+        mamba_metadata = MambaMetadata(
+            max_requests=num_requests,
+            max_tokens=real_seq_len,
+            mamba_chunk_size=self.mixer.chunk_size,
+            d_conv=self.d_conv,
+        )
+        mamba_metadata.seq_idx = torch.zeros(
+            (1, real_seq_len), dtype=torch.int32, device=self.device
+        )
+        mamba_metadata.cu_seqlens = torch.tensor(
+            [0, real_seq_len], dtype=torch.int32, device=self.device
+        )
+        mamba_metadata.batch_indices_prefill = torch.tensor(
+            [0], dtype=torch.int32, device=self.device
+        )
+        mamba_metadata.real_prefill_token_count = real_seq_len
+        mamba_metadata.cu_seqlens_list = [0, real_seq_len]
+
+        context = types.SimpleNamespace(
+            mamba_metadata=mamba_metadata, mamba_slot_allocator=None
+        )
+
         # Run
         self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
         output = self.mixer._ssm_prefill(
-            zxBCdt=zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices,
+            zxBCdt=zxBCdt, conv_state=conv_state, ssm_state=ssm_state, context=context
         )
 
         # Output should have real_seq_len tokens
