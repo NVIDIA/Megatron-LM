@@ -3562,6 +3562,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
     # Run training iterations till done.
@@ -4595,3 +4596,40 @@ def should_disable_forward_pre_hook(args):
         )
         and args.overlap_param_gather
     )
+
+
+def _get_thd_sequence_length_upper_bound(args):
+    """Return the padded per-sample THD length upper bound used for graph sizing."""
+    max_sequence_length = getattr(args, "seq_length", None)
+    mock_config_spec = None
+    if getattr(args, "use_varlen_dataset", False):
+        mock_config_spec = getattr(args, "varlen_mock_dataset_config_json", None)
+    elif getattr(args, "sft", False):
+        mock_config_spec = getattr(args, "sft_mock_dataset_config_json", None)
+
+    if mock_config_spec is not None:
+        from megatron.training.datasets.utils import load_json_arg
+
+        mock_config = load_json_arg(mock_config_spec)
+        if isinstance(mock_config, dict) and mock_config.get("max_seq_len") is not None:
+            max_sequence_length = int(mock_config["max_seq_len"])
+
+    if max_sequence_length is None:
+        return None
+
+    if getattr(args, "seq_length", None) is not None:
+        max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
+
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    pad_granularity = cp_pad * sp_pad
+    return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)

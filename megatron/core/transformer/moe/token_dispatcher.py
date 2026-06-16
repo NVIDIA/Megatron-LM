@@ -1070,16 +1070,15 @@ class _HybridEPManager(_DispatchManager):
             or self.config.moe_hybridep_pad_variable_tokens
         )
         if equalize_thd_token_counts:
-            if (
-                self.config.sequence_packing_scheduler is not None
-                and torch.cuda.is_current_stream_capturing()
+            if self.config.sequence_packing_scheduler is not None and (
+                torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling()
             ):
-                # Capture path: routing_map has already been padded to a static
+                # CUDA graph path: routing_map has already been padded to a static
                 # length upstream (CUDA graph + sequence packing implies
                 # cu_seqlens_q_padded -> max_seqlen_per_dp_cp_rank), so num_tokens
                 # is identical across the EP communication group. Skip the
-                # all_reduce + .item() (forbidden during stream capture) and use
-                # the local value directly.
+                # all_reduce + .item() during both dynamo tracing and stream
+                # capture, and use the local value directly.
                 padded_num_tokens = num_tokens
             else:
                 # Use the actual tp_ep max so all ranks in the MoE communication

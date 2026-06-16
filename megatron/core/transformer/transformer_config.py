@@ -1094,10 +1094,10 @@ class TransformerConfig(ModelParallelConfig):
     buffer."""
 
     cuda_graph_dynamic_microbatches: bool = False
-    """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
-    number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
-    When enabled, capture builds a bounded number of graph slots and replay maps real
-    microbatch_id to slot_id by modulo."""
+    """Allow CUDA graph replay when runtime microbatch count varies across iterations.
+    This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
+    packing, capture uses a conservative upper bound on the packed microbatch count so graph
+    replay can cover iterations whose real packed microbatch count changes."""
 
     ####################
     # Hyper-Connection Configuration

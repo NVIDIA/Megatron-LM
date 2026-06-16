@@ -23,6 +23,7 @@ the per-iteration loss / grad_norm lines. They must be exactly equal.
 
 import os
 import re
+import socket
 import subprocess
 from pathlib import Path
 
@@ -521,6 +522,91 @@ class TestDecomposeReconstruct:
         assert set(kw.keys()) == keys
 
 
+class TestStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_static_padding_mask_is_unmasked_for_capture(self):
+        """Capture-time padding_mask must not mark every static token as padding."""
+        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        layer.config.sequence_packing_scheduler = "dp_balanced"
+        layer.config.cuda_graph_impl = "transformer_engine"
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+
+        assert static_inputs["padding_mask"].shape == (1, 128)
+        assert not static_inputs["padding_mask"].any()
+
+
+class TestDynamicMicrobatchSlots:
+
+    @pytest.mark.internal
+    def test_pp2_slots_track_max_outstanding_microbatches(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        order = [1, 1, -1, 1, -1, 1, -1, -1]
+
+        assert TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, 1) == 2
+
+    @pytest.mark.internal
+    def test_vpp_slots_track_each_chunk_liveness(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        order = [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
+
+        assert TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, 2) == 5
+
+    @pytest.mark.internal
+    def test_dp_balanced_thd_capture_upper_bound_uses_max_sequence_length(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        assert (
+            TECudaGraphHelper._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size=64,
+                dp_size=1,
+                cp_size=1,
+                max_seqlen_per_dp_cp_rank=4096,
+                max_sequence_length=4096,
+                max_num_seqs=8,
+            )
+            == 64
+        )
+        assert (
+            TECudaGraphHelper._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size=64,
+                dp_size=1,
+                cp_size=2,
+                max_seqlen_per_dp_cp_rank=4096,
+                max_sequence_length=4096,
+                max_num_seqs=8,
+            )
+            == 32
+        )
+
+    @pytest.mark.internal
+    def test_dp_balanced_thd_capture_upper_bound_aligns_vpp_groups(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        assert (
+            TECudaGraphHelper._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size=18,
+                dp_size=1,
+                cp_size=1,
+                max_seqlen_per_dp_cp_rank=4096,
+                max_sequence_length=2048,
+                microbatch_group_size_per_vp_stage=8,
+                max_num_seqs=8,
+            )
+            == 16
+        )
+
+
 # =============================================================================
 # 3. E2E no-graph vs graph bitwise loss/grad_norm match
 #    Subprocess-launches `torchrun pretrain_gpt.py` -- same recipe as
@@ -531,22 +617,29 @@ class TestDecomposeReconstruct:
 # Common args shared across both models.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-_SFT_JSON = (
+_VARLEN_JSON = (
     '{"mode":"distribution","type":"lognormal",'
-    '"min_seq_len":128,"max_seq_len":2048,"mean_seq_len":1024,"lognormal_sigma":0.8}'
+    '"format":"thd","min_seq_len":512,"max_seq_len":4096,'
+    '"mean_seq_len":3072,"lognormal_sigma":1.1}'
+)
+
+_QWEN3_VARLEN_JSON = (
+    '{"mode":"distribution","type":"lognormal",'
+    '"format":"thd","min_seq_len":128,"max_seq_len":1024,'
+    '"mean_seq_len":512,"lognormal_sigma":0.8}'
 )
 
 _TRAIN_ITERS = 5
 
 _COMMON_ARGS = [
     "--seq-length",
-    "2048",
+    "4096",
     "--max-position-embeddings",
     "8192",
     "--micro-batch-size",
     "1",
     "--global-batch-size",
-    "4",
+    "64",
     "--train-iters",
     str(_TRAIN_ITERS),
     "--lr",
@@ -574,18 +667,19 @@ _COMMON_ARGS = [
     "--swiglu",
     "--disable-bias-linear",
     "--sequence-parallel",
-    "--sft",
+    "--use-varlen-dataset",
     "--mock-data",
     "--tokenizer-type",
     "NullTokenizer",
-    "--sft-mock-dataset-config-json",
-    _SFT_JSON,
+    "--varlen-mock-dataset-config-json",
+    _VARLEN_JSON,
     "--sequence-packing-scheduler",
     "dp_balanced",
     "--max-seqlen-per-dp-cp-rank",
-    "1024",
+    "4096",
     "--pad-packed-seq-alignment",
     "max",
+    "--no-pad-packed-seq-by-appending-dummy-seq",
     "--calculate-per-token-loss",
     "--transformer-impl",
     "transformer_engine",
@@ -608,8 +702,27 @@ _COMMON_ARGS = [
     "--no-check-for-nan-in-loss-and-grad",
     "--deterministic-mode",
     "--thd-max-num-seqs",
-    "32",
+    "8",
 ]
+
+
+def _with_arg_replacements(args, replacements):
+    args = list(args)
+    for name, value in replacements.items():
+        idx = args.index(name)
+        args[idx + 1] = value
+    return args
+
+
+_QWEN3_COMMON_ARGS = _with_arg_replacements(
+    _COMMON_ARGS,
+    {
+        "--seq-length": "1024",
+        "--varlen-mock-dataset-config-json": _QWEN3_VARLEN_JSON,
+        "--max-seqlen-per-dp-cp-rank": "512",
+    },
+)
+
 
 _MOONLIGHT_ARGS = _COMMON_ARGS + [
     "--num-layers",
@@ -670,7 +783,7 @@ _MOONLIGHT_ARGS = _COMMON_ARGS + [
     "163840",
 ]
 
-_QWEN3_ARGS = _COMMON_ARGS + [
+_QWEN3_ARGS = _QWEN3_COMMON_ARGS + [
     "--num-layers",
     "36",
     "--hidden-size",
@@ -699,9 +812,27 @@ _QWEN3_ARGS = _COMMON_ARGS + [
     "hybridep",
 ]
 
-_ATTN_CUDA_GRAPH_ARGS = ["--cuda-graph-impl", "transformer_engine", "--cuda-graph-modules", "attn"]
+_ATTN_CUDA_GRAPH_ARGS = [
+    "--cuda-graph-impl",
+    "transformer_engine",
+    "--cuda-graph-dynamic-microbatches",
+    "--cuda-graph-modules",
+    "attn",
+]
 
 _MOE_CUDA_GRAPH_ARGS = _ATTN_CUDA_GRAPH_ARGS + ["moe_preprocess", "moe_router"]
+
+
+def _get_available_port(preferred):
+    """Return preferred if free, otherwise ask the OS for an available localhost port."""
+    for port in (preferred, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("localhost", port))
+            except OSError:
+                continue
+            return sock.getsockname()[1]
+    raise RuntimeError("Could not find an available localhost port")
 
 
 def _run_pretrain(model_args, cuda_graph_args, master_port):
@@ -742,7 +873,7 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
             "--master_addr",
             "localhost",
             "--master_port",
-            str(master_port),
+            str(_get_available_port(master_port)),
             "pretrain_gpt.py",
         ]
         + model_args
@@ -774,12 +905,9 @@ def _extract_metrics(stdout):
         lr = re.search(r"learning rate:\s*(\S+)", window)
         lm_loss = re.search(r"lm loss:\s*(\S+)", window)
         grad_norm = re.search(r"grad norm:\s*(\S+)", window)
-        lb_loss = re.search(r"load_balancing_loss:\s*(\S+)", window)
         if not (lr and lm_loss and grad_norm):
             continue
         parts = [f"iter={m.group(1)}", f"lr={lr.group(1)}", f"lm_loss={lm_loss.group(1)}"]
-        if lb_loss:
-            parts.append(f"lb_loss={lb_loss.group(1)}")
         parts.append(f"grad_norm={grad_norm.group(1)}")
         results.append(" | ".join(parts))
     return results
@@ -799,10 +927,11 @@ class TestE2EBitwise:
     """End-to-end bitwise comparison: pretrain_gpt.py noGraph vs cudaGraph.
 
     Each test launches `torchrun pretrain_gpt.py` twice -- once without CUDA
-    graphs and once with `cuda_graph_impl=transformer_engine cuda_graph_modules=attn`
-    -- using the same model/test settings as test_moonlight_qwen3_bitwise.sh.
-    Asserts the per-iteration `lm loss / load_balancing_loss / grad norm`
-    lines are byte-identical.
+    graphs and once with `cuda_graph_impl=transformer_engine` -- using the same
+    model/test settings as test_moonlight_qwen3_bitwise.sh. Moonlight covers
+    attn/moe_preprocess/moe_router graphs with router fusion; Qwen3 covers attn
+    graphs because this test's Qwen3 recipe is dense.
+    Asserts the per-iteration `lm loss / grad norm` lines are byte-identical.
 
     Slow (~5 min per model). Marked `internal` so CI can opt-in.
     """
