@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-from typing import Optional
 
 import torch
 
@@ -52,12 +51,13 @@ def configure_module_rng(
     )
 
 
-def set_module_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
-    """Set requires_grad for every parameter in a module when the module exists."""
-    if module is None:
-        return
-    for param in module.parameters():
-        param.requires_grad = requires_grad
+def _freeze_modality_submodule(submodule: torch.nn.Module, args: argparse.Namespace) -> None:
+    """Freeze the encoder backbone (--freeze-vit) and/or projector (--freeze-projection)."""
+    if getattr(args, "freeze_vit", False):
+        submodule.encoders.requires_grad_(False)
+    if getattr(args, "freeze_projection", False):
+        submodule.input_projections.requires_grad_(False)
+        submodule.output_projections.requires_grad_(False)
 
 
 def _module_config(module: torch.nn.Module):
@@ -92,7 +92,7 @@ def wrap_active_modules_with_ddp(
     with torch.cuda.stream(ddp_stream):
         if mimo_model.language_model is not None:
             if getattr(args, "freeze_lm", False):
-                set_module_requires_grad(mimo_model.language_model, False)
+                mimo_model.language_model.requires_grad_(False)
             overlap = getattr(args, "overlap_grad_reduce", False)
             ddp_config = DistributedDataParallelConfig(
                 overlap_grad_reduce=overlap,
@@ -124,8 +124,7 @@ def wrap_active_modules_with_ddp(
         for name, submodule in mimo_model.modality_submodules.items():
             if submodule is None or name not in topology.module_pgs:
                 continue
-            if getattr(args, "freeze_encoders", False):
-                set_module_requires_grad(submodule, False)
+            _freeze_modality_submodule(submodule, args)
             ddp_config = DistributedDataParallelConfig(
                 overlap_grad_reduce=False,
                 overlap_param_gather=False,
