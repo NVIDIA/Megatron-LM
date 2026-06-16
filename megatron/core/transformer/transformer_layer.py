@@ -1204,13 +1204,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
-                # Static cu_seqlens shaped [thd_max_num_seqs + 1]. We seed it as
+                # Static cu_seqlens shaped [thd_max_packed_sequences + 1]. We seed it as
                 # one full-length sequence (covers the worst case at capture):
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
                 # entries. cu_seqlens_q / kv / *_padded all share this layout.
                 max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-                max_num_seqs = self.config.thd_max_num_seqs
+                max_num_seqs = self.config.thd_max_packed_sequences
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
 

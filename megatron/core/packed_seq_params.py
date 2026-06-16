@@ -129,8 +129,8 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
         return None
     actual_entries = cu_seqlens.shape[0]
     assert actual_entries <= target_entries, (
-        f"Actual num_seqs ({actual_entries - 1}) exceeds thd_max_num_seqs "
-        f"({target_entries - 1}). Increase --thd-max-num-seqs, decrease "
+        f"Actual num_seqs ({actual_entries - 1}) exceeds thd_max_packed_sequences "
+        f"({target_entries - 1}). Increase --thd-max-packed-sequences, decrease "
         f"--max-seqlen-per-dp-cp-rank, or filter shorter samples upstream so "
         f"the packing scheduler stops earlier."
     )
@@ -167,7 +167,7 @@ def _round_up_to_alignment(value: int, alignment: int) -> int:
 def get_thd_padding_kwargs(
     pad_packed_seq_alignment: Union[int, Literal["max"]],
     max_seqlen_per_dp_cp_rank: Optional[int],
-    thd_max_num_seqs: Optional[int],
+    thd_max_packed_sequences: Optional[int],
     cuda_graph_static: bool,
 ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """Resolve ``pad_sequence_for_thd`` kwargs from the training config.
@@ -177,12 +177,12 @@ def get_thd_padding_kwargs(
     - ``max`` pads token-like tensors to ``max_seqlen_per_dp_cp_rank``;
     - a positive value pads token-like tensors to a multiple of that value.
 
-    Padding cu_seqlens to ``thd_max_num_seqs + 1`` is a CUDA Graph static-input
+    Padding cu_seqlens to ``thd_max_packed_sequences + 1`` is a CUDA Graph static-input
     requirement. Eager pad-to-max should preserve sequence metadata so kernels
     continue to see the real packed sequence boundaries.
     """
     if cuda_graph_static:
-        return None, int(max_seqlen_per_dp_cp_rank), thd_max_num_seqs
+        return None, int(max_seqlen_per_dp_cp_rank), thd_max_packed_sequences
 
     if pad_packed_seq_alignment == "max":
         return None, int(max_seqlen_per_dp_cp_rank), None
@@ -198,6 +198,9 @@ def _resolve_thd_padding_lengths(
     packed_seq_params: PackedSeqParams,
     target_len: Optional[int],
     alignment: Optional[int],
+    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
 ) -> Tuple[int, int, int, int, torch.device]:
     """Resolve local/global THD padding lengths without changing tensors.
 
@@ -209,15 +212,9 @@ def _resolve_thd_padding_lengths(
         mask_device: Device used to build the returned padding mask.
     """
 
-    # Resolve the CP geometry used to translate local lengths to global endpoints.
-    from megatron.core import parallel_state
-
-    cp_size = (
-        packed_seq_params.local_cp_size
-        if packed_seq_params.local_cp_size is not None
-        else parallel_state.get_context_parallel_world_size()
+    cp_size, cp_rank = _resolve_thd_cp_geometry(
+        packed_seq_params, cp_group=cp_group, cp_size=cp_size, cp_rank=cp_rank
     )
-    cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
 
     # Find the first token-like tensor that carries this rank's local length.
     local_tensor_T = None
@@ -288,6 +285,47 @@ def _resolve_thd_padding_lengths(
     return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
 
+def _resolve_thd_cp_geometry(
+    packed_seq_params: PackedSeqParams,
+    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Resolve CP geometry for THD padding.
+
+    Callers with a known CP group or explicit size/rank should pass it here.
+    Falling back to ``parallel_state`` preserves legacy call sites.
+    """
+    if cp_group is not None:
+        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+
+    if cp_size is not None:
+        cp_size = int(cp_size)
+        if cp_rank is not None:
+            return cp_size, int(cp_rank)
+        if cp_size == 1:
+            return cp_size, 0
+
+    if packed_seq_params.cp_group is not None:
+        cp_group = packed_seq_params.cp_group
+        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+
+    if cp_size is None and packed_seq_params.local_cp_size is not None:
+        cp_size = int(packed_seq_params.local_cp_size)
+        if cp_size == 1:
+            return cp_size, 0
+
+    # Last resort for compatibility with older callers that do not thread CP
+    # geometry through PackedSeqParams.
+    from megatron.core import parallel_state
+
+    if cp_size is None:
+        cp_size = int(parallel_state.get_context_parallel_world_size())
+    if cp_rank is None:
+        cp_rank = int(parallel_state.get_context_parallel_rank()) if cp_size > 1 else 0
+    return int(cp_size), int(cp_rank)
+
+
 def pad_sequence_for_thd(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],
@@ -299,6 +337,9 @@ def pad_sequence_for_thd(
     max_num_seqs: Optional[int] = None,
     pad_by_appending_dummy_seq: bool = True,
     padding_mask: Optional[Tensor] = None,
+    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
 ) -> Tuple[
     Optional[Tensor],
     Optional[Tensor],
@@ -333,6 +374,12 @@ def pad_sequence_for_thd(
             tail as an extra dummy sequence in cu_seqlens metadata.
         padding_mask: Existing bool padding mask for already-packed tokens,
             with True marking padding positions.
+        cp_group: Context-parallel process group for resolving local/global
+            THD padding lengths. If omitted, ``packed_seq_params.cp_group`` is
+            used when available.
+        cp_size: Explicit context-parallel world size used when no CP group is
+            available.
+        cp_rank: Explicit context-parallel rank used with ``cp_size``.
 
     Notes:
         - THD CP slicing is defined by Transformer Engine. On metadata-only
@@ -361,6 +408,9 @@ def pad_sequence_for_thd(
             packed_seq_params,
             target_len=target_len,
             alignment=alignment,
+            cp_group=cp_group,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
         )
     )
 

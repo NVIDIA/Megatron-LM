@@ -22,7 +22,7 @@ from tests.unit_tests.test_utilities import Utils
 
 def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
     config = SimpleNamespace(
-        thd_max_num_seqs=32,
+        thd_max_packed_sequences=32,
         pad_packed_seq_alignment="max",
         pad_packed_seq_by_appending_dummy_seq=True,
     )
@@ -39,7 +39,7 @@ def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
 
 def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
     config = SimpleNamespace(
-        thd_max_num_seqs=1,
+        thd_max_packed_sequences=1,
         pad_packed_seq_alignment="max",
         pad_packed_seq_by_appending_dummy_seq=True,
     )

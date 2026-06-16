@@ -86,7 +86,7 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
         num_query_groups=nkv,
         ffn_hidden_size=ffn,
         max_seqlen_per_dp_cp_rank=max_seqlen,
-        thd_max_num_seqs=max_num_seqs,
+        thd_max_packed_sequences=max_num_seqs,
         tensor_model_parallel_size=tp,
         sequence_parallel=sp,
         bf16=True,
@@ -112,7 +112,7 @@ def test_pad_to_max_resolves_padding_kwargs(cuda_graph_static, expected_max_num_
     alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
         pad_packed_seq_alignment="max",
         max_seqlen_per_dp_cp_rank=8192,
-        thd_max_num_seqs=32,
+        thd_max_packed_sequences=32,
         cuda_graph_static=cuda_graph_static,
     )
 
@@ -399,7 +399,7 @@ class TestPadSequenceForThd:
         alignment, pad_target_len, max_num_seqs = get_thd_padding_kwargs(
             pad_packed_seq_alignment="max",
             max_seqlen_per_dp_cp_rank=target_len,
-            thd_max_num_seqs=32,
+            thd_max_packed_sequences=32,
             cuda_graph_static=False,
         )
 
@@ -736,7 +736,7 @@ _COMMON_ARGS = [
     "1",
     "--no-check-for-nan-in-loss-and-grad",
     "--deterministic-mode",
-    "--thd-max-num-seqs",
+    "--thd-max-packed-sequences",
     "8",
 ]
 

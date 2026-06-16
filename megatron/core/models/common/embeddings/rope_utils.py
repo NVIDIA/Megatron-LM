@@ -282,10 +282,11 @@ def _apply_rotary_pos_emb_thd(
     else:
         freq_pos = local_pos.to(torch.int64)
 
-    if max_seqlen is None:
-        exact_packed_freqs = freqs.dim() >= 1 and cp_size == 1 and freqs.size(0) > total_tokens
-    else:
-        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+    assert max_seqlen is not None, (
+        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
+        "detection does not silently depend on tensor shape heuristics."
+    )
+    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
     if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token

@@ -468,26 +468,26 @@ scheduler_map: Dict[str, Type[BasePackingScheduler]] = {
 def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     """Return the scheduler cap for real THD sequences.
 
-    ``thd_max_num_seqs`` is the final static THD capacity, including the
+    ``thd_max_packed_sequences`` is the final static THD capacity, including the
     optional dummy sequence appended for a padding tail. The dp_balanced
     scheduler only packs real sequences, so reserve one slot when dummy-tail
     padding is enabled.
     """
-    max_num_seqs = getattr(config, 'thd_max_num_seqs', None)
+    max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
     if max_num_seqs is None:
         return None
 
     max_num_seqs = int(max_num_seqs)
     if max_num_seqs < 1:
-        raise ValueError(f"thd_max_num_seqs must be >= 1, got {max_num_seqs}.")
+        raise ValueError(f"thd_max_packed_sequences must be >= 1, got {max_num_seqs}.")
 
     if getattr(config, 'pad_packed_seq_alignment', None) is not None and getattr(
         config, 'pad_packed_seq_by_appending_dummy_seq', True
     ):
         if max_num_seqs < 2:
             raise ValueError(
-                "thd_max_num_seqs must be >= 2 when THD padding appends a dummy "
-                "sequence, because thd_max_num_seqs includes that dummy sequence."
+                "thd_max_packed_sequences must be >= 2 when THD padding appends a dummy "
+                "sequence, because thd_max_packed_sequences includes that dummy sequence."
             )
         return max_num_seqs - 1
 
@@ -539,7 +539,7 @@ def wrap_data_iterator(
     scheduler_max_num_seqs = (
         _get_scheduler_max_real_num_seqs(config)
         if scheduler_type == 'dp_balanced'
-        else getattr(config, 'thd_max_num_seqs', None)
+        else getattr(config, 'thd_max_packed_sequences', None)
     )
 
     scheduler = scheduler_map[scheduler_type](
@@ -794,7 +794,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_num_seqs + 1 entries.
+    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
@@ -802,7 +802,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
             pad_alignment,
             getattr(config, 'max_seqlen_per_dp_cp_rank', None),
-            getattr(config, 'thd_max_num_seqs', None),
+            getattr(config, 'thd_max_packed_sequences', None),
             getattr(config, 'cuda_graph_impl', 'none') != 'none',
         )
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
@@ -819,6 +819,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                     config, 'pad_packed_seq_by_appending_dummy_seq', True
                 ),
                 padding_mask=padding_mask,
+                cp_group=cp_group,
             )
         )
 

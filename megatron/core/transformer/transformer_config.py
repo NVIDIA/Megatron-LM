@@ -1082,8 +1082,10 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
-    thd_max_num_seqs: int = 32
-    """Maximum number of THD sequence entries per microbatch, including any dummy
+    thd_max_packed_sequences: int = field(
+        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    )
+    """Maximum number of THD packed sequences per microbatch, including any dummy
     sequence appended for a padding tail. The dp_balanced packing scheduler reserves
     that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
     tensors are padded to this size + 1.

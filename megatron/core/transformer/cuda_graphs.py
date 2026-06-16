@@ -2340,7 +2340,7 @@ class TECudaGraphHelper:
             else self.seq_length
         )
 
-        max_num_seqs = getattr(self.config, 'thd_max_num_seqs', None)
+        max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
         if max_num_seqs is not None:
             max_num_seqs = int(max_num_seqs)
             if getattr(self.config, 'pad_packed_seq_alignment', None) is not None and getattr(
