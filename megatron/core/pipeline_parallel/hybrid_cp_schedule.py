@@ -524,7 +524,6 @@ def hybrid_context_parallel_forward_backward(
     no_sync_func,
     total_num_tokens,
     check_first_val_step,
-    model_type,
     pg_collection,
 ):
     """
@@ -622,7 +621,7 @@ def hybrid_context_parallel_forward_backward(
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
                     backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                        input_tensor, output_tensor, output_tensor_grad, config
                     )
 
     # For the last group, we need to run the last sub-sample out of the context handler.
@@ -647,7 +646,7 @@ def hybrid_context_parallel_forward_backward(
             current_microbatch += 1
             total_num_tokens += num_tokens.item()
             if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     # The last sub-sample of the last group of the last microbatch is
     # run out of the context handler.
@@ -669,6 +668,6 @@ def hybrid_context_parallel_forward_backward(
     )
     total_num_tokens += num_tokens.item()
     if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     return forward_data_store, total_num_tokens

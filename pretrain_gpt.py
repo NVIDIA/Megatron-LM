@@ -102,7 +102,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
         for key, data in batch.items():
             # TODO (pmannan): Are there any other keys that need to be skipped?
-            if key in ['attention_mask']:
+            if key in ['attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'hybrid_cp_group', 'max_seqlen']:
                 continue
             # TODO(pmannan): Is unsqueeze better than stack?
             batch[key] = torch.stack([data], 0)
