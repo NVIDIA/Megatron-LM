@@ -87,22 +87,24 @@ def _token_source_global_rank(language_grid) -> int:
     """Global (default-group) rank of the single LLM token-source coordinate.
 
     The source is the language coordinate (tp=0, cp=0, dp=0, pp=last). It is derived
-    statically from grid metadata (shape/dim_names/rank_offset) that is identical on
-    every rank, so even the non-colocated encoder grid — which is not a member of any
-    LLM group — can name this global rank as the broadcast root.
+    statically from the grid's rank enumeration (identical on every rank), so even the
+    non-colocated encoder grid — which is not a member of any LLM group — can name this
+    global rank as the broadcast root.
 
-    ``get_rank_enum("pp")`` yields the exact PP rank lists ``create_pg`` uses. The grid's
-    ``rank_offset`` is always the all-zero coordinate (tp=0, cp=0, dp=0, pp=0), so the PP
-    line that starts at ``rank_offset`` is the (tp=0, cp=0, dp=0) line and its last entry
-    is the (pp=last) source rank.
+    ``get_rank_enum("pp")`` returns the authoritative PP rank lists that ``create_pg``
+    uses for this grid; each list is one (tp, cp, dp) coordinate ordered along PP and
+    already accounts for ``rank_offset``. Rather than assume which list is the all-zero
+    coordinate, the source line is read directly from the enumeration: the global minimum
+    rank belongs to (tp=0, cp=0, dp=0), so its PP line is the source line and that line's
+    last entry is the (pp=last) source rank.
     """
     pp_lines = language_grid.get_rank_enum("pp")
+    min_rank = min(rank for line in pp_lines for rank in line)
     for line in pp_lines:
-        if line[0] == language_grid.rank_offset:
+        if min_rank in line:
             return int(line[-1])
     raise RuntimeError(
-        f"Could not derive token-source global rank from language grid "
-        f"(rank_offset={language_grid.rank_offset}, pp_lines={pp_lines})"
+        f"Could not derive token-source global rank from language grid pp_lines={pp_lines}"
     )
 
 
