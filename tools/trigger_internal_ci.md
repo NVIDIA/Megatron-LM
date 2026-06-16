@@ -40,6 +40,7 @@ python tools/trigger_internal_ci.py \
   [--functional-test-scope mr] \
   [--functional-test-repeat 5] \
   [--functional-test-cases all] \
+  [--functional-test-time-limit 14400] \
   [--dry-run]
 ```
 
@@ -50,6 +51,7 @@ python tools/trigger_internal_ci.py \
 | `--functional-test-scope` | `mr` | `FUNCTIONAL_TEST_SCOPE` pipeline variable |
 | `--functional-test-repeat` | `5` | `FUNCTIONAL_TEST_REPEAT` pipeline variable |
 | `--functional-test-cases` | `all` | `FUNCTIONAL_TEST_CASES` pipeline variable |
+| `--functional-test-time-limit` | *(scope-dependent)* | `FUNCTIONAL_TEST_TIME_LIMIT` pipeline variable, in seconds. Defaults to `14400` (4h) for the long-running `release` and `weekly` scopes; left unset otherwise. |
 | `--dry-run` | off | Print what would happen without pushing or triggering |
 
 ## Example
