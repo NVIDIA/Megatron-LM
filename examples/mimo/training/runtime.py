@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -16,7 +17,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_pg_rank, get_pg_size
-from megatron.training.training import wrap_model_chunks_with_ddp
+from megatron.training.training import resolve_ddp_bucket_size, wrap_model_chunks_with_ddp
 from megatron.training.utils import print_rank_0
 
 
@@ -47,18 +48,27 @@ def configure_module_rng(
 def _resolve_bucket_size(
     args: argparse.Namespace, module: torch.nn.Module, dp_cp_group, overlap_grad_reduce: bool
 ) -> Optional[int]:
-    """Mirror megatron.training.get_model's DDP bucket-size logic (training.py:1764-1778)."""
-    if not overlap_grad_reduce:
-        return None  # get_model sets bucket_size=None when overlap is off
+    """Resolve a module's DDP bucket size via the shared get_model helper.
+
+    Maps the MIMO ``args`` (``ddp_num_buckets`` / ``ddp_bucket_size``) onto the
+    fields ``resolve_ddp_bucket_size`` reads from a DDP config, then delegates so the
+    3-branch policy stays single-sourced with ``get_model``. ``ddp_bucket_size <= 0``
+    is normalized to ``None`` (the default trigger) and an empty module yields ``None``.
+    """
     num_buckets = getattr(args, "ddp_num_buckets", None)
     if num_buckets is not None:
         assert num_buckets > 0
-        num_params = sum(p.numel() for p in module.parameters())
-        return max(1, num_params // num_buckets) if num_params > 0 else None
     bucket_size = getattr(args, "ddp_bucket_size", 0)
-    if bucket_size and bucket_size > 0:
-        return bucket_size
-    return max(40_000_000, 1_000_000 * get_pg_size(dp_cp_group))  # get_model's sane default
+    if not bucket_size or bucket_size <= 0:
+        bucket_size = None
+    num_params = sum(p.numel() for p in module.parameters())
+    if num_buckets is not None and num_params == 0:
+        return None  # empty module: no params to bucket
+    config = SimpleNamespace(num_buckets=num_buckets, bucket_size=bucket_size)
+    resolved = resolve_ddp_bucket_size(config, dp_cp_group, overlap_grad_reduce, num_params)
+    if num_buckets is not None and resolved is not None:
+        return max(1, resolved)  # never hand DDP a zero-size bucket
+    return resolved
 
 
 def set_module_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
