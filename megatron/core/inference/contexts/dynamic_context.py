@@ -142,6 +142,12 @@ class PendingFinishedRows:
             rows:         [10] [11] [12]
             active_mask:    F    T    F
             request_ids:       [11]
+
+        Args:
+            None.
+
+        Returns:
+            None: This method validates dataclass invariants in place.
         """
         assert self.active_mask.dtype == torch.bool
         assert self.active_mask.dim() == 1
@@ -282,6 +288,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         ),
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
+        """Initialize dynamic batching context metadata and allocators.
+
+        Args:
+            model_config (TransformerConfig): Model configuration used to size
+                attention, Mamba, MoE, and parallelism-specific context state.
+            inference_config (InferenceConfig): Inference configuration used to
+                size dynamic request, token, and KV-cache state.
+
+        Returns:
+            None: This constructor initializes context state in place.
+        """
         super().__init__(inference_config=inference_config)
 
         # Prefix caching configuration
@@ -926,7 +943,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = None
 
     def initialize_all_tensors(self) -> None:
-        """Allocate all GPU state during initial construction."""
+        """Allocate all GPU state during initial construction.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method allocates tensor state in place.
+        """
         # Mark allocated.
         if self.is_tensor_state_allocated:
             return
@@ -2421,7 +2445,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._pending_mamba_transfer = None
 
     def reset_tensors(self) -> None:
-        """Fill all bookkeeping tensors with sentinel values."""
+        """Fill all bookkeeping tensors with sentinel values.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method resets tensor contents in place.
+        """
 
         # Reset request indexes.
         self.request_ids.fill_(-1)
@@ -2452,6 +2483,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method resets context metadata in place.
         """
 
         # Reset request/token counts.
@@ -2764,8 +2801,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             req (DynamicInferenceRequest): Request to add.
             prefill_chunk_length (Optional[int]): Length of prefill chunk to add. If None, the request will be fully added.
 
-        Return:
-            None
+        Returns:
+            None: This method adds the request to context state in place.
         """
         # If tensor state is deallocated, do not add request.
         if not self.is_tensor_state_allocated:
@@ -2971,6 +3008,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         Example:
             before: pending -> [11]
             after:  pending -> none
+
+        Args:
+            None.
+
+        Returns:
+            None: This method clears context state in place.
         """
         self._pending_finished_rows = None
 
@@ -2992,6 +3035,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             active rows: [10] [11] [12]
             finished:      F    T    F
             pending ids:      [11]
+
+        Args:
+            finished_active_mask (Tensor): One-dimensional mask in active-row
+                order, where true entries mark rows that finished.
+
+        Returns:
+            None: This method records pending finished-row state in place.
         """
 
         # Step 1: Reject recording if an earlier pending finish is still unconsumed.
@@ -3039,6 +3089,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             sample rows: [10] [11] [12]
             pending:         [11]
             result rows: [10]      [12]
+
+        Args:
+            step_result (Dict): Engine-facing result dictionary whose per-row
+                entries may still include rows that finished in a prior resolve.
+
+        Returns:
+            Dict: A shallow-copied result dictionary with prior-finished rows
+            removed when pending finished-row state exists; otherwise the input
+            dictionary is returned unchanged.
         """
 
         # Step 1: Return unchanged when no pending finished rows exist.
@@ -3114,6 +3173,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Example:
             before: [10] [11 done] [12]
             after:  [10] [12]      [empty]
+
+        Args:
+            next_tokens (Optional[Tensor]): Sampled-token tensor to move with
+                kept request rows during compaction.
+            new_speculative_tokens (Optional[Tensor]): Speculative-token tensor
+                to move with kept request rows during compaction.
+
+        Returns:
+            None: This method mutates context request rows and pending state in
+            place.
         """
 
         # Step 1: Return unchanged when no pending finished rows exist.
@@ -3193,6 +3262,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             context rows:    [10] [11] [12]
             prepared update: [10] [11] [12]
             after consume:   [10]      [12]
+
+        Args:
+            prepared_update (Dict[str, Optional[Tensor]]): Prepared request
+                update tensors keyed by active mask, sampled tokens, optional
+                speculative tokens, and optional previous block IDs.
+            request_bookkeeping (Optional[Dict]): Engine-facing bookkeeping
+                dictionary to filter alongside context rows when supplied.
+
+        Returns:
+            Tuple[Dict[str, Optional[Tensor]], Optional[Dict]]: The adjusted
+            prepared update and adjusted request bookkeeping after pending
+            finished rows are consumed.
         """
 
         # Step 1: Return inputs unchanged when no pending rows exist.
@@ -3232,6 +3313,17 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
+
+        Args:
+            src_idxs (Tensor): Source request-row indexes to move from.
+            dst_idxs (Tensor): Destination request-row indexes to move to.
+            next_tokens (Tensor): Sampled-token tensor to move with request
+                rows when supplied.
+            new_speculative_tokens (Optional[Tensor]): Speculative-token tensor
+                to move with request rows when supplied.
+
+        Returns:
+            None: This method moves bookkeeping tensors in place.
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
@@ -3263,6 +3355,17 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
+
+        Args:
+            src_idxs (Tensor): Source request-row indexes to swap.
+            dst_idxs (Tensor): Destination request-row indexes to swap.
+            next_tokens (Optional[Tensor]): Sampled-token tensor to swap with
+                request rows when supplied.
+            new_speculative_tokens (Optional[Tensor]): Speculative-token tensor
+                to swap with request rows when supplied.
+
+        Returns:
+            None: This method swaps bookkeeping tensors in place.
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
@@ -3570,6 +3673,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             requests: [10]      [12]
             tokens:   42        43
             forward: [10:42]   [12:43]
+
+        Args:
+            active_requests_mask (Tensor): One-dimensional mask in active-row
+                order, where one marks requests that remain active.
+            new_tokens (Tensor): Newly sampled base tokens, one per active row.
+            new_speculative_tokens (Tensor): Optional speculative-token tensor
+                with shape `[num_speculative_tokens, active_request_count]`.
+            prev_last_block_ids (Optional[Tensor]): Previous last-block IDs used
+                when resumed requests cross a KV block boundary.
+            request_bookkeeping (Optional[Dict]): Engine-facing bookkeeping to
+                filter and return alongside the adjusted prepared update.
+
+        Returns:
+            Union[Dict[str, Optional[Tensor]], Tuple[Dict[str, Optional[Tensor]], Dict]]:
+            The adjusted prepared update, plus adjusted request bookkeeping when
+            `request_bookkeeping` is supplied.
         """
 
         # Step 1: Move sampled-token inputs to CPU bookkeeping tensors.
@@ -3760,6 +3879,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             active:    1    0    1
             pending:     [11]
             prepare: [10]      [12]
+
+        Args:
+            prepared_update (Dict[str, Optional[Tensor]]): Prepared request
+                update produced from sampled tokens, including active mask and
+                sampled-token tensors.
+
+        Returns:
+            Dict[str, Optional[Tensor]]: Lifecycle result dictionary for the
+            split path. Pause and eviction IDs are always `None` in this
+            finish-only implementation.
         """
 
         # Step 1: Normalize prepared-update tensors onto CPU.
@@ -3819,6 +3948,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                   -> resolve_requests(N)
                   -> prepare_requests(N+1)
                   -> forward(N+1)
+
+        Args:
+            active_requests_mask (Tensor): One-dimensional mask in active-row
+                order, where one marks requests that remain active.
+            new_tokens (Tensor): Newly sampled base tokens, one per active row.
+            new_speculative_tokens (Tensor): Optional speculative-token tensor
+                with shape `[num_speculative_tokens, active_request_count]`.
+
+        Returns:
+            Dict[str, Optional[Tensor]]: Lifecycle result dictionary returned by
+            `resolve_requests`.
         """
 
         # Step 1: Package sampled outputs into a prepared update.
@@ -3879,7 +4019,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 with num_speculative tokens per active request.
                 (num_speculative_tokens, active_request_length)
 
-        Return:
+        Returns:
             (Tensor) Newly paused request IDs.
         """
         # 1. The active token mask tells us which requests are still active and which are completed

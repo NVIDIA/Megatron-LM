@@ -1817,6 +1817,15 @@ def _add_transformer_engine_args(parser):
     return parser
 
 def _add_inference_args(parser):
+    """Add inference-related command-line arguments to the parser.
+
+    Args:
+        parser (argparse.ArgumentParser): Parser to receive inference argument
+            definitions.
+
+    Returns:
+        argparse.ArgumentParser: Parser with inference arguments added.
+    """
     group = parser.add_argument_group(title='inference')
 
     group.add_argument('--inference-batch-times-seqlen-threshold',

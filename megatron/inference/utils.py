@@ -291,7 +291,18 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
 
 def get_inference_config_from_model_and_args(model: MegatronModule, args):
-    """Returns a `InferenceConfig` constructed from the model and command line arguments."""
+    """Returns a `InferenceConfig` constructed from the model and command line arguments.
+
+    Args:
+        model (MegatronModule): Model used to derive inference shape and
+            parallelism settings.
+        args (argparse.Namespace): Parsed command-line arguments used to fill
+            inference configuration fields.
+
+    Returns:
+        InferenceConfig: Inference configuration built from the model and
+        command-line arguments.
+    """
 
     # Max sequence length.
     position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")

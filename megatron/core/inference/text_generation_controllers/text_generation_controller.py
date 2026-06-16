@@ -82,6 +82,17 @@ class TextGenerationController:
     """
 
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
+        """Initialize controller state for dynamic or static text generation.
+
+        Args:
+            inference_wrapped_model (AbstractModelInferenceWrapper): Wrapped
+                model and inference context used by the generation loop.
+            tokenizer: Tokenizer used for prompt tokenization and output
+                detokenization.
+
+        Returns:
+            None: This constructor initializes controller state in place.
+        """
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
@@ -1628,6 +1639,13 @@ class TextGenerationController:
             outputs:
                 prepared_update   -> mask/tokens for context
                 request_bookkeeping -> ids/sample for response
+
+        Args:
+            None.
+
+        Returns:
+            Tuple[Dict, Dict[str, Tensor]]: The prepared context-update payload
+            and the engine-facing request bookkeeping payload.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1725,6 +1743,14 @@ class TextGenerationController:
             route:
                 legacy or non-decode -> update_requests_legacy
                 serial decode        -> resolve_requests -> prepare_requests
+
+        Args:
+            use_legacy (bool): If true, call `context.update_requests_legacy`;
+                otherwise call the split `context.update_requests` path.
+
+        Returns:
+            Dict[str, Tensor]: Request bookkeeping merged with the selected
+            context update result.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -1765,6 +1791,13 @@ class TextGenerationController:
                 prepare(N+1)
                   -> forward(N+1)
                   -> cuda_graph_count
+
+        Args:
+            None.
+
+        Returns:
+            Optional[int]: CUDA graph request count for the prepared forward
+            when CUDA graphs are active; otherwise `None`.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -1815,6 +1848,16 @@ class TextGenerationController:
                   -> prepare(N+1)
                   -> forward(N+1)
                   -> resolve(N)
+
+        Args:
+            prepared_update (Dict): Prepared request-update payload built from
+                the sampled step.
+            request_bookkeeping (Dict): Engine-facing request bookkeeping to
+                keep aligned with context row changes.
+
+        Returns:
+            Tuple[Dict, Dict[str, Optional[Tensor]]]: Adjusted request
+            bookkeeping and lifecycle result dictionary from `resolve_requests`.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -1860,6 +1903,12 @@ class TextGenerationController:
         Example:
             config: "async"
             mode:   AsyncSchedulingMode.ASYNC
+
+        Args:
+            None.
+
+        Returns:
+            AsyncSchedulingMode: Configured dynamic request-update mode.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -1888,6 +1937,16 @@ class TextGenerationController:
             active decode:
                 stop_words -> "stop_words"
                 greedy GPT -> None
+
+        Args:
+            mode (AsyncSchedulingMode): Requested new request-update mode to
+                validate.
+            prepared_update (Optional[Dict]): Prepared request-update payload
+                when sampled-step data is already available.
+
+        Returns:
+            Optional[str]: First unsupported-feature reason, or `None` when the
+            decode step is eligible for the requested mode.
         """
         context = self.inference_wrapped_model.inference_context
         model_config = self.model_config
@@ -1960,6 +2019,16 @@ class TextGenerationController:
                 feature: MTP
             result:
                 RuntimeError("... unsupported feature: mtp_model.")
+
+        Args:
+            mode (AsyncSchedulingMode): Requested new request-update mode to
+                validate.
+            prepared_update (Optional[Dict]): Prepared request-update payload
+                when sampled-step data is already available.
+
+        Returns:
+            None: This method raises `RuntimeError` when the requested mode is
+            unsupported.
         """
 
         # Step 1: Query the unsupported-feature reason.
@@ -1992,6 +2061,13 @@ class TextGenerationController:
                 legacy or non-decode -> legacy update
                 serial decode        -> split update
                 async normal loop    -> legacy fallback
+
+        Args:
+            None.
+
+        Returns:
+            Dict[str, Tensor]: Request bookkeeping from the selected post-sample
+            context update path.
         """
         context = self.inference_wrapped_model.inference_context
         mode = self._get_request_update_mode()
@@ -2031,6 +2107,13 @@ class TextGenerationController:
                   -> prepare(N+1)
                   -> forward(N+1)
                   -> resolve(N)
+
+        Args:
+            None.
+
+        Returns:
+            Tuple[Dict, Dict]: Request bookkeeping and lifecycle result from the
+            async-shaped decode step.
         """
 
         # Step 1: Sample from the current logits.
@@ -2072,6 +2155,13 @@ class TextGenerationController:
             route:
                 mode async + decode + eligible -> async-shaped step
                 otherwise                      -> None
+
+        Args:
+            None.
+
+        Returns:
+            Optional[Dict]: Async-shaped step result when this method handles the
+            current decode step; otherwise `None` to use the normal path.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -2131,7 +2221,7 @@ class TextGenerationController:
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
-        Return:
+        Returns:
             (Optional[Dict]): A dictionary containing:
                 active_request_ids (Tensor): Current active request IDs.
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
