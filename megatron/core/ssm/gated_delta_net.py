@@ -59,12 +59,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Triton's autotune key for causal_conv1d includes cdiv(total_tokens, 1024).
-# Dynamic CP causes total_tokens to vary per microbatch, triggering repeated
-# autotuning. Aligning to this boundary collapses most variations into a small
-# number of buckets.
-_CONV_PAD_ALIGNMENT = 4096
-
 
 @dataclass
 class GatedDeltaNetSubmodules:
@@ -551,6 +545,20 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
+            if cp_size_all_gather > 1 and packed_seq_params is None and batch > 1:
+                # TODO: If additional gated delta rule backends are added, handle this
+                # SBHD + all-gather CP + batch>1 case per backend instead of
+                # unconditionally rejecting it.
+                raise ValueError(
+                    "GDN all-gather CP with SBHD inputs currently requires micro_batch_size == 1 "
+                    "because the FLA gated delta rule backend requires a single batch dimension "
+                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
+                )
+            if cp_size_all_gather > 1 and self.config.gdn_conv_pad_alignment is not None:
+                raise ValueError(
+                    "gdn_conv_pad_alignment is incompatible with GDN all-gather CP. Padding "
+                    "chunk-local causal-conv inputs can change later chunk numerics."
+                )
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
                 qkvzba,
                 batch,
@@ -559,6 +567,7 @@ class GatedDeltaNet(MegatronModule):
                 cp_group_a2a,
                 cu_seqlens_q,
                 all_gather_cp_context,
+                packed_seq_params=packed_seq_params,
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
@@ -620,7 +629,15 @@ class GatedDeltaNet(MegatronModule):
         return out, out_bias
 
     def pre_gated_delta_rule(
-        self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None, cp_context=None
+        self,
+        qkvzba,
+        batch,
+        seq_len,
+        cp_size,
+        cp_group,
+        cu_seqlens_q=None,
+        cp_context=None,
+        packed_seq_params=None,
     ):
         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
@@ -688,10 +705,22 @@ class GatedDeltaNet(MegatronModule):
         else:
             assert self.activation in ["silu", "swish"]
             _orig_seq = qkv.shape[1]
-            _pad_n = 0 if cp_context is not None else -_orig_seq % _CONV_PAD_ALIGNMENT
+            _pad_n = 0
             _conv_input = qkv.contiguous()
             _conv_cu_seqlens = cu_seqlens_q
             _conv_cp_context = cp_context
+            if self.config.gdn_conv_pad_alignment is not None:
+                if packed_seq_params is None or cu_seqlens_q is None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is only supported with packed sequence "
+                        "parameters in THD format. SBHD inputs do not need causal-conv padding."
+                    )
+                if cp_context is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with GDN all-gather CP. Padding "
+                        "chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+                _pad_n = -_orig_seq % self.config.gdn_conv_pad_alignment
             if _pad_n > 0:
                 _conv_input = torch.nn.functional.pad(_conv_input, (0, 0, 0, _pad_n))
                 # cu_seqlens_q is None in non-packed-sequence mode; only the

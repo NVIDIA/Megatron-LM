@@ -379,6 +379,11 @@ class TransformerConfig(ModelParallelConfig):
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without all-gather CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
+
     ####################
     # initialization
     ####################
@@ -1500,6 +1505,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.gdn_conv_pad_alignment > 0, (
+                        f"gdn_conv_pad_alignment must be positive when set, "
+                        f"got {self.gdn_conv_pad_alignment}."
+                    )
 
             # Check tensor parallelism compatibility
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
@@ -1516,6 +1526,13 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_cp_comm_type must be one of 'a2a' or 'all_gather', "
                     f"got {self.linear_cp_comm_type!r}."
                 )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.linear_cp_comm_type != "all_gather", (
+                        "gdn_conv_pad_alignment is incompatible with "
+                        "linear_cp_comm_type='all_gather' when context_parallel_size > 1. "
+                        "Padding chunk-local GDN causal-conv inputs can change later "
+                        "chunk numerics."
+                    )
         elif self.experimental_attention_variant == "dsa":
             pass
         elif self.experimental_attention_variant == "dsv4_hybrid":

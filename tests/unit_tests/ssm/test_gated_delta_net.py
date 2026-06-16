@@ -119,6 +119,15 @@ def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
         )
 
 
+def test_gdn_conv_pad_alignment_rejects_all_gather_cp():
+    with pytest.raises(AssertionError, match="gdn_conv_pad_alignment is incompatible"):
+        _make_gdn_config(
+            context_parallel_size=2,
+            linear_cp_comm_type="all_gather",
+            gdn_conv_pad_alignment=4096,
+        )
+
+
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size", "cp_comm_type"),
     [
@@ -217,7 +226,9 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        micro_batch_size = (
+            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
+        )
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -255,7 +266,9 @@ class TestGatedDeltaNet:
         gdn = self.gdn
         gdn.train()
 
-        micro_batch_size = 2
+        micro_batch_size = (
+            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
+        )
         seq_length = 64
         torch.manual_seed(1234)
         base_input = torch.randn(
@@ -295,6 +308,45 @@ class TestGatedDeltaNet:
                 atol=1e-4,
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
+
+    def test_gpu_forward_rejects_sbhd_all_gather_cp_batch_gt_one(self):
+        if not (self.cp_comm_type == "all_gather" and self.cp_size > 1):
+            pytest.skip("Only all-gather CP with CP>1 uses the FLA CP batch guard.")
+
+        gdn = self.gdn
+
+        micro_batch_size = 2
+        seq_length = 64
+        hidden_states = torch.ones(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with pytest.raises(ValueError, match="requires micro_batch_size == 1"):
+            gdn(hidden_states, None)
+
+    def test_gpu_forward_rejects_sbhd_conv_padding(self):
+        gdn = self.gdn
+        gdn.config.gdn_conv_pad_alignment = 4096
+
+        micro_batch_size = (
+            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
+        )
+        seq_length = 64
+        hidden_states = torch.ones(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        expected_error = (
+            "incompatible with GDN all-gather CP"
+            if self.cp_comm_type == "all_gather" and self.cp_size > 1
+            else "only supported with packed sequence"
+        )
+        with pytest.raises(ValueError, match=expected_error):
+            gdn(hidden_states, None)
 
     def test_jit_compiled_helpers(self):
         import torch._dynamo
@@ -454,14 +506,30 @@ class TestGatedDeltaNet:
         )
         assert output_thd_no_padding.shape == output_thd_padded.shape
 
-        # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
+        # C) explicit causal-conv padding is only applied to packed inputs and
+        # should not affect the original unpadded token outputs.
+        self.gdn.config.gdn_conv_pad_alignment = 48
+        output_thd_conv_pad, _ = self.gdn(
+            hidden_states_thd, None, packed_seq_params=no_padding_params
+        )
+        self.gdn.config.gdn_conv_pad_alignment = None
+        assert output_thd_conv_pad.shape == output_thd_no_padding.shape
+        torch.testing.assert_close(
+            output_thd_conv_pad,
+            output_thd_no_padding,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"THD conv-padded output mismatch ({rank=}): {msg}",
+        )
+
+        # D) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
-        # D) actual mismatch branch without *_padded: should raise.
+        # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
