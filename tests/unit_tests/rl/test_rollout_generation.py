@@ -44,9 +44,6 @@ class MockInferenceInterface(ReturnsRaw):
                 response=LLMChatMessage(role="assistant", content=prompt),
                 raw_text=prompt,
                 finish_reason="stop",
-                policy_epoch=[(0, 0)],
-                kv_cache_epoch=[(0, 0)],
-                num_evictions=0,
             )
         finally:
             self.active_requests -= 1
@@ -86,12 +83,7 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
             responses = episode.responses
             reward = float(responses[-1].response.content.removeprefix("t"))
             return Rollout(
-                trajectory=[r.raw_text for r in responses],
-                reward=reward,
-                env_id=self.env_id,
-                policy_epoch=[r.policy_epoch for r in responses],
-                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
-                num_evictions=[r.num_evictions for r in responses],
+                trajectory=[r.raw_text for r in responses], reward=reward, env_id=self.env_id
             )
 
         return GroupRolloutParams(run_episode=run_episode, build_rollout=build_rollout)
@@ -456,7 +448,7 @@ class TestGroupedRollouts:
             assert np.gcd.reduce(agent_slots) == 0
 
 
-def make_response(epochs, prompt_length, total_len, content="resp", finish_reason="stop"):
+def make_response(prompt_length, total_len, content="resp", finish_reason="stop"):
     return InferenceResponse(
         response=LLMChatMessage(role="assistant", content=content),
         raw_text=content,
@@ -464,17 +456,14 @@ def make_response(epochs, prompt_length, total_len, content="resp", finish_reaso
         prompt_length=prompt_length,
         logprobs=[0.0] * (total_len - prompt_length),
         finish_reason=finish_reason,
-        policy_epoch=epochs,
-        kv_cache_epoch=epochs,
-        num_evictions=0,
     )
 
 
 # Conversation length -> response spec: length 1 is the first turn (the bare prompt), length 3
 # the second (assistant reply + observation appended).
 TWO_TURN_SCRIPT = {
-    1: dict(epochs=[(0, 5)], prompt_length=3, total_len=7, content="a0"),
-    3: dict(epochs=[(0, 5)], prompt_length=6, total_len=11, content="a1"),
+    1: dict(prompt_length=3, total_len=7, content="a0"),
+    3: dict(prompt_length=6, total_len=11, content="a1"),
 }
 
 # Both two-turn termination modes (env-signaled done, max_turns exhausted) must produce this
@@ -484,7 +473,6 @@ TWO_TURN_EXPECTED = dict(
     reward_conv=[("user", "hello"), ("assistant", "a0"), ("user", "obs0"), ("assistant", "a1")],
     rewarded=[("a1", "stop")],
     genmask_sums=[4, 5],
-    policy_epoch=[[(0, 5)], [(0, 5)]],
 )
 
 
@@ -543,13 +531,12 @@ class TestMultiTurnEpisode:
             pytest.param(
                 1,
                 None,
-                {1: dict(epochs=[(0, 7)], prompt_length=2, total_len=6, content="only")},
+                {1: dict(prompt_length=2, total_len=6, content="only")},
                 dict(
                     seen_roles=[["user"]],
                     reward_conv=[("user", "hello"), ("assistant", "only")],
                     rewarded=[("only", "stop")],
                     genmask_sums=[4],
-                    policy_epoch=[[(0, 7)]],
                     observation_turns=[],
                 ),
                 id="single_turn",
@@ -615,9 +602,6 @@ class TestMultiTurnEpisode:
         assert agent.rewarded == expected["rewarded"]
         # Per-turn generation masks cover exactly each turn's generated tokens.
         assert [sum(mask) for mask in rollout.generation_mask] == expected["genmask_sums"]
-        # Per-turn (engine-frame) staleness nesting is preserved.
-        assert rollout.policy_epoch == expected["policy_epoch"]
-        assert rollout.kv_cache_epoch == expected["policy_epoch"]
         # get_observation is consulted only when another generation is still possible -- never on
         # the final allowed turn.
         assert agent.observation_turns == expected["observation_turns"]
