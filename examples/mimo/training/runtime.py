@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -65,32 +64,6 @@ def configure_module_rng(
     )
 
 
-def _resolve_bucket_size(
-    args: argparse.Namespace, module: torch.nn.Module, dp_cp_group, overlap_grad_reduce: bool
-) -> Optional[int]:
-    """Resolve a module's DDP bucket size via the shared get_model helper.
-
-    Maps the MIMO ``args`` (``ddp_num_buckets`` / ``ddp_bucket_size``) onto the
-    fields ``resolve_ddp_bucket_size`` reads from a DDP config, then delegates so the
-    3-branch policy stays single-sourced with ``get_model``. ``ddp_bucket_size <= 0``
-    is normalized to ``None`` (the default trigger) and an empty module yields ``None``.
-    """
-    num_buckets = getattr(args, "ddp_num_buckets", None)
-    if num_buckets is not None:
-        assert num_buckets > 0
-    bucket_size = getattr(args, "ddp_bucket_size", 0)
-    if not bucket_size or bucket_size <= 0:
-        bucket_size = None
-    num_params = sum(p.numel() for p in module.parameters())
-    if num_buckets is not None and num_params == 0:
-        return None  # empty module: no params to bucket
-    config = SimpleNamespace(num_buckets=num_buckets, bucket_size=bucket_size)
-    resolved = resolve_ddp_bucket_size(config, dp_cp_group, overlap_grad_reduce, num_params)
-    if num_buckets is not None and resolved is not None:
-        return max(1, resolved)  # never hand DDP a zero-size bucket
-    return resolved
-
-
 def set_module_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
     """Set requires_grad for every parameter in a module when the module exists."""
     if module is None:
@@ -144,15 +117,18 @@ def wrap_active_modules_with_ddp(
             ddp_config = DistributedDataParallelConfig(
                 overlap_grad_reduce=overlap,
                 overlap_param_gather=getattr(args, "overlap_param_gather", False),
-                bucket_size=_resolve_bucket_size(
-                    args,
-                    mimo_model.language_model,
-                    topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY].dp_cp,
-                    overlap,
-                ),
+                num_buckets=getattr(args, "ddp_num_buckets", None),
+                bucket_size=getattr(args, "ddp_bucket_size", None),
                 pad_buckets_for_high_nccl_busbw=pad_buckets,
                 use_distributed_optimizer=True,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
+            )
+            # Resolve the absolute bucket size on the real config, as get_model does.
+            ddp_config.bucket_size = resolve_ddp_bucket_size(
+                ddp_config,
+                topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY].dp_cp,
+                overlap,
+                sum(p.numel() for p in mimo_model.language_model.parameters()),
             )
             lm_config = _module_config(mimo_model.language_model)
             lm_module = _maybe_float16_wrap(mimo_model.language_model, lm_config, is_encoder=False)
@@ -173,12 +149,18 @@ def wrap_active_modules_with_ddp(
             ddp_config = DistributedDataParallelConfig(
                 overlap_grad_reduce=False,
                 overlap_param_gather=False,
-                bucket_size=_resolve_bucket_size(
-                    args, submodule, topology.module_pgs[name].dp_cp, False
-                ),
+                num_buckets=getattr(args, "ddp_num_buckets", None),
+                bucket_size=getattr(args, "ddp_bucket_size", None),
                 pad_buckets_for_high_nccl_busbw=pad_buckets,
                 use_distributed_optimizer=True,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
+            )
+            # Encoders keep overlap off; resolve_ddp_bucket_size returns None there.
+            ddp_config.bucket_size = resolve_ddp_bucket_size(
+                ddp_config,
+                topology.module_pgs[name].dp_cp,
+                False,
+                sum(p.numel() for p in submodule.parameters()),
             )
             enc_config = _module_config(submodule)
             enc_module = _maybe_float16_wrap(submodule, enc_config, is_encoder=True)

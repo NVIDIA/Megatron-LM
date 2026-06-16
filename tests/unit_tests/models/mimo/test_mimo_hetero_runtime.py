@@ -7,17 +7,14 @@ import argparse
 import pytest
 import torch
 
-from examples.mimo.training.runtime import (
-    _resolve_bucket_size,
-    configure_module_rng,
-    wrap_active_modules_with_ddp,
-)
+from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
-from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+from megatron.training.training import resolve_ddp_bucket_size
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     get_language_model_spec,
     get_vision_submodules_spec,
@@ -41,7 +38,7 @@ def _args(**overrides):
         image_token_id=100,
         fp32=True,
         ddp_num_buckets=None,
-        ddp_bucket_size=0,
+        ddp_bucket_size=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -88,25 +85,20 @@ def _eight_gpu_topology():
 
 
 class TestResolveBucketSize:
+    """The MIMO wrap delegates bucket sizing to the shared get_model helper."""
+
     def test_num_buckets_divides_param_count(self):
-        module = torch.nn.Linear(8, 16, bias=False)  # 128 params
-        args = _args(ddp_num_buckets=4)
-        # num_buckets short-circuits before get_pg_size, so the group is unused.
-        assert _resolve_bucket_size(args, module, None, overlap_grad_reduce=True) == 128 // 4
+        config = DistributedDataParallelConfig(num_buckets=4)
+        assert resolve_ddp_bucket_size(config, None, True, 128) == 128 // 4
 
     def test_explicit_bucket_size_passes_through(self):
-        args = _args(ddp_bucket_size=4096)
-        assert (
-            _resolve_bucket_size(args, torch.nn.Linear(2, 2), None, overlap_grad_reduce=True)
-            == 4096
-        )
+        config = DistributedDataParallelConfig(bucket_size=4096)
+        assert resolve_ddp_bucket_size(config, None, True, 256) == 4096
 
     def test_overlap_off_returns_none(self):
         # get_model sets bucket_size=None when overlap_grad_reduce is off.
-        assert (
-            _resolve_bucket_size(_args(), torch.nn.Linear(2, 2), None, overlap_grad_reduce=False)
-            is None
-        )
+        config = DistributedDataParallelConfig(bucket_size=4096)
+        assert resolve_ddp_bucket_size(config, None, False, 256) is None
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
@@ -123,10 +115,8 @@ class TestResolveBucketSizeDefault:
             dp_cp = topo.module_pgs[MIMO_LANGUAGE_MODULE_KEY].dp_cp
             dp_size = torch.distributed.get_world_size(group=dp_cp)
             expected = max(40_000_000, 1_000_000 * dp_size)
-            got = _resolve_bucket_size(
-                _args(), torch.nn.Linear(2, 2), dp_cp, overlap_grad_reduce=True
-            )
-            assert got == expected
+            config = DistributedDataParallelConfig()  # no explicit bucket size
+            assert resolve_ddp_bucket_size(config, dp_cp, True, 256) == expected
         finally:
             topo.destroy()
 
