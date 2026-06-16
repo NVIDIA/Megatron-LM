@@ -26,10 +26,17 @@ from .parameter_group import ParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
+class FsdpContext:
+    """Runtime state shared by one experimental FSDP subtree."""
+
+    is_first_microbatch: bool = True
+
+
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
     _parameter_groups: tuple[ParameterGroup, ...]
+    _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
     _num_training_parameters: int
 
@@ -37,6 +44,7 @@ class FsdpModule:
         self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
+        self._context = None
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -58,6 +66,26 @@ class FsdpModule:
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
+
+    def _assign_context(self, context: FsdpContext) -> None:
+        self._context = context
+
+    def _lazy_init_context(self) -> FsdpContext:
+        """Initialize the shared runtime context for this FSDP root subtree."""
+        if self._context is not None:
+            return self._context
+
+        context = FsdpContext()
+        for submodule in cast(nn.Module, self).modules():
+            if not isinstance(submodule, FsdpModule):
+                continue
+            if submodule._context is not None:
+                raise RuntimeError(
+                    "FSDP context is already initialized for a descendant module. "
+                    "Run forward through the root FSDP module first."
+                )
+            submodule._assign_context(context)
+        return context
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
@@ -84,9 +112,11 @@ class FsdpModule:
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
+        context = self._lazy_init_context()
         self._ready_grad_parameters.clear()
         for group in self._parameter_groups:
-            group.sync_model_weight_from_main_weight()
+            if context.is_first_microbatch:
+                group.sync_model_weight_from_main_weight()
             group.unshard_parameters()
 
     def post_forward(self) -> None:

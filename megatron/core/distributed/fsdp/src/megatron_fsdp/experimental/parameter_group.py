@@ -14,7 +14,8 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -31,6 +32,19 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 def contained_in_parameter_group(parameter: nn.Parameter) -> bool:
     """Return whether a parameter is already owned by a ParameterGroup."""
     return hasattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR)
+
+
+@contextmanager
+def _nvtx_range(message: str) -> Iterator[None]:
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class ParameterGroup:
@@ -178,9 +192,10 @@ class ParameterGroup:
         if self.main_weight is self.model_weight:
             return
 
-        self.main_weight.cast(self.model_weight.dtype).redistribute(
-            self.model_weight.placements, out=self.model_weight
-        )
+        with _nvtx_range("sync_model_weight_from_main_weight"):
+            self.main_weight.cast(self.model_weight.dtype).redistribute(
+                self.model_weight.placements, out=self.model_weight
+            )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""

@@ -14,12 +14,17 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .fsdp_module import FsdpModule
+from .fsdp_module import FsdpContext, FsdpModule
 from .placement import Placements
+
+__all__ = ["FsdpContext", "FsdpModule", "fully_shard", "microbatch"]
 
 
 def fully_shard(
@@ -53,9 +58,42 @@ def fully_shard(
         raise
 
 
+@contextmanager
+def microbatch(module: nn.Module, is_first: bool) -> Iterator[None]:
+    """Scope experimental FSDP main-weight synchronization to one microbatch.
+
+    Args:
+        module: Module tree whose experimental FSDP roots should use this microbatch state.
+        is_first: Whether forwards in this scope are for the first microbatch.
+    """
+    contexts: list[FsdpContext] = []
+    _collect_fsdp_contexts(module, contexts)
+    previous_states = [(context, context.is_first_microbatch) for context in contexts]
+    for context in contexts:
+        context.is_first_microbatch = is_first
+
+    try:
+        yield
+    finally:
+        for context, is_first_microbatch in previous_states:
+            context.is_first_microbatch = is_first_microbatch
+
+
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
     module_cls = module.__class__
     fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
     module.__class__ = fsdp_cls
+
+
+def _collect_fsdp_contexts(
+    module: nn.Module,
+    contexts: list[FsdpContext],
+) -> None:
+    if isinstance(module, FsdpModule):
+        contexts.append(module._lazy_init_context())
+        return
+
+    for child in module.children():
+        _collect_fsdp_contexts(child, contexts)
