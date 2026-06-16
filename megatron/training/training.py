@@ -2234,8 +2234,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt:
-            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+        if has_nvidia_modelopt and p2p_communicator is None:
+            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors.
+            # Skipped on the MIMO cross-grid path (p2p_communicator present): MIMO does not
+            # use distillation, and this helper reads parallel_state pp groups that are not
+            # initialized without mpu. The MIMO bridge schedule handles its own tensor shapes.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
@@ -2388,8 +2391,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if is_last_stage:
-        # Average loss across microbatches.
+    if is_last_stage and losses_reduced:
+        # Average loss across microbatches. ``losses_reduced`` is empty on ranks
+        # that produce no loss (e.g. MIMO encoder-grid ranks, which are their own
+        # module's last PP stage but never compute the language loss), so guard the
+        # ``losses_reduced[0]`` access.
         loss_reduced = {}
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
@@ -3352,7 +3358,18 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func()
+    if p2p_communicator is not None:
+        # MIMO cross-grid bridge: select the schedule by the presence of a
+        # cross-module P2P communicator, not by parallel_state pp size (which is
+        # unset when mpu is not initialized). The without-interleaving schedule
+        # accepts both p2p_communicator and the MultiModuleProcessGroupCollection.
+        from megatron.core.pipeline_parallel.schedules import (
+            forward_backward_pipelining_without_interleaving,
+        )
+
+        forward_backward_func = forward_backward_pipelining_without_interleaving
+    else:
+        forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
