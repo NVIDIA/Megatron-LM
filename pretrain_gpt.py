@@ -129,8 +129,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        # `get_batch_on_this_rank_for_sequence_packing` owns optional THD padding
-        # and returns a 7-tuple including `padding_mask` (None when no padding).
+        # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
+        # and returns a 7-tuple including `padding_mask`.
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,

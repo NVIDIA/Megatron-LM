@@ -3,7 +3,7 @@
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -11,7 +11,7 @@ from megatron.core.extensions.transformer_engine import get_thd_partitioned_indi
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
-def get_cp_slice_for_thd(batch, cp_group):
+def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
     """Partition sequence data for context parallelism in THD format.
 
     Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
@@ -20,6 +20,7 @@ def get_cp_slice_for_thd(batch, cp_group):
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
+        keys: Sequence data keys to slice. Defaults to the original THD data tensors.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:
@@ -33,7 +34,9 @@ def get_cp_slice_for_thd(batch, cp_group):
     # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
     total_tokens = int(cu_seqlens[-1].item())
     index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+    if keys is None:
+        keys = ('tokens', 'position_ids', 'labels', 'loss_mask')
+    for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
 

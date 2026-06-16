@@ -2,7 +2,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -226,6 +226,7 @@ def get_capacity(
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
     reduce_group: torch.distributed.ProcessGroup,
+    reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> Tuple[torch.Tensor, Union[int, torch.Tensor], Union[int, torch.Tensor]]:
@@ -233,15 +234,23 @@ def get_tokens_per_expert_and_token_count(
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
+    if reduce_groups is None:
+        reduce_groups = (reduce_group,)
+
+    global_tokens_per_expert = local_tokens_per_expert
+    reduce_world_size = 1
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+        reduce_world_size *= group.size()
+
     if with_padding_mask:
         local_num_tokens = local_tokens_per_expert.sum() // topk
         total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+        total_num_tokens = local_num_tokens * reduce_world_size
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 

@@ -102,6 +102,22 @@ def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:
     return F.pad(t, (0, target_len - actual_len), value=0)
 
 
+def _pad_padding_mask(mask: Tensor, target_len: int) -> Tensor:
+    """Pad a [..., seq] bool padding mask to ``target_len`` with True."""
+    actual_len = mask.shape[-1]
+    assert actual_len <= target_len, (
+        f"Padding mask length ({actual_len}) exceeds target ({target_len}); "
+        "refusing to silently truncate."
+    )
+    if actual_len == target_len:
+        return mask
+
+    pad_shape = list(mask.shape)
+    pad_shape[-1] = target_len - actual_len
+    tail = torch.ones(pad_shape, dtype=mask.dtype, device=mask.device)
+    return torch.cat((mask, tail), dim=-1)
+
+
 def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Optional[Tensor]:
     """Pad a cu_seqlens tensor to exactly ``target_entries`` entries.
 
@@ -282,6 +298,7 @@ def pad_sequence_for_thd(
     target_len: Optional[int] = None,
     max_num_seqs: Optional[int] = None,
     pad_by_appending_dummy_seq: bool = True,
+    padding_mask: Optional[Tensor] = None,
 ) -> Tuple[
     Optional[Tensor],
     Optional[Tensor],
@@ -314,6 +331,8 @@ def pad_sequence_for_thd(
             ``max_num_seqs + 1`` entries for static CUDA Graph inputs.
         pad_by_appending_dummy_seq: If true, represent the post-pack padding
             tail as an extra dummy sequence in cu_seqlens metadata.
+        padding_mask: Existing bool padding mask for already-packed tokens,
+            with True marking padding positions.
 
     Notes:
         - THD CP slicing is defined by Transformer Engine. On metadata-only
@@ -410,6 +429,12 @@ def pad_sequence_for_thd(
     )
 
     # True marks padded local token slots for routing/loss paths.
-    padding_mask = torch.arange(local_target_len, device=mask_device).unsqueeze(0) >= local_actual_T
+    tail_padding_mask = (
+        torch.arange(local_target_len, device=mask_device).unsqueeze(0) >= local_actual_T
+    )
+    if padding_mask is None:
+        padding_mask = tail_padding_mask
+    else:
+        padding_mask = _pad_padding_mask(padding_mask, local_target_len) | tail_padding_mask
 
     return tokens, labels, loss_mask, position_ids, padded_params, padding_mask

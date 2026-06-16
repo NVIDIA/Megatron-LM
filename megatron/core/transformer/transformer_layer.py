@@ -776,6 +776,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             input_ids=kwargs.get("input_ids", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
 
@@ -799,6 +800,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         input_ids: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -858,6 +860,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
+        if self.is_moe_layer and packed_seq_params is not None:
+            moe_kwargs["packed_seq_params"] = packed_seq_params
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
@@ -1274,6 +1278,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
                 input_ids=kwargs.get("input_ids", None),
+                packed_seq_params=kwargs.get("packed_seq_params", None),
             )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
@@ -1443,6 +1448,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
                 input_ids=kwargs.get("input_ids", None),
+                packed_seq_params=kwargs.get("packed_seq_params", None),
             )
         return output, context
 
@@ -1788,6 +1794,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             input_ids=kwargs.get("input_ids", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
             mhc_recompute_manager=mhc_recompute_manager,
         )
         return output, context
@@ -1904,6 +1911,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         inference_context=None,
         padding_mask=None,
         input_ids=None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
@@ -1950,6 +1958,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs['input_ids'] = input_ids
+        if self.is_moe_layer and packed_seq_params is not None:
+            moe_kwargs['packed_seq_params'] = packed_seq_params
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
@@ -2148,7 +2158,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
-            output = self._forward_mlp(*cuda_graph_output, input_ids=kwargs.get("input_ids", None))
+            output = self._forward_mlp(
+                *cuda_graph_output,
+                input_ids=kwargs.get("input_ids", None),
+                packed_seq_params=kwargs.get("packed_seq_params", None),
+            )
         return output, context
 
 
@@ -2263,7 +2277,9 @@ class MoETransformerLayer(TransformerLayer):
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, attr)
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None, input_ids=None):
+    def _forward_mlp_router(
+        self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None
+    ):
         """
         Executes the router phase of the MoE block.
 
@@ -2292,6 +2308,7 @@ class MoETransformerLayer(TransformerLayer):
             intermediate_tensors=(),
             padding_mask=padding_mask,
             input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
@@ -2345,7 +2362,12 @@ class MoETransformerLayer(TransformerLayer):
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(
-        self, hidden_states, inference_context=None, padding_mask=None, input_ids=None
+        self,
+        hidden_states,
+        inference_context=None,
+        padding_mask=None,
+        input_ids=None,
+        packed_seq_params=None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -2362,10 +2384,17 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None, input_ids=None
+            hidden_states,
+            inference_context=None,
+            padding_mask=None,
+            input_ids=None,
+            packed_seq_params=None,
         ):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
-                hidden_states, padding_mask=padding_mask, input_ids=input_ids
+                hidden_states,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
             )
 
             # After the router graph replays, the captured .copy_() operations that update
@@ -2393,6 +2422,7 @@ class MoETransformerLayer(TransformerLayer):
                         hidden_states,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
+                        packed_seq_params=packed_seq_params,
                     )
                 else:
                     return tensor_parallel.checkpoint(
@@ -2400,15 +2430,22 @@ class MoETransformerLayer(TransformerLayer):
                             _forward_mlp_partial_cudagraphs,
                             padding_mask=padding_mask,
                             input_ids=input_ids,
+                            packed_seq_params=packed_seq_params,
                         ),
                         False,
                         hidden_states,
                     )
             else:
                 return _forward_mlp_partial_cudagraphs(
-                    hidden_states, padding_mask=padding_mask, input_ids=input_ids
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    packed_seq_params=packed_seq_params,
                 )
         else:
             return super()._forward_mlp(
-                hidden_states, padding_mask=padding_mask, input_ids=input_ids
+                hidden_states,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
             )

@@ -441,6 +441,37 @@ class TestPadSequenceForThd:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_mask_preserves_existing_padding(self):
+        """Existing THD padding and appended tail padding are merged in one helper."""
+        seqlens, total_T, max_seqlen = [4, 4], 8, 10
+        padding_mask = torch.tensor(
+            [[False, False, False, True, False, False, True, True]],
+            dtype=torch.bool,
+            device="cuda",
+        )
+
+        _, _, _, _, _, m = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            _make_psp(seqlens),
+            target_len=max_seqlen,
+            max_num_seqs=4,
+            padding_mask=padding_mask,
+        )
+
+        assert torch.equal(
+            m,
+            torch.tensor(
+                [[False, False, False, True, False, False, True, True, True, True]],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cu_seqlens_fill_value(self):
         """Static cu padding repeats dummy valid/padded cumulative values."""
         seqlens, total_T = [50, 30], 80
