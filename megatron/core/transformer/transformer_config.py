@@ -376,6 +376,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment."""
+
     ####################
     # initialization
     ####################
@@ -1466,6 +1469,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.gdn_conv_pad_alignment > 0, (
+                        f"gdn_conv_pad_alignment must be positive when set, "
+                        f"got {self.gdn_conv_pad_alignment}."
+                    )
 
             # Check tensor parallelism compatibility
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size

@@ -58,12 +58,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Triton's autotune key for causal_conv1d includes cdiv(total_tokens, 1024).
-# Dynamic CP causes total_tokens to vary per microbatch, triggering repeated
-# autotuning. Aligning to this boundary collapses most variations into a small
-# number of buckets.
-_CONV_PAD_ALIGNMENT = 4096
-
 
 @dataclass
 class GatedDeltaNetSubmodules:
@@ -585,15 +579,14 @@ class GatedDeltaNet(MegatronModule):
         kernel_batch = batch
         kernel_seq_len = seq_len_post_a2a
         if cp_size_all_gather > 1 and packed_seq_params is None and batch > 1:
-            # FLA CP kernels require a single batch dimension. Treat regular
-            # SBHD micro-batch samples as packed sequences while preserving the
-            # original output layout after the kernel.
-            kernel_batch = 1
-            kernel_seq_len = batch * seq_len_post_a2a
-            qkv = qkv.reshape(kernel_batch, kernel_seq_len, -1)
-            gate = gate.reshape(kernel_batch, kernel_seq_len, -1, self.value_head_dim)
-            beta = beta.reshape(kernel_batch, kernel_seq_len, -1)
-            alpha = alpha.reshape(kernel_batch, kernel_seq_len, -1)
+            # TODO: If additional gated delta rule backends are added, handle this
+            # SBHD + all-gather CP + batch>1 case per backend instead of
+            # unconditionally rejecting it.
+            raise ValueError(
+                "GDN all-gather CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "because the FLA gated delta rule backend requires a single batch dimension "
+                "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
@@ -637,29 +630,27 @@ class GatedDeltaNet(MegatronModule):
         else:
             assert self.activation in ["silu", "swish"]
             _orig_seq = qkv.shape[1]
-            # The dynamic-CP padding bucket is only valid for the non-FLA-CP
-            # layout, where qkv already contains the full sequence handled by
-            # this rank after CP->HP all-to-all. All-gather CP passes a
-            # full-sequence cp_context into FLA kernels while qkv remains a
-            # rank-local time chunk; padding that chunk would desynchronize the
-            # local tensor length from the CP context layout.
-            _pad_n = 0 if cp_size_all_gather > 1 else -_orig_seq % _CONV_PAD_ALIGNMENT
+            _pad_n = 0
             _conv_input = qkv.contiguous()
             _conv_cu_seqlens = cu_seqlens_q
             _conv_cp_context = all_gather_cp_context
+            if self.config.gdn_conv_pad_alignment is not None:
+                if packed_seq_params is None or cu_seqlens_q is None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is only supported with packed sequence "
+                        "parameters in THD format. SBHD inputs do not need causal-conv padding."
+                    )
+                _pad_n = -_orig_seq % self.config.gdn_conv_pad_alignment
             if _pad_n > 0:
                 _conv_input = torch.nn.functional.pad(_conv_input, (0, 0, 0, _pad_n))
-                # cu_seqlens_q is None in non-packed-sequence mode; only the
-                # last-segment offset needs to grow to cover the padding tail.
-                if cu_seqlens_q is not None:
-                    _conv_cu_seqlens = cu_seqlens_q.clone()
-                    _conv_cu_seqlens[-1] += _pad_n
-                    if cp_size_all_gather > 1:
-                        _conv_cp_context = build_cp_context(
-                            cu_seqlens=_conv_cu_seqlens,
-                            group=cp_group_all_gather,
-                            conv1d_kernel_size=self.conv_kernel_dim,
-                        )
+                _conv_cu_seqlens = cu_seqlens_q.clone()
+                _conv_cu_seqlens[-1] += _pad_n
+                if cp_size_all_gather > 1:
+                    _conv_cp_context = build_cp_context(
+                        cu_seqlens=_conv_cu_seqlens,
+                        group=cp_group_all_gather,
+                        conv1d_kernel_size=self.conv_kernel_dim,
+                    )
             qkv, _ = causal_conv1d(
                 x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
