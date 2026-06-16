@@ -132,6 +132,10 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+            # Async-shaped scheduling runs one forward before the normal response
+            # path consumes it. "Primed" means that this lookahead forward has
+            # been run and its logits are ready for sampling; the companion value
+            # preserves the CUDA graph request count for that forward.
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
 
