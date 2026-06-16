@@ -3,7 +3,6 @@
 import os
 import sys
 import time
-from argparse import Namespace
 
 from megatron.training.arguments import parse_and_validate_args
 import torch
@@ -31,7 +30,9 @@ from typing import List
 
 from examples.inference.utils import build_requests
 from megatron.inference.utils import add_inference_args, get_model_for_inference
-from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training import get_args, print_rank_0
+from megatron.training.argument_utils import inference_cfg_from_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.initialize import initialize_megatron
 
 
@@ -53,21 +54,14 @@ def add_static_inference_args(parser):
     return parser
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
-    """Utility to get the relevant backend for running inference
-
-    This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model .
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
+def get_inference_engine(
+    inference_cfg: InferenceScriptConfig, args, model: MegatronModule
+) -> StaticInferenceEngine:
+    """Return the static inference engine for GPT static inference."""
     tokenizer = build_tokenizer(args)
     inference_context = StaticInferenceContext(
-        args.inference_max_requests, args.inference_max_seq_length
+        inference_cfg.inference_max_requests,
+        inference_cfg.inference_max_seq_length,
     )
     inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
     text_generation_controller = TextGenerationController(
@@ -75,10 +69,10 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     )
     engine_kwargs = {
         "text_generation_controller": text_generation_controller,
-        "legacy": args.use_legacy_static_engine,
+        "legacy": inference_cfg.use_legacy_static_engine,
     }
-    if not args.use_legacy_static_engine:
-        engine_kwargs["buffer_size_gb"] = args.inference_dynamic_batching_buffer_size_gb
+    if not inference_cfg.use_legacy_static_engine:
+        engine_kwargs["buffer_size_gb"] = inference_cfg.inference_dynamic_batching_buffer_size_gb
     return StaticInferenceEngine(**engine_kwargs)
 
 
@@ -132,24 +126,26 @@ def main():
         },
     )
     initialize_megatron()
+    args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(inference_cfg=inference_cfg)
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(inference_cfg, args, model)
 
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        return_log_probs=args.return_log_probs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
-        top_n_logprobs=args.top_n_logprobs,
+        temperature=inference_cfg.temperature,
+        top_k=inference_cfg.top_k,
+        top_p=inference_cfg.top_p,
+        return_log_probs=inference_cfg.return_log_probs,
+        num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
+        top_n_logprobs=inference_cfg.top_n_logprobs,
     )
 
     # Build tokenizer
     tokenizer = build_tokenizer(args)
 
-    requests = build_requests(args, tokenizer)
+    requests = build_requests(inference_cfg, tokenizer, seed=args.seed)
     prompts = [r.prompt_text for r in requests]
 
     if args.cuda_graph_impl == "local":
@@ -169,7 +165,7 @@ def main():
     end_time = time.perf_counter()
     latency = end_time - start_time
 
-    if torch.distributed.get_rank() == 0 and args.output_path:
+    if torch.distributed.get_rank() == 0 and inference_cfg.output_path:
         results_output = {}
         for idx, result in enumerate(results):
             result_dict = {
@@ -186,7 +182,7 @@ def main():
                 result_dict["logprobs"] = response_logprobs
             results_output[result.request_id] = result_dict
 
-        with open(args.output_path, 'w') as f:
+        with open(inference_cfg.output_path, 'w') as f:
             json.dump(results_output, f)
 
     # Print unique prompts + outputs.
@@ -218,17 +214,17 @@ def main():
             args.cuda_graph_impl == "local",
             (
                 f"<user prompts>"
-                if args.prompts
+                if inference_cfg.prompts
                 else "<auto prompts> %s, %d, %.1e, %.1e"
                 % (
-                    "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
-                    args.num_tokens_to_generate,
-                    args.incoming_requests_duration,
-                    args.incoming_requests_per_sec,
+                    "(%s)" % " ".join(map(str, inference_cfg.num_tokens_to_prompt)),
+                    inference_cfg.num_tokens_to_generate,
+                    inference_cfg.incoming_requests_duration,
+                    inference_cfg.incoming_requests_per_sec,
                 )
             ),
             len(requests),
-            args.inference_max_requests,
+            inference_cfg.inference_max_requests,
             stats["allocated_bytes.all.peak"] / (1024**3),
             stats["reserved_bytes.all.peak"] / (1024**3),
             latency,

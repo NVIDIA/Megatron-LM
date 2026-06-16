@@ -29,6 +29,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_from_args
 from megatron.training.arguments import parse_and_validate_args
 
 
@@ -79,14 +80,17 @@ def main():
     initialize_megatron()
 
     args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
 
     # Match the legacy tool's NVTX gating.
     if args.profile and args.nvtx_ranges:
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model = get_model_for_inference()
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    model = get_model_for_inference(inference_cfg=inference_cfg)
+    inference_config = get_inference_config_from_model_and_args(
+        model, inference_cfg=inference_cfg
+    )
 
     try:
         asyncio.run(_serve(args, model, tokenizer, inference_config))

@@ -14,8 +14,6 @@ from contextlib import nullcontext
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -29,8 +27,11 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 from megatron.core.transformer.module import MegatronModule
+from megatron.inference.utils import builder_to_legacy_callable, get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
+from megatron.training.argument_utils import inference_cfg_from_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 from model_provider import model_provider
 
 sys.path.append(
@@ -39,29 +40,19 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
-    """Get the relevant backend for running inference
-
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore
-    backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model.
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-    # TODO(ksanthanam): Convert this to use dynamic inference counterparts
-
+def get_inference_engine(inference_cfg: InferenceScriptConfig, model: MegatronModule) -> AbstractEngine:
+    """Get the static inference engine for the text generation server."""
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
+    inference_context = StaticInferenceContext(
+        inference_cfg.inference_max_requests,
+        inference_cfg.inference_max_seq_length,
+    )
     inference_wrapped_model = GPTInferenceWrapper(
         model, inference_context
     )
@@ -124,6 +115,7 @@ def main(model_type: str = "gpt"):
     )
     initialize_megatron()
     args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -137,22 +129,11 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        # Set up model and load checkpoint
-        if model_type == "gpt":
-            model_builder = gpt_builder
-        elif model_type in ("hybrid", "mamba"):
-            if model_type == "mamba":
-                import warnings
-
-                warnings.warn(
-                    'model_type="mamba" is deprecated. Use model_type="hybrid" instead.',
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            model_builder = hybrid_builder
-        else:
-            raise ValueError(f"Invalid model provider {model_type}")
-        model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+        builder = get_model_builder(args, provider=model_type, inference_cfg=inference_cfg)
+        model = get_model(
+            partial(model_provider, builder_to_legacy_callable(builder)),
+            wrap_with_ddp=False,
+        )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
@@ -161,7 +142,7 @@ def main(model_type: str = "gpt"):
     model = model[0]
     model.eval()
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(inference_cfg, model)
 
     if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")

@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 
+import dataclasses
+
 import torch
 
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -14,7 +16,9 @@ from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
+from megatron.training.argument_utils import inference_cfg_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.initialize import initialize_megatron
 
 
@@ -35,7 +39,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int, hostname: str | None = None,
+    engine: DynamicInferenceEngine,
+    inference_cfg: InferenceScriptConfig,
+    coordinator_port: int,
+    server_port: int,
+    hostname: str | None = None,
+    parsers: list[str] | None = None,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -43,9 +52,14 @@ async def run_text_generation_server(
 
     Args:
         engine (DynamicInferenceEngine): The dynamic inference engine.
+        inference_cfg: Inference script configuration.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
         server_port (int): The network for port the frontend text generation server.
+        hostname: Optional bind hostname.
+        parsers: Optional response parsers for the frontend server.
     """
+    if parsers is None:
+        parsers = []
 
     rank = torch.distributed.get_rank()
 
@@ -59,10 +73,10 @@ async def run_text_generation_server(
             start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
-                parsers=args.parsers,
+                parsers=parsers,
                 rank=rank,
                 server_port=server_port,
-                verbose=args.inference_text_gen_server_logging,
+                verbose=inference_cfg.inference_text_gen_server_logging,
                 hostname=hostname,
             )
 
@@ -84,6 +98,10 @@ if __name__ == "__main__":
         initialize_megatron()
 
         args = get_args()
+        inference_cfg = dataclasses.replace(
+            inference_cfg_from_args(args),
+            return_log_probs=True,
+        )
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
@@ -97,11 +115,18 @@ if __name__ == "__main__":
         # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
         args.return_log_probs = True
 
-        engine = get_dynamic_inference_engine()
+        engine = get_dynamic_inference_engine(inference_cfg=inference_cfg)
 
         try:
             asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port, args.host)
+                run_text_generation_server(
+                    engine,
+                    inference_cfg,
+                    inference_cfg.inference_coordinator_port,
+                    args.port,
+                    args.host,
+                    parsers=args.parsers,
+                )
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback

@@ -25,6 +25,8 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_from_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.core.utils import configure_nvtx_profiling
 
 # pylint: disable=line-too-long
@@ -32,7 +34,9 @@ from megatron.core.utils import configure_nvtx_profiling
 logging.basicConfig(level=logging.INFO, force=True)
 
 
-async def suspend_resume_cycle(client, engine, args, futures):
+async def suspend_resume_cycle(
+    client, engine, inference_cfg: InferenceScriptConfig, futures
+):
     """Wait for all in-flight requests, then suspend/train/resume."""
     await asyncio.gather(*futures)
 
@@ -40,8 +44,8 @@ async def suspend_resume_cycle(client, engine, args, futures):
     await engine.wait_until(EngineState.PAUSED)
     client.suspend_engines()
     await engine.wait_until(EngineState.SUSPENDED)
-    if args.suspend_timeout > 0:
-        await asyncio.sleep(args.suspend_timeout)
+    if inference_cfg.suspend_timeout > 0:
+        await asyncio.sleep(inference_cfg.suspend_timeout)
     client.resume_engines()
     await engine.wait_until(EngineState.RESUMED)
     client.unpause_engines()
@@ -51,6 +55,7 @@ async def suspend_resume_cycle(client, engine, args, futures):
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
+    inference_cfg: InferenceScriptConfig,
     port: int | None = None,
     sampling_params: SamplingParams | None = None,
 ):
@@ -65,16 +70,18 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
     # leaving inference_coordinator_port as None will find a free port automatically.
-    args = get_args()
-
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
-        coordinator_schedule_output_path=args.coordinator_schedule_output_path,
+        coordinator_schedule_output_path=inference_cfg.coordinator_schedule_output_path,
     )
 
-    # All ranks agree on the number of suspend/resume cycles from args.
-    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    # All ranks agree on the number of suspend/resume cycles from config.
+    num_suspend_resume_cycles = (
+        len(requests) // inference_cfg.suspend_resume_interval
+        if inference_cfg.suspend_resume_interval
+        else 0
+    )
 
     # Create client and run example.
     if dist.get_rank() == 0:
@@ -86,12 +93,12 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        next_suspend_at = args.suspend_resume_interval or 0
+        next_suspend_at = inference_cfg.suspend_resume_interval or 0
         cycles_done = 0
 
         while True:
             current_time = time.time_ns() / 10**9
-            if args.incoming_requests_per_step is None:
+            if inference_cfg.incoming_requests_per_step is None:
                 # Only add requests that have arrived at the current time.
                 while (
                     num_requests_added < num_requests_total
@@ -105,14 +112,17 @@ async def main(
                     num_requests_added += 1
 
                     if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
-                        await suspend_resume_cycle(client, engine, args, futures)
+                        await suspend_resume_cycle(client, engine, inference_cfg, futures)
                         cycles_done += 1
-                        next_suspend_at += args.suspend_resume_interval
+                        next_suspend_at += inference_cfg.suspend_resume_interval
 
             else:
                 # Add deterministic number of requests (generally used for debugging).
                 for i in range(
-                    min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
+                    min(
+                        inference_cfg.incoming_requests_per_step,
+                        num_requests_total - num_requests_added,
+                    )
                 ):
                     # Change sampling parameters to force different generation lengths.
                     request = requests[num_requests_added]
@@ -122,9 +132,9 @@ async def main(
                     num_requests_added += 1
 
                     if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
-                        await suspend_resume_cycle(client, engine, args, futures)
+                        await suspend_resume_cycle(client, engine, inference_cfg, futures)
                         cycles_done += 1
-                        next_suspend_at += args.suspend_resume_interval
+                        next_suspend_at += inference_cfg.suspend_resume_interval
 
             if num_requests_added == num_requests_total:
                 break
@@ -143,7 +153,7 @@ async def main(
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
-        if args.output_path:
+        if inference_cfg.output_path:
             json_results = {}
             throughputs = []
 
@@ -163,9 +173,9 @@ async def main(
                                 
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
-            if args.throughput_check_only:
+            if inference_cfg.throughput_check_only:
                 json_results = throughput_dict
-            with open(args.output_path, "w") as fp:
+            with open(inference_cfg.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
         else:
             print("Results:")
@@ -210,29 +220,38 @@ if __name__ == "__main__":
         )
         initialize_megatron()
         configure_nvtx_profiling(True)
+        args = get_args()
+        inference_cfg = inference_cfg_from_args(args)
+        cuda_graph_impl = args.cuda_graph_impl
 
         tokenizer = get_tokenizer()
 
         # Sampling params.
         sampling_params = SamplingParams(
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            return_log_probs=args.return_log_probs,
-            num_tokens_to_generate=args.num_tokens_to_generate,
+            temperature=inference_cfg.temperature,
+            top_k=inference_cfg.top_k,
+            top_p=inference_cfg.top_p,
+            return_log_probs=inference_cfg.return_log_probs,
+            num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
             termination_id=(
-                args.termination_id if args.termination_id is not None else tokenizer.eod
+                inference_cfg.termination_id
+                if inference_cfg.termination_id is not None
+                else tokenizer.eod
             ),
         )
 
-        model = get_model_for_inference()
+        model = get_model_for_inference(inference_cfg=inference_cfg)
 
-        requests = build_requests(args, tokenizer, sampling_params)
+        requests = build_requests(
+            inference_cfg, tokenizer, seed=args.seed, sampling_params=sampling_params
+        )
 
-        engine = get_dynamic_inference_engine(model=model)
+        engine = get_dynamic_inference_engine(model=model, inference_cfg=inference_cfg)
 
         if dist.get_rank() == 0:
-            setup_prefix = build_dynamic_engine_setup_prefix(args, model, engine.context, requests)
+            setup_prefix = build_dynamic_engine_setup_prefix(
+                inference_cfg, cuda_graph_impl, model, engine.context, requests
+            )
             print("~~~")
             print(setup_prefix)
             print("~~~")
@@ -241,7 +260,14 @@ if __name__ == "__main__":
         if os.environ.get("NSIGHT_PREFIX"):
             torch.cuda.cudart().cudaProfilerStart()
 
-        asyncio.run(main(engine, requests, args.inference_coordinator_port))
+        asyncio.run(
+            main(
+                engine,
+                requests,
+                inference_cfg,
+                inference_cfg.inference_coordinator_port,
+            )
+        )
 
         # Stop Nsight profiler.
         if os.environ.get("NSIGHT_PREFIX"):

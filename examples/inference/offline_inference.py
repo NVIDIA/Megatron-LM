@@ -51,7 +51,9 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -69,16 +71,16 @@ def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def _validate_high_level_api_args(args):
+def _validate_high_level_api_args(inference_cfg: InferenceScriptConfig, args):
     # engine.reset() between trials races the runtime engine loop in
     # coordinator mode (engine_loop_task runs on the runtime thread).
-    if args.use_coordinator and args.inference_repeat_n > 1:
+    if args.use_coordinator and inference_cfg.inference_repeat_n > 1:
         raise ValueError(
             "--use-coordinator with --inference-repeat-n > 1 is not supported: "
             "engine.reset() races the runtime engine loop in coordinator mode."
         )
     # The high-level API takes one sampling_params per generate() call.
-    if args.prompt_file and getattr(args, "num_tokens_from_file", False):
+    if inference_cfg.prompt_file and inference_cfg.num_tokens_from_file:
         raise ValueError(
             "--prompt-file with --num-tokens-from-file produces per-request "
             "num_tokens_to_generate, but the high-level API takes one "
@@ -87,10 +89,10 @@ def _validate_high_level_api_args(args):
         )
 
 
-def _validate_prompt_lengths(args, llm, requests):
+def _validate_prompt_lengths(inference_cfg: InferenceScriptConfig, llm, requests):
     # Validate prompt lengths against the resolved max_tokens (default
     # is filled in by DynamicInferenceContext during construction).
-    if args.enable_chunked_prefill:
+    if inference_cfg.enable_chunked_prefill:
         return
     invalid = {
         idx: len(r.prompt_tokens)
@@ -119,14 +121,21 @@ def _print_setup_prefix(setup_prefix: str) -> None:
 
 
 def _report_results(
-    args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured
+    inference_cfg,
+    cuda_graph_impl,
+    setup_prefix,
+    results,
+    throughputs,
+    total_time,
+    peak_mem_stats,
+    captured,
 ):
     if dist.get_rank() != 0:
         return
 
     print_unique_prompts_and_outputs(results)
     dump_inference_results_to_json(
-        args,
+        inference_cfg,
         results,
         throughputs,
         peak_mem_stats,
@@ -154,7 +163,9 @@ def _report_results(
     print("~~~")
 
 
-def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, sampling_params):
+def _run_sync(
+    args, inference_cfg, cuda_graph_impl, model, tokenizer, inference_config, requests, prompts_list, sampling_params
+):
     results = []
     throughputs = []
     total_time = 0.0
@@ -169,14 +180,16 @@ def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, 
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
     ) as llm:
-        setup_prefix = build_dynamic_engine_setup_prefix(args, model, llm.context, requests)
-        _validate_prompt_lengths(args, llm, requests)
+        setup_prefix = build_dynamic_engine_setup_prefix(
+            inference_cfg, cuda_graph_impl, model, llm.context, requests
+        )
+        _validate_prompt_lengths(inference_cfg, llm, requests)
 
         # Coordinator mode: only the primary rank submits work; worker ranks
         # fall through and block in __exit__ until shutdown propagates STOP.
         if llm.is_primary_rank:
             _print_setup_prefix(setup_prefix)
-            for trial_idx in range(args.inference_repeat_n):
+            for trial_idx in range(inference_cfg.inference_repeat_n):
                 # Skip first-trial reset; the engine is fresh post-construction.
                 if trial_idx > 0:
                     llm.engine.reset()
@@ -193,11 +206,13 @@ def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, 
 
     # Engine is shut down on all ranks; safe to all-reduce peak-memory now.
     peak_mem_stats = get_global_peak_memory_stats_bytes()
-    _report_results(args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured)
+    _report_results(
+        inference_cfg, cuda_graph_impl, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured
+    )
 
 
 async def _run_async(
-    args, model, tokenizer, inference_config, requests, prompts_list, sampling_params
+    args, inference_cfg, cuda_graph_impl, model, tokenizer, inference_config, requests, prompts_list, sampling_params
 ):
     results = []
     throughputs = []
@@ -213,12 +228,14 @@ async def _run_async(
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
     ) as llm:
-        setup_prefix = build_dynamic_engine_setup_prefix(args, model, llm.context, requests)
-        _validate_prompt_lengths(args, llm, requests)
+        setup_prefix = build_dynamic_engine_setup_prefix(
+            inference_cfg, cuda_graph_impl, model, llm.context, requests
+        )
+        _validate_prompt_lengths(inference_cfg, llm, requests)
 
         if llm.is_primary_rank:
             _print_setup_prefix(setup_prefix)
-            for trial_idx in range(args.inference_repeat_n):
+            for trial_idx in range(inference_cfg.inference_repeat_n):
                 if trial_idx > 0:
                     llm.engine.reset()
                 torch.cuda.reset_peak_memory_stats()
@@ -233,7 +250,9 @@ async def _run_async(
             captured = _capture_engine_stats(llm)
 
     peak_mem_stats = get_global_peak_memory_stats_bytes()
-    _report_results(args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured)
+    _report_results(
+        inference_cfg, cuda_graph_impl, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured
+    )
 
 
 def main():
@@ -242,7 +261,8 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
-    _validate_high_level_api_args(args)
+    inference_cfg = inference_cfg_from_args(args)
+    _validate_high_level_api_args(inference_cfg, args)
 
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
@@ -255,20 +275,26 @@ def main():
     torch.cuda.reset_peak_memory_stats()
 
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        skip_prompt_log_probs=args.skip_prompt_log_probs,
-        return_log_probs=args.return_log_probs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
-        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
-        top_n_logprobs=args.top_n_logprobs,
-        stop_words=args.stop_words,
+        temperature=inference_cfg.temperature,
+        top_k=inference_cfg.top_k,
+        top_p=inference_cfg.top_p,
+        skip_prompt_log_probs=inference_cfg.skip_prompt_log_probs,
+        return_log_probs=inference_cfg.return_log_probs,
+        num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
+        termination_id=(
+            inference_cfg.termination_id
+            if inference_cfg.termination_id is not None
+            else tokenizer.eod
+        ),
+        top_n_logprobs=inference_cfg.top_n_logprobs,
+        stop_words=inference_cfg.stop_words,
     )
 
-    model = get_model_for_inference()
-    inference_config = get_inference_config_from_model_and_args(model, args)
-    requests = build_requests(args, tokenizer, sampling_params)
+    model = get_model_for_inference(inference_cfg=inference_cfg)
+    inference_config = get_inference_config_from_model_and_args(
+        model, inference_cfg=inference_cfg
+    )
+    requests = build_requests(inference_cfg, tokenizer, seed=args.seed, sampling_params=sampling_params)
 
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
@@ -276,7 +302,17 @@ def main():
 
     prompts_list = [r.prompt_text for r in requests]
 
-    runner_args = (args, model, tokenizer, inference_config, requests, prompts_list, sampling_params)
+    runner_args = (
+        args,
+        inference_cfg,
+        args.cuda_graph_impl,
+        model,
+        tokenizer,
+        inference_config,
+        requests,
+        prompts_list,
+        sampling_params,
+    )
     if args.async_mode:
         asyncio.run(_run_async(*runner_args))
     else:
