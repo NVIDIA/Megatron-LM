@@ -125,7 +125,7 @@ def rewind_kv_cache(
 
     Returns:
         (blocks_to_release, remove_mask) — same semantics as the original
-        torch.compile'd `_rewind_kv_cache` (KV-cache portion only; Mamba
+        torch.compile'd `_rewind_kv_cache` (KV-cache portion only; SSM
         state updates are handled separately by the caller).
     """
     N = accepted_counts.shape[0]
@@ -350,17 +350,17 @@ def prepare_next_forward_pass(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 4: Mamba state selective copy (eliminates temporary allocations)
+# Kernel 4: SSM state selective copy (eliminates temporary allocations)
 # ---------------------------------------------------------------------------
 @triton.jit
-def _mamba_state_selective_copy_kernel(
+def _ssm_state_selective_copy_kernel(
     # Source: intermediate states  [L, M, S+1, *state_shape]
     SRC_PTR,
     # Destination: current states  [L, M, *state_shape]
     DST_PTR,
     # Per-request index arrays
     PREFILL_STATUS_PTR,  # [N] 0=decode, 1=prefill
-    STATE_IDX_PTR,  # [N] maps request → mamba state slot
+    STATE_IDX_PTR,  # [N] maps request → SSM state slot
     ACCEPTED_PTR,  # [N] accepted token index per request
     # Strides (in elements)
     src_stride_layer,
@@ -373,11 +373,11 @@ def _mamba_state_selective_copy_kernel(
     # Compile-time
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Copy intermediate Mamba state to current state for decode requests.
+    """Copy intermediate SSM state to current state for decode requests.
 
     Grid: (N, L, num_chunks)
       - dim 0: active request index
-      - dim 1: mamba layer index
+      - dim 1: SSM layer index
       - dim 2: chunk of the flattened state vector
 
     No-op for prefill requests.
@@ -410,22 +410,22 @@ def _mamba_state_selective_copy_kernel(
     tl.store(DST_PTR + dst_base + elem_offsets, data, mask=mask)
 
 
-def mamba_state_selective_copy(
+def ssm_state_selective_copy(
     intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
 ):
-    """Copy accepted intermediate Mamba states to current states in-place.
+    """Copy accepted intermediate SSM states to current states in-place.
 
     For each decode request, copies
     `intermediate[layer, slot, accepted_count, ...]` →
-    `current[layer, slot, ...]` for every Mamba layer.
+    `current[layer, slot, ...]` for every SSM layer.
 
     Args:
         intermediate_states: `(L, M, S+1, *state_shape)` — intermediate buffer.
         current_states: `(L, M, *state_shape)` — current state buffer (updated in-place).
         prefill_status: `(N,)` int tensor — 0 for decode, 1 for prefill.
-        state_idx: `(N,)` int tensor — mamba state slot index per request.
+        state_idx: `(N,)` int tensor — SSM state slot index per request.
         accepted_counts: `(N,)` int tensor — accepted token index per request.
-        num_layers: number of Mamba layers (first dim of the state tensors).
+        num_layers: number of SSM layers (first dim of the state tensors).
     """
     N = prefill_status.shape[0]
     if N == 0:
@@ -440,7 +440,7 @@ def mamba_state_selective_copy(
     num_chunks = triton.cdiv(state_size, BLOCK_SIZE)
     grid = (N, num_layers, num_chunks)
 
-    _mamba_state_selective_copy_kernel[grid](
+    _ssm_state_selective_copy_kernel[grid](
         intermediate_states,
         current_states,
         prefill_status,

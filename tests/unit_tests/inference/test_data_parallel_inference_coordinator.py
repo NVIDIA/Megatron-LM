@@ -274,7 +274,7 @@ def initialize_model_parallel(request, monkeypatch):
 
 
 @pytest.fixture
-def test_case_communicator():
+def test_case_communicator(initialize_model_parallel):
     """A separate ZMQ communicator for test sync barriers.
 
     Use this instead of engine._world_barrier() when the engine loop may be

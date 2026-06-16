@@ -22,8 +22,8 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
-    MambaInferenceStateConfig,
     PrefixCachingEvictionPolicy,
+    SSMInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -104,7 +104,7 @@ class TestPrefixCachingCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-            mamba_config = None
+            ssm_config = None
         else:  # hybrid
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
@@ -131,12 +131,12 @@ class TestPrefixCachingCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-            mamba_config = MambaInferenceStateConfig.from_model(model)
+            ssm_config = SSMInferenceStateConfig.from_model(model)
 
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
-        return model, mamba_config
+        return model, ssm_config
 
     def _reset_cuda_graph_state(self, model):
         """Reset all CUDA graph global and per-module state."""
@@ -149,7 +149,7 @@ class TestPrefixCachingCudaGraphs:
                 module.cudagraph_runners.clear()
                 module.custom_cudagraphs_lookup_table.clear()
 
-    def _build_engine(self, model, mamba_config, num_cuda_graphs):
+    def _build_engine(self, model, ssm_config, num_cuda_graphs):
         """Build an engine with prefix caching and optional CUDA graphs."""
         set_rounder(4)
         inference_config_kwargs = dict(
@@ -163,9 +163,9 @@ class TestPrefixCachingCudaGraphs:
             num_cuda_graphs=num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=True,
         )
-        if mamba_config is not None:
+        if ssm_config is not None:
             inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=0.05
+                ssm_inference_state_config=ssm_config, prefix_caching_ssm_gb=0.05
             )
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
@@ -271,15 +271,15 @@ class TestPrefixCachingCudaGraphs:
                 pytest.skip(reason)
 
         # Create model with CUDA graph support (cuda_graph_impl="local").
-        model, mamba_config = self._create_model(model_type, num_cuda_graphs=2)
+        model, ssm_config = self._create_model(model_type, num_cuda_graphs=2)
         prompts = self._create_prompts()
 
         # Baseline: no CUDA graphs.
-        baseline_engine = self._build_engine(model, mamba_config, num_cuda_graphs=None)
+        baseline_engine = self._build_engine(model, ssm_config, num_cuda_graphs=None)
         baseline_outputs, _ = self._run_scenario(baseline_engine, batch_structure, prompts)
 
         # CG enabled.
-        cg_engine = self._build_engine(model, mamba_config, num_cuda_graphs=2)
+        cg_engine = self._build_engine(model, ssm_config, num_cuda_graphs=2)
         cg_outputs, step_log = self._run_scenario(cg_engine, batch_structure, prompts)
 
         # 1. Correctness: generated tokens must match.
@@ -372,7 +372,7 @@ class TestHybridChunkedPrefillIntermediateState:
     def _build_engine(
         self,
         model,
-        mamba_config,
+        ssm_config,
         enable_prefix_caching,
         enable_chunked_prefill,
         max_tokens=None,
@@ -384,7 +384,7 @@ class TestHybridChunkedPrefillIntermediateState:
             max_sequence_length=MAX_SEQ_LEN,
             buffer_size_gb=0.5,
             block_size_tokens=BLOCK_SIZE,
-            mamba_inference_state_config=mamba_config,
+            ssm_inference_state_config=ssm_config,
             materialize_only_last_token_logits=False,
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
@@ -396,7 +396,7 @@ class TestHybridChunkedPrefillIntermediateState:
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-                prefix_caching_mamba_gb=0.05,
+                prefix_caching_ssm_gb=0.05,
             )
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens
@@ -455,7 +455,7 @@ class TestHybridChunkedPrefillIntermediateState:
         )
 
         model = self._create_hybrid_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
 
         device = torch.cuda.current_device()
         prompt0 = torch.arange(0, 300, dtype=torch.int64, device=device)
@@ -469,7 +469,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
         # Baseline: no prefix caching, no chunked prefill.
         baseline_engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=False, enable_chunked_prefill=False
+            model, ssm_config, enable_prefix_caching=False, enable_chunked_prefill=False
         )
         for i, prompt in enumerate([prompt0, prompt1, prompt2]):
             baseline_engine._add_request(self._make_request(i, prompt, enable_pc=False))
@@ -483,7 +483,7 @@ class TestHybridChunkedPrefillIntermediateState:
         # Test: prefix caching + chunked prefill, max_tokens=400.
         test_engine = self._build_engine(
             model,
-            mamba_config,
+            ssm_config,
             enable_prefix_caching=True,
             enable_chunked_prefill=True,
             max_tokens=400,
@@ -505,7 +505,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
         # Verify req0 cached its Mamba state.
         assert (
-            len(ctx.mamba_slot_allocator.hash_to_block_id) > 0
+            len(ctx.ssm_slot_allocator.hash_to_block_id) > 0
         ), "req0 should have cached Mamba state"
 
         # Phase 2: add req1 + req2 simultaneously.
@@ -517,10 +517,10 @@ class TestHybridChunkedPrefillIntermediateState:
         while test_engine.has_unfinished_requests():
             collect_finished(test_engine.step_modern())
 
-        # Verify Mamba state was restored for req2 (prefix-cached).
+        # Verify SSM state was restored for req2 (prefix-cached).
         assert (
-            req2._mamba_num_matched_blocks == 1
-        ), f"req2 should have 1 Mamba match, got {req2._mamba_num_matched_blocks}"
+            req2._ssm_num_matched_blocks == 1
+        ), f"req2 should have 1 SSM match, got {req2._ssm_num_matched_blocks}"
 
         # Verify prefix caching saved prefill tokens.
         assert ctx.lifetime_prefill_token_count < (300 + 800 + 300), (

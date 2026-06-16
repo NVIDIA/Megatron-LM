@@ -14,7 +14,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
@@ -110,7 +110,7 @@ class TextGenerationControllerTestBase:
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
 
-        mamba_inference_state_config = None
+        ssm_inference_state_config = None
         if hybrid_layer_pattern:
             model = HybridModel(
                 config=transformer_config,
@@ -122,7 +122,7 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-            mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+            ssm_inference_state_config = SSMInferenceStateConfig.from_model(model)
         else:
             layer_spec = get_gpt_layer_local_spec()
 
@@ -165,7 +165,7 @@ class TextGenerationControllerTestBase:
                     block_size_tokens=block_size_tokens,
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
-                    mamba_inference_state_config=mamba_inference_state_config,
+                    ssm_inference_state_config=ssm_inference_state_config,
                     sampling_backend=sampling_backend,
                 ),
             )
@@ -1080,13 +1080,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         if is_hybrid_model:
-            ctx.mamba_metadata.request_to_mamba_state_idx[:2] = torch.tensor(
+            ctx.ssm_metadata.request_to_ssm_state_idx[:2] = torch.tensor(
                 [0, 1], dtype=torch.int32, device=context_device
             )
-            ctx.mamba_ssm_states.zero_()
-            ctx.mamba_intermediate_ssm_states.fill_(99)
-            ctx.mamba_conv_states.zero_()
-            ctx.mamba_intermediate_conv_states.fill_(77)
+            ctx.ssm_recurrent_states.zero_()
+            ctx.ssm_intermediate_recurrent_states.fill_(99)
+            ctx.ssm_conv_states.zero_()
+            ctx.ssm_intermediate_conv_states.fill_(77)
 
         # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1123,10 +1123,14 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
-            assert torch.all(ctx.mamba_ssm_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
-            assert torch.all(ctx.mamba_ssm_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
-            assert torch.all(ctx.mamba_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
-            assert torch.all(ctx.mamba_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(
+                ctx.ssm_recurrent_states[:, 0] == 99
+            )  # Req 0 accepted 1, loaded index 1
+            assert torch.all(
+                ctx.ssm_recurrent_states[:, 1] == 99
+            )  # Req 1 accepted 0, loaded index 0
+            assert torch.all(ctx.ssm_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.ssm_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
 
     @pytest.mark.internal
     def test_rewind_kv_cache_stale_padding_is_safe(self):

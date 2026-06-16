@@ -8,7 +8,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -93,7 +93,7 @@ class StaticInferenceEngine(AbstractEngine):
 
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+        ssm_inference_state_config = SSMInferenceStateConfig.from_model(
             self.inference_wrapped_model.model
         )
 
@@ -104,7 +104,7 @@ class StaticInferenceEngine(AbstractEngine):
                     inference_config=InferenceConfig(
                         max_sequence_length=original_context.max_sequence_length,
                         buffer_size_gb=buffer_size_gb,
-                        mamba_inference_state_config=mamba_inference_state_config,
+                        ssm_inference_state_config=ssm_inference_state_config,
                         max_requests=max_batch_size,
                         num_cuda_graphs=1,
                         block_size_tokens=256,

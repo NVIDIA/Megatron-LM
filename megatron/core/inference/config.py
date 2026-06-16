@@ -12,68 +12,68 @@ from megatron.core.utils import get_attr_wrapped_model
 
 
 @dataclass
-class MambaInferenceStateConfig:
+class SSMInferenceStateConfig:
     """
-    Config for initializing Mamba model inference state tensors.
+    Config for initializing SSM model inference state tensors.
 
     Note that we maintain separate metadata for decode, regular prefill, and
-    chunked prefill requests because the Mamba kernels do not yet support mixing
+    chunked prefill requests because the SSM kernels do not yet support mixing
     these. Once the kernels have been updated we can simplify this code.
     """
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    A list of strings that indicates the layer type (SSM / Attention / MLP) for each layer.
     See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
-    """Mamba conv states shape per request."""
+    """Conv states shape per request."""
 
-    ssm_states_shape: Tuple[int]
-    """Mamba SSM states shape per request."""
+    recurrent_states_shape: Tuple[int]
+    """Recurrent states shape per request."""
 
     conv_states_dtype: torch.dtype
-    """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
+    """The dtype to use for the conv state tensor. Defaults to the model dtype."""
 
-    ssm_states_dtype: torch.dtype
-    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+    recurrent_states_dtype: torch.dtype
+    """The dtype to use for the recurrent state tensor. Defaults to the model dtype."""
 
-    mamba_chunk_size: int = 128
-    """The chunk size used by the Mamba SSM Triton kernels."""
+    ssm_chunk_size: int = 128
+    """The chunk size used by the SSM Triton kernels."""
 
     @classmethod
     def from_model(
         cls,
         model: MegatronModule,
         conv_states_dtype: Optional[torch.dtype] = None,
-        ssm_states_dtype: Optional[torch.dtype] = None,
-    ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        recurrent_states_dtype: Optional[torch.dtype] = None,
+    ) -> Optional["SSMInferenceStateConfig"]:
+        """Returns SSM inference state config from the model if it is a hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
-                decoder.mamba_state_shapes_per_request()
+            (ssm_conv_states_shape, ssm_recurrent_states_shape) = (
+                decoder.ssm_state_shapes_per_request()
             )
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
-                ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
+            if recurrent_states_dtype is None:
+                recurrent_states_dtype = model.config.params_dtype
+            ssm_chunk_size = 128
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
+                    ssm_chunk_size = layer.mixer.chunk_size
                     break
             return cls(
                 layer_type_list=layer_type_list,
-                conv_states_shape=mamba_conv_states_shape,
-                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_shape=ssm_conv_states_shape,
+                recurrent_states_shape=ssm_recurrent_states_shape,
                 conv_states_dtype=conv_states_dtype,
-                ssm_states_dtype=ssm_states_dtype,
-                mamba_chunk_size=mamba_chunk_size,
+                recurrent_states_dtype=recurrent_states_dtype,
+                ssm_chunk_size=ssm_chunk_size,
             )
         return None
 
@@ -105,7 +105,7 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
 
 
 class KVCacheManagementMode(str, Enum):
-    """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
+    """Mode for handling large tensors (KV cache, SSM states) during suspend/resume."""
 
     PERSIST = "persist"
     """Do not deallocate and reallocate large tensors; keep them on GPU."""
@@ -142,7 +142,7 @@ class InferenceConfig:
     """
 
     # =================================
-    # KV cache and Mamba states config
+    # KV cache and SSM states config
     # =================================
     block_size_tokens: int = 256
     """Size of KV cache block size."""
@@ -163,12 +163,12 @@ class InferenceConfig:
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
 
-    mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
-    """The Mamba inference state config if the model is a hybrid model."""
+    ssm_inference_state_config: Optional[SSMInferenceStateConfig] = None
+    """The SSM inference state config if the model is a hybrid model."""
 
-    mamba_memory_ratio: Optional[float] = None
+    ssm_memory_ratio: Optional[float] = None
     """
-    Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
+    Percentage of memory buffer to allocate for SSM states. If not specified, allocates SSM
     state tensors for each KV cache block. Only used for hybrid models.
     """
 
@@ -242,7 +242,7 @@ class InferenceConfig:
 
     static_kv_memory_pointers: bool = False
     """
-    Whether the KV cache (and Mamba states) will reside at the same memory addresses
+    Whether the KV cache (and SSM states) will reside at the same memory addresses
     after suspend/resume as before. When True, CUDA graphs that reference these buffers
     remain valid across suspend/resume cycles and do not need to be recaptured.
     Requires either UVM or `torch_memory_saver` when `kv_cache_management_mode` is not PERSIST.
@@ -304,10 +304,10 @@ class InferenceConfig:
     Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
-    prefix_caching_mamba_gb: Optional[float] = None
-    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
-    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
-    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    prefix_caching_ssm_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the SSM state cache used by prefix caching
+    on hybrid models. Each cache slot stores recurrent and conv states for all SSM layers
+    at a single block boundary. When set, SSM states at KV divergence and last-aligned
     block boundaries are cached and reused across requests with matching prefixes."""
 
     # =================================
