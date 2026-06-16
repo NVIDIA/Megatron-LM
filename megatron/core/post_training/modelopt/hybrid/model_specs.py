@@ -6,20 +6,48 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.post_training.modelopt.layers import Norm
+from megatron.core.post_training.modelopt.layers import Linear, Norm
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexer,
+    DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
+)
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
 )
+
+
+class _DuplicatedLinear(Linear):
+    """ModelOpt local linear that accepts TE's duplicated-linear constructor kwarg."""
+
+    def __init__(self, *args, parallel_mode: str = "duplicated", **kwargs):
+        if parallel_mode != "duplicated":
+            raise ValueError(f"{type(self).__name__} only supports parallel_mode='duplicated'")
+        super().__init__(*args, **kwargs)
+
 
 # Identical to `hybrid_stack_spec` except the MoE layer uses SequentialMLP (per-expert
 # linears) instead of TEGroupedMLP, so ModelOpt flows that need to operate on individual
@@ -98,12 +126,14 @@ def _get_hybrid_stack_local_spec(
     """
     mamba_state_dict_keys_map = {}
     transformer_state_dict_keys_map = {}
+    gdn_state_dict_keys_map = {}
     if remap_te_layernorm:
         mamba_state_dict_keys_map = {'norm.': 'mixer.in_proj.layer_norm_'}
         transformer_state_dict_keys_map = {
             'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
             'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
         }
+        gdn_state_dict_keys_map = {'input_layernorm.': 'self_attention.in_proj.layer_norm_'}
 
     mamba_layer = ModuleSpec(
         module=MambaLayer,
@@ -117,6 +147,23 @@ def _get_hybrid_stack_local_spec(
             ),
             mamba_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map=mamba_state_dict_keys_map,
+        ),
+    )
+
+    gdn_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=Norm,
+            self_attention=ModuleSpec(
+                module=GatedDeltaNet,
+                submodules=GatedDeltaNetSubmodules(
+                    in_proj=ColumnParallelLinear,
+                    out_norm=Norm,
+                    out_proj=RowParallelLinear,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map=gdn_state_dict_keys_map,
         ),
     )
 
@@ -137,6 +184,42 @@ def _get_hybrid_stack_local_spec(
             ),
             self_attn_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map=transformer_state_dict_keys_map,
+        ),
+    )
+
+    dsa_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=Norm,
+            self_attention=ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": attn_mask_type},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=ColumnParallelLinear,
+                    linear_q_down_proj=Linear,
+                    linear_q_up_proj=ColumnParallelLinear,
+                    linear_kv_down_proj=Linear,
+                    linear_kv_up_proj=ColumnParallelLinear,
+                    core_attention=ModuleSpec(
+                        module=DSAttention,
+                        submodules=DSAttentionSubmodules(
+                            indexer=ModuleSpec(
+                                module=DSAIndexer,
+                                submodules=DSAIndexerSubmodules(
+                                    linear_wq_b=_DuplicatedLinear,
+                                    linear_wk=_DuplicatedLinear,
+                                    k_norm=Norm,
+                                    linear_weights_proj=_DuplicatedLinear,
+                                ),
+                            )
+                        ),
+                    ),
+                    linear_proj=RowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    kv_layernorm=IdentityOp,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
         ),
     )
 
@@ -166,12 +249,33 @@ def _get_hybrid_stack_local_spec(
         ),
     )
 
+    mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(
+            layer_specs=[
+                ModuleSpec(
+                    module=MultiTokenPredictionLayer,
+                    submodules=MultiTokenPredictionLayerSubmodules(
+                        enorm=Norm,
+                        hnorm=Norm,
+                        eh_proj=ColumnParallelLinear,
+                        mtp_model_layer=None,
+                        layer_norm=Norm,
+                    ),
+                )
+            ]
+        ),
+    )
+
     return ModuleSpec(
         module=HybridStack,
         submodules=HybridStackSubmodules(
             mamba_layer=mamba_layer,
+            gdn_layer=gdn_layer,
             attention_layer=attention_layer,
+            dsa_layer=dsa_layer,
             mlp_layer=mlp_layer,
             moe_layer=moe_layer,
+            mtp_block_spec=mtp_block_spec,
         ),
     )
