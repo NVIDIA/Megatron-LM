@@ -5,34 +5,10 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.state import GlobalState
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
-
-# Startup timestamps for tracking program initialization phases
-_STARTUP_TIMESTAMPS = {
-    'program_start': None,  # Set by entry script before imports
-    'main_entry': None,     # Set by entry script at start of __main__
-    'pretrain_entry': None, # Set at top of pretrain()
-}
-
-
-def set_startup_timestamps(program_start=None, main_entry=None):
-    """Set startup timestamps from the entry script.
-
-    Call this after imports but before calling pretrain() to register
-    the program start time and main entry time.
-
-    Args:
-        program_start: Timestamp captured at very start of program, before any imports.
-        main_entry: Timestamp captured right after entering __main__ block.
-    """
-    global _TRAIN_START_TIME, _STARTUP_TIMESTAMPS
-    if program_start is not None:
-        _TRAIN_START_TIME = program_start
-        _STARTUP_TIMESTAMPS['program_start'] = program_start
-    if main_entry is not None:
-        _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
 import copy
@@ -228,6 +204,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
+from megatron.training.setup import setup
 from megatron.training.utils import is_hybrid_model
 
 try:
@@ -281,6 +258,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+from megatron.training.utils.log_utils import barrier_and_log as print_datetime
 
 stimer = StragglerDetector()
 
@@ -295,16 +273,6 @@ def destroy_global_state():
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
-
-def print_datetime(string, override_timestamp=None):
-    """Note that this call will sync across all ranks. Use override_timestamp if provided;
-       otherwise use current timestamp."""
-    torch.distributed.barrier()
-    if override_timestamp is None:
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-    else:
-        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
-    print_rank_0(f'[{string}] datetime: {time_str} ')
 
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
@@ -1033,15 +1001,16 @@ def preprocess_common_state_dict(common_state_dict):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
-    model_provider,
     model_type,
     forward_step_func,
+    model_provider=None,
     process_non_loss_data_func=None,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
+    startup_timestamps: dict[str, float | None] = {},
 ):
     """Main training program.
 
@@ -1084,151 +1053,85 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        startup_timestamps: timestamps of startup events before this function
+            is called. 'program_start' and 'main_entry' times will be 
+            automatically logged if provided.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
-    global _STARTUP_TIMESTAMPS
-    _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+    startup_timestamps["pretrain_entry"] = time.time()
+    startup_timestamps["program_start_local"] = startup_timestamps.get("program_start", _TRAIN_START_TIME)
 
+    state = GlobalState()
+    state.cfg = cfg_container
+    state.startup_timestamps = startup_timestamps
+    state.start_time = startup_timestamps["program_start_local"]  # To be min-reduced in setup()
+    state.startup_timestamps["legacy_train_start_time"] = _LEGACY_TRAIN_START_TIME
+    timers = state.timers
+
+    timers("startup-in-process-setup", log_level=0).start()
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
-
-    timestamp_after_inprocess_setup = time.time()
+    timers("startup-in-process-setup").stop()
 
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
+    timers("startup-in-job-setup", log_level=0).start()
     ft_integration.setup()
-    timestamp_after_in_job_setup = time.time()
+    timers("startup-in-job-setup").stop()
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
+    setup_output = setup(
+        state=state,
+        train_valid_test_dataset_provider=train_valid_test_dataset_provider,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
-        store=store,
+        restart_store=store,
+        model_provider_func=model_provider,
     )
 
-    timestamp_after_initialize_megatron = time.time()
+    global _TRAIN_START_TIME    # TODO (@maanug): replace all accesses with GlobalState start_time
+    _TRAIN_START_TIME = state.start_time
+
 
     args = get_args()
-    timers = get_timers()
 
-    if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
-        set_ideal_affinity_for_current_gpu()
+    program_start_global = state.start_time
+    program_start_local = startup_timestamps.get("program_start_local")
+    main_entry = startup_timestamps.get("main_entry")
+    pretrain_entry = startup_timestamps.get("pretrain_entry")
+    megatron_init_end = startup_timestamps.get("megatron_init_end")
 
-
-    if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
-
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
-
-    timestamp_after_set_jit_fusion_options = time.time()
-
-    # Adjust the startup time so it reflects the global minimum.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches).
-    program_start = _STARTUP_TIMESTAMPS.get('program_start')
-    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
-    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
-
-    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
-    program_start_global = _TRAIN_START_TIME
-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
-        program_start_global = program_start_global.item()
-    set_startup_timestamps(program_start=program_start_global)
-
-    global _LEGACY_TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
-
-    # Capture megatron init end time (matches original time.time() placement)
-    megatron_init_end = time.time()
-
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(program_start_global * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
-
-    # Print basic megatron init time (using global min start)
-    # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
-    print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
-    )
-
-    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
-    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
-
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
-        # Inject startup deltas into timers
+    if program_start_local is not None and main_entry is not None and pretrain_entry is not None and megatron_init_end is not None:
+        # Log startup deltas
         startup_timers = {
-            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
-            'startup-library-setup': main_entry - program_start, # Local library imports
+            'startup-program-entry-spread': program_start_local - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+            'startup-library-setup': main_entry - program_start_local, # Local library imports
             'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
-            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
-            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
-            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
-            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
             'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
             'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
+
+        setup_events = [
+            'startup-in-process-setup', # Local in-process setup
+            'startup-in-job-setup', # Local in-job setup
+            'startup-initialize-megatron', # Local initialize megatron
+            'startup-set-jit-fusion-options', # Local set JIT fusion options
+            'all-reduce-start-timestamps-tensor', # 2x All-reduce, first collective call
+        ]
+        startup_events = [name for name in (list(startup_timers.keys()) + setup_events) if name in timers._timers]
+        timers.log(startup_events, barrier=True)
 
         # Print rank 0's absolute timestamps
-        startup_timestamps = {
-            'before library-setup': program_start,
+        timestamps = {
+            'before library-setup': program_start_local,
             'after library-setup': main_entry,
             'before megatron-init': pretrain_entry,
         }
-        for name, ts in startup_timestamps.items():
+        for name, ts in timestamps.items():
             ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
             print_rank_0(f'[{name}] datetime: {ts_str}')
-
-    print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
-
-    # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "The 'nvidia_resiliency_ext' module is required for local "
-                "checkpointing but was not found. Please ensure it is installed."
-            )
-
-        if cfg_container.checkpoint.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
-            )
-        else:
-            repl_strategy = None
-
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(
-                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
-            )
-        }
-    else:
-        checkpointing_context = {}
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
