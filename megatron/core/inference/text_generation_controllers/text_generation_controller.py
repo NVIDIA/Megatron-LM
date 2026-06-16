@@ -1604,30 +1604,40 @@ class TextGenerationController:
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
     def _build_dynamic_step_request_update(self) -> Tuple[Dict, Dict[str, Tensor]]:
-        """Prepare request bookkeeping inputs and return data after sampling.
+        """Package sampled outputs into context-update and response bookkeeping inputs.
 
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
+        This batches the sampled-token transfer to CPU, builds the active mask,
+        and captures finished request IDs before context rows can move. The
+        returned `prepared_update` is consumed by context update methods, while
+        `request_bookkeeping` is merged into the engine-facing step result.
 
-        Return:
-            Tuple containing the prepared context update and request return data.
+        Steps:
+            1. Transfer sampled token tensors from GPU to CPU.
+            2. Build active and finished request metadata.
+            3. Capture routing block IDs before context rows move.
+            4. Return separate context-update and response-bookkeeping payloads.
+
+        Example:
+            sampled:
+                gpu tokens -> [42] [43]
+                cpu tokens -> [42] [43]
+            outputs:
+                prepared_update   -> mask/tokens for context
+                request_bookkeeping -> ids/sample for response
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Step 1: Transfer sampled token tensors from GPU to CPU in one batch.
         range_push("transfer_samples_to_cpu")
         sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
             active_request_count
         )
         range_pop()
 
+        # Step 2: Build active and finished request metadata on CPU.
         range_push("active_request_mask")
-        # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
 
@@ -1661,7 +1671,7 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
-        # Save block IDs for finished requests before update_requests releases them.
+        # Step 3: Capture routing block IDs before update_requests can release or move rows.
         # Needed for per-block routing reconstruction in the engine.
         finished_routing_block_ids = {}
         if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
@@ -1677,6 +1687,7 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
+        # Step 4: Return separate context-update and response-bookkeeping payloads.
         prepared_update = {
             "active_requests_mask": active_request_mask,
             "new_tokens": new_sample_copy,
@@ -1695,10 +1706,25 @@ class TextGenerationController:
         return prepared_update, request_bookkeeping
 
     def _dynamic_step_context_bookkeeping_legacy(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context through the preserved legacy path."""
+        """Update the dynamic context through the preserved legacy path.
+
+        This is the controller wrapper around `context.update_requests_legacy`.
+
+        Steps:
+            1. Build the sampled-step update payload.
+            2. Call the preserved legacy context update and merge its result.
+
+        Example:
+            route:
+                legacy or non-decode
+                  -> update_requests_legacy
+        """
         context = self.inference_wrapped_model.inference_context
+
+        # Step 1: Build the sampled-step update payload.
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
+        # Step 2: Call the preserved legacy context update and merge its result.
         range_push("update_requests_legacy")
         update_result = context.update_requests_legacy(**prepared_update)
         range_pop()
@@ -1706,10 +1732,26 @@ class TextGenerationController:
         return {**request_bookkeeping, **(update_result or {})}
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context through the split resolve/prepare path."""
+        """Update the dynamic context through the split serial path.
+
+        This is the controller wrapper around the new `context.update_requests`.
+
+        Steps:
+            1. Build the sampled-step update payload.
+            2. Call the split context update and merge its result.
+
+        Example:
+            route:
+                serial decode
+                  -> resolve_requests
+                  -> prepare_requests
+        """
         context = self.inference_wrapped_model.inference_context
+
+        # Step 1: Build the sampled-step update payload.
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
+        # Step 2: Call the split context update and merge its result.
         range_push("update_requests")
         update_result = context.update_requests(**prepared_update)
         range_pop()
@@ -1717,10 +1759,31 @@ class TextGenerationController:
         return {**request_bookkeeping, **(update_result or {})}
 
     def _dynamic_step_forward_for_async_scheduling(self) -> Optional[int]:
-        """Run one dynamic forward pass for the serial async-shaped path."""
+        """Run the forward portion of the async-shaped serial path.
+
+        The context is already prepared for the next forward before this method
+        is called. This records the CUDA-graph request count needed by later
+        result construction and preserves the normal routing bookkeeping around
+        the forward pass.
+
+        Steps:
+            1. Initialize input and position tensors from the prepared context.
+            2. Record CUDA graph request count when graphs are active.
+            3. Run the model forward pass.
+            4. Commit normal post-forward routing and Mamba bookkeeping.
+
+        Example:
+            flow:
+                prepare(N+1)
+                  -> forward(N+1)
+                  -> cuda_graph_count
+        """
         context = self.inference_wrapped_model.inference_context
+
+        # Step 1: Initialize input and position tensors from the prepared context.
         input_ids, position_ids = self._dynamic_step_context_init()
 
+        # Step 2: Record CUDA graph request count when graphs are active.
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
@@ -1729,9 +1792,11 @@ class TextGenerationController:
         if config.moe_enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
+        # Step 3: Run the model forward pass.
         range_push("forward_pass")
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
+        # Step 4: Commit normal post-forward routing and Mamba bookkeeping.
         if context.is_hybrid_model and context.mamba_slot_allocator is not None:
             context.mamba_slot_allocator.commit_intermediate_states()
 
@@ -1742,9 +1807,31 @@ class TextGenerationController:
     def _run_async_scheduling_request_update(
         self, prepared_update: Dict, request_bookkeeping: Dict, *, run_forward: bool = True
     ) -> Tuple[Dict, Dict[str, Optional[Tensor]]]:
-        """Run prepare(N+1) -> forward(N+1) -> resolve(N) serially."""
+        """Run the future async-overlap order serially.
+
+        This prepares the next forward from the sampled tokens, optionally runs
+        that forward, then resolves lifecycle changes from the sampled step. If
+        all rows finished or forwarding is disabled, it resolves immediately and
+        clears the primed-forward state. Otherwise it records that the next
+        forward has already been run for async-shaped result handling.
+
+        Steps:
+            1. Prepare next-forward bookkeeping from the sampled update.
+            2. Resolve immediately if no forward should run.
+            3. Run the prepared forward when active rows remain.
+            4. Resolve the sampled step with delayed finish compaction.
+            5. Record whether a forward is primed for result handling.
+
+        Example:
+            flow:
+                sample(N)
+                  -> prepare(N+1)
+                  -> forward(N+1)
+                  -> resolve(N)
+        """
         context = self.inference_wrapped_model.inference_context
 
+        # Step 1: Prepare next-forward bookkeeping from the sampled update.
         range_push("prepare_requests")
         prepared_update, request_bookkeeping = context.prepare_requests(
             **prepared_update, request_bookkeeping=request_bookkeeping
@@ -1758,6 +1845,8 @@ class TextGenerationController:
             or active_requests_mask.numel() == 0
             or (active_requests_mask == 0).all()
         ):
+
+            # Step 2: Resolve immediately if no forward should run.
             range_push("resolve_requests")
             resolve_result = context.resolve_requests(prepared_update)
             range_pop()
@@ -1765,19 +1854,29 @@ class TextGenerationController:
             self._async_schedule_primed_cuda_graph_request_count = None
             return request_bookkeeping, resolve_result or {}
 
+        # Step 3: Run the prepared forward when active rows remain.
         self._async_schedule_primed_cuda_graph_request_count = (
             self._dynamic_step_forward_for_async_scheduling()
         )
 
+        # Step 4: Resolve the sampled step with delayed finish compaction.
         range_push("resolve_requests")
         resolve_result = context.resolve_requests(prepared_update, delay_finished_compaction=True)
         range_pop()
 
+        # Step 5: Record whether a forward is primed for result handling.
         self._async_schedule_forward_primed = True
         return request_bookkeeping, resolve_result or {}
 
     def _get_request_update_mode(self) -> AsyncSchedulingMode:
-        """Return the configured dynamic request-update mode."""
+        """Return the configured request-update mode as an enum.
+
+        This normalizes config storage before routing decisions.
+
+        Example:
+            config: "async"
+            mode:   AsyncSchedulingMode.ASYNC
+        """
         context = self.inference_wrapped_model.inference_context
 
         return AsyncSchedulingMode(context.config.async_scheduling_mode)
@@ -1785,18 +1884,41 @@ class TextGenerationController:
     def _get_decode_request_update_unsupported_reason(
         self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
     ) -> Optional[str]:
-        """Return why the new request-update path is unsupported for this decode-only step."""
+        """Return the first reason a decode step cannot use the new update path.
+
+        The new serial and async-shaped paths are intentionally limited to
+        vanilla GPT greedy decode while the legacy path preserves all features.
+        This method centralizes checks for waiting requests, stop words,
+        speculative/MTP/Mamba/MoE/EP state, paused rows, logprobs, non-greedy
+        sampling, and async KV block boundaries. A `None` result means the step
+        is eligible for the requested mode.
+
+        Steps:
+            1. Check request-queue, stop-word, and controller speculative state.
+            2. Reject unsupported model families and parallelism modes.
+            3. Reject paused rows, prepared speculative tokens, and extra output features.
+            4. Reject non-greedy sampling settings.
+            5. Apply async-only KV block-boundary protection.
+
+        Example:
+            active decode:
+                stop_words -> "stop_words"
+                greedy GPT -> None
+        """
         context = self.inference_wrapped_model.inference_context
         model_config = self.model_config
         active_slice = slice(context.paused_request_count, context.total_request_count)
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # Step 1: Check request-queue, stop-word, and controller speculative state.
         if getattr(context, "request_update_has_waiting_requests", False):
             return "waiting_requests"
         if active_request_count > 0 and context.request_has_stop_words[active_slice].any().item():
             return "stop_words"
         if self.num_speculative_tokens > 0:
             return "speculative_tokens"
+
+        # Step 2: Reject unsupported model families and parallelism modes.
         if getattr(model_config, "mtp_num_layers", None):
             return "mtp_model"
         if context.is_hybrid_model or getattr(model_config, "is_hybrid_model", False):
@@ -1807,6 +1929,8 @@ class TextGenerationController:
             return "expert_parallel"
         if context.expert_model_parallel_group is not None:
             return "expert_parallel"
+
+        # Step 3: Reject paused rows, prepared speculative tokens, and extra output features.
         if context.paused_request_count != 0:
             return "paused_requests"
         if prepared_update is not None and prepared_update["new_speculative_tokens"] is not None:
@@ -1817,11 +1941,14 @@ class TextGenerationController:
             return "log_probs"
         if (context.request_metadata["top_n_logprobs"][active_slice] > 0).any().item():
             return "top_n_logprobs"
+
+        # Step 4: Reject non-greedy sampling settings.
         if not (context.request_metadata["top_k"][active_slice] == 1).all().item():
             return "non_greedy_sampling"
         if (context.request_metadata["top_p"][active_slice] > 0.0).any().item():
             return "non_greedy_sampling"
 
+        # Step 5: Apply async-only KV block-boundary protection.
         if mode == AsyncSchedulingMode.ASYNC:
             block_boundary_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
             if (
@@ -1836,9 +1963,27 @@ class TextGenerationController:
     def _raise_if_decode_request_update_unsupported(
         self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
     ) -> None:
-        """Raise when a decode-only step requests the new path with unsupported features."""
+        """Raise a clear error when a requested new update mode is unsupported.
+
+        This converts the centralized eligibility reason into user-facing failure.
+
+        Steps:
+            1. Query the unsupported-feature reason.
+            2. Raise when a reason is present.
+
+        Example:
+            request:
+                mode: SERIAL
+                feature: MTP
+            result:
+                RuntimeError("... unsupported feature: mtp_model.")
+        """
+
+        # Step 1: Query the unsupported-feature reason.
         reason = self._get_decode_request_update_unsupported_reason(mode, prepared_update)
         if reason is not None:
+
+            # Step 2: Raise when a reason is present.
             raise RuntimeError(
                 f"Dynamic batching request-update mode '{mode.value}' only supports "
                 f"decode-only vanilla GPT greedy steps without extra lifecycle events; "
@@ -1846,28 +1991,77 @@ class TextGenerationController:
             )
 
     def _dynamic_step_context_bookkeeping_for_mode(self) -> Dict[str, Tensor]:
-        """Route post-sampling request updates to legacy or the new serial path."""
+        """Route post-sampling context bookkeeping by request-update mode.
+
+        Legacy mode and non-decode steps always use the preserved mainline path.
+        Serial decode steps use the split update path after eligibility checks,
+        while async mode falls back to legacy here because its dedicated entry
+        point handles the async-shaped order.
+
+        Steps:
+            1. Route legacy mode and non-decode steps to legacy update.
+            2. Route eligible serial decode steps to split update.
+            3. Validate async-mode decode eligibility.
+            4. Use legacy fallback for async mode in the normal loop.
+
+        Example:
+            route:
+                legacy or non-decode -> legacy update
+                serial decode        -> split update
+                async normal loop    -> legacy fallback
+        """
         context = self.inference_wrapped_model.inference_context
         mode = self._get_request_update_mode()
 
+        # Step 1: Route legacy mode and non-decode steps to legacy update.
         if mode == AsyncSchedulingMode.LEGACY or not context.is_decode_only():
             return self._dynamic_step_context_bookkeeping_legacy()
 
+        # Step 2: Route eligible serial decode steps to split update.
         if mode == AsyncSchedulingMode.SERIAL:
             self._raise_if_decode_request_update_unsupported(mode)
             return self._dynamic_step_context_bookkeeping()
 
+        # Step 3: Validate async-mode decode eligibility.
         self._raise_if_decode_request_update_unsupported(mode)
+
+        # Step 4: Use legacy fallback for async mode in the normal loop.
         return self._dynamic_step_context_bookkeeping_legacy()
 
     def _run_async_scheduling_step(self) -> Tuple[Dict, Dict]:
-        """Run sample(N) -> prepare(N+1) -> forward(N+1) -> resolve(N)."""
+        """Run one async-shaped decode step after the prior forward is available.
+
+        This samples the current logits, builds the context update payload, and
+        checks async eligibility with the freshly sampled data. It then delegates
+        to the request-update helper that runs prepare, forward, and resolve in
+        the future-overlap order.
+
+        Steps:
+            1. Sample from the current logits.
+            2. Build the sampled-step request-update payload.
+            3. Validate async decode eligibility with sampled data.
+            4. Run prepare, forward, and resolve in async-shaped order.
+
+        Example:
+            flow:
+                sample(N)
+                  -> prepare(N+1)
+                  -> forward(N+1)
+                  -> resolve(N)
+        """
+
+        # Step 1: Sample from the current logits.
         range_push("sampling")
         self._dynamic_step_sample_logits()
         range_pop()
+
+        # Step 2: Build the sampled-step request-update payload.
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
+        # Step 3: Validate async decode eligibility with sampled data.
         self._raise_if_decode_request_update_unsupported(AsyncSchedulingMode.ASYNC, prepared_update)
+
+        # Step 4: Run prepare, forward, and resolve in async-shaped order.
         request_bookkeeping, resolve_result = self._run_async_scheduling_request_update(
             prepared_update, request_bookkeeping
         )
@@ -1875,16 +2069,41 @@ class TextGenerationController:
         return request_bookkeeping, resolve_result or {}
 
     async def _try_async_generate_output_tokens_dynamic_batch(self) -> Optional[Dict]:
-        """Run one serial async-shaped dynamic decode step when the basic gate allows it."""
+        """Try to handle dynamic decode through async-shaped scheduling.
+
+        This method is the async-mode entry gate: it returns `None` when mode or
+        decode state requires the normal generation path. On the first eligible
+        decode step it primes a forward if one is not already available, and on
+        later steps it consumes the primed forward result through the
+        async-shaped step. Empty state clears pending async scheduling metadata
+        before falling back.
+
+        Steps:
+            1. Return `None` unless async mode and decode-only state apply.
+            2. Validate eligibility before the first primed forward.
+            3. Clear async state when no active work remains.
+            4. Prime a forward when entering an eligible async decode window.
+            5. Build and return the async-shaped result.
+
+        Example:
+            route:
+                mode async + decode + eligible -> async-shaped step
+                otherwise                      -> None
+        """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # Step 1: Return `None` unless async mode and decode-only state apply.
         if self._get_request_update_mode() != AsyncSchedulingMode.ASYNC:
             return None
         if not context.is_decode_only():
             return None
+
+        # Step 2: Validate eligibility before the first primed forward.
         if not self._async_schedule_forward_primed:
             self._raise_if_decode_request_update_unsupported(AsyncSchedulingMode.ASYNC)
+
+        # Step 3: Clear async state when no active work remains.
         if context.active_token_count == 0 and active_request_count == 0:
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
@@ -1892,6 +2111,8 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
+
+            # Step 4: Prime a forward when entering an eligible async decode window.
             if not self._async_schedule_forward_primed:
                 self._async_schedule_primed_cuda_graph_request_count = (
                     self._dynamic_step_forward_for_async_scheduling()
@@ -1901,6 +2122,8 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
+
+            # Step 5: Build and return the async-shaped result.
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
             assert not return_log_probs and not return_top_n_logprobs
 
