@@ -1145,7 +1145,7 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     activation_offload_fraction: float = 1.0
-    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+    """The fraction of activation offload groups to offload, which should be in range [0, 1]."""
 
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""

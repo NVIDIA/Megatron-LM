@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 @functools.lru_cache(maxsize=None)
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
+    # Keep this import lazy to avoid a transformer/pipeline circular import, and cache the
+    # resolved class so repeated TransformerLayer construction does not redo the import lookup.
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )

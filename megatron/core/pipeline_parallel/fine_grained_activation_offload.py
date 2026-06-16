@@ -1216,7 +1216,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         return grad_output + (None, None, None, None)
 
 
-def fine_grained_offloading_group_commit(
+def fine_grained_offloading_group_offload(
     tensor, name, forced_released_tensors=None, delay_offload=False
 ):
     """
@@ -1233,23 +1233,23 @@ def fine_grained_offloading_group_commit(
     if isinstance(tensor, tuple):
         if len(tensor) == 0:
             return tensor
-        committed0 = fine_grained_offloading_group_commit(
+        offloaded0 = fine_grained_offloading_group_offload(
             tensor[0],
             name=name,
             forced_released_tensors=forced_released_tensors,
             delay_offload=delay_offload,
         )
-        return (committed0,) + tensor[1:]
+        return (offloaded0,) + tensor[1:]
     if isinstance(tensor, list):
         if len(tensor) == 0:
             return tensor
-        committed0 = fine_grained_offloading_group_commit(
+        offloaded0 = fine_grained_offloading_group_offload(
             tensor[0],
             name=name,
             forced_released_tensors=forced_released_tensors,
             delay_offload=delay_offload,
         )
-        return [committed0] + tensor[1:]
+        return [offloaded0] + tensor[1:]
 
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     if cur_forward_chunk is None:
@@ -1381,7 +1381,7 @@ class FineGrainedActivationOffloadingInterface:
     def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
         """Group offload the tensors."""
         if self.offload:
-            return fine_grained_offloading_group_commit(
+            return fine_grained_offloading_group_offload(
                 tensor, self.name, forced_released_tensors, delay_offload
             )
         return tensor
