@@ -45,6 +45,12 @@ os.environ.setdefault('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
 
+_REQUIRES_TWO_RANKS = pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2 or torch.cuda.device_count() < 2,
+    reason="requires torchrun with at least 2 GPUs",
+)
+
+
 # =============================================================================
 # Helpers (shared by the lightweight unit tests)
 # =============================================================================
@@ -169,7 +175,7 @@ class TestResolveThdPaddingLengths:
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
+    @_REQUIRES_TWO_RANKS
     def test_cp_tensor_alignment_uses_local_target_and_global_tail(self):
         """CP-local padding tail determines the global padded endpoint."""
         Utils.destroy_model_parallel()
@@ -193,7 +199,7 @@ class TestResolveThdPaddingLengths:
         assert mask_device == tokens.device
 
     @pytest.mark.internal
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
+    @_REQUIRES_TWO_RANKS
     def test_cp_tensor_target_len_scales_global_target(self):
         """Fixed target_len is CP-local and scales to a global endpoint."""
         Utils.destroy_model_parallel()
@@ -215,7 +221,7 @@ class TestResolveThdPaddingLengths:
     @pytest.mark.parametrize(
         "alignment,target_len,expected_global_target", [(128, None, 256), (None, 128, 256)]
     )
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
+    @_REQUIRES_TWO_RANKS
     def test_cp_no_tensor_partitions_actual_and_target_lengths(
         self, alignment, target_len, expected_global_target
     ):
@@ -278,7 +284,7 @@ class TestPadSequenceForThd:
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
+    @_REQUIRES_TWO_RANKS
     def test_cp_alignment_uses_global_cu_seqlens_length(self):
         """CP-local token length must not cap global packed-sequence padding."""
         Utils.destroy_model_parallel()
@@ -299,7 +305,7 @@ class TestPadSequenceForThd:
         assert not mask[0, :local_T].any()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
+    @_REQUIRES_TWO_RANKS
     def test_cp_alignment_covers_local_padding_tail(self):
         """CP-local padding can create a global tail even when global length is aligned."""
         Utils.destroy_model_parallel()
@@ -945,6 +951,7 @@ def _extract_metrics(stdout):
 
 
 @pytest.mark.internal
+@pytest.mark.skip(reason="Temporarily disabled until the required Transformer Engine PR lands.")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
 @pytest.mark.parametrize(

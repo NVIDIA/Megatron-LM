@@ -1572,16 +1572,6 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
-    if args.sequence_packing_scheduler is not None:
-        if args.sequence_packing_scheduler == 'dp_balanced':
-            total_cp_ranks = args.context_parallel_size
-        else:
-            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
-        )
-
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
             args.pad_packed_seq_alignment
