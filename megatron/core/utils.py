@@ -2408,10 +2408,9 @@ def get_batch_on_this_cp_rank(
             assert (
                 batch['local_cp_size'] is not None
             ), "local_cp_size is required for hybrid context parallel"
-            if batch['local_cp_size'].item() > 1:
-                hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = get_sft_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
-                batch["hybrid_cp_group"] = hybrid_cp_group
+            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+            batch = get_sft_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+            batch["hybrid_cp_group"] = hybrid_cp_group
         else:
             batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:  # NOTE(asolergi-nv): Pretrain case
