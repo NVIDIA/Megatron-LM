@@ -373,6 +373,10 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             experimental_attention_variant_loss_scale_func(loss_scale)
         else:
+            # TODO: This path assumes static CP across outstanding pipeline microbatches.
+            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
+            # changes, carry the scale per autograd context instead of via a
+            # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches
