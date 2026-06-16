@@ -61,9 +61,8 @@ class BalancedCPScheduler:
         The number is rounded up to the next power of 2 to match the available
         hybrid context parallel process group sizes.
         """
-        # HACK: EP ranks run out of sync and can crash due to hang
+        # TODO(pmannan): EP ranks run out of sync and can crash due to hang
         # This is a temporary fix to ensure that expert ranks run in sync.
-        # TODO(pmannan): Remove this hack after fixing the hang issue.
         # This is sufficient to get most of the benefits of HybridCP
         min_cp_size = max(
             1, self.config.expert_model_parallel_size / self.config.tensor_model_parallel_size
