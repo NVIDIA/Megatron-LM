@@ -272,7 +272,7 @@ class ArgumentGroupFactory:
 def _check_mutual_exclusive(args, arg_names: list[str]) -> None:
     enabled_args = [arg_name for arg_name in arg_names if getattr(args, arg_name)]
     assert len(enabled_args) <= 1, (
-        f"{', '.join('--' + arg_name.replace('_', '-') for arg_name in enabled_args)} "
+        f"{', '.join(enabled_args)} "
         "are mutually exclusive."
     )
 
