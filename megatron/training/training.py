@@ -762,6 +762,7 @@ def num_floating_point_operations(
             )
 
         dsv4_hybrid_extra_term = 0
+        dsv4_hybrid_extra_core_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -855,13 +856,18 @@ def num_floating_point_operations(
             seq_len = args.seq_length
 
             # ---- Sparse attention (replaces full core attention) ----
-            # Per token per layer: n_head * (positions_attended) * v_head_dim, x2 for
-            # QK^T and softmax @ V. Average valid positions account for the causal mask.
+            # Split into token-linear parts (window attention, constant per token)
+            # and L^2 parts (compressed-KV attention, scales with sequence length)
+            # so THD packed sequences get correct seqlen_squared_sum_in_batch scaling.
+
+            # r=0: window-only, fixed per-token cost.
             sparse_attn_r0 = n_layers_r0 * n_head * window * v_head_dim * 2
-            avg_comp_128 = (seq_len // 128) / 2
-            sparse_attn_r128 = (
-                n_layers_r128 * n_head * (window + avg_comp_128) * v_head_dim * 2
-            )
+
+            # r=128: window (token-linear) + all compressed KV (L^2).
+            # Compressed positions per token ≈ L/(128*2) (causal /2), x2 for
+            # QK^T + softmax@V → L^2 coefficient: n_head * v_head_dim / 128.
+            sparse_attn_r128_window = n_layers_r128 * n_head * window * v_head_dim * 2
+            sparse_attn_r128_core = n_layers_r128 * n_head * v_head_dim / 128
 
             # ---- Main compressor (ratio > 0 layers) ----
             # Two projections per layer (wkv + wgate): hidden -> coff * v_head_dim.
@@ -893,24 +899,33 @@ def num_floating_point_operations(
                     n_layers_r4 * n_head * (window + avg_comp_4) * v_head_dim * 2
                 )
 
-                # Indexer's own compressor (coff=2, wkv + wgate), Q proj, weights proj,
-                # and scoring each query against the seq_len // 4 compressed positions.
-                indexer_term = (
+                # Indexer token-linear: compressor (coff=2, wkv + wgate), Q proj,
+                # weights proj.
+                indexer_token_term = (
                     n_layers_r4 * args.hidden_size * (2 * idx_head_dim) * 2
                     + n_layers_r4 * args.q_lora_rank * idx_n_heads * idx_head_dim
                     + n_layers_r4 * args.hidden_size * idx_n_heads
-                    + n_layers_r4 * idx_n_heads * idx_head_dim * (seq_len // 4)
                 )
+                # Indexer L^2: scoring each query against ~L/4 compressed positions.
+                indexer_scoring_core = n_layers_r4 * idx_n_heads * idx_head_dim / 4
             else:
                 sparse_attn_r4 = 0
-                indexer_term = 0
+                indexer_token_term = 0
+                indexer_scoring_core = 0
 
-            sparse_attn_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128
+            sparse_attn_token_term = (
+                sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128_window
+            )
 
             dsv4_hybrid_extra_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * (sparse_attn_term + main_compressor_term + indexer_term)
+                * (sparse_attn_token_term + main_compressor_term + indexer_token_term)
+            )
+            dsv4_hybrid_extra_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (sparse_attn_r128_core + indexer_scoring_core)
             )
         else:
             num_linear_attention_layers = 0
@@ -924,8 +939,12 @@ def num_floating_point_operations(
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
         )
-        # Core attention (L^2) FLOPs per standard-attention layer.
-        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
+        # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
+        # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
+        self_attn_core_term = (
+            standard_self_attn_core_term * num_standard_attention_layers
+            + dsv4_hybrid_extra_core_term
+        )
 
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
