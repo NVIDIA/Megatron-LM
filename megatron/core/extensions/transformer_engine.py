@@ -3142,21 +3142,18 @@ def _install_te_checkpoint_fgao_resize_patch():
                 consume_reloaded_tensor_mark,
             )
 
-            if not inputs or not detached_inputs:
-                return detached_inputs
+            resize_tensors = getattr(state, "resize_tensors", None)
+            if resize_tensors is None:
+                resize_tensors = []
+                state.resize_tensors = resize_tensors
 
-            inp = inputs[0]
-            detached = detached_inputs[0]
-            if (
-                torch.is_tensor(inp)
-                and torch.is_tensor(detached)
-                and consume_reloaded_tensor_mark(inp)
-            ):
-                resize_tensors = getattr(state, "resize_tensors", None)
-                if resize_tensors is None:
-                    resize_tensors = []
-                    state.resize_tensors = resize_tensors
-                resize_tensors.append(detached)
+            for inp, detached in zip(inputs, detached_inputs):
+                if (
+                    torch.is_tensor(inp)
+                    and torch.is_tensor(detached)
+                    and consume_reloaded_tensor_mark(inp)
+                ):
+                    resize_tensors.append(detached)
             return detached_inputs
 
         te_dist._mcore_original_detach_variable = original_detach_variable
