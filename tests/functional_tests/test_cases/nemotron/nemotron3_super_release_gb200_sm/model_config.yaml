@@ -132,6 +132,7 @@ MODEL_ARGS:
   --use-persistent-ckpt-worker: true
   --save-interval: 100
   --save-retain-interval: 2000
+  --async-ckpt-use-cpu-shm: true
 
   # Validation args
   --eval-interval: 100
