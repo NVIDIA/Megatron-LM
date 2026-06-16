@@ -97,6 +97,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         for key in BATCH_KEYS:
             batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 
+    if is_hybrid_cp:
+        # Convert [seqlen] to [1, seqlen] similar to default collate_fn
+        # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
+        for key, data in batch.items():
+            if key in ['attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'hybrid_cp_group', 'max_seqlen']:
+                continue
+            batch[key] = torch.stack([data], 0)
+
     batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, is_hybrid_cp=is_hybrid_cp, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage())
     
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:

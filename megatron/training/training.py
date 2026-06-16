@@ -1372,21 +1372,21 @@ def pretrain(
     if args.hybrid_context_parallel:
         if mpu.get_tensor_model_parallel_rank() == 0:
             assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, model_cfg))
         if isinstance(valid_data_iterator, list):
             valid_data_iterator = [
-                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                iter(HybridCPDataLoaderWrapper(v, model_cfg)) if v is not None else None
                 for v in valid_data_iterator
             ]
         elif valid_data_iterator is not None:
-            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, config))
+            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, model_cfg))
         if isinstance(test_data_iterator, list):
             test_data_iterator = [
-                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                iter(HybridCPDataLoaderWrapper(v, model_cfg)) if v is not None else None
                 for v in test_data_iterator
             ]
         elif test_data_iterator is not None:
-            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, config))
+            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, model_cfg))
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
