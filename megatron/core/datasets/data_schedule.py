@@ -241,8 +241,12 @@ class DpBalancedScheduler(BasePackingScheduler):
                     if mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_i):
                         vpp_needs_data[vp_i] = True
 
-        # data_iterator is not None on TP rank 0 for PP stages that need data
-        # (first stage, last stage, or any stage with MTP).
+        # In packed-sequence mode is_dataset_built_on_rank returns True for every
+        # PP stage on TP rank 0, so data_iterator is not None on TP rank 0 of
+        # every PP stage (and every stage independently fetches data and computes
+        # the global seqlen stats). vpp_needs_data / keys_to_keep below only decide
+        # which data fields are kept per stage; they do not affect whether
+        # data_iterator is None.
         if data_iterator is not None:
             assert tp_group.rank() == 0, "Only TP rank 0 should have data_iterator"
 
