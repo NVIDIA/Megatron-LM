@@ -6,7 +6,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, _override_stale_capture_stream
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -16,6 +16,22 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_override_stale_capture_stream_toggles_when_available(monkeypatch):
+    calls = []
+
+    def set_override(enabled):
+        calls.append(enabled)
+
+    monkeypatch.setattr(
+        torch.autograd.graph, "set_override_stale_capture_stream", set_override, raising=False
+    )
+
+    with _override_stale_capture_stream():
+        assert calls == [True]
+
+    assert calls == [True, False]
 
 
 @pytest.mark.skipif(
