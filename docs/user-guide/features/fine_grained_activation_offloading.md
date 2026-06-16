@@ -66,6 +66,26 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 
 With full-iteration CUDA graphs (local graph impl, `full_iteration` in `cuda_graph_scope`) and fine-grained activation offloading enabled, set it to a non-None integer: that path does not rely on `record_stream`, so explicit joins are required.
 
+### Activation Offload Fraction
+
+`--activation-offload-fraction` (`TransformerConfig.activation_offload_fraction`) is a fraction
+over eligible offload groups, not a byte fraction and not a selector for which module names are
+enabled. It is used together with `--offload-modules`: all module names listed in
+`--offload-modules` still register their offload groups, and the fraction is applied once across
+the combined eligible groups from all configured modules.
+
+The manager keeps the first N% of eligible groups in forward execution order and leaves the later
+groups on GPU. For example, with
+`--offload-modules core_attn attn_proj expert_fc1 --activation-offload-fraction 0.5`, the eligible
+`core_attn`, `attn_proj`, and `expert_fc1` groups are considered together in execution order, and
+the first 50% of that combined group list are offloaded. The fraction does not mean "offload 50% of
+the activation bytes" and does not mean "offload only the first 50% of the module names".
+
+The fraction is applied after other eligibility filters such as `min_offloaded_tensor_size`, the
+last-group margin used to avoid backward reload stalls, and
+`delta_offload_bytes_across_pp_ranks`. Therefore N% is computed over the remaining eligible groups
+from all configured offload modules after those filters.
+
 ### CUDA Graph Integration
 
 Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabled, the following constraints apply:
@@ -162,7 +182,7 @@ The first training iteration serves as a **warmup phase** where the manager reco
 
 1. **Reserve margin**: The last N groups (by deduplication count) are kept on GPU to avoid reload blocking the compute stream.
 2. **Apply PP rank delta**: Higher PP ranks offload fewer bytes (controlled by `delta_offload_bytes_across_pp_ranks`).
-3. **Apply fraction**: Only a fraction of eligible groups are actually offloaded (controlled by `activation_offload_fraction`).
+3. **Apply fraction**: Only the first N% of the remaining eligible groups are offloaded across all configured modules (controlled by `activation_offload_fraction`).
 4. **Print summary table**: An ASCII table of per-rank offload bytes is printed for debugging.
 
 ### CPU Tensor Pool

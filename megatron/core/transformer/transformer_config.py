@@ -1145,7 +1145,10 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     activation_offload_fraction: float = 1.0
-    """The fraction of activation offload groups to offload, which should be in range [0, 1]."""
+    """Fraction of eligible activation offload groups to offload across configured modules.
+    For details, see:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#activation-offload-fraction.
+    """
 
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""

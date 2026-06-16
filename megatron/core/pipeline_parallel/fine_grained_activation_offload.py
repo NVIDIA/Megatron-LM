@@ -589,7 +589,7 @@ class PipelineOffloadManager:
                     )
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
-        # Disable the groups to meet the activation offload fraction.
+        # Disable the later groups to meet the activation offload fraction.
         for chunk in self._cached_chunks_backward:
             offloaded_groups_count = 0
             for group in chunk.offload_groups:
