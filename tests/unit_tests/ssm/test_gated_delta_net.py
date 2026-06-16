@@ -146,7 +146,9 @@ class TestGatedDeltaNet:
         """Whole-module 'gdn' recompute must match the non-recompute forward and gradients.
 
         The same module/input is run twice (recompute off, then on); the forward output and
-        all parameter / input gradients must agree within bf16 tolerance.
+        all parameter / input gradients must agree within a tight tolerance (rtol/atol=1e-4).
+        The recompute path is run-to-run deterministic on these kernels (empirically bitwise),
+        so a tolerance well below the bf16 floor is expected to hold.
         """
         gdn = self.gdn
         gdn.train()
@@ -179,16 +181,16 @@ class TestGatedDeltaNet:
         finally:
             gdn.recompute_gdn = False
 
-        torch.testing.assert_close(out_rc, out_ref, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
         assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
         assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
         for name in pgrad_ref:
             torch.testing.assert_close(
                 pgrad_rc[name],
                 pgrad_ref[name],
-                rtol=1e-2,
-                atol=1e-2,
+                rtol=1e-4,
+                atol=1e-4,
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
