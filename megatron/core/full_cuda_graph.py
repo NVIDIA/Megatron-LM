@@ -1,10 +1,9 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
 import gc
 import logging
-from contextlib import contextmanager
 
 import torch
 
@@ -51,21 +50,6 @@ def get_graph_pool(use_single_mempool):
     if use_single_mempool:
         return get_shared_graph_pool()
     return torch.cuda.graph_pool_handle()
-
-
-@contextmanager
-def _override_stale_capture_stream():
-    """Redirect stale autograd stream refs while capturing full-iteration graphs."""
-    set_override = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
-    if set_override is None:
-        yield
-        return
-
-    set_override(True)
-    try:
-        yield
-    finally:
-        set_override(False)
 
 
 # The below functions traverse through nested data structures (tuples, lists, dicts)
@@ -230,16 +214,15 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with _override_stale_capture_stream():
-                with torch.cuda.graph(
-                    FullCudaGraphWrapper.cuda_graph[training_str],
-                    stream=capture_stream,
-                    pool=get_graph_pool(self.use_single_mempool),
-                    capture_error_mode="thread_local",
-                ):
-                    FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
-                        *args, **kwargs
-                    )
+            with torch.cuda.graph(
+                FullCudaGraphWrapper.cuda_graph[training_str],
+                stream=capture_stream,
+                pool=get_graph_pool(self.use_single_mempool),
+                capture_error_mode="thread_local",
+            ):
+                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                    *args, **kwargs
+                )
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
