@@ -326,7 +326,7 @@ class DSv4HybridAttention(Attention):
                 if packed_seq_params.cu_seqlens_kv_padded is not None
                 else packed_seq_params.cu_seqlens_kv
             )
-            rope_seqlen = cu_seqlens_kv
+            rope_seqlen = packed_seq_params.max_seqlen_kv
             rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_kv = None

@@ -56,6 +56,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         multi_latent_attention=True,
     )
 
+    max_seqlen = None
     if input_format == "sbhd":
         cu_seqlens = None
         seqlen = 1024
@@ -101,6 +102,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         freqs,
         transformer_config,
         cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
@@ -151,6 +153,7 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         multi_latent_attention=True,
     )
 
+    max_seqlen = None
     if input_format == "sbhd":
         cu_seqlens = None
         seqlen = 1024
@@ -209,6 +212,7 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         freqs,
         transformer_config,
         cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
