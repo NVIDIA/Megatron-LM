@@ -554,7 +554,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc".
+             "shared_experts", "mhc", "gdn".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -566,8 +566,11 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
+    "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
+            gated norm, CP all-to-all and out_proj). Requires
+            experimental_attention_variant="gated_delta_net".
     "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
     ####################
@@ -1891,6 +1894,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "mhc",
+                    "gdn",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1907,6 +1911,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:
