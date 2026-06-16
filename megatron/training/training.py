@@ -1511,12 +1511,11 @@ def update_train_iters(args):
 
 
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
-    """Resolve the absolute DDP grad-bucket size (shared by get_model and MIMO).
+    """Resolve the absolute DDP grad-bucket size.
 
     With ``num_buckets`` set: ``num_parameters // num_buckets``; else if no explicit
     ``bucket_size``: ``max(40_000_000, 1_000_000 * dp_cp_size)``; if ``overlap_grad_reduce``
-    is False: ``None`` (overrides the above). ``dp_cp_group`` is passed explicitly so callers
-    on disjoint grids (e.g. MIMO's per-module groups) need not read a global parallel_state.
+    is False: ``None`` (overrides the above).
     """
     if ddp_config.num_buckets is not None:
         bucket_size = num_parameters // ddp_config.num_buckets
