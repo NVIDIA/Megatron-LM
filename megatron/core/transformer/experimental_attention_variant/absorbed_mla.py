@@ -755,8 +755,8 @@ class AbsorbedMLASelfAttention(Attention):
             output_ = self.core_attention(
                 q_absorbed,
                 k_compressed,
-                None,
-                attention_mask,
+                value=None,
+                attention_mask=attention_mask,
                 x=hidden_states,
                 qr=q_compressed,
                 up_v_weight=up_v_weight,
@@ -844,8 +844,8 @@ class AbsorbedMLASelfAttention(Attention):
             core_attn_out = self.core_attention(
                 q_absorbed,
                 kv_compressed,
-                None,
-                attention_mask,
+                value=None,
+                attention_mask=attention_mask,
                 x=hidden_states,
                 qr=q_compressed,
                 up_v_weight=v_up_weight,

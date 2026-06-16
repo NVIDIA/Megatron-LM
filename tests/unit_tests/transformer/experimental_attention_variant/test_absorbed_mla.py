@@ -244,7 +244,7 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
         return run_function(*args)
 
     class CoreAttention(torch.nn.Module):
-        def forward(self, query, key, value, attention_mask, **kwargs):
+        def forward(self, query, key, *, value, attention_mask, **kwargs):
             del query, key, value, attention_mask
             assert kwargs["packed_seq_params"] is packed_seq_params
             assert kwargs["position_ids"] is None
@@ -277,8 +277,8 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
     assert output is hidden_states
 
 
-def test_load_from_state_dict_combines_split_kv_up_projection(monkeypatch):
-    """Pre-refactor split K/V up-projection checkpoints should load into the combined layout."""
+def test_load_from_state_dict_backwards_compatible_with_split_kv_up_projection(monkeypatch):
+    """Pre-refactor split K/V up-projection checkpoints load into the combined layout."""
 
     dummy_attention = object.__new__(AbsorbedMLASelfAttention)
     dummy_attention.num_attention_heads_per_partition = 2
