@@ -3,6 +3,8 @@ import os
 import sys
 
 import pytest
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training.argument_utils import gpt_config_from_args
 import torch
 import torch.distributed
 
@@ -93,7 +95,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     sys.argv = ['test_upcycling.py']
     args = parse_args()
     args.num_layers = 2
-    args.vocal_size = 256
+    args.padded_vocab_size = 256
     args.hidden_size = 128
     args.num_attention_heads = 8
     args.max_position_embeddings = 256
@@ -183,8 +185,17 @@ class TestGPTModel:
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container.model.transformer_layer_spec = get_gpt_layer_local_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -206,7 +217,17 @@ class TestGPTModel:
         )
         set_upcycling_args(ep, granularity, num_experts=2)
         # model_parallel_cuda_manual_seed(_SEED+1)
-        moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
+        model_cfg = gpt_config_from_args(args)
+        model_cfg.transformer_layer_spec = get_gpt_layer_local_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        moe_model = builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg_container.ddp,
+            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+        )
 
         # Upcycle the dense model to the MoE model
         moe_model = unwrap_model(moe_model)
@@ -254,8 +275,17 @@ class TestGPTModel:
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container.model.transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -277,7 +307,17 @@ class TestGPTModel:
         )
         set_upcycling_args(ep, granularity)
         # model_parallel_cuda_manual_seed(_SEED+1)
-        moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
+        model_cfg = gpt_config_from_args(args)
+        model_cfg.transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        moe_model = builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg_container.ddp,
+            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+        )
 
         # Upcycle the dense model to the MoE model
         moe_model = unwrap_model(moe_model)

@@ -6,6 +6,7 @@ import os
 import sys
 
 import pytest
+from megatron.core.process_groups_config import ProcessGroupCollection
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
@@ -97,7 +98,7 @@ class TestFP8Param:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -125,7 +126,7 @@ class TestFP8Param:
         sys.argv = ['test_fp8_param.py']
         args = parse_args()
         args.num_layers = 4
-        args.vocal_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -248,15 +249,24 @@ class TestFP8Param:
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
-            gpt_model = get_model(
-                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
+            model_cfg = cfg_container.model
+            builder_cls = model_cfg.get_builder_cls()
+            builder = builder_cls(model_cfg)
+            gpt_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
             )
             gpt_model[0].eval()
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                self.model_provider,
+                ModelType.encoder_or_decoder,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
