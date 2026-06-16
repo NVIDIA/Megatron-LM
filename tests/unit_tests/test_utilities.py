@@ -1,12 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
+from typing import Literal
 from datetime import timedelta
+from argparse import Namespace
 
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+    gpt_config_from_args,
+    hybrid_config_from_args,
+)
 
 
 class TestModel(torch.nn.Module):
@@ -133,6 +140,19 @@ class Utils:
             **kwargs,
         )
         Utils.inited = True
+
+    @staticmethod
+    def pretrain_config_from_global_args(args: Namespace, model_class: Literal["gpt", "hybrid"]):
+        if model_class == "gpt":
+            model_cfg = gpt_config_from_args(args)
+        elif model_class == "hybrid":
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            raise ValueError(
+                f"MCore model type {model_class} not supported. Choose one of 'gpt' or 'hybrid'."
+            )
+
+        return pretrain_cfg_container_from_args(args, model_cfg)
 
     @staticmethod
     def fake_initialize_model_parallel(
