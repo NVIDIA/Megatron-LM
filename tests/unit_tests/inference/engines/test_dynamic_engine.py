@@ -854,6 +854,28 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_max_sequence_length_clamp(self) -> None:
+        """Clamp (not reject) when num_tokens_to_generate exceeds the remaining sequence budget."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=1, min_prompt_length=8, max_prompt_length=8, num_tokens_to_generate=4
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+
+        remaining_tokens = env.engine.context.max_sequence_length - len(request.prompt_tokens)
+        request.sampling_params.num_tokens_to_generate = remaining_tokens + 100
+
+        env.engine._add_request(request)
+
+        # Clamped to the remaining budget, not rejected.
+        assert request.status != Status.FAILED
+        assert request.sampling_params.num_tokens_to_generate == remaining_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
@@ -1150,6 +1172,69 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"Request {request.request_id}, generated token {i}: "
                     f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
                 )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_return_prompt_log_probs_with_zero_tokens_to_generate(self):
+        """Prompt log probs must be returned when scoring only (num_tokens_to_generate=0).
+
+        Regression test for a prefill-step trimming bug: when a request generates
+        no tokens, the end-of-generation trim set ``keep=0`` and front-sliced
+        ``request_log_probs[:0]``, discarding every prompt log prob (in a prefill
+        step ``request_log_probs`` covers the whole prompt, with the disposable
+        sampled-token log prob at the tail). The fix trims the excess *trailing*
+        log probs instead. This is the path exercised by loglikelihood / echo
+        evaluations (e.g. lm-eval-harness sends ``max_tokens=0``).
+        """
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            skip_prompt_log_probs=False,
+            num_tokens_to_generate=0,
+        )
+
+        validated_any = False
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # No tokens were requested, so none should be generated.
+            assert len(request.generated_tokens) == 0, (
+                f"Request {request.request_id}: expected 0 generated tokens, "
+                f"got {len(request.generated_tokens)}"
+            )
+            assert request.generated_log_probs is None or len(request.generated_log_probs) == 0, (
+                f"Request {request.request_id}: expected no generated log probs, got "
+                f"{len(request.generated_log_probs) if request.generated_log_probs else 0}"
+            )
+
+            # The full set of prompt log probs (all tokens except the first) must
+            # still be present -- before the fix this list was empty.
+            prompt_len = len(request.prompt_tokens)
+            assert request.prompt_log_probs is not None, (
+                f"Request {request.request_id}: prompt_log_probs should not be None "
+                f"when scoring with num_tokens_to_generate=0"
+            )
+            assert len(request.prompt_log_probs) == prompt_len - 1, (
+                f"Request {request.request_id}: Expected {prompt_len - 1} prompt log probs, "
+                f"got {len(request.prompt_log_probs)}"
+            )
+            for i, log_prob in enumerate(request.prompt_log_probs):
+                assert (
+                    log_prob is not None
+                ), f"Request {request.request_id}, prompt token {i}: log_prob is None"
+                assert not math.isnan(log_prob) and not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, prompt token {i}: log_prob {log_prob} invalid"
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, prompt token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+            validated_any = True
+
+        assert validated_any, "No completed requests were validated"
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -1725,6 +1810,83 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert req_b.status == Status.COMPLETED
         assert len(env.engine.waiting_request_ids) == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_skips_request_when_token_budget_exhausted(self):
+        """
+        Test that chunked prefill scheduling leaves a waiting request untouched when the
+        token batch is already full (active_token_count == max_tokens), instead of
+        scheduling a zero-length chunk.
+
+        This exercises the `token_partially_can_be_added` guard in the scheduler's entry
+        condition. When a fully-admitted request fills the batch exactly to max_tokens, a
+        following waiting request has zero token budget. Without the guard, the scheduler
+        would compute token_budget = max_tokens - active_token_count = 0 and try to admit a
+        0-token chunk, tripping `assert prefill_chunk_length > 0` in `add_request`.
+
+        Scenario:
+            - Max tokens per step: 16
+            - Request A: 16-token prompt -> fully admitted, fills the batch exactly.
+            - Request B: 8-token prompt  -> zero budget remains; must stay waiting.
+        """
+        max_tokens = 16
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=max_tokens,
+            context_max_tokens=max_tokens,
+            context_max_requests=2,
+            context_block_size_tokens=256,
+            max_sequence_length=128,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs.
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Request A: prompt length == max_tokens, so it fills the batch exactly.
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (max_tokens,), device='cuda')
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_a)
+
+        # Request B: added after A, so it sits behind A in the waiting queue.
+        req_b_tokens = torch.randint(0, test_config.vocab_size, (8,), device='cuda')
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_b_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_b)
+
+        # Schedule without crashing: A is fully admitted, B is left waiting.
+        env.engine.schedule_waiting_requests()
+
+        # Request A fully admitted and the batch is exactly full.
+        assert ctx.active_token_count == max_tokens
+        assert ctx.total_request_count == 1
+        assert ctx.num_prefill_requests == 1
+        # A was a full (non-chunked) admit, so no chunked prefill is in flight.
+        assert ctx.chunked_prefill_request_id == -1
+
+        # Request B got zero budget: untouched and still at the head of the waiting queue.
+        assert req_b.finished_chunk_token_count == 0
+        assert list(env.engine.waiting_request_ids) == [2]
 
     @pytest.mark.internal
     @pytest.mark.skipif(

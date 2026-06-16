@@ -95,7 +95,7 @@ dev = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "multi-storage-client~=0.27",
+    "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
     "flash-linear-attention~=0.4.0",
     "megatron-energon[av_decode]~=7.0",
@@ -111,6 +111,7 @@ dev = [
     "openai[aiohttp]",
     "orjson",
     "fast-hadamard-transform",
+    "zstandard",
 ]
 
 ### 'lts' extra is deprecated                                                   ###
@@ -174,6 +175,7 @@ ci = ["python-gitlab", "slack-sdk", "pandas"]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
+managed = true
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
@@ -200,7 +202,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b84005"
+version = "2.16.0+4220403e"
 requires-dist = [
     # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
     # RunnablePassthrough() instantiation, which is imported transitively in
