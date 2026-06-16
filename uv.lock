@@ -40,7 +40,7 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.15.0+42b84005"
+version = "2.16.0+4220403e"
 requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect"]
 
 [[package]]
@@ -5400,7 +5400,7 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.15.0+42b84005"
+version = "2.16.0+4220403e"
 source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4220403e831d29e93868f7793693ea83f6b8b05b#4220403e831d29e93868f7793693ea83f6b8b05b" }
 dependencies = [
     { name = "einops" },
