@@ -132,7 +132,11 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
     )
 
     try:
-        for dims in (["tp"], ["cp"], ["pp"], ["dp"], ["dp", "cp"], ["tp", "cp"], ["tp", "pp"]):
+        for dims in (
+            ["tp"], ["cp"], ["pp"], ["dp"],
+            ["dp", "cp"], ["tp", "cp"], ["tp", "pp"],
+            ["tp", "dp"], ["tp", "dp", "cp"], ["tp", "cp", "dp", "pp"],
+        ):
             grid.create_pg(dims)
         for dims in (["ep"], ["expt_tp"], ["expt_dp"], ["expt_tp", "ep"], ["expt_tp", "ep", "pp"]):
             grid.create_pg(dims, view=_EXPERT_VIEW)
@@ -191,6 +195,11 @@ def pg_collection_from_grid(
     pgc.dp_cp = grid.get_pg(["dp", "cp"])
     pgc.intra_dp_cp = pgc.dp_cp
     pgc.tp_cp = grid.get_pg(["tp", "cp"])
+    # MoE layers/router and finalize_model_grads read tp_dp_cp (tensor+data+context
+    # parallel group); cuda-graph capture reads tp_dp. Set them explicitly since the
+    # ProcessGroupCollection leaves them init=False.
+    pgc.tp_dp = grid.get_pg(["tp", "dp"])
+    pgc.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
     pgc.mp = grid.get_pg(["tp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
