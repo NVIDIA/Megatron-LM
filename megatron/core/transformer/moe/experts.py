@@ -64,6 +64,38 @@ from megatron.core.inference.moe import (
 logger = logging.getLogger(__name__)
 
 
+def _minimax_unfused_swiglu_scale(intermediate_parallel, per_token_scale, glu_offset):
+    hidden = intermediate_parallel.shape[-1] // 2
+    gate = intermediate_parallel[..., :hidden].to(torch.float32)
+    up = intermediate_parallel[..., hidden:].to(torch.float32)
+    if glu_offset:
+        up = up + glu_offset
+    scale = per_token_scale.to(torch.float32)
+    if scale.dim() < gate.dim():
+        scale = scale.unsqueeze(-1)
+    return (F.silu(gate) * up * scale).to(intermediate_parallel.dtype)
+
+
+def _minimax_record_expert_wgrad_fp32(weight, input_tensor, grad_output):
+    if (
+        weight is None
+        or input_tensor is None
+        or grad_output is None
+        or input_tensor.shape[0] == 0
+    ):
+        return
+    with torch.no_grad():
+        wgrad = torch.matmul(
+            grad_output.detach().to(torch.float32).transpose(0, 1),
+            input_tensor.detach().to(torch.float32),
+        )
+        previous = getattr(weight, '_run_torch_expert_fp32_wgrad', None)
+        if previous is None:
+            weight._run_torch_expert_fp32_wgrad = wgrad
+        else:
+            previous.add_(wgrad)
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -799,6 +831,69 @@ class SequentialMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+
+        use_minimax_plain_swiglu = (
+            self.num_local_experts > 1
+            and not (self.config.fp8 or self.config.fp4)
+            and self.config.gated_linear_unit
+            and permuted_probs is not None
+        )
+        if use_minimax_plain_swiglu:
+            if self.config.moe_apply_probs_on_input:
+                original_dtype = permuted_local_hidden_states.dtype
+                permuted_local_hidden_states = (
+                    permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
+                ).to(original_dtype)
+                permuted_probs = torch.ones_like(permuted_probs)
+
+            tokens_per_expert_list = tokens_per_expert.tolist()
+            tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert_list)
+            probs_list = torch.split(permuted_probs, tokens_per_expert_list)
+
+            fc1_out_list = []
+            for expert, tokens in zip(self.local_experts, tokens_list):
+                fc1_out, fc1_bias = apply_module(expert.linear_fc1)(tokens)
+                if fc1_bias is not None:
+                    fc1_out = fc1_out + fc1_bias
+                fc1_out_list.append(fc1_out)
+                if tokens.shape[0] > 0 and getattr(fc1_out, 'requires_grad', False):
+                    fc1_weight = expert.linear_fc1.weight
+                    fc1_tokens = tokens
+
+                    def _fc1_grad_hook(grad, _weight=fc1_weight, _input=fc1_tokens):
+                        _minimax_record_expert_wgrad_fp32(_weight, _input, grad)
+                        return grad
+
+                    fc1_out.register_hook(_fc1_grad_hook)
+
+            fc1_all = torch.cat(fc1_out_list, dim=0)
+            intermediate_all = _minimax_unfused_swiglu_scale(
+                fc1_all,
+                permuted_probs,
+                self.config.glu_linear_offset if self.config.glu_linear_offset else 0.0,
+            )
+
+            intermediate_list = torch.split(intermediate_all, tokens_per_expert_list)
+            output_local_list = []
+            for expert, intermediate, probs in zip(
+                self.local_experts, intermediate_list, probs_list
+            ):
+                output, output_bias = apply_module(expert.linear_fc2)(intermediate)
+                if intermediate.shape[0] > 0 and getattr(output, 'requires_grad', False):
+                    fc2_weight = expert.linear_fc2.weight
+                    fc2_input = intermediate
+
+                    def _fc2_grad_hook(grad, _weight=fc2_weight, _input=fc2_input):
+                        _minimax_record_expert_wgrad_fp32(_weight, _input, grad)
+                        return grad
+
+                    output.register_hook(_fc2_grad_hook)
+                if probs is not None and output_bias is not None:
+                    output = output + output_bias.unsqueeze(0) * probs.unsqueeze(-1)
+                    output_bias = None
+                output_local_list.append(output)
+
+            return torch.cat(output_local_list, dim=0), None
 
         if self.num_local_experts == 1:
             if self.config.fp8 or self.config.fp4:

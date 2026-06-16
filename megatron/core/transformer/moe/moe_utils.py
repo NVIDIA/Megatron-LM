@@ -24,6 +24,29 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
+def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tensor):
+    """index_select whose backward scatter-add uses an fp32 accumulation buffer."""
+    return tokens.float().index_select(0, sorted_indices).to(tokens.dtype)
+
+
+def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
+    if len(restore_shape) != 2:
+        return None
+
+    hidden = int(restore_shape[-1])
+    output_tokens = torch.zeros(
+        restore_shape,
+        dtype=torch.float32,
+        device=permuted_tokens.device,
+    )
+    output_tokens.scatter_add_(
+        0,
+        sorted_indices.unsqueeze(1).expand(-1, hidden),
+        permuted_tokens.to(torch.float32),
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
+
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
@@ -423,7 +446,10 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    if not drop_and_pad:
+        permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
@@ -482,6 +508,11 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    if probs is None and not drop_and_pad:
+        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        if fp32_output is not None:
+            return fp32_output
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -1355,18 +1386,10 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
-            grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
-        else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+        grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+        grad_weight_fp32 = torch.mm(grad_output.float().t(), inp.float())
+        weight._run_torch_gate_fp32_wgrad = grad_weight_fp32
+        grad_weight = grad_weight_fp32.to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)

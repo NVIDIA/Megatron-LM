@@ -4,6 +4,7 @@ import os
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -138,7 +139,18 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        if self.config.cross_entropy_loss_fusion:
+        # MiniMax alignment: with TP=1 there is no vocab-parallel split, and
+        # torch.nn.functional.cross_entropy matches Paddle's fused CE path more
+        # closely than Megatron's vocab-parallel CE helper. Keep this source
+        # path scoped to TP=1 + 3D logits.
+        if parallel_state.get_tensor_model_parallel_world_size() == 1 and logits.ndim == 3:
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).view_as(labels)
+        elif self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))

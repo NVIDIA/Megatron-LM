@@ -410,6 +410,13 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    minimax_loss_normalized_in_graph = num_tokens is not None
+    if minimax_loss_normalized_in_graph:
+        # MiniMax alignment: ms-swift's loss_func already divides by local
+        # valid-token count inside the autograd graph.  Do not apply MCore's
+        # extra 1/global_num_tokens scale below; after DP grad sync, apply only
+        # the DP average expected by Paddle optimizer-boundary probes.
+        num_tokens = None
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -481,6 +488,22 @@ def finalize_model_grads(
         _update_router_expert_bias(model, config)
 
     reset_model_temporary_tensors(config, model)
+
+    if minimax_loss_normalized_in_graph:
+        dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        if dp_size > 1:
+            for model_chunk in model:
+                model_chunk.scale_gradients(1.0 / dp_size)
+
+        # MiniMax alignment: RouterGatingLinearFunction keeps the raw fp32 gate
+        # weight-gradient on the gate parameter.  All-reduce it at the same
+        # finalize sync point so the distributed optimizer can consume the
+        # reduced fp32 value without a runtime finalize monkey-patch.
+        for model_chunk in model:
+            for param in model_chunk.parameters():
+                gate_wgrad = getattr(param, "_run_torch_gate_fp32_wgrad", None)
+                if gate_wgrad is not None:
+                    torch.distributed.all_reduce(gate_wgrad, group=dp_cp_group)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

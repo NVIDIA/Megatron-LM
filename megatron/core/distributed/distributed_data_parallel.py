@@ -441,7 +441,22 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
-                    param.main_grad.add_(param.grad.data)
+                    expert_fp32_wgrad = getattr(param, '_run_torch_expert_fp32_wgrad', None)
+                    if expert_fp32_wgrad is not None:
+                        if tuple(expert_fp32_wgrad.shape) != tuple(param.main_grad.shape):
+                            raise RuntimeError(
+                                'expert MLP fp32 wgrad shape mismatch: '
+                                f'captured={tuple(expert_fp32_wgrad.shape)} '
+                                f'main_grad={tuple(param.main_grad.shape)}'
+                            )
+                        if param.main_grad.dtype != torch.float32:
+                            raise RuntimeError(
+                                f'expert MLP main_grad is {param.main_grad.dtype}, expected fp32'
+                            )
+                        param.main_grad.copy_(expert_fp32_wgrad)
+                        param._run_torch_expert_fp32_wgrad = None
+                    else:
+                        param.main_grad.add_(param.grad.data)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

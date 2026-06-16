@@ -567,7 +567,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
+            if hasattr(self, '_capture_gate_manual_adamw_states'):
+                self._capture_gate_manual_adamw_states()
             self.optimizer.step()
+            if hasattr(self, '_apply_gate_manual_adamw_states'):
+                self._apply_gate_manual_adamw_states()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 

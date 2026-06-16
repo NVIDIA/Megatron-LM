@@ -200,6 +200,10 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        # MiniMax alignment: expert fp32 wgrad replay requires Megatron DDP
+        # main_grad buffers to be fp32. Keep this in source instead of a
+        # workspace runtime monkey-patch so DDP construction is deterministic.
+        self.grad_reduce_in_fp32 = True
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
