@@ -739,9 +739,7 @@ class MambaMixer(MegatronModule):
             seq_idx = packed_seq_params.seq_idx
 
         state_dtype_kwarg = (
-            {"state_dtype": self.mamba_training_ssm_states_dtype}
-            if MAMBA_HAS_STATE_DTYPE
-            else {}
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
         )
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
