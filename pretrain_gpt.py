@@ -125,6 +125,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
+loss_func_cached_logits = None
 
 def loss_func(
     loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
@@ -144,7 +145,21 @@ def loss_func(
     """
     args = get_args()
 
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    if args.logits_load_dir is not None:
+        # Offline knowledge distillation loss using cached teacher log-probabilities.
+        global loss_func_cached_logits
+        if loss_func_cached_logits is None:
+            from megatron.training.distillation import LossFuncCallable
+            loss_func_cached_logits = LossFuncCallable(
+                logprobs_dir=args.logits_load_dir,
+                decode_threads=args.logits_load_decode_threads,
+                prefetch_factor=args.logits_load_prefetch_factor,
+                msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+                kd_loss_alpha=args.logits_load_kd_loss_alpha,
+                ignore_errors=args.logits_load_ignore_errors,
+            )
+        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
