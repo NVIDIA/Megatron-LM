@@ -1975,7 +1975,7 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
 
     def _build_model_wrapper(wrap_with_ddp: bool):
-        from megatron.training.utils.train_utils import start_memory_history_recording
+        from megatron.training.utils import start_memory_history_recording
 
         start_memory_history_recording(cfg_container.profiling)
 

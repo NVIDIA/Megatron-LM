@@ -1,13 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
+import logging
 import os
-from megatron.training.utils.common_utils import print_rank_0
+
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
 from megatron.training.config import ProfilingConfig
-
-import logging
+from megatron.training.utils.common_utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
