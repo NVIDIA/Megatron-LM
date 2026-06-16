@@ -1638,7 +1638,7 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.position_embedding_type != 'rope':
+    if args.position_embedding_type not in ('rope', 'mrope'):
         args.apply_rope_fusion = False
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
