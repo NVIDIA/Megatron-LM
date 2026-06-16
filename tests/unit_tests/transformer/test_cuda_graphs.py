@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
@@ -34,10 +34,11 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -804,6 +805,50 @@ class TestParallelHybridBlockCudagraphs:
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    def test_mhc_hybrid_layers_are_te_cudagraph_capturable(self):
+        """Regression: a mHC-enabled HybridStack must expose graph-capturable layers.
+
+        When ``enable_hyper_connections=True``, ``HybridStack`` wraps every layer in
+        ``HyperConnectionHybridLayer``. That wrapper must subclass
+        ``GraphableMegatronModule`` and be recognized by ``_layer_is_graphable`` so TE
+        cuda-graph discovery finds the wrapped layers. Before the fix the wrapper
+        subclassed plain ``MegatronModule``, so discovery rejected every layer (0
+        graphable) and CUDA graph capture was silently skipped for the whole hybrid
+        model -- making the mHC hybrid run fully eager (several times slower than the
+        graphed GPT mHC path). This test fails on the pre-fix code via both assertions.
+        """
+        # The wrapper must be graph-capturable by construction.
+        assert issubclass(HyperConnectionHybridLayer, GraphableMegatronModule)
+
+        layer_type_list = validate_segment_layers("M-M*-")  # mamba / mlp / attention mix
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mamba, CudaGraphModule.mlp],
+        )
+        block = HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp"]
+            ),
+        )
+
+        # Every layer is wrapped, and the wrappers are discoverable as graphable.
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in block.layers)
+        graphable = [layer for layer in block.layers if _layer_is_graphable(layer, config)]
+        assert len(graphable) > 0, (
+            "mHC HybridStack produced 0 graphable layers -- TE cuda-graph capture would "
+            "be silently skipped for the entire model (the pre-fix bug)."
+        )
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,
