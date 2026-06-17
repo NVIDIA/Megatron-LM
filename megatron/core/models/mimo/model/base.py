@@ -279,12 +279,7 @@ class MimoModel(MegatronModule):
             self.language_model.set_input_tensor(input_tensor)
 
     def _active_submodules(self):
-        """Yield this rank's active (DDP-wrapped) submodules.
-
-        Each rank builds only the submodules on its grid, and every present
-        submodule is DDP-wrapped, so a present submodule always carries a grad
-        buffer (absent modules are None / missing).
-        """
+        """Yield this rank's present submodules."""
         if self.language_model is not None:
             yield self.language_model
         for submodule in self.modality_submodules.values():
@@ -292,12 +287,7 @@ class MimoModel(MegatronModule):
                 yield submodule
 
     def zero_grad_buffer(self):
-        """Zero grad buffers of the active DDP-wrapped submodules.
-
-        Lets the stock ``train_step`` treat the MimoModel as one model chunk
-        (it calls ``model_chunk.zero_grad_buffer()``) while MIMO keeps per-submodule
-        DDP wrapping.
-        """
+        """Zero each active submodule's DDP grad buffer."""
         for module in self._active_submodules():
             module.zero_grad_buffer()
 
