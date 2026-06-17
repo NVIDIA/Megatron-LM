@@ -202,78 +202,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
-            # Transpose: s b x --> b s x
-            # From sbhd to bshd format
-            qkvzba = qkvzba.transpose(0, 1)
-
-            # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-            # (beta, alpha for GDN; f, b, w for GDN2)
-            qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
-
-            # Convolution on qkv
-            nvtx_range_push(suffix="conv1d")
-            seq_len = qkv.shape[1]
-            qkv_channels_split_sections = [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-            ]
-            conv1d_weight = get_parameter_local_cp(
-                self.conv1d.weight,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                qkvzba, batch, seq_len, self.cp_size, self.pg_collection.cp, cu_seqlens_q
             )
-            conv1d_bias = (
-                get_parameter_local_cp(
-                    self.conv1d.bias,
-                    dim=0,
-                    cp_group=self.pg_collection.cp,
-                    split_sections=qkv_channels_split_sections,
-                )
-                if self.conv_bias
-                else None
-            )
-            if self.config.deterministic_mode:
-                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-                conv_out = F.conv1d(
-                    input=qkv,  # Torch-native only accept [b, d, s] format input
-                    weight=conv1d_weight,
-                    bias=conv1d_bias,
-                    stride=self.conv1d.stride,
-                    padding=self.conv1d.padding,
-                    dilation=self.conv1d.dilation,
-                    groups=self.conv_dim_local_tp // self.cp_size,
-                )
-                qkv = self.act_fn(conv_out[..., :seq_len])
-                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-            else:
-                assert self.activation in ["silu", "swish"]
-                qkv, _ = causal_conv1d(
-                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                    bias=conv1d_bias,
-                    activation=self.activation,
-                    initial_state=None,
-                    output_final_state=False,
-                    cu_seqlens=cu_seqlens_q,
-                )
-            nvtx_range_pop(suffix="conv1d")
-
-            A_log_local_cp = get_parameter_local_cp(
-                self.A_log, dim=0, cp_group=self.pg_collection.cp
-            )
-            dt_bias_local_cp = get_parameter_local_cp(
-                self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-            )
-
-            # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
-            nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-            kernel_inputs = self._prepare_input_for_gated_delta_rule(
-                qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-            )
-            gate = kernel_inputs.pop("gate")
-            nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -436,6 +370,86 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
+
+    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+        """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
+
+        # Transpose: s b x --> b s x
+        # From sbhd to bshd format
+        qkvzba = qkvzba.transpose(0, 1)
+
+        # Split the tensor into q, k, v, gate (z), beta, and alpha.
+        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+
+        # Convolution on qkv
+        nvtx_range_push(suffix="conv1d")
+        seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=cp_group,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=cp_group,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+            conv_out = F.conv1d(
+                input=qkv,  # Torch-native only accept [b, d, s] format input
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=conv1d_bias,
+                activation=self.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+        nvtx_range_pop(suffix="conv1d")
+
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)
+
+        # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
+        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
+        kernel_inputs = self._prepare_input_for_gated_delta_rule(
+            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+        )
+        gate = kernel_inputs.pop("gate")
+        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+
+        return (
+            kernel_inputs["q"],
+            kernel_inputs["k"],
+            kernel_inputs["v"],
+            gate,
+            kernel_inputs["beta"],
+            kernel_inputs["g"],
+        )
 
     def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
         """Call the streamed fused pre-GDR wrapper."""
