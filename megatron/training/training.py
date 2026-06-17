@@ -3354,8 +3354,6 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     if p2p_communicator is not None:
-        # MIMO cross-grid bridge: pick the schedule by p2p_communicator presence, not
-        # parallel_state pp size (unset without mpu). without-interleaving supports both.
         from megatron.core.pipeline_parallel.schedules import (
             forward_backward_pipelining_without_interleaving,
         )
