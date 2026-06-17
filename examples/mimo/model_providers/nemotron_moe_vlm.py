@@ -10,7 +10,6 @@ vision ``RADIOViTModel`` + ``MultimodalProjector`` ``ModuleSpec`` s.
 from __future__ import annotations
 
 import argparse
-import os
 from contextlib import nullcontext
 from copy import deepcopy
 from typing import Optional
@@ -441,9 +440,9 @@ def nemotron_language_config(
     config.use_cpu_initialization = True
     config.variable_seq_lengths = True
     config.cross_entropy_fusion_impl = "te"
-    # alltoall/deepep are env-tuned per cluster, not run-script flags.
-    config.moe_token_dispatcher_type = os.environ.get("MOE_TOKEN_DISPATCHER_TYPE", "alltoall")
-    config.moe_flex_dispatcher_backend = os.environ.get("MOE_FLEX_DISPATCHER_BACKEND", "deepep")
+    # moe_token_dispatcher_type / moe_flex_dispatcher_backend come from CLI flags
+    # so the base config validates at construction (shared-expert-overlap requires
+    # the alltoall/flex dispatcher); the run script defaults them from env.
     config.params_dtype = dtype
     config.pipeline_dtype = dtype
     config.bf16 = bf16
