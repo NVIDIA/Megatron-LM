@@ -91,6 +91,8 @@ def _count_local_tokens_kernel_persistent(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
+    if valid_tokens == 0:
+        return
     valid_pairs = valid_tokens * topk
 
     total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
