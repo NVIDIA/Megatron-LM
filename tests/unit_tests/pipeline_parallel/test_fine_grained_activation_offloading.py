@@ -471,6 +471,12 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         if enable_offload_reset:
             off_interface.reset()
 
+        # Keep warmup-created grad buffers resident for stable peak-memory comparisons,
+        # but clear warmup values before capturing correctness grads.
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+
         data0 = _make_schedule_inputs()
         data1 = _make_schedule_inputs()
         plan0 = model.build_schedule_plan(**data0)
