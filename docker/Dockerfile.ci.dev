@@ -62,6 +62,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+    # The streamed GDN pre-GDR fused backward needs causal-conv1d, but base
+    # install/import checks should not have to build this CUDA extension.
+    uv pip install --no-build-isolation --no-deps "causal-conv1d~=1.6"
 EOF
 
 # Install DeepEP
