@@ -478,7 +478,7 @@ class GatedDeltaNet(MegatronModule):
             beta=beta,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
@@ -557,9 +557,12 @@ class GatedDeltaNet(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+        # NOTE: q/k L2-norm is folded into the gated_delta_rule kernel via
+        # use_qk_l2norm_in_kernel=self.use_qk_l2norm (see forward()). The kernel
+        # saves only rstd for backward and recomputes normalized q/k, avoiding a
+        # materialized normalized query_key activation. Both the FLA kernel and
+        # the torch deterministic path use eps=1e-6, matching the previous
+        # explicit l2norm() default -> numerically lossless.
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
