@@ -1,10 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 '''
-WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_model.py
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/mimo/test_mimo_model.py
 '''
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -448,17 +449,25 @@ class TestMimoModel:
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
 
     def test_forward_with_partition_adapter(self):
-        """Test that partition_adapter.shard() is called and embeddings are transposed correctly."""
+        """shard() receives sequence-first embeddings and returns LM-layout [S/cp, B, H].
+
+        The caller no longer transposes around shard(): it passes the sequence-first
+        ``(S, B, H)`` combined embeddings straight in, and shard()'s LM-layout output
+        flows straight into the language model as ``decoder_input``.
+        """
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
         sharded_seq_len = self.seq_len // 2
+        # shard() returns LM-layout [S/cp, B, H] and a (CP-sharded) loss mask.
         sharded_emb = torch.zeros(
-            self.batch_size, sharded_seq_len, self.hidden_size, device=self.device
+            sharded_seq_len, self.batch_size, self.hidden_size, device=self.device
         )
+        sharded_loss_mask = torch.ones(self.batch_size, sharded_seq_len, device=self.device)
         mock_adapter = MagicMock()
-        mock_adapter.shard.return_value = (sharded_emb, None, None, None, None)
+        mock_adapter.shard.return_value = (sharded_emb, None, sharded_loss_mask, None)
         mimo_model.partition_adapter = mock_adapter
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
@@ -481,16 +490,88 @@ class TestMimoModel:
             ),
             patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
         ):
-            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+            _, out_loss_mask = mimo_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
+                modality_inputs=None,
+            )
 
         mock_adapter.shard.assert_called_once()
         shard_kwargs = mock_adapter.shard.call_args[1]
-        assert shard_kwargs['embeddings'].shape == (self.batch_size, self.seq_len, self.hidden_size)
+        # The helper passes sequence-first [S, B, H] embeddings straight to shard().
+        assert shard_kwargs['embeddings'].shape == (self.seq_len, self.batch_size, self.hidden_size)
+        assert shard_kwargs['loss_mask'] is loss_mask
+        # shard()'s LM-layout output flows straight into the LM (no extra transpose).
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
             self.batch_size,
             self.hidden_size,
         )
+        # forward() returns the (possibly sharded) loss mask from shard().
+        assert out_loss_mask is sharded_loss_mask
+
+    def test_get_text_embeddings_raises_when_sp_and_embedding_scatter_enabled(self):
+        """SP must not double-scatter: if the LM embedding still scatters, raise.
+
+        With sequence parallelism active, PartitionAdapter scatters the combined
+        embeddings. If the language embedding also scattered, the flat text tokens
+        would be split across TP ranks before alignment. ``get_text_embeddings``
+        must reject that configuration.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        sp_adapter = MagicMock()
+        sp_adapter.cfg.seq_parallel = True
+        mimo_model.partition_adapter = sp_adapter
+        # Embedding layer reports it would scatter for sequence parallelism.
+        mimo_model.language_model.embedding.scatter_to_sequence_parallel = True
+
+        with pytest.raises(RuntimeError, match="embedding scatter to be disabled"):
+            mimo_model.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+
+    def test_get_text_embeddings_ok_when_sp_and_embedding_scatter_disabled(self):
+        """SP with embedding scatter disabled is the supported configuration."""
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        sp_adapter = MagicMock()
+        sp_adapter.cfg.seq_parallel = True
+        mimo_model.partition_adapter = sp_adapter
+        mimo_model.language_model.embedding.scatter_to_sequence_parallel = False
+
+        text_embeddings = mimo_model.get_text_embeddings(
+            input_ids, position_ids, self.special_token_ids
+        )
+        assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
+
+    def test_forward_language_module_rejects_attention_mask_under_cp(self):
+        """A dense attention_mask is rejected under context parallelism.
+
+        Under CP the hidden states are CP-local, so a dense [B, S] mask cannot line up
+        with the sharded sequence; _forward_language_module must fail fast.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+        attention_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
+
+        cp_adapter = MagicMock()
+        cp_adapter.cfg.use_cp = True
+        mimo_model.partition_adapter = cp_adapter
+
+        with pytest.raises(RuntimeError, match="context parallelism requires attention_mask=None"):
+            mimo_model._forward_language_module(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                loss_mask=None,
+                labels=None,
+                input_tensors=None,
+            )
 
 
 class MockProcessGroup:
@@ -713,10 +794,11 @@ class TestMimoModelNonColocated:
             patch.object(model.role, 'is_last_stage', return_value=True),
             patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
         ):
-            model._forward_language_module(
+            lm_output, _ = model._forward_language_module(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=None,
+                loss_mask=None,
                 labels=None,
                 input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
             )
@@ -724,3 +806,150 @@ class TestMimoModelNonColocated:
         assert captured['input_ids'] is None
         assert captured['decoder_input'] is None
         torch.testing.assert_close(captured['position_ids'], position_ids)
+
+
+class TestMimoModelFanoutHelpers:
+    """CPU-only coverage for bridge-fanout helper methods on ``MimoModel``."""
+
+    @staticmethod
+    def _stub_model(special_token_ids):
+        model = MimoModel.__new__(MimoModel)
+        model.special_token_ids = special_token_ids
+        # COLOCATED skips the fan-out DP assertion path; this fixture targets
+        # the metadata-tagging logic only.
+        model.role = SimpleNamespace(mode=ModuleLayout.COLOCATED)
+        return model
+
+    def test_attach_modality_split_sizes_tags_output_with_per_sample_counts(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 1, 2, 3]])
+        output = torch.zeros(3, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert output._mimo_bridge_split_sizes == [2, 1]
+
+    def test_attach_modality_split_sizes_skips_when_total_mismatches(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 1], [1, 1]])
+        output = torch.zeros(5, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_when_token_counts_uniform(self):
+        model = self._stub_model({"images": 50257})
+        # Two samples, two image tokens each — uniform per-sample counts.
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 50257, 3, 4]])
+        output = torch.zeros(4, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_for_single_sample_batch(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1]])
+        output = torch.zeros(2, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_has_encoder_tokens_detects_presence_and_absence(self):
+        model = self._stub_model({"images": 50257, "audio": 50258})
+
+        assert model._has_encoder_tokens(torch.tensor([[50257, 1]]), "images") is True
+        assert model._has_encoder_tokens(torch.tensor([[1, 2]]), "images") is False
+        assert model._has_encoder_tokens(None, "images") is False
+        assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
+
+    @staticmethod
+    def _stub_mimo_config(
+        *,
+        hidden_size=8,
+        language_dtype=torch.float32,
+        include_language_dtype=True,
+        modality_params=None,
+    ):
+        language_config = SimpleNamespace(hidden_size=hidden_size)
+        if include_language_dtype:
+            language_config.params_dtype = language_dtype
+        return SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': language_config}),
+            modality_submodules_spec={
+                "images": SimpleNamespace(params={} if modality_params is None else modality_params)
+            },
+        )
+
+    def test_set_input_tensor_unwraps_outer_list_and_forwards_to_language_model(self):
+        lm = MagicMock()
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = lm
+        tensor = torch.zeros(2, 4)
+
+        model.set_input_tensor([tensor])
+
+        assert torch.equal(model.input_tensors, tensor)
+        lm.set_input_tensor.assert_called_once_with(tensor)
+
+    def test_set_input_tensor_dict_unwraps_single_element_value_lists(self):
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = None
+        t_lang = torch.zeros(2, 4)
+        t_vision = torch.zeros(3, 4)
+
+        model.set_input_tensor({"language": [t_lang], "vision": t_vision})
+
+        assert torch.equal(model.input_tensors["language"], t_lang)
+        assert torch.equal(model.input_tensors["vision"], t_vision)
+
+    def test_empty_encoder_output_uses_language_dtype_without_modality_config(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, language_dtype=torch.bfloat16, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_defaults_to_float32_without_language_dtype(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, include_language_dtype=False, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.float32
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for current_device")
+    def test_empty_encoder_output_uses_current_cuda_device(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(hidden_size=8, language_dtype=torch.bfloat16)
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cuda"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_raises_when_hidden_size_missing(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': SimpleNamespace()})
+        )
+
+        with pytest.raises(ValueError, match="hidden_size"):
+            model._empty_encoder_output("images")
