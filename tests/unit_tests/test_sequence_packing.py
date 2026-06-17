@@ -9,12 +9,42 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    _build_thd_padding_mask,
+    _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_scheduler_thd_padding_mask_from_cu_seqlens():
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+
+    padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
+
+    assert torch.equal(
+        padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
+    )
+
+
+def test_scheduler_sanitizes_thd_padding_values():
+    padding_mask = torch.tensor([False, False, True, False, True])
+    batch = {
+        'tokens': torch.tensor([11, 12, -1, 21, -1], dtype=torch.int64),
+        'labels': torch.tensor([12, 13, -1, 22, -1], dtype=torch.int64),
+        'loss_mask': torch.ones(5, dtype=torch.float32),
+        'position_ids': torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64),
+    }
+
+    _sanitize_thd_padding_values(batch, padding_mask)
+
+    assert torch.equal(batch['tokens'], torch.tensor([11, 12, 0, 21, 0]))
+    assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
+    assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
+    assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
 class MockVariableLengthSequencePackingDataIterator:
@@ -196,8 +226,10 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
             data_iterator=data_iterator, mtp_on_this_rank=False, vp_stage=None
         )
 
-        # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        # Unpack the result. Scheduler THD always returns padding_mask.
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
+            result
+        )
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -206,6 +238,12 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         is_first_stage = parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         is_first_or_last = is_first_stage or is_last_stage
+
+        assert padding_mask is not None
+        assert padding_mask.dtype == torch.bool
+        assert padding_mask.dim() == 2
+        assert padding_mask.size(0) == 1
+        assert not padding_mask.any(), "Mock data has no per-sequence padding."
 
         # =====================================================================
         # TEST 1: Verify data based on pipeline stage

@@ -21,6 +21,48 @@ from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPSchedul
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
+def _build_thd_padding_mask(
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
+) -> torch.Tensor:
+    """Build a 1D THD padding mask from scheduler sequence metadata."""
+    assert cu_seqlens.dim() == 1
+    assert cu_seqlens_padded.dim() == 1
+    assert cu_seqlens.numel() == cu_seqlens_padded.numel()
+
+    total_tokens = int(cu_seqlens_padded[-1].item())
+    if total_tokens == 0:
+        return torch.empty((0,), dtype=torch.bool, device=cu_seqlens.device)
+
+    num_sequences = cu_seqlens.numel() - 1
+    if num_sequences <= 0:
+        return torch.ones((total_tokens,), dtype=torch.bool, device=cu_seqlens.device)
+
+    positions = torch.arange(
+        total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
+    )
+    seq_indices = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
+
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
+    valid_ends = cu_seqlens_padded[:-1] + valid_lengths
+    return positions >= valid_ends[seq_indices]
+
+
+def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
+    """Replace padded token-like slots with safe neutral values in-place."""
+    assert padding_mask.dim() == 1
+    pad_values = {'tokens': 0, 'labels': 0, 'loss_mask': 0.0, 'position_ids': 0}
+    for key, pad_value in pad_values.items():
+        tensor = batch.get(key)
+        if tensor is None:
+            continue
+        assert tensor.dim() == 1, f"{key} must be 1D before CP slicing, got {tensor.dim()}D"
+        assert tensor.numel() == padding_mask.numel(), (
+            f"{key} length ({tensor.numel()}) must match padding_mask length "
+            f"({padding_mask.numel()}) before CP slicing."
+        )
+        batch[key] = tensor.masked_fill(padding_mask, pad_value)
+
+
 class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.
@@ -713,7 +755,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
     Returns:
-        tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
+        tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
+        packed_seq_params, padding_mask)
     """
 
     if pg_collection is None:
@@ -755,20 +798,31 @@ def get_batch_on_this_rank_for_sequence_packing(
         assert data_iterator is None, "Non TP 0 rank should not have data_iterator"
         batch = {}
 
-    # Partition tokens, position_ids, labels, loss_mask for context parallel, currently only
-    # TP rank 0 and the first/last PP stage rank has these data.
-    if is_tp_rank_0 and is_first_or_last_stage:
+    # Build padding_mask before CP slicing while tensors still have the full
+    # packed length represented by cu_seqlens_padded[-1].
+    if is_tp_rank_0:
+        batch['padding_mask'] = _build_thd_padding_mask(
+            batch['cu_seqlens'], batch['cu_seqlens_padded']
+        )
+        _sanitize_thd_padding_values(batch, batch['padding_mask'])
+
+    # Partition padding_mask for context parallel on every PP stage. Partition
+    # token-like tensors only on stages that own them.
+    if is_tp_rank_0:
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
         # If cp_size == 1, no need to do further processing.
         if cp_size > 1:
-            total_tokens = batch['tokens'].size(0)
             # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
             # cu_seqlens to get the correct result.
             # TODO: Revert this workaround once TE fixes the issue.
             cu_seqlens = batch["cu_seqlens_padded"]
+            total_tokens = int(cu_seqlens[-1].item())
             index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-            for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+            cp_slice_keys = ['padding_mask']
+            if is_first_or_last_stage:
+                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+            for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
@@ -780,15 +834,14 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
     cu_seqlen_size = cu_seqlen_size.item()
 
-    # Broadcast total_tokens because we need it to create placeholder for tokens, position_ids,
-    # labels, loss_mask for non TP 0 ranks. Only first or last stage need this.
-    if is_first_or_last_stage:
-        if is_tp_rank_0:
-            total_tokens = torch.tensor(batch['tokens'].size(0), dtype=torch.int32, device=dev)
-        else:
-            total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-        broadcast_tensor(total_tokens, tp_src_rank, tp_group)
-        total_tokens = total_tokens.item()
+    # Broadcast total_tokens because padding_mask is prepared on every PP stage.
+    # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
+    if is_tp_rank_0:
+        total_tokens = torch.tensor(batch['padding_mask'].size(0), dtype=torch.int32, device=dev)
+    else:
+        total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
+    broadcast_tensor(total_tokens, tp_src_rank, tp_group)
+    total_tokens = total_tokens.item()
 
     # Step1: Prepare "tokens", "position_ids" on all ranks.
     if is_first_stage or mtp_on_this_rank:
@@ -820,7 +873,14 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['labels'] = None
         batch['loss_mask'] = None
 
-    # Step3: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
+    # Step3: Prepare "padding_mask" on all TP ranks.
+    if is_tp_rank_0:
+        assert batch['padding_mask'].dtype == torch.bool
+        batch['padding_mask'] = batch['padding_mask'].view(1, total_tokens)
+    else:
+        batch['padding_mask'] = torch.empty([1, total_tokens], dtype=torch.bool, device=dev)
+
+    # Step4: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
     if is_tp_rank_0:
         assert batch['cu_seqlens'].dtype == torch.int32
         assert batch['cu_seqlens_padded'].dtype == torch.int32
@@ -841,6 +901,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
     broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
     broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['padding_mask'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
@@ -850,6 +911,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     position_ids = batch['position_ids']
     labels = batch['labels']
     loss_mask = batch['loss_mask']
+    padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
@@ -870,4 +932,4 @@ def get_batch_on_this_rank_for_sequence_packing(
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
-    return tokens, labels, loss_mask, None, position_ids, packed_seq_params
+    return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask
