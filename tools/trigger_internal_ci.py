@@ -40,7 +40,30 @@ PIPELINE_VARIABLES_FIXED = {
     "INTEGRATION_TEST": "no",
 }
 
+# Scopes whose recipes run full convergence/checkpointing workloads and need a
+# long wall-clock budget. The default short-scope time limit is left untouched.
+LONG_RUNNING_SCOPES = ("release", "weekly")
+LONG_RUNNING_TIME_LIMIT_SECONDS = 4 * 60 * 60
+
 logger = logging.getLogger(__name__)
+
+
+def resolve_time_limit(scope, override):
+    """Resolve the FUNCTIONAL_TEST_TIME_LIMIT value for a functional test scope.
+
+    Args:
+        scope: The functional test scope (e.g. ``mr``, ``release``, ``weekly``).
+        override: Explicit time limit in seconds, or ``None`` to auto-resolve.
+
+    Returns:
+        The time limit in seconds when one applies, otherwise ``None`` so the
+        variable is left unset and short-running scopes keep their default.
+    """
+    if override is not None:
+        return override
+    if scope in LONG_RUNNING_SCOPES:
+        return LONG_RUNNING_TIME_LIMIT_SECONDS
+    return None
 
 
 def get_remote_url(origin):
@@ -77,7 +100,9 @@ def get_current_branch():
 def git_push(origin, target_branch, dry_run=False):
     """Force-push HEAD to the given branch on the named git remote."""
     if dry_run:
-        logger.info("[DRY RUN] Would push HEAD to remote '%s' as %s", origin, target_branch)
+        logger.info(
+            "[DRY RUN] Would push HEAD to remote '%s' as %s", origin, target_branch
+        )
         return
     subprocess.run(
         ["git", "push", origin, f"HEAD:{target_branch}", "--force"],
@@ -96,7 +121,10 @@ def trigger_pipeline(gitlab_url, access_token, ref, pipeline_vars, dry_run=False
         )
         return
     logger.info(
-        "Triggering pipeline on https://%s project %s @ %s", gitlab_url, GITLAB_PROJECT_ID, ref
+        "Triggering pipeline on https://%s project %s @ %s",
+        gitlab_url,
+        GITLAB_PROJECT_ID,
+        ref,
     )
     gl = gitlab.Gitlab(f"https://{gitlab_url}", private_token=access_token)
     project = gl.projects.get(GITLAB_PROJECT_ID, lazy=True)
@@ -135,6 +163,16 @@ def main():
         "--functional-test-cases",
         default="all",
         help="FUNCTIONAL_TEST_CASES pipeline variable (default: all)",
+    )
+    parser.add_argument(
+        "--functional-test-time-limit",
+        type=int,
+        default=None,
+        help=(
+            "FUNCTIONAL_TEST_TIME_LIMIT pipeline variable in seconds. Defaults to "
+            "14400 (4h) for the long-running 'release' and 'weekly' scopes and is "
+            "left unset for other scopes."
+        ),
     )
     parser.add_argument(
         "--cluster-a100",
@@ -180,6 +218,12 @@ def main():
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }
 
+    time_limit = resolve_time_limit(
+        args.functional_test_scope, args.functional_test_time_limit
+    )
+    if time_limit is not None:
+        pipeline_vars["FUNCTIONAL_TEST_TIME_LIMIT"] = str(time_limit)
+
     for var, val in [
         ("CLUSTER_A100", args.cluster_a100),
         ("CLUSTER_H100", args.cluster_h100),
@@ -189,7 +233,11 @@ def main():
             pipeline_vars[var] = val
 
     trigger_pipeline(
-        gitlab_hostname, args.access_token, target_branch, pipeline_vars, dry_run=args.dry_run
+        gitlab_hostname,
+        args.access_token,
+        target_branch,
+        pipeline_vars,
+        dry_run=args.dry_run,
     )
 
 

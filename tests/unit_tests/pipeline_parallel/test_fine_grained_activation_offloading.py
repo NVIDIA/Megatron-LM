@@ -10,6 +10,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -30,6 +31,52 @@ def _reset_cuda_memory() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.min_offloaded_tensor_size = min_offloaded_tensor_size
+    return handler
+
+
+def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
+    handler = _make_chunk_handler_for_offload_checker()
+
+    cpu_tensor = torch.empty(1024)
+    assert not handler.tensor_need_offloading_checker(cpu_tensor)
+    assert handler.tensor_push(cpu_tensor) is cpu_tensor
+    assert handler.tensor_pop(cpu_tensor) is cpu_tensor
+
+    parameter = torch.nn.Parameter(torch.empty(1024))
+    assert not handler.tensor_need_offloading_checker(parameter)
+    assert handler.tensor_push(parameter) is parameter
+    assert handler.tensor_pop(parameter) is parameter
+
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available in this PyTorch version.")
+
+    with FakeTensorMode():
+        fake_tensor = torch.empty(1024, device="cuda")
+    assert not handler.tensor_need_offloading_checker(fake_tensor)
+    assert handler.tensor_push(fake_tensor) is fake_tensor
+    assert handler.tensor_pop(fake_tensor) is fake_tensor
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_respects_tensor_offloading_activation_opt_out():
+    handler = _make_chunk_handler_for_offload_checker()
+
+    tensor = torch.empty(1024, device="cuda")
+    assert handler.tensor_need_offloading_checker(tensor)
+
+    tensor._TE_do_not_offload = True
+    assert not handler.tensor_need_offloading_checker(tensor)
+
+    tensor = torch.empty(1024, device="cuda")
+    tensor.offloading_activation = False
+    assert not handler.tensor_need_offloading_checker(tensor)
 
 
 def _build_gpt_model(
@@ -470,6 +517,12 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         """
         if enable_offload_reset:
             off_interface.reset()
+
+        # Keep warmup-created grad buffers resident for stable peak-memory comparisons,
+        # but clear warmup values before capturing correctness grads.
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
         data0 = _make_schedule_inputs()
         data1 = _make_schedule_inputs()

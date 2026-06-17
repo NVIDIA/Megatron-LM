@@ -544,7 +544,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
+                if inference_context is not None:
+                    if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                        # Block-scope CUDA graph mode: copy_() into the
+                        # pre-allocated buffer so every graph replay writes to
+                        # the same fixed GPU address regardless of batch size.
+                        assert inference_context.mtp_decoder_hidden_states is not None
+                        inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                            hidden_states
+                        )
+                    else:
+                        # Non-block scope: direct assignment; the controller will set
+                        # this back to None after reading to allow GC.
+                        inference_context.mtp_decoder_hidden_states = hidden_states
             else:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
@@ -559,6 +571,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
