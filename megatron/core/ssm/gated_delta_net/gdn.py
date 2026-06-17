@@ -30,6 +30,13 @@ class GatedDeltaNet(_GDNBase):
     # pylint: disable=missing-class-docstring
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
+        self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
+        if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
+            raise ValueError(
+                "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
+                "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+            )
+
         # alpha, beta
         self.in_proj_extra_dim = self.num_value_heads * 2
 
@@ -156,77 +163,92 @@ class GatedDeltaNet(_GDNBase):
             packed_seq_params,
         )
 
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
+        if self.gdn_pre_gated_delta_rule_fusion:
+            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
+            )
+            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+            )
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+        else:
+            # Transpose: s b x --> b s x
+            # From sbhd to bshd format
+            qkvzba = qkvzba.transpose(0, 1)
 
-        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-        # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+            # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
+            # (beta, alpha for GDN; f, b, w for GDN2)
+            qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
+            gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
+            # Convolution on qkv
+            nvtx_range_push(suffix="conv1d")
+            seq_len = qkv.shape[1]
+            qkv_channels_split_sections = [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            ]
+            conv1d_weight = get_parameter_local_cp(
+                self.conv1d.weight,
                 dim=0,
                 cp_group=self.pg_collection.cp,
                 split_sections=qkv_channels_split_sections,
             )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+            conv1d_bias = (
+                get_parameter_local_cp(
+                    self.conv1d.bias,
+                    dim=0,
+                    cp_group=self.pg_collection.cp,
+                    split_sections=qkv_channels_split_sections,
+                )
+                if self.conv_bias
+                else None
             )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
+            if self.config.deterministic_mode:
+                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+                conv_out = F.conv1d(
+                    input=qkv,  # Torch-native only accept [b, d, s] format input
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    stride=self.conv1d.stride,
+                    padding=self.conv1d.padding,
+                    dilation=self.conv1d.dilation,
+                    groups=self.conv_dim_local_tp // self.cp_size,
+                )
+                qkv = self.act_fn(conv_out[..., :seq_len])
+                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            else:
+                assert self.activation in ["silu", "swish"]
+                qkv, _ = causal_conv1d(
+                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens_q,
+                )
+            nvtx_range_pop(suffix="conv1d")
+
+            A_log_local_cp = get_parameter_local_cp(
+                self.A_log, dim=0, cp_group=self.pg_collection.cp
             )
-        nvtx_range_pop(suffix="conv1d")
+            dt_bias_local_cp = get_parameter_local_cp(
+                self.dt_bias, dim=0, cp_group=self.pg_collection.cp
+            )
 
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
-
-        # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
-        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-        )
-        gate = kernel_inputs.pop("gate")
-        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+            # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
+            nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
+            kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            )
+            gate = kernel_inputs.pop("gate")
+            nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -262,6 +284,34 @@ class GatedDeltaNet(_GDNBase):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper."""
+
+        try:
+            from megatron.core.fusions.fused_pre_gated_delta_rule import (
+                fused_streamed_pre_gated_delta_rule,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
+            ) from exc
+
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
 
 
 ####################
