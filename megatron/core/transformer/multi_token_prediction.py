@@ -2090,6 +2090,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         for iteration in range(self.config.mtp_num_layers):
             # Compute MTP-shifted padding mask for this depth
             if mtp_loss_mask is not None and padding_mask is not None:
+                # TODO: verify CP boundary correctness — roll_tensor communicates
+                # with the adjacent CP rank, but the token rolled in may carry a
+                # stale loss_mask value (always 0) rather than the true mask from
+                # the neighbouring rank's boundary.
                 mtp_loss_mask, _ = roll_tensor(
                     mtp_loss_mask,
                     shifts=-1,
@@ -2097,7 +2101,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                 )
-                mtp_padding_mask = mtp_loss_mask == 0
+                mtp_padding_mask = ~mtp_loss_mask.bool()
             else:
                 mtp_padding_mask = padding_mask
 

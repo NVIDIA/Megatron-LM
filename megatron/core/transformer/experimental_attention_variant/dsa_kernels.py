@@ -677,6 +677,11 @@ def indexer_topk(
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny  # kept compatible w/ cudnn kernel
 
 
+def _thd_to_fake_bshd(*tensors: Tensor) -> Tuple[Tensor, ...]:
+    """Prepend a B=1 dim to THD tensors for cuDNN wrappers that expect BSHD."""
+    return tuple(t.unsqueeze(0) for t in tensors)
+
+
 def _compute_indexer_predict(
     q_indexer: Tensor,
     k_indexer: Tensor,
@@ -714,13 +719,9 @@ def _compute_indexer_predict(
                 "``topk_indices_global=True`` so the kernel addresses K "
                 "by flat ids over the packed ``(total_k, D)`` buffer."
             )
-        total_q, h, d = q_indexer.shape
-        total_k = k_indexer.shape[0]
-        topk = topk_indices.shape[-1]
-        q_bshd = q_indexer.view(1, total_q, h, d)
-        k_bsd = k_indexer.view(1, total_k, d)
-        w_bsh = weights.view(1, total_q, h)
-        topk_bst = topk_indices.view(1, total_q, topk)
+        q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+            q_indexer, k_indexer, weights, topk_indices
+        )
     else:
         q_bshd, k_bsd, w_bsh, topk_bst = q_indexer, k_indexer, weights, topk_indices
 
@@ -734,7 +735,7 @@ def _compute_indexer_predict(
     )
     predict = result["predict"]
     if is_thd:
-        predict = predict.view(total_q, topk)
+        predict = predict.squeeze(0)
     return predict
 
 
@@ -764,13 +765,7 @@ def _compute_attn_target(
                 "``topk_indices_global=True`` so the kernel addresses K "
                 "by flat ids over the packed ``(total_k, D)`` buffer."
             )
-        total_q, h, d = q_attn.shape
-        total_k = k_attn.shape[0]
-        topk = topk_indices.shape[-1]
-        q_bshd = q_attn.view(1, total_q, h, d)
-        k_bsd = k_attn.view(1, total_k, d)
-        lse_bsh = lse.view(1, total_q, h)
-        topk_bst = topk_indices.view(1, total_q, topk)
+        q_bshd, k_bsd, lse_bsh, topk_bst = _thd_to_fake_bshd(q_attn, k_attn, lse, topk_indices)
     else:
         q_bshd, k_bsd, lse_bsh, topk_bst = q_attn, k_attn, lse, topk_indices
 
@@ -785,7 +780,7 @@ def _compute_attn_target(
     )
     target = result["target"]
     if is_thd:
-        target = target.view(total_q, topk)
+        target = target.squeeze(0)
     return target
 
 
@@ -1226,21 +1221,20 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 attn_score_for_bwd = target.clone()
                 index_score_for_bwd = predict.clone()
                 if is_thd:
-                    total_comp_idx = k_indexer_flat.shape[0]
-                    topk = topk_indices_cmp.shape[-1]
-                    idx_hd = q_indexer_flat.shape[-1]
                     topk_indices_cmp_global = local_to_global_flat(
                         topk_indices_cmp,
                         batch_size=-1,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_kv=cu_seqlens_compressed_idx,
                     )
-                    bwd_q = q_indexer_flat.view(1, total_q, idx_nh, idx_hd)
-                    bwd_w = w_indexer.view(1, total_q, idx_nh)
-                    bwd_k = k_indexer_flat.view(1, total_comp_idx, idx_hd)
-                    bwd_attn = attn_score_for_bwd.view(1, total_q, topk)
-                    bwd_idx = index_score_for_bwd.view(1, total_q, topk)
-                    bwd_topk = topk_indices_cmp_global.view(1, total_q, topk)
+                    bwd_q, bwd_w, bwd_k, bwd_attn, bwd_idx, bwd_topk = _thd_to_fake_bshd(
+                        q_indexer_flat,
+                        w_indexer,
+                        k_indexer_flat,
+                        attn_score_for_bwd,
+                        index_score_for_bwd,
+                        topk_indices_cmp_global,
+                    )
                 else:
                     bwd_q = q_indexer_flat
                     bwd_w = w_indexer
@@ -1263,9 +1257,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 )
 
                 if is_thd:
-                    precomputed_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
-                    precomputed_grad_k_indexer = ig["d_index_k"].view(total_comp_idx, idx_hd)
-                    precomputed_grad_weights = ig["d_weights"].view(total_q, idx_nh)
+                    precomputed_grad_q_indexer = ig["d_index_q"].squeeze(0)
+                    precomputed_grad_k_indexer = ig["d_index_k"].squeeze(0)
+                    precomputed_grad_weights = ig["d_weights"].squeeze(0)
                 else:
                     precomputed_grad_q_indexer = ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
                     precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
@@ -1276,7 +1270,10 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 dense_bwd_kwargs = {}
                 if is_thd:
                     dense_bwd_kwargs = dict(
-                        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_compressed_idx
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_compressed_idx,
+                        max_seqlen_q=int(max_seqlen_q),
+                        max_seqlen_k=int(max_seqlen_compressed_idx),
                     )
                 ig = _DSA.dense_indexer_backward_wrapper(
                     q_indexer_flat,
