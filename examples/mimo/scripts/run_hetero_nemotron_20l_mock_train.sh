@@ -19,6 +19,8 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * 
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-0}
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-}
 IMAGE_TOKEN_ID=${IMAGE_TOKEN_ID:-511}
+MOE_TOKEN_DISPATCHER_TYPE=${MOE_TOKEN_DISPATCHER_TYPE:-alltoall}
+MOE_FLEX_DISPATCHER_BACKEND=${MOE_FLEX_DISPATCHER_BACKEND:-deepep}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
 TOKENIZER_ARGS=()
@@ -68,6 +70,8 @@ esac
   --moe-aux-loss-coeff 1e-4 \
   --moe-shared-expert-intermediate-size 3712 \
   --moe-shared-expert-overlap \
+  --moe-token-dispatcher-type "${MOE_TOKEN_DISPATCHER_TYPE}" \
+  --moe-flex-dispatcher-backend "${MOE_FLEX_DISPATCHER_BACKEND}" \
   --moe-permute-fusion \
   --use-fused-weighted-squared-relu \
   --mamba-num-heads 64 \
