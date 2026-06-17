@@ -186,7 +186,10 @@ class ParameterGroup:
         """Install full parameters for local compute."""
         self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
-        # Materializing FSDP-managed storage should not look like a user mutation.
+        # Autograd records a tensor's version counter when saving it for backward, and
+        # in-place writes like the out= redistribution below increment that counter even
+        # under no_grad. Without preserving it, backward can fail with "modified by an
+        # inplace operation" even though FSDP only materialized internal storage.
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
