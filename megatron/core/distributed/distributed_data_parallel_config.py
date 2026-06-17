@@ -36,6 +36,19 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    use_layer_wise_param_layout: bool = True
+    """Layer-wise (Muon) optimizer only. When True (default), LayerWise-managed buffers use
+       the shard-aligned padded LayerWise param layout. When False, the compact decoupled
+       layout is selected instead: LayerWise-managed buffers (Muon's 2D matrix params) use a
+       compact no-padding DDP layout and locally disable DistributedOptimizer semantics
+       (all-reduce gradients, legacy whole-param ping-pong ownership, and ``allgather_params``
+       param sync), while non-LayerWise buffers (embeddings, biases, layernorm) keep the
+       standard byte-level :class:`DistributedOptimizer` layout. This removes the persistent
+       ``dp_size * max(shard_load)`` LayerWise padding from the long-lived param/grad buffers,
+       making ``use_distributed_optimizer`` a per-buffer property. Has no effect unless a
+       LayerWise (Muon) distributed optimizer is in use.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.

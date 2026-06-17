@@ -1561,6 +1561,20 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 
+    if args.use_layer_wise_distributed_optimizer:
+        assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+            "Layer-wise (Muon) distributed optimizer does not support FP8/FP4 parameter gather "
+            "(fp8_param_gather / fp4_param_gather). Use fp8_param_gather=False (e.g. blockwise/"
+            "MXFP8 compute with parameters persisted in bf16)."
+        )
+        if not args.use_layer_wise_param_layout:
+            assert args.num_distributed_optimizer_instances == 1, (
+                "--no-use-layer-wise-param-layout (decoupled compact LayerWise DDP layout) requires "
+                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
+                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
+                "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
@@ -2814,14 +2828,18 @@ def _add_distributed_args(parser):
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
+                       help='Opt out of the precomputed shard-aligned (padded) LayerWise param '
+                       'layout. With an emerging (Muon) optimizer under --use-distributed-optimizer, '
+                       'this selects the experimental compact, decoupled DDP layout: '
+                       'LayerWise-managed (Muon 2D matrix) buffers use a compact no-padding DDP '
+                       'layout and locally disable DistributedOptimizer semantics (all-reduce '
+                       'gradients + legacy whole-param ping-pong ownership + allgather_params param '
+                       'sync), while sibling non-LayerWise buffers (embeddings, biases, layernorm) '
+                       'keep the standard byte-level DistributedOptimizer. This removes the '
+                       'persistent dp_size * max(shard_load) LayerWise padding from the long-lived '
+                       'buffers. Incompatible with FP8 parameter gather (fp8_param_gather=True). '
+                       'Produces different bf16 reduction ordering from the default padded layout, '
+                       'so will not match its loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
