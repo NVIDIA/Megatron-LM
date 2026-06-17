@@ -921,30 +921,31 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
         self.ctx = None
 
-    def discard_output_and_register_recompute(self, hook_tensor):
-        """
-        Release the output tensor storages and register the recompute function as a grad hook of
-        the hook_tensor.
+    def discard_output(self):
+        """Free the output storages, keeping tensor metadata for backward.
 
-        Note: the caller should make sure that the output tensors are no longer used
-        in the forward pass and the gradient of the hook_tensor is computed before the recomputed
-        tensors are used.
+        Pair with :meth:`register_recompute_hook` when discard and hook happen in different places.
         """
-        # When ckpt_manager is set, this is a no-op.
-        # Manager handles all discarding and hook registration uniformly.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
         if self.ckpt_manager is not None or is_graph_warmup():
             return
-
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
+        # resize keeps tensor metadata (needed for backward) while releasing the memory.
         for output in self.outputs:
             output.untyped_storage().resize_(0)
 
-        # register the recomputation as a backward hook, when the the gradient of the hook_tensor
-        # is computed, the recomputation will be triggered. The hook_tensor should be selected
-        # carefully to ensure that the tensors are recomputed before it is used by other backward
-        # computations.
+    def register_recompute_hook(self, hook_tensor):
+        """Recompute from ``hook_tensor``'s grad hook (its grad must run before the discarded
+        outputs are needed in backward).
+        """
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if self.ckpt_manager is not None or is_graph_warmup():
+            return
         if hook_tensor.requires_grad:
             hook_tensor.register_hook(self._recompute)
+
+    def discard_output_and_register_recompute(self, hook_tensor):
+        """Free the output storages and register the recompute as a grad hook on ``hook_tensor``."""
+        self.discard_output()
+        self.register_recompute_hook(hook_tensor)
