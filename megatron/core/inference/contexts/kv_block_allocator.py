@@ -35,7 +35,6 @@ class KVBlockAllocator:
             PrefixCachingEvictionPolicy.REF_ZERO
         ),
     ):
-
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
@@ -49,29 +48,34 @@ class KVBlockAllocator:
         self.dummy_block_idx = self.total_count - 1
 
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device="cpu")
 
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
-            self.block_hashes = torch.full((self.total_count,), -1, dtype=torch.int64, device='cpu')
+            self.block_hashes = torch.full(
+                (self.total_count,), -1, dtype=torch.int64, device="cpu"
+            )
 
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
-                (self.total_count,), dtype=torch.int32, device='cpu'
+                (self.total_count,), dtype=torch.int32, device="cpu"
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device='cpu'
+                    (self.total_count,), dtype=torch.int64, device="cpu"
                 )
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
+
+        # Per-block DSA indexer indices storage (populated when indexer replay is enabled)
+        self.block_indexer_indices: Dict[int, np.ndarray] = {}
 
     def __str__(self):
         return (
@@ -108,13 +112,17 @@ class KVBlockAllocator:
         """Compute number of paused blocks used."""
         if not self.enable_prefix_caching:
             return (
-                self.context.request_kv_block_counts[: self.context.paused_request_count]
+                self.context.request_kv_block_counts[
+                    : self.context.paused_request_count
+                ]
                 .sum()
                 .item()
             )
 
         if self.context.paused_request_count > 0:
-            paused_rows = self.context.request_to_kv_block_ids[: self.context.paused_request_count]
+            paused_rows = self.context.request_to_kv_block_ids[
+                : self.context.paused_request_count
+            ]
             valid_ids = paused_rows[paused_rows >= 0]
             if valid_ids.numel() > 0:
                 return int(torch.unique(valid_ids).numel())
@@ -165,7 +173,8 @@ class KVBlockAllocator:
         if self.total_avail < num_blocks:
             if (
                 not self.enable_prefix_caching
-                or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+                or self.prefix_caching_eviction_policy
+                == PrefixCachingEvictionPolicy.REF_ZERO
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
@@ -206,7 +215,10 @@ class KVBlockAllocator:
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+            if (
+                self.prefix_caching_eviction_policy
+                == PrefixCachingEvictionPolicy.REF_ZERO
+            ):
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
@@ -221,7 +233,9 @@ class KVBlockAllocator:
                 if unreg_mask.any():
                     unreg_blocks = blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
+                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = (
+                        unreg_blocks
+                    )
                     self.total_avail += num_unreg
         else:
             num_blocks = blocks.numel()
@@ -243,7 +257,7 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device="cpu")
 
         self.total_avail = self.total_count - 1
 
@@ -264,7 +278,9 @@ class KVBlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_kv_block_hashes(
+        self, block_ids: list[int], block_hashes: list[int]
+    ) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Args:
@@ -273,8 +289,12 @@ class KVBlockAllocator:
         """
         if not block_ids:
             return
-        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
-        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+        id_tensor = torch.tensor(
+            block_ids, dtype=torch.int64, device=self.block_hashes.device
+        )
+        hash_tensor = torch.tensor(
+            block_hashes, dtype=torch.int64, device=self.block_hashes.device
+        )
         self.block_hashes[id_tensor] = hash_tensor
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
@@ -297,7 +317,10 @@ class KVBlockAllocator:
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
         deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
+            map(
+                self.kv_hash_to_block_id.pop,
+                keys_to_delete & self.kv_hash_to_block_id.keys(),
+            ),
             maxlen=0,
         )
 
@@ -388,13 +411,15 @@ class KVBlockAllocator:
         if token_count == 0:
             return
 
-        assert (
-            flat_routing.shape[0] == token_count
-        ), f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
+        assert flat_routing.shape[0] == token_count, (
+            f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
+        )
 
         # Token-to-block mapping for all active tokens
         block_ids_np = context.token_to_block_idx[:token_count].cpu().numpy()
-        positions_np = context.token_to_local_position_within_kv_block[:token_count].cpu().numpy()
+        positions_np = (
+            context.token_to_local_position_within_kv_block[:token_count].cpu().numpy()
+        )
 
         dummy = self.dummy_block_idx
 
@@ -402,7 +427,7 @@ class KVBlockAllocator:
         unique_blocks, inverse, counts = np.unique(
             block_ids_np, return_inverse=True, return_counts=True
         )
-        sorted_indices = np.argsort(inverse, kind='stable')
+        sorted_indices = np.argsort(inverse, kind="stable")
         sorted_positions = positions_np[sorted_indices]
         sorted_routing = flat_routing[sorted_indices]
 
@@ -483,3 +508,117 @@ class KVBlockAllocator:
             ndarray [block_size_tokens, num_layers, topk] or None if not stored.
         """
         return self.block_routing.get(block_id)
+
+    def store_indexer_per_block(self, flat_indices: Optional[np.ndarray]) -> None:
+        """Scatter flat indexer indices into per-block storage.
+
+        Uses the context's token-to-block mapping to distribute each token's
+        indexer data into the appropriate block.
+
+        Args:
+            flat_indices: ndarray of shape [active_token_count, num_dsa_layers, index_topk]
+                aligned with the context's active-token layout, or None.
+        """
+        if flat_indices is None:
+            return
+
+        context = self.context
+        token_count = context.active_token_count
+        if token_count == 0:
+            return
+
+        assert flat_indices.shape[0] == token_count, (
+            f"Indexer token count {flat_indices.shape[0]} != active token count {token_count}"
+        )
+
+        block_ids_np = context.token_to_block_idx[:token_count].cpu().numpy()
+        positions_np = (
+            context.token_to_local_position_within_kv_block[:token_count].cpu().numpy()
+        )
+
+        dummy = self.dummy_block_idx
+
+        unique_blocks, inverse, counts = np.unique(
+            block_ids_np, return_inverse=True, return_counts=True
+        )
+        sorted_indices = np.argsort(inverse, kind="stable")
+        sorted_positions = positions_np[sorted_indices]
+        sorted_flat_indices = flat_indices[sorted_indices]
+
+        offset = 0
+        for bid, count in zip(unique_blocks, counts):
+            bid = int(bid)
+            count = int(count)
+            if bid == dummy:
+                offset += count
+                continue
+            block_pos = sorted_positions[offset : offset + count]
+            block_indices = sorted_flat_indices[offset : offset + count]
+            self.store_block_indexer_indices(bid, block_pos, block_indices)
+            offset += count
+
+    def reconstruct_indexer_from_blocks(
+        self, block_ids: list[int], total_indexer_tokens: int
+    ) -> Optional[np.ndarray]:
+        """Reconstruct indexer indices from per-block storage.
+
+        Concatenates per-block indexer ndarrays in block order, trimming the
+        last block to exactly ``total_indexer_tokens`` entries.
+
+        Args:
+            block_ids: Ordered list of block IDs for the request.
+            total_indexer_tokens: Expected number of indexer tokens
+                (total_tokens - 1, since the last generated token has no
+                forward-pass indexer).
+
+        Returns:
+            ndarray [total_indexer_tokens, num_dsa_layers, index_topk] or None if any
+            block is missing indexer data.
+        """
+        block_size = self.context.block_size_tokens
+        indexer_parts = []
+        tokens_collected = 0
+
+        for bid in block_ids:
+            indices = self.get_block_indexer_indices(bid)
+            if indices is None:
+                return None
+            remaining = total_indexer_tokens - tokens_collected
+            if remaining <= 0:
+                break
+            take = min(block_size, remaining)
+            indexer_parts.append(indices[:take])
+            tokens_collected += take
+
+        if not indexer_parts or tokens_collected != total_indexer_tokens:
+            return None
+
+        return np.concatenate(indexer_parts, axis=0)
+
+    def store_block_indexer_indices(
+        self, block_id: int, positions: np.ndarray, indices: np.ndarray
+    ) -> None:
+        """Store indexer indices for specific token positions in a block.
+
+        Args:
+            block_id: The block ID.
+            positions: ndarray of token positions within the block (1D, int).
+            indices: ndarray of indexer data [num_positions, num_dsa_layers, index_topk].
+        """
+        if block_id not in self.block_indexer_indices:
+            self.block_indexer_indices[block_id] = np.zeros(
+                (self.context.block_size_tokens, indices.shape[-2], indices.shape[-1]),
+                dtype=indices.dtype,
+            )
+        self.block_indexer_indices[block_id][positions] = indices
+
+    def get_block_indexer_indices(self, block_id: int) -> Optional[np.ndarray]:
+        """Get indexer indices for a block.
+
+        Args:
+            block_id: The block ID.
+
+        Returns:
+            ndarray [block_size_tokens, num_dsa_layers, index_topk] or None if not stored.
+        """
+        return self.block_indexer_indices.get(block_id)

@@ -37,6 +37,10 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.experimental_attention_variant.indexer_replay import (
+    IndexerReplay,
+    IndexerReplayAction,
+)
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -81,7 +85,9 @@ class TextGenerationController:
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
     """
 
-    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
+    def __init__(
+        self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer
+    ):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
@@ -94,7 +100,9 @@ class TextGenerationController:
         else:
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
 
-        self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
+        self.model_is_pipeline_parallel = (
+            self.model_config.pipeline_model_parallel_size > 1
+        )
 
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
@@ -111,7 +119,8 @@ class TextGenerationController:
             self.num_mtp_depths = 0
         else:
             assert (
-                self.model_config.mtp_num_layers and self.model_config.mtp_num_layers >= 1
+                self.model_config.mtp_num_layers
+                and self.model_config.mtp_num_layers >= 1
             ), "mtp_num_layers must be >= 1 when num_speculative_tokens > 0"
             if self.model_config.mtp_use_repeated_layer:
                 self.num_mtp_depths = self.num_speculative_tokens
@@ -211,13 +220,19 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._sampled_tokens_cuda = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
         self._sampled_mtp_tokens_cuda = torch.empty(
-            [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+            [self.num_speculative_tokens, max_requests],
+            dtype=torch.int64,
+            device=device,
         )
         self._accepted_tokens_per_request = (
             torch.ones(
-                [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
+                [max_requests, self.num_speculative_tokens],
+                dtype=torch.int64,
+                device=device,
             )
             * -1
         )
@@ -228,7 +243,9 @@ class TextGenerationController:
             max_requests, dtype=torch.int64, device=device
         )
         self._last_accepted_seq_indices = None
-        self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
+        self._mtp_token_ids_buf = torch.empty(
+            [1, max_requests], dtype=torch.int64, device=device
+        )
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
         )
@@ -261,7 +278,10 @@ class TextGenerationController:
 
     @staticmethod
     def detokenize(
-        tokenizer, tokens: List[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+        tokenizer,
+        tokens: List[int],
+        remove_EOD: bool = True,
+        skip_special_tokens: bool = True,
     ) -> str:
         """
         Detokenize a sequence of token IDs, optionally removing trailing EOD
@@ -315,7 +335,9 @@ class TextGenerationController:
         if not detokenize_segments:
             tokens = tokens_gpu_tensor.tolist()
             return (
-                self.detokenize(self.tokenizer, tokens, skip_special_tokens=skip_special_tokens),
+                self.detokenize(
+                    self.tokenizer, tokens, skip_special_tokens=skip_special_tokens
+                ),
                 None,
             )
 
@@ -331,12 +353,15 @@ class TextGenerationController:
             prompts_plus_generations.append(detok_str)
             offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
             words = [
-                detok_str[start:end] for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+                detok_str[start:end]
+                for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
             ]
 
             prompts_plus_generations_segments.append(words)
 
-        text = self.detokenize(self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens)
+        text = self.detokenize(
+            self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens
+        )
 
         return text, prompts_plus_generations_segments
 
@@ -381,7 +406,9 @@ class TextGenerationController:
             assert generation_started is not None
             if logits is None:
                 batch_size = last_token_logits.shape[0]
-                last_token_log_probs = F.log_softmax(last_token_logits, dim=1).to(torch.float32)
+                last_token_log_probs = F.log_softmax(last_token_logits, dim=1).to(
+                    torch.float32
+                )
                 top_n_logits_this_step = torch.topk(
                     last_token_log_probs, k=sampling_params.top_n_logprobs
                 )
@@ -396,7 +423,10 @@ class TextGenerationController:
                     mask = torch.ones(batch_size, dtype=torch.bool)
 
                 self._update_top_n_logprobs_dict(
-                    top_n_logprobs_this_step, top_n_logprobs_indices, mask, top_n_logprobs_dict
+                    top_n_logprobs_this_step,
+                    top_n_logprobs_indices,
+                    mask,
+                    top_n_logprobs_dict,
                 )
             else:
                 assert not sampling_params.skip_prompt_log_probs
@@ -404,12 +434,18 @@ class TextGenerationController:
                 # Compute the prompt logprobs
                 batch_size, seq_length, _ = logits.shape
                 log_probs = F.log_softmax(logits, dim=2).to(torch.float32)
-                top_n_logits_this_step = torch.topk(log_probs, k=sampling_params.top_n_logprobs)
+                top_n_logits_this_step = torch.topk(
+                    log_probs, k=sampling_params.top_n_logprobs
+                )
 
                 # Move the token dimension to the front and then add each token logprobs
                 # individually for every request in the batch
-                top_n_logprobs_this_step = top_n_logits_this_step.values.permute(1, 0, 2).cpu()
-                top_n_logprobs_indices = top_n_logits_this_step.indices.permute(1, 0, 2).cpu()
+                top_n_logprobs_this_step = top_n_logits_this_step.values.permute(
+                    1, 0, 2
+                ).cpu()
+                top_n_logprobs_indices = top_n_logits_this_step.indices.permute(
+                    1, 0, 2
+                ).cpu()
 
                 # We append to the logprobs dict for every prompt token
                 mask = torch.ones(batch_size, dtype=torch.bool)
@@ -510,10 +546,13 @@ class TextGenerationController:
         padded_prompt_tokens_list = batch_prompt_tokens_list
         num_padded_requests = padded_batch_size - len(batch_prompt_tokens_list)
         padded_prompt_tokens_list += [
-            [self.tokenizer.eod] * padded_sequence_length for _ in range(num_padded_requests)
+            [self.tokenizer.eod] * padded_sequence_length
+            for _ in range(num_padded_requests)
         ]
 
-        tokens = torch.tensor(padded_prompt_tokens_list, device=torch.cuda.current_device())
+        tokens = torch.tensor(
+            padded_prompt_tokens_list, device=torch.cuda.current_device()
+        )
 
         return tokens
 
@@ -585,7 +624,9 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
-        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
+        is_inference_optimized = (
+            self.model_config.transformer_impl == "inference_optimized"
+        )
         if is_inference_optimized:
             assert not moe_pad_experts_for_cuda_graph_inference, (
                 "moe_pad_experts_for_cuda_graph_inference cannot be True when "
@@ -593,8 +634,12 @@ class TextGenerationController:
             )
         if moe_pad_experts_for_cuda_graph_inference:
             if context.using_cuda_graph_this_step():
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+                capacity_factor = (
+                    model_config.num_moe_experts / model_config.moe_router_topk
+                )
+                set_decode_expert_padding(
+                    unwrapped_model, True, capacity_factor=capacity_factor
+                )
             else:
                 set_decode_expert_padding(unwrapped_model, False)
 
@@ -633,7 +678,11 @@ class TextGenerationController:
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+                {
+                    "tokens": input_ids,
+                    "position_ids": position_ids,
+                    "attention_mask": None,
+                }
             )
             # logits shape: [1, seq_len, vocab_size]
 
@@ -664,7 +713,9 @@ class TextGenerationController:
 
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+            self._all_logits_cuda[:, :logits_seq_len, :].copy_(
+                logits[:, :logits_seq_len, :]
+            )
         else:
             self._all_logits_cuda = logits
 
@@ -681,8 +732,12 @@ class TextGenerationController:
         back to the allocator outside the compiled graph.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
+        active_request_slice = slice(
+            context.paused_request_count, context.total_request_count
+        )
 
         # accepted_counts is the only GPU input; D2H a small slice so the
         # CPU rewind can read its values via .tolist() inside a Python loop.
@@ -692,8 +747,12 @@ class TextGenerationController:
 
         blocks_to_release, remove_mask = rewind_kv_cache(
             accepted_counts=accepted_tokens_per_request_cpu,
-            prefill_status=context.request_in_prefill_status_tensor[active_request_slice],
-            last_kv_block_offset=context.request_last_kv_block_offset[active_request_slice],
+            prefill_status=context.request_in_prefill_status_tensor[
+                active_request_slice
+            ],
+            last_kv_block_offset=context.request_last_kv_block_offset[
+                active_request_slice
+            ],
             kv_length_offsets=context.request_kv_length_offsets[active_request_slice],
             kv_block_counts=context.request_kv_block_counts[active_request_slice],
             last_kv_block_id=context.request_last_kv_block_id[active_request_slice],
@@ -710,8 +769,12 @@ class TextGenerationController:
             # gpu_view.request_in_prefill_status was uploaded by this step's
             # coalesced H2D and mirrors the active-slice CPU values, so we
             # don't need to re-upload prefill_status for the Mamba kernels.
-            prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
-            accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
+            prefill_status_gpu = context.gpu_view.request_in_prefill_status[
+                :active_request_count
+            ]
+            accepted_counts_gpu = self._accepted_token_counts_per_request[
+                :active_request_count
+            ]
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
@@ -764,13 +827,17 @@ class TextGenerationController:
         """
         nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
         unwrapped_model = self._unwrapped_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
+        has_mtp = (
+            self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
+        )
 
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
@@ -807,7 +874,7 @@ class TextGenerationController:
         current_hidden = last_accepted_hidden if has_mtp else None
 
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
-        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+        if getattr(self, "_mtp_resolved_padded_count", None) is not None:
             # CUDA-graph path: use the EP-synced padded count.
             padded_count = self._mtp_resolved_padded_count
             assert not self._sp_enabled or padded_count % self._tp_size == 0
@@ -845,7 +912,9 @@ class TextGenerationController:
             mtp_logits_2d = None
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
-                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                mtp_depth = (
+                    None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                )
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
@@ -865,7 +934,9 @@ class TextGenerationController:
                 mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(
+                    1
+                )  # [active_request_count, vocab_size]
 
             # Broadcast MTP logits across pipeline stages.
             if self.model_is_pipeline_parallel:
@@ -892,7 +963,10 @@ class TextGenerationController:
         # the context attribute; release it so the tensor can be garbage
         # collected. In block-scope CUDA graph mode the attribute is a
         # pre-allocated fixed buffer that must persist across replays.
-        if has_mtp and context.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
+        if (
+            has_mtp
+            and context.inference_cuda_graph_scope != InferenceCudaGraphScope.block
+        ):
             context.mtp_decoder_hidden_states = None
 
     def _verify_speculative_tokens(
@@ -917,7 +991,9 @@ class TextGenerationController:
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
 
         # Sampling-side request counts: padded when running a captured graph.
         # Verify uses the actual counts so the Triton kernels operate on the real workload.
@@ -1035,7 +1111,9 @@ class TextGenerationController:
             num_speculative_tokens=self.num_speculative_tokens,
         )
         # Expose the active slice so downstream code sees the right length.
-        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
+        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[
+            :active_request_count
+        ]
 
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
@@ -1043,7 +1121,9 @@ class TextGenerationController:
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
 
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
@@ -1075,11 +1155,20 @@ class TextGenerationController:
             return_log_probs (bool): Whether to return the sampled log_probs.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
 
         return (
-            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
-            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+            (
+                context.active_request_metadata["return_log_probs"][
+                    :active_request_count
+                ]
+            ).any(),
+            (
+                context.active_request_metadata["top_n_logprobs"][:active_request_count]
+                > 0
+            ).any(),
         )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
@@ -1120,7 +1209,10 @@ class TextGenerationController:
         tp_size = get_pg_size(tp_group)
 
         # All-gather across TP group if using sequence parallelism (tp_size > 1)
-        if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
+        if (
+            tp_size > 1
+            and get_model_config(self.inference_wrapped_model.model).sequence_parallel
+        ):
             # With SP, the model processes padded_active_token_count tokens total,
             # scattered evenly across TP ranks. Each rank routes
             # padded_active_token_count // tp_size tokens through MoE layers.
@@ -1135,16 +1227,63 @@ class TextGenerationController:
             stacked_routing = stacked_routing[:local_token_count]
             # gather_from_sequence_parallel_region gathers along dim 0
             # [local_token_count, num_layers, topk] -> [padded_token_count, num_layers, topk]
-            stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
+            stacked_routing = gather_from_sequence_parallel_region(
+                stacked_routing, group=tp_group
+            )
 
         # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
+    def _indexer_record_bookkeeping(self) -> Optional[np.ndarray]:
+        """Collect flat indexer topk indices for DSA indexer recording.
+
+        Retrieves recorded indexer decisions via the context's indexer_metadata
+        (which handles CUDA graph static buffers), performs the TP all-gather
+        when sequence parallelism is active, strips CUDA padding, and returns
+        a flat CPU numpy array aligned with the context's active-token layout.
+
+        Returns:
+            Optional[np.ndarray]: Flat indexer array of shape
+                [active_token_count, num_layers, index_topk], or None if indexer
+                replay is disabled or no indexer data was recorded.
+        """
+        config = self.inference_wrapped_model.model.config
+        if not config.dsa_enable_indexer_replay:
+            return None
+
+        context = self.inference_wrapped_model.inference_context
+        if context.dsa_indexer_metadata is None:
+            return None
+
+        stacked_indices = context.dsa_indexer_metadata.get_indexer_indices()
+
+        if stacked_indices is None:
+            return None
+
+        active_token_count = context.active_token_count
+
+        tp_group = self.inference_wrapped_model.tp_group
+        tp_size = get_pg_size(tp_group)
+
+        if (
+            tp_size > 1
+            and get_model_config(self.inference_wrapped_model.model).sequence_parallel
+        ):
+            local_token_count = context.padded_active_token_count // tp_size
+            stacked_indices = stacked_indices[:local_token_count]
+            stacked_indices = gather_from_sequence_parallel_region(
+                stacked_indices, group=tp_group
+            )
+
+        return stacked_indices[:active_token_count].cpu().numpy().astype(np.int32)
+
     def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
         # This code cannot be reached when we are using speculative decode.
         assert self.num_speculative_tokens == 0
         logits_seq_len = (
@@ -1159,7 +1298,9 @@ class TextGenerationController:
             only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
 
-    def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
+    def _dynamic_step_calculate_log_probs_speculative(
+        self,
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs from logits for speculative decoding.
 
         For decode requests, computes log probs for each accepted speculative token
@@ -1177,13 +1318,17 @@ class TextGenerationController:
                 log_probs_tensor: Full log_softmax tensor for top-n computation.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
 
         # Use gpu_view for data consumed by GPU log-probs operations.
         request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
             :active_request_count
         ]
-        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+        request_query_lengths = context.gpu_view.request_query_lengths[
+            :active_request_count
+        ]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1195,7 +1340,9 @@ class TextGenerationController:
         if only_last:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
-            log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+            log_probs_tensor = F.log_softmax(
+                logits_squeezed[: context.active_token_count], dim=-1
+            )
 
         log_probs_list_decode = []
 
@@ -1204,7 +1351,9 @@ class TextGenerationController:
             decode_log_probs = log_probs_tensor[:decode_len].reshape(
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
-            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            accepted_counts = self._accepted_token_counts_per_request[
+                :num_decode_requests
+            ]
 
             # Build a [num_decode, num_spec+1] token ID matrix for gathering.
             # Columns 0..num_spec-1 hold accepted speculative tokens (clamped to 0
@@ -1216,15 +1365,17 @@ class TextGenerationController:
                 device=logits.device,
                 dtype=torch.long,
             )
-            gather_tokens[:, : self.num_speculative_tokens] = self._accepted_tokens_per_request[
-                :num_decode_requests
-            ].clamp(min=0)
+            gather_tokens[:, : self.num_speculative_tokens] = (
+                self._accepted_tokens_per_request[:num_decode_requests].clamp(min=0)
+            )
             gather_tokens[
                 torch.arange(num_decode_requests, device=logits.device), accepted_counts
             ] = self._sampled_tokens_cuda[:num_decode_requests]
 
             # Gather: [num_decode, num_spec+1]
-            gathered_log_probs = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
+            gathered_log_probs = decode_log_probs.gather(
+                2, gather_tokens.unsqueeze(-1)
+            ).squeeze(-1)
 
             log_probs_list_decode = [
                 gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
@@ -1242,14 +1393,17 @@ class TextGenerationController:
                     num_decode_requests:active_request_count
                 ]
                 selected_log_probs = prefill_log_probs[
-                    torch.arange(num_prefill_requests, device=logits.device), prefill_new_tokens
+                    torch.arange(num_prefill_requests, device=logits.device),
+                    prefill_new_tokens,
                 ]
                 log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
             else:
                 prefill_token_ids = context.gpu_view.token_to_input_ids[
                     decode_len : context.active_token_count
                 ].roll(-1, 0)
-                prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
+                prefill_query_lengths = request_query_lengths[
+                    request_in_prefill_status_tensor == 1
+                ]
                 new_token_idx = prefill_query_lengths.cumsum(0) - 1
                 prefill_new_tokens = self._sampled_tokens_cuda[
                     num_decode_requests:active_request_count
@@ -1287,13 +1441,17 @@ class TextGenerationController:
             tuples, one per emitted token position.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
 
         # Use gpu_view for data consumed by GPU top-n operations.
         request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
             :active_request_count
         ]
-        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+        request_query_lengths = context.gpu_view.request_query_lengths[
+            :active_request_count
+        ]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1305,14 +1463,15 @@ class TextGenerationController:
             decode_log_probs = log_probs_tensor[:decode_len].reshape(
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
-            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            accepted_counts = self._accepted_token_counts_per_request[
+                :num_decode_requests
+            ]
             top_n_per_request = context.active_request_metadata["top_n_logprobs"][
                 :num_decode_requests
             ]
             max_top_n = int(top_n_per_request.max().item())
 
             if max_top_n > 0:
-
                 # Single batched topk on GPU: [num_decode, num_spec+1, max_top_n]
                 topk_results = torch.topk(decode_log_probs, k=max_top_n, dim=-1)
 
@@ -1325,7 +1484,10 @@ class TextGenerationController:
                     if top_n > 0:
                         num_valid = accepted_counts[i].item() + 1
                         top_n_results[i] = [
-                            (topk_values_cpu[i, j, :top_n], topk_indices_cpu[i, j, :top_n])
+                            (
+                                topk_values_cpu[i, j, :top_n],
+                                topk_indices_cpu[i, j, :top_n],
+                            )
                             for j in range(num_valid)
                         ]
 
@@ -1363,9 +1525,9 @@ class TextGenerationController:
                     prefill_log_probs_per_request = prefill_log_probs.split(
                         prefill_query_lengths.tolist(), dim=0
                     )
-                    prefill_skip_prompt = context.active_request_metadata["skip_prompt_log_probs"][
-                        num_decode_requests:active_request_count
-                    ].tolist()
+                    prefill_skip_prompt = context.active_request_metadata[
+                        "skip_prompt_log_probs"
+                    ][num_decode_requests:active_request_count].tolist()
 
                     for i in range(num_prefill_requests):
                         top_n = int(prefill_top_n[i])
@@ -1377,7 +1539,10 @@ class TextGenerationController:
                             if skip_prompt and request_lp.size(0) > 1:
                                 top_n_logits = torch.topk(request_lp[-1], k=top_n)
                                 top_n_results[req_idx] = [
-                                    (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                                    (
+                                        top_n_logits.values.cpu(),
+                                        top_n_logits.indices.cpu(),
+                                    )
                                 ]
                             else:
                                 top_n_logits = torch.topk(request_lp, k=top_n, dim=-1)
@@ -1410,18 +1575,27 @@ class TextGenerationController:
         )
 
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
+        active_request_slice = slice(
+            context.paused_request_count, context.total_request_count
+        )
 
         # Handle decode-only mode (only last token)
-        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+        if (
+            context.config.materialize_only_last_token_logits
+            or context.is_decode_only()
+        ):
             # In decode mode or when only last token logits are materialized,
             # logits already represent only the last tokens
             log_probs = log_probs_tensor[:active_request_count]
 
             top_n_results = {}
             for req_idx in range(active_request_count):
-                top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+                top_n = int(
+                    context.active_request_metadata["top_n_logprobs"][req_idx].item()
+                )
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
@@ -1443,13 +1617,17 @@ class TextGenerationController:
 
         top_n_results = {}
         for req_idx in range(active_request_count):
-            top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+            top_n = int(
+                context.active_request_metadata["top_n_logprobs"][req_idx].item()
+            )
             if top_n > 0:
                 request_log_probs = log_probs_per_request[
                     req_idx
                 ]  # [num_tokens_for_request, vocab_size]
                 skip_prompt = bool(
-                    context.active_request_metadata["skip_prompt_log_probs"][req_idx].item()
+                    context.active_request_metadata["skip_prompt_log_probs"][
+                        req_idx
+                    ].item()
                 )
 
                 # If skip_prompt_log_probs is True, only compute for last token
@@ -1520,7 +1698,9 @@ class TextGenerationController:
             return
 
         context = self.inference_wrapped_model.inference_context
-        has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
+        has_mtp = (
+            self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
+        )
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
@@ -1532,7 +1712,7 @@ class TextGenerationController:
 
         # Use precomputed MTP CUDA graph batch size when available;
         # otherwise use minimal SP-compatible size.
-        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+        if getattr(self, "_mtp_resolved_padded_count", None) is not None:
             padded_count = self._mtp_resolved_padded_count
             assert not self._sp_enabled or padded_count % self._tp_size == 0
         elif has_mtp:
@@ -1543,13 +1723,19 @@ class TextGenerationController:
         if has_mtp:
             # Minimal dummy tensors to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
+            dummy_hidden = torch.zeros(
+                (padded_count, 1, hidden_size), device=device, dtype=dtype
+            )
             if self._sp_enabled:
                 dummy_hidden = scatter_to_sequence_parallel_region(
                     dummy_hidden, group=self.inference_wrapped_model.tp_group
                 )
-            dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
+            dummy_token_ids = torch.zeros(
+                (1, padded_count), device=device, dtype=torch.long
+            )
+            dummy_position_ids = torch.zeros(
+                (1, padded_count), device=device, dtype=torch.long
+            )
 
         context = self.inference_wrapped_model.inference_context
 
@@ -1557,7 +1743,9 @@ class TextGenerationController:
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
-                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                mtp_depth = (
+                    None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                )
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
@@ -1595,7 +1783,9 @@ class TextGenerationController:
         """
         sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
         if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
+            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[
+                :, :active_request_count
+            ].cpu()
         else:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
@@ -1616,8 +1806,12 @@ class TextGenerationController:
                 finished_request_ids (Tensor): Finished request IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
+        active_request_slice = slice(
+            context.paused_request_count, context.total_request_count
+        )
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
         range_push("transfer_samples_to_cpu")
@@ -1650,14 +1844,17 @@ class TextGenerationController:
         # (detected in previous step's post_process_requests)
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(
+                request_ids_list
+            )
             if stop_word_finished_ids:
                 for idx, request_id in enumerate(request_ids_list):
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
         finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+            + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
@@ -1713,7 +1910,9 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+        )
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
@@ -1728,10 +1927,14 @@ class TextGenerationController:
                 else None
             )
 
-            # Enable routing recording before forward pass if routing replay is enabled
+            # Enable routing/indexer recording before forward pass if replay is enabled
             config = self.inference_wrapped_model.model.config
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+            if config.dsa_enable_indexer_replay:
+                IndexerReplay.set_global_indexer_replay_action(
+                    IndexerReplayAction.RECORD
+                )
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
@@ -1748,7 +1951,13 @@ class TextGenerationController:
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            context.kv_block_allocator.store_routing_per_block(
+                self._router_record_bookkeeping()
+            )
+            # Collect flat indexer indices and scatter them into per-block storage.
+            context.kv_block_allocator.store_indexer_per_block(
+                self._indexer_record_bookkeeping()
+            )
             range_pop()
 
         # This is the best place to yield control back to event loop.
@@ -1762,7 +1971,9 @@ class TextGenerationController:
 
         with torch.inference_mode():
             range_push("sampling")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            return_log_probs, return_top_n_logprobs = (
+                self._dynamic_step_log_probs_bookkeeping()
+            )
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
@@ -1787,7 +1998,9 @@ class TextGenerationController:
 
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+                context.kv_block_allocator.release_memory_blocks(
+                    blocks_to_release[remove_mask]
+                )
             else:
                 self._dynamic_step_sample_logits()
 
@@ -1799,11 +2012,15 @@ class TextGenerationController:
                         self._dynamic_step_calculate_log_probs_speculative()
                     )
                     if return_top_n_logprobs:
-                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
-                            log_probs_tensor
+                        top_n_logprobs = (
+                            self._dynamic_step_calculate_top_n_logprobs_speculative(
+                                log_probs_tensor
+                            )
                         )
                 else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    log_probs, log_probs_tensor = (
+                        self._dynamic_step_calculate_log_probs()
+                    )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor
@@ -1816,7 +2033,10 @@ class TextGenerationController:
             num_decode_requests = context.num_decode_requests
             if self.num_speculative_tokens > 0:
                 # Prefill-only batches must not have any accepted speculative tokens.
-                assert num_decode_requests > 0 or (self._accepted_tokens_per_request == -1).all()
+                assert (
+                    num_decode_requests > 0
+                    or (self._accepted_tokens_per_request == -1).all()
+                )
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
@@ -1853,7 +2073,9 @@ class TextGenerationController:
     ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop(loop)
-        return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+        return loop.run_until_complete(
+            self.async_generate_output_tokens_dynamic_batch()
+        )
 
     def _update_top_n_logprobs_dict(
         self,
@@ -1904,7 +2126,9 @@ class TextGenerationController:
         Returns:
             OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
         """
-        assert all(request.prompt_tokens is not None for request in active_requests.values())
+        assert all(
+            request.prompt_tokens is not None for request in active_requests.values()
+        )
 
         # Perform a deep copy so that the request prompt tokens do not get modified.
         batch_prompt_tokens_list: List[List[int]] = list(
@@ -1921,7 +2145,9 @@ class TextGenerationController:
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
 
         # For batch inference the sampling params are the same for all request
-        sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params
+        sampling_params: SamplingParams = list(active_requests.values())[
+            0
+        ].sampling_params
 
         # Remove Float16Module wrapper if it exists
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -1939,12 +2165,16 @@ class TextGenerationController:
 
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
-        max_sequence_length = max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
+        max_sequence_length = (
+            max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
+        )
         context = self.inference_wrapped_model.inference_context
         assert isinstance(context, StaticInferenceContext)
         inference_max_batch_size = context.max_batch_size
         inference_max_sequence_length = context.max_sequence_length
-        padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
+        padded_batch_size = (
+            inference_max_batch_size if enable_cuda_graph else batch_size
+        )
         if padded_batch_size > inference_max_batch_size:
             raise ValueError(
                 f"Padded batch size {padded_batch_size} > max batch size {inference_max_batch_size}"
@@ -2101,7 +2331,10 @@ class TextGenerationController:
                 # Only materialize prompt log probs if the user requests log probs
                 materialize_only_last_token_logits = (
                     self.inference_wrapped_model.inference_context.is_decode_only()
-                    or not (sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0)
+                    or not (
+                        sampling_params.return_log_probs
+                        or sampling_params.top_n_logprobs > 0
+                    )
                 )
                 inference_context = self.inference_wrapped_model.inference_context
                 inference_context.config.materialize_only_last_token_logits = (
@@ -2118,16 +2351,23 @@ class TextGenerationController:
                 batch_prompt_tokens = self.unpad_input_prompt_tokens(
                     padded_batch_prompt_tokens, batch_size
                 )
-                assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
+                assert batch_prompt_tokens.shape[0] == batch_size, (
+                    batch_prompt_tokens.shape[0]
+                )
                 if is_pipeline_last_stage(self.pp_group):
                     logits = logits[:batch_size]
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
-                    logits_seq_len = 1 if materialize_only_last_token_logits else context_length
+                    logits_seq_len = (
+                        1 if materialize_only_last_token_logits else context_length
+                    )
                     logits_shape = [batch_size, logits_seq_len, self.vocab_size]
                     if is_pipeline_last_stage(self.pp_group):
-                        assert logits is not None and torch.Size(logits_shape) == logits.shape
+                        assert (
+                            logits is not None
+                            and torch.Size(logits_shape) == logits.shape
+                        )
                     # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
@@ -2155,7 +2395,8 @@ class TextGenerationController:
 
                 logits_for_top_n_prompt_logprobs = (
                     logits
-                    if context_start_position == 0 and not sampling_params.skip_prompt_log_probs
+                    if context_start_position == 0
+                    and not sampling_params.skip_prompt_log_probs
                     else None
                 )
                 sampled_logits = self.sample_from_logits(
@@ -2170,9 +2411,9 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Substitute the sampled logits only for the prompts that
                     # have started generating tokens
-                    batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
-                        generation_started
-                    ]
+                    batch_prompt_tokens[generation_started, context_end_position] = (
+                        sampled_logits[generation_started]
+                    )
 
                 # Compute log probs
                 if sampling_params.return_log_probs:
@@ -2186,9 +2427,9 @@ class TextGenerationController:
                     )
                     # Get the log probabilities for only the prompt tokens
                     assert output_log_probs is not None
-                    output_log_probs[:, context_start_position:context_end_position] = torch.gather(
-                        log_probs, 2, indices
-                    ).squeeze(2)
+                    output_log_probs[:, context_start_position:context_end_position] = (
+                        torch.gather(log_probs, 2, indices).squeeze(2)
+                    )
 
                 context_start_position = context_end_position
 
@@ -2281,14 +2522,22 @@ class TextGenerationController:
             input_prompt_length = int(prompt_lengths_in_batch[idx])
             # Shorter prompts might have generated more than required tokens. So we trim them down
             required_sequence_length = int(
-                min(generated_sequence_lengths[idx], sampling_params.num_tokens_to_generate)
+                min(
+                    generated_sequence_lengths[idx],
+                    sampling_params.num_tokens_to_generate,
+                )
             )
             # Extract only the generated tokens
             required_result_tokens = batch_prompt_tokens_with_generations[
-                idx, input_prompt_length : (input_prompt_length + required_sequence_length)
+                idx,
+                input_prompt_length : (input_prompt_length + required_sequence_length),
             ]
-            generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
-            request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
+            generated_sequence_lengths = generated_sequence_lengths.to(
+                dtype=torch.int32
+            )
+            request.generated_sequence_lengths = generated_sequence_lengths.to(
+                dtype=torch.int32
+            )
             request.generated_length = required_sequence_length
             request.generated_tokens = required_result_tokens
 
@@ -2299,7 +2548,9 @@ class TextGenerationController:
             spill_length = input_prompt_length - min_prompt_length_in_batch
             if spill_length > 0:
                 spill_latency = request_tpot[:spill_length].sum()
-                request_tpot = torch.cat((spill_latency.unsqueeze(0), request_tpot[spill_length:]))
+                request_tpot = torch.cat(
+                    (spill_latency.unsqueeze(0), request_tpot[spill_length:])
+                )
 
             # Remove the extraneous latencies if the
             # request sequence length < maximum sequence length
@@ -2307,10 +2558,14 @@ class TextGenerationController:
             request.tpot = request_tpot.tolist()
 
             if output_log_probs is not None:
-                request.prompt_log_probs = output_log_probs[idx, : input_prompt_length - 1].tolist()
+                request.prompt_log_probs = output_log_probs[
+                    idx, : input_prompt_length - 1
+                ].tolist()
                 request.generated_log_probs = output_log_probs[
                     idx,
-                    input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
+                    input_prompt_length - 1 : (
+                        input_prompt_length + required_sequence_length - 1
+                    ),
                 ].tolist()
             if sampling_params.top_n_logprobs > 0:
                 if not sampling_params.skip_prompt_log_probs:
@@ -2325,8 +2580,9 @@ class TextGenerationController:
                         : input_prompt_length - 1
                     ]
                     request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
-                        input_prompt_length
-                        - 1 : (input_prompt_length + required_sequence_length - 1)
+                        input_prompt_length - 1 : (
+                            input_prompt_length + required_sequence_length - 1
+                        )
                     ]
                 else:
                     assert len(top_n_logprobs_dict[idx]) >= required_sequence_length, (
@@ -2346,7 +2602,9 @@ class TextGenerationController:
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )
-            request.text = text  # Inference server returns prompts & generations together
+            request.text = (
+                text  # Inference server returns prompts & generations together
+            )
             if sampling_params.return_segments:
                 request.segments = segments[0]
             request.generated_text = text[len(request.prompt) :]
@@ -2369,12 +2627,16 @@ class TextGenerationController:
         Returns:
             A dict of the inference input for the current batch.
         """
-        inference_input = self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+        inference_input = self.inference_wrapped_model.prep_inference_input(
+            prompts_tokens
+        )
 
         if use_attention_mask and (
             attention_mask := inference_input.get("attention_mask", None) is None
         ):
-            inference_input["attention_mask"] = get_attention_mask(prompts_tokens.size(1))
+            inference_input["attention_mask"] = get_attention_mask(
+                prompts_tokens.size(1)
+            )
 
         return inference_input
 
@@ -2465,7 +2727,10 @@ class TextGenerationController:
                 )
             )
 
-            if is_generation_done or generated_length == sampling_params.num_tokens_to_generate:
+            if (
+                is_generation_done
+                or generated_length == sampling_params.num_tokens_to_generate
+            ):
                 stream.finish()
 
         ret = map(
