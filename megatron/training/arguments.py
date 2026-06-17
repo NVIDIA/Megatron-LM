@@ -77,6 +77,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1202,13 +1203,6 @@ def validate_args(args, defaults={}):
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
 
-    # Support for variable sequence lengths across batches/microbatches.
-    # set it if the dataloader supports generation of variable sequence lengths
-    # across batches/microbatches. Due to additional communication overhead
-    # during pipeline parallelism, it should not be set if sequence length
-    # is constant during training.
-    args.variable_seq_lengths = False
-
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
@@ -1380,6 +1374,23 @@ def validate_args(args, defaults={}):
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
+    if args.mock_data and args.sft and args.sft_mock_dataset_config_json is None:
+        args.sft_mock_dataset_config_json = json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": args.seq_length // 2,
+                "max_seq_len": args.seq_length,
+                "mean_seq_len": args.seq_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
+        )
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
@@ -1492,6 +1503,47 @@ def validate_args(args, defaults={}):
     # fsdp_dtensor checkpointing format checks.
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            # Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after varlen scheduler
+    # auto-select so it validates the final resolved scheduler.
+    if args.sequence_packing_scheduler is not None:
+        args.variable_seq_lengths = True
+        assert args.max_seqlen_per_dp_cp_rank is not None, (
+            "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
+        )
+        total_cp_ranks = args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
 
     # Data blend checks
     assert args.mock_data + \
@@ -2117,6 +2169,9 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2872,6 +2927,14 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
+                       help='Maximum sequence length per CP rank. This is used to calculate the '
+                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Enables hybrid context parallel. This is used to balance the workload '
+                       'of each CP rank when we use packed samples with variable sequence lengths. '
+                       'Requires --max-seqlen-per-dp-cp-rank to be set.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -3405,8 +3468,69 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
+    group.add_argument(
+        '--sft-tokenizer-prompt-format',
+        type=str,
+        default="nemotron-h-aligned",
+        help='SFT prompt format.',
+    )
+    group.add_argument(
+        '--sft-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
+        'If not specified and --mock-data is set, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced``. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
     return parser
 
 def _add_logits_distillation_args(parser):
