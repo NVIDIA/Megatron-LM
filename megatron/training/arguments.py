@@ -4016,6 +4016,15 @@ def _add_distributed_args(parser):
         'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.',
     )
     group.add_argument(
+        '--fsdp-db-use-persist-buf-on-alloc-fail',
+        action='store_true',
+        dest='fsdp_db_use_persist_buf_on_alloc_fail',
+        default=False,
+        help='Fall back to a persistent buffer when a bucket does not fit the FSDP double '
+        'buffer size, instead of a dynamic allocation. Required with Megatron-FSDP + MoE + '
+        'CUDA graph to avoid illegal memory access during graph replay (NVIDIA/Megatron-LM#4232).',
+    )
+    group.add_argument(
         '--create-all-gather-group',
         action='store_true',
         help='Create a separate process group for all-gather operations '
