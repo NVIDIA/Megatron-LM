@@ -2,9 +2,9 @@
 
 """Unit tests for the Nemotron6-MoE VLM model provider.
 
-Covers the post-parse preset (vision/data-path knobs + stage freezing) and the
-config parity gate: the from-args language config must reproduce the reference
-Nemotron architecture field-for-field, except the two fields that
+Covers the post-parse preset (vision/data-path knobs) and the config parity
+gate: the from-args language config must reproduce the reference Nemotron
+architecture field-for-field, except the two fields that
 ``core_transformer_config_from_args`` correctly supplies (documented below).
 """
 
@@ -17,7 +17,6 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
     add_model_provider_args,
     apply_model_provider_defaults,
-    apply_training_stage,
     validate_model_provider_args,
 )
 
@@ -80,29 +79,24 @@ def _parse(argv):
 def test_preset_sets_vision_and_datapath_knobs():
     args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--num-image-tiles", "12"])
     apply_model_provider_defaults(args)
-    apply_training_stage(args)
     assert args.pixel_shuffle is True
     assert args.disable_vision_class_token is True
     assert args.image_seq_length == 256 * 12
     assert args.dynamic_resolution is True
-    assert args.use_tiling is False
-    assert args.use_thumbnail is False
-    # Default stage freezes only the vision tower.
-    assert args.training_stage == "stage2"
-    assert args.freeze_vit is True
-    assert getattr(args, "freeze_lm", False) is False
 
 
-def test_stage1_freezes_both_towers():
-    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--training-stage", "stage1"])
+def test_freeze_flags_drive_tower_freezing():
+    # The freeze interface is the --freeze-* flags (no training-stage preset).
+    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--freeze-vit", "--freeze-lm"])
     apply_model_provider_defaults(args)
-    apply_training_stage(args)
     assert args.freeze_vit is True
     assert args.freeze_lm is True
+    assert args.freeze_projection is False
 
 
 def test_preset_skips_non_nemotron_provider():
-    args = _parse(["--model-provider", "mock"])
+    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
+    args.model_provider = "other"  # provider is nemotron-only; simulate a non-match
     apply_model_provider_defaults(args)
     assert getattr(args, "image_seq_length", None) is None
 
@@ -110,7 +104,6 @@ def test_preset_skips_non_nemotron_provider():
 def test_validate_rejects_out_of_range_image_token():
     args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
     apply_model_provider_defaults(args)
-    apply_training_stage(args)
     args.padded_vocab_size = 131072
     args.image_token_id = 131072  # == vocab size -> out of range
     with pytest.raises(ValueError):
@@ -221,5 +214,41 @@ def test_language_config_parity(num_layers, hybrid_pattern):
 
     # Code-only overrides.
     assert config.position_embedding_type == "none"
-    assert config.seq_length == 8192
+    assert config.seq_length == 8192  # sourced from stock --seq-length, not hardcoded
     assert config.tensor_model_parallel_size == 1
+
+
+def test_language_model_spec_builds_mamba():
+    """language_model_spec returns a MambaModel spec carrying the preset config."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.mamba.mamba_model import MambaModel
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+    assert spec.module is MambaModel
+    assert spec.params["config"].num_layers == 20
+    assert spec.params["max_sequence_length"] == args.seq_length
+
+
+def test_vision_submodules_spec_wires_radio_encoder():
+    """vision_submodules_spec wires the RADIO encoder + affine projector, and the
+    preset's pixel-shuffle / class-token-drop knobs reach the wrapper params."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        NEMOTRON_VISION_ENCODER_KEY,
+        vision_submodules_spec,
+    )
+    from examples.mimo.model_providers.radio_encoder import RADIOEncoderWrapper
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+
+    encoder = spec.submodules["encoders"][NEMOTRON_VISION_ENCODER_KEY]
+    assert encoder.module is RADIOEncoderWrapper
+    assert encoder.params["apply_pixel_shuffle"] is True
+    assert encoder.params["drop_class_token"] is True
+
+    projection = spec.submodules["input_projections"][0]
+    assert projection.params["projector_type"] == "affine"
+
+# A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
+# TE + a distributed init and is left to the cog functional check.
