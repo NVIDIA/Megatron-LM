@@ -66,7 +66,7 @@ class DBuffer:
     """
 
     # DBuffer owns only the data-parallel sub-mesh. Higher-level callers, such as
-    # ParameterGroup, should extend returned DTensors with tensor-parallel mesh axes
+    # FsdpParameterGroup, should extend returned DTensors with tensor-parallel mesh axes
     # because TP sharding metadata lives on nn.Parameter in MCore/TransformerEngine.
     mesh: DeviceMesh
     placements: tuple[Placement, ...]

@@ -18,7 +18,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .fsdp_module import FsdpModule
+from .module import FsdpModule
 from .placement import Placements
 
 

@@ -29,11 +29,11 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
 def contained_in_parameter_group(parameter: nn.Parameter) -> bool:
-    """Return whether a parameter is already owned by a ParameterGroup."""
+    """Return whether a parameter is already owned by an FsdpParameterGroup."""
     return hasattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR)
 
 
-class ParameterGroup:
+class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
     owning_module: nn.Module
@@ -66,7 +66,7 @@ class ParameterGroup:
             mixed_precision_policy: Precision policy for main weights and gradients.
         """
         if not parameters:
-            raise ValueError("ParameterGroup requires at least one parameter.")
+            raise ValueError("FsdpParameterGroup requires at least one parameter.")
 
         model_weight_placements = tuple(placements.parameter)
         main_grad_placements = tuple(placements.gradient)
@@ -234,8 +234,7 @@ class ParameterGroup:
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = has_grad(self.sharded_parameters)
         can_reduce_into_main_grad = (
-            not has_sharded_grads
-            and partial_grad.dtype == self.main_grad.dtype
+            not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)

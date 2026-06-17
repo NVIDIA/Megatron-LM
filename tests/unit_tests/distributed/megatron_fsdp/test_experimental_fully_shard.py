@@ -311,9 +311,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
             optimizer.step()
 
     torch.manual_seed(4321)
-    baseline = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
-        device
-    )
+    baseline = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
     baseline_optimizer = torch.optim.AdamW(baseline.parameters(), lr=0.01)
     x = torch.randn(batch, dim, device=device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(device)
@@ -327,9 +325,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     torch.cuda.empty_cache()
 
     torch.manual_seed(4321)
-    model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
-        device
-    )
+    model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
     for layer in model:
         fully_shard(
             layer,

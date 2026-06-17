@@ -22,14 +22,14 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .parameter_group import ParameterGroup, contained_in_parameter_group
+from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
-    _parameter_groups: tuple[ParameterGroup, ...]
+    _parameter_groups: tuple[FsdpParameterGroup, ...]
     _ready_grad_parameters: set[nn.Parameter]
     _num_training_parameters: int
 
@@ -43,7 +43,7 @@ class FsdpModule:
             range(mesh.ndim)
         ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         parameter_groups = [
-            ParameterGroup(
+            FsdpParameterGroup(
                 owning_module=self,
                 parameters=group_parameters,
                 mesh=mesh,
@@ -107,7 +107,7 @@ class FsdpModule:
             group.reshard_parameters()
         self._ready_grad_parameters.clear()
 
-    def parameter_groups(self) -> tuple[ParameterGroup, ...]:
+    def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Return parameter groups owned by this FSDP unit."""
         return self._parameter_groups
 
