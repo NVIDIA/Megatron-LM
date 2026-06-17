@@ -43,6 +43,9 @@ from .validation import (
 
 logger = logging.getLogger(__name__)
 
+# monkeypatch needed for ModelOpt
+# will be removed once MLM updated to newer ModelOpt
+get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
