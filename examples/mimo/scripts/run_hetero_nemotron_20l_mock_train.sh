@@ -41,8 +41,46 @@ esac
   --standalone \
   --nproc-per-node "${GPUS_PER_NODE}" \
   examples/mimo/pretrain_mimo.py \
-  --model-provider nemotron-moe-vlm-20l \
+  --model-provider nemotron-moe-vlm \
   --training-stage "${TRAINING_STAGE}" \
+  --num-layers 20 \
+  --hybrid-layer-pattern "MEMEM*EMEMEM*EMEMEM*" \
+  --hidden-size 2688 \
+  --num-attention-heads 32 \
+  --group-query-attention \
+  --num-query-groups 8 \
+  --ffn-hidden-size 1856 \
+  --kv-channels 128 \
+  --squared-relu \
+  --disable-bias-linear \
+  --normalization RMSNorm \
+  --init-method-std 0.0173 \
+  --num-experts 128 \
+  --moe-router-topk 6 \
+  --moe-grouped-gemm \
+  --moe-ffn-hidden-size 1856 \
+  --moe-router-score-function sigmoid \
+  --moe-router-topk-scaling-factor 2.5 \
+  --moe-router-enable-expert-bias \
+  --moe-router-dtype fp32 \
+  --moe-router-load-balancing-type seq_aux_loss \
+  --moe-router-fusion \
+  --moe-aux-loss-coeff 1e-4 \
+  --moe-shared-expert-intermediate-size 3712 \
+  --moe-shared-expert-overlap \
+  --moe-permute-fusion \
+  --use-fused-weighted-squared-relu \
+  --mamba-num-heads 64 \
+  --mamba-head-dim 64 \
+  --mamba-num-groups 8 \
+  --mamba-state-dim 128 \
+  --linear-conv-kernel-dim 4 \
+  --position-embedding-type none \
+  --calculate-per-token-loss \
+  --cross-entropy-loss-fusion \
+  --seq-length 8192 \
+  --max-position-embeddings 8192 \
+  --bf16 \
   --encoder-tp 2 \
   --encoder-pp 1 \
   --encoder-dp 2 \
