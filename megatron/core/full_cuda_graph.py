@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
@@ -33,6 +33,7 @@ def _print_rank0(message):
     except RuntimeError:
         rank = 0
     if rank == 0:
+        # pylint: disable=bad-builtin
         print(f"[full_cuda_graph] {message}", flush=True)
 
 
