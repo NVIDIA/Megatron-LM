@@ -3353,14 +3353,9 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    if p2p_communicator is not None:
-        from megatron.core.pipeline_parallel.schedules import (
-            forward_backward_pipelining_without_interleaving,
-        )
-
-        forward_backward_func = forward_backward_pipelining_without_interleaving
-    else:
-        forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func(
+        schedule_pg_collection=schedule_pg_collection
+    )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
