@@ -1668,7 +1668,15 @@ class ChainedOptimizer(MegatronOptimizer):
                 else:
                     main_params.append(p)
 
-            if optimizer.config.clip_grad > 0.0:
+            # Skip magnitude-based gradient clipping for orthogonalizing optimizers
+            # (e.g. Muon): their update is scale-invariant (Newton-Schulz discards the
+            # gradient magnitude), so clipping is a no-op at best. At worst, when the
+            # global ``grad_norm`` is large the tiny clip coefficient pushes per-matrix
+            # gradients below Newton-Schulz's normalization floor, silently degenerating
+            # the orthogonalization and stalling training. See issue #5394.
+            if optimizer.config.clip_grad > 0.0 and not getattr(
+                optimizer, "skip_grad_norm_clip", False
+            ):
                 if main_params:
                     clip_grad_by_total_norm_fp32(
                         main_params,
