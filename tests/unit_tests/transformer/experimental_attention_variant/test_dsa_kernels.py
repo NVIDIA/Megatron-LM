@@ -284,12 +284,6 @@ class TestBuildFlatTopkIdxs:
         assert torch.equal(
             len_cpu, len_cuda.cpu()
         ), "(b) length tensor differs between CPU fallback and cuDNN kernel"
-        assert torch.equal(
-            flat_cpu, flat_cuda.cpu()
-        ), "(b) flat tensor differs between CPU fallback and cuDNN kernel"
-        assert torch.equal(
-            len_cpu, len_cuda.cpu()
-        ), "(b) length tensor differs between CPU fallback and cuDNN kernel"
 
 
 # ---------------------------------------------------------------------------

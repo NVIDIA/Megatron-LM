@@ -1126,7 +1126,7 @@ class TestCsaThdIndexHelpers:
         at each segment boundary (not global flat KV ids).
         """
         cu = _cu_seqlens([4, 3])  # = [0, 4, 7]
-        out = get_window_topk_idxs_thd(window_size=3, cu_seqlens_q=cu, device='cpu')
+        out = get_window_topk_idxs_thd(window_size=3, cu_seqlens_q=cu)
         assert out.shape == (7, 3)
         assert out.dtype == torch.int32
         expected = torch.tensor(
@@ -1138,7 +1138,7 @@ class TestCsaThdIndexHelpers:
     def test_window_causality_no_future(self):
         """No window index should exceed the query's position-in-segment."""
         cu = _cu_seqlens([5, 6, 3])
-        out = get_window_topk_idxs_thd(window_size=4, cu_seqlens_q=cu, device='cpu')
+        out = get_window_topk_idxs_thd(window_size=4, cu_seqlens_q=cu)
         seq_lens = (cu[1:] - cu[:-1]).tolist()
         offsets = cu[:-1].tolist()
         for b, (offset, slen) in enumerate(zip(offsets, seq_lens)):
@@ -1165,7 +1165,7 @@ class TestCsaThdIndexHelpers:
         """
         ratio = 4
         out = get_compress_topk_idxs_thd(
-            ratio, _cu_seqlens(q_segs), _cu_seqlens(kv_segs), _cu_seqlens(comp_segs), device='cpu'
+            ratio, _cu_seqlens(q_segs), _cu_seqlens(kv_segs), _cu_seqlens(comp_segs)
         )
         assert out.shape == expected_shape
         for (start, end), (lo, hi) in expected_ranges.items():
@@ -1176,7 +1176,7 @@ class TestCsaThdIndexHelpers:
         """Per-row valid count == ``min(seqlen_compressed[b], (pos+1)//ratio)``."""
         ratio = 4
         out = get_compress_topk_idxs_thd(
-            ratio, _cu_seqlens([8]), _cu_seqlens([5]), _cu_seqlens([2]), device='cpu'
+            ratio, _cu_seqlens([8]), _cu_seqlens([5]), _cu_seqlens([2])
         )
         for pos in range(8):
             n_valid_expected = min(2, (pos + 1) // ratio)

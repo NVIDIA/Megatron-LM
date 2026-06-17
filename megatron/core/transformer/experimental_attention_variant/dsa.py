@@ -811,6 +811,13 @@ def fwd_fused_indexer_loss_naive_thd(
     Segments with ``seqlen_k[b] == 0`` contribute nothing (mean-mode still
     counts their rows in ``total_q``).
     """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "fwd_fused_indexer_loss_naive_thd: this unfused per-segment loop uses "
+            "GPU→CPU syncs (.item()) and cannot run during CUDA graph capture. "
+            "Use the fused kernel path (apply_dsa_kernel_fusion=True) instead."
+        )
+
     B = int(cu_seqlens_q.shape[0]) - 1
     total_q = q.shape[0]
     device = q.device
@@ -907,6 +914,13 @@ def bwd_fused_indexer_loss_naive_thd(
       ``seqlen_q[b] / total_q`` factor here would shrink every indexer
       gradient by ``1 / num_segments``.
     """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "bwd_fused_indexer_loss_naive_thd: this unfused per-segment loop uses "
+            "GPU→CPU syncs (.item()) and cannot run during CUDA graph capture. "
+            "Use the fused kernel path (apply_dsa_kernel_fusion=True) instead."
+        )
+
     B = int(cu_seqlens_q.shape[0]) - 1
     device = q.device
     total_q = max(int(q.shape[0]), 1)

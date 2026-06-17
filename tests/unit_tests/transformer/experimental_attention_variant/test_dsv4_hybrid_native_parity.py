@@ -911,8 +911,12 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=calculate_per_token_loss,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -982,7 +986,8 @@ class TestDSv4HybridNativeParity:
     @pytest.mark.parametrize("variant", ["flash", "pro"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
-        ("seqlen", "dsa_indexer_use_sparse_loss"), [(512, False), (4096, False), (4096, True), (8192, True)]
+        ("seqlen", "dsa_indexer_use_sparse_loss"),
+        [(512, False), (4096, False), (4096, True), (8192, True)],
     )
     def test_thd_attention_matches_native_reference(
         self,
@@ -1012,8 +1017,12 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1089,7 +1098,7 @@ class TestDSv4HybridNativeParity:
         ("seg_lens", "dsa_indexer_use_sparse_loss"),
         [
             # pytest.param([152, 1024, 2345], False, id="three-seg-dense"),
-            pytest.param([152, 1024, 2345], True, id="three-seg-sparse"),
+            pytest.param([152, 1024, 2345], True, id="three-seg-sparse")
         ],
     )
     def test_thd_multiseg_attention_matches_native_reference(
@@ -1131,8 +1140,12 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1144,8 +1157,7 @@ class TestDSv4HybridNativeParity:
         real_params = _copy_real_params_to_native(real_layer, native_layer)
 
         hidden_states = torch.randn(
-            total_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda",
-            requires_grad=True,
+            total_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
         )
         hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
         grad = torch.randn_like(hidden_states)
@@ -1259,8 +1271,12 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1269,14 +1285,14 @@ class TestDSv4HybridNativeParity:
         ).cuda()
 
         hidden_states = torch.randn(
-            actual_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda",
+            actual_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
         )
 
         # ---- Unpadded run (reference) ----------------------------------------
         hidden_unpadded = hidden_states.detach().clone().requires_grad_(True)
         packed_unpadded = _make_thd_packed_seq_params(seg_lens)
         out_unpadded, _ = real_layer(
-            hidden_states=hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded,
+            hidden_states=hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
         )
         grad_unpadded = torch.randn_like(out_unpadded)
         out_unpadded.backward(grad_unpadded)
@@ -1304,7 +1320,7 @@ class TestDSv4HybridNativeParity:
         )
 
         out_padded, _ = real_layer(
-            hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded,
+            hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded
         )
         # Use the same grad for real tokens, zero for padding.
         grad_padded = F.pad(grad_unpadded.detach(), (0, 0, 0, 0, 0, pad_len))
@@ -1313,16 +1329,10 @@ class TestDSv4HybridNativeParity:
         # ---- Assertions: real tokens must match ------------------------------
         label = f"thd-padded-{backend}-{variant}-r{compress_ratio}-segs{len(seg_lens)}"
         _assert_similarity(
-            out_padded[:actual_T].detach(),
-            out_unpadded.detach(),
-            f"{label}:out",
-            eps=fwd_eps,
+            out_padded[:actual_T].detach(), out_unpadded.detach(), f"{label}:out", eps=fwd_eps
         )
         _assert_similarity(
-            hidden_padded.grad[:actual_T],
-            hidden_unpadded.grad,
-            f"{label}:hidden_grad",
-            eps=bwd_eps,
+            hidden_padded.grad[:actual_T], hidden_unpadded.grad, f"{label}:hidden_grad", eps=bwd_eps
         )
 
         del real_layer, hidden_states, hidden_unpadded, hidden_padded

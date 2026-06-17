@@ -442,7 +442,7 @@ def dsa_sparse_attn(
             )
         if kv.ndim != 2:
             raise ValueError(
-                f"THD dsa_sparse_attn expects kv of shape (total_skv, d), " f"got {tuple(kv.shape)}"
+                f"THD dsa_sparse_attn expects kv of shape (total_skv, d), got {tuple(kv.shape)}"
             )
         q_flat, kv_flat = query, kv
     else:
@@ -1505,7 +1505,7 @@ def fused_indexer_sparse_attn(
             (unscaled) ``weights``.
         loss_coeff:   coefficient scaling the KL divergence loss.
         sparse_loss:  if ``True``, KL is computed only over the top-K
-            positions (cheap; **SBHD only**); if ``False`` (the default,
+            positions (cheap); if ``False`` (the default,
             matches ``transformer_config.dsa_indexer_use_sparse_loss``),
             KL is computed over the full causally-valid KV. See
             :class:`FusedIndexerSparseAttnFunc` for the full data flow.

@@ -128,10 +128,7 @@ def _get_csa_compressed_capacity(
 
 
 def get_window_topk_idxs_thd(
-    window_size: int,
-    cu_seqlens_q: torch.Tensor,
-    device: torch.device,
-    total_q: Optional[int] = None,
+    window_size: int, cu_seqlens_q: torch.Tensor, total_q: Optional[int] = None
 ) -> torch.Tensor:
     """Sliding-window indices for a packed THD layout.
 
@@ -145,7 +142,6 @@ def get_window_topk_idxs_thd(
         window_size: number of positions per window.
         cu_seqlens_q: ``(B+1,)`` int32 cumulative Q lengths
             (self-attention: same as KV lengths).
-        device: tensor device.
         total_q: total number of query tokens (avoids a GPU→CPU sync
             when the caller already knows it, e.g. from ``x.shape[0]``).
 
@@ -154,6 +150,7 @@ def get_window_topk_idxs_thd(
     """
     if total_q is None:
         total_q = int(cu_seqlens_q[-1].item())
+    device = cu_seqlens_q.device
     batch_of_token = batch_of_row(cu_seqlens_q, total_q=total_q)
     token_idx = torch.arange(total_q, device=device, dtype=cu_seqlens_q.dtype)
     valid = token_idx < cu_seqlens_q[-1]
@@ -172,7 +169,6 @@ def get_compress_topk_idxs_thd(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
     cu_seqlens_compressed: torch.Tensor,
-    device: torch.device,
     total_q: Optional[int] = None,
     max_n_compressed: Optional[int] = None,
 ) -> torch.Tensor:
@@ -194,7 +190,6 @@ def get_compress_topk_idxs_thd(
             (used to derive the per-segment compressed-offset).
         cu_seqlens_compressed: ``(B+1,)`` int32 cumulative compressed-KV
             lengths (== Compressor's second return value).
-        device: tensor device.
         total_q: total number of query tokens (avoids a GPU→CPU sync
             when the caller already knows it, e.g. from ``x.shape[0]``).
         max_n_compressed: max compressed sequence length across segments
@@ -207,6 +202,7 @@ def get_compress_topk_idxs_thd(
     """
     if total_q is None:
         total_q = int(cu_seqlens_q[-1].item())
+    device = cu_seqlens_q.device
     seq_lens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
     seq_lens_compressed = cu_seqlens_compressed[1:] - cu_seqlens_compressed[:-1]
     if max_n_compressed is None:
@@ -527,6 +523,8 @@ def unfused_compressed_sparse_attn(
     softmax_scale: float,
 ) -> torch.Tensor:
     """Differentiable sparse attention with MQA + learnable attention sink.
+    Note: the unfused function is mainly for reference, and the performance
+    and the memory footprint of it is not good for the real scenario.
 
     Layout is detected from ``query.ndim``:
 
@@ -1640,7 +1638,6 @@ class CompressedSparseAttention(MegatronModule):
         n_compressed_total: int,
         np_: int,
         total_q: int,
-        device: torch.device,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
         cu_seqlens_kv_full: torch.Tensor,
@@ -1655,6 +1652,7 @@ class CompressedSparseAttention(MegatronModule):
         Returns ``(output, indexer_loss)`` where *output* is
         ``(total_q, 1, np * hn)``.
         """
+        device = query.device
         indexer_loss = None
 
         if self.compress_ratio > 1 and n_compressed_total > 0:
@@ -1707,9 +1705,9 @@ class CompressedSparseAttention(MegatronModule):
                                 dtype=cu_seqlens_q_for_loss.dtype,
                                 device=cu_seqlens_q_for_loss.device,
                             ),
-                            (seg_lens_q // self.compress_ratio).cumsum(0).to(
-                                cu_seqlens_q_for_loss.dtype
-                            ),
+                            (seg_lens_q // self.compress_ratio)
+                            .cumsum(0)
+                            .to(cu_seqlens_q_for_loss.dtype),
                         ]
                     )
                     topk_indices_cmp, indexer_loss = FusedDSAIndexerLoss.apply(
@@ -1775,7 +1773,6 @@ class CompressedSparseAttention(MegatronModule):
                     cu_seqlens_q,
                     cu_seqlens_kv,
                     cu_seqlens_compressed,
-                    device,
                     total_q=total_q,
                     max_n_compressed=max_seqlen_q // self.compress_ratio,
                 )
@@ -1800,7 +1797,6 @@ class CompressedSparseAttention(MegatronModule):
         query: torch.Tensor,
         kv_full_thd: torch.Tensor,
         total_q: int,
-        device: torch.device,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
         cu_seqlens_kv_full: torch.Tensor,
@@ -1820,7 +1816,6 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 cu_seqlens_compressed,
-                device,
                 total_q=total_q,
                 max_n_compressed=max_seqlen_q // self.compress_ratio,
             )
@@ -1852,7 +1847,6 @@ class CompressedSparseAttention(MegatronModule):
         kv_full_thd: torch.Tensor,
         packed_seq_params: PackedSeqParams,
         total_q: int,
-        device: torch.device,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
         cu_seqlens_kv_full: torch.Tensor,
@@ -1873,7 +1867,7 @@ class CompressedSparseAttention(MegatronModule):
         q_thd = q_indexer.squeeze(1)
         w_thd = weights_indexer.squeeze(1)
         if k_indexer is None:
-            topk_indices_cmp = torch.full((total_q, 0), -1, dtype=torch.int32, device=device)
+            topk_indices_cmp = torch.full((total_q, 0), -1, dtype=torch.int32, device=query.device)
         else:
             k_thd = k_indexer.squeeze(1)
             max_seqlen_compressed_idx = max_seqlen_q // self.compress_ratio
@@ -1930,7 +1924,6 @@ class CompressedSparseAttention(MegatronModule):
         packed_seq_params: PackedSeqParams,
         total_q: int,
         np_: int,
-        device: torch.device,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
         cu_seqlens_kv_full: torch.Tensor,
@@ -2028,7 +2021,6 @@ class CompressedSparseAttention(MegatronModule):
         #            unsqueeze symmetric with SBHD)
         # x, qr    : (total_q, 1, *)
         total_q, _np, _ = query.shape
-        device = query.device
 
         cu_seqlens_q = (
             packed_seq_params.cu_seqlens_q_padded
@@ -2071,7 +2063,7 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 3: window indices (per-segment local) ---------------------
         window_idxs = get_window_topk_idxs_thd(
-            self.window_size, cu_seqlens_q, device, total_q=total_q
+            self.window_size, cu_seqlens_q, total_q=total_q
         )  # (total_q, win_topk) local-to-segment
 
         # ---- Step 4: path dispatch --------------------------------------------
@@ -2092,7 +2084,6 @@ class CompressedSparseAttention(MegatronModule):
                 n_compressed_total,
                 _np,
                 total_q,
-                device,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 cu_seqlens_kv_full,
@@ -2109,7 +2100,6 @@ class CompressedSparseAttention(MegatronModule):
                 packed_seq_params,
                 total_q,
                 _np,
-                device,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 cu_seqlens_kv_full,
@@ -2126,7 +2116,6 @@ class CompressedSparseAttention(MegatronModule):
                 kv_full_thd,
                 packed_seq_params,
                 total_q,
-                device,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 cu_seqlens_kv_full,
@@ -2139,7 +2128,6 @@ class CompressedSparseAttention(MegatronModule):
                 query,
                 kv_full_thd,
                 total_q,
-                device,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 cu_seqlens_kv_full,
