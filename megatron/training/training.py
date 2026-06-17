@@ -2236,9 +2236,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         if has_nvidia_modelopt and p2p_communicator is None:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors.
-            # Skipped on the MIMO cross-grid path (p2p_communicator present): MIMO does not
-            # use distillation, and this helper reads parallel_state pp groups that are not
-            # initialized without mpu. The MIMO bridge schedule handles its own tensor shapes.
+            # Skipped on the MIMO path: it reads uninitialized parallel_state pp groups.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
@@ -2393,9 +2391,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     if is_last_stage and losses_reduced:
         # Average loss across microbatches. ``losses_reduced`` is empty on ranks
-        # that produce no loss (e.g. MIMO encoder-grid ranks, which are their own
-        # module's last PP stage but never compute the language loss), so guard the
-        # ``losses_reduced[0]`` access.
+        # that produce no loss (e.g. MIMO encoder-grid ranks), so guard the access.
         loss_reduced = {}
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
@@ -3359,10 +3355,8 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     if p2p_communicator is not None:
-        # MIMO cross-grid bridge: select the schedule by the presence of a
-        # cross-module P2P communicator, not by parallel_state pp size (which is
-        # unset when mpu is not initialized). The without-interleaving schedule
-        # accepts both p2p_communicator and the MultiModuleProcessGroupCollection.
+        # MIMO cross-grid bridge: pick the schedule by p2p_communicator presence, not
+        # parallel_state pp size (unset without mpu). without-interleaving supports both.
         from megatron.core.pipeline_parallel.schedules import (
             forward_backward_pipelining_without_interleaving,
         )
