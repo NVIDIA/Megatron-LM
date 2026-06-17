@@ -278,18 +278,17 @@ class MimoModel(MegatronModule):
         if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
-    def _ddp_wrapped_submodules(self):
-        """Yield this rank's submodules that carry a DDP grad buffer.
+    def _active_submodules(self):
+        """Yield this rank's active (DDP-wrapped) submodules.
 
-        MIMO wraps each submodule (language model, modality encoders) in its own
-        DistributedDataParallel rather than wrapping the MimoModel as a single
-        chunk, so only the actively-wrapped submodules expose grad-buffer methods.
-        Raw/inactive submodules are skipped.
+        Each rank builds only the submodules on its grid, and every present
+        submodule is DDP-wrapped, so a present submodule always carries a grad
+        buffer (absent modules are None / missing).
         """
-        if self.language_model is not None and hasattr(self.language_model, 'zero_grad_buffer'):
+        if self.language_model is not None:
             yield self.language_model
         for submodule in self.modality_submodules.values():
-            if submodule is not None and hasattr(submodule, 'zero_grad_buffer'):
+            if submodule is not None:
                 yield submodule
 
     def zero_grad_buffer(self):
@@ -299,7 +298,7 @@ class MimoModel(MegatronModule):
         (it calls ``model_chunk.zero_grad_buffer()``) while MIMO keeps per-submodule
         DDP wrapping.
         """
-        for module in self._ddp_wrapped_submodules():
+        for module in self._active_submodules():
             module.zero_grad_buffer()
 
     def get_text_embeddings(
