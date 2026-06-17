@@ -185,6 +185,7 @@ class TestParallelTransformerBlock:
         if attn_class is not None:
             for layer in full_transformer_block.layers:
                 layer.self_attention.__class__ = attn_class
+                assert not hasattr(layer.self_attention, "dual_rope_kind")
                 layer.self_attention.dual_rope_kind = dual_rope_kind
 
         assert full_transformer_block.config.recompute_granularity == 'full'
