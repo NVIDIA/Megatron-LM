@@ -178,7 +178,6 @@ class GPTModelConfig(ModelConfig):
     """Config file when tp_comm_overlap is enabled."""
 
     ### settings for default layer spec options ###
-    use_transformer_engine_op_fuser: bool = False
     use_arbitrary_attention_mask: bool | None = None
 
     @override
