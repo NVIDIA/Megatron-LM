@@ -166,15 +166,27 @@ def _build_argv(num_layers, hybrid_pattern):
     ]
 
 
-def _parse_full(argv):
-    from megatron.training.arguments import parse_args
+def _parse_validate(argv):
+    """Build args via the production pipeline so validate_args-derived fields
+    (params_dtype, padded_vocab_size, ...) resolve exactly as in a real run.
+
+    Mirrors examples/mimo/pretrain_mimo.py::_parse_and_validate: parse_args ->
+    prepare_model_provider_args (preset, before validate) -> validate_args. Runs
+    at world_size=1, tp=pp=cp=1 so validate_args' divisibility checks pass with
+    no distributed/mpu init.
+    """
+    from examples.mimo.model_providers.nemotron_moe_vlm import prepare_model_provider_args
+    from megatron.training.arguments import parse_args, validate_args
 
     saved = sys.argv
     sys.argv = ["pytest"] + argv
     try:
-        return parse_args(add_model_provider_args, ignore_unknown_args=True)
+        args = parse_args(add_model_provider_args, ignore_unknown_args=True)
     finally:
         sys.argv = saved
+    prepare_model_provider_args(args)
+    validate_args(args)
+    return args
 
 
 @pytest.mark.parametrize("num_layers,hybrid_pattern", [_PRESET_20L, _PRESET_52L])
@@ -189,9 +201,7 @@ def test_language_config_parity(num_layers, hybrid_pattern):
     """
     from examples.mimo.model_providers.nemotron_moe_vlm import nemotron_language_config
 
-    args = _parse_full(_build_argv(num_layers, hybrid_pattern))
-    apply_model_provider_defaults(args)
-    args.padded_vocab_size = 131072
+    args = _parse_validate(_build_argv(num_layers, hybrid_pattern))
 
     config = nemotron_language_config(args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1)
 
