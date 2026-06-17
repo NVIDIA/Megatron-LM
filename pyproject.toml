@@ -242,6 +242,10 @@ omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
+    # These fused paths are mostly Triton DSL kernels and PyTorch
+    # autograd-engine callbacks. The CUDA code is exercised by unit tests,
+    # but coverage.py cannot reliably trace those execution contexts.
+    "*/megatron/core/fusions/*",
 ]
 parallel = true
 sigterm = false
