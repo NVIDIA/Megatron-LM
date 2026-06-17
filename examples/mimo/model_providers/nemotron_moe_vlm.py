@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from typing import Optional
 
 import torch
@@ -36,40 +37,17 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
 
 try:
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelLinear,
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-    )
+    from megatron.core.extensions.transformer_engine import TERowParallelLinear
 except ImportError:  # pragma: no cover - TE always present in the CI container
-    TEColumnParallelLinear = None
-    TELayerNormColumnParallelLinear = None
     TERowParallelLinear = None
 
 MOCK_MODEL_PROVIDER = "mock"
-NEMOTRON_20L_MODEL_PROVIDER = "nemotron-moe-vlm-20l"
-NEMOTRON_54L_MODEL_PROVIDER = "nemotron-moe-vlm-54l"
-NEMOTRON_20L_IMAGE_SEQ_PER_TILE = 256
-NEMOTRON_20L_MAX_NUM_TILES = 12
-NEMOTRON_20L_DEFAULT_STAGE = "stage2"
+NEMOTRON_MODEL_PROVIDER = "nemotron-moe-vlm"
+NEMOTRON_IMAGE_SEQ_PER_TILE = 256
+NEMOTRON_MAX_NUM_TILES = 12
+NEMOTRON_DEFAULT_STAGE = "stage2"
+NEMOTRON_SEQ_LENGTH = 8192
 NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
-
-# Canonical Nemotron6-MoE architecture preset.
-_NEMOTRON_HIDDEN_SIZE = 2688
-_NEMOTRON_NUM_ATTENTION_HEADS = 32
-_NEMOTRON_NUM_QUERY_GROUPS = 8
-_NEMOTRON_FFN_HIDDEN_SIZE = 1856
-_NEMOTRON_KV_CHANNELS = 128
-_NEMOTRON_NUM_MOE_EXPERTS = 128
-_NEMOTRON_MOE_ROUTER_TOPK = 6
-_NEMOTRON_MOE_SHARED_EXPERT = 3712
-_NEMOTRON_SEQ_LENGTH = 8192
-_NEMOTRON_20L_LAYERS = 20
-_NEMOTRON_54L_LAYERS = 54
-_NEMOTRON_20L_HYBRID_PATTERN = "MEMEM*EMEMEM*EMEMEM*"
-_NEMOTRON_54L_HYBRID_PATTERN = (
-    "MEMEM*EMEM*EMEM*EMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEME"
-)
 
 
 # Process-group / grid helpers.
@@ -107,17 +85,9 @@ def is_process_group_member(pg) -> bool:
     return pg is not None and dist.get_rank(group=pg) >= 0
 
 
-def is_nemotron_20l(args: argparse.Namespace) -> bool:
-    """Return whether the Nemotron6-MoE VLM 20L provider is active."""
-    return getattr(args, "model_provider", None) == NEMOTRON_20L_MODEL_PROVIDER
-
-
 def is_nemotron_moe_vlm(args: argparse.Namespace) -> bool:
-    """Return whether a Nemotron6-MoE VLM provider is active."""
-    return getattr(args, "model_provider", None) in (
-        NEMOTRON_20L_MODEL_PROVIDER,
-        NEMOTRON_54L_MODEL_PROVIDER,
-    )
+    """Return whether the Nemotron6-MoE VLM provider is active."""
+    return getattr(args, "model_provider", None) == NEMOTRON_MODEL_PROVIDER
 
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -129,7 +99,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider = parser.add_argument_group("mimo model provider")
     provider.add_argument(
         "--model-provider",
-        choices=[MOCK_MODEL_PROVIDER, NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER],
+        choices=[MOCK_MODEL_PROVIDER, NEMOTRON_MODEL_PROVIDER],
         default=MOCK_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )
@@ -149,7 +119,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--max-num-tiles",
         dest="num_image_tiles",
         type=int,
-        default=NEMOTRON_20L_MAX_NUM_TILES,
+        default=NEMOTRON_MAX_NUM_TILES,
     )
     provider.add_argument("--vision-model-type", type=str, default="radio")
     provider.add_argument("--pixel-shuffle", action="store_true")
@@ -207,78 +177,32 @@ def prepare_model_provider_args(args: argparse.Namespace) -> None:
     args.vision_input_mode = "pixels" if is_nemotron_moe_vlm(args) else "hidden_states"
 
 
-def _force_set(args: argparse.Namespace, name: str, value) -> None:
-    """Force-override a stock arg the runtime/dataloaders read off ``args``."""
-    setattr(args, name, value)
-
-
-def _fill_if_default(args: argparse.Namespace, name: str, value, stock_default) -> None:
-    """Fill an architecture arg only when the user left the stock default."""
-    current = getattr(args, name, stock_default)
-    if current == stock_default:
-        setattr(args, name, value)
-
-
 def apply_model_provider_defaults(args: argparse.Namespace) -> None:
-    """Apply the Nemotron6-MoE VLM architecture preset onto stock args."""
+    """Set the vision/data-path knobs the dataloaders read off ``args``.
+
+    Architecture (num_layers, hidden_size, moe_*, mamba_*, hybrid pattern, ...)
+    comes from stock args via ``core_transformer_config_from_args``; the run
+    script passes those flags. This only sets the vision/data-path fields.
+    """
     if not is_nemotron_moe_vlm(args):
         return
 
-    num_layers = (
-        _NEMOTRON_54L_LAYERS
-        if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER
-        else _NEMOTRON_20L_LAYERS
-    )
-    hybrid_pattern = (
-        _NEMOTRON_54L_HYBRID_PATTERN
-        if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER
-        else _NEMOTRON_20L_HYBRID_PATTERN
-    )
-
-    # --- Force-overrides --------------------------------------------------
-    _force_set(args, "num_layers", num_layers)
-    _force_set(args, "hybrid_layer_pattern", hybrid_pattern)
-    _force_set(args, "pixel_shuffle", True)
-    _force_set(args, "disable_vision_class_token", True)
-    _force_set(
-        args,
-        "image_seq_length",
-        NEMOTRON_20L_IMAGE_SEQ_PER_TILE * args.num_image_tiles,
-    )
+    args.pixel_shuffle = True
+    args.disable_vision_class_token = True
+    args.image_seq_length = NEMOTRON_IMAGE_SEQ_PER_TILE * args.num_image_tiles
     if getattr(args, "dynamic_resolution", None) is None:
         args.dynamic_resolution = True
-    if args.dynamic_resolution:
-        _force_set(args, "use_tiling", False)
-        _force_set(args, "use_thumbnail", False)
-    else:
-        _force_set(args, "use_tiling", True)
-        _force_set(args, "use_thumbnail", True)
-
-    # --- Fill-if-default --------------------------------------------------
-    _fill_if_default(args, "hidden_size", _NEMOTRON_HIDDEN_SIZE, None)
-    _fill_if_default(args, "num_attention_heads", _NEMOTRON_NUM_ATTENTION_HEADS, None)
-    _fill_if_default(args, "num_query_groups", _NEMOTRON_NUM_QUERY_GROUPS, None)
-    _fill_if_default(args, "ffn_hidden_size", _NEMOTRON_FFN_HIDDEN_SIZE, None)
-    _fill_if_default(args, "kv_channels", _NEMOTRON_KV_CHANNELS, None)
-    _fill_if_default(args, "num_experts", _NEMOTRON_NUM_MOE_EXPERTS, None)
-    _fill_if_default(args, "moe_router_topk", _NEMOTRON_MOE_ROUTER_TOPK, 2)
-    _fill_if_default(args, "moe_grouped_gemm", True, False)
-    _fill_if_default(
-        args,
-        "moe_shared_expert_intermediate_size",
-        _NEMOTRON_MOE_SHARED_EXPERT,
-        None,
-    )
-    _fill_if_default(args, "seq_length", _NEMOTRON_SEQ_LENGTH, None)
-    _fill_if_default(args, "max_position_embeddings", _NEMOTRON_SEQ_LENGTH, None)
+    # Dynamic resolution patchifies natively (no fixed-tile resize / thumbnail).
+    args.use_tiling = not args.dynamic_resolution
+    args.use_thumbnail = not args.dynamic_resolution
 
 
 def apply_training_stage(args: argparse.Namespace) -> None:
-    """Apply stage-specific freeze flags for the Nemotron VLM recipe."""
+    """Set the freeze flags for the requested stage (the runtime reads the flags)."""
     if not is_nemotron_moe_vlm(args):
         return
 
-    stage = args.training_stage or NEMOTRON_20L_DEFAULT_STAGE
+    stage = args.training_stage or NEMOTRON_DEFAULT_STAGE
     if stage == "stage1":
         args.freeze_vit = True
         args.freeze_lm = True
@@ -408,17 +332,9 @@ class RADIOEncoderWrapper(torch.nn.Module):
             has_cpe=True,
             embedder_bias=False,
             dynamic_resolution=dynamic_resolution,
+            force_eval_mode=force_eval_mode,
             pg_collection=pg_collection,
         )
-        if self.force_eval_mode:
-            self.radio_model.eval()
-
-    def train(self, mode: bool = True):
-        """Keep frozen RADIO in eval mode while allowing the projection to train."""
-        super().train(mode)
-        if self.force_eval_mode:
-            self.radio_model.eval()
-        return self
 
     @property
     def config(self):
@@ -501,80 +417,44 @@ def nemotron_projection_layer_spec() -> ModuleSpec:
     )
 
 
+def _dtype(args: argparse.Namespace):
+    """Resolve params/pipeline dtype: bf16 unless --fp32/--fp16."""
+    bf16 = not getattr(args, "fp32", False) and not getattr(args, "fp16", False)
+    return bf16, (torch.bfloat16 if bf16 else torch.float32)
+
+
+def _base_config(args: argparse.Namespace) -> TransformerConfig:
+    """Stock config from CLI args; the per-tower override helpers deepcopy this."""
+    from megatron.training.argument_utils import core_transformer_config_from_args
+
+    return core_transformer_config_from_args(args)
+
+
 def nemotron_language_config(
     args: argparse.Namespace, tp_size: int, pp_size: int, ep_size: int, expt_tp_size: int
 ) -> TransformerConfig:
-    """Build the Nemotron6-MoE language TransformerConfig (canonical preset)."""
-    bf16 = not getattr(args, "fp32", False) and not getattr(args, "fp16", False)
-    dtype = torch.bfloat16 if bf16 else torch.float32
-    config = TransformerConfig(
-        num_layers=_NEMOTRON_54L_LAYERS
-        if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER
-        else _NEMOTRON_20L_LAYERS,
-        hidden_size=_NEMOTRON_HIDDEN_SIZE,
-        num_attention_heads=_NEMOTRON_NUM_ATTENTION_HEADS,
-        attention_backend=AttnBackend.flash,
-        num_query_groups=_NEMOTRON_NUM_QUERY_GROUPS,
-        ffn_hidden_size=_NEMOTRON_FFN_HIDDEN_SIZE,
-        kv_channels=_NEMOTRON_KV_CHANNELS,
-        activation_func=squared_relu,
-        gated_linear_unit=False,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        normalization="RMSNorm",
-        add_bias_linear=False,
-        init_method_std=0.0173,
-        use_cpu_initialization=True,
-        variable_seq_lengths=True,
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=pp_size,
-        expert_model_parallel_size=ep_size,
-        expert_tensor_parallel_size=expt_tp_size,
-        sequence_parallel=tp_size > 1,
-        params_dtype=dtype,
-        pipeline_dtype=dtype,
-        bf16=bf16,
-        calculate_per_token_loss=True,
-        cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl="te",
-        bias_activation_fusion=False,
-        masked_softmax_fusion=True,
-        persist_layer_norm=True,
-        bias_dropout_fusion=True,
-        moe_ffn_hidden_size=_NEMOTRON_FFN_HIDDEN_SIZE,
-        num_moe_experts=_NEMOTRON_NUM_MOE_EXPERTS,
-        moe_router_topk=_NEMOTRON_MOE_ROUTER_TOPK,
-        moe_grouped_gemm=True,
-        moe_router_score_function="sigmoid",
-        moe_router_topk_scaling_factor=2.5,
-        moe_router_enable_expert_bias=True,
-        moe_router_dtype="fp32",
-        moe_router_load_balancing_type="seq_aux_loss",
-        moe_router_force_load_balancing=getattr(args, "moe_router_force_load_balancing", False),
-        moe_router_fusion=True,
-        moe_aux_loss_coeff=1.0e-4,
-        moe_shared_expert_intermediate_size=_NEMOTRON_MOE_SHARED_EXPERT,
-        moe_shared_expert_overlap=True,
-        moe_token_dispatcher_type=os.environ.get("MOE_TOKEN_DISPATCHER_TYPE", "alltoall"),
-        moe_flex_dispatcher_backend=os.environ.get("MOE_FLEX_DISPATCHER_BACKEND", "deepep"),
-        moe_permute_fusion=True,
-        use_fused_weighted_squared_relu=True,
-        is_hybrid_model=True,
-        mamba_num_heads=64,
-        mamba_head_dim=64,
-        mamba_num_groups=8,
-        mamba_state_dim=128,
-        linear_conv_kernel_dim=4,
-    )
+    """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
+    config = deepcopy(_base_config(args))
+    bf16, dtype = _dtype(args)
+    # Code-only fields (not cleanly arg-expressible) + hetero parallelism pins.
+    config.attention_backend = AttnBackend.flash
+    config.use_cpu_initialization = True
+    config.variable_seq_lengths = True
+    config.cross_entropy_fusion_impl = "te"
+    # alltoall/deepep are env-tuned per cluster, not run-script flags.
+    config.moe_token_dispatcher_type = os.environ.get("MOE_TOKEN_DISPATCHER_TYPE", "alltoall")
+    config.moe_flex_dispatcher_backend = os.environ.get("MOE_FLEX_DISPATCHER_BACKEND", "deepep")
+    config.params_dtype = dtype
+    config.pipeline_dtype = dtype
+    config.bf16 = bf16
+    config.expert_model_parallel_size = ep_size
+    config.expert_tensor_parallel_size = expt_tp_size
+    config.tensor_model_parallel_size = tp_size
+    config.pipeline_model_parallel_size = pp_size
+    config.sequence_parallel = tp_size > 1
     config.position_embedding_type = "none"
-    config.seq_length = _NEMOTRON_SEQ_LENGTH
-    config.max_position_embeddings = _NEMOTRON_SEQ_LENGTH
-    mtp_layers = int(getattr(args, "mtp_num_layers", 0) or 0)
-    if mtp_layers > 0:
-        config.mtp_num_layers = mtp_layers
-        config.mtp_loss_scaling_factor = float(getattr(args, "mtp_loss_scaling_factor", 0.1))
-        if getattr(args, "mtp_use_repeated_layer", False):
-            config.mtp_use_repeated_layer = True
+    config.seq_length = NEMOTRON_SEQ_LENGTH
+    config.max_position_embeddings = NEMOTRON_SEQ_LENGTH
     return config
 
 
@@ -585,20 +465,12 @@ def require_per_token_loss(config: TransformerConfig) -> None:
 
 
 def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) -> TransformerConfig:
-    """Build the RADIO vision TransformerConfig from the 20L reference provider."""
-    bf16 = not getattr(args, "fp32", False) and not getattr(args, "fp16", False)
-    dtype = torch.bfloat16 if bf16 else torch.float32
-    config = TransformerConfig(
-        num_layers=32,
-        hidden_size=1280,
-        num_attention_heads=16,
-        use_cpu_initialization=True,
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=pp_size,
-        params_dtype=dtype,
-        pipeline_dtype=dtype,
-        bf16=bf16,
-    )
+    """RADIO vision config: stock from-args base + RADIO-specific overrides."""
+    config = deepcopy(_base_config(args))
+    bf16, dtype = _dtype(args)
+    config.num_layers = 32
+    config.hidden_size = 1280
+    config.num_attention_heads = 16
     config.kv_channels = 80
     config.num_query_groups = 16
     config.ffn_hidden_size = 5120
@@ -616,32 +488,57 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.attention_softmax_in_fp32 = True
     config.attention_dropout = 0.0
     config.hidden_dropout = 0.0
-    # Trigger TransformerBlock's final_layernorm allocation.
-    config.mtp_num_layers = 0
+    config.mtp_num_layers = 0  # Trigger TransformerBlock's final_layernorm allocation.
+    config.use_cpu_initialization = True
+    _make_dense_non_hybrid(config)  # ViT inherits no MoE/Mamba/hybrid settings.
+    config.params_dtype = dtype
+    config.pipeline_dtype = dtype
+    config.bf16 = bf16
+    config.tensor_model_parallel_size = tp_size
+    config.pipeline_model_parallel_size = pp_size
+    config.sequence_parallel = False
     return config
 
 
 def nemotron_projection_config(args: argparse.Namespace, tp_size: int) -> TransformerConfig:
-    """Build the RADIO-to-Nemotron projection config."""
-    bf16 = not getattr(args, "fp32", False) and not getattr(args, "fp16", False)
-    dtype = torch.bfloat16 if bf16 else torch.float32
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=_NEMOTRON_HIDDEN_SIZE,
-        num_attention_heads=1,
-        use_cpu_initialization=True,
-        params_dtype=dtype,
-        pipeline_dtype=dtype,
-        bf16=bf16,
-    )
-    config.tensor_model_parallel_size = tp_size
+    """RADIO-to-Nemotron projection config: stock from-args base + overrides."""
+    config = deepcopy(_base_config(args))
+    bf16, dtype = _dtype(args)
+    config.num_layers = 1
+    config.hidden_size = _llm_hidden_size(args)
+    config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * 5120
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
     config.add_bias_linear = False
     config.activation_func = squared_relu
     config.normalization = "RMSNorm"
+    config.use_cpu_initialization = True
+    _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
+    config.params_dtype = dtype
+    config.pipeline_dtype = dtype
+    config.bf16 = bf16
+    config.tensor_model_parallel_size = tp_size
+    config.sequence_parallel = False
     return config
+
+
+def _llm_hidden_size(args: argparse.Namespace) -> int:
+    """Language hidden size the projection maps into (from stock --hidden-size)."""
+    return int(args.hidden_size)
+
+
+def _make_dense_non_hybrid(config: TransformerConfig) -> None:
+    """Strip language-only MoE/Mamba/hybrid settings inherited from the base config."""
+    config.num_moe_experts = None
+    config.moe_ffn_hidden_size = None
+    config.moe_shared_expert_intermediate_size = None
+    config.moe_grouped_gemm = False
+    config.moe_router_fusion = False
+    config.moe_permute_fusion = False
+    config.moe_shared_expert_overlap = False
+    config.is_hybrid_model = False
+    config.use_fused_weighted_squared_relu = False
 
 
 def language_model_spec(
@@ -679,7 +576,7 @@ def language_model_spec(
                 "config": config,
                 "mamba_stack_spec": mamba_stack_spec,
                 "vocab_size": _vocab_size(args),
-                "max_sequence_length": _NEMOTRON_SEQ_LENGTH,
+                "max_sequence_length": NEMOTRON_SEQ_LENGTH,
                 "pre_process": pp_rank == 0,
                 "post_process": pp_rank == pp_size - 1,
                 "hybrid_layer_pattern": args.hybrid_layer_pattern,
