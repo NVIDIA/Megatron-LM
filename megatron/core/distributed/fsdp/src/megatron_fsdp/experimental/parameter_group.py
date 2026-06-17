@@ -121,6 +121,11 @@ class FsdpParameterGroup:
         self.main_grad = None
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            # Keep main_grad persistent for the initial implementation. For micro-batch
+            # size 1, this allocation could be delayed until post_backward and then
+            # eagerly deallocated right after optimizer.step(), avoiding main_grad
+            # storage during forward. That requires a separate lifetime contract with
+            # the optimizer, so this version keeps the simpler persistent buffer.
             self.main_grad = DBuffer(
                 mesh=self.mesh,
                 placements=main_grad_placements,
