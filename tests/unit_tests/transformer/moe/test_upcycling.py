@@ -3,8 +3,6 @@ import os
 import sys
 
 import pytest
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.training.argument_utils import gpt_config_from_args
 import torch
 import torch.distributed
 
@@ -17,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
@@ -26,6 +25,7 @@ from megatron.core.utils import (
     is_te_min_version,
     unwrap_model,
 )
+from megatron.training.argument_utils import gpt_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,

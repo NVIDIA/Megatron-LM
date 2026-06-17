@@ -6,7 +6,6 @@ import os
 import sys
 
 import pytest
-from megatron.core.process_groups_config import ProcessGroupCollection
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
@@ -17,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
