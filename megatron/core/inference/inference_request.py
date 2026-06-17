@@ -67,7 +67,9 @@ def unwrap_serialized_tensors(serialized_request: dict) -> dict:
         dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
     """
     return {
-        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        k: v[1]
+        if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor"
+        else v
         for k, v in serialized_request.items()
     }
 
@@ -88,7 +90,9 @@ class Status(Enum):
 # =========================================================================
 
 
-def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+def compute_block_hashes_batched(
+    prompt_tokens: torch.Tensor, block_size: int
+) -> List[int]:
     """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
     Each block hash is computed as SHA-256(parent_digest || block_bytes), where
@@ -113,14 +117,14 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
     hashes = []
-    parent_digest = b'\x00' * 32  # SHA-256 digest size
+    parent_digest = b"\x00" * 32  # SHA-256 digest size
 
     for i in range(num_complete_blocks):
         block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
         digest = hashlib.sha256(parent_digest + block_bytes).digest()
 
         # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
-        raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
+        raw = int.from_bytes(digest[:8], byteorder="little", signed=False)
         hash_val = (raw % (2**63 - 1)) + 1
 
         hashes.append(hash_val)
@@ -177,7 +181,9 @@ class InferenceRequest:
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()  # shallow dict copy
         obj["status"] = self.status.name if self.status else None
-        obj["sampling_params"] = self.sampling_params.serialize() if self.sampling_params else None
+        obj["sampling_params"] = (
+            self.sampling_params.serialize() if self.sampling_params else None
+        )
         obj["inference_parameters"] = (
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
@@ -187,7 +193,9 @@ class InferenceRequest:
             k: (
                 ("tensor", serialize_tensor(v))
                 if isinstance(v, torch.Tensor)
-                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray) else v
+                else ("ndarray", serialize_ndarray(v))
+                if isinstance(v, np.ndarray)
+                else v
             )
             for k, v in obj.items()
         }
@@ -240,7 +248,9 @@ class DynamicInferenceEventType(Enum):
 
     ADD_ENGINE = auto()  # When request is added to engine via _add_request()
     ADD_CONTEXT = auto()  # When request is added to context (scheduled for prefill)
-    GENERATED_TOKEN = auto()  # When an output token is generated (payload = {"token_id": int})
+    GENERATED_TOKEN = (
+        auto()
+    )  # When an output token is generated (payload = {"token_id": int})
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -269,7 +279,6 @@ class DynamicInferenceEvent:
     payload: Optional[Any] = None
 
     def __post_init__(self):
-
         # Timestamp.
         if self.timestamp is None:
             self.timestamp = time.time()
@@ -371,8 +380,12 @@ class DynamicInferenceRequest(InferenceRequest):
     latency: Optional[float] = None
     # routing_indices is reconstructed from per-block storage when a request finishes.
     routing_indices: Optional[np.ndarray] = None
+    # indexer_indices is reconstructed from per-block storage when a request finishes.
+    indexer_indices: Optional[np.ndarray] = None
     finished_chunk_token_count: int = 0
-    stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    stop_word_ids: Optional[List[List[int]]] = (
+        None  # Tokenized stop words (populated internally)
+    )
     # Consecutive steps this request has been deferred by CG-aware admission gating.
     # Reset to 0 on successful admission. Used only for starvation logging.
     cg_wait_iters: int = 0
@@ -451,7 +464,7 @@ class DynamicInferenceRequest(InferenceRequest):
             # hence we expect routing indices for total_tokens - 1
             assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
-                f"total tokens {total_tokens-1}."
+                f"total tokens {total_tokens - 1}."
             )
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
@@ -459,7 +472,9 @@ class DynamicInferenceRequest(InferenceRequest):
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
-        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
+        self.events = [
+            DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])
+        ]
 
     @property
     def tracked_metadata(self) -> List[Any]:
@@ -473,7 +488,10 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         sp = self.sampling_params
         if sp.termination_id is None:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
                 warnings.warn(
                     f"DynamicInferenceRequest {self.request_id} has no termination_id set "
                     "in its sampling_params. Defaulting to -1."
@@ -595,7 +613,9 @@ class DynamicInferenceRequestRecord:
     latency: Optional[float] = None
 
     @classmethod
-    def from_request(cls, request: DynamicInferenceRequest) -> "DynamicInferenceRequestRecord":
+    def from_request(
+        cls, request: DynamicInferenceRequest
+    ) -> "DynamicInferenceRequestRecord":
         """Initialize record from a single request.
 
         Args:
@@ -685,7 +705,9 @@ class DynamicInferenceRequestRecord:
             new_request.add_event_add_engine()
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
+    def merge(
+        self, tokenizer: MegatronTokenizer | None = None
+    ) -> DynamicInferenceRequest:
         """Merge requests into a single checkpoint-agnostic request object.
 
         Args:
@@ -704,9 +726,17 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        routing_parts = [
+            r.routing_indices for r in self.requests if r.routing_indices is not None
+        ]
         if routing_parts:
             routing_indices = np.concatenate(routing_parts)
+        indexer_indices = None
+        indexer_parts = [
+            r.indexer_indices for r in self.requests if r.indexer_indices is not None
+        ]
+        if indexer_parts:
+            indexer_indices = np.concatenate(indexer_parts)
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -737,6 +767,7 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            indexer_indices=indexer_indices,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
@@ -768,7 +799,9 @@ class DynamicInferenceRequestRecord:
             (DynamicInferenceRequestRecord) Deserialized record.
         """
         request = cls(**obj)
-        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
+        request.requests = [
+            DynamicInferenceRequest.deserialize(r) for r in obj["requests"]
+        ]
         return request
 
 
