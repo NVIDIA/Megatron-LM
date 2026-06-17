@@ -2234,9 +2234,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt and p2p_communicator is None:
-            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors.
-            # Skipped on the MIMO path: it reads uninitialized parallel_state pp groups.
+        if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+            # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
@@ -2390,8 +2389,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         torch.cuda.empty_cache()
 
     if is_last_stage and losses_reduced:
-        # Average loss across microbatches. ``losses_reduced`` is empty on ranks
-        # that produce no loss (e.g. MIMO encoder-grid ranks), so guard the access.
+        # Average loss across microbatches.
+        # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = {}
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
