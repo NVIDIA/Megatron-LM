@@ -41,7 +41,7 @@ class MockCoreAttention(torch.nn.Module):
         self.pg_collection = kwargs.get("pg_collection")
 
     def forward(
-        self, q, k, v, *args, packed_seq_params: Optional[PackedSeqParams] = None, **kwargs
+        self, q, k, v=None, *args, packed_seq_params: Optional[PackedSeqParams] = None, **kwargs
     ):
         """Mock forward pass."""
         if packed_seq_params is None:
