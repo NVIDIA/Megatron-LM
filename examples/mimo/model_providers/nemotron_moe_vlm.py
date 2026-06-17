@@ -1,40 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Nemotron6-MoE VLM model provider for hetero MIMO examples (stock-args edition).
+"""Nemotron6-MoE VLM model provider for hetero MIMO examples.
 
-This is PR-E1 of the NMFW-516 hetero-MIMO upstreaming effort. It ports the
-prototype provider (sasatheesh/pre-vlm-07) onto Megatron's *stock* argument
-system (``megatron.training.arguments``).
-
-The crucial difference from the prototype: stock ``arguments.py`` already
-auto-generates CLI flags for every ``TransformerConfig`` dataclass field
-(``--hidden-size``, ``--num-layers``, ``--num-attention-heads``,
-``--num-query-groups``, ``--ffn-hidden-size``, ``--kv-channels``,
-``--moe-router-topk``, ``--moe-grouped-gemm``,
-``--moe-shared-expert-intermediate-size``, ``--moe-ffn-hidden-size``, etc.) via
-``ArgumentGroupFactory(TransformerConfig, ...)``, plus ``--num-experts``,
-``--seq-length``, ``--max-position-embeddings``, ``--normalization``,
-``--bf16``/``--fp16``, ``--seed``, ``--micro-batch-size``, ``--img-h``,
-``--img-w``, ``--patch-dim``, ``--tokenizer-model``, ``--tokenizer-type``,
-``--squared-relu``, ``--hybrid-layer-pattern``, etc.
-
-Therefore this module:
-  * declares ONLY genuinely-new MIMO/vision/provider args via
-    :func:`add_model_provider_args` (suitable as a stock ``extra_args_provider``);
-  * applies the ``nemotron-moe-vlm-20l`` architecture preset *post-parse* via
-    :func:`prepare_model_provider_args`, with an explicit respect-or-override
-    policy (see module docstring table in the PR description); and
-  * builds the language ``MambaModel`` (hybrid Mamba/MoE) and the vision
-    ``RADIOViTModel`` + ``MultimodalProjector`` ``ModuleSpec`` s, ported faithfully
-    from the prototype.
-
-NOTE on the preset: rather than reconstructing every architecture knob from
-hard-coded constants the way the prototype's ``apply_model_provider_defaults``
-does, the build functions here construct the canonical Nemotron config directly
-(see :func:`nemotron_language_config`). The post-parse preset only *force-sets*
-the small set of args that downstream code (data loaders, validate, the MIMO
-runtime) reads off ``args`` directly, and otherwise *fills* user-omitted
-architecture args so an ``--print-args`` dump is faithful.
+Declares the MIMO/vision provider args, applies the Nemotron architecture
+preset, and builds the language ``MambaModel`` (hybrid Mamba/MoE) and the
+vision ``RADIOViTModel`` + ``MultimodalProjector`` ``ModuleSpec`` s.
 """
 
 from __future__ import annotations
@@ -84,8 +54,7 @@ NEMOTRON_20L_MAX_NUM_TILES = 12
 NEMOTRON_20L_DEFAULT_STAGE = "stage2"
 NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
 
-# Canonical Nemotron6-MoE architecture (the preset). These are the values the
-# build functions construct directly and the preset force-fills onto ``args``.
+# Canonical Nemotron6-MoE architecture preset.
 _NEMOTRON_HIDDEN_SIZE = 2688
 _NEMOTRON_NUM_ATTENTION_HEADS = 32
 _NEMOTRON_NUM_QUERY_GROUPS = 8
@@ -103,13 +72,7 @@ _NEMOTRON_54L_HYBRID_PATTERN = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Small process-group / grid helpers.
-#
-# The prototype imported these from ``examples.mimo.utils.hetero``, which is not
-# present on main yet (it arrives with a later hetero PR). They are vendored
-# here so this provider has no dependency outside the model_providers package.
-# ---------------------------------------------------------------------------
+# Process-group / grid helpers.
 def get_grid_dim_size(grid: HyperCommGrid, dim: str) -> int:
     """Return the size of ``dim`` in a HyperCommGrid, or 1 if absent."""
     try:
@@ -158,31 +121,19 @@ def is_nemotron_moe_vlm(args: argparse.Namespace) -> bool:
 
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register *new* model-provider args for hetero MIMO examples.
+    """Register new model-provider args for hetero MIMO examples.
 
-    Stock ``arguments.py`` already owns every ``TransformerConfig`` field flag
-    plus ``--num-experts``, ``--seq-length``, ``--max-position-embeddings``,
-    ``--img-h``, ``--img-w``, ``--patch-dim``, ``--tokenizer-model``,
-    ``--tokenizer-type``, ``--squared-relu``, ``--hybrid-layer-pattern``, etc.
-    Declaring those here would raise an argparse "conflicting option" error.
-    Only genuinely-new MIMO/vision/provider knobs are added below.
-
-    Designed to be passed straight to stock ``pretrain(extra_args_provider=...)``;
-    returns the parser per the stock hook contract.
+    Only MIMO/vision/provider knobs are declared here; stock ``arguments.py``
+    owns the ``TransformerConfig`` field flags.
     """
     provider = parser.add_argument_group("mimo model provider")
-    # NB: stock train.py already declares --model-provider as a free-form str.
-    # If this provider is wired in as the *only* extra_args_provider it must own
-    # the flag; when composed with the existing MIMO add_mimo_args the caller
-    # must register exactly one. We expose the choices-constrained variant and
-    # leave de-duplication to the entrypoint (see open questions).
     provider.add_argument(
         "--model-provider",
         choices=[MOCK_MODEL_PROVIDER, NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER],
         default=MOCK_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )
-    # Vision / MIMO-specific knobs (none of these exist as stock args).
+    # Vision / MIMO-specific knobs.
     provider.add_argument("--image-seq-length", type=int, default=None,
                           help="Total image tokens emitted by the encoder per sample.")
     provider.add_argument("--image-token-id", type=int, default=511,
@@ -192,9 +143,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument("--tokenizer-prompt-format", type=str, default="nemotron6-moe")
     provider.add_argument("--image-tag-type", type=str, default="")
     provider.add_argument("--force-system-message", action="store_true")
-    # NB: --moe-router-force-load-balancing is auto-generated by stock arguments.py
-    # from the TransformerConfig field; redeclaring it raises an argparse conflict.
-    # nemotron_language_config reads it via getattr(args, "moe_router_force_load_balancing").
     provider.add_argument("--class-token-len", type=int, default=8)
     provider.add_argument(
         "--num-image-tiles",
@@ -243,24 +191,14 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument(
         "--training-stage", choices=["stage1", "stage2", "stage3"], default=None
     )
-    # Stock declares --bf16/--fp16 but not --fp32; the provider/data path uses fp32
-    # as the "force full precision" toggle (matches the prototype). Default bf16.
     provider.add_argument("--fp32", action="store_true", help="Use float32 instead of bfloat16.")
-    # NB: --llm-ep / --llm-expt-tp are *topology* knobs and are declared by the
-    # hetero grid-arg provider (examples/mimo/training/args.py::add_hetero_grid_args),
-    # not here -- declaring them in both groups would raise an argparse
-    # "conflicting option" error when the two providers compose. The build
-    # functions below still read them via getattr(args, "llm_ep"/"llm_expt_tp", ...)
-    # fallbacks, which tolerate their absence (default 1 / None).
     return parser
 
 
 def prepare_model_provider_args(args: argparse.Namespace) -> None:
     """Apply the post-parse Nemotron preset + derived tokenizer/vision settings.
 
-    Call this AFTER ``parse_args`` and BEFORE stock ``validate_args`` so the
-    preset-derived sizes flow into validation. See module docstring for the
-    respect-or-override policy.
+    Call after ``parse_args`` and before stock ``validate_args``.
     """
     apply_model_provider_defaults(args)
     apply_training_stage(args)
@@ -275,30 +213,14 @@ def _force_set(args: argparse.Namespace, name: str, value) -> None:
 
 
 def _fill_if_default(args: argparse.Namespace, name: str, value, stock_default) -> None:
-    """Fill an architecture arg only when the user left the stock default.
-
-    This keeps an ``--print-args`` dump faithful to the constructed config while
-    still respecting an explicit user override (which would then mismatch the
-    hard-coded build config -- see :func:`validate_model_provider_args`).
-    """
+    """Fill an architecture arg only when the user left the stock default."""
     current = getattr(args, name, stock_default)
     if current == stock_default:
         setattr(args, name, value)
 
 
 def apply_model_provider_defaults(args: argparse.Namespace) -> None:
-    """Apply Nemotron6-MoE VLM architecture preset onto stock args.
-
-    Force-overrides (runtime/dataloader/validate read these directly):
-        image_seq_length, pixel_shuffle, disable_vision_class_token,
-        use_tiling, use_thumbnail, dynamic_resolution, num_layers,
-        hybrid_layer_pattern.
-
-    Fill-if-default (kept faithful for arg dumps; build funcs use constants):
-        hidden_size, num_attention_heads, num_query_groups, ffn_hidden_size,
-        kv_channels, num_experts, moe_router_topk, moe_grouped_gemm,
-        moe_shared_expert_intermediate_size, seq_length, max_position_embeddings.
-    """
+    """Apply the Nemotron6-MoE VLM architecture preset onto stock args."""
     if not is_nemotron_moe_vlm(args):
         return
 
@@ -326,10 +248,6 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
     if getattr(args, "dynamic_resolution", None) is None:
         args.dynamic_resolution = True
     if args.dynamic_resolution:
-        # Dynamic-resolution strategy reads use_thumbnail inside
-        # DynamicResolutionImageTilingStrategy and emits an extra thumbnail tile
-        # when True. use_tiling is inert in this branch; pin both False for
-        # args-dump parity (matches the prototype).
         _force_set(args, "use_tiling", False)
         _force_set(args, "use_thumbnail", False)
     else:
@@ -337,10 +255,6 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
         _force_set(args, "use_thumbnail", True)
 
     # --- Fill-if-default --------------------------------------------------
-    # Stock dataclass defaults for these architecture fields. The build
-    # functions construct the canonical config directly from constants, so
-    # these fills exist only so an args dump matches the built model and so
-    # downstream tokenizer/data code sees consistent sizes.
     _fill_if_default(args, "hidden_size", _NEMOTRON_HIDDEN_SIZE, None)
     _fill_if_default(args, "num_attention_heads", _NEMOTRON_NUM_ATTENTION_HEADS, None)
     _fill_if_default(args, "num_query_groups", _NEMOTRON_NUM_QUERY_GROUPS, None)
@@ -399,17 +313,10 @@ def resolve_image_token_id(args: argparse.Namespace) -> None:
     args.image_token_id = int(image_token_id)
     if tokenizer.pad is not None:
         args.pad_token_id = int(tokenizer.pad)
-    # Stock derives padded_vocab_size from the tokenizer at validate time; we
-    # only need padded_vocab_size for the build functions, read lazily below.
 
 
 def _vocab_size(args: argparse.Namespace) -> int:
-    """Resolve the vocabulary size from stock args.
-
-    Stock sets ``padded_vocab_size`` during ``validate_args`` from the tokenizer
-    (or ``--vocab-size`` when provided via tokenizer-type=NullTokenizer). The
-    build functions consume this; tests may set it directly.
-    """
+    """Resolve the vocabulary size from stock args (``padded_vocab_size`` / ``vocab_size``)."""
     for attr in ("padded_vocab_size", "vocab_size"):
         value = getattr(args, attr, None)
         if value:
@@ -435,8 +342,7 @@ def _pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, versi
     """Pixel shuffle for dynamic resolution (variable tile sizes).
 
     Splits the packed sequence by per-tile lengths, applies pixel shuffle to each
-    tile, then re-concatenates. Vendored from the prototype to avoid touching the
-    upstream-owned ``llava_model.py``.
+    tile, then re-concatenates.
     """
     seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
     splits = torch.split(x, seq_lens.tolist(), dim=-2)
@@ -585,10 +491,8 @@ def nemotron_projection_layer_spec() -> ModuleSpec:
     """Return the Nemotron VLM RADIO-to-language projector layer spec."""
     if TERowParallelLinear is None:
         raise RuntimeError("TERowParallelLinear is required")
-    # MultimodalProjector's "affine" path instantiates linear_fc1 with
-    # gather_output=True, which TE column-parallel linears reject. Use the core
-    # ColumnParallelLinear for fc1 (matches pre-vlm-07, whose MultimodalProjector
-    # hardcoded ColumnParallelLinear for the affine projector).
+    # MultimodalProjector's affine path builds fc1 with gather_output=True, which
+    # TE column-parallel linears reject; use core ColumnParallelLinear for fc1.
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
