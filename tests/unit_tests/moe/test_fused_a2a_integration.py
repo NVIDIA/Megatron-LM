@@ -69,6 +69,9 @@ def _resolve(args, clean_env=None):
     # Propagate --moe-deepep-num-sms when --moe-a2a-num-sms is absent (mirrors validate_args)
     if cfg.num_sms is None and getattr(args, 'moe_deepep_num_sms', None) is not None:
         cfg = type(cfg)(chunk_size=cfg.chunk_size, num_sms=args.moe_deepep_num_sms)
+    # Re-validate after propagation to fail fast on odd values
+    # supplied via --moe-deepep-num-sms (mirrors validate_args).
+    cfg.validate()
     return cfg
 
 
@@ -165,6 +168,15 @@ class TestValidateArgsResolutionLogic(unittest.TestCase):
         args = _make_args(moe_a2a_num_sms=6, moe_deepep_num_sms=30)
         cfg = _resolve(args, clean_env={})
         self.assertEqual(cfg.num_sms, 6)
+
+    def test_odd_moe_deepep_num_sms_propagation_raises(self):
+        # moe_deepep_num_sms is propagated into fused_a2a_config.num_sms
+        # when --moe-a2a-num-sms is not set; the post-propagation validate()
+        # call must reject odd values to fail fast at validate_args time.
+        args = _make_args(moe_deepep_num_sms=21)
+        with self.assertRaises(ValueError) as ctx:
+            _resolve(args, clean_env={})
+        self.assertIn("even", str(ctx.exception))
 
     # ---- Defaults (all None) ------------------------------------------------
     def test_all_defaults_none_when_nothing_set(self):

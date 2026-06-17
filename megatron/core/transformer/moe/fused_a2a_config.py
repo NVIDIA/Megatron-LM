@@ -13,14 +13,14 @@ class FusedA2AConfig:
 
     Fields:
         chunk_size: Optional[int] - Chunk size for all-to-all (must be positive if set)
-        num_sms: Optional[int] - Number of SMs for kernel (must be positive if set)
+        num_sms: Optional[int] - Number of SMs for kernel (must be positive and even if set)
         # Future tunables can be added here
-    
+
     Precedence: CLI > ENV > CONFIG FILE > DEFAULTS
     """
     chunk_size: Optional[int] = None
     num_sms: Optional[int] = None
-    # Add future tunables here
+    # Future tunables can be added here
 
     def validate(self):
         if self.chunk_size is not None:
@@ -29,6 +29,14 @@ class FusedA2AConfig:
         if self.num_sms is not None:
             if not (self.num_sms > 0):
                 raise ValueError(f"num_sms must be positive, got {self.num_sms}")
+            # DeepEP's Buffer.set_num_sms asserts new_num_sms % 2 == 0
+            # and the C++ kernel asserts config.num_sms % 2 == 0. An odd value
+            # would crash deep inside the kernel with an opaque assertion;
+            # fail fast at validate_args time instead.
+            if self.num_sms % 2 != 0:
+                raise ValueError(
+                    f"num_sms must be even (DeepEP requirement), got {self.num_sms}"
+                )
 
     @staticmethod
     def from_dict(cfg: dict) -> 'FusedA2AConfig':

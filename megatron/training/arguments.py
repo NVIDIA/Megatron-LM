@@ -1810,6 +1810,10 @@ def validate_args(args, defaults={}):
             chunk_size=args.fused_a2a_config.chunk_size,
             num_sms=args.moe_deepep_num_sms,
         )
+    # Re-validate after the propagation so the even-SM check also covers
+    # values supplied via --moe-deepep-num-sms (which the resolver above
+    # does not see).
+    args.fused_a2a_config.validate()
     if args.fused_a2a_config.chunk_size is not None or args.fused_a2a_config.num_sms is not None:
         print_rank_0(f'[MoE A2A] Effective FusedA2AConfig: {args.fused_a2a_config}')
 
@@ -2149,6 +2153,14 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # registered manually in _add_moe_args to keep the None-sentinel
+        # for the FusedA2A config resolution flow; auto-generation would
+        # shadow the dataclass default and break backward compatibility.
+        "moe_deepep_num_sms",
+        # not a CLI arg: populated programmatically by validate_args via
+        # resolve_fused_a2a_config_from_sources. Auto-generating this as a
+        # CLI flag would expose a dataclass type that argparse cannot parse.
+        "fused_a2a_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

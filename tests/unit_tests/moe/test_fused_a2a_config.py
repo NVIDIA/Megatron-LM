@@ -17,10 +17,11 @@ class TestFusedA2AConfigResolution(unittest.TestCase):
                 del os.environ[k]
 
     def test_cli_priority(self):
-        args = DummyArgs(moe_a2a_chunk_size=42, moe_a2a_num_sms=7, moe_a2a_config_file=None)
+        # num_sms must be even (DeepEP requirement).
+        args = DummyArgs(moe_a2a_chunk_size=42, moe_a2a_num_sms=8, moe_a2a_config_file=None)
         cfg = resolve_fused_a2a_config_from_sources(cli_args=args)
         self.assertEqual(cfg.chunk_size, 42)
-        self.assertEqual(cfg.num_sms, 7)
+        self.assertEqual(cfg.num_sms, 8)
 
     def test_env_priority(self):
         os.environ["MOE_A2A_CHUNK_SIZE"] = "99"
