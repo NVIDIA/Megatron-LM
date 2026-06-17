@@ -912,6 +912,9 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+            # Orthogonalizing optimizers (Muon) have scale-invariant updates; magnitude
+            # gradient clipping is a no-op at best and harmful at worst (see issue #5394).
+            setattr(optimizer, 'skip_grad_norm_clip', True)
             tp_group = pg_collection.tp
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
@@ -990,6 +993,9 @@ def _get_megatron_emerging_optimizer(
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
         )
+        # LayerWise owns the Muon-managed (orthogonalizing) matrix params; their update
+        # is scale-invariant, so skip magnitude gradient clipping for it (see issue #5394).
+        setattr(layer_wise_optimizer, 'skip_grad_norm_clip', True)
         # LayerWise owns Muon-managed params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:
