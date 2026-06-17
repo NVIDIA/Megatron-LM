@@ -12,3 +12,5 @@ coverage:
         if_not_found: success
 fixes:
   - "/opt/megatron-lm/::"
+ignore:
+  - "megatron/core/fusions/*"
