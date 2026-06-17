@@ -128,6 +128,19 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 
 Effective per-GPU weight size = `W / (TP × GTP)`. Example: TP=4 + GTP=8 with NVFP4 → 32× weight-memory reduction and 128× wire-bandwidth reduction vs full BF16 replication, before data parallelism.
 
+**Weak scaling.** GTP fixes the shard width and grows the job by adding data-parallel replicas (DP = #GPUs / GTP), so per-GPU compute stays constant while only the DP gradient reduction widens with scale.
+
+The best GTP size is model- and cluster-dependent — driven by weight sizes, per-GPU memory headroom, and which collectives can be kept on fast links — so there is no single recommended value. The example below runs on **GB200 NVL72** (a 72-GPU NVLink domain) and uses **GTP64**, which places communication as:
+
+- **NVLink-local:** the *dense-layer* (Mamba / attention / shared-expert) GTP weight all-gather + wgrad reduce-scatter, **and** the `EP64` all-to-all dispatch/combine — all kept inside one ≤72-GPU NVLink domain (EP64 ≤ NVL72).
+- **Inter-node (IB / CX7):** the DP gradient reduction **plus** the `EGTP2` expert-weight all-gather / wgrad reduce-scatter, whose 2 shards land on different NVLink domains and so cross nodes.
+
+On an Ultra-proxy hybrid Mamba-MoE model (**~280B parameters**; `GTP64 · EP64 · EGTP2`, mb1, MXFP8, BF16 reduce-scatter, no CUDA graph), scaling efficiency holds **≥93 % of the single-domain (128-GPU / DP2) baseline out to 3072 GPUs (DP48)**, while max reserved memory *decreases* with scale (137 → 104 GB) as the distributed optimizer shards optimizer/grad state across more DP replicas.
+
+> **Takeaway:** near-flat weak scaling — **≥93 % efficiency from 128 → 3072 GPUs**, with per-GPU memory shrinking as DP grows.
+
+![GTP64 weak-scaling efficiency](images/0617_gtp64_weak_scaling_efficiency.png)
+
 ### 1.7 Native distributed checkpointing (DCP)
 
 **GTP + DCP is straightforward:**
