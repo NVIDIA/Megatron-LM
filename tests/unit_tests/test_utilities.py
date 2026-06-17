@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
-from typing import Literal
-from datetime import timedelta
 from argparse import Namespace
+from datetime import timedelta
+from typing import Literal
 
 import torch
 from torch._C._distributed_c10d import PrefixStore
@@ -10,9 +10,9 @@ from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
 from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
     gpt_config_from_args,
     hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
 )
 
 
