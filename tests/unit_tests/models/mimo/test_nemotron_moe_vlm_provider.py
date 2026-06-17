@@ -22,9 +22,10 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 )
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
-# 20L and 52L Nemotron presets; every other field is shared.
+# 20L and 54L Nemotron presets; every other field is shared. num_layers follows
+# the pattern length (get_hybrid_total_layer_count): 20 and 54 layer-tokens.
 _PRESET_20L = (20, "MEMEM*EMEMEM*EMEMEM*")
-_PRESET_52L = (52, "MEMEM*EMEM*EMEM*EMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEME")
+_PRESET_54L = (54, "MEMEM*EMEM*EMEM*EMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEME")
 
 # Shared Nemotron6-MoE architecture (the reference fixture): the exact values the
 # run script passes as stock CLI flags.
@@ -193,7 +194,7 @@ def _parse_validate(argv):
     return args
 
 
-@pytest.mark.parametrize("num_layers,hybrid_pattern", [_PRESET_20L, _PRESET_52L])
+@pytest.mark.parametrize("num_layers,hybrid_pattern", [_PRESET_20L, _PRESET_54L])
 def test_language_config_parity(num_layers, hybrid_pattern):
     """from-args language config == reference arch, modulo 2 documented fields.
 
