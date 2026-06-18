@@ -74,7 +74,7 @@ BEFORE_SCRIPT: |
     --export-default-te-spec \
     --export-quant-cfg MAMBA_MOE_NVFP4_CONSERVATIVE_CFG \
     --calib-size 256 \
-    --calib-batch-size 4 \
+    --calib-batch-size 8 \
     --skip-generate
   echo -e "\n=== Stage 1 complete ===\n"
 MODEL_ARGS:
