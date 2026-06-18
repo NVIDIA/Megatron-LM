@@ -45,7 +45,13 @@ except (ImportError, PackageNotFoundError):
 HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 
 if HAVE_EMERGING_OPTIMIZERS:
+    from emerging_optimizers.orthogonalized_optimizers import OrthogonalizedOptimizer
     from emerging_optimizers.scalar_optimizers import Lion
+else:
+    # Sentinel so ``isinstance(opt, OrthogonalizedOptimizer)`` is always False when the
+    # package is unavailable. All sites that test it are already guarded by
+    # HAVE_EMERGING_OPTIMIZERS, so this is only a defensive fallback for import safety.
+    OrthogonalizedOptimizer = ()
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -874,7 +880,21 @@ def _get_megatron_emerging_optimizer(
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
+            # Only orthogonalizing optimizers (Muon family, i.e. subclasses of
+            # OrthogonalizedOptimizer) have scale-invariant updates that make magnitude
+            # grad-norm clipping a no-op-at-best / harmful-at-worst (issue #5394).
+            # Other emerging optimizers (SOAP, Lion) are NOT scale-invariant and must
+            # still be clipped, so the flag is gated on this check rather than set for
+            # every emerging optimizer.
+            is_orthogonalizing = isinstance(optimizer, OrthogonalizedOptimizer)
             if use_layer_wise:
+                # Mark the raw (unwrapped) Muon sub-optimizer so the flag is visible in
+                # the layer-wise DIRECT path. NOTE: LayerWiseDistributedOptimizer re-wraps
+                # base optimizers in Float16OptimizerWithFloat16Params when config.bf16 is
+                # True, so this flag is *also* re-propagated onto the actual
+                # ``chained_optimizers`` members after construction below.
+                if is_orthogonalizing:
+                    setattr(optimizer, 'skip_grad_norm_clip', True)
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
             if config.bf16:
@@ -886,7 +906,9 @@ def _get_megatron_emerging_optimizer(
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
             # Orthogonalizing optimizers (Muon) have scale-invariant updates; magnitude
             # gradient clipping is a no-op at best and harmful at worst (see issue #5394).
-            setattr(optimizer, 'skip_grad_norm_clip', True)
+            # Gate on is_orthogonalizing so SOAP/Lion (non-scale-invariant) keep clipping.
+            if is_orthogonalizing:
+                setattr(optimizer, 'skip_grad_norm_clip', True)
             if pg_collection is None or not hasattr(pg_collection, 'tp'):
                 tp_group = parallel_state.get_tensor_model_parallel_group()
             else:
@@ -966,9 +988,28 @@ def _get_megatron_emerging_optimizer(
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
         )
-        # LayerWise owns the Muon-managed (orthogonalizing) matrix params; their update
-        # is scale-invariant, so skip magnitude gradient clipping for it (see issue #5394).
-        setattr(layer_wise_optimizer, 'skip_grad_norm_clip', True)
+        # Re-propagate the skip flag onto the actual chained sub-optimizers. LayerWise
+        # re-wraps each base optimizer in Float16OptimizerWithFloat16Params when
+        # config.bf16 is True, so the flag set on the raw Muon sub-optimizer above is
+        # NOT visible on ``layer_wise_optimizer.chained_optimizers`` (the wrappers do not
+        # forward attribute access). The DIRECT path returns ``layer_wise_optimizer`` and
+        # runs the inherited ``ChainedOptimizer.step()`` over these inner subs, reading
+        # their per-sub flag. Carry the flag from each member's underlying raw optimizer
+        # (``.optimizer`` on a wrapper, else the member itself) so Muon subs stay flagged
+        # while non-emerging (Adam) subs stay unflagged.
+        for sub_optimizer in layer_wise_optimizer.chained_optimizers:
+            raw_sub = getattr(sub_optimizer, 'optimizer', sub_optimizer)
+            if getattr(raw_sub, 'skip_grad_norm_clip', False):
+                setattr(sub_optimizer, 'skip_grad_norm_clip', True)
+        # The CHAINED path (results non-empty) treats ``layer_wise_optimizer`` as a leaf
+        # and reads the CONTAINER flag, so set it only when every base sub-optimizer is
+        # orthogonalizing (Muon-only container). In the separate-distopt path the
+        # container is Muon-only -> True; if any non-Muon sub is inside (legacy path) the
+        # container must NOT claim skip -- and that path is direct anyway.
+        if base_optimizers and all(
+            getattr(o, 'skip_grad_norm_clip', False) for o in base_optimizers
+        ):
+            setattr(layer_wise_optimizer, 'skip_grad_norm_clip', True)
         # LayerWise owns Muon-managed params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:

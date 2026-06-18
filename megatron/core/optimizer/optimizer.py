@@ -1545,6 +1545,45 @@ class ChainedOptimizer(MegatronOptimizer):
         return grad_norm
 
     @torch.no_grad()
+    def _get_grad_norm_skip_threshold(self):
+        """Grad norm used for the ``grad_norm_skip_threshold`` comparison.
+
+        This is the same quantity as :meth:`get_grad_norm` but EXCLUDES the gradients of
+        sub-optimizers flagged with ``skip_grad_norm_clip`` (orthogonalizing / Muon-family,
+        see issue #5394). A Muon-managed sub can produce a combined grad norm of order 1e7
+        whose magnitude is irrelevant (Newton-Schulz discards it); folding it into the
+        shared norm would wrongly trip the skip threshold for well-behaved Adam-managed
+        subs. Excluding those grads gives each non-skipped sub a threshold check against a
+        norm computed only over the params that are actually magnitude-clipped.
+
+        When no sub is flagged, this returns exactly :meth:`get_grad_norm` (no behavior
+        change for non-Muon users). The distributed all-reduce semantics of
+        :func:`get_grad_norm_fp32` are preserved; because ``skip_grad_norm_clip`` is fixed
+        at construction it is identical across ranks, so the set of collectives issued here
+        is globally consistent.
+        """
+        # Fast path / no-op-equivalence: if nothing is flagged, reuse get_grad_norm so the
+        # value (and the collectives issued) are bit-for-bit the existing behavior.
+        if not any(
+            getattr(optimizer, 'skip_grad_norm_clip', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return self.get_grad_norm()
+
+        # Mirror get_grad_norm() exactly (single get_grad_norm_fp32 over the concatenated
+        # grads), but concatenate only the non-skip sub-optimizers' grads. When nothing is
+        # flagged this is handled by the fast path above, so for non-Muon users the value
+        # and collectives are unchanged.
+        grads_for_norm = []
+        for optimizer in self.chained_optimizers:
+            if getattr(optimizer, 'skip_grad_norm_clip', False):
+                continue
+            grads_for_norm += optimizer.get_grads_for_grad_norm()
+        return get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        )
+
+    @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
             params = []
@@ -1631,11 +1670,19 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        # Norm used for the grad_norm_skip_threshold comparison only. It excludes the grads
+        # of skip-flagged (orthogonalizing / Muon) sub-optimizers so a Muon sub's huge but
+        # meaningless grad magnitude cannot wrongly trip the skip threshold for well-behaved
+        # Adam subs (see issue #5394). Equals ``grad_norm`` when nothing is flagged.
+        # NOTE: scoped to the threshold check; the clip ``total_norm`` below still uses the
+        # full ``grad_norm`` (a separate follow-up may narrow the clip norm too).
+        threshold_grad_norm = self._get_grad_norm_skip_threshold()
         should_skip_update = False
 
         should_clip = any(
             not (hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer)
             and optimizer.config.clip_grad > 0.0
+            and not getattr(optimizer, 'skip_grad_norm_clip', False)
             for optimizer in self.chained_optimizers
         )
         if should_clip:
@@ -1695,9 +1742,20 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
+            # Skip-flagged (Muon) subs are exempt from the magnitude-based skip threshold:
+            # their grad magnitude is discarded by Newton-Schulz, so it is not a meaningful
+            # signal for skipping the update. For all other subs, compare against the
+            # narrower ``threshold_grad_norm`` (which excludes the Muon subs' grads).
+            if (
+                not getattr(optimizer, "skip_grad_norm_clip", False)
+                and threshold_grad_norm > optimizer.config.grad_norm_skip_threshold
+                and main_params
+            ):
                 log_single_rank(
-                    logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+                    logger,
+                    logging.INFO,
+                    "skipping grad norm because it's too large %s",
+                    threshold_grad_norm,
                 )
                 should_skip_update = True
 
