@@ -28,7 +28,7 @@ try:
         tag_gtp_params_with_names,
         update_gtp_config,
         wait_async_comms,
-        wait_gtp_grads_on_current_stream,
+        wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
     )
 
@@ -56,6 +56,6 @@ __all__ = [
     "tag_gtp_params_with_names",
     "update_gtp_config",
     "wait_async_comms",
-    "wait_gtp_grads_on_current_stream",
+    "wait_for_gtp_grad_reduction_on_current_stream",
     "wrap_module_params_gtp",
 ]

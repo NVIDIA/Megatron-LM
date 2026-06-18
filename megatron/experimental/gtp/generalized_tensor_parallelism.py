@@ -255,7 +255,7 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
-def wait_gtp_grads_on_current_stream() -> None:
+def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
     Drains in-flight AG/RS on the side streams (eager expert backward may still be writing

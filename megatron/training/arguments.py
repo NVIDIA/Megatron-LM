@@ -1462,6 +1462,11 @@ def validate_args(args, defaults={}):
                 "force setting NCCL_PROTO=Simple might introduce bad perf."
             )
 
+        assert not args.ddp_average_in_collective, (
+            "GTP requires --ddp-average-in-collective off (the default); averaged collectives "
+            "would need per-buffer 1/gtp scaling."
+        )
+
         assert args.ckpt_format in ('torch', 'torch_dist'), (
             f"GTP supports only --ckpt-format 'torch' (legacy) or 'torch_dist', got "
             f"'{args.ckpt_format}'."

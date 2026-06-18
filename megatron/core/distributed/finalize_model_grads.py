@@ -541,9 +541,9 @@ def finalize_model_grads(
         config.generalized_tensor_parallel_remat_size > 1
         or config.expert_generalized_tensor_parallel_remat_size > 1
     ):
-        from megatron.experimental.gtp import wait_gtp_grads_on_current_stream
+        from megatron.experimental.gtp import wait_for_gtp_grad_reduction_on_current_stream
 
-        wait_gtp_grads_on_current_stream()
+        wait_for_gtp_grad_reduction_on_current_stream()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
