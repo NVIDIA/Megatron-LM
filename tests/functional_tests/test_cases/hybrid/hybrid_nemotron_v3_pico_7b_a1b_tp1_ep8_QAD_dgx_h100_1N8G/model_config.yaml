@@ -4,13 +4,11 @@ ENV_VARS:
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: ":4096:8"
   # Paths
-  MODEL_BF16_CKPT: "${DATA_PATH}/model/nemotron_v3_pico_7b-a1b"
+  MODEL_BF16_CKPT: "${DATA_PATH}/model/nemotron_v3_pico_7b-a1b/3T-token_deeparch"
   PTQ_QUANTIZED_CKPT: "${DATA_CACHE_PATH}/ptq_quantized_ckpt"
   TOKENIZER: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
   HF_HOME: "${DATA_PATH}/.hf_cache"
-  DISTILL_CONFIG: '{intermediate_layer_pairs: [], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: false, kd_loss_scale: 10.0}'
 BEFORE_SCRIPT: |
-  mkdir -p ${DATA_CACHE_PATH}/distill && echo $DISTILL_CONFIG | yq -P > ${DATA_CACHE_PATH}/distill/distill_config.yaml
   # Stage 1: PTQ quantization via quantize.py directly
   echo -e "\n=== Stage 1: Running PTQ (NVFP4) ===\n"
   cd /opt/megatron-lm
@@ -33,11 +31,11 @@ BEFORE_SCRIPT: |
     --expert-tensor-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --context-parallel-size 1 \
-    --hidden-size 1536 \
-    --num-attention-heads 12 \
+    --hidden-size 1216 \
+    --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 2 \
-    --ffn-hidden-size 1024 \
+    --ffn-hidden-size 896 \
     --kv-channels 128 \
     --squared-relu \
     --normalization RMSNorm \
@@ -46,9 +44,9 @@ BEFORE_SCRIPT: |
     --hidden-dropout 0.0 \
     --position-embedding-type none \
     --untie-embeddings-and-output-weights \
-    --init-method-std 0.0229 \
-    --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEMEM*EMEMEM*EMEMEME \
-    --mamba-num-heads 48 \
+    --init-method-std 0.0256 \
+    --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+    --mamba-num-heads 64 \
     --export-model-type MambaModel \
     --num-experts 128 \
     --moe-router-topk 6 \
@@ -58,7 +56,7 @@ BEFORE_SCRIPT: |
     --moe-router-dtype fp32 \
     --moe-router-score-function sigmoid \
     --moe-router-load-balancing-type seq_aux_loss \
-    --moe-shared-expert-intermediate-size 2048 \
+    --moe-shared-expert-intermediate-size 3712 \
     --moe-token-dispatcher-type alltoall \
     --moe-permute-fusion \
     --moe-grouped-gemm \
@@ -75,23 +73,22 @@ BEFORE_SCRIPT: |
     --distributed-timeout-minutes 30 \
     --export-default-te-spec \
     --export-quant-cfg MAMBA_MOE_NVFP4_CONSERVATIVE_CFG \
-    --calib-size 512 \
-    --calib-batch-size 16 \
+    --calib-size 256 \
+    --calib-batch-size 4 \
     --skip-generate
   echo -e "\n=== Stage 1 complete ===\n"
 MODEL_ARGS:
   # KD teacher/config
   --export-default-te-spec: true
   --export-kd-teacher-load: ${MODEL_BF16_CKPT}
-  --export-kd-cfg: ${DATA_CACHE_PATH}/distill/distill_config.yaml
   --auto-detect-ckpt-format: true
   --finetune: true
   # Architecture
-  --hidden-size: 1536
-  --num-attention-heads: 12
+  --hidden-size: 1216
+  --num-attention-heads: 32
   --group-query-attention: true
   --num-query-groups: 2
-  --ffn-hidden-size: 1024
+  --ffn-hidden-size: 896
   --kv-channels: 128
   --squared-relu: true
   --normalization: RMSNorm
@@ -100,9 +97,9 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --position-embedding-type: none
   --untie-embeddings-and-output-weights: true
-  --init-method-std: 0.0229
-  --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEMEM*EMEMEM*EMEMEME
-  --mamba-num-heads: 48
+  --init-method-std: 0.0256
+  --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
+  --mamba-num-heads: 64
   --export-model-type: MambaModel
   # MoE
   --num-experts: 128
@@ -113,7 +110,7 @@ MODEL_ARGS:
   --moe-router-dtype: fp32
   --moe-router-score-function: sigmoid
   --moe-router-load-balancing-type: seq_aux_loss
-  --moe-shared-expert-intermediate-size: 2048
+  --moe-shared-expert-intermediate-size: 3712
   --moe-token-dispatcher-type: alltoall
   --moe-permute-fusion: true
   --moe-grouped-gemm: true
