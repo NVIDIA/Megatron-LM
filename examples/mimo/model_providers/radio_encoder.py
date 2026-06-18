@@ -1,12 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""RADIO vision encoder for hetero MIMO examples.
-
-Provides the RADIO encoder wrapper (class-token drop + pixel-shuffle adapter over
-core ``RADIOViTModel``), its vision ``TransformerConfig``, the encoder
-``ModuleSpec`` builder, and the RADIO-specific CLI args. Imported by the
-Nemotron6-MoE VLM provider.
-"""
+"""RADIO vision encoder for hetero MIMO examples: wrapper, vision config, encoder spec, and args."""
 
 from __future__ import annotations
 
@@ -27,8 +21,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
 
-# Canonical module name for the RADIO encoder. Single source of truth shared by
-# the provider (encoders-dict key) and the topology default encoder name.
+# Canonical RADIO encoder module name (shared by the provider key + topology default).
 RADIO_ENCODER_MODULE_NAME = "radio_encoder"
 
 
@@ -41,6 +34,8 @@ def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.Argument
                        help="Apply pixel shuffle to the RADIO features.")
     group.add_argument("--disable-vision-class-token", action="store_true",
                        help="Drop the RADIO class tokens from the emitted features.")
+    group.add_argument("--dynamic-resolution", action="store_true",
+                       help="Patchify each image at native aspect ratio with a token budget.")
     return parser
 
 
