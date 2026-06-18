@@ -9,7 +9,7 @@
     test:
       runs-on:
         group: nemo-ci-cpu
-        labels: nvidia-ci-aws-cpu-dev-01
+        labels: nvidia-ci-aws-cpu-dev-02
       steps:
         - run: |
             docker --version
