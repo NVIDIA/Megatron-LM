@@ -330,6 +330,58 @@ def test_builder():
         ).build()
 
 
+def test_fast_cache_load_disables_rank_synchronization(monkeypatch, tmp_path):
+    tokenizer = build_tokenizer(
+        Namespace(
+            vocab_size=2048,
+            tokenizer_type="NullTokenizer",
+            rank=0,
+            make_vocab_size_divisible_by=128,
+            tensor_model_parallel_size=1,
+        )
+    )
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=8,
+        blend=None,
+        blend_per_split=[(["dummy-prefix"], None), (["dummy-prefix"], None), None],
+        split=None,
+        path_to_cache=str(tmp_path),
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        fast_cache_load=True,
+    )
+    builder = BlendedMegatronDatasetBuilder(GPTDataset, [10, 10, 0], lambda: True, config)
+
+    class DummyLowLevelDataset:
+        sequence_lengths = numpy.ones(16, dtype=numpy.int32)
+
+    synchronize_ranks_values = []
+
+    monkeypatch.setattr(
+        GPTDataset,
+        "build_low_level_dataset",
+        staticmethod(lambda dataset_path, config: DummyLowLevelDataset()),
+    )
+
+    def record_synchronize_ranks(cls, is_built_on_rank, synchronize_ranks, *args):
+        synchronize_ranks_values.append(synchronize_ranks)
+        return object()
+
+    monkeypatch.setattr(
+        BlendedMegatronDatasetBuilder,
+        "build_generic_dataset",
+        staticmethod(record_synchronize_ranks),
+    )
+
+    builder._build_megatron_dataset_splits("dummy-prefix", config.split_matrix, [10, 10, 0])
+
+    assert synchronize_ranks_values == [False, False]
+
+
 @pytest.mark.parametrize("use_split", [True, False])
 @pytest.mark.parametrize("add_weights", [True, False])
 @pytest.mark.parametrize("fast_cache_load", [True, False])
