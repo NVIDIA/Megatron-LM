@@ -114,9 +114,12 @@ class TestRADIOEncoderWrapper:
         # Packed variable-tile path: one square tile of rows*cols patches, fed as
         # pre-patchified features (matches the dynamic-resolution data builder).
         # The packed (thd) attention path requires bf16 + a flash/fused backend
-        # (the fixed sbhd path tolerates fp32; this one does not). imgs_sizes /
-        # cu_seqlens / max_seqlen stay int32 on CPU, matching the data builder;
-        # RADIOViTModel itself adds class_token_len per tile to cu_seqlens.
+        # (the fixed sbhd path tolerates fp32; this one does not). TE fused attn
+        # needs cu_seqlens on CUDA (mirrors training/step.py::move_batch_to_cuda,
+        # which moves the PackedSeqParams index tensors to the device); max_seqlen
+        # is passed as plain ints; imgs_sizes stays on CPU since RADIOViTModel reads
+        # it via .tolist()/Python iteration. RADIOViTModel itself adds
+        # class_token_len per tile to cu_seqlens.
         wrapper = _build_wrapper(
             apply_pixel_shuffle=True,
             drop_class_token=True,
@@ -129,13 +132,13 @@ class TestRADIOEncoderWrapper:
         feat_dim = 3 * PATCH * PATCH
         x = torch.randn(1, patches, feat_dim, device="cuda", dtype=torch.bfloat16)
         imgs_sizes = torch.tensor([[rows * PATCH, cols * PATCH]], dtype=torch.int32)
-        cu_seqlens = torch.tensor([0, patches], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, patches], dtype=torch.int32, device="cuda")
         packed = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=torch.tensor(patches, dtype=torch.int32),
-            max_seqlen_kv=torch.tensor(patches, dtype=torch.int32),
+            max_seqlen_q=patches,
+            max_seqlen_kv=patches,
         )
 
         out = wrapper(x, imgs_sizes=imgs_sizes, packed_seq_params=packed)
