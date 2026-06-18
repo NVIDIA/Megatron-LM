@@ -182,6 +182,7 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
 
     def test_module_construction(self):
         gdn = self.gdn
+        assert getattr(gdn.in_proj.weight, "use_muon", True) is False
         if self.use_gdn2:
             assert isinstance(gdn, GatedDeltaNet2)
             assert gdn.gated_delta_rule is chunk_gdn2
