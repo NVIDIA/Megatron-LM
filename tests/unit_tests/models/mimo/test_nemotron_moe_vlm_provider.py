@@ -75,11 +75,13 @@ def _parse(argv):
     return args
 
 
-def test_dynamic_resolution_defaults_on():
+def test_dynamic_resolution_defaults_off():
+    # --dynamic-resolution is a radio_encoder flag (store_true), registered via
+    # add_radio_encoder_args; default off, passed explicitly to enable.
     args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
-    assert args.dynamic_resolution is True  # default-on; --no-dynamic-resolution disables
-    off = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--no-dynamic-resolution"])
-    assert off.dynamic_resolution is False
+    assert args.dynamic_resolution is False
+    on = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--dynamic-resolution"])
+    assert on.dynamic_resolution is True
 
 
 def test_freeze_flags_drive_tower_freezing():

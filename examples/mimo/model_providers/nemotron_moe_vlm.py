@@ -1,12 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Nemotron6-MoE VLM model provider for hetero MIMO examples.
-
-Declares the MIMO/vision provider args and builds the language ``MambaModel``
-(hybrid Mamba/MoE) and the vision ``RADIOViTModel`` + ``MultimodalProjector``
-``ModuleSpec`` s. Image-token / tokenizer / data-path knobs live with the data
-pipeline, not here.
-"""
+"""Nemotron6-MoE VLM model provider for hetero MIMO examples."""
 
 from __future__ import annotations
 
@@ -64,15 +58,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
         default=NEMOTRON_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )
-    provider.add_argument(
-        "--dynamic-resolution",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Patchify each image at its native aspect ratio with a token budget instead of "
-            "fixed-tile resize. Pass --no-dynamic-resolution to disable."
-        ),
-    )
     provider.add_argument("--freeze-lm", action="store_true")
     provider.add_argument("--freeze-vit", action="store_true")
     provider.add_argument("--freeze-projection", action="store_true")
@@ -118,14 +103,10 @@ def nemotron_language_config(
     """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
     bf16, dtype = _dtype(args)
-    # Code-only fields (not cleanly arg-expressible) + hetero parallelism pins.
-    # attention_backend flows from --attention-backend; cross_entropy_fusion_impl
-    # from its (native) default — both auto-copied by core_transformer_config_from_args.
+    # Code-only fields + hetero parallelism pins.
     config.use_cpu_initialization = True
     config.variable_seq_lengths = True
-    # moe_token_dispatcher_type / moe_flex_dispatcher_backend come from CLI flags
-    # so the base config validates at construction (shared-expert-overlap requires
-    # the alltoall/flex dispatcher); the run script defaults them from env.
+    # moe dispatcher flags come from CLI so the base config validates at construction.
     config.params_dtype = dtype
     config.pipeline_dtype = dtype
     config.bf16 = bf16
@@ -135,8 +116,7 @@ def nemotron_language_config(
     config.pipeline_model_parallel_size = pp_size
     config.sequence_parallel = tp_size > 1
     config.position_embedding_type = "none"
-    # seq_length / max_position_embeddings come from stock --seq-length /
-    # --max-position-embeddings via the from-args base (no silent override).
+    # seq_length / max_position_embeddings flow from stock args (no override).
     return config
 
 
@@ -233,8 +213,8 @@ def vision_submodules_spec(
 
     vision_config = radio_vision_config(args, tp_size, pp_size)
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
-    # projector_type="affine" uses only submodules.linear_fc1 (a single affine
-    # projection); fc2 from MLPSubmodules is ignored unless type is "mlp".
+    # affine -> single linear_fc1; mlp -> fc1+act+fc2 (core MultimodalProjector
+    # branches on vision_projection_type).
     vision_projection_spec = ModuleSpec(
         module=MultimodalProjector,
         params={
