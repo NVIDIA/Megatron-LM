@@ -16,6 +16,7 @@ import torch.distributed as dist
 from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -38,6 +39,7 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -81,8 +83,29 @@ def build_no_sync_func(mimo_model):
     return no_sync_func
 
 
-def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    """Create a HyperCommGrid with specified parallelism."""
+def create_hypercomm_grid(
+    offset=0, tp=1, cp=1, pp=1, dp=1, expert_tp=None, expert_ep=1, expert_dp=1
+):
+    """Create a HyperCommGrid with specified parallelism.
+
+    When ``expert_ep > 1`` or ``expert_tp`` differs from the dense ``tp`` an
+    ``"expert"`` MoE factorization is registered as a *separate* grid rank-view via
+    the ``register_view(...)`` API (rather than via the degenerate base
+    ``ep``/``expt_dp`` dims). The expert view re-partitions the SAME ranks as the
+    dense base view into ``expt_tp x ep x expt_dp x pp``.
+
+    ``pp`` is declared a shared dim of the expert view. ``register_view`` enforces
+    that a shared dim enumerate to the SAME ranks under both factorizations, so the
+    expert ``dim_names`` are ordered ``[expt_tp, pp, expt_dp, ep]`` -- this makes the
+    expert ``pp`` groups identical to the base ``pp`` groups (the base order is
+    ``[tp, cp, pp, dp, ...]``; with ``cp == 1`` the base ``pp`` stride matches the
+    expert ``pp`` stride). The expert ``[expt_tp, ep, pp]`` group then reuses the
+    base ``pp`` ranks.
+
+    The optimizer (``_get_pg_collection_for_optimizer``) reads the expert groups
+    from this registered view via ``grid.get_pg(..., view="expert")`` rather than
+    the base-dim KeyError fallback.
+    """
     grid = HyperCommGrid(
         shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
         dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
@@ -94,13 +117,41 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["pp"])
     grid.create_pg(["dp"])
     grid.create_pg(["dp", "cp"])
+    grid.create_pg(["tp", "cp"])  # tp_cp: consumed by the MoE router (and TP+CP collectives)
+    grid.create_pg(["tp", "cp", "dp"])  # tp_dp_cp: consumed by the MoE router
     grid.create_pg(["ep"])
     grid.create_pg(["expt_dp"])
     # Required by _get_pg_collection_for_optimizer
     grid.create_pg(["tp", "pp"])
     grid.create_pg(["tp", "ep", "pp"])
     grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Dense distributed-optimizer grad-stats group (excludes the expert ep axis).
+    grid.create_pg(["tp", "cp", "dp", "pp"])
+
+    if expert_tp is None:
+        expert_tp = tp
+    register_expert = expert_ep > 1 or expert_dp > 1 or expert_tp != tp
+    if register_expert:
+        assert expert_tp * expert_ep * expert_dp * pp == grid.size, (
+            f"expert factorization expt_tp={expert_tp} * ep={expert_ep} * "
+            f"expt_dp={expert_dp} * pp={pp} must equal grid size {grid.size}"
+        )
+        # dim order chosen so that the shared 'pp' dim enumerates to the same ranks
+        # as the base view's 'pp' (see docstring).
+        grid.register_view(
+            "expert",
+            shape=[expert_tp, pp, expert_dp, expert_ep],
+            dim_names=["expt_tp", "pp", "expt_dp", "ep"],
+            shared_dims=["pp"],
+        )
+        # Groups consumed by the optimizer (expert path).
+        grid.create_pg(["expt_tp", "ep", "pp"], view="expert")
+        grid.create_pg(["expt_dp"], view="expert")
+        # Groups consumed by the MoE model (router / token dispatcher / experts).
+        grid.create_pg(["ep"], view="expert")
+        grid.create_pg(["expt_tp"], view="expert")
+        grid.create_pg(["expt_tp", "ep"], view="expert")
+
     _active_grids.append(grid)
     return grid
 
@@ -116,15 +167,33 @@ def destroy_all_grids():
 
 
 def get_pg_collection(grid):
-    """Get ProcessGroupCollection from grid."""
+    """Get ProcessGroupCollection from grid.
+
+    When the grid has a registered ``"expert"`` rank-view (MoE), the expert-parallel
+    groups consumed by the MoE router / token dispatcher / experts
+    (``ep``/``expt_tp``/``tp_ep``/``expt_dp``) are read from that view via
+    ``grid.get_pg(..., view="expert")`` rather than from the degenerate base dims, so
+    the model and the optimizer agree on the same expert factorization. The dense
+    ``tp`` group always comes from the base view (attention/dense MLP).
+    """
     pg_collection = ProcessGroupCollection()
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
     pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])  # consumed by the MoE router
+    pg_collection.tp_dp_cp = grid.get_pg(["tp", "cp", "dp"])  # consumed by the MoE router
+
+    try:
+        pg_collection.ep = grid.get_pg("ep", view="expert")
+    except KeyError:
+        pg_collection.ep = grid.get_pg("ep")
+        pg_collection.expt_dp = grid.get_pg("expt_dp")
+    else:
+        pg_collection.expt_tp = grid.get_pg("expt_tp", view="expert")
+        pg_collection.tp_ep = grid.get_pg(["expt_tp", "ep"], view="expert")
+        pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
     return pg_collection
 
 
@@ -215,6 +284,9 @@ def get_language_model_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    num_moe_experts=None,
+    moe_router_topk=2,
+    moe_grouped_gemm=False,
 ):
     """Get the language model spec.
 
@@ -226,6 +298,12 @@ def get_language_model_spec(
     TransformerConfig, which pins DDP's gradient_scaling_factor to 1.0
     (pure SUM reduction). Callers that flip this must supply a 3-tuple
     loss_func and drive the external divide in their finalize hook.
+
+    ``num_moe_experts`` builds an MoE language model. The expert-model-parallel
+    and expert-tensor-parallel sizes are taken from ``pg_collection.ep`` /
+    ``pg_collection.expt_tp`` (which the caller sources from the grid's registered
+    ``"expert"`` view), and the layer spec is built with MoE submodules so tokens
+    actually route through experts.
     """
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -238,6 +316,24 @@ def get_language_model_spec(
     if not dropout:
         extra_kwargs['attention_dropout'] = 0.0
         extra_kwargs['hidden_dropout'] = 0.0
+
+    if num_moe_experts is not None:
+        ep_size = pg_collection.ep.size() if pg_collection.ep is not None else 1
+        expt_tp_size = (
+            pg_collection.expt_tp.size() if pg_collection.expt_tp is not None else tp_size
+        )
+        extra_kwargs.update(
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=moe_router_topk,
+            moe_grouped_gemm=moe_grouped_gemm,
+            expert_model_parallel_size=ep_size,
+            expert_tensor_parallel_size=expt_tp_size,
+            # Bias in MoE is only supported with ETP==1; disable for the ETP>1 toy.
+            add_bias_linear=False,
+            # The MoE layer raises during training when attention tensor parallelism
+            # (tp_size > 1) is enabled without sequence parallelism, so turn it on.
+            sequence_parallel=tp_size > 1,
+        )
 
     lm_config = TransformerConfig(
         num_layers=num_layers,
@@ -255,16 +351,23 @@ def get_language_model_spec(
         calculate_per_token_loss=per_token_loss,
         **extra_kwargs,
     )
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+    )
     return ModuleSpec(
         module=GPTModel,
         params={
             "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+            "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": vocab_size,
             "max_sequence_length": seq_len,
             "pre_process": (pp_rank == 0),
             "post_process": (pp_rank == pp_size - 1),
             "pg_collection": pg_collection,
+            # Under sequence parallelism the MIMO partition adapter owns the
+            # sequence-dim scatter, so the GPT embedding must NOT also scatter to the
+            # SP region; MimoModel raises otherwise.
+            "scatter_embedding_sequence_parallel": not lm_config.sequence_parallel,
         },
     )
 
@@ -381,6 +484,9 @@ def get_mimo_model(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    num_moe_experts=None,
+    moe_router_topk=2,
+    moe_grouped_gemm=False,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -415,6 +521,9 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        num_moe_experts=num_moe_experts,
+        moe_router_topk=moe_router_topk,
+        moe_grouped_gemm=moe_grouped_gemm,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
@@ -438,7 +547,11 @@ def get_mimo_model(
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config)
+    # Thread the LLM's tp/cp groups so the partition adapter (engaged when the LLM
+    # uses sequence parallelism or context parallelism, e.g. the MoE+ETP test) reads
+    # them from the grid instead of falling back to the uninitialized global
+    # parallel_state tensor-model-parallel group.
+    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
     mimo_model.to(torch.device("cuda"))
     if bf16:
         mimo_model.to(torch.bfloat16)
@@ -567,10 +680,24 @@ def run_mimo_1f1b_test(
     seq_length=64,
     micro_batch_size=2,
     num_microbatches=4,
+    llm_expert_tp=None,
+    llm_expert_ep=1,
+    llm_expert_dp=1,
+    num_moe_experts=None,
+    moe_router_topk=2,
+    moe_grouped_gemm=False,
 ):
-    """Run MIMO model through 1F1B schedule and verify."""
+    """Run MIMO model through 1F1B schedule and verify.
+
+    When ``num_moe_experts`` is set, the language model is an MoE GPT model with
+    expert parallelism. The LLM grid registers an ``"expert"`` rank-view whose
+    factorization is ``expt_tp=llm_expert_tp x ep=llm_expert_ep x
+    expt_dp=llm_expert_dp x pp=llm_pp`` (see ``create_hypercomm_grid``); the
+    optimizer consumes it via the ``grid.get_pg(..., view="expert")`` path.
+    """
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
     # GPTModel (LanguageModule) asserts these are unset or match the attention backend.
+    import math
     import os
 
     os.environ.pop('NVTE_FLASH_ATTN', None)
@@ -582,7 +709,16 @@ def run_mimo_1f1b_test(
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
     )
-    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(
+        offset=llm_offset,
+        tp=llm_tp,
+        cp=1,
+        pp=llm_pp,
+        dp=llm_dp,
+        expert_tp=llm_expert_tp,
+        expert_ep=llm_expert_ep,
+        expert_dp=llm_expert_dp,
+    )
 
     # Create all embedding PGs upfront — dist.new_group is a collective that
     # requires ALL ranks to participate, so we must create them before any
@@ -590,6 +726,34 @@ def run_mimo_1f1b_test(
     create_all_embedding_groups([encoder_grid, llm_grid])
 
     torch.manual_seed(12345)
+    # Register the 'model-parallel-rng' / expert-parallel RNG states in the TP RNG
+    # tracker. Under sequence parallelism the language embedding forks the
+    # 'model-parallel-rng' region (for SP dropout) and the MoE experts fork the
+    # expert-parallel region. These HyperCommGrid-based tests never initialize the
+    # global parallel_state, so derive the tp/ep/etp ranks from the rank's own grid
+    # and pass them explicitly instead of letting the helper read uninitialized globals.
+    if is_rank_in_grid(llm_grid):
+        seed_tp_rank = dist.get_rank(llm_grid.get_pg("tp"))
+        try:
+            seed_ep_rank = dist.get_rank(llm_grid.get_pg("ep", view="expert"))
+            seed_etp_rank = dist.get_rank(llm_grid.get_pg("expt_tp", view="expert"))
+        except KeyError:
+            seed_ep_rank = 0
+            seed_etp_rank = 0
+    else:
+        seed_tp_rank = dist.get_rank(encoder_grid.get_pg("tp"))
+        seed_ep_rank = 0
+        seed_etp_rank = 0
+    tensor_parallel.model_parallel_cuda_manual_seed(
+        12345, tp_rank=seed_tp_rank, ep_rank=seed_ep_rank, etp_rank=seed_etp_rank
+    )
+
+    # The sequence-parallel output-layer all-gather pulls a scratch buffer from
+    # parallel_state's global memory buffer, which full parallel_state init would
+    # normally create. These HyperCommGrid tests don't init parallel_state, so set it
+    # up directly (idempotently) before the forward pass.
+    if parallel_state._GLOBAL_MEMORY_BUFFER is None:
+        parallel_state._set_global_memory_buffer()
 
     mimo_model, module_to_grid_map, topology, language_pg, vision_pg = get_mimo_model(
         encoder_name=encoder_name,
@@ -599,6 +763,9 @@ def run_mimo_1f1b_test(
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=seq_length,
+        num_moe_experts=num_moe_experts,
+        moe_router_topk=moe_router_topk,
+        moe_grouped_gemm=moe_grouped_gemm,
     )
 
     no_sync_func = build_no_sync_func(mimo_model)
@@ -700,6 +867,25 @@ def run_mimo_1f1b_test(
         output_tensor, loss_mask = model(**batch)
         return output_tensor, partial(loss_func, loss_mask)
 
+    # When MoE is enabled, verify the optimizer takes the expert-view path
+    # (grid.get_pg(..., view="expert")) rather than the base-dim KeyError fallback: the
+    # LLM optimizer's expert groups must be the registered view's groups.
+    if num_moe_experts is not None and is_rank_in_grid(llm_grid):
+        from megatron.core.models.mimo.optimizer import EXPERT_VIEW
+
+        llm_info = optimizer.module_infos[MIMO_LANGUAGE_MODULE_KEY]
+        assert llm_info.pg_collection.tp_ep_pp is llm_grid.get_pg(
+            ["expt_tp", "ep", "pp"], view=EXPERT_VIEW
+        ), "MIMO optimizer did not source tp_ep_pp from the registered 'expert' view"
+        assert llm_info.pg_collection.expt_dp is llm_grid.get_pg(
+            ["expt_dp"], view=EXPERT_VIEW
+        ), "MIMO optimizer did not source expt_dp from the registered 'expert' view"
+        # The expert tp_ep_pp partition must differ from the dense mp ([tp,pp]) one,
+        # confirming a genuine EP/ETP factorization is honored (not aliased onto dense).
+        assert sorted(dist.get_process_group_ranks(llm_info.pg_collection.tp_ep_pp)) != sorted(
+            dist.get_process_group_ranks(llm_info.pg_collection.mp)
+        ), "expert tp_ep_pp aliased onto dense mp; EP/ETP not actually exercised"
+
     optimizer.zero_grad()
 
     try:
@@ -715,18 +901,42 @@ def run_mimo_1f1b_test(
             pg_collection=pg_collection,
         )
 
+        # Cheap MoE sanity: at least one expert parameter received a finite gradient
+        # on LLM ranks. Checked after the schedule's finalize hook has run (which
+        # reduces grads into main_grad) but before the optimizer consumes them.
+        if num_moe_experts is not None and is_rank_in_grid(llm_grid):
+            lm = unwrap_model(mimo_model.language_model)
+            expert_grads = [
+                p.main_grad
+                for name, p in lm.named_parameters()
+                if 'experts' in name and getattr(p, 'main_grad', None) is not None
+            ]
+            assert expert_grads, "No expert parameters with a main_grad found on LLM rank"
+            assert any(
+                g.abs().sum().item() > 0 for g in expert_grads
+            ), "All expert-parameter gradients are zero; tokens did not route through experts"
+            assert all(
+                torch.isfinite(g).all() for g in expert_grads
+            ), "Expert-parameter gradient is not finite"
+
         # Optimizer step with global gradient clipping
         success, grad_norm, num_zeros = optimizer.step()
         assert success, "Optimizer step failed"
         assert (
             grad_norm is not None and grad_norm > 0
         ), f"Expected positive grad norm, got {grad_norm}"
+        if num_moe_experts is not None:
+            assert math.isfinite(grad_norm), f"grad_norm is not finite: {grad_norm}"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
             assert len(losses) > 0, "Expected losses on last LLM stage"
             for loss_dict in losses:
                 assert 'loss_reduced' in loss_dict
+                if num_moe_experts is not None:
+                    loss_val = loss_dict['loss_reduced']
+                    loss_val = loss_val.item() if torch.is_tensor(loss_val) else float(loss_val)
+                    assert math.isfinite(loss_val), f"Loss is not finite: {loss_val}"
 
         return losses
     finally:
@@ -920,5 +1130,52 @@ class TestMimo1F1BSchedule:
             vocab_size=1000,
             seq_length=64,
             micro_batch_size=2,
+            num_microbatches=4,
+        )
+
+    def test_moe_llm_ep2_etp2_8gpu(self):
+        """MoE LLM with EP=2 and ETP=2 trains e2e on 8 GPUs (expert rank-view).
+
+        Heterogeneous 8-rank split:
+          - Encoder (dense vision): ranks 0-3, TP=1 PP=1 DP=4.
+          - MoE LLM: ranks 4-7, dense attention TP=2 PP=1 DP=2; the SAME 4 ranks
+            are re-partitioned by a registered ``"expert"`` rank-view into
+            ``expt_tp=2 x ep=2 x expt_dp=1 x pp=1`` (8 = 4 encoder + 4 LLM).
+
+        This exercises expert parallelism (EP>1) AND expert-tensor parallelism
+        (ETP>1) via ``register_view("expert", ...)``: the MoE model's expert process
+        groups and the optimizer's expert groups both come from
+        ``grid.get_pg(..., view="expert")`` (NOT the degenerate base-dim fallback).
+        The run asserts the schedule completes, ``optimizer.step()`` returns a finite
+        positive ``grad_norm``, the loss is finite, and at least one expert parameter
+        received a finite non-zero gradient (tokens actually routed through experts).
+        ``add_bias_linear`` is disabled because bias in MoE is only supported with
+        ETP==1.
+
+        Gated identically to the other ``_8gpu`` tests: RUNS on the 8-GPU lane.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=4,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=1,
+            llm_dp=2,
+            llm_offset=4,
+            llm_expert_tp=2,
+            llm_expert_ep=2,
+            llm_expert_dp=1,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_grouped_gemm=False,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=4,
             num_microbatches=4,
         )
