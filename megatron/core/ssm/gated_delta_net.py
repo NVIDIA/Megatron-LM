@@ -165,6 +165,15 @@ class GatedDeltaNet(MegatronModule):
             name=(name + ".in_proj") if name is not None else None,
         )
 
+        # in_proj fuses the per-head query/key/value projections together with the conv,
+        # gate and beta projections into a single matrix (in_proj_dim above). Orthogonalizing
+        # this heterogeneous fused weight as one 2D matrix (e.g. with Muon) is not meaningful,
+        # so flag it to fall back to the standard (Adam) optimizer, the same way fused/embedding
+        # params are kept out of the orthogonalizing optimizer.
+        # See https://github.com/NVIDIA/Megatron-LM/issues/2885
+        if hasattr(self.in_proj, "weight") and self.in_proj.weight is not None:
+            self.in_proj.weight.skip_orthogonalization = True
+
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
