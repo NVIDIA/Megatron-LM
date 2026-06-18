@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_logits_distillation_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -1964,6 +1965,28 @@ def validate_args(args, defaults={}):
     if not args.async_save:
         args.async_strategy = "mcore"
 
+    if args.logits_save_dir is not None:
+        assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
+        assert args.async_save, (
+            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
+            'Logits are flushed as an async request in the checkpoint queue.'
+        )
+
+    if args.freeze_all_layers:
+        if args.use_distributed_optimizer:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
+            )
+            args.use_distributed_optimizer = False
+        if args.overlap_param_gather:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with overlap_param_gather. Disabling overlap_param_gather.'
+            )
+            args.overlap_param_gather = False
+
+    if args.override_ckpt_iteration is not None:
+        assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert (
@@ -2674,6 +2697,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "moe_grad_scale_func",
         "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
@@ -3529,6 +3553,18 @@ def _add_rl_args(parser):
         help='Skip BOS token at the beginning of the sequences. Default is False.',
     )
     group.add_argument(
+        '--rl-profile',
+        action='store_true',
+        default=False,
+        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).',
+    )
+    group.add_argument(
+        '--rl-profile-dir',
+        type=str,
+        default=None,
+        help='Directory to write RL profiling data. Defaults to {save}/profiles.',
+    )
+    group.add_argument(
         '--rl-inference-parsers',
         nargs='*',
         default=[],
@@ -3793,6 +3829,9 @@ def _add_learning_rate_args(parser):
         help='Minimum value for learning rate for the input and output layer. The scheduler'
         'clip values below this threshold',
     )
+    group.add_argument(
+        '--freeze-all-layers', action='store_true', help='Freeze all layers of the model.'
+    )
 
     return parser
 
@@ -3830,6 +3869,14 @@ def _add_checkpointing_args(parser):
         action='store_true',
         default=None,
         help='Do not load rng state when loading checkpoint.',
+    )
+    group.add_argument(
+        '--override-ckpt-iteration',
+        type=int,
+        default=None,
+        help='Override the iteration stored in the loaded checkpoint. '
+        'Also resets consumed_train_samples accordingly so the '
+        'data loader replays samples from that iteration onward.',
     )
     group.add_argument(
         '--use-dist-ckpt',
@@ -5149,6 +5196,46 @@ def _add_varlen_dataset_args(parser):
         'min_seq_len=seq_length//2, max_seq_len=seq_length, '
         'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
+    return parser
+
+def _add_logits_distillation_args(parser):
+    group = parser.add_argument_group(title='Logits Distillation')
+
+    group.add_argument('--logits-save-top-k', type=int, default=None,
+                       help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-load-dir', type=str, default=None,
+                       help='Directory to load logits.')
+    group.add_argument('--logits-load-decode-threads', type=int, default=4,
+                       help='Number of decode threads for cached-logits zstd '
+                            'decompression and torch.load processing.')
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
+                       help='PyTorch DataLoader prefetch factor for decoded '
+                            'cached-logits iterations. (Non-MSC only)')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of sequential tar consumption.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
+                       help='KD loss alpha for loading logits. Total loss is calculated as '
+                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings and '
+                            'training falls back to LM-only loss instead of crashing.')
     return parser
 
 

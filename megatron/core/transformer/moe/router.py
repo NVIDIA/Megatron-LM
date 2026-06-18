@@ -193,6 +193,7 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
         self.mtp_layer_number: Optional[int] = None
+        self.frozen_expert_bias = False
 
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
