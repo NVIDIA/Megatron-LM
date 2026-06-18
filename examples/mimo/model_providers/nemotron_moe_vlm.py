@@ -104,7 +104,6 @@ def nemotron_language_config(
     config = deepcopy(_base_config(args))
     bf16, dtype = _dtype(args)
     # Code-only fields + hetero parallelism pins.
-    config.use_cpu_initialization = True
     config.variable_seq_lengths = True
     # moe dispatcher flags come from CLI so the base config validates at construction.
     config.params_dtype = dtype
@@ -139,7 +138,6 @@ def nemotron_projection_config(args: argparse.Namespace, tp_size: int) -> Transf
     config.add_bias_linear = False
     config.activation_func = squared_relu
     config.normalization = "RMSNorm"
-    config.use_cpu_initialization = True
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
     config.params_dtype = dtype
     config.pipeline_dtype = dtype
