@@ -212,9 +212,10 @@ def test_language_config_parity(num_layers, hybrid_pattern):
     assert config.deallocate_pipeline_outputs is True
     assert config.inference_sampling_seed == args.seed
 
-    # Code-only overrides.
+    # Code-only overrides. (seq_length / max_position_embeddings are NOT
+    # TransformerConfig fields; the seq-length contract is covered by
+    # test_language_model_spec_builds_mamba via max_sequence_length.)
     assert config.position_embedding_type == "none"
-    assert config.seq_length == 8192  # sourced from stock --seq-length, not hardcoded
     assert config.tensor_model_parallel_size == 1
 
 
