@@ -1,5 +1,4 @@
 ENV_VARS:
-  SKIP_PYTEST: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   NCCL_ALGO: Ring
@@ -117,8 +116,10 @@ MODEL_ARGS:
   --moe-grouped-gemm: true
   --use-fused-weighted-squared-relu: true
   # Tokenizer
-  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-type: SFTTokenizer
   --tokenizer-model: ${TOKENIZER}
+  --sft: true
+  --sft-tokenizer-prompt-format: identity
   --bf16: true
   # Parallelism
   --tensor-model-parallel-size: 2
@@ -132,7 +133,6 @@ MODEL_ARGS:
   --no-create-attention-mask-in-dataloader: true
   --ddp-num-buckets: 8
   --override-opt_param-scheduler: true
-  --no-mmap-bin-files: true
   --num-workers: 1
   --ckpt-format: torch_dist
   --ckpt-fully-parallel-save: true
@@ -143,7 +143,7 @@ MODEL_ARGS:
   --global-batch-size: 8
   --seq-length: 4096
   --max-position-embeddings: 4096
-  --train-iters: 3
+  --train-iters: 10
   --lr: 0.00015
   --lr-decay-style: cosine
   --lr-decay-iters: 320000
@@ -157,16 +157,16 @@ MODEL_ARGS:
   # Checkpoint & data
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${PTQ_QUANTIZED_CKPT}
-  --data-path: "${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document"
+  --data-path: "${DATA_PATH}/text/nemotron-3-super-sft_train-sample.jsonl"
   --split: "949,50,1"
   --distributed-backend: nccl
   --transformer-impl: transformer_engine
   --data-cache-path: ${DATA_CACHE_PATH}
   # Logging
   --log-interval: 1
-  --save-interval: 1000
-  --eval-interval: 1000
-  --eval-iters: 10
+  --save-interval: 10
+  --eval-interval: 10
+  --eval-iters: 2
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
