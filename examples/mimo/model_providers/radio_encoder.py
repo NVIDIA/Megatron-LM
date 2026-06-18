@@ -27,6 +27,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
 
+# Canonical module name for the RADIO encoder. Single source of truth shared by
+# the provider (encoders-dict key) and the topology default encoder name.
+RADIO_ENCODER_MODULE_NAME = "radio_encoder"
+
 
 def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register the RADIO-encoder-specific CLI args (stock owns img/patch/hidden)."""

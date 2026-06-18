@@ -1,68 +1,123 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""CPU-only unit tests for the RADIO vision encoder helpers.
+"""GPU forward/backward test for the RADIO vision encoder wrapper.
 
-Covers the RADIO-specific arg registration and the encoder ``ModuleSpec`` builder
-mapping (the previously write-only ``--pixel-shuffle`` / ``--disable-vision-class-token``
-flags must now flow into the wrapper params). A real wrapper forward needs GPU/TE
-and is left to a functional (cog) check.
+Builds the real ``RADIOEncoderWrapper`` (RADIOViTModel + TE) via
+``radio_vision_encoder_spec`` and runs forward + backward on synthetic input,
+exercising the class-token-drop and pixel-shuffle flags (which change the output
+shape) plus the dynamic-resolution packed-tile path. Needs 1 GPU:
+
+    WORLD_SIZE=1 python -m torch.distributed.run --nproc_per_node=1 -m pytest \
+        tests/unit_tests/models/mimo/test_radio_encoder.py
 """
 
-import argparse
 from types import SimpleNamespace
+
+import pytest
+import torch
 
 from examples.mimo.model_providers.radio_encoder import (
     RADIOEncoderWrapper,
-    add_radio_encoder_args,
     radio_vision_encoder_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+
+IMG = 224
+PATCH = 14
+CLASS_TOKENS = 8
+HIDDEN = 64
+PATCHES = (IMG // PATCH) ** 2  # 16 * 16 = 256
 
 
-def test_add_radio_encoder_args_registers_flags():
-    parser = argparse.ArgumentParser()
-    add_radio_encoder_args(parser)
-
-    defaults = parser.parse_args([])
-    assert defaults.class_token_len == 8
-    assert defaults.pixel_shuffle is False
-    assert defaults.disable_vision_class_token is False
-
-    enabled = parser.parse_args(
-        ["--class-token-len", "4", "--pixel-shuffle", "--disable-vision-class-token"]
-    )
-    assert enabled.class_token_len == 4
-    assert enabled.pixel_shuffle is True
-    assert enabled.disable_vision_class_token is True
-
-
-def test_radio_vision_encoder_spec_reads_args(monkeypatch):
-    # Avoid importing TransformerEngine on the CPU-only path.
-    monkeypatch.setattr(
-        "examples.mimo.model_providers.radio_encoder.get_vit_layer_with_transformer_engine_spec",
-        lambda: "layer-spec",
+def _build_wrapper(*, apply_pixel_shuffle, drop_class_token, dynamic_resolution):
+    """Build the wrapper through the production spec builder, then instantiate it."""
+    config = TransformerConfig(
+        num_layers=2, hidden_size=HIDDEN, num_attention_heads=4, use_cpu_initialization=True
     )
     args = SimpleNamespace(
-        img_h=512,
-        img_w=512,
-        patch_dim=16,
-        class_token_len=8,
-        pixel_shuffle=True,
-        disable_vision_class_token=True,
-        freeze_vit=True,
-        dynamic_resolution=False,
+        img_h=IMG,
+        img_w=IMG,
+        patch_dim=PATCH,
+        class_token_len=CLASS_TOKENS,
+        pixel_shuffle=apply_pixel_shuffle,
+        disable_vision_class_token=drop_class_token,
+        freeze_vit=False,
+        dynamic_resolution=dynamic_resolution,
     )
-    vision_config = object()
-
-    spec = radio_vision_encoder_spec(args, vision_config, pg_collection=None)
-
+    spec = radio_vision_encoder_spec(args, config, pg_collection=None)
     assert spec.module is RADIOEncoderWrapper
-    params = spec.params
-    assert params["transformer_config"] is vision_config
-    assert params["img_h"] == 512 and params["img_w"] == 512
-    assert params["patch_dim"] == 16
-    assert params["class_token_len"] == 8
-    # The previously write-only flags now drive the wrapper params.
-    assert params["apply_pixel_shuffle"] is True
-    assert params["drop_class_token"] is True
-    assert params["force_eval_mode"] is True
-    assert params["dynamic_resolution"] is False
+    return spec.module(**spec.params).cuda()
+
+
+def _has_finite_grad(module):
+    return any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in module.parameters()
+        if p.requires_grad
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="RADIO encoder forward needs a GPU")
+class TestRADIOEncoderWrapper:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "apply_pixel_shuffle,drop_class_token,expected_seq,expected_hidden",
+        [
+            # Raw RADIO output keeps the class tokens.
+            (False, False, PATCHES + CLASS_TOKENS, HIDDEN),
+            # Class-token drop removes class_token_len tokens.
+            (False, True, PATCHES, HIDDEN),
+            # Drop + 0.5x-per-axis pixel shuffle: seq /= 4, hidden *= 4.
+            (True, True, PATCHES // 4, HIDDEN * 4),
+        ],
+    )
+    def test_fixed_resolution_forward_backward(
+        self, apply_pixel_shuffle, drop_class_token, expected_seq, expected_hidden
+    ):
+        wrapper = _build_wrapper(
+            apply_pixel_shuffle=apply_pixel_shuffle,
+            drop_class_token=drop_class_token,
+            dynamic_resolution=False,
+        )
+        x = torch.randn(2, 3, IMG, IMG, device="cuda")
+
+        out = wrapper(x)
+        assert out.shape == torch.Size([2, expected_seq, expected_hidden])
+
+        out.sum().backward()
+        assert _has_finite_grad(wrapper)
+
+    def test_dynamic_resolution_forward_backward(self):
+        # Packed variable-tile path: one square tile of rows*cols patches, fed as
+        # pre-patchified features (matches the dynamic-resolution data builder).
+        wrapper = _build_wrapper(
+            apply_pixel_shuffle=True, drop_class_token=True, dynamic_resolution=True
+        )
+        rows = cols = 8
+        patches = rows * cols
+        feat_dim = 3 * PATCH * PATCH
+        x = torch.randn(1, patches, feat_dim, device="cuda")
+        imgs_sizes = torch.tensor([[rows * PATCH, cols * PATCH]], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, patches], dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=torch.tensor(patches, dtype=torch.int32),
+            max_seqlen_kv=torch.tensor(patches, dtype=torch.int32),
+        )
+
+        out = wrapper(x, imgs_sizes=imgs_sizes, packed_seq_params=packed)
+        assert out.dim() == 3 and out.shape[0] == 1
+
+        out.sum().backward()
+        assert _has_finite_grad(wrapper)
