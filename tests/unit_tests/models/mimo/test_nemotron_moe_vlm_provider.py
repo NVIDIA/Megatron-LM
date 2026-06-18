@@ -15,9 +15,9 @@ import pytest
 
 from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
-    NEMOTRON_VISION_ENCODER_KEY,
     add_model_provider_args,
 )
+from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -135,6 +135,7 @@ def _build_argv(num_layers, hybrid_pattern):
         "--mamba-state-dim", "128",
         "--linear-conv-kernel-dim", "4",
         "--position-embedding-type", "none",
+        "--attention-backend", "flash",
         "--calculate-per-token-loss",
         "--cross-entropy-loss-fusion",
         "--seq-length", "8192",
@@ -213,16 +214,13 @@ def test_language_model_spec_builds_mamba():
 def test_vision_submodules_spec_wires_radio_encoder():
     """vision_submodules_spec wires the RADIO encoder + affine projector, and the
     preset's pixel-shuffle / class-token-drop knobs reach the wrapper params."""
-    from examples.mimo.model_providers.nemotron_moe_vlm import (
-        NEMOTRON_VISION_ENCODER_KEY,
-        vision_submodules_spec,
-    )
+    from examples.mimo.model_providers.nemotron_moe_vlm import vision_submodules_spec
     from examples.mimo.model_providers.radio_encoder import RADIOEncoderWrapper
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
     spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
 
-    encoder = spec.submodules["encoders"][NEMOTRON_VISION_ENCODER_KEY]
+    encoder = spec.submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
     assert encoder.module is RADIOEncoderWrapper
     assert encoder.params["apply_pixel_shuffle"] is True
     assert encoder.params["drop_class_token"] is True

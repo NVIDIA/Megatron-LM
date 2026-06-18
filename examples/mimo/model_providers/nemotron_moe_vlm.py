@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Optional
 
 from examples.mimo.model_providers.radio_encoder import (
+    RADIO_ENCODER_MODULE_NAME,
     _base_config,
     _dtype,
     _make_dense_non_hybrid,
@@ -36,7 +37,6 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -47,12 +47,6 @@ except ImportError:  # pragma: no cover - TE always present in the CI container
     TERowParallelLinear = None
 
 NEMOTRON_MODEL_PROVIDER = "nemotron-moe-vlm"
-NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
-
-
-def is_nemotron_moe_vlm(args: argparse.Namespace) -> bool:
-    """Return whether the Nemotron6-MoE VLM provider is active."""
-    return getattr(args, "model_provider", None) == NEMOTRON_MODEL_PROVIDER
 
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -125,10 +119,10 @@ def nemotron_language_config(
     config = deepcopy(_base_config(args))
     bf16, dtype = _dtype(args)
     # Code-only fields (not cleanly arg-expressible) + hetero parallelism pins.
-    config.attention_backend = AttnBackend.flash
+    # attention_backend flows from --attention-backend; cross_entropy_fusion_impl
+    # from its (native) default — both auto-copied by core_transformer_config_from_args.
     config.use_cpu_initialization = True
     config.variable_seq_lengths = True
-    config.cross_entropy_fusion_impl = "te"
     # moe_token_dispatcher_type / moe_flex_dispatcher_backend come from CLI flags
     # so the base config validates at construction (shared-expert-overlap requires
     # the alltoall/flex dispatcher); the run script defaults them from env.
@@ -237,12 +231,6 @@ def vision_submodules_spec(
     tp_size = get_group_size_or(tp_pg, get_grid_dim_size(encoder_grid, "tp"))
     pp_size = get_group_size_or(pp_pg, get_grid_dim_size(encoder_grid, "pp"))
 
-    if not is_nemotron_moe_vlm(args):
-        raise NotImplementedError(
-            "vision_submodules_spec on stock args currently supports only the "
-            "Nemotron6-MoE VLM providers; use the mock provider's own builder otherwise."
-        )
-
     vision_config = radio_vision_config(args, tp_size, pp_size)
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
     # projector_type="affine" uses only submodules.linear_fc1 (a single affine
@@ -261,7 +249,7 @@ def vision_submodules_spec(
         module=VisionModalitySubmodules,
         params={"pg_collection": pg_collection},
         submodules={
-            "encoders": {NEMOTRON_VISION_ENCODER_KEY: vision_encoder_spec},
+            "encoders": {RADIO_ENCODER_MODULE_NAME: vision_encoder_spec},
             "input_projections": [vision_projection_spec],
         },
     )
