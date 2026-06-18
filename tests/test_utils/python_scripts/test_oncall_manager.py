@@ -158,11 +158,7 @@ def test_ensure_schedule_filled_uses_schedule_file_order(oncall_manager, monkeyp
         "alice",
         "bob",
     ]
-    assert [entry["date"] for entry in schedule[-3:]] == [
-        "2026-01-28",
-        "2026-02-04",
-        "2026-02-11",
-    ]
+    assert [entry["date"] for entry in schedule[-3:]] == ["2026-01-28", "2026-02-04", "2026-02-11"]
 
 
 def test_validate_schedule_users_in_rotation_team_accepts_all_users(
@@ -189,15 +185,8 @@ def test_validate_schedule_users_in_rotation_team_accepts_all_users(
 def test_validate_schedule_users_in_rotation_team_rejects_missing_user(
     oncall_manager, monkeypatch, capsys
 ):
-    schedule = [
-        {"user": "charlie", "date": "2026-01-07"},
-        {"user": "alice", "date": "2026-01-14"},
-    ]
-    monkeypatch.setattr(
-        oncall_manager,
-        "get_team_members",
-        lambda org, team_slug: {"alice"},
-    )
+    schedule = [{"user": "charlie", "date": "2026-01-07"}, {"user": "alice", "date": "2026-01-14"}]
+    monkeypatch.setattr(oncall_manager, "get_team_members", lambda org, team_slug: {"alice"})
 
     with pytest.raises(SystemExit) as error:
         oncall_manager.validate_schedule_users_in_rotation_team(schedule, "NVIDIA")
@@ -229,9 +218,7 @@ def test_rotate_schedule_keeps_popped_user_in_rotation_order(oncall_manager, mon
         oncall_manager, "save_schedule", lambda new_schedule: saved_schedule.extend(new_schedule)
     )
     monkeypatch.setattr(
-        oncall_manager,
-        "get_team_members",
-        lambda org, team_slug: {"alice", "bob", "charlie"},
+        oncall_manager, "get_team_members", lambda org, team_slug: {"alice", "bob", "charlie"}
     )
     monkeypatch.setattr(oncall_manager, "update_active_oncall_team", lambda *_args, **_kwargs: None)
 
