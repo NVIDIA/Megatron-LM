@@ -2,9 +2,9 @@
 
 """Unit tests for the Nemotron6-MoE VLM model provider.
 
-Covers the post-parse preset (vision/data-path knobs) and the config parity
-gate: the from-args language config must reproduce the reference Nemotron
-architecture field-for-field, except the two fields that
+Covers the post-parse derived knobs and the config parity gate: the from-args
+language config must reproduce the reference Nemotron architecture
+field-for-field, except the two fields that
 ``core_transformer_config_from_args`` correctly supplies (documented below).
 """
 
@@ -15,9 +15,9 @@ import pytest
 
 from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
+    NEMOTRON_VISION_ENCODER_KEY,
     add_model_provider_args,
-    apply_model_provider_defaults,
-    validate_model_provider_args,
+    prepare_model_provider_args,
 )
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
@@ -76,38 +76,25 @@ def _parse(argv):
     return args
 
 
-def test_preset_sets_vision_and_datapath_knobs():
-    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--num-image-tiles", "12"])
-    apply_model_provider_defaults(args)
-    assert args.pixel_shuffle is True
-    assert args.disable_vision_class_token is True
-    assert args.image_seq_length == 256 * 12
-    assert args.dynamic_resolution is True
+def test_dynamic_resolution_defaults_on():
+    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
+    assert args.dynamic_resolution is True  # default-on; --no-dynamic-resolution disables
+    off = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--no-dynamic-resolution"])
+    assert off.dynamic_resolution is False
 
 
 def test_freeze_flags_drive_tower_freezing():
-    # The freeze interface is the --freeze-* flags (no training-stage preset).
+    # The freeze interface is the --freeze-* flags.
     args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER, "--freeze-vit", "--freeze-lm"])
-    apply_model_provider_defaults(args)
     assert args.freeze_vit is True
     assert args.freeze_lm is True
     assert args.freeze_projection is False
 
 
-def test_preset_skips_non_nemotron_provider():
+def test_prepare_sets_vision_encoder_key():
     args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
-    args.model_provider = "other"  # provider is nemotron-only; simulate a non-match
-    apply_model_provider_defaults(args)
-    assert getattr(args, "image_seq_length", None) is None
-
-
-def test_validate_rejects_out_of_range_image_token():
-    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
-    apply_model_provider_defaults(args)
-    args.padded_vocab_size = 131072
-    args.image_token_id = 131072  # == vocab size -> out of range
-    with pytest.raises(ValueError):
-        validate_model_provider_args(args)
+    prepare_model_provider_args(args)
+    assert args.vision_encoder_key == NEMOTRON_VISION_ENCODER_KEY
 
 
 # --- Config parity gate (requires torch; runs in CI) ----------------------
@@ -119,6 +106,8 @@ def _build_argv(num_layers, hybrid_pattern):
     """Full stock + provider CLI for the Nemotron preset (mirrors the run script)."""
     return [
         "--model-provider", NEMOTRON_MODEL_PROVIDER,
+        "--pixel-shuffle",
+        "--disable-vision-class-token",
         "--num-layers", str(num_layers),
         "--hybrid-layer-pattern", hybrid_pattern,
         "--hidden-size", "2688",

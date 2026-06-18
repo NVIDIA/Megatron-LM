@@ -2,9 +2,10 @@
 
 """Nemotron6-MoE VLM model provider for hetero MIMO examples.
 
-Declares the MIMO/vision provider args, applies the Nemotron architecture
-preset, and builds the language ``MambaModel`` (hybrid Mamba/MoE) and the
-vision ``RADIOViTModel`` + ``MultimodalProjector`` ``ModuleSpec`` s.
+Declares the MIMO/vision provider args and builds the language ``MambaModel``
+(hybrid Mamba/MoE) and the vision ``RADIOViTModel`` + ``MultimodalProjector``
+``ModuleSpec`` s. Image-token / tokenizer / data-path knobs live with the data
+pipeline, not here.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ except ImportError:  # pragma: no cover - TE always present in the CI container
     TERowParallelLinear = None
 
 NEMOTRON_MODEL_PROVIDER = "nemotron-moe-vlm"
-NEMOTRON_IMAGE_SEQ_PER_TILE = 256
 NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
 
 
@@ -56,11 +56,11 @@ def is_nemotron_moe_vlm(args: argparse.Namespace) -> bool:
 
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register new model-provider args for hetero MIMO examples.
+    """Register the model-provider args for hetero MIMO examples.
 
-    Only MIMO/vision/provider knobs are declared here; stock ``arguments.py``
-    owns the ``TransformerConfig`` field flags and ``radio_encoder`` owns the
-    RADIO-encoder knobs.
+    Only the provider/vision knobs this PR consumes are declared here; stock
+    ``arguments.py`` owns the ``TransformerConfig`` field flags and
+    ``radio_encoder`` owns the RADIO-encoder knobs.
     """
     add_radio_encoder_args(parser)
     provider = parser.add_argument_group("mimo model provider")
@@ -70,31 +70,13 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
         default=NEMOTRON_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )
-    # Vision / MIMO-specific knobs.
-    provider.add_argument("--image-seq-length", type=int, default=None,
-                          help="Total image tokens emitted by the encoder per sample.")
-    provider.add_argument("--image-token-id", type=int, default=511,
-                          help="Vocab id of the placeholder image token.")
-    provider.add_argument("--pad-token-id", type=int, default=0)
-    provider.add_argument("--image-token", type=str, default="<image>")
-    provider.add_argument("--tokenizer-prompt-format", type=str, default="nemotron6-moe")
-    provider.add_argument("--image-tag-type", type=str, default="")
-    provider.add_argument("--force-system-message", action="store_true")
-    provider.add_argument(
-        "--num-image-tiles",
-        "--max-num-tiles",
-        dest="num_image_tiles",
-        type=int,
-        default=12,
-    )
     provider.add_argument(
         "--dynamic-resolution",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=True,
         help=(
             "Patchify each image at its native aspect ratio with a token budget instead of "
-            "fixed-tile resize. Enabled by default for Nemotron6-MoE VLM providers. "
-            "Pass --no-dynamic-resolution to disable."
+            "fixed-tile resize. Pass --no-dynamic-resolution to disable."
         ),
     )
     provider.add_argument("--freeze-lm", action="store_true")
@@ -112,57 +94,11 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
 
 
 def prepare_model_provider_args(args: argparse.Namespace) -> None:
-    """Apply the post-parse Nemotron preset + derived tokenizer/vision settings.
+    """Set the derived ``vision_encoder_key`` the spec builders / topology read.
 
     Call after ``parse_args`` and before stock ``validate_args``.
     """
-    apply_model_provider_defaults(args)
-    resolve_image_token_id(args)
     args.vision_encoder_key = NEMOTRON_VISION_ENCODER_KEY
-    args.vision_input_mode = "pixels" if is_nemotron_moe_vlm(args) else "hidden_states"
-
-
-def apply_model_provider_defaults(args: argparse.Namespace) -> None:
-    """Set the vision/data-path knobs the dataloaders read off ``args``.
-
-    Architecture (num_layers, hidden_size, moe_*, mamba_*, hybrid pattern, ...)
-    comes from stock args via ``core_transformer_config_from_args``; the run
-    script passes those flags. This only sets the vision/data-path fields.
-    """
-    if not is_nemotron_moe_vlm(args):
-        return
-
-    args.pixel_shuffle = True
-    args.disable_vision_class_token = True
-    args.image_seq_length = NEMOTRON_IMAGE_SEQ_PER_TILE * args.num_image_tiles
-    if getattr(args, "dynamic_resolution", None) is None:
-        args.dynamic_resolution = True
-
-
-def resolve_image_token_id(args: argparse.Namespace) -> None:
-    """Resolve image, pad, and vocab ids from the configured tokenizer."""
-    if not is_nemotron_moe_vlm(args) or not getattr(args, "tokenizer_model", None):
-        return
-
-    from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import (
-        MegatronMultimodalTokenizer,
-    )
-
-    tokenizer = MegatronMultimodalTokenizer(
-        path=args.tokenizer_model,
-        prompt_format=args.tokenizer_prompt_format,
-        special_tokens=[args.image_token],
-        image_tag_type=args.image_tag_type,
-        force_system_message=args.force_system_message,
-    )
-    image_token_id = tokenizer.convert_tokens_to_ids(args.image_token)
-    if image_token_id is None:
-        raise RuntimeError(
-            f"tokenizer at {args.tokenizer_model} did not produce an id for {args.image_token}"
-        )
-    args.image_token_id = int(image_token_id)
-    if tokenizer.pad is not None:
-        args.pad_token_id = int(tokenizer.pad)
 
 
 def _vocab_size(args: argparse.Namespace) -> int:
@@ -174,28 +110,6 @@ def _vocab_size(args: argparse.Namespace) -> int:
     raise ValueError(
         "vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size"
     )
-
-
-def validate_model_provider_args(args: argparse.Namespace) -> None:
-    """Validate derived model-provider arguments.
-
-    Call after stock ``validate_args`` so ``padded_vocab_size`` is populated.
-    """
-    vocab_size = _vocab_size(args)
-    if not 0 <= args.image_token_id < vocab_size:
-        raise ValueError("--image-token-id must be within the vocabulary")
-    if not 0 <= args.pad_token_id < vocab_size:
-        raise ValueError("--pad-token-id must be within the vocabulary")
-
-
-def get_vision_encoder_module(args: argparse.Namespace, vision_submodule):
-    """Return the provider-owned encoder module used for DDP config and freezing."""
-    return vision_submodule.encoders[NEMOTRON_VISION_ENCODER_KEY]
-
-
-def iter_vision_projection_modules(vision_submodule):
-    """Return the provider-owned projection modules used for freeze-stage policy."""
-    return iter(vision_submodule.input_projections)
 
 
 def nemotron_projection_layer_spec() -> ModuleSpec:
