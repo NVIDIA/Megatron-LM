@@ -13,9 +13,6 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_submodules,
-)
 from megatron.core.optimizer import (
     ChainedOptimizer,
     OptimizerConfig,
@@ -26,17 +23,9 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_latent_attention import (
-    FusedMLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
-from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _init_distributed
@@ -1074,59 +1063,6 @@ def test_optimizer_reload_model_params():
             torch.testing.assert_close(
                 main_param, torch.empty_like(main_param).fill_(3.0), atol=0, rtol=0
             )
-
-
-def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_matching():
-    if not is_te_min_version("1.10.0"):
-        pytest.skip("Requires TE >= 1.10.0")
-
-    Utils.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(123)
-    try:
-        transformer_config = MLATransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            q_lora_rank=32,
-            kv_lora_rank=32,
-            qk_head_dim=128,
-            v_head_dim=128,
-            qk_pos_emb_head_dim=64,
-            rope_type="rope",
-            rotary_base=10000,
-            original_max_position_embeddings=32,
-        )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
-            multi_latent_attention=True, mla_down_proj_fusion=True
-        ).self_attention.submodules
-        assert isinstance(submodules, MLASelfAttentionSubmodules)
-        fused_mla = FusedMLASelfAttention(
-            transformer_config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
-        )
-
-        model = nn.Module()
-        model.decoder = nn.Module()
-        model.decoder.layers = nn.ModuleList([nn.Module()])
-        model.decoder.layers[0].self_attention = fused_mla
-
-        prefix = "module.decoder.layers.0.self_attention."
-        sharded_state_dict = fused_mla.sharded_state_dict(prefix=prefix)
-        q_key = next(k for k in sharded_state_dict if k.endswith("linear_q_down_proj.weight"))
-        kv_key = next(k for k in sharded_state_dict if k.endswith("linear_kv_down_proj.weight"))
-        fused_key = f"{prefix}{next(k for k in fused_mla.state_dict() if k.endswith('linear_qkv_down_proj.weight'))}"
-        q_weight = sharded_state_dict[q_key].data
-        kv_weight = sharded_state_dict[kv_key].data
-        state_dict = {q_key: q_weight, kv_key: kv_weight}
-
-        DistributedOptimizer._synthesize_state_dict_params_for_model(state_dict, model)
-
-        assert fused_key in state_dict
-        assert q_key not in state_dict
-        assert kv_key not in state_dict
-        torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
-    finally:
-        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(

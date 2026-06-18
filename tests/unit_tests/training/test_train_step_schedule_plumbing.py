@@ -8,6 +8,18 @@ from unittest import mock
 from megatron.training import training as training_mod
 
 
+class _NS(SimpleNamespace):
+    """SimpleNamespace that returns None for any attribute not explicitly set.
+
+    Tolerates extra (falsy) args/config fields the merged ``train_step`` reads
+    beyond what this focused plumbing test sets, e.g. dev-only
+    ``sequence_packing_scheduler`` / ``rl_use_sequence_packing``.
+    """
+
+    def __getattr__(self, name):  # only called when normal lookup misses
+        return None
+
+
 class _Rerun:
     """Run the forward/backward body once, then ask train_step to exit before optimizer.step."""
 
@@ -22,7 +34,7 @@ class _Rerun:
 
 
 def _run(**kwargs):
-    args = SimpleNamespace(
+    args = _NS(
         save_params_interval=None,
         save_activations_interval=None,
         save_tokens_per_expert_interval=None,
@@ -31,6 +43,7 @@ def _run(**kwargs):
         reuse_grad_buf_for_mxfp8_param_ag=False,
         overlap_param_gather=False,
         seq_length=8,
+        global_batch_size=8,
         micro_batch_size=1,
         decoder_seq_length=None,
         empty_unused_memory_level=0,
@@ -50,7 +63,7 @@ def _run(**kwargs):
             model=model,
             optimizer=SimpleNamespace(zero_grad=lambda: None),
             opt_param_scheduler=None,
-            config=SimpleNamespace(),
+            config=_NS(),
             forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
