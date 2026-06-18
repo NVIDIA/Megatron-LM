@@ -123,3 +123,63 @@ def test_assign_reviewer_requests_oncall_when_needed(oncall_manager, monkeypatch
             "json": {"team_reviewers": ["mcore-oncall"]},
         }
     ]
+
+
+def test_ensure_schedule_filled_uses_schedule_file_order(oncall_manager, monkeypatch):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+        {"user": "bob", "date": "2026-01-21"},
+    ]
+    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 6)
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda *_args, **_kwargs: pytest.fail("team members should not determine oncall order"),
+    )
+
+    oncall_manager.ensure_schedule_filled(schedule)
+
+    assert [entry["user"] for entry in schedule] == [
+        "charlie",
+        "alice",
+        "bob",
+        "charlie",
+        "alice",
+        "bob",
+    ]
+    assert [entry["date"] for entry in schedule[-3:]] == [
+        "2026-01-28",
+        "2026-02-04",
+        "2026-02-11",
+    ]
+
+
+def test_rotate_schedule_keeps_popped_user_in_rotation_order(oncall_manager, monkeypatch):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+        {"user": "bob", "date": "2026-01-21"},
+    ]
+    saved_schedule = []
+    real_datetime = oncall_manager.datetime
+
+    class FakeDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 1, 14, tzinfo=tz)
+
+    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 3)
+    monkeypatch.setattr(oncall_manager, "datetime", FakeDateTime)
+    monkeypatch.setattr(
+        oncall_manager, "load_schedule", lambda: [entry.copy() for entry in schedule]
+    )
+    monkeypatch.setattr(
+        oncall_manager, "save_schedule", lambda new_schedule: saved_schedule.extend(new_schedule)
+    )
+    monkeypatch.setattr(oncall_manager, "update_active_oncall_team", lambda *_args, **_kwargs: None)
+
+    oncall_manager.rotate_schedule("NVIDIA")
+
+    assert [entry["user"] for entry in saved_schedule] == ["alice", "bob", "charlie"]
+    assert saved_schedule[-1]["date"] == "2026-01-28"

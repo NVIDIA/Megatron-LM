@@ -25,7 +25,6 @@ from slack_sdk.errors import SlackApiError
 # Constants
 GITHUB_API_URL = "https://api.github.com"
 SCHEDULE_FILE = ".github/oncall_schedule.json"
-ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
 COMMUNITY_REQUEST_LABEL = "community-request"
@@ -258,6 +257,17 @@ def save_schedule(schedule):
         json.dump(schedule, f, indent=4)
         f.write('\n') # trailing newline
 
+def get_schedule_user_order(schedule):
+    """Returns unique users from the schedule in file order."""
+    ordered_users = []
+    seen_users = set()
+    for entry in schedule:
+        user = entry.get('user')
+        if user and user not in seen_users:
+            ordered_users.append(user)
+            seen_users.add(user)
+    return ordered_users
+
 def update_active_oncall_team(org, new_oncall):
     """Updates the active oncall team to contain only the new oncall user."""
     # 1. Get current members of the active team
@@ -289,6 +299,7 @@ def update_active_oncall_team(org, new_oncall):
 
 def rotate_schedule(repo_owner, dry_run=False):
     schedule = load_schedule()
+    rotation_order = get_schedule_user_order(schedule)
     print(f"Current schedule length: {len(schedule)}")
     
     # 1. Rotate (Remove past week)
@@ -319,7 +330,7 @@ def rotate_schedule(repo_owner, dry_run=False):
         print("Schedule empty, nothing to rotate.")
 
     # 2. Replenish
-    ensure_schedule_filled(schedule, repo_owner)
+    ensure_schedule_filled(schedule, rotation_order)
     
     # 3. Update active oncall team
     if schedule:
@@ -343,17 +354,12 @@ def get_last_wednesday():
     offset = (today.weekday() - 2) % 7
     return today - timedelta(days=offset)
 
-def ensure_schedule_filled(schedule, repo_owner):
+def ensure_schedule_filled(schedule, rotation_order=None):
     """Appends users to schedule until it reaches TARGET_WEEKS."""
-    members = get_team_members(repo_owner, ROTATION_TEAM_SLUG)
-    if not members:
-        print(f"Warning: No team members found in {ROTATION_TEAM_SLUG}.")
+    rotation_order = rotation_order or get_schedule_user_order(schedule)
+    if not rotation_order:
+        print("Warning: No users found in schedule. Cannot fill schedule.")
         return
-    if 'svcnvidia-nemo-ci' in members:
-        members.remove('svcnvidia-nemo-ci')
-    members = list(members)
-
-    members.sort() # Deterministic order
     
     while len(schedule) < TARGET_WEEKS:
         # Determine start date for the new entry
@@ -361,8 +367,8 @@ def ensure_schedule_filled(schedule, repo_owner):
             # Start with the most recent Wednesday if list is empty
             next_date = get_last_wednesday()
             
-            # Start with the first member alphabetically if list is empty
-            next_user = members[0]
+            # Start with the first user in the hard-coded schedule order if list is empty
+            next_user = rotation_order[0]
         else:
             last_entry = schedule[-1]
             last_user = last_entry['user']
@@ -376,16 +382,16 @@ def ensure_schedule_filled(schedule, repo_owner):
                 next_date = get_last_wednesday() + timedelta(days=7 * len(schedule))
 
             try:
-                # Find index of last scheduled user in the team list
-                if last_user in members:
-                    last_idx = members.index(last_user)
-                    next_idx = (last_idx + 1) % len(members)
-                    next_user = members[next_idx]
+                # Find index of last scheduled user in the hard-coded schedule order
+                if last_user in rotation_order:
+                    last_idx = rotation_order.index(last_user)
+                    next_idx = (last_idx + 1) % len(rotation_order)
+                    next_user = rotation_order[next_idx]
                 else:
-                    # Last user not in team, just pick first member
-                    next_user = members[0]
+                    # Last user not in schedule order, just pick first user
+                    next_user = rotation_order[0]
             except ValueError:
-                next_user = members[0]
+                next_user = rotation_order[0]
         
         new_entry = {"user": next_user, "date": next_date.strftime("%Y-%m-%d")}
         schedule.append(new_entry)
@@ -459,7 +465,7 @@ def main():
         rotate_schedule(owner, dry_run=args.dry_run)
     elif args.command == "fill":
         schedule = load_schedule()
-        ensure_schedule_filled(schedule, owner)
+        ensure_schedule_filled(schedule)
         save_schedule(schedule)
         print("Schedule filled and saved.")
     elif args.command == "assign":
@@ -467,4 +473,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
