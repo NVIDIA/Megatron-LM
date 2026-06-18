@@ -19,8 +19,8 @@ from examples.mimo.model_providers.radio_encoder import (
 )
 from examples.mimo.utils.hetero import (
     get_grid_dim_size,
-    get_group_rank_or,
-    get_group_size_or,
+    get_pg_rank,
+    get_pg_size,
     is_process_group_member,
 )
 from megatron.core.activations import squared_relu
@@ -166,19 +166,24 @@ def language_model_spec(
     grid). ``llm_grid`` is the language ``HyperCommGrid`` used only for fallback
     dim sizes when a group is missing.
     """
-    pp_pg = getattr(pg_collection, "pp", None) if pg_collection is not None else None
-    tp_pg = getattr(pg_collection, "tp", None) if pg_collection is not None else None
-    ep_pg = getattr(pg_collection, "ep", None) if pg_collection is not None else None
-    expt_tp_pg = getattr(pg_collection, "expt_tp", None) if pg_collection is not None else None
-
-    fallback_tp_size = get_grid_dim_size(llm_grid, "tp")
-    pp_rank = get_group_rank_or(pp_pg)
-    pp_size = get_group_size_or(pp_pg, get_grid_dim_size(llm_grid, "pp"))
-    tp_size = get_group_size_or(tp_pg, fallback_tp_size)
-    ep_size = get_group_size_or(ep_pg, getattr(args, "llm_ep", 1))
-    expt_tp_size = get_group_size_or(
-        expt_tp_pg, getattr(args, "llm_expt_tp", None) or 1
-    )
+    # None on ranks outside the language grid -> sizes come from the grid; when a
+    # collection is provided its pp/tp/ep/expt_tp groups must all be present.
+    if pg_collection is None:
+        pp_rank = 0
+        pp_size = get_grid_dim_size(llm_grid, "pp")
+        tp_size = get_grid_dim_size(llm_grid, "tp")
+        ep_size = getattr(args, "llm_ep", 1)
+        expt_tp_size = getattr(args, "llm_expt_tp", None) or 1
+    else:
+        assert all(
+            getattr(pg_collection, name, None) is not None
+            for name in ("pp", "tp", "ep", "expt_tp")
+        ), "language pg_collection is missing a required pp/tp/ep/expt_tp group"
+        pp_rank = get_pg_rank(pg_collection.pp)
+        pp_size = get_pg_size(pg_collection.pp)
+        tp_size = get_pg_size(pg_collection.tp)
+        ep_size = get_pg_size(pg_collection.ep)
+        expt_tp_size = get_pg_size(pg_collection.expt_tp)
 
     config = nemotron_language_config(args, tp_size, pp_size, ep_size, expt_tp_size)
     require_per_token_loss(config)
@@ -208,8 +213,17 @@ def vision_submodules_spec(
     """Create the vision ``ModuleSpec`` for the local encoder grid."""
     pp_pg = getattr(pg_collection, "pp", None) if pg_collection is not None else None
     tp_pg = getattr(pg_collection, "tp", None) if pg_collection is not None else None
-    tp_size = get_group_size_or(tp_pg, get_grid_dim_size(encoder_grid, "tp"))
-    pp_size = get_group_size_or(pp_pg, get_grid_dim_size(encoder_grid, "pp"))
+    # None on ranks outside the encoder grid -> sizes from the grid; a provided
+    # collection must carry pp/tp.
+    if pg_collection is None:
+        tp_size = get_grid_dim_size(encoder_grid, "tp")
+        pp_size = get_grid_dim_size(encoder_grid, "pp")
+    else:
+        assert pp_pg is not None and tp_pg is not None, (
+            "encoder pg_collection is missing the required pp/tp group"
+        )
+        tp_size = get_pg_size(tp_pg)
+        pp_size = get_pg_size(pp_pg)
 
     vision_config = radio_vision_config(args, tp_size, pp_size)
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)

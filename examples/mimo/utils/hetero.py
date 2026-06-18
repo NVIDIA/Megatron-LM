@@ -17,19 +17,16 @@ def get_grid_dim_size(grid: HyperCommGrid, dim: str) -> int:
         return 1
 
 
-def get_group_size_or(pg, fallback: int) -> int:
-    """Return ``pg``'s world size when joinable, else ``fallback``."""
-    if pg is None:
-        return fallback
+def get_pg_size(pg) -> int:
+    """World size of a required process group (asserts the group is present)."""
+    assert pg is not None, "required process group is missing from the collection"
     return dist.get_world_size(group=pg)
 
 
-def get_group_rank_or(pg, fallback: int = 0) -> int:
-    """Return this rank's index within ``pg``, else ``fallback``."""
-    if pg is None:
-        return fallback
-    rank = dist.get_rank(group=pg)
-    return rank if rank >= 0 else fallback
+def get_pg_rank(pg) -> int:
+    """This rank's index within a required process group (asserts the group is present)."""
+    assert pg is not None, "required process group is missing from the collection"
+    return dist.get_rank(group=pg)
 
 
 def is_process_group_member(pg) -> bool:
