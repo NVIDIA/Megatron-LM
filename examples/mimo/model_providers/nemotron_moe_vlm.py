@@ -93,14 +93,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     return parser
 
 
-def prepare_model_provider_args(args: argparse.Namespace) -> None:
-    """Set the derived ``vision_encoder_key`` the spec builders / topology read.
-
-    Call after ``parse_args`` and before stock ``validate_args``.
-    """
-    args.vision_encoder_key = NEMOTRON_VISION_ENCODER_KEY
-
-
 def _vocab_size(args: argparse.Namespace) -> int:
     """Resolve the vocabulary size from stock args (``padded_vocab_size`` / ``vocab_size``)."""
     for attr in ("padded_vocab_size", "vocab_size"):

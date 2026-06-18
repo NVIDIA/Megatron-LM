@@ -17,7 +17,6 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
     NEMOTRON_VISION_ENCODER_KEY,
     add_model_provider_args,
-    prepare_model_provider_args,
 )
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
@@ -91,12 +90,6 @@ def test_freeze_flags_drive_tower_freezing():
     assert args.freeze_projection is False
 
 
-def test_prepare_sets_vision_encoder_key():
-    args = _parse(["--model-provider", NEMOTRON_MODEL_PROVIDER])
-    prepare_model_provider_args(args)
-    assert args.vision_encoder_key == NEMOTRON_VISION_ENCODER_KEY
-
-
 # --- Config parity gate (requires torch; runs in CI) ----------------------
 
 pytest.importorskip("torch")
@@ -157,12 +150,10 @@ def _parse_validate(argv):
     """Build args via the production pipeline so validate_args-derived fields
     (params_dtype, padded_vocab_size, ...) resolve exactly as in a real run.
 
-    Mirrors examples/mimo/pretrain_mimo.py::_parse_and_validate: parse_args ->
-    prepare_model_provider_args (preset, before validate) -> validate_args. Runs
-    at world_size=1, tp=pp=cp=1 so validate_args' divisibility checks pass with
-    no distributed/mpu init.
+    Mirrors examples/mimo/pretrain_mimo.py: parse_args -> validate_args. Runs at
+    world_size=1, tp=pp=cp=1 so validate_args' divisibility checks pass with no
+    distributed/mpu init.
     """
-    from examples.mimo.model_providers.nemotron_moe_vlm import prepare_model_provider_args
     from megatron.training.arguments import parse_args, validate_args
 
     saved = sys.argv
@@ -171,7 +162,6 @@ def _parse_validate(argv):
         args = parse_args(add_model_provider_args, ignore_unknown_args=True)
     finally:
         sys.argv = saved
-    prepare_model_provider_args(args)
     validate_args(args)
     return args
 
