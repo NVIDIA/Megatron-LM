@@ -22,6 +22,7 @@ from examples.mimo.model_providers.radio_encoder import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -32,10 +33,23 @@ HIDDEN = 64
 PATCHES = (IMG // PATCH) ** 2  # 16 * 16 = 256
 
 
-def _build_wrapper(*, apply_pixel_shuffle, drop_class_token, dynamic_resolution):
+def _build_wrapper(
+    *,
+    apply_pixel_shuffle,
+    drop_class_token,
+    dynamic_resolution,
+    params_dtype=torch.float32,
+    attention_backend=AttnBackend.auto,
+):
     """Build the wrapper through the production spec builder, then instantiate it."""
     config = TransformerConfig(
-        num_layers=2, hidden_size=HIDDEN, num_attention_heads=4, use_cpu_initialization=True
+        num_layers=2,
+        hidden_size=HIDDEN,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        params_dtype=params_dtype,
+        bf16=params_dtype == torch.bfloat16,
+        attention_backend=attention_backend,
     )
     args = SimpleNamespace(
         img_h=IMG,
@@ -99,13 +113,21 @@ class TestRADIOEncoderWrapper:
     def test_dynamic_resolution_forward_backward(self):
         # Packed variable-tile path: one square tile of rows*cols patches, fed as
         # pre-patchified features (matches the dynamic-resolution data builder).
+        # The packed (thd) attention path requires bf16 + a flash/fused backend
+        # (the fixed sbhd path tolerates fp32; this one does not). imgs_sizes /
+        # cu_seqlens / max_seqlen stay int32 on CPU, matching the data builder;
+        # RADIOViTModel itself adds class_token_len per tile to cu_seqlens.
         wrapper = _build_wrapper(
-            apply_pixel_shuffle=True, drop_class_token=True, dynamic_resolution=True
+            apply_pixel_shuffle=True,
+            drop_class_token=True,
+            dynamic_resolution=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
         )
         rows = cols = 8
         patches = rows * cols
         feat_dim = 3 * PATCH * PATCH
-        x = torch.randn(1, patches, feat_dim, device="cuda")
+        x = torch.randn(1, patches, feat_dim, device="cuda", dtype=torch.bfloat16)
         imgs_sizes = torch.tensor([[rows * PATCH, cols * PATCH]], dtype=torch.int32)
         cu_seqlens = torch.tensor([0, patches], dtype=torch.int32)
         packed = PackedSeqParams(
