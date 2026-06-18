@@ -1570,18 +1570,37 @@ class ChainedOptimizer(MegatronOptimizer):
         ):
             return self.get_grad_norm()
 
-        # Mirror get_grad_norm() exactly (single get_grad_norm_fp32 over the concatenated
-        # grads), but concatenate only the non-skip sub-optimizers' grads. When nothing is
-        # flagged this is handled by the fast path above, so for non-Muon users the value
-        # and collectives are unchanged.
-        grads_for_norm = []
-        for optimizer in self.chained_optimizers:
-            if getattr(optimizer, 'skip_grad_norm_clip', False):
-                continue
-            grads_for_norm += optimizer.get_grads_for_grad_norm()
-        return get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+        non_skip = [
+            optimizer
+            for optimizer in self.chained_optimizers
+            if not getattr(optimizer, 'skip_grad_norm_clip', False)
+        ]
+        if not non_skip:
+            # Everything is skip-flagged (e.g. a Muon-only chain). There is nothing to
+            # threshold; skip-flagged subs are exempt from the threshold check anyway.
+            return 0.0
+        if len(non_skip) == 1:
+            # Single non-skip sub: defer to its own norm (handles its own group sharedness).
+            return non_skip[0].get_grad_norm()
+
+        # Determine grad-stats sharedness over the NON-SKIP subs only, not the whole
+        # container: the container-level get_grad_stats_parallel_group() asserts that ALL
+        # subs share a group, which fails on the distributed-optimizer path where a Muon
+        # LayerWise sub and an Adam DistributedOptimizer sub have different grad-stats
+        # groups. This mirrors get_grad_norm()'s shared / non-shared handling.
+        try:
+            ref_group = non_skip[0].get_grad_stats_parallel_group()
+            shared = all(o.get_grad_stats_parallel_group() == ref_group for o in non_skip)
+        except AssertionError:
+            shared = False
+        if shared:
+            grads_for_norm = []
+            for optimizer in non_skip:
+                grads_for_norm += optimizer.get_grads_for_grad_norm()
+            return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=ref_group)
+        # Non-shared groups: combine per-sub norms (mirrors get_grad_norm()'s fallback).
+        grad_norms = [o.get_grad_norm() or 0.0 for o in non_skip]
+        return math.sqrt(sum(x * x for x in grad_norms))
 
     @torch.no_grad()
     def count_zeros(self):
