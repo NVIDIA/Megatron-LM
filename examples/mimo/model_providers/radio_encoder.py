@@ -90,7 +90,6 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.attention_dropout = 0.0
     config.hidden_dropout = 0.0
     config.mtp_num_layers = 0  # Trigger TransformerBlock's final_layernorm allocation.
-    config.use_cpu_initialization = True
     _make_dense_non_hybrid(config)  # ViT inherits no MoE/Mamba/hybrid settings.
     config.params_dtype = dtype
     config.pipeline_dtype = dtype

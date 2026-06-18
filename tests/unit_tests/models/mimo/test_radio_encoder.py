@@ -46,7 +46,6 @@ def _build_wrapper(
         num_layers=2,
         hidden_size=HIDDEN,
         num_attention_heads=4,
-        use_cpu_initialization=True,
         params_dtype=params_dtype,
         bf16=params_dtype == torch.bfloat16,
         attention_backend=attention_backend,
