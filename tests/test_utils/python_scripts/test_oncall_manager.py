@@ -125,6 +125,16 @@ def test_assign_reviewer_requests_oncall_when_needed(oncall_manager, monkeypatch
     ]
 
 
+def test_get_headers_rejects_invalid_token(oncall_manager, monkeypatch, capsys):
+    monkeypatch.setenv("GH_TOKEN", "not a token\nwith newline")
+
+    with pytest.raises(SystemExit) as error:
+        oncall_manager.get_headers()
+
+    assert error.value.code == 1
+    assert "GH_TOKEN or GITHUB_TOKEN is invalid" in capsys.readouterr().out
+
+
 def test_ensure_schedule_filled_uses_schedule_file_order(oncall_manager, monkeypatch):
     schedule = [
         {"user": "charlie", "date": "2026-01-07"},
@@ -155,6 +165,47 @@ def test_ensure_schedule_filled_uses_schedule_file_order(oncall_manager, monkeyp
     ]
 
 
+def test_validate_schedule_users_in_rotation_team_accepts_all_users(
+    oncall_manager, monkeypatch, capsys
+):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+        {"user": "bob", "date": "2026-01-21"},
+        {"user": "alice", "date": "2026-01-28"},
+    ]
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"alice", "bob", "charlie", "dana"},
+    )
+
+    rotation_order = oncall_manager.validate_schedule_users_in_rotation_team(schedule, "NVIDIA")
+
+    assert rotation_order == ["charlie", "alice", "bob"]
+    assert "Validated 3 scheduled user(s) in mcore-oncall-rotation" in capsys.readouterr().out
+
+
+def test_validate_schedule_users_in_rotation_team_rejects_missing_user(
+    oncall_manager, monkeypatch, capsys
+):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+    ]
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"alice"},
+    )
+
+    with pytest.raises(SystemExit) as error:
+        oncall_manager.validate_schedule_users_in_rotation_team(schedule, "NVIDIA")
+
+    assert error.value.code == 1
+    assert "charlie" in capsys.readouterr().out
+
+
 def test_rotate_schedule_keeps_popped_user_in_rotation_order(oncall_manager, monkeypatch):
     schedule = [
         {"user": "charlie", "date": "2026-01-07"},
@@ -176,6 +227,11 @@ def test_rotate_schedule_keeps_popped_user_in_rotation_order(oncall_manager, mon
     )
     monkeypatch.setattr(
         oncall_manager, "save_schedule", lambda new_schedule: saved_schedule.extend(new_schedule)
+    )
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"alice", "bob", "charlie"},
     )
     monkeypatch.setattr(oncall_manager, "update_active_oncall_team", lambda *_args, **_kwargs: None)
 

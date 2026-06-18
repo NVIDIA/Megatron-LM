@@ -25,6 +25,7 @@ from slack_sdk.errors import SlackApiError
 # Constants
 GITHUB_API_URL = "https://api.github.com"
 SCHEDULE_FILE = ".github/oncall_schedule.json"
+ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
 COMMUNITY_REQUEST_LABEL = "community-request"
@@ -42,6 +43,11 @@ def get_headers():
         
     if not token:
         print("Error: GH_TOKEN or GITHUB_TOKEN not set")
+        sys.exit(1)
+
+    token = token.strip()
+    if not token or any(char.isspace() for char in token):
+        print("Error: GH_TOKEN or GITHUB_TOKEN is invalid")
         sys.exit(1)
         
     return {
@@ -268,6 +274,25 @@ def get_schedule_user_order(schedule):
             seen_users.add(user)
     return ordered_users
 
+def validate_schedule_users_in_rotation_team(schedule, repo_owner):
+    """Validates scheduled users are members of the rotation team."""
+    schedule_users = get_schedule_user_order(schedule)
+    if not schedule_users:
+        print("Warning: No users found in schedule. Cannot validate rotation team membership.")
+        return schedule_users
+
+    rotation_team_members = get_team_members(repo_owner, ROTATION_TEAM_SLUG)
+    missing_users = sorted(set(schedule_users) - rotation_team_members)
+    if missing_users:
+        print(
+            f"Error: Scheduled oncall user(s) are not members of "
+            f"{ROTATION_TEAM_SLUG}: {', '.join(missing_users)}"
+        )
+        sys.exit(1)
+
+    print(f"Validated {len(schedule_users)} scheduled user(s) in {ROTATION_TEAM_SLUG}.")
+    return schedule_users
+
 def update_active_oncall_team(org, new_oncall):
     """Updates the active oncall team to contain only the new oncall user."""
     # 1. Get current members of the active team
@@ -299,7 +324,7 @@ def update_active_oncall_team(org, new_oncall):
 
 def rotate_schedule(repo_owner, dry_run=False):
     schedule = load_schedule()
-    rotation_order = get_schedule_user_order(schedule)
+    rotation_order = validate_schedule_users_in_rotation_team(schedule, repo_owner)
     print(f"Current schedule length: {len(schedule)}")
     
     # 1. Rotate (Remove past week)
@@ -465,7 +490,8 @@ def main():
         rotate_schedule(owner, dry_run=args.dry_run)
     elif args.command == "fill":
         schedule = load_schedule()
-        ensure_schedule_filled(schedule)
+        rotation_order = validate_schedule_users_in_rotation_team(schedule, owner)
+        ensure_schedule_filled(schedule, rotation_order)
         save_schedule(schedule)
         print("Schedule filled and saved.")
     elif args.command == "assign":
