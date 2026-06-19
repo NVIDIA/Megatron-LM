@@ -21,7 +21,6 @@ def get_paths_from_blend(
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]],
 ) -> List[str]:
     """Extract all dataset paths from blend and blend_per_split.
-
     Args:
         blend (Optional[Tuple[List[str], Optional[List[float]]]]): A blend tuple containing
             a list of dataset paths and optionally a list of weights, e.g.,
@@ -29,12 +28,10 @@ def get_paths_from_blend(
         blend_per_split (Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]): 
             A list of 3 blend tuples (for train, valid, test splits), where each element has 
             the same structure as blend
-
     Returns:
         List[str]: A list of all unique dataset paths found in blend and blend_per_split
     """
     paths = []
-    
     # Extract paths from blend
     if blend is not None:
         paths_list, _ = blend

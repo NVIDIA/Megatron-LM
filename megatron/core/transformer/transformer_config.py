@@ -27,6 +27,9 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
+# FusedA2AConfig is a lightweight dataclass with no heavy dependencies — safe to import directly.
+from megatron.core.transformer.moe.fused_a2a_config import FusedA2AConfig
+
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
@@ -884,6 +887,14 @@ class TransformerConfig(ModelParallelConfig):
     """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
     exceeding this budget will be dropped. None means no token will be dropped. 
     The default is None."""
+
+    fused_a2a_config: Optional[FusedA2AConfig] = None
+    """User-tunable configuration for fused all-to-all MoE communication (DeepEP backend).
+    Resolved once at training startup by validate_args from CLI flags, environment variables
+    (MOE_A2A_CHUNK_SIZE, MOE_A2A_NUM_SMS), and an optional JSON/YAML config file.
+    Precedence: CLI > ENV > config file > built-in defaults.
+    None means all tunables fall back to their built-in defaults.
+    See --moe-a2a-chunk-size, --moe-a2a-num-sms, --moe-a2a-config-file."""
 
     ##################
     # Context Parallel
