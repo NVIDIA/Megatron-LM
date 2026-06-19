@@ -130,7 +130,7 @@ def _full_main_grads(stack):
             g_attr = 'main_grad' if hasattr(p, 'main_grad') else 'grad'
             mg = getattr(p, g_attr)
             if isinstance(p, GTPShardedParam):
-                g = ps.get_generalized_tensor_parallel_remat_group()
+                g = ps.get_gtp_weight_remat_group()
                 shards = [torch.empty_like(mg) for _ in range(g.size())]
                 dist.all_gather(shards, mg.contiguous(), group=g)
                 out[name] = torch.cat(shards, dim=0).float().cpu()
@@ -175,7 +175,7 @@ def _worker(rank, world_size, port):
     for layer in gtp_stack:
         layer.cuda()
 
-    g = ps.get_generalized_tensor_parallel_remat_group()
+    g = ps.get_gtp_weight_remat_group()
     gtp_rank = g.rank()
     assert g.size() == 2, f"expected gtp shard group size 2, got {g.size()}"
 
@@ -313,7 +313,7 @@ def _worker_distopt(rank, world_size, port):
     gtp_stack = _make_stack(_make_config(), pgc)
     for layer in gtp_stack:
         layer.cuda()
-    g = ps.get_generalized_tensor_parallel_remat_group()
+    g = ps.get_gtp_weight_remat_group()
     gtp_rank = g.rank()
     for name, p in gtp_stack.named_parameters():
         full = saved[name]
@@ -435,8 +435,8 @@ def _worker_moe_distopt(rank, world_size, port):
     moe_stack = _make_moe_stack(_make_moe_config(), pgc)
     for layer in moe_stack:
         layer.cuda()
-    g = ps.get_generalized_tensor_parallel_remat_group()
-    eg = ps.get_expert_generalized_tensor_parallel_remat_group()
+    g = ps.get_gtp_weight_remat_group()
+    eg = ps.get_expert_gtp_weight_remat_group()
     gtp_rank, egtp_rank = g.rank(), eg.rank()
     n_egtp_sharded = 0
     for name, p in moe_stack.named_parameters():

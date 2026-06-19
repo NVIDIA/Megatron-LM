@@ -28,8 +28,8 @@ except ImportError:
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
-_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
-_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+_GTP_WEIGHT_REMAT_GROUP = None
+_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -54,8 +54,8 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # _EXPERT_DATA denotes data parallelism of expert which replicates weight across the group.
 
 # Expert generalized tensor parallelism group that current rank belongs to.
-_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
-_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+_EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+_EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
@@ -682,14 +682,14 @@ def initialize_model_parallel(
             each weight is rematerialized independently (per-weight, not per-
             layer) via async all-gather on every forward AND backward pass. A
             first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
-            dataclass field ``ModelParallelConfig.generalized_tensor_parallel_remat_size``.
+            dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
 
         expert_gtp_remat_size (int, default = 1):
             Expert-side counterpart of ``gtp_remat_size`` — shards routed-expert
             weights along ``out_features`` and rematerializes per-weight on
             every forward AND backward pass. A first-class orthogonal axis on the
             expert grid. Independent from ``gtp_remat_size``. Maps to
-            ``ModelParallelConfig.expert_generalized_tensor_parallel_remat_size``.
+            ``ModelParallelConfig.expert_gtp_weight_remat_size``.
 
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
@@ -934,21 +934,21 @@ def initialize_model_parallel(
     # Build the generalized tensor parallel groups.
     # GTP overlaps with the CP-DP domain because GTP only shards weights
     # while CP only shards activations — they are independent and can share ranks.
-    global _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
-    global _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    global _GTP_WEIGHT_REMAT_GROUP
+    global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
-        _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is None
+        _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
     for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
         group = create_group(
             gtp_ranks,
             timeout=timeout,
             pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
-            group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
+            group_desc="GTP_WEIGHT_REMAT_GROUP",
         )
         if rank in gtp_ranks:
-            _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = group
-            _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = gtp_ranks
+            _GTP_WEIGHT_REMAT_GROUP = group
+            _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
 
     # Tokens for the FULL (gtp-inclusive) data-parallel domain. gtp is factored out of the
     # generator's 'dp' axis, so the full data domain spans gtp explicitly ('gtp-dp'). The
@@ -1333,10 +1333,10 @@ def initialize_model_parallel(
     ### Expert-related parallel groups initialization
     # Build the expert generalized tensor parallel group
     # Expert GTP overlaps with the expert DP domain (experts don't use CP).
-    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
-    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    global _EXPERT_GTP_WEIGHT_REMAT_GROUP
+    global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
-        _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is None
+        _EXPERT_GTP_WEIGHT_REMAT_GROUP is None
     ), 'Expert generalized tensor parallel group is already initialized'
     # EGTP shard groups are get_ranks('gtp') on the expert generator (singletons when
     # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
@@ -1345,11 +1345,11 @@ def initialize_model_parallel(
             egtp_ranks,
             timeout=timeout,
             pg_options=get_nccl_options("expt_gtp", nccl_comm_cfgs),
-            group_desc="EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
+            group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
         )
         if rank in egtp_ranks:
-            _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = group
-            _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = egtp_ranks
+            _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
+            _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1698,40 +1698,40 @@ def get_tensor_model_parallel_group(check_initialized=True):
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_generalized_tensor_parallel_remat_group(check_initialized=True):
+def get_gtp_weight_remat_group(check_initialized=True):
     """Get the parameter-sharding group the caller rank belongs to."""
     if check_initialized:
         assert (
-            _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is not None
+            _GTP_WEIGHT_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
-    return _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    return _GTP_WEIGHT_REMAT_GROUP
 
 
-def get_generalized_tensor_parallel_remat_world_size():
+def get_gtp_weight_remat_world_size():
     """Return world size for the parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_generalized_tensor_parallel_remat_group(check_initialized=False)
+        group = get_gtp_weight_remat_group(check_initialized=False)
         return group.size() if group is not None else 0
     else:
         return 0
 
 
-def get_generalized_tensor_parallel_remat_rank():
+def get_gtp_weight_remat_rank():
     """Return caller's rank in the parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_generalized_tensor_parallel_remat_group(check_initialized=False)
+        group = get_gtp_weight_remat_group(check_initialized=False)
         return group.rank() if group is not None else 0
     else:
         return 0
 
 
-def get_generalized_tensor_parallel_remat_global_ranks(check_initialized=True):
+def get_gtp_weight_remat_global_ranks(check_initialized=True):
     """Get all global ranks of the parameter-sharding group that the caller rank belongs to."""
     if check_initialized:
         assert (
-            _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS is not None
+            _GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
         ), "generalized tensor parallel group is not initialized"
-    return _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    return _GTP_WEIGHT_REMAT_GLOBAL_RANKS
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
@@ -2168,40 +2168,40 @@ def get_tensor_and_context_parallel_rank():
 
 
 ### Expert-related parallel states functions
-def get_expert_generalized_tensor_parallel_remat_group(check_initialized=True):
+def get_expert_gtp_weight_remat_group(check_initialized=True):
     """Get the expert-parameter-sharding group the caller rank belongs to."""
     if check_initialized:
         assert (
-            _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is not None
+            _EXPERT_GTP_WEIGHT_REMAT_GROUP is not None
         ), "expert generalized tensor parallel group is not initialized"
-    return _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    return _EXPERT_GTP_WEIGHT_REMAT_GROUP
 
 
-def get_expert_generalized_tensor_parallel_remat_world_size():
+def get_expert_gtp_weight_remat_world_size():
     """Return world size for the expert-parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_generalized_tensor_parallel_remat_group(check_initialized=False)
+        group = get_expert_gtp_weight_remat_group(check_initialized=False)
         return group.size() if group is not None else 0
     else:
         return 0
 
 
-def get_expert_generalized_tensor_parallel_remat_rank():
+def get_expert_gtp_weight_remat_rank():
     """Return caller's rank in the expert-parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_generalized_tensor_parallel_remat_group(check_initialized=False)
+        group = get_expert_gtp_weight_remat_group(check_initialized=False)
         return group.rank() if group is not None else 0
     else:
         return 0
 
 
-def get_expert_generalized_tensor_parallel_remat_global_ranks(check_initialized=True):
+def get_expert_gtp_weight_remat_global_ranks(check_initialized=True):
     """Get all global ranks of the expert-parameter-sharding group that the caller rank belongs to."""
     if check_initialized:
         assert (
-            _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS is not None
+            _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
         ), "expert generalized tensor parallel group is not initialized"
-    return _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    return _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
 
 
 def get_expert_model_parallel_group(check_initialized=True):
@@ -2464,7 +2464,7 @@ def get_all_ranks():
     pipeline-model-parallel and expert-model-parallel groups."""
     ranks = [
         get_tensor_model_parallel_rank(),
-        get_generalized_tensor_parallel_remat_rank(),
+        get_gtp_weight_remat_rank(),
         get_data_parallel_rank(),
         get_context_parallel_rank(),
         get_pipeline_model_parallel_rank(),
@@ -2481,11 +2481,11 @@ def destroy_model_parallel():
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
 
-    global _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
-    _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
+    global _GTP_WEIGHT_REMAT_GROUP
+    _GTP_WEIGHT_REMAT_GROUP = None
 
-    global _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
-    _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+    global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -2571,11 +2571,11 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     # Destroy parallel state related to expert parallelism.
-    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
-    _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
+    global _EXPERT_GTP_WEIGHT_REMAT_GROUP
+    _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
 
-    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
-    _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+    global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None

@@ -803,12 +803,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
-                gtp_rank_to_print = mpu.get_generalized_tensor_parallel_remat_rank() + 1
+                gtp_rank_to_print = mpu.get_gtp_weight_remat_rank() + 1
                 pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
                              f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
-                             f"gtp {gtp_rank_to_print}/{mpu.get_generalized_tensor_parallel_remat_world_size()}, "
+                             f"gtp {gtp_rank_to_print}/{mpu.get_gtp_weight_remat_world_size()}, "
                              f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
@@ -2033,7 +2033,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
-                 f'gtp {mpu.get_generalized_tensor_parallel_remat_rank() + 1}/{mpu.get_generalized_tensor_parallel_remat_world_size()}, '
+                 f'gtp {mpu.get_gtp_weight_remat_rank() + 1}/{mpu.get_gtp_weight_remat_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
 

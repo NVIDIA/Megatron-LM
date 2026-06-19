@@ -1674,8 +1674,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Configure GTP padding alignment based on quantization recipe before model construction.
     if (
-        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
-        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
     ):
         from megatron.experimental.gtp import update_gtp_config
 
@@ -1738,8 +1738,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # from args.cuda_graph_modules + moe_shared_expert_overlap. Must run after
     # model build, before the first forward (which lazily builds chain links).
     if (
-        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
-        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
     ):
         from megatron.experimental.gtp import (
             GTP_CONFIG,

@@ -16,9 +16,9 @@ from typing_extensions import override
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
-    get_expert_generalized_tensor_parallel_remat_rank,
-    get_generalized_tensor_parallel_remat_rank,
+    get_expert_gtp_weight_remat_rank,
     get_global_memory_buffer,
+    get_gtp_weight_remat_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -122,8 +122,8 @@ def param_is_not_gtp_duplicate(param):
         return True
     is_expert = not getattr(param, "allreduce", True)
     if is_expert:
-        return get_expert_generalized_tensor_parallel_remat_rank() == 0
-    return get_generalized_tensor_parallel_remat_rank() == 0
+        return get_expert_gtp_weight_remat_rank() == 0
+    return get_gtp_weight_remat_rank() == 0
 
 
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):

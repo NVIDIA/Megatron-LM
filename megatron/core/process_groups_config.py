@@ -126,10 +126,10 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
-    # _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    # _GTP_WEIGHT_REMAT_GROUP
     gtp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
@@ -285,12 +285,9 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_context_parallel=True,
             ),
-            'gtp': partial(
-                parallel_state.get_generalized_tensor_parallel_remat_group, check_initialized=False
-            ),
+            'gtp': partial(parallel_state.get_gtp_weight_remat_group, check_initialized=False),
             'expt_gtp': partial(
-                parallel_state.get_expert_generalized_tensor_parallel_remat_group,
-                check_initialized=False,
+                parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
             ),
         }
 

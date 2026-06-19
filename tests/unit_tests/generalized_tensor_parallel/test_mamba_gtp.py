@@ -185,7 +185,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     for layer in layers_gtp:
         layer.cuda()
 
-    gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+    gtp_group = ps.get_gtp_weight_remat_group()
     gtp_size = gtp_group.size()
     gtp_rank = gtp_group.rank()
 

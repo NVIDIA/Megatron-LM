@@ -1433,9 +1433,33 @@ def validate_args(args, defaults={}):
             args.high_priority_stream_groups.append('ep_dp')
 
 
-    if args.generalized_tensor_parallel_remat_size > 1 or args.expert_generalized_tensor_parallel_remat_size > 1:
-        gtp_size = args.generalized_tensor_parallel_remat_size
-        egtp_size = args.expert_generalized_tensor_parallel_remat_size
+    # Derive the internal gtp_weight_remat_size from the user-facing
+    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
+    # from argument generation), so it is set here as a fresh attribute on args before it is
+    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
+    # Mirrors ModelParallelConfig.__post_init__.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
+    # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
+    # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
+    (args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.expert_tensor_parallel_size,
+            args.expert_tensor_parallel_num_weight_shards,
+            getattr(args, "expert_gtp_weight_remat_size", 1),
+        )
+    )
+
+    if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+        gtp_weight_remat_size = args.gtp_weight_remat_size
+        egtp_weight_remat_size = args.expert_gtp_weight_remat_size
         if get_device_arch_version() >= 10:
             # Setting GTP communication groups for high priority streams for Blackwell and later
             # architectures. Assigning high priority to communication streams ensures that
@@ -1444,7 +1468,7 @@ def validate_args(args, defaults={}):
             if 'gtp' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('gtp')
                 warn_rank_0("Setting 'gtp' group for high priority streams.")
-            if egtp_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
+            if egtp_weight_remat_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('expt_gtp')
                 warn_rank_0("Setting 'expt_gtp' group for high priority streams.")
 
@@ -2165,6 +2189,10 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # internal/derived: controlled only via --tensor-parallel-num-weight-shards
+        "gtp_weight_remat_size",
+        # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
+        "expert_gtp_weight_remat_size",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

@@ -449,10 +449,8 @@ def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
     leaving them 1/gtp short. SUM (not AVG) over the gtp/egtp group recovers the full mean.
     No-op when GTP is inactive (gtp/egtp group size <= 1).
     """
-    gtp_group = parallel_state.get_generalized_tensor_parallel_remat_group(check_initialized=False)
-    egtp_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group(
-        check_initialized=False
-    )
+    gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    egtp_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
 
     dense_params, dense_grads = [], []
     expert_params, expert_grads = [], []
@@ -537,10 +535,7 @@ def finalize_model_grads(
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Fence the current stream against all GTP backward grad work before the DP gradient sync.
-    if (
-        config.generalized_tensor_parallel_remat_size > 1
-        or config.expert_generalized_tensor_parallel_remat_size > 1
-    ):
+    if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
         from megatron.experimental.gtp import wait_for_gtp_grad_reduction_on_current_stream
 
         wait_for_gtp_grad_reduction_on_current_stream()

@@ -113,7 +113,7 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 
 - **TP** (intra-layer): orthogonal axis — GTP shards `out_features` regardless of TP's parallel mode (column or row). 2D grid naturally formed via `tp_group × gtp_group`.
 - **SP** (sequence-parallel): transparent — GTP operates at weight dim, SP at sequence dim.
-- **EP** (MoE): `GroupedLinear` with GTP → each routed expert sharded across `EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP AG/RS (NCCL/IB).
+- **EP** (MoE): `GroupedLinear` with GTP → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP AG/RS (NCCL/IB).
 - **DDP**: GTP bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). `register_grad_accum_hook` + manual invocation from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) serializes DDP RS strictly after GTP RS — critical at IB scale to avoid deadlock between DDP and GTP on the same NIC.
 
 ### 1.5 Opt-in, minimally invasive integration
@@ -121,7 +121,7 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 - Drop-in `gtp_group` kwarg on `Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`; no framework-level refactor required.
 - **Per-weight opt-in.** GTP wraps only weights threaded with the `gtp_group=` kwarg — typically the heavy GEMM linears (`Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`). Small replicated tensors (LayerNorm γ/β, biases, Mamba `dt_bias`/`A_log`/`D`/`conv1d`, MoE router, latent-proj MLPs) stay full — no NCCL launch latency for params where the all-gather wouldn't amortize. The split is visible in §3.2's *dense non-GTP* vs *dense GTP* membership.
 - `classify_gtp_chains(model)` walks `named_parameters()` once at init and sets `chain_id` on every `GTPShardedParam` based on the current `cuda_graph_modules`.
-- Turning it off is a no-op: when `gtp_group.size() == 1`, `wrap_module_params_gtp` short-circuits; when `generalized_tensor_parallel_remat_size == 1`, the GTP path in `layers.py` is skipped entirely.
+- Turning it off is a no-op: when `gtp_group.size() == 1`, `wrap_module_params_gtp` short-circuits; when `gtp_weight_remat_size == 1`, the GTP path in `layers.py` is skipped entirely.
 - User-tunable knobs (`GTPConfig.pad_for_alignment`, `weight_prefetch`, `check_param_states`) plus a debug-name tagger (`tag_gtp_params_with_names`) for readable link-table output.
 
 ### 1.6 Scaling
@@ -158,13 +158,23 @@ GTP is enabled through two CLI flags on Megatron's training launcher; everything
 ### 2.1 Required flags
 
 ```bash
-# Shard dense weights (attention, mamba, MLP linears) 1/N along out_features.
---generalized-tensor-parallel-remat-size <N>
+# Total number of shards each dense weight (attention, mamba, MLP linears) is split into along
+# out_features, across the tensor-parallel + GTP axes. Must be >= --tensor-model-parallel-size and
+# divisible by it. The GTP degree is derived as num_weight_shards / tensor_model_parallel_size
+# (e.g. TP=1 + num_weight_shards=2 -> GTP=2; TP=2 + num_weight_shards=8 -> GTP=4).
+--tensor-parallel-num-weight-shards <num_weight_shards>
 
-# Shard MoE routed-expert weights 1/M along out_features. Independent from
-# `--generalized-tensor-parallel-remat-size`; can be 1 for non-MoE models.
---expert-generalized-tensor-parallel-remat-size <M>
+# Total number of shards each MoE routed-expert weight is split into along out_features, across the
+# expert-tensor-parallel + expert-GTP axes. Must be >= --expert-tensor-parallel-size and divisible
+# by it. The expert-GTP degree is derived as num_weight_shards / expert_tensor_parallel_size.
+# Independent from --tensor-parallel-num-weight-shards; can be left unset for non-MoE models.
+--expert-tensor-parallel-num-weight-shards <num_weight_shards>
 ```
+
+> The (dense / expert) GTP degree is exposed **only** through
+> `--tensor-parallel-num-weight-shards` / `--expert-tensor-parallel-num-weight-shards`. The internal
+> `gtp_weight_remat_size` / `expert_gtp_weight_remat_size` config fields are derived from them and
+> have no CLI flag.
 
 ### 2.2 High-priority streams (Blackwell and later)
 
@@ -179,12 +189,13 @@ The launcher also exports `CUDA_GRAPHS_USE_NODE_PRIORITY=1` so captured CUDA gra
 ### 2.3 Minimal end-to-end example
 
 ```bash
-# 4 ranks, GTP=2 across out_features, no TP, BF16 weights.
+# 4 ranks, TP=2 + GTP=2 across out_features, BF16 weights.
+# TP=2 + num-weight-shards=4 -> GTP = 4 / 2 = 2.
 torchrun --nproc-per-node 4 pretrain_gpt.py \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 1 \
-    --generalized-tensor-parallel-remat-size 2 \
-    --expert-generalized-tensor-parallel-remat-size 1 \
+    --tensor-parallel-num-weight-shards 4 \
+    --expert-tensor-parallel-num-weight-shards 1 \
     --high-priority-stream-groups ep gtp expt_gtp \
     --bf16 \
     --num-layers 12 --hidden-size 1024 --num-attention-heads 16 \
@@ -238,7 +249,7 @@ TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `La
 
 #### What the flags do under the hood
 
-1. `parallel_state.initialize_model_parallel(...)` treats GTP/EGTP as **first-class orthogonal axes** (`world_size = TP*GTP*CP*DP`, and the expert grid `= ETP*EP*PP*EGTP*expert_dp`). It builds the shard groups `_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--generalized-tensor-parallel-remat-size`) and `_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--expert-generalized-tensor-parallel-remat-size`), plus the gtp/egtp-EXCLUDED replicate DP groups (`_DATA_PARALLEL_GROUP_NO_GTP`, `_EXPERT_DATA_PARALLEL_GROUP_NO_GTP`) that DDP and the optimizer shard over. These `*_no_gtp` groups alias the regular DP groups when GTP is inactive (remat size 1).
+1. `parallel_state.initialize_model_parallel(...)` treats GTP/EGTP as **first-class orthogonal axes** (`world_size = TP*GTP*CP*DP`, and the expert grid `= ETP*EP*EGTP*PP*expert_dp`). It builds the shard groups `_GTP_WEIGHT_REMAT_GROUP` (size = `--tensor-parallel-num-weight-shards / --tensor-model-parallel-size`) and `_EXPERT_GTP_WEIGHT_REMAT_GROUP` (size = `--expert-tensor-parallel-num-weight-shards / --expert-tensor-parallel-size`), plus the gtp/egtp-EXCLUDED replicate DP groups (`_DATA_PARALLEL_GROUP_NO_GTP`, `_EXPERT_DATA_PARALLEL_GROUP_NO_GTP`) that DDP and the optimizer shard over. These `*_no_gtp` groups alias the regular DP groups when GTP is inactive (remat size 1).
 2. Megatron's `extensions/transformer_engine.py` reads `pg_collection.gtp` / `pg_collection.expt_gtp` and forwards them as the `gtp_group=` kwarg to `te.Linear` / `te.LayerNormLinear` / `te.GroupedLinear`. TE's `module/base.py` calls back into `megatron.experimental.gtp` via the hook registry (`register_gtp_hooks`) to slice each weight at `reset_parameters` time.
 3. DDP treats GTP shards as ordinary params: they go into the same dense / expert buffers as everything else, reduced over the gtp/egtp-EXCLUDED replicate group (`intra_dp_cp_no_gtp_group` / `intra_expt_dp_no_egtp_group`) with the standard `1/full` scaling. The gtp axis is completed elsewhere — GTP shards by their reduce-scatter sum, replicated (non-GTP) params by a SUM all-reduce in `finalize_model_grads`. See §3.2.
 4. Optimizer state is sharded over the same replicate group; clip-by-global-norm reduces squared norms over the dist-opt grad-stats group, which spans the full world (including the gtp/egtp axis), with replicated non-GTP params counted once per gtp/egtp axis to avoid over-counting.

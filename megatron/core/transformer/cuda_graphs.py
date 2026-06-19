@@ -867,7 +867,7 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
-            self.gtp_remat = self.base_module.config.generalized_tensor_parallel_remat_size > 1
+            self.gtp_remat = self.base_module.config.gtp_weight_remat_size > 1
 
             if self.gtp_remat:
                 # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
@@ -882,18 +882,16 @@ class _CudaGraphRunner(torch.nn.Module):
                 # Dense for mamba/attn/shared_experts; expert (below) for routed
                 # experts captured when "moe" is in cuda_graph_modules.
                 from megatron.core.parallel_state import (
-                    get_expert_generalized_tensor_parallel_remat_group,
-                    get_expert_generalized_tensor_parallel_remat_world_size,
-                    get_generalized_tensor_parallel_remat_group,
+                    get_expert_gtp_weight_remat_group,
+                    get_expert_gtp_weight_remat_world_size,
+                    get_gtp_weight_remat_group,
                 )
 
-                self._register_gtp_side_streams(get_generalized_tensor_parallel_remat_group())
+                self._register_gtp_side_streams(get_gtp_weight_remat_group())
                 # EGTP streams: required so _wait/_sync_side_streams drain EGTP
                 # NCCL into runner_stream before bwd_completion_event fires.
-                if get_expert_generalized_tensor_parallel_remat_world_size() > 1:
-                    self._register_gtp_side_streams(
-                        get_expert_generalized_tensor_parallel_remat_group()
-                    )
+                if get_expert_gtp_weight_remat_world_size() > 1:
+                    self._register_gtp_side_streams(get_expert_gtp_weight_remat_group())
                 # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
                 # so bwd_completion_event records past NCCL_AG completion.
                 self.bwd_ag_fence_event = torch.cuda.Event()
@@ -1333,17 +1331,17 @@ class _CudaGraphRunner(torch.nn.Module):
                 # so bwd_completion_event records AFTER NCCL_AG completion.
                 wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
                 from megatron.core.parallel_state import (
-                    get_expert_generalized_tensor_parallel_remat_group,
-                    get_expert_generalized_tensor_parallel_remat_world_size,
-                    get_generalized_tensor_parallel_remat_group,
+                    get_expert_gtp_weight_remat_group,
+                    get_expert_gtp_weight_remat_world_size,
+                    get_gtp_weight_remat_group,
                 )
 
-                gtp_group = get_generalized_tensor_parallel_remat_group()
+                gtp_group = get_gtp_weight_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
                 self.bwd_ag_fence_event.record(graphed_ag)
                 torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
-                if get_expert_generalized_tensor_parallel_remat_world_size() > 1:
-                    egtp_group = get_expert_generalized_tensor_parallel_remat_group()
+                if get_expert_gtp_weight_remat_world_size() > 1:
+                    egtp_group = get_expert_gtp_weight_remat_group()
                     egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
                     self.bwd_ag_fence_event.record(egtp_graphed_ag)
                     torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
@@ -1381,8 +1379,8 @@ class _CudaGraphRunner(torch.nn.Module):
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
         self._gtp_finalize_hook_plan = []
         if self.gtp_remat and self.finalized_during_bwd_capture:
-            dense_group = parallel_state.get_generalized_tensor_parallel_remat_group()
-            expert_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group()
+            dense_group = parallel_state.get_gtp_weight_remat_group()
+            expert_group = parallel_state.get_expert_gtp_weight_remat_group()
             params_by_group = defaultdict(list)
             for param in self.finalized_during_bwd_capture:
                 is_expert = not getattr(param, 'allreduce', True)

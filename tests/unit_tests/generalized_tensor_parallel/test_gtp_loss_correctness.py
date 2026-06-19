@@ -135,7 +135,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     for layer in layers_gtp:
         layer.cuda()
 
-    gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+    gtp_group = ps.get_gtp_weight_remat_group()
     gtp_size = gtp_group.size()
     gtp_rank = gtp_group.rank()
     assert gtp_size == 4, f"GTP shard group size should be 4, got {gtp_size}"

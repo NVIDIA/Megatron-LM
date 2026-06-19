@@ -1319,7 +1319,7 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
     gtp_module.GTP_CONFIG.pad_for_alignment = 0
     try:
-        gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+        gtp_group = ps.get_gtp_weight_remat_group()
 
         class _TwoLayerModel(torch.nn.Module):
             def __init__(self):
@@ -1374,7 +1374,7 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
     orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
     gtp_module.GTP_CONFIG.pad_for_alignment = 0
     try:
-        gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+        gtp_group = ps.get_gtp_weight_remat_group()
 
         class _TwoLayerModelWithBias(torch.nn.Module):
             def __init__(self):

@@ -2366,7 +2366,7 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
                     if (
-                        self.generalized_tensor_parallel_remat_size > 1
+                        self.gtp_weight_remat_size > 1
                         and self.cuda_graph_impl == "local"
                         and (self.fp8 is not None or self.fp4 is not None)
                         and self.moe_shared_expert_intermediate_size is not None

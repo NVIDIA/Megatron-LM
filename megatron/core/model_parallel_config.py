@@ -7,6 +7,37 @@ from typing import Callable, ContextManager, Literal, Optional
 import torch
 
 
+def resolve_tensor_parallel_weight_shards(
+    tensor_model_parallel_size: int,
+    tensor_parallel_num_weight_shards: Optional[int],
+    gtp_weight_remat_size: int,
+) -> tuple:
+    """Reconcile ``tensor_parallel_num_weight_shards`` and ``gtp_weight_remat_size``.
+
+    ``tensor_parallel_num_weight_shards`` is the user-facing total number of shards each weight is
+    split into across the tensor-parallel + GTP axes. It is the source of truth and implies
+    ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``.
+    When None it defaults to ``tensor_model_parallel_size * gtp_weight_remat_size`` (so the pair
+    stays consistent, and equals ``tensor_model_parallel_size`` in the no-GTP default). Idempotent.
+
+    Returns the reconciled ``(tensor_parallel_num_weight_shards, gtp_weight_remat_size)``.
+    """
+    tp = tensor_model_parallel_size
+    if tensor_parallel_num_weight_shards is None:
+        tensor_parallel_num_weight_shards = tp * gtp_weight_remat_size
+    else:
+        assert tensor_parallel_num_weight_shards >= tp, (
+            f"tensor_parallel_num_weight_shards ({tensor_parallel_num_weight_shards}) must be >= "
+            f"tensor_model_parallel_size ({tp})."
+        )
+        assert tensor_parallel_num_weight_shards % tp == 0, (
+            f"tensor_parallel_num_weight_shards ({tensor_parallel_num_weight_shards}) must be "
+            f"divisible by tensor_model_parallel_size ({tp})."
+        )
+        gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
+    return tensor_parallel_num_weight_shards, gtp_weight_remat_size
+
+
 @dataclass
 class ModelParallelConfig:
     """Base configuration for Megatron Core
@@ -20,11 +51,24 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
-    generalized_tensor_parallel_remat_size: int = 1
+    tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each weight is split into across the tensor-parallel + GTP axes
+       (i.e. ``tensor_model_parallel_size * gtp_weight_remat_size``). This is the user-facing knob:
+       it must be ``>= tensor_model_parallel_size`` and divisible by it. When None it defaults to
+       ``tensor_model_parallel_size`` (no GTP sharding). It is the source of truth and implies
+       ``gtp_weight_remat_size = tensor_parallel_num_weight_shards // tensor_model_parallel_size``
+       (resolved in ``__post_init__``).
+    """
+
+    gtp_weight_remat_size: int = 1
     """Generalized tensor parallelism with weight rematerialization. Shards model weights
        across GPU ranks along ``out_features``; each weight is rematerialized independently
        (per-weight, not per-layer) via async all-gather on every forward AND backward pass.
        Placed right after tensor parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
+       ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
@@ -79,15 +123,30 @@ class ModelParallelConfig:
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
-    expert_generalized_tensor_parallel_remat_size: int = 1
-    """Generalized tensor parallelism with weight rematerialization, for expert layers. Independent
-      from the decoder's ``generalized_tensor_parallel_remat_size``.
-      Placed right after expert parallelism in the parallelism ordering.
-    """
-
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
        Default is None, which will be set to the value of tensor_model_parallel_size.
+    """
+
+    expert_tensor_parallel_num_weight_shards: Optional[int] = None
+    """Total number of shards each expert weight is split into across the expert-tensor-parallel +
+       expert-GTP axes (i.e. ``expert_tensor_parallel_size * expert_gtp_weight_remat_size``). This is
+       the user-facing knob for expert layers: it must be ``>= expert_tensor_parallel_size`` and
+       divisible by it. When None it defaults to ``expert_tensor_parallel_size`` (no expert GTP
+       sharding). It is the source of truth and implies
+       ``expert_gtp_weight_remat_size = expert_tensor_parallel_num_weight_shards //
+       expert_tensor_parallel_size`` (resolved in ``__post_init__``).
+    """
+
+    expert_gtp_weight_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization, for expert layers. Independent
+       from the decoder's ``gtp_weight_remat_size``.
+       Placed right after expert parallelism in the parallelism ordering.
+
+       INTERNAL / DERIVED — there is no CLI flag for it; do not set directly. It is computed in
+       ``__post_init__`` from ``expert_tensor_parallel_num_weight_shards`` (= that value divided by
+       ``expert_tensor_parallel_size``). Use ``expert_tensor_parallel_num_weight_shards`` to control
+       expert GTP.
     """
 
     ###################
@@ -437,6 +496,25 @@ class ModelParallelConfig:
 
         if self.expert_tensor_parallel_size is None:
             self.expert_tensor_parallel_size = self.tensor_model_parallel_size
+
+        # Reconcile the user-facing tensor_parallel_num_weight_shards with the internal
+        # gtp_weight_remat_size (num_weight_shards = tensor_model_parallel_size * gtp_weight_remat).
+        (self.tensor_parallel_num_weight_shards, self.gtp_weight_remat_size) = (
+            resolve_tensor_parallel_weight_shards(
+                self.tensor_model_parallel_size,
+                self.tensor_parallel_num_weight_shards,
+                self.gtp_weight_remat_size,
+            )
+        )
+
+        # Same reconciliation for the expert layers (expert_tensor_parallel_size is finalized above).
+        (self.expert_tensor_parallel_num_weight_shards, self.expert_gtp_weight_remat_size) = (
+            resolve_tensor_parallel_weight_shards(
+                self.expert_tensor_parallel_size,
+                self.expert_tensor_parallel_num_weight_shards,
+                self.expert_gtp_weight_remat_size,
+            )
+        )
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
