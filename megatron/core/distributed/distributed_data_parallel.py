@@ -82,11 +82,23 @@ class DistributedDataParallel(_BaseDataParallel):
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
-        # DDP reduces each bucket over the GTP/EGTP-EXCLUDED *replicate* groups below; the gtp axis
-        # is completed separately and a single 1/(gtp x replicate) factor scales both axes together.
-        # Full rationale (independent reduction, together scaling, why average_in_collective=False):
-        # see megatron/experimental/gtp/README.md section 3.2 "DDP buckets with (E)GTP".
-        # The *_no_gtp intra groups alias the regular intra groups when GTP is off.
+        # Example process-group sizes (e.g., TP=2, GTP=64, world_size=1024 with PP=CP=EP=1 and
+        # single DistOpt instance):
+        #   model_size = TP x PP x CP x GTP = 2 x 64 = 128  ->  DP = 1024 / 128 = 8.
+        #   The model weights are replicated DP (= 8) times.
+        #     dp_cp_group (degree of batch sharding, includes GTP) = GTP x DP = 64 * 8 = 512.
+        #     dp_cp_no_gtp_group (degree of weight replication, excludes GTP) = 8.
+        #     gtp_group = 64.
+        #     tp_group = 2.
+        #
+        # Data-parallel gradient reductions for each bucket are performed over dp_cp_no_gtp_group
+        # (GTP-excluded group). Data-parallel gradient reductions over the GTP group are completed
+        # separately in the model backward pass.
+        #
+        # See Section 3.2 in `gtp/README.md` for more details (including why
+        # average_in_collective=False).
+        #
+        # When GTP is disabled, the *_no_gtp groups alias the regular DP groups.
         self.intra_dp_cp_group = process_group_dict.get(
             'intra_dp_cp_no_gtp_group', process_group_dict['intra_dp_cp_group']
         )
