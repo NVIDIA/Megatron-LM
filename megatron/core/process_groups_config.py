@@ -50,11 +50,17 @@ class ProcessGroupCollection:
         # Data Parallelism Groups
         dp: Data parallel process group
         dp_cp: Data and context parallel group
+        dp_cp_no_gtp: Data and context parallel group excluding GTP peers
+            (true dense-weight replicas); identical to dp_cp when GTP=1
         expt_dp: Expert data parallel group
+        expt_dp_no_egtp: Expert data parallel group excluding EGTP peers
+            (true expert-weight replicas); identical to expt_dp when EGTP=1
         intra_dp_cp: Intra partial data parallel group
+        intra_dp_cp_no_gtp: Intra partial data parallel group excluding GTP peers
+            (true dense-weight replicas); identical to intra_dp_cp when GTP=1
         intra_expt_dp: Intra partial expert data parallel group
         intra_expt_dp_no_egtp: Intra expert data parallel group excluding EGTP peers
-            (true expert-weight replicas); identical to expt_dp when EGTP=1
+            (true expert-weight replicas); identical to intra_expt_dp when EGTP=1
         inter_dist_opt: Inter distributed optimizer instance group
 
     Example:
@@ -123,6 +129,10 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — DP+CP excluding GTP peers (true dense-weight
+    # replicas). Identical to ``dp_cp`` when GTP=1.
+    dp_cp_no_gtp: torch.distributed.ProcessGroup = field(init=False)
+
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
@@ -139,17 +149,25 @@ class ProcessGroupCollection:
     # _EXPERT_DATA_PARALLEL_GROUP
     expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — expert DP excluding EGTP peers (true expert-weight
+    # replicas). Identical to ``expt_dp`` when EGTP=1.
+    expt_dp_no_egtp: torch.distributed.ProcessGroup = field(init=False)
+
     # _EXPERT_DATA_PARALLEL_GROUP_AG
     expt_dp_ag: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — intra-instance DP+CP excluding GTP
+    # peers (true dense-weight replicas). Identical to ``intra_dp_cp`` when GTP=1.
+    intra_dp_cp_no_gtp: torch.distributed.ProcessGroup = field(init=False)
+
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _EXPERT_DATA_PARALLEL_GROUP_NO_GTP — expert DP excluding EGTP peers (true expert
-    # weight replicas). Identical to ``expt_dp`` when EGTP=1.
+    # _INTRA_EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — intra-instance expert DP excluding EGTP
+    # peers (true expert-weight replicas). Identical to ``intra_expt_dp`` when EGTP=1.
     intra_expt_dp_no_egtp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -250,10 +268,21 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'dp_cp_no_gtp': partial(
+                parallel_state.get_data_parallel_group,
+                with_context_parallel=True,
+                no_gtp=True,
+            ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
+                partial_data_parallel=True,
+            ),
+            'intra_dp_cp_no_gtp': partial(
+                parallel_state.get_data_parallel_group,
+                with_context_parallel=True,
+                no_gtp=True,
                 partial_data_parallel=True,
             ),
             'intra_expt_dp': partial(
@@ -278,6 +307,11 @@ class ProcessGroupCollection:
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
             'expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
+            ),
+            'expt_dp_no_egtp': partial(
+                parallel_state.get_expert_data_parallel_group,
+                check_initialized=False,
+                no_gtp=True,
             ),
             'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(

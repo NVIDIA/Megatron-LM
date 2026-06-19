@@ -203,7 +203,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
-        data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
+        data_parallel_world_size = (
+            param_and_grad_buffer.num_optimizer_shards
+            if param_and_grad_buffer.num_optimizer_shards is not None
+            else param_and_grad_buffer.data_parallel_group.size()
+        )
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
@@ -566,6 +570,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod

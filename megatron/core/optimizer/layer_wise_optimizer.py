@@ -288,6 +288,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=dp_size,
         )
 
     @staticmethod
@@ -365,6 +366,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+
+        # Use GTP/EGTP-excluded DP groups for layer-wise sharding and all-gather so that
+        # only true weight replicas are sharded across; GTP's own all-gather / reduce-scatter
+        # handles the GTP axis separately. Falls back to the full groups when GTP is inactive.
+        if pg_collection is not None:
+            self.dp_cp_group = pg_collection.dp_cp_no_gtp or pg_collection.dp_cp
+            self.expt_dp_group = pg_collection.expt_dp_no_egtp or pg_collection.expt_dp
+        else:
+            self.dp_cp_group = None
+            self.expt_dp_group = None
 
         full_param_layouts = None
         if model_chunks is not None:
@@ -448,13 +459,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 chunk).  ``None`` triggers the legacy fallback.
         """
         # Simplify when dp_cp group size is 1.
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        dp_cp_size = get_pg_size(self.dp_cp_group)
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+        expt_dp_size = get_pg_size(self.expt_dp_group)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -463,8 +474,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
-        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
-        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+        dp_cp_rank = get_pg_rank(self.dp_cp_group)
+        expt_dp_rank = get_pg_rank(self.expt_dp_group)
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
@@ -478,14 +489,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
                     continue
-                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
                     param_start_index,
                     param_end_index,
                     bucket_id,
                 ) in layout.param_index_map.items():
                     bucket_start_index, bucket_end_index = layout.bucket_indices[bucket_id]
-                    shard_size = (bucket_end_index - bucket_start_index) // dp_size
+                    shard_size = (bucket_end_index - bucket_start_index) // layout.num_optimizer_shards
                     shard_id = (param_start_index - bucket_start_index) // shard_size
                     shard_end_index = bucket_start_index + (shard_id + 1) * shard_size
                     assert param_end_index <= shard_end_index, (
@@ -561,12 +571,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
+                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.expt_dp_group):
                     param_groups_this_rank[group_index].append(p)
                 self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
             else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.pg_collection.dp_cp):
+                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.dp_cp_group):
                     param_groups_this_rank[group_index].append(p)
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
@@ -599,7 +609,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for bucket in group.buckets:
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
-                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
+                    bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp_group))]
                     for bucket_list, full_params_list in zip(
                         bucket_params_list, self.dp_cp_params_list
                     ):
@@ -614,7 +624,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
+                            [] for _ in range(get_pg_size(self.expt_dp_group))
                         ]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
@@ -678,9 +688,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.pg_collection is None:
             return
         if self.dp_cp_params_list:
-            _allgather_helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            _allgather_helper(self.dp_cp_params_list, self.dp_cp_group)
         if self.expt_dp_params_list:
-            _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _allgather_helper(self.expt_dp_params_list, self.expt_dp_group)
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -689,15 +699,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.dp_cp_group, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+                torch.distributed.broadcast(p, src_global_rank, self.dp_cp_group)
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.expt_dp_group, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+                torch.distributed.broadcast(p, src_global_rank, self.expt_dp_group)
 
     @torch.no_grad()
     def get_grad_norm(self):
