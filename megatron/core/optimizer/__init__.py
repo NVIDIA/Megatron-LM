@@ -907,13 +907,15 @@ def _get_megatron_emerging_optimizer(
                         "the legacy LayerWise ping-pong path for MoE models."
                     )
                 fallback_config.use_distributed_optimizer = True
+                # Shard optimizer state over the gtp-EXCLUDED replicate group
+                # (intra_dp_cp_no_gtp_group), matching how the DDP grad buffer is partitioned.
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
+                    data_parallel_group=distopt_process_groups['intra_dp_cp_no_gtp_group'],
                     data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],

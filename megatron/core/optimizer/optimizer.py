@@ -775,6 +775,53 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return success, grad_norm, num_zeros_in_grad
 
 
+def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_groups) -> None:
+    """Backfill the optimizer id->ShardedTensor map with GTP shards it is missing (in place).
+
+    WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). A GTP weight
+    whose model entry is a gathered+split factory (Mamba ``in_proj``) exposes the *gathered* tensor,
+    not the per-shard ``GTPShardedParam``, so it fails to match and is absent from the map -- the
+    generic conversion below would then KeyError on it. This backfills the same per-shard
+    ShardedTensor every other GTP weight already gets, so its optimizer state is saved per-shard.
+
+    WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
+    matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
+    Distributed Adam uses its own ``DistributedOptimizer.sharded_state_dict`` (flat-buffer path)
+    and is unaffected.
+
+    No-op when GTP is unavailable or when every param already matched.
+    """
+    try:
+        from megatron.core import parallel_state
+        from megatron.experimental.gtp import (
+            GTPShardedParam,
+            make_sharded_tensors_for_checkpoint_with_gtp,
+        )
+    except ImportError:
+        return  # GTP not built in -- nothing to backfill.
+
+    # Checkpoint compatibility point: source the groups from parallel_state, mirroring the
+    # make_*_for_checkpoint helpers (which fall back to these same globals).
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    for param_id, p in enumerate(chain.from_iterable(float16_groups)):
+        # Skip params that already matched, and any non-GTP param (those always match).
+        if param_id in id_to_sharded_param_map or not isinstance(p, GTPShardedParam):
+            continue
+        # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
+        # keeps the function usable in tests where the name was not tagged.
+        key = p._debug_name or f'_gtp_optim_param_{param_id}'
+        entry = make_sharded_tensors_for_checkpoint_with_gtp(
+            {key: p},
+            prefix='',
+            tensor_parallel_layers_axis_map={key: 0},
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+        )
+        id_to_sharded_param_map[param_id] = entry[key]
+
+
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
@@ -964,6 +1011,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
         )
+
+        _backfill_gtp_sharded_param_map(id_to_sharded_param_map, self.float16_groups)
 
         # Convert fp32_from_fp16_params
         assert len(state_dict['fp32_from_fp16_params']) == len(

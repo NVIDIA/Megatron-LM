@@ -16,8 +16,8 @@ import torch.distributed as dist
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.experimental.gtp import (
     GTP_CONFIG,
-    GTPShardedParam,
     HAVE_GTP,
+    GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp,
     reset_gtp_quantize_cache,
     update_gtp_config,
@@ -632,6 +632,100 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
             assert n_writers == 1, f"{base}: expected exactly 1 writer, got {n_writers}: {rids}"
 
 
+def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
+    """GTP+Muon checkpoint fix: in_proj's gathered+split model entry does NOT object-id-match the
+    per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
+    Float16OptimizerWithFloat16Params.sharded_state_dict). Verify the per-shard fallback used by the
+    fix restores a ShardedTensor with local_shape == the optimizer param shape, which
+    make_sharded_optimizer_tensor then accepts.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.dist_checkpointing.optimizer import (
+        get_param_id_to_sharded_param_map,
+        make_sharded_optimizer_tensor,
+    )
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+    from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.experimental.gtp import (
+        make_sharded_tensors_for_checkpoint_with_gtp,
+        tag_gtp_params_with_names,
+    )
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    model_parallel_cuda_manual_seed(42)
+    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    config = TransformerConfig(
+        num_attention_heads=32,
+        num_layers=1,
+        hidden_size=4096,
+        mamba_num_heads=128,
+        mamba_head_dim=64,
+        mamba_state_dim=128,
+        mamba_num_groups=8,
+        use_mamba_mem_eff_path=True,
+        params_dtype=torch.bfloat16,
+        hidden_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    submodules = MambaLayerSubmodules(
+        mixer=ModuleSpec(
+            module=MambaMixer,
+            submodules=MambaMixerSubmodules(
+                in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+            ),
+        ),
+        mamba_bda=get_bias_dropout_add,
+    )
+    layer = MambaLayer(config, submodules, layer_number=1, pg_collection=pg).cuda()
+    tag_gtp_params_with_names(layer)  # set _debug_name (mirrors production setup)
+
+    in_proj_w = layer.mixer.in_proj.weight
+    assert isinstance(in_proj_w, GTPShardedParam), "in_proj.weight should be GTP-sharded"
+
+    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
+    model_sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
+
+    # Reproduce the gap: in_proj's per-shard optim param has no id-match in the model dict.
+    id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
+    assert 0 not in id_map, "expected in_proj to be MISSING from id map (the KeyError gap)"
+
+    # The fix's per-shard fallback restores a matching entry.
+    key = in_proj_w._debug_name or '_gtp_optim_param_0'
+    entry = make_sharded_tensors_for_checkpoint_with_gtp(
+        {key: in_proj_w},
+        prefix='',
+        tensor_parallel_layers_axis_map={key: 0},
+        tp_group=ps.get_tensor_model_parallel_group(),
+        dp_cp_group=ps.get_data_parallel_group(with_context_parallel=True),
+    )[key]
+    assert tuple(entry.local_shape) == tuple(in_proj_w.shape), (
+        f"per-shard entry local_shape {tuple(entry.local_shape)} != param shape "
+        f"{tuple(in_proj_w.shape)}"
+    )
+    # make_sharded_optimizer_tensor must accept it for a same-shape optimizer state tensor.
+    opt_state = torch.zeros_like(in_proj_w)
+    osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
+    assert osh is not None
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -642,6 +736,10 @@ class TestGtpDcpHelper:
     def test_mamba_replicated_param_replica_ids(self):
         _require_world_size(4)
         _worker_mamba_replicated_param_replica_ids(dist.get_rank(), 4, None)
+
+    def test_mamba_inproj_optim_param_map(self):
+        _require_world_size(4)
+        _worker_mamba_inproj_optim_param_map(dist.get_rank(), 4, None)
 
     def test_composite_offset_same_axis(self):
         _require_world_size(4)
