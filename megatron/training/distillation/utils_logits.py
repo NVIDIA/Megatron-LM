@@ -425,31 +425,20 @@ class TarShardPrefetcher:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def schedule(self, url: str) -> None:
-        if not self.enabled or url in self._futures:
-            return
-        assert self._executor is not None
-        self._futures[url] = self._executor.submit(self._prefetch_url, url)
-
     def schedule_group(self, urls: Sequence[str]) -> None:
         for url in urls:
-            self.schedule(url)
-
-    def wait(self, url: str) -> None:
-        future = self._futures.pop(url, None)
-        if future is None:
-            return
-        start = time.monotonic()
-        future.result()
-        waited = time.monotonic() - start
-        if waited > 0.5:
-            logger.warning(
-                "Waited %.3fs for cached-logit tar shard prefetch: %s", waited, url
-            )
+            if not self.enabled or url in self._futures:
+                return
+            assert self._executor is not None
+            self._futures[url] = self._executor.submit(self._prefetch_url, url)
 
     def wait_group(self, urls: Sequence[str]) -> None:
         for url in urls:
-            self.wait(url)
+            future = self._futures.pop(url, None)
+            if future is None:
+                return
+            elapsed = future.result()
+            logger.debug("Prefetch fetch time for %s: %.3fs", url, elapsed)
 
     def iter_prefetched(self, groups: Iterable[Sequence[str]]) -> Iterator[Tuple[str, ...]]:
         """Yield URL groups, waiting only when a prefetched group is not ready."""
@@ -468,8 +457,10 @@ class TarShardPrefetcher:
             self.wait_group(group)
             yield group
 
-    def _prefetch_url(self, url: str) -> None:
+    def _prefetch_url(self, url: str) -> float:
         # Whole-object caching avoids tar-member range bookkeeping while still
         # keeping the object download ahead of the sequential tar reader.
+        start = time.monotonic()
         with open_logit_file(url, "rb", prefetch_file=True) as stream:
             stream.read()
+        return time.monotonic() - start
