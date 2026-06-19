@@ -533,6 +533,105 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
         )
 
 
+def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
+    """End-to-end ``MambaMixer.sharded_state_dict`` under GTP: the GTP-REPLICATED
+    directly-owned params (A_log / dt_bias / D / conv1d.*) must get conflict-free
+    replica_ids — distinct across every rank holding the same chunk, with exactly
+    one "main" (writer) replica — so DCP elects a single writer per chunk.
+
+    With TP=1 these params are full on every rank, so all ``world_size`` replicas
+    of each must have unique replica_ids and exactly one writer. This is the
+    invariant the gtp_rank replica_id fixup defends; it must hold whether or not
+    that fixup runs (the gtp-inclusive dp_cp rank already disambiguates peers).
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.dist_checkpointing.mapping import (
+        ShardedObject,
+        ShardedTensorFactory,
+        is_main_replica,
+    )
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+    from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    GTP = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp peers and replicate DP)
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP
+    )
+    model_parallel_cuda_manual_seed(42)
+    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+
+    config = TransformerConfig(
+        num_attention_heads=32,
+        num_layers=1,
+        hidden_size=4096,
+        mamba_num_heads=128,
+        mamba_head_dim=64,
+        mamba_state_dim=128,
+        mamba_num_groups=8,
+        use_mamba_mem_eff_path=True,
+        params_dtype=torch.bfloat16,
+        hidden_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    submodules = MambaLayerSubmodules(
+        mixer=ModuleSpec(
+            module=MambaMixer,
+            submodules=MambaMixerSubmodules(
+                in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+            ),
+        ),
+        mamba_bda=get_bias_dropout_add,
+    )
+    layer = MambaLayer(config, submodules, layer_number=1, pg_collection=pg).cuda()
+    assert any(
+        isinstance(p, GTPShardedParam) for p in layer.parameters()
+    ), "GTP not active: no GTPShardedParam in the GTP=2 Mamba layer"
+
+    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
+    sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
+
+    target_bases = {'A_log', 'dt_bias', 'D', 'conv1d.weight', 'conv1d.bias'}
+    local = {}
+    for key, val in sd.items():
+        base = key.split('mixer.', 1)[-1]
+        if base in target_bases and isinstance(
+            val, (ShardedTensor, ShardedTensorFactory, ShardedObject)
+        ):
+            rid = val.replica_id
+            if isinstance(rid, tuple):
+                local[base] = tuple(rid)
+
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, local)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        bases = set(gathered[0])
+        assert bases, "no GTP-replicated tiny params found in MambaMixer sharded_state_dict"
+        for base in sorted(bases):
+            rids = [g[base] for g in gathered]
+            assert len(set(rids)) == world_size, (
+                f"{base}: replica_id collision across ranks -> DCP write conflict: {rids}"
+            )
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, f"{base}: expected exactly 1 writer, got {n_writers}: {rids}"
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -540,6 +639,10 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
 
 @pytest.mark.run_only_on_devices_with_compute_capability(compute_capability=(10, 0))
 class TestGtpDcpHelper:
+    def test_mamba_replicated_param_replica_ids(self):
+        _require_world_size(4)
+        _worker_mamba_replicated_param_replica_ids(dist.get_rank(), 4, None)
+
     def test_composite_offset_same_axis(self):
         _require_world_size(4)
         _worker_helper_offsets_tp_eq_gtp_axis(dist.get_rank(), 4, None)

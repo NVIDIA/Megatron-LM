@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedObject, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
@@ -1306,10 +1306,7 @@ class MambaMixer(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
-        # Parameters: A_log / dt_bias / D / conv1d.* are GTP-REPLICATED — every GTP rank holds an
-        # identical copy. The vanilla helper sets replica_id without GTP awareness, so all GTP
-        # ranks would claim the same chunk with the same all-zero replica_id and DCP would have a
-        # write conflict. Track those keys here and fold gtp_rank into replica_id below.
+        # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
@@ -1323,9 +1320,6 @@ class MambaMixer(MegatronModule):
             },
             sharded_offsets=sharded_offsets,
         )
-        # Captured before submodules are merged below, so this is exactly the directly-owned
-        # MambaMixer params/buffers (A_log, dt_bias, D, conv1d_*) — deterministic across ranks.
-        gtp_replicated_keys = set(sharded_state_dict.keys())
         # Submodules
         for name, module in self.named_children():
             module_sharded_sd = sharded_state_dict_default(
@@ -1363,17 +1357,13 @@ class MambaMixer(MegatronModule):
             torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_group)
             if gathered.shape[0] != in_proj_dim:
                 gathered = gathered[:in_proj_dim].contiguous()
-            # Mcore replica_id convention is (PP, TP-replica-coord, DP). For a TP-sharded
-            # tensor the TP-replica-coord is 0; we put gtp_rank there so DCP elects exactly
-            # one writer per chunk (the one with gtp_rank=0 and dp_cp_rank=0) without
-            # touching the PP slot.
-            gtp_rank = torch.distributed.get_rank(gtp_group)
+            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
             dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
             sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
                 gathered,
                 f"{prefix}in_proj.weight",
                 tp_axis=0,
-                replica_id=(0, gtp_rank, dp_cp_rank),
+                replica_id=(0, 0, dp_cp_rank),
                 prepend_offsets=sharded_offsets,
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
@@ -1446,22 +1436,6 @@ class MambaMixer(MegatronModule):
                 ["x", "B", "C"],
                 0,
             )
-
-        # Fold gtp_rank into replica_id (pos 1) of the GTP-replicated keys from the vanilla
-        # (GTP-blind) helper: tp_rank * gtp_size + gtp_rank, so only gtp=tp=dp=0 stays all-zero
-        # and is elected writer. in_proj / out_proj already used the GTP-aware helper.
-        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
-            gtp_rank = torch.distributed.get_rank(self.in_proj.weight.group)
-            gtp_size = in_proj_gtp_size
-            for key in gtp_replicated_keys:
-                val = sharded_state_dict.get(key)
-                if isinstance(val, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
-                    rid = val.replica_id
-                    if isinstance(rid, tuple) and len(rid) == 3:
-                        new_pos1 = rid[1] * gtp_size + gtp_rank
-                        sharded_state_dict[key] = replace(
-                            val, replica_id=(rid[0], new_pos1, rid[2])
-                        )
 
         return sharded_state_dict
 
