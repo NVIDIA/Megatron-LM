@@ -251,7 +251,7 @@ def get_calib_dataloader(
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
-    if os.path.isfile(dataset_path_or_name):
+    if os.path.isfile(dataset_path_or_name) and dataset_path_or_name.endswith(".jsonl"):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
         all_texts = []
