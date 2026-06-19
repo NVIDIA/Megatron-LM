@@ -56,6 +56,7 @@ Usage example
 
 import concurrent.futures
 import logging
+import warnings
 from collections import deque
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -65,8 +66,8 @@ import torch.distributed.nn as dist_nn
 import torch.utils.data
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
   BATCHED_TAR_RE,
   CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -83,6 +84,7 @@ from megatron.training.distillation.utils_logits import (
   storage_glob_with_caching,
   sorted_batched_tars,
 )
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +249,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
         msc_prefetch_depth: int = 2,
+        ignore_hash: bool = False,
     ):
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
@@ -258,7 +261,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
         # Per-tar dataset-identity verification: each tar stream validates its
         # leading _meta.json before yielding any payload data.
-        self._expected_hash, _ = compute_dataset_hash()
+        self._expected_hash = None if ignore_hash else compute_dataset_hash()[0]
 
         self._decode_threads = max(1, decode_threads)
         if decode_lookahead is None:
@@ -654,11 +657,13 @@ class CachedLogitsKDLoss:
         decode_threads: int = 1,
         prefetch_factor: int = 2,
         msc_prefetch_depth: int = 2,
+        ignore_hash: bool = False,
     ):
         self.logprobs_dir = logprobs_dir
         self._decode_threads = decode_threads
         self._prefetch_factor = prefetch_factor
         self._msc_prefetch_depth = msc_prefetch_depth
+        self._ignore_hash = ignore_hash
 
         # ---- parallel-state bookkeeping ----
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -693,6 +698,7 @@ class CachedLogitsKDLoss:
             start_iteration=start_iteration,
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
+            ignore_hash=self._ignore_hash,
         )
         # Remote shard discovery uses rank-0 collectives, so it must run in the
         # main training process rather than a DataLoader worker.
@@ -777,8 +783,16 @@ class CachedLogitsKDLoss:
             student_logits.device, non_blocking=True
         )
 
-        logger.debug("[TP%s-CP%s-DP%s]: Iter_%s Batch_%s",
-                     self.tp_rank, self.cp_rank, self.dp_rank, iteration, microbatch_idx)
+        # ---- trim teacher logits to match student sequence length ----
+        if teacher_values.size(0) > student_logits.size(0):
+            if safe_get_rank() == 0:
+                warnings.warn(
+                    "CachedLogitsKDLoss: teacher logits sequence length "
+                    f"({teacher_values.size(0)}) is longer than student sequence length "
+                    f"({student_logits.size(0)}); trimming teacher logits to match.",
+                )
+            teacher_values = teacher_values[:student_logits.size(0)]
+            teacher_indices = teacher_indices[:student_logits.size(0)]
 
         # ---- compute loss ----
         return topk_kl_div(
@@ -804,6 +818,7 @@ class LossFuncCallable:
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
+        ignore_hash: bool = False,
     ):
         self.logprobs_dir = logprobs_dir
         self.decode_threads = decode_threads
@@ -812,6 +827,7 @@ class LossFuncCallable:
         self.kd_func = None
         self.alpha = kd_loss_alpha
         self.ignore_errors = ignore_errors
+        self.ignore_hash = ignore_hash
 
     @staticmethod
     def _mask_loss(output_tensor, loss_mask):
@@ -835,6 +851,7 @@ class LossFuncCallable:
                 decode_threads=self.decode_threads,
                 prefetch_factor=self.prefetch_factor,
                 msc_prefetch_depth=self.msc_prefetch_depth,
+                ignore_hash=self.ignore_hash,
             )
 
         # LM loss
