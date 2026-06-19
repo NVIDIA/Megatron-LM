@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from typing import List
 
 from examples.mimo.training.topology import ModuleGridSpec
@@ -70,13 +69,6 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"--num-experts ({num_experts}) must be divisible by --llm-ep ({args.llm_ep})"
         )
 
-    # Sample-based scheduler resolution: derive --train-iters from --train-samples.
-    if getattr(args, "train_samples", None) is not None:
-        gbs = getattr(args, "global_batch_size", None)
-        if not gbs or gbs <= 0:
-            raise ValueError("--train-samples requires a positive --global-batch-size")
-        args.train_iters = math.ceil(args.train_samples / gbs)
-
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
 
     if args.llm_only:
@@ -123,18 +115,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 def build_module_grid_specs(
     args: argparse.Namespace, world_size: int, encoder_module_name: str
 ) -> List[ModuleGridSpec]:
-    """Map parsed grid args onto the ModuleGridSpec list create_topology consumes.
-
-    Returns ``[encoder_grid_spec, language_grid_spec]`` (or just the language spec
-    when ``--llm-only``). The caller supplies ``encoder_module_name`` (the model
-    provider owns it). ``num_ranks`` is the ground truth ModuleGridSpec field;
-    ``dp`` / ``expt_dp`` are derived in ``ModuleGridSpec.__post_init__`` from the
-    tp/cp/pp/ep/expt_tp factorization, so we pass ``num_ranks = tp*cp*pp*dp`` and
-    let the dataclass re-derive dp (matching the supplied value) and expt_dp.
-
-    Must be called after :func:`validate_hetero_grid_args` so the spans are known
-    to tile ``[0, world_size)``.
-    """
+    """Map grid args to the ModuleGridSpec list create_topology consumes; caller supplies encoder_module_name."""
     encoder_size, llm_size = validate_hetero_grid_args(args, world_size)
 
     language_grid_spec = ModuleGridSpec(
