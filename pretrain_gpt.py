@@ -173,7 +173,13 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir,
+    decode_threads,
+    prefetch_factor,
+    msc_prefetch_depth,
+    kd_loss_alpha,
+    ignore_errors,
+    ignore_hash,
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -189,6 +195,7 @@ def _build_cached_logits_loss_func(
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -219,6 +226,7 @@ def loss_func(
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]

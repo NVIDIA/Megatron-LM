@@ -3447,6 +3447,11 @@ def _add_logits_distillation_args(parser):
                        default=False,
                        help='When set, KD loss errors are logged as warnings and '
                             'training falls back to LM-only loss instead of crashing.')
+    group.add_argument('--logits-load-ignore-hash', action='store_true',
+                       default=False,
+                       help='When set, skip cached-logits tar metadata hash validation. '
+                            'Use only when intentionally loading logits saved with an '
+                            'older or otherwise incompatible dataset hash.')
     return parser
 
 

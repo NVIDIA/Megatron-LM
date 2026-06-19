@@ -188,8 +188,8 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
-    stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
-    fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
+    stream itself: ``seed``, ``train_samples`` (with a fall-back to
+    ``train_iters * global_batch_size``), and the data ``blend``.
     """
     args = get_args()
     train_samples = getattr(args, 'train_samples', None)
@@ -201,7 +201,6 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
 
     identifiers = OrderedDict()
     identifiers["seed"] = getattr(args, 'seed', None)
-    identifiers["sequence_length"] = getattr(args, 'seq_length', None)
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)
 
