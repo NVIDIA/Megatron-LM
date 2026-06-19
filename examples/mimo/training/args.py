@@ -11,9 +11,6 @@ from typing import List
 from examples.mimo.training.topology import ModuleGridSpec
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
-# Default encoder grid module name (single-sourced with radio_encoder.py in #5397).
-DEFAULT_ENCODER_MODULE_NAME = "radio_encoder"
-
 
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register the hetero per-module parallelism args (--encoder-*/--llm-*)."""
@@ -124,12 +121,13 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 
 
 def build_module_grid_specs(
-    args: argparse.Namespace, world_size: int
+    args: argparse.Namespace, world_size: int, encoder_module_name: str
 ) -> List[ModuleGridSpec]:
     """Map parsed grid args onto the ModuleGridSpec list create_topology consumes.
 
     Returns ``[encoder_grid_spec, language_grid_spec]`` (or just the language spec
-    when ``--llm-only``). ``num_ranks`` is the ground truth ModuleGridSpec field;
+    when ``--llm-only``). The caller supplies ``encoder_module_name`` (the model
+    provider owns it). ``num_ranks`` is the ground truth ModuleGridSpec field;
     ``dp`` / ``expt_dp`` are derived in ``ModuleGridSpec.__post_init__`` from the
     tp/cp/pp/ep/expt_tp factorization, so we pass ``num_ranks = tp*cp*pp*dp`` and
     let the dataclass re-derive dp (matching the supplied value) and expt_dp.
@@ -153,9 +151,8 @@ def build_module_grid_specs(
     if args.llm_only:
         return [language_grid_spec]
 
-    encoder_name = getattr(args, "vision_encoder_key", None) or DEFAULT_ENCODER_MODULE_NAME
     encoder_grid_spec = ModuleGridSpec(
-        name=encoder_name,
+        name=encoder_module_name,
         num_ranks=encoder_size,
         tp=args.encoder_tp,
         cp=args.encoder_cp,

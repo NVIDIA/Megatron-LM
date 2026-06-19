@@ -37,7 +37,6 @@ def _layout_8gpu_20l(**overrides):
     args.global_batch_size = None
     args.train_samples = None
     args.num_experts = 128
-    args.vision_encoder_key = "radio_encoder"
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -48,7 +47,9 @@ def test_canonical_layout_validates_and_maps_specs():
     encoder_size, llm_size = validate_hetero_grid_args(args, WORLD_SIZE_8)
     assert (encoder_size, llm_size) == (4, 4)
 
-    encoder_grid_spec, language_grid_spec = build_module_grid_specs(args, WORLD_SIZE_8)
+    encoder_grid_spec, language_grid_spec = build_module_grid_specs(
+        args, WORLD_SIZE_8, encoder_module_name="radio_encoder"
+    )
     assert encoder_grid_spec.name == "radio_encoder"
     assert encoder_grid_spec.num_ranks == 4
     assert encoder_grid_spec.rank_offset == 0  # encoder span always starts at rank 0
@@ -106,7 +107,7 @@ def test_llm_only_covers_world():
     args = _layout_8gpu_20l(llm_only=True, llm_offset=0, llm_ep=2, num_experts=128)
     encoder_size, llm_size = validate_hetero_grid_args(args, 4)
     assert (encoder_size, llm_size) == (0, 4)
-    specs = build_module_grid_specs(args, 4)
+    specs = build_module_grid_specs(args, 4, encoder_module_name="radio_encoder")
     assert len(specs) == 1
     assert specs[0].name == MIMO_LANGUAGE_MODULE_KEY
 
