@@ -1,32 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Hetero grid/topology CLI args + validation for the stock-args MIMO examples.
-
-This is PR-E2 of the NMFW-516 hetero-MIMO upstreaming effort. It contributes the
-heterogeneous parallelism/topology argument group and its validation, designed
-to compose with Megatron's *stock* argument system as an
-``extra_args_provider`` and a post-``validate_args`` validation hook.
-
-Responsibilities (this PR only):
-  * :func:`add_hetero_grid_args` registers the per-module parallelism knobs
-    (``--encoder-*`` and ``--llm-*``) plus ``--llm-offset`` / ``--llm-only``.
-    These are namespaced so they never collide with stock parallelism flags
-    (``--tensor-model-parallel-size`` and friends are owned by the LLM grid but
-    expressed via the namespaced ``--llm-tp`` so the encoder grid can differ).
-  * :func:`validate_hetero_grid_args` ports the prototype's hetero invariants:
-    disjoint + covering rank spans, fan-out divisibility, MoE EP divisibility,
-    and the sample-vs-iter scheduler resolution. Call it AFTER stock
-    ``validate_args`` so tokenizer/preset-derived sizes are populated.
-  * :func:`build_module_grid_specs` maps parsed grid args onto the two
-    :class:`~examples.mimo.training.topology.ModuleGridSpec` s that
-    :func:`~examples.mimo.training.topology.create_topology` consumes.
-
-Arg-ownership note: ``--llm-ep`` and ``--llm-expt-tp`` are *parallelism* knobs
-and live here, not in the model provider's ``add_model_provider_args``. The
-provider still reads them via ``getattr(args, "llm_ep", ...)`` /
-``getattr(args, "llm_expt_tp", ...)`` fallbacks, so the two PRs compose cleanly
-once stacked.
-"""
+"""Hetero grid/topology CLI args + validation for the MIMO example."""
 
 from __future__ import annotations
 
@@ -37,27 +11,15 @@ from typing import List
 from examples.mimo.training.topology import ModuleGridSpec
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
-# Default name for the (single) vision encoder module grid. The E1 provider sets
-# ``args.vision_encoder_key = "radio_encoder"``; we mirror that default here so
-# the encoder ModuleGridSpec carries the same module name the provider/runtime
-# look up. Resolved at spec-build time via ``getattr(args, "vision_encoder_key")``.
+# Default encoder grid module name (single-sourced with radio_encoder.py in #5397).
 DEFAULT_ENCODER_MODULE_NAME = "radio_encoder"
 
 
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the hetero parallelism/topology arg group.
-
-    Stock-hook compatible: returns the parser so it can be passed straight to
-    ``pretrain(extra_args_provider=...)`` or composed with the model-provider
-    args provider. Declares only namespaced ``--encoder-*`` / ``--llm-*`` knobs;
-    never re-declares a stock flag (``--tensor-model-parallel-size``,
-    ``--micro-batch-size``, ``--global-batch-size``, ``--num-experts``, ...).
-    """
+    """Register the hetero per-module parallelism args (--encoder-*/--llm-*)."""
     grid = parser.add_argument_group("hetero module grids")
 
-    # Encoder grid placement + factorization.
-    grid.add_argument("--encoder-offset", type=int, default=0,
-                      help="First global rank of the vision-encoder grid span.")
+    # Encoder grid factorization (the encoder span always starts at rank 0).
     grid.add_argument("--encoder-tp", type=int, default=2,
                       help="Encoder tensor-model-parallel size.")
     grid.add_argument("--encoder-cp", type=int, default=1,
@@ -78,9 +40,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
                       help="Language pipeline-model-parallel size.")
     grid.add_argument("--llm-dp", type=int, default=2,
                       help="Language data-parallel size. Global batch is keyed on this.")
-    # MoE expert parallelism for the language grid. Relocated here from the E1
-    # model provider's add_model_provider_args (these are topology knobs); the
-    # provider keeps a getattr(args, "llm_ep"/"llm_expt_tp", ...) fallback read.
+    # MoE expert parallelism for the language grid.
     grid.add_argument("--llm-ep", type=int, default=1,
                       help="Language expert-model-parallel size (MoE).")
     grid.add_argument("--llm-expt-tp", type=int, default=None,
@@ -102,26 +62,11 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
-    """Validate the disjoint-grid hetero layout. Returns ``(encoder_size, llm_size)``.
-
-    Call AFTER stock ``validate_args`` (so ``micro_batch_size`` / ``num_experts``
-    are populated) and after the model-provider preset (so ``num_experts`` reflects
-    the active provider). Ports the prototype invariants:
-
-      * CP must be 1 on both grids (Phase-2 limitation).
-      * MoE: ``num_experts % llm_ep == 0`` (resolves PR-E1 open-Q3 -- the
-        EP-divisibility check belongs here, not in the provider).
-      * Global batch is keyed on ``llm_dp``: ``mbs * num_microbatches * llm_dp``.
-      * Sample-vs-iter scheduler resolution when ``--train-samples`` is present.
-      * ``--llm-only``: language grid must cover ``[0, world_size)`` exactly.
-      * Fan-out divisibility: ``mbs * llm_dp % encoder_dp == 0``.
-      * Encoder + LLM rank spans are DISJOINT and COVERING over ``world_size``.
-    """
+    """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
     if args.encoder_cp != 1 or args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
-    # MoE EP-divisibility (PR-E1 open-Q3 resolution). Stock arg is --num-experts,
-    # surfaced on args as num_experts; the prototype also used num_moe_experts.
+    # MoE expert count must divide evenly across the language grid's expert parallelism.
     num_experts = _num_experts(args)
     if num_experts and num_experts % args.llm_ep != 0:
         raise ValueError(
@@ -164,7 +109,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
         )
 
     encoder_size = args.encoder_tp * args.encoder_cp * args.encoder_pp * args.encoder_dp
-    encoder_ranks = set(range(args.encoder_offset, args.encoder_offset + encoder_size))
+    encoder_ranks = set(range(encoder_size))  # encoder span always starts at rank 0
     llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
     all_ranks = set(range(world_size))
 
@@ -187,8 +132,8 @@ def build_module_grid_specs(
 ) -> List[ModuleGridSpec]:
     """Map parsed grid args onto the ModuleGridSpec list create_topology consumes.
 
-    Returns ``[encoder_spec, language_spec]`` (or just ``[language_spec]`` when
-    ``--llm-only``). ``num_ranks`` is the ground truth ModuleGridSpec field;
+    Returns ``[encoder_grid_spec, language_grid_spec]`` (or just the language spec
+    when ``--llm-only``). ``num_ranks`` is the ground truth ModuleGridSpec field;
     ``dp`` / ``expt_dp`` are derived in ``ModuleGridSpec.__post_init__`` from the
     tp/cp/pp/ep/expt_tp factorization, so we pass ``num_ranks = tp*cp*pp*dp`` and
     let the dataclass re-derive dp (matching the supplied value) and expt_dp.
@@ -198,7 +143,7 @@ def build_module_grid_specs(
     """
     encoder_size, llm_size = validate_hetero_grid_args(args, world_size)
 
-    language_spec = ModuleGridSpec(
+    language_grid_spec = ModuleGridSpec(
         name=MIMO_LANGUAGE_MODULE_KEY,
         num_ranks=llm_size,
         tp=args.llm_tp,
@@ -206,43 +151,30 @@ def build_module_grid_specs(
         pp=args.llm_pp,
         ep=args.llm_ep,
         rank_offset=args.llm_offset,
-        expt_tp=_resolve_expt_tp(args.llm_expt_tp, args.llm_tp),
+        expt_tp=args.llm_expt_tp or 1,
     )
 
     if args.llm_only:
-        return [language_spec]
+        return [language_grid_spec]
 
     encoder_name = getattr(args, "vision_encoder_key", None) or DEFAULT_ENCODER_MODULE_NAME
-    encoder_spec = ModuleGridSpec(
+    encoder_grid_spec = ModuleGridSpec(
         name=encoder_name,
         num_ranks=encoder_size,
         tp=args.encoder_tp,
         cp=args.encoder_cp,
         pp=args.encoder_pp,
         ep=1,
-        rank_offset=args.encoder_offset,
+        rank_offset=0,
         expt_tp=1,
     )
-    return [encoder_spec, language_spec]
-
-
-def _resolve_expt_tp(expt_tp, tp: int) -> int:
-    """Expert TP defaults to 1 when unset.
-
-    Matches ModuleGridSpec's convention (experts default to TP=1, set explicitly
-    for MoE -- intentionally not Megatron's etp=tp). The 20L MoE layout (ep=4 over
-    4 ranks) requires expt_tp=1: expt_tp*ep*pp must divide num_ranks.
-    """
-    return 1 if expt_tp is None else expt_tp
+    return [encoder_grid_spec, language_grid_spec]
 
 
 def _num_experts(args: argparse.Namespace) -> int:
-    """Resolve MoE expert count from stock (--num-experts) or prototype args."""
-    for attr in ("num_experts", "num_moe_experts"):
-        value = getattr(args, attr, None)
-        if value:
-            return int(value)
-    return 0
+    """Resolve MoE expert count from the stock --num-experts arg."""
+    value = getattr(args, "num_experts", None)
+    return int(value) if value else 0
 
 
 def _num_microbatches(args: argparse.Namespace) -> int:
