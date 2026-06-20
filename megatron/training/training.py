@@ -1682,7 +1682,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if getattr(args, 'fp4', None) is not None:
             update_gtp_config(pad_for_alignment=16)
         elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
-            update_gtp_config(pad_for_alignment=32, coalesce_amax_allreduce=False)
+            update_gtp_config(pad_for_alignment=32)
         elif getattr(args, 'fp8', None) is not None:
             update_gtp_config(pad_for_alignment=16)
 
@@ -1744,6 +1744,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         from megatron.experimental.gtp import (
             GTP_CONFIG,
             classify_gtp_chains,
+            reset_gtp_state,
             set_cuda_graph_modules,
             tag_gtp_params_with_names,
         )
@@ -1758,6 +1759,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             moe_shared_expert_overlap=_mse_overlap,
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
+        # Clear stale process-global chain state so a rebuilt model starts fresh.
+        reset_gtp_state()
         for model_module in model:
             tag_gtp_params_with_names(model_module)
             classify_gtp_chains(model_module)

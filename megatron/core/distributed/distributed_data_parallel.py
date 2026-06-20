@@ -193,6 +193,15 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.full_param_layout = full_param_layout
 
+        # GTP needs average_in_collective=False: the per-bucket collective runs over the
+        # GTP-EXCLUDED group, so NCCL AVG would miss the 1/gtp factor. arguments.py guards the
+        # training path; this assert covers direct megatron-core users.
+        gtp_active = ProcessGroupCollection.is_gtp_active(process_group_dict)
+        assert not (gtp_active and self.ddp_config.average_in_collective), (
+            "GTP requires average_in_collective=False (the default); averaged collectives reduce "
+            "over the GTP-excluded group and would miss the 1/gtp gradient scaling factor."
+        )
+
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (

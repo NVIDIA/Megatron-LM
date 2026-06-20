@@ -683,6 +683,7 @@ def initialize_model_parallel(
             layer) via async all-gather on every forward AND backward pass. A
             first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
+            NOTE: "remat" here is NOT activation recomputation/checkpointing.
 
         expert_gtp_remat_size (int, default = 1):
             Expert-side counterpart of ``gtp_remat_size`` — shards routed-expert
@@ -1753,37 +1754,32 @@ def get_data_parallel_group(
         no_gtp: If True, return only the true weight-replica ranks (exclude GTP peers).
         partial_data_parallel: If True, return partial DP group (requires with_context_parallel).
     """
-    if no_gtp:
-        if with_context_parallel:
-            if partial_data_parallel:
-                assert (
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP is not None
-                ), "Intra partial data parallel group with CP and GTP is not initialized"
-                return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP is not None
-            ), "data parallel group with CP and GTP is not initialized"
-            return _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP
-        else:
-            assert partial_data_parallel is False, "Partial DP for Optimizer needs to include CP"
-            assert (
-                _DATA_PARALLEL_GROUP_NO_GTP is not None
-            ), "data parallel group with generalized tensor parallel is not initialized"
-            return _DATA_PARALLEL_GROUP_NO_GTP
-    if with_context_parallel:
-        if partial_data_parallel:
-            assert (
-                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
-            ), "Intra partial data parallel group is not initialized"
-            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        assert (
-            _DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), "data parallel group with context parallel combined is not initialized"
-        return _DATA_PARALLEL_GROUP_WITH_CP
-    else:
-        assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
-        assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
-        return _DATA_PARALLEL_GROUP
+    assert (
+        with_context_parallel or not partial_data_parallel
+    ), "Partial DP for Optimizer needs to include CP"
+    # (no_gtp, with_context_parallel, partial_data_parallel) -> (group, description). The globals
+    # are read at call time (assigned during initialize_model_parallel). partial requires CP, so
+    # the (*, False, True) rows are unreachable and omitted.
+    group_table = {
+        (False, False, False): (_DATA_PARALLEL_GROUP, "data parallel group"),
+        (False, True, False): (_DATA_PARALLEL_GROUP_WITH_CP, "data parallel group with CP"),
+        (False, True, True): (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP,
+            "intra partial data parallel group with CP",
+        ),
+        (True, False, False): (_DATA_PARALLEL_GROUP_NO_GTP, "data parallel group (no GTP)"),
+        (True, True, False): (
+            _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP,
+            "data parallel group with CP (no GTP)",
+        ),
+        (True, True, True): (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP,
+            "intra partial data parallel group with CP (no GTP)",
+        ),
+    }
+    group, description = group_table[(no_gtp, with_context_parallel, partial_data_parallel)]
+    assert group is not None, f"{description} is not initialized"
+    return group
 
 
 def get_data_parallel_group_gloo(
@@ -2353,31 +2349,26 @@ def get_expert_data_parallel_group(
     check_initialized=True, no_gtp=False, partial_expert_data_parallel=False
 ):
     """Get expert data parallel group."""
-    if no_gtp:
-        if partial_expert_data_parallel:
-            if check_initialized:
-                assert _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP is not None, (
-                    "Intra partial expert data parallel group with generalized tensor "
-                    "parallel is not initialized"
-                )
-            return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP
-        if check_initialized:
-            assert (
-                _EXPERT_DATA_PARALLEL_GROUP_NO_GTP is not None
-            ), "Expert data parallel group with generalized tensor parallel is not initialized"
-        return _EXPERT_DATA_PARALLEL_GROUP_NO_GTP
-    if partial_expert_data_parallel:
-        if check_initialized:
-            assert (
-                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
-            ), "Intra partial expert data parallel group is not initialized"
-        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
-    else:
-        if check_initialized:
-            assert (
-                _EXPERT_DATA_PARALLEL_GROUP is not None
-            ), "Expert data parallel group is not initialized"
-        return _EXPERT_DATA_PARALLEL_GROUP
+    # (no_gtp, partial_expert_data_parallel) -> (group, description). Read at call time.
+    group_table = {
+        (False, False): (_EXPERT_DATA_PARALLEL_GROUP, "Expert data parallel group"),
+        (False, True): (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+            "Intra partial expert data parallel group",
+        ),
+        (True, False): (
+            _EXPERT_DATA_PARALLEL_GROUP_NO_GTP,
+            "Expert data parallel group (no GTP)",
+        ),
+        (True, True): (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP,
+            "Intra partial expert data parallel group (no GTP)",
+        ),
+    }
+    group, description = group_table[(no_gtp, partial_expert_data_parallel)]
+    if check_initialized:
+        assert group is not None, f"{description} is not initialized"
+    return group
 
 
 def get_expert_data_parallel_group_gloo(no_gtp=False, partial_expert_data_parallel=False):

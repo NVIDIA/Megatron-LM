@@ -336,6 +336,19 @@ class ProcessGroupCollection:
         return cls(**init_dict)
 
     @staticmethod
+    def is_gtp_active(process_group_dict: Dict) -> bool:
+        """True iff GTP or EGTP is active (a weight-shard group spans >1 rank).
+
+        Reads the 'gtp_group'/'expt_gtp_group' entries produced by both setup_process_groups_for_*
+        builders; a None group means that axis is unused.
+        """
+        gtp = process_group_dict.get('gtp_group')
+        expt_gtp = process_group_dict.get('expt_gtp_group')
+        return (gtp is not None and gtp.size() > 1) or (
+            expt_gtp is not None and expt_gtp.size() > 1
+        )
+
+    @staticmethod
     def setup_process_groups_for_optimizer(
         pg_collection: Optional['ProcessGroupCollection'],
         model_chunks: List,
@@ -401,6 +414,10 @@ class ProcessGroupCollection:
                 no_gtp=True, partial_expert_data_parallel=True
             )
             expt_dp_no_egtp_group = parallel_state.get_expert_data_parallel_group(no_gtp=True)
+            gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+            expt_gtp_group = parallel_state.get_expert_gtp_weight_remat_group(
+                check_initialized=False
+            )
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
 
             # Gloo groups
@@ -558,6 +575,10 @@ class ProcessGroupCollection:
             else:
                 expt_dp_no_egtp_group = expt_dp_group
 
+            # 8. GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
+            gtp_group = getattr(pg_collection, 'gtp', None)
+            expt_gtp_group = getattr(pg_collection, 'expt_gtp', None)
+
             # Gloo groups - not supported when pg_collection is provided
             if use_gloo_process_groups:
                 raise ValueError(
@@ -577,6 +598,8 @@ class ProcessGroupCollection:
             'expt_dp_no_egtp_group': expt_dp_no_egtp_group,
             'intra_expt_dp_group': intra_expt_dp_group,
             'intra_expt_dp_no_egtp_group': intra_expt_dp_no_egtp_group,
+            'gtp_group': gtp_group,
+            'expt_gtp_group': expt_gtp_group,
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
             'expt_tp_pp_with_egtp_group': expt_tp_pp_with_egtp_group,
@@ -633,8 +656,12 @@ class ProcessGroupCollection:
                     no_gtp=True, partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
+                'gtp_group': parallel_state.get_gtp_weight_remat_group(check_initialized=False),
                 'pp_group': parallel_state.get_pipeline_model_parallel_group(),
                 'ep_group': parallel_state.get_expert_model_parallel_group(),
+                'expt_gtp_group': parallel_state.get_expert_gtp_weight_remat_group(
+                    check_initialized=False
+                ),
                 'inter_dist_opt_group': (
                     parallel_state.get_inter_distributed_optimizer_instance_group()
                     if ddp_config.num_distributed_optimizer_instances > 1
@@ -744,6 +771,10 @@ class ProcessGroupCollection:
                 result['expt_dp_no_egtp_group'] = pg_collection.expt_dp_no_egtp
             else:
                 result['expt_dp_no_egtp_group'] = result['expt_dp_group']
+
+            # 9. GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
+            result['gtp_group'] = getattr(pg_collection, 'gtp', None)
+            result['expt_gtp_group'] = getattr(pg_collection, 'expt_gtp', None)
 
             return result
 

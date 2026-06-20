@@ -925,7 +925,9 @@ class TransformerConfig(ModelParallelConfig):
     more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
 
     cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
+    """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
+    minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
+    the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.

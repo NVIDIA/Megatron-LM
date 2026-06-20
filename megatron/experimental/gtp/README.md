@@ -16,8 +16,9 @@ Core implementation: `megatron/experimental/gtp/generalized_tensor_parallelism.p
    - 1.3 [Low-precision quantize-then-gather](#13-low-precision-quantize-then-gather)
    - 1.4 [Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
    - 1.5 [Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
-   - 1.6 [Scaling](#16-scaling)
-   - 1.7 [Native distributed checkpointing (DCP)](#17-native-distributed-checkpointing-dcp)
+   - 1.6 [Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
+   - 1.7 [Scaling](#17-scaling)
+   - 1.8 [Native distributed checkpointing (DCP)](#18-native-distributed-checkpointing-dcp)
 2. [Usage](#2-usage)
    - 2.1 [Required flags](#21-required-flags)
    - 2.2 [High-priority streams (Blackwell and later)](#22-high-priority-streams-blackwell-and-later)
@@ -124,7 +125,16 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 - Turning it off is a no-op: when `gtp_group.size() == 1`, `wrap_module_params_gtp` short-circuits; when `gtp_weight_remat_size == 1`, the GTP path in `layers.py` is skipped entirely.
 - User-tunable knobs (`GTPConfig.pad_for_alignment`, `weight_prefetch`, `check_param_states`) plus a debug-name tagger (`tag_gtp_params_with_names`) for readable link-table output.
 
-### 1.6 Scaling
+### 1.6 Optimizer-agnostic (Adam + Muon)
+
+GTP runs under both the standard **Adam** `DistributedOptimizer` and **Muon** (the `LayerWiseDistributedOptimizer`), DCP save/load included:
+
+- **Adam** shards optimizer state over the gtp/egtp-excluded replicate group, like any GTP run (§3.2).
+- **Muon** keeps matrix params *whole* (Newton–Schulz needs the full 2D weight). A GTP-replicated whole param (e.g. MoE router, latent-proj MLPs) then lands on one checkpoint key shared by all GTP peers, so the LayerWise optimizer folds `gtp_rank` into its `replica_id` — exactly one peer writes (the optimizer-state analog of the model-side fold in §3.3). Mamba `in_proj` (a gathered+split factory on the model side) saves its optimizer state per-shard via a small backfill helper.
+
+Neither path adds a GTP-specific checkpoint format or call site.
+
+### 1.7 Scaling
 
 Effective per-GPU weight size = `W / (TP × GTP)`. Example: TP=4 + GTP=8 with NVFP4 → 32× weight-memory reduction and 128× wire-bandwidth reduction vs full BF16 replication, before data parallelism.
 
@@ -141,7 +151,7 @@ On an Ultra-proxy hybrid Mamba-MoE model (**~280B parameters**; `GTP64 · EP64 �
 
 ![GTP64 weak-scaling efficiency](images/0617_gtp64_weak_scaling_efficiency.png)
 
-### 1.7 Native distributed checkpointing (DCP)
+### 1.8 Native distributed checkpointing (DCP)
 
 **GTP + DCP is straightforward:**
 - Reuses the existing checkpoint stack rather than adding a parallel one. GTP-sharded weights *and* distributed-optimizer state save/load through the standard PyTorch / Mcore `torch_dist` sharded checkpoint, with **no GTP-specific format or call path** and a tiny code footprint (one new helper + one helper made GTP-aware).
@@ -212,8 +222,7 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, wgrad_before_dgrad=False,
-  fp8_param_gather=False, coalesce_amax_allreduce=False)
+  weight_prefetch=True, async_reduction=True, fp8_param_gather=False)
 ```
 
 ### 2.4 Tuning knobs
@@ -225,13 +234,13 @@ update_gtp_config(
     pad_for_alignment=16,         # NVFP4: 16, MXFP8: 32, BF16: any; auto-set in training.py
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP gradient reduction asynchronously
-    # wgrad_before_dgrad: deferred — setting True currently raises NotImplementedError
     fp8_param_gather=False,       # Companion to Megatron's --fp8-param-gather; currently asserted off
-    # coalesce_amax_allreduce: deferred — setting True logs an info and falls back to per-weight
 )
 ```
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
+
+> **CUDA-graph warmup under GTP.** When CUDA graphs are enabled, GTP forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
 
 ---
 
@@ -287,7 +296,7 @@ Communication never blocks compute except at the very first layer of each direct
 
 Current behavior: backward always runs dgrad GEMM, then wgrad GEMM, then issues the GTP wgrad RS — the RS overlaps with the *next* layer's bwd GEMMs (the one-step deferral above).
 
-A future MR will add an opt-in wgrad-before-dgrad schedule on `_Linear` / `_LayerNormLinear` so the GTP wgrad RS NCCL overlaps with the dgrad GEMM of the **same** layer (best for the GTP + no-TP case). Until that MR lands, attempting to set `GTPConfig.wgrad_before_dgrad = True` raises `NotImplementedError`.
+A future MR will add an opt-in wgrad-before-dgrad schedule on `_Linear` / `_LayerNormLinear` so the GTP wgrad RS NCCL overlaps with the dgrad GEMM of the **same** layer (best for the GTP + no-TP case).
 
 ##### Recompute-forward prefetch chain  *(GTP + activation recompute)*
 
@@ -335,6 +344,8 @@ Why this is correct — the gtp axis is completed in two complementary ways, so 
 
 - **GTP-sharded weights**: each rank already holds the gtp-summed shard via the (E)GTP wgrad reduce-scatter, then DDP sums over the replicate group → `sum-over-(gtp×replicate) / full = mean`.
 - **Replicated (non-GTP) params** (LayerNorm γ/β, biases, router, …): DDP sums only over the replicate group, leaving them `1/gtp` short; `finalize_model_grads._allreduce_replicated_grads_over_gtp_group` then does a SUM all-reduce over the gtp (dense) / egtp (expert) group to recover the full mean. SUM (not AVG) because the `1/full` DDP scaling already applied.
+
+> **`average_in_collective` must be off (the default).** The `1/(replicate×gtp)` scaling above is a *pre-scale* applied before a SUM collective. `average_in_collective=True` instead uses NCCL AVG, which divides by the collective's own group — the gtp/egtp-**excluded** replicate group — so it divides by `replicate` only, missing the `1/gtp` factor and over-scaling gradients by `gtp`. Asserted via `ProcessGroupCollection.is_gtp_active` in both `arguments.py` (training) and `DistributedDataParallel.__init__` (direct megatron-core users).
 
 **`broadcast_params`** (the one-shot init/load param sync) selects the group by `is_gtp`: GTP shards broadcast over the gtp-excluded `*_no_gtp` group (`dp_cp_no_gtp_group` / `expt_dp_no_egtp_group`), everything else over the regular DP group (`dp_cp_group` / `expt_dp_group`). Excluding (E)GTP peers is essential — each peer holds a distinct 1/N shard of the same `GTPShardedParam`, so a shared group would let rank-0's shard clobber the others. The non-`intra_` ("full") groups are used here so the sync reaches every distopt instance.
 
@@ -398,5 +409,6 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_loss_correctness.py` | End-to-end: GTP per-step loss trajectory matches a no-GTP baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
 | `test_gtp_dcp.py` | Distributed-checkpoint sharding (§3.3): TP×GTP composite/cross-axis offsets, alignment-pad `allow_shape_mismatch`, cross-topology reshard metadata, and quantize-cache reset. |
+| `test_gtp_muon_dcp.py` | GTP + Muon (LayerWise) optimizer-state checkpoint roundtrip (§1.6): `replica_id` fold for GTP-replicated whole params (router, latent-proj). |
 
 All tests require ≥ 4 GPUs and the GTP-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP change.

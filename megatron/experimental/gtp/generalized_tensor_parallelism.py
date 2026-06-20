@@ -275,14 +275,6 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
         cur.wait_event(evt)
 
 
-# NOTE: Coalesced amax reduction across the GTP group is deferred to a follow-up
-# MR. The TE-side split-phase APIs (`compute_amax_nvfp4`, `quantize_cast_only_nvfp4`,
-# `compute_multi_amax_nvfp4`) and the Mcore-side `_quantize_with_coalesced_amax`
-# helper have been removed. The `GTPConfig.coalesce_amax_allreduce` knob is kept
-# as a stub: setting it to True logs an info message and falls back to the
-# per-weight quantize path inside `_all_gather_weight`.
-
-
 @dataclass
 class GTPConfig:
     """Global configuration for Generalized Tensor Parallelism."""
@@ -296,21 +288,10 @@ class GTPConfig:
     # overlap. When False, every wgrad RS is synchronous and finalizes
     # inline, at the cost of that overlap.
     async_reduction: bool = True
-    # Stub field, reserved for a follow-up MR that will land the wgrad-before-dgrad
-    # schedule on the TE side (_Linear / _LayerNormLinear backward run wgrad GEMM
-    # before dgrad GEMM, so the GTP wgrad reduce-scatter overlaps with dgrad GEMM).
-    # Setting this to True via update_gtp_config() currently raises NotImplementedError.
-    wgrad_before_dgrad: bool = False
     # GTP companion to Megatron --fp8-param-gather: optimizer casts FP32 master
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
     # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
     fp8_param_gather: bool = False
-    # Stub field, reserved for a follow-up MR that will re-land the coalesced
-    # NVFP4 amax allreduce across the GTP group (single NCCL call across all
-    # batched per-expert amax tensors, plus the TE split-phase compute_amax /
-    # quantize_cast primitives). Setting this to True via update_gtp_config()
-    # currently logs an info message and falls back to the per-weight path.
-    coalesce_amax_allreduce: bool = False
 
 
 GTP_CONFIG = GTPConfig()
@@ -318,16 +299,6 @@ GTP_CONFIG = GTPConfig()
 
 def update_gtp_config(**kwargs):
     """Update the global GTP configuration."""
-    if kwargs.get("wgrad_before_dgrad"):
-        raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
-    if kwargs.get("coalesce_amax_allreduce"):
-        warnings.warn(
-            "GTPConfig.coalesce_amax_allreduce: coalesced amax reduction across the "
-            "GTP group is deferred in a followup MR; falling back to per-weight amax "
-            "allreduce.",
-            stacklevel=2,
-        )
-        kwargs["coalesce_amax_allreduce"] = False
     for key, value in kwargs.items():
         if not hasattr(GTP_CONFIG, key):
             raise ValueError(f"Unknown GTP config option: {key}")
@@ -512,13 +483,12 @@ class GTPShardedParam(torch.nn.Parameter):
     integrator needs to drive overlap with captured compute.
     """
 
-    # Per-chain state: each chain_id (GTPChain.GRAPHED / GTPChain.UNGRAPHED) has
-    # its own linked list. Chains never cross-link: prev_w/next_w only connect
-    # params with the same chain_id.
+    # Per-chain linked-list state, keyed by chain_id (GTPChain.GRAPHED/UNGRAPHED); chains
+    # never cross-link (prev_w/next_w join only same-chain_id params). Call reset_gtp_state()
+    # before rebuilding a GTP model in the same process.
     _chain_state: Dict[str, dict] = {}
 
-    # Per-chain cursor for the recompute-forward prefetch chain (see the _recompute_*
-    # slot on GTPShardedParam). Keyed by chain_id like _chain_state.
+    # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
     _recompute_chain_state: Dict[str, dict] = {}
 
     @classmethod
@@ -842,10 +812,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 w._set_state(new_state)
 
         # 2. Prepare: quantize, set usage direction.
-        # NOTE: The coalesced amax allreduce path (gated by
-        # GTPConfig.coalesce_amax_allreduce) is deferred to a follow-up MR;
-        # always use the per-weight quantize path here. update_gtp_config() logs
-        # an info message when a caller tries to enable the deferred knob.
         fp8_pg_hit = GTP_CONFIG.fp8_param_gather and self.did_cast_to_low_precision
 
         if not fp8_pg_hit:
@@ -1831,6 +1797,19 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         (weight,) = ctx.saved_tensors
         return weight.wgrad_reduce_scatter(grad_output)
+
+
+def reset_gtp_state():
+    """Clear the process-global GTP prefetch-chain state (``GTPShardedParam._chain_state`` /
+    ``._recompute_chain_state``).
+
+    These class-level dicts survive model teardown, so a GTP model rebuilt in the same process
+    would otherwise inherit the prior model's stale ``last_weight`` pointers / flushed link
+    tables. Call once before the per-chunk ``classify_gtp_chains`` loop (never inside it — chains
+    span chunks). No-op on a fresh process.
+    """
+    GTPShardedParam._chain_state.clear()
+    GTPShardedParam._recompute_chain_state.clear()
 
 
 def reset_gtp_quantize_cache(model):

@@ -1039,7 +1039,6 @@ def get_megatron_optimizer(
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
     intra_dp_cp_no_gtp_group = process_groups_dict['intra_dp_cp_no_gtp_group']
-    intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
     intra_expt_dp_no_egtp_group = process_groups_dict['intra_expt_dp_no_egtp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
@@ -1049,19 +1048,21 @@ def get_megatron_optimizer(
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
-    # GTP/EGTP params fold into the main / expert optimizers, sharding their optimizer state over
-    # the *_no_gtp (gtp/egtp-EXCLUDED) replicate group — which aliases the full DP group when GTP
-    # is inactive. GTP is "active" when that group is strictly smaller (no Gloo state path then).
-    # A None group means the axis is unused (e.g. no expert parallelism) → not active.
-    def _gtp_active_for(sub, full):
-        return sub is not None and full is not None and sub.size() != full.size()
-
-    gtp_active = _gtp_active_for(intra_dp_cp_no_gtp_group, intra_dp_cp_group) or _gtp_active_for(
-        intra_expt_dp_no_egtp_group, intra_expt_dp_group
-    )
-    main_dp_group = intra_dp_cp_no_gtp_group
-    main_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo
-    main_expt_dp_group = intra_expt_dp_no_egtp_group
+    # Drives no-Gloo state path + sharding over the *_no_gtp replicate group below.
+    gtp_active = ProcessGroupCollection.is_gtp_active(process_groups_dict)
+    optim_dp_group = intra_dp_cp_no_gtp_group
+    # The gtp-excluded replicate group has no Gloo variant by design (parallel_state asserts it),
+    # so None is correct under GTP. Warn if a Gloo group was requested so the drop is not silent.
+    if gtp_active and intra_dp_cp_group_gloo is not None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "GTP is active: disabling the optimizer's Gloo data-parallel group (no Gloo variant "
+            "of the gtp-excluded replicate group). Use DCP (--ckpt-format torch_dist) for "
+            "checkpointing; the legacy Gloo CPU scatter path is unavailable under GTP.",
+        )
+    optim_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo
+    optim_expt_dp_group = intra_expt_dp_no_egtp_group
 
     # ``mp_group`` spans TP×GTP×PP (GTP-merged).
     model_parallel_rank = get_pg_rank(mp_group)
@@ -1155,7 +1156,7 @@ def get_megatron_optimizer(
                     param_to_param_group[param_name] = param_group_id
                 param_group_id += 1
 
-        # main_dp_group_gloo was selected above (None when GTP is active; no Gloo path yet).
+        # optim_dp_group_gloo was selected above (None when GTP is active; no Gloo path yet).
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config=config,
@@ -1163,8 +1164,8 @@ def get_megatron_optimizer(
                 param_groups=param_groups,
                 per_model_buffers=buffers,
                 model_parallel_group=mp_group,
-                data_parallel_group=main_dp_group,
-                data_parallel_group_gloo=main_dp_group_gloo,
+                data_parallel_group=optim_dp_group,
+                data_parallel_group_gloo=optim_dp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -1197,7 +1198,7 @@ def get_megatron_optimizer(
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_group)
         # Gloo expert-DP group for the optimizer, only when (E)GTP is inactive. When active the
         # optimizer shards over the egtp-EXCLUDED (no_egtp) replicate group, which has no Gloo
-        # variant yet, so pass None (mirrors the dense main_dp_group_gloo above).
+        # variant yet, so pass None (mirrors the dense optim_dp_group_gloo above).
         if use_gloo_process_groups and not gtp_active:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
@@ -1209,7 +1210,7 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_with_egtp_group,
-                data_parallel_group=main_expt_dp_group,
+                data_parallel_group=optim_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,

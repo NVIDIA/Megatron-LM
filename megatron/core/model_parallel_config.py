@@ -11,6 +11,8 @@ def resolve_tensor_parallel_weight_shards(
     tensor_model_parallel_size: int,
     tensor_parallel_num_weight_shards: Optional[int],
     gtp_weight_remat_size: int,
+    shards_field: str = "tensor_parallel_num_weight_shards",
+    tp_field: str = "tensor_model_parallel_size",
 ) -> tuple:
     """Reconcile ``tensor_parallel_num_weight_shards`` and ``gtp_weight_remat_size``.
 
@@ -26,14 +28,16 @@ def resolve_tensor_parallel_weight_shards(
     if tensor_parallel_num_weight_shards is None:
         tensor_parallel_num_weight_shards = tp * gtp_weight_remat_size
     else:
-        assert tensor_parallel_num_weight_shards >= tp, (
-            f"tensor_parallel_num_weight_shards ({tensor_parallel_num_weight_shards}) must be >= "
-            f"tensor_model_parallel_size ({tp})."
-        )
-        assert tensor_parallel_num_weight_shards % tp == 0, (
-            f"tensor_parallel_num_weight_shards ({tensor_parallel_num_weight_shards}) must be "
-            f"divisible by tensor_model_parallel_size ({tp})."
-        )
+        if tensor_parallel_num_weight_shards < tp:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f">= {tp_field} ({tp})."
+            )
+        if tensor_parallel_num_weight_shards % tp != 0:
+            raise ValueError(
+                f"{shards_field} ({tensor_parallel_num_weight_shards}) must be "
+                f"divisible by {tp_field} ({tp})."
+            )
         gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
 
@@ -513,6 +517,8 @@ class ModelParallelConfig:
                 self.expert_tensor_parallel_size,
                 self.expert_tensor_parallel_num_weight_shards,
                 self.expert_gtp_weight_remat_size,
+                shards_field="expert_tensor_parallel_num_weight_shards",
+                tp_field="expert_tensor_parallel_size",
             )
         )
 
