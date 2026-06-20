@@ -20,7 +20,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -48,9 +47,8 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "/claude review"
-          show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
@@ -114,7 +112,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -147,9 +144,8 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "/claude strict-review"
-          show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
