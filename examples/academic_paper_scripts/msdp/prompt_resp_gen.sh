@@ -13,14 +13,13 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
 
-CHECKPOINT_PATH=<PATH_OF_LANGUAGE_MODEL> (e.g., /357m)
-VOCAB_PATH=<PATH_OF_VOCAB_FILE> (e.g., /gpt2-vocab.json)
-MERGE_PATH=<PATH_OF_MERGE_FILE> (e.g., /gpt2-merges.txt)
-INPUT_PATH=<PATH_OF_INPUT_TEST_DATA_FILE> (e.g., /testseen_processed.txt)
-PROMPT_PATH=<PATH_OF_RESPONSE_GENERATION_PROMPTS> \
-        (e.g., /response_prompts.txt)
-OUTPUT_PATH=<PATH_OF_OUTPUT_GENERATION_FILE> \
-        (e.g., /output_testseen_response_generations.txt)
+# Required inputs. Set these in the environment before running this script.
+: "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH, e.g. /path/to/357m}"
+: "${VOCAB_PATH:?Set VOCAB_PATH, e.g. /path/to/gpt2-vocab.json}"
+: "${MERGE_PATH:?Set MERGE_PATH, e.g. /path/to/gpt2-merges.txt}"
+: "${INPUT_PATH:?Set INPUT_PATH, e.g. /path/to/testseen_processed.txt}"
+: "${PROMPT_PATH:?Set PROMPT_PATH, e.g. /path/to/response_prompts.txt}"
+: "${OUTPUT_PATH:?Set OUTPUT_PATH, e.g. /path/to/output_testseen_response_generations.txt}"
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
         --num-layers 24 \
@@ -29,15 +28,15 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
         --seq-length 2048 \
         --max-position-embeddings 2048 \
         --micro-batch-size 1 \
-        --vocab-file ${VOCAB_PATH} \
-        --merge-file ${MERGE_PATH} \
-        --load ${CHECKPOINT_PATH} \
+        --vocab-file "${VOCAB_PATH}" \
+        --merge-file "${MERGE_PATH}" \
+        --load "${CHECKPOINT_PATH}" \
         --fp16 \
         --DDP-impl torch \
         --tokenizer-type GPT2BPETokenizer \
-        --sample-input-file ${INPUT_PATH} \
-        --sample-output-file ${OUTPUT_PATH} \
-        --prompt-file ${PROMPT_PATH} \
+        --sample-input-file "${INPUT_PATH}" \
+        --sample-output-file "${OUTPUT_PATH}" \
+        --prompt-file "${PROMPT_PATH}" \
         --prompt-type response \
         --num-prompt-examples 20 \
         --task MSDP-PROMPT 

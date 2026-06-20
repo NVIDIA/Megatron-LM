@@ -11,10 +11,9 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
                   
-MODEL_GEN_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION> \ 
-        (e.g., /testseen_knowledge_generations.txt)
-GROUND_TRUTH_PATH=<PATH_OF_THE_GROUND_TRUTH_KNOWLEDGE> \ 
-        (e.g., /testseen_knowledge_reference.txt)
+# Required inputs. Set these in the environment before running this script.
+: "${MODEL_GEN_PATH:?Set MODEL_GEN_PATH, e.g. /path/to/testseen_knowledge_generations.txt}"
+: "${GROUND_TRUTH_PATH:?Set GROUND_TRUTH_PATH, e.g. /path/to/testseen_knowledge_reference.txt}"
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
         --num-layers 24 \
@@ -24,8 +23,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
         --max-position-embeddings 2048 \
         --micro-batch-size 4 \
         --task MSDP-EVAL-F1 \
-        --guess-file ${MODEL_GEN_PATH} \
-        --answer-file ${GROUND_TRUTH_PATH}
+        --guess-file "${MODEL_GEN_PATH}" \
+        --answer-file "${GROUND_TRUTH_PATH}"
 
 
 ############################################
@@ -39,5 +38,5 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
 # the nlg-eval github, and run the corresponding evaluation commands.
 
 nlg-eval \
-    --hypothesis=<PATH_OF_THE_KNOWLEDGE_GENERATION> \
-    --references=<PATH_OF_THE_GROUND_TRUTH_KNOWLEDGE>
+    --hypothesis="${MODEL_GEN_PATH}" \
+    --references="${GROUND_TRUTH_PATH}"
