@@ -163,7 +163,14 @@ def get_current_iteration() -> int:
 
 def _blend_identifiers(args: Any) -> Dict[str, Any]:
     """Build a path-agnostic representation of the training data blend."""
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = get_blend_and_blend_per_split(
+        data_paths=args.data_path,
+        data_args_path=args.data_args_path,
+        per_split_data_args_path=args.per_split_data_args_path,
+        train_data_paths=args.train_data_path,
+        valid_data_paths=args.valid_data_path,
+        test_data_paths=args.test_data_path,
+    )
 
     def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
         if blend_tuple is None:

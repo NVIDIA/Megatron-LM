@@ -77,15 +77,24 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
-        super().__post_init__()
+        """Do asserts and set fields post init.
 
-        assert self.tokenizer is not None
+        Tokenizer-independent validation runs here; tokenizer-dependent state
+        (``token_dtype_code``) is deferred to ``_finalize_with_tokenizer`` so the
+        config can be constructed before the tokenizer exists (and completed later
+        via ``finalize(tokenizer)``). When a tokenizer is supplied at construction,
+        the base ``__post_init__`` invokes ``_finalize_with_tokenizer`` eagerly.
+        """
+        super().__post_init__()
 
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+    def _finalize_with_tokenizer(self) -> None:
+        """Derive token dtype from the tokenizer vocab size (needs a tokenizer)."""
+        super()._finalize_with_tokenizer()
+        assert self.tokenizer is not None
         self.token_dtype_code = (
             None
             if self.tokenizer.vocab_size is None
@@ -125,6 +134,14 @@ class GPTDataset(MegatronDataset):
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
+        # The tokenizer may be deferred when the config is built early (e.g. inside
+        # a config container). It must be materialized (via config.finalize(tokenizer))
+        # before datasets are built. Fail loudly rather than erroring cryptically
+        # on the first tokenizer access deep inside index building.
+        assert config.tokenizer is not None, (
+            "GPTDatasetConfig has no tokenizer; call config.finalize(tokenizer) with a "
+            "built tokenizer before building datasets."
+        )
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )

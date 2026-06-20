@@ -160,12 +160,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -218,6 +212,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
 from megatron.training.config import FaultInjectorConfig
+from megatron.training.datasets.data_loaders import cyclic_iter
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -1338,14 +1333,14 @@ def pretrain(
             if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                 vp_stage_train_valid_test_dataset_provider.is_distributed = True
             iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+                vp_stage_train_valid_test_dataset_provider, cfg=cfg_container
             )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            build_train_valid_test_data_iterators(train_valid_test_dataset_provider, cfg=cfg_container)
         )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -4142,21 +4137,6 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
 
 
-def cyclic_iter(iterable):
-    while True:
-        iterator = iter(iterable)
-        count = 0
-        for x in iterator:
-            count += 1
-            yield x
-        if count == 0:
-            # No data was yielded, the iterable is empty
-            raise RuntimeError(
-                "cyclic_iter: iterable produced no data. "
-                "This may indicate the validation dataloader is empty or eval_iters is incorrectly set. "
-                "Check that your validation dataset has data and that the dataloader is properly configured."
-            )
-
 
 def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
@@ -4207,8 +4187,14 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
-    """Build pretraining data loaders."""
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, cfg=None):
+    """Build pretraining data loaders.
+
+    When ``cfg`` (a ``PretrainConfigContainer`` with a populated ``cfg.dataset``)
+    is provided, the data-loader configuration is sourced from the container; it
+    is threaded into ``build_pretraining_data_loader``. Otherwise the legacy
+    ``get_args()`` configuration is used.
+    """
 
     args = get_args()
 
@@ -4263,20 +4249,20 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase, cfg=cfg)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0, cfg=cfg))
                 else:
                     if args.multiple_validation_sets:
                         # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                         # correct and needs to be calculated/set per validation set
                         raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples, cfg=cfg))
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            test_dataloader = build_pretraining_data_loader(test_ds, 0, cfg=cfg)
             do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
@@ -4295,18 +4281,23 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider, cfg=None):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, cfg=cfg
     )
 
-    # Build iterators.
-    dl_type = args.dataloader_type
+    # Build iterators. Prefer the container's dataloader_type when populated.
+    dataset_cfg = getattr(cfg, "dataset", None) if cfg is not None else None
+    dl_type = (
+        dataset_cfg.dataloader_type
+        if dataset_cfg is not None and dataset_cfg.dataloader_type is not None
+        else args.dataloader_type
+    )
     assert dl_type in ['single', 'cyclic', 'external']
 
     def _get_iterator(dataloader_type, dataloader):

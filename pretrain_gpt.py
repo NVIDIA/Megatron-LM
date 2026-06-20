@@ -36,7 +36,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import (
+    get_mtp_ranks,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -54,7 +56,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args, gpt_config_from_args
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -279,13 +281,25 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
-    tokenizer = build_tokenizer(args)
+def core_gpt_dataset_config_from_args(args: Any, with_tokenizer: bool = True) -> GPTDatasetConfig:
+    # The tokenizer is a heavy, environment-specific object. When building the
+    # config purely to populate the (early, serializable) config container, defer
+    # it (with_tokenizer=False) and materialize later via finalize(). The dataset
+    # provider keeps with_tokenizer=True so tokenizer construction stays in its
+    # current place / on the same ranks.
+    tokenizer = build_tokenizer(args) if with_tokenizer else None
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = get_blend_and_blend_per_split(
+        data_paths=args.data_path,
+        data_args_path=args.data_args_path,
+        per_split_data_args_path=args.per_split_data_args_path,
+        train_data_paths=args.train_data_path,
+        valid_data_paths=args.valid_data_path,
+        test_data_paths=args.test_data_path,
+    )
 
     sequences_per_dataset = None
     if args.per_dataset_sequences_path is not None:
@@ -318,6 +332,9 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dataloader_type": args.dataloader_type,
+        "num_workers": args.num_workers,
+        "data_sharding": args.data_sharding,
     }
 
     # add FIM args to the config
@@ -412,7 +429,8 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     model_cfg = gpt_config_from_args(args)
-    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    dataset_cfg = core_gpt_dataset_config_from_args(args, with_tokenizer=False)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg, dataset_cfg=dataset_cfg)
     pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),

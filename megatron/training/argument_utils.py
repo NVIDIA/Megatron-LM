@@ -1,36 +1,39 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import ast
+import builtins
 import dataclasses
-import typing
-import types
-from typing import Any, Callable, Optional
-from argparse import ArgumentParser, _ArgumentGroup, Namespace
+import enum
 import inspect
 import itertools
-import builtins
-import ast
-import enum
-from dataclasses import Field, fields
+import types
+import typing
 import warnings
-import torch.nn.functional as F
+from argparse import ArgumentParser, Namespace, _ArgumentGroup
+from dataclasses import Field, fields
+from typing import Any, Callable, Optional
+
 import torch
+import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
-
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
-    TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    CheckpointConfig,
+    DistributedInitConfig,
     LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    SchedulerConfig,
     StragglerDetectionConfig,
-    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+    TokenizerConfig,
+    TrainingConfig,
+    ValidationConfig,
 )
-from megatron.training.models import HybridModelConfig, GPTModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig
+
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -272,13 +275,13 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig
-    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-        HeterogeneousTransformerConfig,
-    )
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
         load_quantization_recipe,
+    )
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
     )
 
     # Config class.
@@ -475,8 +478,18 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     return HybridModelConfig(**kwargs)
 
 
-def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
-    """Build a PretrainConfigContainer from the argparse arguments."""
+def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None, dataset_cfg=None) -> PretrainConfigContainer:
+    """Build a PretrainConfigContainer from the argparse arguments.
+
+    Args:
+        args: Parsed argparse namespace.
+        model_cfg: Optional model config (e.g. ``HybridModelConfig``).
+        dataset_cfg: Optional dataset config (a ``BlendedMegatronDatasetConfig``
+            subclass, e.g. ``GPTDatasetConfig``). When provided it is stored on
+            ``cfg.dataset`` so data-loader construction can be driven from the
+            container instead of global args. Dataset configs are model/script
+            specific, so they are built by the pretrain script and passed in here.
+    """
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
     if model_cfg is None:
@@ -507,6 +520,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         train=_default_config_from_args(TrainingConfig, args),
         validation=_default_config_from_args(ValidationConfig, args),
         model=model_cfg,
+        dataset=dataset_cfg,
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,

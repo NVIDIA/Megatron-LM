@@ -4,10 +4,11 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
-from typing import Any, Type, TypeVar
+from typing import Any, Optional, Type, TypeVar
 
 import yaml
 
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.optimizer import OptimizerConfig
@@ -27,7 +28,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -236,7 +237,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    # dataset: GPTDatasetConfig # TODO (@maanug): add support
+    dataset: Optional[BlendedMegatronDatasetConfig] = None
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -247,3 +248,27 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def finalize(self, tokenizer=None) -> "PretrainConfigContainer":
+        """Materialize runtime objects that are deferred at construction.
+
+        The container is created early as a declarative, serializable job
+        description -- before heavy / environment-specific objects like the
+        tokenizer exist. Once the tokenizer has been built (via the usual
+        mechanism, on the usual ranks), call ``finalize(tokenizer)`` to inject it
+        into ``cfg.dataset`` so the dataset config can be used to build datasets.
+
+        Building the tokenizer from ``cfg.tokenizer`` (the ``TokenizerConfig``
+        spec) is intentionally not done here: ``TokenizerConfig`` currently exposes
+        only a subset of the fields ``build_tokenizer`` consumes, and tokenizer
+        construction is kept in its existing place. Pass the built tokenizer in.
+
+        Args:
+            tokenizer: The built tokenizer to inject into ``cfg.dataset``.
+
+        Returns:
+            self, for chaining.
+        """
+        if self.dataset is not None and tokenizer is not None:
+            self.dataset.finalize(tokenizer)
+        return self
