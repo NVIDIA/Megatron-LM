@@ -31,7 +31,6 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
 
 
-@pytest.mark.distributed
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
     """DBuffer layout returns element offsets and pads to LCM * DP size."""
     if distributed_setup.world_size < 2:
@@ -53,7 +52,6 @@ def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_set
     assert buffer.layout.size == 48
 
 
-@pytest.mark.distributed
 def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     """DBuffer layout keeps small tensors aligned to their non-leading dimensions."""
     if distributed_setup.world_size < 2:
@@ -74,7 +72,6 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     assert buffer.layout.size == 24
 
 
-@pytest.mark.distributed
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     """LCM packing fills row-aligned padding gaps on a 5-rank flat-sharded mesh."""
     if distributed_setup.world_size < 5:
@@ -118,7 +115,6 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
         assert buffer.get_dtensor(index).shape == shapes[index]
 
 
-@pytest.mark.distributed
 def test_constructor_allocates_local_buffer(distributed_setup):
     """DBuffer allocates local storage from shape, mesh, placement, dtype, and device."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -155,7 +151,6 @@ def test_constructor_allocates_local_buffer(distributed_setup):
     assert sharded_buffer.local_buffer.device == distributed_setup.device
 
 
-@pytest.mark.distributed
 def test_cast_to_same_dtype_returns_self(distributed_setup):
     """DBuffer.cast returns self when the dtype already matches."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -165,7 +160,6 @@ def test_cast_to_same_dtype_returns_self(distributed_setup):
     assert buffer.cast(torch.float32) is buffer
 
 
-@pytest.mark.distributed
 def test_cast_preserves_layout_and_casts_values(distributed_setup):
     """DBuffer.cast preserves layout metadata and casts local values."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -185,7 +179,6 @@ def test_cast_preserves_layout_and_casts_values(distributed_setup):
     )
 
 
-@pytest.mark.distributed
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -214,7 +207,6 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 
 
-@pytest.mark.distributed
 def test_from_local_reuses_required_local_buffer(distributed_setup):
     """DBuffer.from_local reuses caller-provided local storage without allocation."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -235,7 +227,6 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
 
-@pytest.mark.distributed
 def test_replicate_get_local_tensor_and_dtensor(distributed_setup):
     """Replicated DBuffer returns full local tensors and replicated DTensors."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -248,7 +239,6 @@ def test_replicate_get_local_tensor_and_dtensor(distributed_setup):
     torch.testing.assert_close(dtensor.to_local(), tensors[0], rtol=0, atol=0)
 
 
-@pytest.mark.distributed
 def test_distribute_tensors_moves_inputs_to_mesh_device(distributed_setup):
     """distribute_tensors moves full input tensors to the mesh device type."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -262,7 +252,6 @@ def test_distribute_tensors_moves_inputs_to_mesh_device(distributed_setup):
     )
 
 
-@pytest.mark.distributed
 def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
     """distribute_tensors treats input tensors as detached contiguous values."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -280,7 +269,6 @@ def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
     )
 
 
-@pytest.mark.distributed
 def test_sharded_allgather_round_trip(distributed_setup):
     """Sharded buffers round-trip through all-gather as contiguous tensor fragments."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -299,7 +287,6 @@ def test_sharded_allgather_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-@pytest.mark.distributed
 def test_sharded_allgather_into_existing_buffer(distributed_setup):
     """Sharded buffers can all-gather directly into a preallocated replicated buffer."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -321,7 +308,6 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 
-@pytest.mark.distributed
 def test_mesh_axis_must_be_non_negative_int(distributed_setup):
     """DBuffer communication methods require explicit non-negative integer mesh axes."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -341,7 +327,6 @@ def test_mesh_axis_must_be_non_negative_int(distributed_setup):
         buffer.allgather(-1)
 
 
-@pytest.mark.distributed
 def test_replicate_scatter_round_trip(distributed_setup):
     """Replicated buffers locally chunk into sharded buffers and all-gather back."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -375,7 +360,6 @@ def test_replicate_scatter_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
 
-@pytest.mark.distributed
 def test_partial_allreduce(distributed_setup):
     """Partial buffers all-reduce into replicated buffers."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -396,7 +380,6 @@ def test_partial_allreduce(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-@pytest.mark.distributed
 def test_partial_allreduce_average(distributed_setup):
     """Partial buffers can all-reduce with AVG."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -427,7 +410,6 @@ def test_partial_allreduce_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-@pytest.mark.distributed
 def test_partial_reduce_scatter_to_flat(distributed_setup):
     """Partial buffers reduce-scatter into sharded buffers."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -461,7 +443,6 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-@pytest.mark.distributed
 def test_partial_reduce_scatter_to_flat_average(distributed_setup):
     """Partial buffers can reduce-scatter with AVG."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -489,7 +470,6 @@ def test_partial_reduce_scatter_to_flat_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-@pytest.mark.distributed
 def test_get_dtensor_from_sharded_buffer(distributed_setup):
     """Sharded DBuffer exposes per-tensor local shards as DTensors."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -504,7 +484,6 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
     assert dtensor.shape == tensors[0].shape
 
 
-@pytest.mark.distributed
 def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
     """A 2D mesh can replicate on one axis and flat-shard on the other."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -523,7 +502,6 @@ def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-@pytest.mark.distributed
 def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
     """Flat axes must be a suffix to keep every local buffer contiguous."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -545,7 +523,6 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         )
 
 
-@pytest.mark.distributed
 def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     """Multiple Flat axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -574,7 +551,6 @@ def test_2d_mesh_shards_across_all_ranks(distributed_setup):
         assert fully_sharded_buffer.get_local_tensor(index).is_contiguous()
 
 
-@pytest.mark.distributed
 def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     """Partial+Flat reduce-scatter reduces the existing Flat local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -618,7 +594,6 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-@pytest.mark.distributed
 def test_2d_mesh_replicate_flat_scatter_to_flat_flat(distributed_setup):
     """Replicate+Flat scatter chunks the existing Flat local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
