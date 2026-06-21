@@ -86,7 +86,6 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
-@pytest.mark.distributed
 def test_fully_shard_losses_match_baseline(distributed_setup):
     """Minimal per-module FSDP training should match single-rank SGD."""
     rank = distributed_setup.rank
@@ -130,7 +129,6 @@ def test_fully_shard_losses_match_baseline(distributed_setup):
         optimizer.step()
 
 
-@pytest.mark.distributed
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     """An outer FSDP unit owns direct parameters but not nested child-unit parameters."""
     world_size = distributed_setup.world_size
@@ -153,7 +151,6 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     assert outer_names == ["bias"]
 
 
-@pytest.mark.distributed
 def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     """A non-trainable parameter group should not allocate persistent main gradients."""
     world_size = distributed_setup.world_size
@@ -170,9 +167,6 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     (group,) = model.parameter_groups()
     assert not group.requires_grad
     assert group.main_grad is None
-
-
-pytest.mark.distributed
 
 
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
@@ -200,7 +194,6 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
-@pytest.mark.distributed
 def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     """The next forward should observe weights updated by the previous optimizer step."""
     world_size = distributed_setup.world_size
@@ -238,7 +231,6 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
-@pytest.mark.distributed
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     """CPU-initialized parameters should be sharded with their real values."""
     world_size = distributed_setup.world_size
@@ -260,7 +252,6 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(full_weight, expected_weight)
 
 
-@pytest.mark.distributed
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     """A non-leaf parameter view saved for backward should survive full-storage resize."""
     world_size = distributed_setup.world_size
@@ -286,7 +277,6 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-@pytest.mark.distributed
 def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     """Per-layer FSDP should reduce peak CUDA memory during training."""
     rank = distributed_setup.rank
