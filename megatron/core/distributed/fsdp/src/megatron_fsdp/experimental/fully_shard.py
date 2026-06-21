@@ -57,5 +57,8 @@ def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
     module_cls = module.__class__
+    # Attach the FSDP mixin to the original module instance instead of wrapping it
+    # in a new child module, so parent modules do not need to replace or reorder
+    # their existing submodule references.
     fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
     module.__class__ = fsdp_cls
