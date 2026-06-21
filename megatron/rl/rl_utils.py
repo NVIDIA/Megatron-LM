@@ -19,6 +19,12 @@ from typing import Any, Dict, Iterator, List, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.nn
+
+try:
+    import transformer_engine_torch as tex
+except ImportError:
+    tex = None
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
@@ -746,6 +752,98 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _scatter_for_context_parallel(
+    tokens: torch.Tensor,
+    position_ids: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    cp_size: int,
+) -> tuple:
+    """Prepare local inputs for one context-parallel rank.
+
+    Formats the bins to allow for the use of Transfomer Engine's `thd_get_partitioned_indices`.
+
+    Args:
+        tokens:            Full token tensor  [batch, seq_len].
+        position_ids:      Full position-id tensor  [batch, seq_len].
+        packed_seq_params: PackedSeqParams for the full bin.
+        cp_size:           Context-parallel world size.
+
+    Returns:
+        (local_tokens, local_position_ids, cp_packed_seq_params, local_labels,
+        partition_index) where every local tensor has sequence length `seq_len // cp_size`
+        and `partition_index` holds the global positions owned by this rank.
+    """
+    assert tex is not None, (
+        "Context-parallel RL logprobs require Transformer Engine to compute THD indices."
+    )
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+
+    seq_len = tokens.shape[1]
+    assert seq_len % (2 * cp_size) == 0, (
+        f"Sequence length {seq_len} must be divisible by 2*context_parallel_size."
+    )
+
+    # We do not need logprobs for the n+1 token.
+    tokens_shifted = torch.cat([tokens[:, 1:], tokens[:, -1:]], dim=1)
+
+    # Shallow-copy so we do not mutate the main sequence params.
+    cp_packed_seq_params = copy.copy(packed_seq_params)
+    cp_packed_seq_params.cp_group = cp_group
+    cp_packed_seq_params.local_cp_size = cp_size
+    # THD CP expects to have padded seqlens; if we don't need to pad, use the unpadded version.
+    if cp_packed_seq_params.cu_seqlens_q_padded is None:
+        cp_packed_seq_params.cu_seqlens_q_padded = cp_packed_seq_params.cu_seqlens_q
+    if cp_packed_seq_params.cu_seqlens_kv_padded is None:
+        cp_packed_seq_params.cu_seqlens_kv_padded = cp_packed_seq_params.cu_seqlens_kv
+
+    partition_index = tex.thd_get_partitioned_indices(
+        cp_packed_seq_params.cu_seqlens_q_padded, seq_len, cp_size, cp_rank
+    ).long()
+
+    local_tokens = tokens.index_select(1, partition_index)
+    local_position_ids = position_ids.index_select(1, partition_index)
+    local_labels = tokens_shifted.index_select(1, partition_index)
+
+    return local_tokens, local_position_ids, cp_packed_seq_params, local_labels, partition_index
+
+
+def _gather_logprobs_context_parallel(
+    local_logprobs: torch.Tensor,
+    partition_index: torch.Tensor,
+    seq_len: int,
+    no_grad: bool,
+) -> torch.Tensor:
+    """Reassemble full-sequence logprobs from the per-rank CP partitions.
+
+    Args:
+        local_logprobs:  Local logprob tensor  [batch, seq_len // cp_size].
+        partition_index: Global positions owned by this rank (from the scatter).
+        seq_len:         Full sequence length.
+        no_grad:         True when called in inference/reference-logprob mode.
+
+    Returns:
+        Full logprob tensor  [batch, seq_len - 1].
+    """
+    cp_group = mpu.get_context_parallel_group()
+
+    full = torch.zeros(
+        local_logprobs.shape[0],
+        seq_len,
+        dtype=local_logprobs.dtype,
+        device=local_logprobs.device,
+    ).index_copy(1, partition_index, local_logprobs)
+
+    if no_grad:
+        torch.distributed.all_reduce(full, group=cp_group)
+    else:
+        # Allow gradients to flow back to each rank.
+        full = torch.distributed.nn.functional.all_reduce(full, group=cp_group)
+
+    # Drop the dummy boundary position.
+    return full[:, :-1]
+
+
 def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
@@ -762,8 +860,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
-        Logprobs of input sequences.
+        Logprobs of input sequences  [batch, seq_len - 1].
 
+        With context parallelism (cp_size > 1) each rank runs the forward pass
+        on its ``seq_len // cp_size`` token slice.  Logprobs are all-gathered
+        after the log-softmax so the returned tensor always has the full
+        sequence length, matching the cp_size == 1 interface exactly.
     """
 
     args = get_args()
@@ -790,6 +892,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 total_tokens=tokens.shape[1],
             )
 
+    cp_size = mpu.get_context_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("rl/get-logprobs", time=True):
@@ -802,15 +905,32 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
-            with torch.no_grad() if no_grad else nullcontext():
-                logits_or_hidden_states = model(
-                    tokens,
-                    position_ids,
-                    attention_mask_for_forward,
-                    packed_seq_params=packed_seq_params,
-                    runtime_gather_output=True,
-                    fp32_output=fp32_output,
+
+            if cp_size > 1:
+                # Scatter: each rank processes seq_len // cp_size tokens.
+                local_tokens, local_position_ids, cp_packed_seq_params, local_labels, cp_index = (
+                    _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_size)
                 )
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        local_tokens,
+                        local_position_ids,
+                        attention_mask_for_forward,
+                        packed_seq_params=cp_packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                    )
+            else:
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        tokens,
+                        position_ids,
+                        attention_mask_for_forward,
+                        packed_seq_params=packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                    )
+
             model.config.flash_decode = flash_decode
 
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
@@ -818,12 +938,19 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
         if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
-        else:
-            logits = logits_or_hidden_states
-            with nvtx_range("rl/log-softmax", time=True):
+
+        logits = logits_or_hidden_states
+        with nvtx_range("rl/log-softmax", time=True):
+            if cp_size > 1:
+                # Compute local logprobs then gather the full sequence.
+                local_logprobs = selective_log_softmax(logits, local_labels)
+                logprobs = _gather_logprobs_context_parallel(
+                    local_logprobs, cp_index, tokens.shape[1], no_grad
+                )
+            else:
                 # We do not need logprobs for the n+1 token.
                 logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-            return logprobs
+        return logprobs
 
 
 def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:

@@ -533,3 +533,117 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
 
     # Iterator is local, batch size is global
     assert expected_bs == actual_bs
+
+
+def test_sequence_packing_aligned_placement():
+    """seq_length_multiple > 1 places sequences at aligned offsets with padded gaps."""
+    tokenizer = MockTokenizer()
+    bin_size = 24
+    packer = sequence_packing_utils.SequencePacker(
+        bin_size=bin_size, pad_token=tokenizer.pad, seq_length_multiple=4
+    )
+
+    # Actual lengths 5 and 7 -> reserved footprints 8 and 8 (both fit one bin).
+    seq_a = torch.cat([torch.arange(1, 6), torch.full((2,), tokenizer.pad)])
+    seq_b = torch.arange(10, 17)
+    sequences = torch.stack([seq_a, seq_b])
+
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        sequences
+    )
+
+    assert packed_trajs.shape == (1, bin_size)
+    # The packer sorts by length (desc): seq_b (7) is placed first, seq_a (5) second,
+    # each at a 4-aligned offset, with the padded end sentinel appended.
+    assert packing_info.seq_starts[0] == [0, 8, 16]
+    assert packing_info.bin_seq_indices[0] == [1, 0]
+
+    # Data at aligned starts; gaps stay pad tokens with a zero loss mask.
+    assert torch.equal(packed_trajs[0, 0:7], seq_b)
+    assert packed_trajs[0, 7] == tokenizer.pad
+    assert torch.equal(packed_trajs[0, 8:13], seq_a[:5])
+    assert torch.all(packed_trajs[0, 13:] == tokenizer.pad)
+    assert torch.all(packed_loss_mask[0, 7:8] == 0)
+    assert torch.all(packed_loss_mask[0, 13:] == 0)
+    # Position ids restart at each aligned start.
+    assert packed_position_ids[0, 8] == 0
+
+
+def test_sequence_packing_aligned_fit_accounting():
+    """Fit decisions must use the reserved (rounded) footprint, not the raw length."""
+    tokenizer = MockTokenizer()
+    packer = sequence_packing_utils.SequencePacker(
+        bin_size=8, pad_token=tokenizer.pad, seq_length_multiple=4
+    )
+    # Three sequences of length 3 (footprint 4): only two fit per 8-token bin.
+    sequences = torch.arange(1, 10).reshape(3, 3)
+    packed_trajs, _, _, packing_info = packer.pack_sequences(sequences)
+    assert packed_trajs.shape[0] == 2
+    assert sorted(len(idxs) for idxs in packing_info.bin_seq_indices) == [1, 2]
+
+
+def test_sequence_packer_rejects_indivisible_bin():
+    with pytest.raises(AssertionError, match="divisible"):
+        sequence_packing_utils.SequencePacker(
+            bin_size=10, pad_token=0, seq_length_multiple=4
+        )
+
+
+def test_packed_seq_params_aligned_boundaries():
+    """create_packed_seq_params_for_bin must emit the placement grid as
+    cu_seqlens_*_padded and the real token counts as cu_seqlens_*."""
+    max_sequences_per_bin = 4
+    bin_size = 24
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[0, 1]],
+        seq_starts={0: [0, 8, 16]},  # aligned starts + padded end sentinel
+        seq_lengths=[7, 5],
+        seq_to_bin_idx=[0, 0],
+        packing_algo='fifo',
+    )
+
+    params = sequence_packing_utils.create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=max_sequences_per_bin,
+        device=torch.device('cpu'),
+    )
+
+    expected_size = max_sequences_per_bin + 2
+    assert params.cu_seqlens_q.shape[0] == expected_size
+    assert params.cu_seqlens_q_padded.shape[0] == expected_size
+    # Placement grid: slots [0, 8), [8, 16), trailing ghost [16, 24); ghost-padded.
+    assert params.cu_seqlens_q_padded.tolist() == [0, 8, 16, 24, 24, 24]
+    # Real token counts: 7 and 5, then the trailing ghost keeps its full size (8).
+    assert params.cu_seqlens_q.tolist() == [0, 7, 12, 20, 20, 20]
+    # Every padded slot length divides 2*cp for cp=2.
+    padded = params.cu_seqlens_q_padded
+    assert torch.all((padded[1:] - padded[:-1]) % 4 == 0)
+
+
+def test_packed_seq_params_legacy_equivalence_without_alignment():
+    """With back-to-back placement the two boundary arrays match the legacy single array."""
+    max_sequences_per_bin = 4
+    bin_size = 16
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[0, 1]],
+        seq_starts={0: [0, 7, 12]},  # back-to-back (multiple == 1) + sentinel
+        seq_lengths=[7, 5],
+        seq_to_bin_idx=[0, 0],
+        packing_algo='fifo',
+    )
+
+    params = sequence_packing_utils.create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=max_sequences_per_bin,
+        device=torch.device('cpu'),
+    )
+
+    legacy = [0, 7, 12, 16, 16, 16]
+    assert params.cu_seqlens_q.tolist() == legacy
+    assert params.cu_seqlens_q_padded.tolist() == legacy
