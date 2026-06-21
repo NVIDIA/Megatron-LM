@@ -1261,9 +1261,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
-                        key: torch.zeros(
-                            (buffer_numel,), dtype=torch.float32, device="cpu"
-                        )
+                        key: torch.zeros((buffer_numel,), dtype=torch.float32, device="cpu")
                         for key in ("param", "exp_avg", "exp_avg_sq")
                     }
                     world_tensors["numel"] = buffer_numel
@@ -1748,7 +1746,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     tensors = {}
                     for state_key in world_tensor_keys:
-                        if state_key == 'step' or state_key == 'numel' or state_key == 'numel_unpadded':
+                        if (
+                            state_key == 'step'
+                            or state_key == 'numel'
+                            or state_key == 'numel_unpadded'
+                        ):
                             # The optimizer state of STEP is handled
                             # specifically and is read from param_groups.
                             # numel and numel_unpadded are not needed.
