@@ -838,6 +838,67 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return hidden_states, context
 
     @copy_signature(_forward_attention)
+    def _split_attn_mlp_recompute_enabled(self, args, kwargs) -> bool:
+        """Whether this forward call should use the staged attn/MLP recompute.
+
+        Gated to full-layer recompute, training, non-quantized recipes, and the
+        all-keyword call convention used by the block / MTP checkpoint paths.
+        """
+        return bool(
+            getattr(self.config, "recompute_split_attn_mlp", False)
+            and self.training
+            and self.config.recompute_granularity == "full"
+            # Only the 'uniform' recompute path runs layers eagerly so they can
+            # self-checkpoint (see transformer_block / multi_token_prediction).
+            # Other methods keep wrapping the layer in an outer checkpoint, so
+            # fall back to standard behavior to avoid nested double-recompute.
+            and self.config.recompute_method == "uniform"
+            and not (self.config.fp8 or self.config.fp4)
+            and not args
+            and "hidden_states" in kwargs
+        )
+
+    def _forward_split_attn_mlp_recompute(self, **kwargs):
+        """Full-layer recompute split into separate attention and MLP/MoE backward
+        stages so the two halves never co-reside in memory.
+
+        See ``tensor_parallel.random.checkpoint_attn_mlp_split``. Entry is gated by
+        ``_split_attn_mlp_recompute_enabled``; non-differentiable arguments are
+        captured by the closures so only ``hidden_states`` flows through the
+        checkpoint primitive.
+        """
+        hidden_states = kwargs.pop("hidden_states")
+        inference_context = kwargs.get("inference_context", None)
+        padding_mask = kwargs.get("padding_mask", None)
+        input_ids = kwargs.get("input_ids", None)
+        captured_context: list = [None]
+
+        def run_attention(hs):
+            attn_out, context = self._forward_attention(hidden_states=hs, **kwargs)
+            captured_context[0] = context
+            return attn_out
+
+        def run_mlp(hs):
+            return self._forward_mlp(
+                hs,
+                inference_context,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            )
+
+        output = tensor_parallel.random.checkpoint_attn_mlp_split(
+            run_attention, run_mlp, hidden_states
+        )
+        # The split checkpoint only differentiates the single MLP output; a
+        # non-None cross-attention context would need its own gradient path that
+        # this primitive does not provide. Decoder-only stacks (e.g. DeepSeek-V4)
+        # keep context None, so fail loudly rather than silently drop gradients.
+        assert captured_context[0] is None, (
+            "recompute_split_attn_mlp does not support a non-None cross-attention "
+            "context; disable it for encoder-decoder / cross-attention layers."
+        )
+        return output, captured_context[0]
+
     def forward(self, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
@@ -856,6 +917,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "wrapped TransformerLayer through this path automatically for hybrid "
                 "stacks."
             )
+        if self._split_attn_mlp_recompute_enabled(args, kwargs):
+            return self._forward_split_attn_mlp_recompute(**kwargs)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1936,6 +1999,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
+
+        # Staged attn/MLP recompute only applies to plain full-layer recompute,
+        # not the MHC fine-grained recompute manager path (which checkpoints its
+        # own sub-activations). _forward_split_attn_mlp_recompute calls
+        # _forward_attention/_forward_mlp with mhc_recompute_manager defaulting to
+        # None, so it is only correct when no manager is active.
+        if mhc_recompute_manager is None and self._split_attn_mlp_recompute_enabled(args, kwargs):
+            return self._forward_split_attn_mlp_recompute(**kwargs)
 
         hidden_states, context = self._forward_attention(
             *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs

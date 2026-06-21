@@ -110,7 +110,7 @@ def _mla_rope_fwd_inplace_kernel(
         seq_num: number of sequences for thd format, not used for sbhd format
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -206,7 +206,7 @@ def _mla_rope_bwd_inplace_kernel(
 
         batch_size, seq_num, and cu_seqlens_q are the same as in the forward pass
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -549,7 +549,7 @@ def _mla_rope_fwd_kv_split_kernel(
             or [total_seq_len, head_num, emb_dim + k_dim]
         O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
@@ -664,7 +664,7 @@ def _mla_rope_bwd_kv_split_kernel(
             or [total_seq_len, head_num, k_dim + v_dim]
         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:

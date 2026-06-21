@@ -1658,8 +1658,33 @@ class MultiTokenPredictionLayer(MegatronModule):
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
-            with outer_quantization_context:
-                outputs = checkpoint_handler()
+            split_attn_mlp = getattr(self.config, "recompute_split_attn_mlp", False) and not (
+                self.config.fp8 or self.config.fp4
+            )
+            if split_attn_mlp:
+                # The wrapped transformer layer checkpoints its own attention and
+                # MLP/MoE halves separately (see TransformerLayer.forward), so run
+                # the projection + layer eagerly rather than wrapping the whole
+                # block in one checkpoint. Embedding-concat activations are saved
+                # (small) instead of being part of the combined recompute.
+                outputs = self._proj_and_transformer_layer(
+                    hidden_states=hidden_states,
+                    decoder_input=decoder_input,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    attention_bias=attention_bias,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+            else:
+                with outer_quantization_context:
+                    outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(

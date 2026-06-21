@@ -585,6 +585,17 @@ class TransformerConfig(ModelParallelConfig):
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
+    recompute_split_attn_mlp: bool = False
+    """Experimental. With full activation recompute, recompute each layer's
+    attention and MLP/MoE as two separate backward stages instead of one combined
+    layer recompute. This keeps a single forward but stages the backward so
+    attention and MLP/MoE activations never co-reside, lowering the first-backward
+    memory peak from roughly ``attn + mlp`` to ``max(attn, mlp)``. The cost is one
+    extra attention recompute per layer per backward; the attention->MLP boundary
+    is recomputed (not saved), so there is no persistent activation overhead.
+    Only effective with recompute_granularity='full' and non-quantized recipes;
+    ignored otherwise."""
+
     ####################
     # fp8 related
     ####################
@@ -2001,6 +2012,29 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"distribute_saved_activations: {self.distribute_saved_activations} must be "
                     f"false when sequence parallel is enabled: {self.sequence_parallel}"
+                )
+
+        if self.recompute_split_attn_mlp:
+            if self.recompute_granularity != "full":
+                raise ValueError(
+                    "recompute_split_attn_mlp requires recompute_granularity='full' "
+                    f"(got {self.recompute_granularity})."
+                )
+            if self.recompute_method != "uniform":
+                raise ValueError(
+                    "recompute_split_attn_mlp requires recompute_method='uniform' "
+                    f"(got {self.recompute_method}); only the uniform path runs "
+                    "layers eagerly so they can self-checkpoint."
+                )
+            if self.fp8 is not None or self.fp4 is not None:
+                raise ValueError(
+                    "recompute_split_attn_mlp is not supported with fp8/fp4 recipes; "
+                    "the staged recompute path uses tensor_parallel.checkpoint semantics only."
+                )
+            if self.distribute_saved_activations:
+                raise ValueError(
+                    "recompute_split_attn_mlp is incompatible with "
+                    "distribute_saved_activations."
                 )
 
         if self.recompute_modules is None:

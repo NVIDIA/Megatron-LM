@@ -572,12 +572,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
+            # When staged attn/MLP recompute is enabled, each layer checkpoints its
+            # own attention and MLP halves separately (see TransformerLayer.forward).
+            # Run the chunk eagerly so we do not also wrap (and thus defeat / nest)
+            # the per-layer recompute. Quantized recipes keep the standard path.
+            split_attn_mlp = getattr(self.config, "recompute_split_attn_mlp", False) and not (
+                self.config.fp8 or self.config.fp4
+            )
             layer_idx = 0
             while layer_idx < self.num_layers_per_pipeline_rank:
                 chunk_end = min(
                     layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
                 )
-                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+                if split_attn_mlp:
+                    hidden_states, context = custom(layer_idx, chunk_end)(
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                    )
+                else:
+                    hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
 
                 # Feature extraction for uniform recompute: collect at end of each chunk
                 # Note: Only the last layer of each chunk can have features collected

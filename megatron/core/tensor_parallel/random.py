@@ -651,6 +651,114 @@ def checkpoint(
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
+class _AttnMlpSplitCheckpointFunction(torch.autograd.Function):
+    """Two-stage activation checkpoint for a transformer layer.
+
+    The standard ``CheckpointFunction`` rebuilds the *entire* layer's forward
+    graph (attention + MLP/MoE) under ``enable_grad`` before running backward, so
+    both sets of recomputed activations are alive simultaneously. When attention
+    and the MoE MLP are each individually large (e.g. DeepSeek-V4), that combined
+    recompute is the dominant peak in the first backward step.
+
+    This function keeps a single forward (attention is computed only once during
+    the forward pass) but stages the backward so the two halves never co-reside:
+
+      1. Recompute attention under ``no_grad`` from the saved layer input to
+         regenerate *only* the attention->MLP boundary value; attention internals
+         are freed as they are produced.
+      2. Recompute the MLP/MoE under ``enable_grad`` from a detached boundary and
+         run its backward, then drop the MLP graph.
+      3. Recompute attention under ``enable_grad`` from the saved layer input and
+         run its backward using the boundary gradient from step 2.
+
+    Peak recompute memory becomes ``max(attn, mlp)`` instead of ``attn + mlp``.
+    The cost is one extra attention forward per layer per backward (the
+    ``no_grad`` pass in step 1). The attention->MLP boundary is recomputed, not
+    saved, so there is no persistent per-layer activation overhead.
+
+    ``run_attention(layer_input) -> boundary`` and ``run_mlp(boundary) -> output``
+    are closures that capture every non-differentiable argument; only
+    ``layer_input`` flows differentiably in and only its gradient flows out. RNG
+    state is captured per stage so dropout matches the original forward, mirroring
+    ``CheckpointFunction``.
+    """
+
+    # pylint: disable=missing-function-docstring
+    @staticmethod
+    def forward(ctx, run_attention, run_mlp, layer_input):
+        """Forward pass: compute attention then MLP once, saving only the input."""
+        _set_checkpointing()
+        ctx.run_attention = run_attention
+        ctx.run_mlp = run_mlp
+        # Capture RNG before attention and before MLP so each stage's recompute
+        # reproduces the exact dropout masks of this forward.
+        ctx.rng_states_attn = _get_all_rng_states()
+        with torch.no_grad():
+            boundary = run_attention(layer_input)
+            ctx.rng_states_mlp = _get_all_rng_states()
+            output = run_mlp(boundary)
+        ctx.save_for_backward(layer_input)
+        _unset_checkpointing()
+        return output
+
+    # pylint: disable=missing-function-docstring
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: staged recompute so attn and MLP graphs never co-reside."""
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), "
+                "please use .backward() if possible"
+            )
+        _set_checkpointing()
+        (layer_input,) = ctx.saved_tensors
+        detached_input = detach_variable((layer_input,))[0]
+
+        with _fork_rng():
+            # 1) Regenerate the attention->MLP boundary value only (no graph).
+            _set_all_rng_states(*ctx.rng_states_attn)
+            with torch.no_grad():
+                boundary_value = ctx.run_attention(detached_input)
+            boundary_leaf = boundary_value.detach()
+            boundary_leaf.requires_grad_(True)
+
+            # 2) Recompute MLP/MoE with grad, backprop into boundary, free its graph.
+            _set_all_rng_states(*ctx.rng_states_mlp)
+            with torch.enable_grad():
+                output = ctx.run_mlp(boundary_leaf)
+            torch.autograd.backward(output, grad_output)
+            grad_boundary = boundary_leaf.grad
+
+            # 3) Recompute attention with grad and backprop into the layer input.
+            _set_all_rng_states(*ctx.rng_states_attn)
+            with torch.enable_grad():
+                boundary_for_attn = ctx.run_attention(detached_input)
+            torch.autograd.backward(boundary_for_attn, grad_boundary)
+
+        grad_input = detached_input.grad
+        _unset_checkpointing()
+        return None, None, grad_input
+
+
+def checkpoint_attn_mlp_split(
+    run_attention: Callable[[torch.Tensor], torch.Tensor],
+    run_mlp: Callable[[torch.Tensor], _R],
+    layer_input: torch.Tensor,
+) -> _R:
+    """Two-stage attention/MLP activation checkpoint.
+
+    See ``_AttnMlpSplitCheckpointFunction``. Falls back to eager execution during
+    CUDA graph warmup/capture, matching ``checkpoint``.
+    """
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+    if is_graph_warmup() or is_graph_capturing():
+        return run_mlp(run_attention(layer_input))
+    return _AttnMlpSplitCheckpointFunction.apply(run_attention, run_mlp, layer_input)
+
+
 def _save_args_to_ctx(ctx, args):
     """Save mixed tensor/non-tensor arguments into autograd ctx.
 
