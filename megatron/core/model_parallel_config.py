@@ -121,6 +121,11 @@ class ModelParallelConfig:
        None, no function is called on the loss.
     """
 
+    moe_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MoE auxiliary losses, this function should return the
+       scale tensor for MoE aux loss. If None, falls back to grad_scale_func.
+    """
+
     mtp_grad_scale_func: Optional[Callable] = None
     """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
        scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
@@ -434,10 +439,14 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        assert not (self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te'), (
-            "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-            "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion."
-        )
+        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+            warnings.warn(
+                "Transformer Engine cross entropy loss fusion has known stability issues. "
+                "Megatron-LM training args validation rejects this combination by default. "
+                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(
