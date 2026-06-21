@@ -47,6 +47,13 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
+try:
+    from gefen import Gefen
+
+    HAVE_GEFEN = True
+except ImportError:
+    HAVE_GEFEN = False
+
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
@@ -486,7 +493,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when
         *skip_megatron_wrapping=True*.
     """
-    # All param_groups passed here must belong to the same optimizer type (adam / sgd).
+    # All param_groups passed here must belong to the same standard optimizer type.
     # Callers are responsible for splitting by optimizer type before calling this function.
 
     if skip_megatron_wrapping and config.use_precision_aware_optimizer:
@@ -595,6 +602,23 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)
+
+        elif config.optimizer == 'gefen':
+            if not HAVE_GEFEN:
+                raise ImportError(
+                    "Gefen optimizer requires the gefen package to be importable. "
+                    "Install it or make sure the repository root is on PYTHONPATH."
+                )
+            optimizer = Gefen(
+                param_groups,
+                lr=config.lr,
+                fused=True,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+            )
+            # Gefen state depends on observed gradients and is initialized lazily on step().
+            init_state_fn = None
 
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:
@@ -1022,7 +1046,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'gefen'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
