@@ -234,17 +234,34 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         #
         # Padding floor: the on-buffer bucket size is ``dp_size *
         # max_shard_cursor``, which is at least ``dp_size * chunk_max_param``
-        # because some shard must hold that param whole. If a single param
-        # dominates the chunk, finalising on ``chunk_numel >= bucket_size``
-        # alone would emit a bucket with most of its shards near-empty
-        # padding. Instead extend the chunk so its raw numel approaches the
-        # padded buffer size, capping per-bucket overhead at ``1 /
-        # PADDING_FLOOR - 1`` (~11% at 0.9). Falls back to ``bucket_size``
-        # when no single param dominates.
+        # because some shard must hold that param whole. ``bucket_size`` is a
+        # soft *minimum*: once it is reached we keep absorbing params as long
+        # as each one fits into the existing shard padding (i.e., without
+        # growing ``dp_size * max_shard_cursor``), and only close the bucket
+        # when the next param would otherwise enlarge it. This fills shard
+        # padding with real params instead of emitting padded-out buckets.
+        # When the params pack evenly across ``dp_size`` shards the overhead
+        # is zero. ``int(dp_size * chunk_max_param * PADDING_FLOOR)`` keeps the
+        # soft minimum sensible when a single param dominates a shard.
         PADDING_FLOOR = 0.9
         chunk_params: List[torch.nn.Parameter] = []
         chunk_numel = 0
         chunk_max_param = 0
+        # Mirror _emit_bucket's greedy LPT placement incrementally so we can
+        # decide, per param, whether it still fits in the current bucket.
+        shard_loads = [0] * dp_size
+
+        def _absorbs(numel: int) -> bool:
+            """True if ``numel`` fits in the least-loaded shard without growing
+            the bucket's padded size (``dp_size * padded_shard_size``), i.e.,
+            it fills existing shard padding instead of adding a new row."""
+            target = pad_to_divisor(max(shard_loads), shard_divisor)
+            return pad_param_start(min(shard_loads)) + numel <= target
+
+        def _place(numel: int) -> None:
+            shard_id = min(range(dp_size), key=lambda s: shard_loads[s])
+            shard_loads[shard_id] = pad_param_start(shard_loads[shard_id]) + numel
+
         for param in reversed(params):
             param_numel = param.data.nelement()
             if getattr(param, 'shared_embedding', False):
@@ -254,18 +271,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 chunk_params = []
                 chunk_numel = 0
                 chunk_max_param = 0
+                shard_loads[:] = [0] * dp_size
                 _emit_bucket([param], shared_embedding=True)
                 continue
-            chunk_params.append(param)
-            chunk_numel += param_numel
-            chunk_max_param = max(chunk_max_param, param_numel)
-            if bucket_size is not None:
+            # Close the bucket once it has met its soft-minimum size *and* this
+            # param can no longer be absorbed into the existing shard padding
+            # (adding it would grow the bucket).
+            if bucket_size is not None and chunk_params:
                 threshold = max(bucket_size, int(dp_size * chunk_max_param * PADDING_FLOOR))
-                if chunk_numel >= threshold:
+                if chunk_numel >= threshold and not _absorbs(param_numel):
                     _emit_bucket(chunk_params)
                     chunk_params = []
                     chunk_numel = 0
                     chunk_max_param = 0
+                    shard_loads[:] = [0] * dp_size
+            _place(param_numel)
+            chunk_params.append(param)
+            chunk_numel += param_numel
+            chunk_max_param = max(chunk_max_param, param_numel)
         _emit_bucket(chunk_params)
 
         total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
