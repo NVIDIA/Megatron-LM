@@ -1,17 +1,5 @@
 {
   "gb200": {
-    "batch_1": {
-      "batch_size": 1,
-      "dataset": "synthetic",
-      "num_input_tokens_avg": 512.0,
-      "num_output_tokens": 128,
-      "num_iters": 5,
-      "throughput_tok_per_sec": 26.32421878655499,
-      "avg_latency_ms": 4862.373039405793,
-      "p50_latency_ms": 3864.351199939847,
-      "p99_latency_ms": 7142.95435603708,
-      "tpot_ms_per_tok": 37.987831969803665
-    },
     "batch_8": {
       "batch_size": 8,
       "dataset": "synthetic",

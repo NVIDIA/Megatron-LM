@@ -705,7 +705,14 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if in_inference_mode or is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
+                if inference_context is not None:
+                    if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                        assert inference_context.mtp_decoder_hidden_states is not None
+                        inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                            hidden_states
+                        )
+                    else:
+                        inference_context.mtp_decoder_hidden_states = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
