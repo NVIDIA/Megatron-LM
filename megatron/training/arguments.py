@@ -1253,9 +1253,6 @@ def validate_args(args, defaults={}):
             'if context-parallel-size > 1.'
 
     if getattr(args, 'dataloader_inter_document_masking', False):
-        if args.context_parallel_size > 1:
-            assert False, \
-                '--dataloader-inter-document-masking does not yet support context parallelism > 1.'
         # The dataset omits attention_mask when inter-document masking is
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:

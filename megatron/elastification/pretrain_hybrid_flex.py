@@ -230,6 +230,9 @@ def get_batch(data_iterator, vp_stage=None):
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=(
+            getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
+        ),
     )
 
     cu_seqlens = batch.get('cu_seqlens')

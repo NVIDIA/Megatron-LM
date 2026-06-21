@@ -2524,50 +2524,55 @@ def get_batch_on_this_cp_rank(
     is_hybrid_cp: bool,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    use_per_sequence_balancing: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
+        ``use_per_sequence_balancing`` is True, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
         ``is_hybrid_cp`` is False, delegates to
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
-      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, delegates to
-        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
             'cu_seqlens' key (may be None for pretraining).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
-            process group used for SFT and pretraining CP partitioning.
+            process group used for CP partitioning.
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a hybrid CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
+        use_per_sequence_balancing (bool): When True, use per-sequence zigzag
+            even when ``cu_seqlens`` is present (e.g., for inter-document
+            masking where document lengths are not divisible by
+            ``2 * cp_size``).
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
 
-    if batch.get("cu_seqlens") is not None:  # NOTE(asolergi-nv): SFT & HybridCP case
-        if is_hybrid_cp:
-            assert (
-                batch['local_cp_size'] is not None
-            ), "local_cp_size is required for hybrid context parallel"
-            if batch['local_cp_size'].item() > 1:
-                hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                    batch, cp_group=hybrid_cp_group
-                )
-                batch["hybrid_cp_group"] = hybrid_cp_group
-        else:
-            batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
-    else:  # NOTE(asolergi-nv): Pretrain case
+    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
+    elif is_hybrid_cp:
+        assert (
+            batch['local_cp_size'] is not None
+        ), "local_cp_size is required for hybrid context parallel"
+        if batch['local_cp_size'].item() > 1:
+            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+            batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+                batch, cp_group=hybrid_cp_group
+            )
+            batch["hybrid_cp_group"] = hybrid_cp_group
+    else:
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
 
 

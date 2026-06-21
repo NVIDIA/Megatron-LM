@@ -108,7 +108,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not has_cu_seqlens
+    ):
         return [None for _ in BATCH_KEYS]
 
     batch = {}
@@ -160,6 +164,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
