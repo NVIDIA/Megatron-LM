@@ -310,6 +310,70 @@ class TestFusedApplyMLARope:
         _test_fused_apply_mla_rope_for_kv(input_format)
 
 
+def _test_fused_apply_mla_rope_for_q_does_not_modify_input(input_format):
+    """Regression test for in-place aliasing bug.
+
+    The Triton kernel inside fused_apply_mla_rope_for_q writes to Q in-place.
+    If the caller passes a tensor that shares storage with a saved activation (e.g.
+    the output of a linear layer kept by TransformerEngine for weight-grad computation),
+    that activation gets silently overwritten, producing wrong dW -> corrupted weights
+    -> NaN from iteration 2 onward.
+
+    After the fix (q = q.clone() inside ApplyMLARotaryEmbQ.forward), the input tensor
+    must remain byte-for-byte identical after the call.
+    """
+    assert fused_apply_mla_rope_for_q is not None
+    num_heads = 16
+    q_dim = 64
+    emb_dim = 32
+    dtype = torch.bfloat16
+
+    if input_format == "sbhd":
+        cu_seqlens = None
+        seqlen, batch_size = 128, 2
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        freqs, mscale = yarn_rope(seqlen, 0)
+        shape = (seqlen, batch_size, num_heads, q_dim + emb_dim)
+    else:
+        raw_cu = [0, 27, 54, 99, 128]
+        max_seqlen = max(raw_cu[i + 1] - raw_cu[i] for i in range(len(raw_cu) - 1))
+        cu_seqlens = torch.tensor(raw_cu, dtype=torch.int32, device='cuda')
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        freqs, mscale = yarn_rope(max_seqlen, 0)
+        shape = (raw_cu[-1], num_heads, q_dim + emb_dim)
+
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    q = torch.randn(shape, dtype=dtype, device='cuda')
+    q_original = q.clone()
+
+    # Simulate the aliasing that occurs in practice: a view of q that shares storage,
+    # just as linear_q_up_proj's output does after .view() in MLASelfAttention.
+    q_view = q.view(q.shape)
+
+    _ = fused_apply_mla_rope_for_q(q_view, cos, sin, q_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+
+    # The original backing tensor must be untouched.
+    assert torch.equal(q, q_original), (
+        "fused_apply_mla_rope_for_q modified the input tensor in-place. "
+        "This corrupts saved activations in the upstream linear layer and causes "
+        "NaN from the second training iteration onward."
+    )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+class TestFusedApplyMLARopeNoInputMutation:
+    """Regression tests: fused_apply_mla_rope_for_q must not mutate its input."""
+
+    def test_input_unchanged_after_rope_q(self, input_format):
+        _test_fused_apply_mla_rope_for_q_does_not_modify_input(input_format)
+
+
 class TestApplyRotaryPosEmbMlaFusionConflict:
     """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""
 

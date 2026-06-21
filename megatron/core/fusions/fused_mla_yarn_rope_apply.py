@@ -83,7 +83,8 @@ def rotary_fwd_q_kernel(
 ):
     """
     Triton kernel of the forward pass for applying YARN RoPE to MLA's query.
-    This kernel inplace modifies the input tensor Q.
+    This kernel modifies Q in-place; callers are responsible for passing a clone
+    when the original tensor must remain unchanged (see ApplyMLARotaryEmbQ.forward).
 
     Input:
         Q: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
@@ -254,6 +255,12 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         assert headdim == qk_head_dim + emb_dim
         assert emb_dim % 4 == 0
 
+        # Clone q so that the kernel's in-place writes do not corrupt the storage
+        # shared with the upstream linear layer's output tensor. TransformerEngine
+        # saves that output for weight-gradient computation; an in-place modification
+        # produces wrong dW → corrupted weights → NaN from the second iteration onward.
+        q = q.clone()
+
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         rotary_fwd_q_kernel[grid](
             q,
@@ -337,9 +344,9 @@ def fused_apply_mla_rope_for_q(
 ):
     """
     Fused function for applying YARN RoPE to MLA's query.
-    This function inplace modifies the input tensor t.
-    Along the last dimension of t, the last emb_dim elements are applied with RoPE.
-    The first qk_head_dim elements are not modified.
+    Along the last dimension of t, the last emb_dim elements are rotated; the first
+    qk_head_dim elements are left unchanged.  The input tensor t is NOT modified;
+    a fresh output tensor is returned.
     It is an experimental feature and may change in future versions.
     It supports both sbhd and thd input formats.
 
@@ -355,7 +362,7 @@ def fused_apply_mla_rope_for_q(
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
 
     Returns:
-        t: inplace modified input tensor
+        Rotated query tensor (new allocation, input t is unchanged).
     """
     return ApplyMLARotaryEmbQ.apply(
         t, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q, cp_rank, cp_size, rotary_interleaved
