@@ -155,6 +155,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_num_groups": 8,
     "mamba_num_heads": 64,
     "mamba_state_dim": 128,
+    "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
     "microbatch_group_size_per_vp_stage": 1,
