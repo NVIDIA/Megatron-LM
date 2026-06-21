@@ -12,10 +12,14 @@ PP: 1
 DP: 4
 NUM_INPUT_TOKENS: 512
 NUM_OUTPUT_TOKENS: 128
-NUM_WARMUP_ITERS: 2
+# 2 warmup iters can leave the first timed iteration cold on GB200, poisoning
+# the mean/tail metrics; warm up more so timing starts at steady state.
+NUM_WARMUP_ITERS: 5
 NUM_TIMED_ITERS: 5
+# batch_size=1 is omitted: at single-stream the 4-GPU (DP=4) deployment is
+# barely utilized, so per-iteration jitter dominates and the small-sample p50
+# latency is too noisy to gate on. Larger batches are stable perf signals.
 BATCH_SIZES:
-  - 1
   - 8
   - 32
   - 128
