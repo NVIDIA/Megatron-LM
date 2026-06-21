@@ -284,9 +284,6 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
-    if device.type != "cuda":
-        pytest.skip("Peak memory verification requires CUDA.")
-
     mesh = init_device_mesh(device.type, (world_size,))
     dim = 1024
     layers = 16
