@@ -1,4 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """BackendSpecProvider that uses Liger-Kernel Triton operations.
 
 This is a thin extension over ``LocalSpecProvider`` that swaps Liger
@@ -11,10 +10,6 @@ config field (``'native' | 'te' | 'liger'``) and lives outside the spec
 system; this provider does not configure it. See
 ``megatron/core/fusions/liger_cross_entropy.py``.
 """
-from __future__ import annotations
-
-from typing import Optional
-
 try:
     from liger_kernel.megatron import LigerMegatronRMSNorm
 

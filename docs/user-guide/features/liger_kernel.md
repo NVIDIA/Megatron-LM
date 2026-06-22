@@ -1,12 +1,3 @@
-<!---
-   Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-   NVIDIA CORPORATION and its licensors retain all intellectual property
-   and proprietary rights in and to this software, related documentation
-   and any modifications thereto. Any use, reproduction, disclosure or
-   distribution of this software and related documentation without an express
-   license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
-
 # Liger-Kernel Integration
 
 **[Liger-Kernel](https://github.com/linkedin/Liger-Kernel)** is an open-source
@@ -99,10 +90,3 @@ model = GPTModel(
 If `liger-kernel` is not installed, instantiating `LigerSpecProvider` or
 dispatching to `cross_entropy_fusion_impl="liger"` raises `ImportError` with
 an actionable message.
-
-## Future Work
-
-A follow-up will add support for **fused-linear cross-entropy** (`VP-FLCE`),
-which fuses the LM-head matmul with cross-entropy and avoids materializing
-the `[S, B, V/tp]` logits tensor — yielding large activation-memory savings
-at long context and large vocabulary.

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """Tests for the Liger-Kernel vocab-parallel cross-entropy wrapper."""
 
 import pytest

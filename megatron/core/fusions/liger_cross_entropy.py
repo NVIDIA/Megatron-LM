@@ -1,4 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Liger-Kernel Triton vocab-parallel cross-entropy.
 
 Wraps ``liger_kernel.megatron.LigerMegatronCrossEntropy`` so it can be
@@ -9,8 +8,6 @@ dispatched from ``LanguageModule.compute_language_model_loss`` via the
 Liger-Kernel is an optional runtime dependency; the import is deferred to
 call time and raises a clear error if the package is missing.
 """
-from __future__ import annotations
-
 import torch
 
 try:

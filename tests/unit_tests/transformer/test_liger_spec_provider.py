@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """Tests for ``LigerSpecProvider`` — the Liger-Kernel BackendSpecProvider."""
 
 import pytest
