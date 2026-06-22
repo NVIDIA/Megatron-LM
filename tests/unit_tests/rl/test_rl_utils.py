@@ -265,11 +265,12 @@ class TestRLUtils:
         old_logprobs = torch.ones(BATCH, SEQ)
         ref_logprobs = torch.ones(BATCH, SEQ)
         advantages = torch.zeros(BATCH)
-        loss, kl_term, ratios, entropy_term, _, _, _ = rl_utils.calculate_grpo_loss(
+        loss, kl_term, ratios, entropy_term, _, _, is_weights = rl_utils.calculate_grpo_loss(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
             advantages=advantages,
+            inference_logprobs=current_logprobs,
             clamp_eps_lower=0.1,
             clamp_eps_upper=0.1,
             kl_beta=0.1,
@@ -279,6 +280,7 @@ class TestRLUtils:
         torch.testing.assert_close(kl_term, torch.zeros_like(kl_term))
         torch.testing.assert_close(ratios, torch.ones_like(ratios))
         torch.testing.assert_close(entropy_term, -torch.ones_like(ratios) * torch.e)
+        torch.testing.assert_close(is_weights, ratios) # no clampling, no is truncation
 
     def test_grpo_loss_calculation_2x_ratios(self):
         # All policies are equal: clamping is inactive, ratios are ones.
