@@ -133,17 +133,17 @@ class CudaGraphSizingDistribution(str, Enum):
     LINEAR = "linear"
 
 
-class AsyncSchedulingMode(str, Enum):
-    """Request-update scheduling mode for dynamic inference."""
+class RequestResolutionMode(str, Enum):
+    """Request resolution mode for dynamic inference."""
 
     LEGACY = "legacy"
     """Use the preserved mainline request-update path for every step."""
 
-    SERIAL = "serial"
-    """Use the new resolve/prepare request-update path for eligible decode-only steps."""
+    EAGER = "eager"
+    """Resolve requests before preparing the next eligible decode-only step."""
 
-    ASYNC = "async"
-    """Use the async-shaped prepare/forward/resolve path for eligible decode-only steps."""
+    DEFER = "defer"
+    """Defer request resolution until after preparing and forwarding the next eligible decode step."""
 
 
 @dataclass
@@ -288,8 +288,8 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
-    async_scheduling_mode: AsyncSchedulingMode = AsyncSchedulingMode.LEGACY
-    """Request-update scheduling mode for dynamic batching."""
+    request_resolution_mode: RequestResolutionMode = RequestResolutionMode.LEGACY
+    """Request resolution mode for dynamic batching."""
 
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""

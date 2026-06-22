@@ -20,7 +20,7 @@ from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.config import AsyncSchedulingMode
+from megatron.core.inference.config import RequestResolutionMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -1771,8 +1771,8 @@ class TextGenerationController:
         """Update the dynamic context through the preserved legacy request path.
 
         This is the full-feature dynamic generation path used by legacy mode
-        and by non-decode steps in the new modes. Decode-only serial and async
-        steps route before this method and use the split primitives directly.
+        and by non-decode steps in the new modes. Decode-only eager and defer
+        steps route before this method and use the request-resolution primitives directly.
 
         Steps:
             1. Build the sampled-step update payload.
@@ -1932,13 +1932,13 @@ class TextGenerationController:
 
     def _get_decode_request_update_unsupported_reason(
         self,
-        mode: AsyncSchedulingMode,
+        mode: RequestResolutionMode,
         prepared_update: Optional[Dict] = None,
         skip_bookkeeping: bool = False,
     ) -> Optional[str]:
         """Return the first reason a decode step cannot use the new update path.
 
-        The new serial and async-shaped paths are intentionally limited to
+        The new eager and defer paths are intentionally limited to
         vanilla GPT greedy decode while the legacy path preserves all features.
         This method centralizes checks for waiting requests, stop words,
         speculative/MTP/Mamba/MoE/EP state, paused rows, logprobs, non-greedy
@@ -1958,12 +1958,12 @@ class TextGenerationController:
                 greedy GPT -> None
 
         Args:
-            mode (AsyncSchedulingMode): Requested new request-update mode to
+            mode (RequestResolutionMode): Requested new request resolution mode to
                 validate.
             prepared_update (Optional[Dict]): Prepared request-update payload
                 when sampled-step data is already available.
-            skip_bookkeeping (bool): If true, reject split decode because the
-                split paths always update request bookkeeping.
+            skip_bookkeeping (bool): If true, reject request resolution modes
+                because they always update request bookkeeping.
 
         Returns:
             Optional[str]: First unsupported-feature reason, or `None` when the
@@ -2027,7 +2027,7 @@ class TextGenerationController:
 
     def _raise_if_decode_request_update_unsupported(
         self,
-        mode: AsyncSchedulingMode,
+        mode: RequestResolutionMode,
         prepared_update: Optional[Dict] = None,
         skip_bookkeeping: bool = False,
     ) -> None:
@@ -2041,18 +2041,18 @@ class TextGenerationController:
 
         Example:
             request:
-                mode: SERIAL
+                mode: EAGER
                 feature: MTP
             result:
                 RuntimeError("... unsupported feature: mtp_model.")
 
         Args:
-            mode (AsyncSchedulingMode): Requested new request-update mode to
+            mode (RequestResolutionMode): Requested new request resolution mode to
                 validate.
             prepared_update (Optional[Dict]): Prepared request-update payload
                 when sampled-step data is already available.
-            skip_bookkeeping (bool): If true, reject split decode because the
-                split paths always update request bookkeeping.
+            skip_bookkeeping (bool): If true, reject request resolution modes
+                because they always update request bookkeeping.
 
         Returns:
             None: This method raises `RuntimeError` when the requested mode is
@@ -2067,7 +2067,7 @@ class TextGenerationController:
 
             # Step 2: Raise when a reason is present.
             raise RuntimeError(
-                f"Dynamic batching request-update mode '{mode.value}' only supports "
+                f"Dynamic batching request resolution mode '{mode.value}' only supports "
                 f"decode-only vanilla GPT greedy steps without extra lifecycle events; "
                 f"unsupported feature: {reason}."
             )
@@ -2105,7 +2105,7 @@ class TextGenerationController:
         resolve_result: Dict[str, Optional[Tensor]],
         cuda_graph_request_count: Optional[int],
     ) -> Dict:
-        """Build the engine-facing result for a split decode step.
+        """Build the engine-facing result for a request-resolution decode step.
 
         Args:
             sampled_step (SampledStep): Prepared sampled step whose response
@@ -2129,12 +2129,12 @@ class TextGenerationController:
         return ret
 
     async def _prime_forward_and_sample(
-        self, mode: AsyncSchedulingMode
+        self, mode: RequestResolutionMode
     ) -> Tuple[Optional[int], SampledStep]:
         """Prime decode logits, sample them, and build the sampled-step update.
 
         Args:
-            mode (AsyncSchedulingMode): Split decode mode being run.
+            mode (RequestResolutionMode): Request resolution mode being run.
 
         Returns:
             Tuple[Optional[int], SampledStep]: CUDA graph request count for the
@@ -2154,8 +2154,8 @@ class TextGenerationController:
             )
             return cuda_graph_request_count, sampled_step
 
-    async def _run_serial_decode_step(self) -> Dict:
-        """Run one eligible serial decode step through split request primitives.
+    async def _run_eager_resolution_step(self) -> Dict:
+        """Run one eligible decode step with eager request resolution.
 
         Args:
             None.
@@ -2164,7 +2164,7 @@ class TextGenerationController:
             Dict: Engine-facing dynamic generation step result.
         """
         cuda_graph_request_count, sampled_step = await self._prime_forward_and_sample(
-            AsyncSchedulingMode.SERIAL
+            RequestResolutionMode.EAGER
         )
 
         with torch.inference_mode():
@@ -2182,8 +2182,8 @@ class TextGenerationController:
                 sampled_step, resolve_result, cuda_graph_request_count
             )
 
-    async def _run_async_decode_step(self) -> Dict:
-        """Run one eligible async-shaped decode step through split primitives.
+    async def _run_deferred_resolution_step(self) -> Dict:
+        """Run one eligible decode step with deferred request resolution.
 
         Args:
             None.
@@ -2192,7 +2192,7 @@ class TextGenerationController:
             Dict: Engine-facing dynamic generation step result.
         """
         cuda_graph_request_count, sampled_step = await self._prime_forward_and_sample(
-            AsyncSchedulingMode.ASYNC
+            RequestResolutionMode.DEFER
         )
 
         with torch.inference_mode():
@@ -2213,7 +2213,7 @@ class TextGenerationController:
                 sampled_step, resolve_result, cuda_graph_request_count
             )
 
-    async def _run_legacy_dynamic_step(
+    async def _run_legacy_step(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
         """Run the preserved full-feature dynamic generation step.
@@ -2387,19 +2387,19 @@ class TextGenerationController:
             context.clear_pending_finished_rows()
             return None
 
-        mode = context.config.async_scheduling_mode
-        if mode == AsyncSchedulingMode.LEGACY or not context.is_decode_only():
-            return await self._run_legacy_dynamic_step(skip_bookkeeping)
+        mode = context.config.request_resolution_mode
+        if mode == RequestResolutionMode.LEGACY or not context.is_decode_only():
+            return await self._run_legacy_step(skip_bookkeeping)
 
         self._raise_if_decode_request_update_unsupported(
             mode, skip_bookkeeping=skip_bookkeeping
         )
-        if mode == AsyncSchedulingMode.SERIAL:
-            return await self._run_serial_decode_step()
-        elif mode == AsyncSchedulingMode.ASYNC:
-            return await self._run_async_decode_step()
+        if mode == RequestResolutionMode.EAGER:
+            return await self._run_eager_resolution_step()
+        elif mode == RequestResolutionMode.DEFER:
+            return await self._run_deferred_resolution_step()
         else:
-            raise AssertionError(f"Unexpected request-update mode: {mode}")
+            raise AssertionError(f"Unexpected request resolution mode: {mode}")
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

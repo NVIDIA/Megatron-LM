@@ -1852,8 +1852,8 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    def _update_request_update_mode_state(self) -> None:
-        """Update context flags used by request-update mode routing.
+    def _update_request_resolution_mode_state(self) -> None:
+        """Update context flags used by request resolution mode routing.
 
         Args:
             None.
@@ -1884,7 +1884,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # schedule requests
         self.schedule_waiting_requests()
-        self._update_request_update_mode_state()
+        self._update_request_resolution_mode_state()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

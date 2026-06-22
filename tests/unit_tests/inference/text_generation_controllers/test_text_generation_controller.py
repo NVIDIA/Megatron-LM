@@ -16,9 +16,9 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
-    AsyncSchedulingMode,
     InferenceConfig,
     MambaInferenceStateConfig,
+    RequestResolutionMode,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
@@ -194,11 +194,11 @@ class TextGenerationControllerTestBase:
         InferenceMode.set_active()
 
 
-class TestAsyncSchedulingControllerHelpers:
-    def _make_async_eligibility_controller(self):
+class TestRequestResolutionControllerHelpers:
+    def _make_request_resolution_controller(self):
         controller = object.__new__(TextGenerationController)
         context = mock.Mock()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.ASYNC
+        context.config.request_resolution_mode = RequestResolutionMode.DEFER
         context.request_update_has_waiting_requests = False
         context.total_request_count = 2
         context.paused_request_count = 0
@@ -246,85 +246,85 @@ class TestAsyncSchedulingControllerHelpers:
         assert primer.cuda_graph_request_count is None
 
     def test_dynamic_batch_routes_legacy_mode_to_legacy_step(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.LEGACY
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.LEGACY
         context.active_token_count = 1
-        controller._run_legacy_dynamic_step = mock.AsyncMock(return_value={"path": "legacy"})
-        controller._run_serial_decode_step = mock.AsyncMock()
-        controller._run_async_decode_step = mock.AsyncMock()
+        controller._run_legacy_step = mock.AsyncMock(return_value={"path": "legacy"})
+        controller._run_eager_resolution_step = mock.AsyncMock()
+        controller._run_deferred_resolution_step = mock.AsyncMock()
 
         result = asyncio.run(
             controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
         )
 
         assert result == {"path": "legacy"}
-        controller._run_legacy_dynamic_step.assert_awaited_once_with(True)
-        controller._run_serial_decode_step.assert_not_called()
-        controller._run_async_decode_step.assert_not_called()
+        controller._run_legacy_step.assert_awaited_once_with(True)
+        controller._run_eager_resolution_step.assert_not_called()
+        controller._run_deferred_resolution_step.assert_not_called()
 
     def test_dynamic_batch_routes_non_decode_to_legacy_step_with_skip_bookkeeping(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.EAGER
         context.is_decode_only.return_value = False
         context.active_token_count = 1
-        controller._run_legacy_dynamic_step = mock.AsyncMock(return_value={"path": "legacy"})
-        controller._run_serial_decode_step = mock.AsyncMock()
-        controller._run_async_decode_step = mock.AsyncMock()
+        controller._run_legacy_step = mock.AsyncMock(return_value={"path": "legacy"})
+        controller._run_eager_resolution_step = mock.AsyncMock()
+        controller._run_deferred_resolution_step = mock.AsyncMock()
 
         result = asyncio.run(
             controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
         )
 
         assert result == {"path": "legacy"}
-        controller._run_legacy_dynamic_step.assert_awaited_once_with(True)
-        controller._run_serial_decode_step.assert_not_called()
-        controller._run_async_decode_step.assert_not_called()
+        controller._run_legacy_step.assert_awaited_once_with(True)
+        controller._run_eager_resolution_step.assert_not_called()
+        controller._run_deferred_resolution_step.assert_not_called()
 
-    def test_dynamic_batch_routes_serial_decode_to_split_step(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+    def test_dynamic_batch_routes_eager_decode_to_resolution_step(self):
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.EAGER
         context.active_token_count = 1
-        controller._run_serial_decode_step = mock.AsyncMock(return_value={"path": "serial"})
-        controller._run_async_decode_step = mock.AsyncMock()
+        controller._run_eager_resolution_step = mock.AsyncMock(return_value={"path": "eager"})
+        controller._run_deferred_resolution_step = mock.AsyncMock()
 
         result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-        assert result == {"path": "serial"}
-        controller._run_serial_decode_step.assert_awaited_once()
-        controller._run_async_decode_step.assert_not_called()
+        assert result == {"path": "eager"}
+        controller._run_eager_resolution_step.assert_awaited_once()
+        controller._run_deferred_resolution_step.assert_not_called()
 
-    def test_dynamic_batch_routes_async_decode_to_split_step(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.ASYNC
+    def test_dynamic_batch_routes_defer_decode_to_resolution_step(self):
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.DEFER
         context.active_token_count = 1
-        controller._run_serial_decode_step = mock.AsyncMock()
-        controller._run_async_decode_step = mock.AsyncMock(return_value={"path": "async"})
+        controller._run_eager_resolution_step = mock.AsyncMock()
+        controller._run_deferred_resolution_step = mock.AsyncMock(return_value={"path": "defer"})
 
         result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-        assert result == {"path": "async"}
-        controller._run_serial_decode_step.assert_not_called()
-        controller._run_async_decode_step.assert_awaited_once()
+        assert result == {"path": "defer"}
+        controller._run_eager_resolution_step.assert_not_called()
+        controller._run_deferred_resolution_step.assert_awaited_once()
 
-    def test_dynamic_batch_rejects_skip_bookkeeping_for_split_decode(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+    def test_dynamic_batch_rejects_skip_bookkeeping_for_request_resolution_decode(self):
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.EAGER
         context.active_token_count = 1
-        controller._run_legacy_dynamic_step = mock.AsyncMock()
-        controller._run_serial_decode_step = mock.AsyncMock()
-        controller._run_async_decode_step = mock.AsyncMock()
+        controller._run_legacy_step = mock.AsyncMock()
+        controller._run_eager_resolution_step = mock.AsyncMock()
+        controller._run_deferred_resolution_step = mock.AsyncMock()
 
         with pytest.raises(RuntimeError, match="skip_bookkeeping"):
             asyncio.run(
                 controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
             )
 
-        controller._run_legacy_dynamic_step.assert_not_called()
-        controller._run_serial_decode_step.assert_not_called()
-        controller._run_async_decode_step.assert_not_called()
+        controller._run_legacy_step.assert_not_called()
+        controller._run_eager_resolution_step.assert_not_called()
+        controller._run_deferred_resolution_step.assert_not_called()
 
     def test_dynamic_step_context_bookkeeping_uses_legacy_update(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+        controller, context, _ = self._make_request_resolution_controller()
         prepared_update = {
             "active_requests_mask": torch.tensor([1, 0], device='cpu'),
             "new_tokens": torch.tensor([8, 9], device='cpu'),
@@ -353,18 +353,18 @@ class TestAsyncSchedulingControllerHelpers:
         assert result["active_request_ids"] is request_bookkeeping["active_request_ids"]
         assert torch.equal(result["finished_request_ids"], torch.tensor([11]))
 
-    def test_request_update_mode_rejects_unsupported_serial_decode(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+    def test_request_resolution_mode_rejects_unsupported_eager_decode(self):
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.EAGER
         context.active_token_count = 1
         context.request_update_has_waiting_requests = True
 
         with pytest.raises(RuntimeError, match="waiting_requests"):
             asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-    def test_request_update_mode_rejects_serial_kv_block_boundary(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+    def test_request_resolution_mode_rejects_eager_kv_block_boundary(self):
+        controller, context, _ = self._make_request_resolution_controller()
+        context.config.request_resolution_mode = RequestResolutionMode.EAGER
         context.active_token_count = 1
         context.request_last_kv_block_offset = torch.tensor([127, 2], device='cpu')
 
@@ -372,7 +372,7 @@ class TestAsyncSchedulingControllerHelpers:
             asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     def test_prepare_sampled_step_uses_context_adjusted_bookkeeping(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+        controller, context, _ = self._make_request_resolution_controller()
         prepared_update = {
             "active_requests_mask": torch.tensor([0, 1], device='cpu'),
             "new_tokens": torch.tensor([100, 101], device='cpu'),
@@ -410,7 +410,7 @@ class TestAsyncSchedulingControllerHelpers:
         assert sampled_step.request_bookkeeping is filtered_bookkeeping
 
     def test_prepare_sampled_step_keeps_current_bookkeeping_without_filter(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+        controller, context, _ = self._make_request_resolution_controller()
         prepared_update = {
             "active_requests_mask": torch.tensor([0, 1], device='cpu'),
             "new_tokens": torch.tensor([100, 101], device='cpu'),
@@ -440,8 +440,8 @@ class TestAsyncSchedulingControllerHelpers:
         assert sampled_step.prepared_update is filtered_update
         assert sampled_step.request_bookkeeping is request_bookkeeping
 
-    def test_serial_decode_step_call_order(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+    def test_eager_resolution_step_call_order(self):
+        controller, context, _ = self._make_request_resolution_controller()
         events = []
         sampled_step = SampledStep(
             prepared_update={
@@ -468,7 +468,7 @@ class TestAsyncSchedulingControllerHelpers:
             side_effect=lambda: events.append("forward") or None
         )
 
-        result = asyncio.run(controller._run_serial_decode_step())
+        result = asyncio.run(controller._run_eager_resolution_step())
 
         assert events == ["sample", "build", "resolve", "prepare", "forward"]
         controller._prepare_sampled_step.assert_called_once_with(
@@ -476,8 +476,8 @@ class TestAsyncSchedulingControllerHelpers:
         )
         assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
 
-    def test_async_decode_step_call_order(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+    def test_deferred_resolution_step_call_order(self):
+        controller, context, _ = self._make_request_resolution_controller()
         events = []
         sampled_step = SampledStep(
             prepared_update={
@@ -504,7 +504,7 @@ class TestAsyncSchedulingControllerHelpers:
             side_effect=lambda _step: events.append("resolve") or {}
         )
 
-        result = asyncio.run(controller._run_async_decode_step())
+        result = asyncio.run(controller._run_deferred_resolution_step())
 
         assert events == ["sample", "build", "prepare", "forward", "resolve"]
         controller._prepare_sampled_step.assert_called_once_with(
@@ -513,7 +513,7 @@ class TestAsyncSchedulingControllerHelpers:
         assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
 
     def test_decode_step_bootstrap_primes_before_sample(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+        controller, context, _ = self._make_request_resolution_controller()
         events = []
         sampled_step = SampledStep(
             prepared_update={
@@ -540,13 +540,13 @@ class TestAsyncSchedulingControllerHelpers:
         )
         controller._sampled_step_has_active_rows = mock.Mock(return_value=False)
 
-        asyncio.run(controller._run_serial_decode_step())
+        asyncio.run(controller._run_eager_resolution_step())
 
         assert events == ["bootstrap_forward", "sample", "build", "resolve", "prepare"]
         assert not controller._decode_forward_primer.is_primed
 
-    def test_async_decode_step_all_finished_consumes_without_forward(self):
-        controller, context, _ = self._make_async_eligibility_controller()
+    def test_deferred_resolution_step_all_finished_consumes_without_forward(self):
+        controller, context, _ = self._make_request_resolution_controller()
         events = []
         sampled_step = SampledStep(
             prepared_update={
@@ -578,7 +578,7 @@ class TestAsyncSchedulingControllerHelpers:
         )
         controller._forward_prepared_requests = mock.Mock()
 
-        result = asyncio.run(controller._run_async_decode_step())
+        result = asyncio.run(controller._run_deferred_resolution_step())
 
         assert events == ["sample", "build", "prepare", "resolve", "consume"]
         controller._forward_prepared_requests.assert_not_called()
@@ -586,7 +586,7 @@ class TestAsyncSchedulingControllerHelpers:
         assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
 
 
-class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
+class TestRequestResolutionDenseGreedyParity(TextGenerationControllerTestBase):
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
@@ -600,7 +600,9 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
     def teardown_method(self, method):
         InferenceMode.unset_active()
 
-    def _run_dense_greedy_dynamic_generation(self, async_scheduling_mode: AsyncSchedulingMode):
+    def _run_dense_greedy_dynamic_generation(
+        self, request_resolution_mode: RequestResolutionMode
+    ):
         if not is_fa_min_version("2.7.3"):
             pytest.skip(reason="Need latest flash attn for dynamic batching")
 
@@ -616,7 +618,7 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
             max_requests=4,
         )
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.config.async_scheduling_mode = async_scheduling_mode
+        context.config.request_resolution_mode = request_resolution_mode
 
         requests = [
             DynamicInferenceRequest(
@@ -651,11 +653,11 @@ class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
 
         return generated_tokens
 
-    def test_async_scheduling_matches_sync_dense_greedy_decode(self):
-        sync_tokens = self._run_dense_greedy_dynamic_generation(AsyncSchedulingMode.LEGACY)
-        async_tokens = self._run_dense_greedy_dynamic_generation(AsyncSchedulingMode.ASYNC)
+    def test_defer_resolution_matches_legacy_dense_greedy_decode(self):
+        sync_tokens = self._run_dense_greedy_dynamic_generation(RequestResolutionMode.LEGACY)
+        defer_tokens = self._run_dense_greedy_dynamic_generation(RequestResolutionMode.DEFER)
 
-        assert async_tokens == sync_tokens
+        assert defer_tokens == sync_tokens
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):

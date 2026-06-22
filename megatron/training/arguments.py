@@ -1879,13 +1879,13 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
-    group.add_argument('--inference-dynamic-batching-async-scheduling-mode',
-                       type=str, default='legacy', choices=('legacy', 'serial', 'async'),
-                       help='Select the dynamic batching request-update scheduling mode. '
+    group.add_argument('--inference-dynamic-batching-request-resolution-mode',
+                       type=str, default='legacy', choices=('legacy', 'eager', 'defer'),
+                       help='Select the dynamic batching request resolution mode. '
                        '"legacy" preserves the full mainline update path. '
-                       '"serial" uses the new split resolve/prepare path for eligible decode-only '
-                       'steps. "async" uses the async-shaped prepare/forward/resolve path for '
-                       'eligible decode-only steps.')
+                       '"eager" resolves requests before preparing the next eligible decode-only '
+                       'step. "defer" resolves requests after preparing and forwarding the next '
+                       'eligible decode-only step.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
                        help='Amount of on-GPU memory allocated for the KV cache. '

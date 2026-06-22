@@ -3866,7 +3866,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         The split request-update path is finish-only: `resolve_requests` decides
         which active rows finished, and `prepare_requests` later applies the row
         layout change. Keeping compaction and resource release in prepare gives
-        serial and async-shaped scheduling the same ownership model.
+        eager and defer request resolution the same ownership model.
 
         Steps:
             1. Normalize prepared-update tensors onto CPU.

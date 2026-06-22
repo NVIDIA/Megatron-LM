@@ -604,13 +604,13 @@ class DynamicInferenceEngineTestBase:
         return env
 
 
-class TestAsyncSchedulingEligibilityState:
+class TestRequestResolutionEligibilityState:
     def test_waiting_request_eligibility_uses_engine_queue(self):
         engine = object.__new__(DynamicInferenceEngine)
         engine.waiting_request_ids = [1]
         engine.context = mock.Mock()
 
-        engine._update_request_update_mode_state()
+        engine._update_request_resolution_mode_state()
 
         assert engine.context.request_update_has_waiting_requests
 
