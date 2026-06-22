@@ -1816,6 +1816,83 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_chunked_prefill_skips_request_when_token_budget_exhausted(self):
+        """
+        Test that chunked prefill scheduling leaves a waiting request untouched when the
+        token batch is already full (active_token_count == max_tokens), instead of
+        scheduling a zero-length chunk.
+
+        This exercises the `token_partially_can_be_added` guard in the scheduler's entry
+        condition. When a fully-admitted request fills the batch exactly to max_tokens, a
+        following waiting request has zero token budget. Without the guard, the scheduler
+        would compute token_budget = max_tokens - active_token_count = 0 and try to admit a
+        0-token chunk, tripping `assert prefill_chunk_length > 0` in `add_request`.
+
+        Scenario:
+            - Max tokens per step: 16
+            - Request A: 16-token prompt -> fully admitted, fills the batch exactly.
+            - Request B: 8-token prompt  -> zero budget remains; must stay waiting.
+        """
+        max_tokens = 16
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=max_tokens,
+            context_max_tokens=max_tokens,
+            context_max_requests=2,
+            context_block_size_tokens=256,
+            max_sequence_length=128,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs.
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Request A: prompt length == max_tokens, so it fills the batch exactly.
+        req_a_tokens = torch.randint(0, test_config.vocab_size, (max_tokens,), device='cuda')
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_a_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_a)
+
+        # Request B: added after A, so it sits behind A in the waiting queue.
+        req_b_tokens = torch.randint(0, test_config.vocab_size, (8,), device='cuda')
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req_b_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_b)
+
+        # Schedule without crashing: A is fully admitted, B is left waiting.
+        env.engine.schedule_waiting_requests()
+
+        # Request A fully admitted and the batch is exactly full.
+        assert ctx.active_token_count == max_tokens
+        assert ctx.total_request_count == 1
+        assert ctx.num_prefill_requests == 1
+        # A was a full (non-chunked) admit, so no chunked prefill is in flight.
+        assert ctx.chunked_prefill_request_id == -1
+
+        # Request B got zero budget: untouched and still at the head of the waiting queue.
+        assert req_b.finished_chunk_token_count == 0
+        assert list(env.engine.waiting_request_ids) == [2]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_prefix_caching_avoid_single_token_effective_chunk(self):
         """
         Test that prefix caching combined with chunked prefill avoids leaving exactly
@@ -2504,7 +2581,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # High probability for token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2643,7 +2720,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2738,7 +2815,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2834,7 +2911,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -3110,7 +3187,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
                 base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-                model._decoder_hidden_states_cache = torch.zeros(
+                env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                     s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
                 )
                 if test_config.materialize_only_last_token_logits:
@@ -3231,7 +3308,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # Force model to deterministically pick token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -3449,7 +3526,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 dtype=torch.bfloat16,
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3592,7 +3669,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             # Make token 0 very likely so speculative tokens get accepted.
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3714,7 +3791,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3846,7 +3923,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -4101,7 +4178,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -4199,7 +4276,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
