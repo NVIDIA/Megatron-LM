@@ -39,7 +39,7 @@ def test_liger_ce_matches_torch_cross_entropy_tp1(dtype):
     ).reshape(seq_len, batch)
     ref.sum().backward()
 
-    torch.testing.assert_close(grad_liger.float(), logits2.grad, **tols)
+    torch.testing.assert_close(grad_liger.float(), logits2.grad.float(), **tols)
     Utils.destroy_model_parallel()
 
 
