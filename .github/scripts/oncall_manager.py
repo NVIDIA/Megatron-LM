@@ -29,6 +29,7 @@ ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
 COMMUNITY_REQUEST_LABEL = "community-request"
+SERVICE_ACCOUNT_USERNAME = "svcnvidia-nemo-ci"
 TARGET_WEEKS = 12
 
 # Caches for email and Slack lookups
@@ -263,26 +264,25 @@ def save_schedule(schedule):
         json.dump(schedule, f, indent=4)
         f.write('\n') # trailing newline
 
-def get_schedule_user_order(schedule):
-    """Returns unique users from the schedule in file order."""
-    ordered_users = []
-    seen_users = set()
-    for entry in schedule:
-        user = entry.get('user')
-        if user and user not in seen_users:
-            ordered_users.append(user)
-            seen_users.add(user)
-    return ordered_users
+def get_rotation_order(repo_owner):
+    """Returns rotation team members in alphabetical order."""
+    members = get_team_members(repo_owner, ROTATION_TEAM_SLUG)
+    members.discard(SERVICE_ACCOUNT_USERNAME)
+    return sorted(members, key=str.casefold)
 
-def validate_schedule_users_in_rotation_team(schedule, repo_owner):
+def validate_schedule_users_in_rotation_team(schedule, rotation_order):
     """Validates scheduled users are members of the rotation team."""
-    schedule_users = get_schedule_user_order(schedule)
+    schedule_users = {entry.get('user') for entry in schedule if entry.get('user')}
     if not schedule_users:
         print("Warning: No users found in schedule. Cannot validate rotation team membership.")
-        return schedule_users
+        return
 
-    rotation_team_members = get_team_members(repo_owner, ROTATION_TEAM_SLUG)
-    missing_users = sorted(set(schedule_users) - rotation_team_members)
+    rotation_team_members = set(rotation_order)
+    if not rotation_team_members:
+        print(f"Error: No members found in {ROTATION_TEAM_SLUG}.")
+        sys.exit(1)
+
+    missing_users = sorted(schedule_users - rotation_team_members, key=str.casefold)
     if missing_users:
         print(
             f"Error: Scheduled oncall user(s) are not members of "
@@ -291,7 +291,6 @@ def validate_schedule_users_in_rotation_team(schedule, repo_owner):
         sys.exit(1)
 
     print(f"Validated {len(schedule_users)} scheduled user(s) in {ROTATION_TEAM_SLUG}.")
-    return schedule_users
 
 def update_active_oncall_team(org, new_oncall):
     """Updates the active oncall team to contain only the new oncall user."""
@@ -324,7 +323,8 @@ def update_active_oncall_team(org, new_oncall):
 
 def rotate_schedule(repo_owner, dry_run=False):
     schedule = load_schedule()
-    rotation_order = validate_schedule_users_in_rotation_team(schedule, repo_owner)
+    rotation_order = get_rotation_order(repo_owner)
+    validate_schedule_users_in_rotation_team(schedule, rotation_order)
     print(f"Current schedule length: {len(schedule)}")
     
     # 1. Rotate (Remove past week)
@@ -381,9 +381,8 @@ def get_last_wednesday():
 
 def ensure_schedule_filled(schedule, rotation_order=None):
     """Appends users to schedule until it reaches TARGET_WEEKS."""
-    rotation_order = rotation_order or get_schedule_user_order(schedule)
     if not rotation_order:
-        print("Warning: No users found in schedule. Cannot fill schedule.")
+        print(f"Warning: No users found in {ROTATION_TEAM_SLUG}. Cannot fill schedule.")
         return
     
     while len(schedule) < TARGET_WEEKS:
@@ -392,7 +391,7 @@ def ensure_schedule_filled(schedule, rotation_order=None):
             # Start with the most recent Wednesday if list is empty
             next_date = get_last_wednesday()
             
-            # Start with the first user in the hard-coded schedule order if list is empty
+            # Start with the first user in the rotation team order if list is empty
             next_user = rotation_order[0]
         else:
             last_entry = schedule[-1]
@@ -407,7 +406,7 @@ def ensure_schedule_filled(schedule, rotation_order=None):
                 next_date = get_last_wednesday() + timedelta(days=7 * len(schedule))
 
             try:
-                # Find index of last scheduled user in the hard-coded schedule order
+                # Find index of last scheduled user in the rotation team order
                 if last_user in rotation_order:
                     last_idx = rotation_order.index(last_user)
                     next_idx = (last_idx + 1) % len(rotation_order)
@@ -490,7 +489,8 @@ def main():
         rotate_schedule(owner, dry_run=args.dry_run)
     elif args.command == "fill":
         schedule = load_schedule()
-        rotation_order = validate_schedule_users_in_rotation_team(schedule, owner)
+        rotation_order = get_rotation_order(owner)
+        validate_schedule_users_in_rotation_team(schedule, rotation_order)
         ensure_schedule_filled(schedule, rotation_order)
         save_schedule(schedule)
         print("Schedule filled and saved.")

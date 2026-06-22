@@ -135,30 +135,35 @@ def test_get_headers_rejects_invalid_token(oncall_manager, monkeypatch, capsys):
     assert "GH_TOKEN or GITHUB_TOKEN is invalid" in capsys.readouterr().out
 
 
-def test_ensure_schedule_filled_uses_schedule_file_order(oncall_manager, monkeypatch):
-    schedule = [
-        {"user": "charlie", "date": "2026-01-07"},
-        {"user": "alice", "date": "2026-01-14"},
-        {"user": "bob", "date": "2026-01-21"},
-    ]
-    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 6)
+def test_get_rotation_order_uses_alphabetical_rotation_team(oncall_manager, monkeypatch):
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"charlie", "Alice", "bob", "svcnvidia-nemo-ci"},
+    )
+
+    assert oncall_manager.get_rotation_order("NVIDIA") == ["Alice", "bob", "charlie"]
+
+
+def test_ensure_schedule_filled_uses_rotation_team_order(oncall_manager, monkeypatch):
+    schedule = [{"user": "bob", "date": "2026-01-07"}]
+    rotation_order = ["Alice", "bob", "charlie"]
+    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 5)
     monkeypatch.setattr(
         oncall_manager,
         "get_team_members",
         lambda *_args, **_kwargs: pytest.fail("team members should not determine oncall order"),
     )
 
-    oncall_manager.ensure_schedule_filled(schedule)
+    oncall_manager.ensure_schedule_filled(schedule, rotation_order)
 
-    assert [entry["user"] for entry in schedule] == [
-        "charlie",
-        "alice",
-        "bob",
-        "charlie",
-        "alice",
-        "bob",
+    assert [entry["user"] for entry in schedule] == ["bob", "charlie", "Alice", "bob", "charlie"]
+    assert [entry["date"] for entry in schedule[-4:]] == [
+        "2026-01-14",
+        "2026-01-21",
+        "2026-01-28",
+        "2026-02-04",
     ]
-    assert [entry["date"] for entry in schedule[-3:]] == ["2026-01-28", "2026-02-04", "2026-02-11"]
 
 
 def test_validate_schedule_users_in_rotation_team_accepts_all_users(
@@ -176,9 +181,10 @@ def test_validate_schedule_users_in_rotation_team_accepts_all_users(
         lambda org, team_slug: {"alice", "bob", "charlie", "dana"},
     )
 
-    rotation_order = oncall_manager.validate_schedule_users_in_rotation_team(schedule, "NVIDIA")
+    rotation_order = ["alice", "bob", "charlie", "dana"]
 
-    assert rotation_order == ["charlie", "alice", "bob"]
+    oncall_manager.validate_schedule_users_in_rotation_team(schedule, rotation_order)
+
     assert "Validated 3 scheduled user(s) in mcore-oncall-rotation" in capsys.readouterr().out
 
 
@@ -186,10 +192,8 @@ def test_validate_schedule_users_in_rotation_team_rejects_missing_user(
     oncall_manager, monkeypatch, capsys
 ):
     schedule = [{"user": "charlie", "date": "2026-01-07"}, {"user": "alice", "date": "2026-01-14"}]
-    monkeypatch.setattr(oncall_manager, "get_team_members", lambda org, team_slug: {"alice"})
-
     with pytest.raises(SystemExit) as error:
-        oncall_manager.validate_schedule_users_in_rotation_team(schedule, "NVIDIA")
+        oncall_manager.validate_schedule_users_in_rotation_team(schedule, ["alice"])
 
     assert error.value.code == 1
     assert "charlie" in capsys.readouterr().out
