@@ -644,8 +644,6 @@ class CachedLogitsKDLoss:
         decode_threads: Number of decode threads inside the single DataLoader
             worker used to parallelise zstd decompression and ``torch.load``
             across in-flight samples.
-        prefetch_factor: How many decoded iterations the PyTorch DataLoader
-            worker pre-loads ahead.
         msc_prefetch_depth: For remote MSC tar shards, how many whole
             shard objects to materialize into the MSC cache ahead of
             sequential tar consumption.
@@ -655,13 +653,11 @@ class CachedLogitsKDLoss:
         self,
         logprobs_dir: str,
         decode_threads: int = 1,
-        prefetch_factor: int = 2,
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
     ):
         self.logprobs_dir = logprobs_dir
         self._decode_threads = decode_threads
-        self._prefetch_factor = prefetch_factor
         self._msc_prefetch_depth = msc_prefetch_depth
         self._ignore_hash = ignore_hash
 
@@ -686,10 +682,8 @@ class CachedLogitsKDLoss:
 
     def _init_dataloader(self, start_iteration: int) -> None:
         """Create the DataLoader starting from *start_iteration*."""
-        # TeacherTarDataset yields a single ordered stream, so multiple DataLoader
-        # workers would split shards and interleave results non-deterministically.
-        # Cap at 1 DataLoader worker; intra-worker parallelism is obtained via
-        # the ThreadPoolExecutor inside TeacherTarDataset.
+        # Keep the iterable dataset in the training process so ordered shard
+        # streaming, dynamic discovery, and rank-0 collectives stay simple.
         dataset = TeacherTarDataset(
             self.logprobs_dir,
             self.cp_rank,
@@ -702,18 +696,13 @@ class CachedLogitsKDLoss:
         )
         # Remote shard discovery uses rank-0 collectives, so it must run in the
         # main training process rather than a DataLoader worker.
-        dataloader_workers = 0 if is_remote_storage_path(self.logprobs_dir) else 1
-        loader_kwargs = dict(
+        loader = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=None,
             collate_fn=lambda x: x,
             pin_memory=True,
-            num_workers=dataloader_workers,
+            num_workers=0,
         )
-        if dataloader_workers > 0:
-            loader_kwargs["prefetch_factor"] = self._prefetch_factor
-            loader_kwargs["persistent_workers"] = True
-        loader = torch.utils.data.DataLoader(**loader_kwargs)
         self._dataloader_iter = iter(loader)
 
     def _advance_iteration(self) -> None:
@@ -814,7 +803,6 @@ class LossFuncCallable:
         self,
         logprobs_dir: str,
         decode_threads: int = 1,
-        prefetch_factor: int = 2,
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
@@ -822,7 +810,6 @@ class LossFuncCallable:
     ):
         self.logprobs_dir = logprobs_dir
         self.decode_threads = decode_threads
-        self.prefetch_factor = prefetch_factor
         self.msc_prefetch_depth = msc_prefetch_depth
         self.kd_func = None
         self.alpha = kd_loss_alpha
@@ -849,7 +836,6 @@ class LossFuncCallable:
             self.kd_func = CachedLogitsKDLoss(
                 logprobs_dir=self.logprobs_dir,
                 decode_threads=self.decode_threads,
-                prefetch_factor=self.prefetch_factor,
                 msc_prefetch_depth=self.msc_prefetch_depth,
                 ignore_hash=self.ignore_hash,
             )
