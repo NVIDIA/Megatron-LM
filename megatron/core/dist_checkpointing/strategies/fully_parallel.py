@@ -20,7 +20,6 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     ShardDistribution,
     determine_main_replica_uniform_distribution,
     exchange_by_distribution,
-    exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.local_replica import (
@@ -335,29 +334,47 @@ class FullyParallelLoadStrategyWrapper:
                 ), 'Expecting non-trivial distribution for non-trivial parallelization group'
 
         # Step 3: load part of the checkpoint.
-        # Load only sharded objects first. ShardedTensors will be loaded separately
-        # so that we can keep track of sharded tensors loaded by this rank
+        # ShardedTensors keep the FullyParallel distribution: each rank reads
+        # only the shards it was assigned (`to_load_shards`) and receives the
+        # rest (`unloaded_shards`) via the cross-rank exchange in step 4.
         (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
             self._defer_loading_sharded_tensors(sharded_state_dict)
         )
 
+        # ShardedObjects are handled differently: every rank loads *all* of its
+        # own objects directly from storage, so no inter-rank object exchange is
+        # needed. This is correct because an object is addressed in the
+        # checkpoint by its `unique_key` (key + global_offset + global_shape),
+        # which excludes `replica_id`; each distinct object position is therefore
+        # written to disk exactly once (by its main replica) and any rank that
+        # needs it can read it locally with `no_dist=True`. We merge both the
+        # main (`to_load_objects`) and non-main (`unloaded_objects`) replica maps
+        # so this rank loads every object in its state dict. This replaces the
+        # former WORLD-wide `all_gather_object` collective with extra (but cheap)
+        # local reads of small artifacts (RNG states, `_extra_state`, ...).
         (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
+        all_objects_to_load = {**to_load_objects, **unloaded_objects}
 
         assert (
             len(sharded_state_dict) == 0
         ), "sharded_state_dict is not empty after deferring tensors and objects"
-        with trace_region("base_load_ShardedObjects"):
-            with debug_time("base_load_ShardedObjects", logger):
-                # Load sharded objects first
-                loaded_objects = self.base_strategy.load(
-                    to_load_objects, checkpoint_dir, async_strategy
+        # Load this rank's tensor shards together with all of its objects in a
+        # single base-strategy `.load()` call. `mcore_to_pyt_state_dict` already
+        # supports a mixed tensor/object state dict, and a single call means one
+        # metadata read and one load plan instead of two.
+        with trace_region("base_load_ShardedTensorsAndObjects"):
+            with debug_time("base_load_ShardedTensorsAndObjects", logger):
+                loaded = self.base_strategy.load(
+                    {**to_load_shards, **all_objects_to_load}, checkpoint_dir, async_strategy
                 )
-        with trace_region("base_load_ShardedTensors"):
-            with debug_time("base_load_ShardedTensors", logger):
-                # Load sharded tensors separately
-                loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+        # The base strategy returns the loaded values keyed by the same shard
+        # ids we passed in; split them back into tensors and objects. Tensor and
+        # object shard ids never collide (a given key is either a tensor or an
+        # object), so membership in the original maps is an unambiguous split.
+        loaded_tensors = {shard_id: loaded[shard_id] for shard_id in to_load_shards}
+        loaded_objects = {shard_id: loaded[shard_id] for shard_id in all_objects_to_load}
         with trace_region("exchange_loaded_tensors"):
             with debug_time("self.exchange_loaded_tensors", logger):
 
@@ -378,23 +395,14 @@ class FullyParallelLoadStrategyWrapper:
 
             with debug_time("torch.cuda.synchronize", logger):
                 torch.cuda.synchronize()
-        
-        with trace_region("exchange_loaded_objects"):
-            all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
 
-        if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
-            missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
-            raise CheckpointingException(
-                f'Missing object shards after fully parallel loading: {missing_object_shards}'
-            )
-        with trace_region("torch.cuda.synchronize"):
-            torch.cuda.synchronize()
+        # No object exchange: each rank already loaded every object it needs.
 
         with trace_region("fill_in_deferred_sharded_tensors"):
             self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
-        
+
         with trace_region("fill_in_deferred_sharded_objects"):
-            self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)
+            self.fill_in_deferred_sharded_objects(sharded_objects, loaded_objects)
 
         with trace_region("merge"):
             merge(loaded_state_dict, sharded_objects)
