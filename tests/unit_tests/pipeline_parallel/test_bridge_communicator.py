@@ -17,7 +17,7 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
+from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator, CommRole
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -142,6 +142,7 @@ def destroy_all_grids():
         grid.destroy()
     _active_grids.clear()
     BridgeCommunicator.destroy_broadcast_pgs()
+    BridgeCommunicator.destroy_bridge_pgs()
 
 
 def _get_pg_collection_from_grid(grid):
@@ -301,6 +302,29 @@ class TestBridgeCommunicator:
         assert bridge_communicator.dest_grid is grid2
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
+
+    @pytest.mark.parametrize(
+        "grid1_tp, grid1_dp, grid2_tp, grid2_dp",
+        [
+            (2, 2, 4, 1),  # fan-in: 2 src leaders -> 1 dest leader
+            (4, 1, 2, 2),  # fan-out: 1 src leader -> 2 dest leaders
+            (2, 1, 2, 1),  # equal leaders
+        ],
+    )
+    def test_bridge_pg_membership(self, grid1_tp, grid1_dp, grid2_tp, grid2_dp):
+        grid1 = create_hypercomm_grid(offset=0, tp=grid1_tp, cp=1, pp=1, dp=grid1_dp)
+        grid2 = create_hypercomm_grid(offset=4, tp=grid2_tp, cp=1, pp=1, dp=grid2_dp)
+        bridge = BridgeCommunicator(grid1, grid2)
+
+        assert bridge.bridge_pg is not None
+        expected = sorted(set(bridge.src_tp_leaders) | set(bridge.dest_tp_leaders))
+        assert dist.get_process_group_ranks(bridge.bridge_pg) == expected
+
+        # MEMBER (broadcast-only) ranks must not be in the bridge group.
+        member_ranks = [
+            rank for rank, info in bridge.comm_map.items() if info.role == CommRole.MEMBER
+        ]
+        assert all(rank not in expected for rank in member_ranks)
 
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
