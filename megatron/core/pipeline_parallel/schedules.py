@@ -262,6 +262,9 @@ def forward_step_calc_loss(
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
@@ -312,13 +315,16 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        # Calculate the loss scale based on moe_grad_scale_func (preferred),
+        # grad_scale_func (fallback), or default to 1.
         device = get_tensor_device(output_tensor)
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=device)
-        )
+        moe_grad_scale_func = getattr(config, 'moe_grad_scale_func', None)
+        if moe_grad_scale_func is not None:
+            loss_scale = moe_grad_scale_func()
+        elif config.grad_scale_func is not None:
+            loss_scale = config.grad_scale_func(torch.ones(1, device=device))
+        else:
+            loss_scale = torch.ones(1, device=device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
@@ -337,6 +343,18 @@ def forward_step_calc_loss(
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
             MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for DSA (Dynamic Sparse Attention) indexer loss.
+    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        if config.calculate_per_token_loss:
+            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     return output_tensor, num_tokens
 
