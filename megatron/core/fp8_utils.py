@@ -157,6 +157,12 @@ def _get_custom_recipe(
     fp8_dpa: bool = False,
     fp8_mha: bool = False,
 ) -> Union[Fp8Recipe, Fp4Recipe]:
+    if (fp8_dpa or fp8_mha) and not is_te_min_version("2.16.0.dev0"):
+        raise ValueError(
+            "CustomRecipe with fp8 attention requires Transformer Engine >= 2.16.0.dev0, "
+            f"but your version is {get_te_version()}."
+        )
+
     quantizer_factory = _resolve_callable_from_python_import_path(quantizer_factory_python_path)
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(
