@@ -678,9 +678,13 @@ class TestDynamicContext:
             dynamic_context.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
             dynamic_context.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
 
-        update_result = dynamic_context.update_requests(
-            active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
-        )
+        prepared_update = {
+            "active_requests_mask": active_requests_mask,
+            "new_tokens": torch.tensor([0, 1, 2]),
+            "new_speculative_tokens": None,
+        }
+        update_result = dynamic_context.resolve_requests(prepared_update)
+        dynamic_context.prepare_requests(**prepared_update)
 
         assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
         assert dynamic_context.total_request_count == 0

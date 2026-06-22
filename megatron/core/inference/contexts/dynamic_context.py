@@ -1293,7 +1293,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
-        # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
+        # update_requests_legacy() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
 
@@ -2361,7 +2361,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.transfer_bookkeeping_to_gpu()
 
     def _execute_pending_mamba_ops(self) -> None:
-        """Execute Mamba GPU operations deferred from add_request() / update_requests().
+        """Execute Mamba GPU operations deferred from add_request() / update_requests_legacy().
 
         This runs at the start of initialize_attention_state() so that all GPU
         Mamba state is correct before the forward pass.
@@ -3923,57 +3923,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             "newly_paused_request_ids": None,
             "evict_request_ids": None,
         }
-
-    def update_requests(
-        self,
-        active_requests_mask: Tensor,
-        new_tokens: Tensor,
-        new_speculative_tokens: Tensor = None,
-    ) -> Dict[str, Optional[Tensor]]:
-        """Run the new serial request-update composition.
-
-        This wraps `resolve_requests` followed by `prepare_requests` so the
-        serial path and async-shaped path share the same phase boundaries. It
-        resolves lifecycle effects from the sampled step before preparing
-        metadata for the next forward.
-
-        Steps:
-            1. Package sampled outputs into a prepared update.
-            2. Resolve lifecycle changes for the sampled step.
-            3. Prepare next-forward bookkeeping.
-
-        Example:
-            flow:
-                sample(N)
-                  -> resolve_requests(N)
-                  -> prepare_requests(N+1)
-                  -> forward(N+1)
-
-        Args:
-            active_requests_mask (Tensor): One-dimensional mask in active-row
-                order, where one marks requests that remain active.
-            new_tokens (Tensor): Newly sampled base tokens, one per active row.
-            new_speculative_tokens (Tensor): Optional speculative-token tensor
-                with shape `[num_speculative_tokens, active_request_count]`.
-
-        Returns:
-            Dict[str, Optional[Tensor]]: Lifecycle result dictionary returned by
-            `resolve_requests`.
-        """
-
-        # Step 1: Package sampled outputs into a prepared update.
-        prepared_update = {
-            "active_requests_mask": active_requests_mask,
-            "new_tokens": new_tokens,
-            "new_speculative_tokens": new_speculative_tokens,
-        }
-
-        # Step 2: Resolve lifecycle changes for the sampled step.
-        resolve_result = self.resolve_requests(prepared_update)
-
-        # Step 3: Prepare next-forward bookkeeping.
-        self.prepare_requests(**prepared_update)
-        return resolve_result
 
     def update_requests_legacy(
         self,
