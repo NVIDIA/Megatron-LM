@@ -389,6 +389,7 @@ def _apply_unfused_rope(
     config: TransformerConfig,
     cu_seqlens: Optional[torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
+    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply unfused RoPE (split, rotate, concat) with 3-D / 4-D handling.
 
@@ -421,6 +422,7 @@ def _apply_unfused_rope(
         cp_group=cp_group,
         mla_rotary_interleaved=True,
         mla_output_remove_interleaving=True,
+        max_seqlen=max_seqlen,
     )
     out = torch.cat([x_nope, x_pe], dim=-1)
 
@@ -513,7 +515,14 @@ def _apply_rope(
         if ratio > 1:
             rotary_pos_emb = rotary_pos_emb[:total:ratio][:rotary_seq_len]
 
-    return _apply_unfused_rope(x, rotary_pos_emb, nope_dim, pos_dim, config, cu_seqlens, cp_group)
+    # For THD packed sequences ``rotary_pos_emb`` is a single max-length frequency
+    # table reused per segment, so its (post-stride) length is the max sequence
+    # length. Passing it as ``max_seqlen`` keeps ``apply_rotary_pos_emb`` on the
+    # no-global-offset path without a GPU→CPU sync over ``cu_seqlens``.
+    max_seqlen = rotary_pos_emb.shape[0] if packed_seq else None
+    return _apply_unfused_rope(
+        x, rotary_pos_emb, nope_dim, pos_dim, config, cu_seqlens, cp_group, max_seqlen=max_seqlen
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2027,6 +2027,7 @@ class TestApplyRopeThd:
                 ratio=ratio,
                 cp_group=self.pg_collection.cp,
                 cu_seqlens=cu_seqlens,
+                max_seqlen_rope=max(seg_lens) * ratio,
             )
 
             tag = f"(rope={self.rope_type}, ratio={ratio}, fused={apply_rope_fusion})"
@@ -2081,6 +2082,7 @@ class TestApplyRopeThd:
                 ratio=ratio,
                 cp_group=self.pg_collection.cp,
                 cu_seqlens=cu_seqlens,
+                max_seqlen_rope=sq * ratio,
             )
 
             tag = f"(rope={self.rope_type}, ratio={ratio}, fused={apply_rope_fusion})"

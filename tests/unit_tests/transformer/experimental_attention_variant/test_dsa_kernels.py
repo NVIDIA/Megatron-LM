@@ -467,6 +467,15 @@ class TestLazyKernelImports:
 class TestGetTopkAlignment:
     """Architecture-dependent alignment for FlashMLA top-K padding."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_alignment_cache(self):
+        # ``_get_topk_alignment`` is ``@lru_cache``-d, so the first call freezes
+        # its result for the process. Clear it around every test so the patched
+        # device capability is actually re-read.
+        _get_topk_alignment.cache_clear()
+        yield
+        _get_topk_alignment.cache_clear()
+
     @pytest.mark.parametrize(
         "sm_major, expected", [(7, 128), (8, 128), (9, 128), (10, 64), (12, 64), (13, 64)]
     )
