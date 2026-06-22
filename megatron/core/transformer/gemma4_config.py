@@ -67,22 +67,34 @@ class Gemma4TransformerConfig(TransformerConfig):
         layers swap in the 512 head_dim / 1e6 RoPE base and drop the sliding
         window; sliding layers inherit this config's defaults.
         """
+        # Only kv_channels (head_dim 256->512) and window_size (drop sliding window)
+        # are base TransformerConfig fields that differ per layer. rotary_base is NOT
+        # a TransformerConfig field and is not needed per-layer: Gemma4RotaryEmbedding
+        # bakes in both thetas (1e4/1e6) and selects by layer_type. The sliding/full
+        # rope bases are carried as gemma4-only fields (sliding_rotary_base/
+        # full_rotary_base) for the rope module to read.
         keys_to_update = {}
         if self.is_full_attention(global_layer_number):
             keys_to_update['kv_channels'] = self.full_kv_channels
-            keys_to_update['rotary_base'] = self.full_rotary_base
             keys_to_update['window_size'] = None
 
-        transformer_config_field_names = {f.name for f in fields(TransformerConfig)}
+        base_field_names = {f.name for f in fields(TransformerConfig)}
         transformer_config_dict = {
-            f.name: getattr(self, f.name) for f in fields(self) if f.name in transformer_config_field_names
+            f.name: getattr(self, f.name) for f in fields(self) if f.name in base_field_names
         }
         transformer_config_dict.update(keys_to_update)
 
+        # Build a base TransformerConfig (not Gemma4TransformerConfig) so its
+        # __post_init__ does not re-clobber the per-layer kv_channels/rotary_base/
+        # window_size overrides above.
         layer_config = TransformerConfig(**transformer_config_dict)
-        # Carry the gemma4-only fields the per-layer modules need (KV bus role,
-        # rope/mask selection); these are not TransformerConfig fields so they would
-        # otherwise be dropped by the dict round-trip above.
-        layer_config.num_kv_shared_layers = self.num_kv_shared_layers
+        # Carry ALL gemma4-only fields the per-layer modules need (PLE dims, softcap,
+        # KV-bus role, rope/mask selection). They are not base TransformerConfig
+        # fields, so the dict round-trip above drops them; re-attach generically.
+        for f in fields(self):
+            if f.name not in base_field_names:
+                setattr(layer_config, f.name, getattr(self, f.name))
+        # layer_types is derived in __post_init__ (not a dataclass field), so it is
+        # not covered by the fields() loop above; carry it explicitly.
         layer_config.layer_types = self.layer_types
         return layer_config
