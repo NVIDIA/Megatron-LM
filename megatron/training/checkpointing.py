@@ -368,8 +368,14 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup) -> Union[List[Dict[str, Any]], ShardedObject]:
-    """Collect rng state across data parallel ranks."""
+def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup, key_prefix: str = '') -> Union[List[Dict[str, Any]], ShardedObject]:
+    """Collect rng state across data parallel ranks.
+
+    key_prefix: optional namespace for the torch_dist rng ShardedObject key
+        (default '' = stock 'rng_state'). Lets disjoint grids (e.g. hetero MIMO
+        branches that share a (pp,tp) factorization) avoid an identical-key
+        collision by using distinct prefixes.
+    """
     args = get_args()
     rng_state = {
         'random_rng_state': random.getstate(),
@@ -395,7 +401,7 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
+        rng_state_list = ShardedObject(f'{key_prefix}rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
                                        replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -557,7 +563,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
-    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
+    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
+                              key_prefix=getattr(args, 'rng_state_key_prefix', ''))
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
@@ -1716,7 +1723,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if tp_group is None and pp_group is None:
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
-            gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)  # we can load the rng state
+            gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
+                                             key_prefix=getattr(args, 'rng_state_key_prefix', ''))  # we can load the rng state
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None
