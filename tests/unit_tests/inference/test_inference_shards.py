@@ -12,8 +12,7 @@ from megatron.core.inference.shards_spec import (
 
 
 def test_shard_spec_objects_match_string_parsing():
-    objs = [InferenceShardSpec(tp=2, role="prefill"),
-            InferenceShardSpec(tp=1, dp=2, role="decode")]
+    objs = [InferenceShardSpec(tp=2, role="prefill"), InferenceShardSpec(tp=1, dp=2, role="decode")]
     assert normalize_shard_specs(objs, 4) == parse_inference_shards_spec(
         "tp=2,role=prefill+tp=1,dp=2,role=decode", 4
     )
@@ -34,7 +33,14 @@ def test_parse_defaults_and_dp_and_role():
     assert specs[0] == InferenceShardSpec(tp=2, role="prefill")
     assert specs[1] == InferenceShardSpec(tp=1, dp=2, role="decode")
     # dict form (serialization / external consumers) carries the resolved keys.
-    assert specs[0].to_dict() == {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2, "role": "prefill"}
+    assert specs[0].to_dict() == {
+        "tp": 2,
+        "pp": 1,
+        "ep": 1,
+        "dp": 1,
+        "expt_tp": 2,
+        "role": "prefill",
+    }
 
 
 def test_parse_partitions_world_with_dp():
@@ -60,7 +66,9 @@ def test_plus_and_semicolon_separators_equivalent():
 def test_cp_accepted_only_when_one():
     # cp is a recognized key (clear error, not "unknown key") but must be 1:
     # inference shards don't context-parallelize.
-    assert parse_inference_shards_spec("tp=2,cp=1", world_size=2) == [InferenceShardSpec(tp=2, cp=1)]
+    assert parse_inference_shards_spec("tp=2,cp=1", world_size=2) == [
+        InferenceShardSpec(tp=2, cp=1)
+    ]
     with pytest.raises(ValueError):
         InferenceShardSpec(tp=1, cp=2)
     with pytest.raises(ValueError):

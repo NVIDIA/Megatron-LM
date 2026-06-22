@@ -75,9 +75,7 @@ def build_inference_pg_collection(
 
     # Expert DP size (world = expt_tp * ep * expt_dp * pp)
     expt_dp_size = world_size // (expt_tp_size * ep_size * pp_size)
-    assert expt_dp_size >= 1 and (
-        expt_tp_size * ep_size * expt_dp_size * pp_size
-    ) == world_size, (
+    assert expt_dp_size >= 1 and (expt_tp_size * ep_size * expt_dp_size * pp_size) == world_size, (
         f"World size ({world_size}) must be divisible by expt_tp*ep*pp "
         f"({expt_tp_size * ep_size * pp_size})"
     )
@@ -86,15 +84,11 @@ def build_inference_pg_collection(
 
     if use_tp_pp_dp_mapping:
         decoder_grid = HyperCommGrid(
-            [tp_size, cp_size, pp_size, dp_size],
-            ["tp", "cp", "pp", "dp"],
-            rank_offset=rank_offset,
+            [tp_size, cp_size, pp_size, dp_size], ["tp", "cp", "pp", "dp"], rank_offset=rank_offset
         )
     else:
         decoder_grid = HyperCommGrid(
-            [tp_size, cp_size, dp_size, pp_size],
-            ["tp", "cp", "dp", "pp"],
-            rank_offset=rank_offset,
+            [tp_size, cp_size, dp_size, pp_size], ["tp", "cp", "dp", "pp"], rank_offset=rank_offset
         )
 
     tp_group = decoder_grid.create_pg("tp")
