@@ -79,7 +79,7 @@ class RankRole:
         Grids differ → NON_COLOCATED with PP-stage info per module.
         """
         if module_to_grid_map is None or cls._all_grids_colocated(module_to_grid_map):
-            return cls._colocated(modality_module_names)
+            return cls._colocated(modality_module_names, module_to_grid_map)
         return cls._from_grid_map(module_to_grid_map)
 
     @staticmethod
@@ -89,16 +89,30 @@ class RankRole:
         return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
 
     @classmethod
-    def _colocated(cls, modality_module_names: List[str]) -> 'RankRole':
-        """Colocated layout: every module on every rank, PP=1."""
+    def _colocated(
+        cls,
+        modality_module_names: List[str],
+        module_to_grid_map: Optional[Dict[str, 'HyperCommGrid']] = None,
+    ) -> 'RankRole':
+        """Colocated layout: every module on every rank.
+
+        When a grid map is supplied, per-module stage info is derived from
+        each grid's pp group (LLM PP>1 is allowed). With no grid map, every
+        module is both first and last stage.
+        """
         all_module_names = list(modality_module_names) + [MIMO_LANGUAGE_MODULE_KEY]
-        return cls(
-            modules={
-                name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
-                for name in all_module_names
-            },
-            mode=ModuleLayout.COLOCATED,
-        )
+        modules = {}
+        for name in all_module_names:
+            grid = module_to_grid_map.get(name) if module_to_grid_map else None
+            if grid is not None and 'pp' in grid.dim_names:
+                pp_group = grid.get_pg('pp')
+                pp_rank, pp_size = pp_group.rank(), pp_group.size()
+                modules[name] = ModuleStageInfo(
+                    is_first_stage=(pp_rank == 0), is_last_stage=(pp_rank == pp_size - 1)
+                )
+            else:
+                modules[name] = ModuleStageInfo(is_first_stage=True, is_last_stage=True)
+        return cls(modules=modules, mode=ModuleLayout.COLOCATED)
 
     @classmethod
     def _from_grid_map(cls, module_to_grid_map: Dict[str, HyperCommGrid]) -> 'RankRole':

@@ -234,8 +234,8 @@ class TestValidateGrids:
         "side,dim,expected",
         [
             ("src", "pp", "src PP must be 1"),
-            ("dest", "pp", "dest PP must be 1"),
             ("src", "cp", "CP must be 1"),
+            ("dest", "cp", "CP must be 1"),
         ],
     )
     def test_pp_or_cp_gt_one_rejected(self, side, dim, expected):
@@ -249,6 +249,13 @@ class TestValidateGrids:
             dest_grid = create_hypercomm_grid(**bad)
         with pytest.raises(ValueError, match=expected):
             make_comm(src_grid, dest_grid)
+
+    def test_dest_pp_gt_one_accepted(self):
+        # Dest PP>1 is valid: the three-phase colocated schedule handles
+        # the LLM pipeline orchestration. The bridge only needs src PP=1.
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
+        make_comm(src_grid, dest_grid)
 
     def test_dp_not_divisible(self):
         # 6-rank grids with DP sizes (3 vs 2) that neither divides the other.
