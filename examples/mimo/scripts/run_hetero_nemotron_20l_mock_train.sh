@@ -102,16 +102,17 @@ esac
   --image-token "<image>" \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-  --num-microbatches "${NUM_MICROBATCHES}" \
   --lr 2e-4 \
   --min-lr 2e-6 \
   --lr-decay-style cosine \
   --lr-warmup-iters "${LR_WARMUP_ITERS}" \
   --lr-decay-iters 10 \
   --weight-decay 0.05 \
+  --override-opt-param-scheduler \
   --adam-beta1 0.9 \
   --adam-beta2 0.95 \
   --clip-grad 1.0 \
   --ddp-bucket-size 0 \
+  --no-ckpt-fully-parallel-save \
   --train-iters "${TRAIN_ITERS}" \
   "$@"
