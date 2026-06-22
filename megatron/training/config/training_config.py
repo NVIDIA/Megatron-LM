@@ -573,7 +573,7 @@ class CheckpointConfig:
     ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
     replaced by a single per-group file read (the load and save distributions are
     loaded from this directory). Only safe when the config and world size match the
-    run that created the cache (see ``--ckpt-fsdp-dtensor-cache-create``); no
+    run that created the cache (see ``--ckpt-pg-tensors-cache-create``); no
     existence/validity checks are performed, for the lowest possible latency.
     Default (None) preserves the original collective-based behaviour."""
 
