@@ -33,6 +33,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -1208,7 +1209,7 @@ class TestMTPBlockScopeCudaGraph:
         model.eval()
         return model
 
-    def _build_engine(self, *, inference_cuda_graph_scope='block'):
+    def _build_engine(self, *, inference_cuda_graph_scope='block', num_speculative_tokens=1):
         """Build a DynamicInferenceEngine with block-scope CUDA graphs."""
         delete_cuda_graphs()
         model = self._build_model(inference_cuda_graph_scope=inference_cuda_graph_scope)
@@ -1219,7 +1220,7 @@ class TestMTPBlockScopeCudaGraph:
                 max_sequence_length=self.MAX_SEQ_LEN,
                 buffer_size_gb=0.5,
                 materialize_only_last_token_logits=False,
-                num_speculative_tokens=1,
+                num_speculative_tokens=num_speculative_tokens,
                 block_size_tokens=256,
                 max_requests=16,
                 num_cuda_graphs=-1,
@@ -1382,3 +1383,56 @@ class TestMTPBlockScopeCudaGraph:
                 f"{sampled.tolist()} != reference {reference_tokens[depth].tolist()}; "
                 "the unused buffer tail leaked into the MTP forward"
             )
+
+    @pytest.mark.parametrize("inference_cuda_graph_scope", ['block', 'layer'])
+    @torch.inference_mode()
+    def test_no_spec_decode_leaves_decoder_hidden_states_unset(self, inference_cuda_graph_scope):
+        """Regression: a model with an MTP head but ``num_speculative_tokens == 0``.
+
+        When the model has MTP layers (``mtp_num_layers >= 1``) but speculative
+        decoding is disabled, plain inference must NOT touch
+        ``context.mtp_decoder_hidden_states`` — there is no serial post-verification
+        MTP step to consume it, and for block-scope CUDA graphs the buffer is never
+        even allocated (it is allocated only when ``num_speculative_tokens > 0``).
+        """
+        engine = self._build_engine(
+            inference_cuda_graph_scope=inference_cuda_graph_scope, num_speculative_tokens=0
+        )
+        ctrl = engine.controller
+        context = engine.context
+
+        # No speculative decoding -> no MTP depths and no pre-allocated buffer.
+        assert ctrl.num_speculative_tokens == 0
+        assert ctrl.num_mtp_depths == 0
+        assert context.mtp_decoder_hidden_states is None
+
+        prompt_length = 10
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.arange(prompt_length, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=20),
+        )
+        context.add_request(req)
+        context.initialize_attention_state()
+
+        active_mask = torch.ones(1, device='cuda', dtype=torch.int32)
+        new_tokens = torch.zeros(1, device='cuda', dtype=torch.int64)
+        new_spec = torch.zeros(1, 0, device='cuda', dtype=torch.int64)
+        context.update_requests(
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
+        )
+        context.initialize_attention_state()
+
+        # Force the inference flag on so the forward takes the in_inference_mode
+        # branch even though we drive the step directly rather than via the engine
+        # run loop.
+        with InferenceMode.active():
+            for step in range(3):
+                input_ids, position_ids = ctrl._dynamic_step_context_init()
+                ctrl._dynamic_step_forward_logits(input_ids, position_ids)
+
+                assert context.mtp_decoder_hidden_states is None, (
+                    f"Step {step}: mtp_decoder_hidden_states should stay None when "
+                    f"num_speculative_tokens == 0 (scope={inference_cuda_graph_scope}), "
+                    f"got a tensor of shape {tuple(context.mtp_decoder_hidden_states.shape)}"
+                )
