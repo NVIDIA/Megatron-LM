@@ -617,7 +617,7 @@ def run_mimo_1f1b_test(
         module_pgs={
             MIMO_LANGUAGE_MODULE_KEY: language_pg,
             **{name: vision_pg for name in mimo_model.modality_submodules},
-        }
+        },
     )
     configure_grad_sync(SimpleNamespace(), mimo_model, grad_sync_topology)
 

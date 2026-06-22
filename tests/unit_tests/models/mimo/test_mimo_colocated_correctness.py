@@ -181,7 +181,7 @@ def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg)
         module_pgs={
             MIMO_LANGUAGE_MODULE_KEY: language_pg,
             **{name: vision_pg for name in mimo_model.modality_submodules},
-        }
+        },
     )
     configure_grad_sync(SimpleNamespace(), mimo_model, topology)
 
