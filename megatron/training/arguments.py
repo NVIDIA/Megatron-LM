@@ -1051,6 +1051,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1984,7 +1985,13 @@ def _add_inference_args(parser):
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
-                       'states at block boundaries are cached for reuse.')
+                       'states at block boundaries are cached for reuse. This budget '
+                       'covers both the durable cache (the ssm_states/conv_states '
+                       'slots reused across requests) and the per-step extraction '
+                       'scratch (the intermediate_ssm_out/intermediate_conv_out '
+                       'buffers, sized to 3 * max_requests slots); the scratch is '
+                       'reserved first, so a larger max_requests leaves fewer durable '
+                       'slots.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
@@ -2116,6 +2123,7 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        "mamba_training_ssm_states_dtype",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2524,6 +2532,10 @@ def _add_rl_args(parser):
                        help='Deprecated: use --rl-num-parallel-generations instead.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+    group.add_argument('--rl-profile', action='store_true', default=False,
+                        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
+    group.add_argument('--rl-profile-dir', type=str, default=None,
+                        help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
@@ -2739,6 +2751,9 @@ def _add_mixed_precision_args(parser):
                        'for lm head to fp16.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
+    group.add_argument('--mamba-training-ssm-states-dtype', type=str,
+                       choices=['fp32', 'bf16'], default=None,
+                       help='Dtype of the materialized inter-chunk SSM states in Mamba training')
 
     return parser
 

@@ -1087,13 +1087,11 @@ class TextGenerationController:
         unwrapped_model = self._unwrapped_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = self._is_last_pp_stage and hasattr(
-            unwrapped_model, '_decoder_hidden_states_cache'
-        )
+        has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
 
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
-            hidden_states = unwrapped_model._decoder_hidden_states_cache
+            hidden_states = context.mtp_decoder_hidden_states
 
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
@@ -1211,11 +1209,21 @@ class TextGenerationController:
             next_token_ids = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
-        # Clean up cached hidden states in eager mode. Hybrid full-model CUDA
-        # graphs refresh this graph-backed tensor on replay without re-running
-        # the Python assignment that creates the attribute, so keep the handle
-        # alive while graph replay is active.
-        if has_mtp and not context.using_cuda_graph_this_step():
+        # In eager mode forward() assigns the hidden states tensor directly to
+        # the context attribute; release it so the tensor can be garbage
+        # collected. In block-scope CUDA graph mode the attribute is a
+        # pre-allocated fixed buffer that must persist across replays.
+        if has_mtp and context.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
+            context.mtp_decoder_hidden_states = None
+
+        # Hybrid full-model CUDA graphs refresh this graph-backed tensor on
+        # replay without re-running the Python assignment that creates the
+        # attribute, so keep the handle alive while graph replay is active.
+        if (
+            has_mtp
+            and not context.using_cuda_graph_this_step()
+            and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        ):
             del unwrapped_model._decoder_hidden_states_cache
 
     def _sample_speculative_logits(
@@ -2798,15 +2806,13 @@ class TextGenerationController:
         if self.model_config.expert_model_parallel_size <= 1:
             return
 
-        unwrapped_model = self._unwrapped_model
-
-        has_mtp = self._is_last_pp_stage and hasattr(
-            unwrapped_model, '_decoder_hidden_states_cache'
-        )
+        context = self.inference_wrapped_model.inference_context
+        has_mtp = self._is_last_pp_stage and context.mtp_decoder_hidden_states is not None
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
 
+        unwrapped_model = self._unwrapped_model
         device = torch.cuda.current_device()
         dtype = self.model_config.params_dtype
         hidden_size = self.model_config.hidden_size
