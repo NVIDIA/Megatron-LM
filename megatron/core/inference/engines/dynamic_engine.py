@@ -1852,23 +1852,9 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    def _update_request_resolution_mode_state(self) -> None:
-        """Update context flags used by request resolution mode routing.
-
-        Args:
-            None.
-
-        Returns:
-            None: This method updates context routing flags in place.
-        """
-        self.context.request_update_has_waiting_requests = len(self.waiting_request_ids) > 0
-
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
-
-        Args:
-            None.
 
         Returns:
             A tuple comprised of:
@@ -1884,7 +1870,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # schedule requests
         self.schedule_waiting_requests()
-        self._update_request_resolution_mode_state()
+        self.context.request_update_has_waiting_requests = len(self.waiting_request_ids) > 0
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

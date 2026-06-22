@@ -2087,18 +2087,6 @@ class TextGenerationController:
         self._dynamic_step_sample_logits()
         range_pop()
 
-    def _ensure_decode_forward_primed(self) -> None:
-        """Run an initial decode forward when no sampled logits are ready.
-
-        Args:
-            None.
-
-        Returns:
-            None: This method updates `self._decode_forward_primer` in place.
-        """
-        if not self._decode_forward_primer.is_primed:
-            self._decode_forward_primer.mark_primed(self._forward_prepared_requests())
-
     def _build_decode_step_result(
         self,
         sampled_step: SampledStep,
@@ -2141,7 +2129,8 @@ class TextGenerationController:
             sampled forward and the validated sampled-step update.
         """
         with torch.inference_mode():
-            self._ensure_decode_forward_primed()
+            if not self._decode_forward_primer.is_primed:
+                self._decode_forward_primer.mark_primed(self._forward_prepared_requests())
 
         await asyncio.sleep(0)
 
