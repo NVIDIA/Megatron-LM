@@ -2128,14 +2128,17 @@ class TextGenerationController:
         ret.update(resolve_result or {})
         return ret
 
-    async def _run_serial_decode_step(self) -> Dict:
-        """Run one eligible serial decode step through split request primitives.
+    async def _prime_forward_and_sample(
+        self, mode: AsyncSchedulingMode
+    ) -> Tuple[Optional[int], SampledStep]:
+        """Prime decode logits, sample them, and build the sampled-step update.
 
         Args:
-            None.
+            mode (AsyncSchedulingMode): Split decode mode being run.
 
         Returns:
-            Dict: Engine-facing dynamic generation step result.
+            Tuple[Optional[int], SampledStep]: CUDA graph request count for the
+            sampled forward and the validated sampled-step update.
         """
         with torch.inference_mode():
             self._ensure_decode_forward_primed()
@@ -2147,9 +2150,24 @@ class TextGenerationController:
             self._sample_current_logits()
             sampled_step = self._build_request_update()
             self._raise_if_decode_request_update_unsupported(
-                AsyncSchedulingMode.SERIAL, sampled_step.prepared_update
+                mode, sampled_step.prepared_update
             )
+            return cuda_graph_request_count, sampled_step
 
+    async def _run_serial_decode_step(self) -> Dict:
+        """Run one eligible serial decode step through split request primitives.
+
+        Args:
+            None.
+
+        Returns:
+            Dict: Engine-facing dynamic generation step result.
+        """
+        cuda_graph_request_count, sampled_step = await self._prime_forward_and_sample(
+            AsyncSchedulingMode.SERIAL
+        )
+
+        with torch.inference_mode():
             resolve_result = self._resolve_sampled_step(sampled_step)
             sampled_step = self._prepare_sampled_step(
                 sampled_step, filter_response_bookkeeping=False
@@ -2173,19 +2191,11 @@ class TextGenerationController:
         Returns:
             Dict: Engine-facing dynamic generation step result.
         """
+        cuda_graph_request_count, sampled_step = await self._prime_forward_and_sample(
+            AsyncSchedulingMode.ASYNC
+        )
+
         with torch.inference_mode():
-            self._ensure_decode_forward_primed()
-
-        await asyncio.sleep(0)
-
-        with torch.inference_mode():
-            cuda_graph_request_count = self._decode_forward_primer.cuda_graph_request_count
-            self._sample_current_logits()
-            sampled_step = self._build_request_update()
-            self._raise_if_decode_request_update_unsupported(
-                AsyncSchedulingMode.ASYNC, sampled_step.prepared_update
-            )
-
             sampled_step = self._prepare_sampled_step(
                 sampled_step, filter_response_bookkeeping=True
             )
