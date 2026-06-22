@@ -3829,10 +3829,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             log_probs = self._processed_log_probs(
-                logits_squeezed[seq_idx],
-                n_active,
-                None,
-                sampling,
+                logits_squeezed[seq_idx], n_active, None, sampling
             )
             selected_log_probs = log_probs[seq_idx, new_tokens]
             return [[lp] for lp in selected_log_probs.tolist()], log_probs
