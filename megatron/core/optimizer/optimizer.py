@@ -96,8 +96,37 @@ def _multi_tensor_copy_this_to_that(
 
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 MTP_GRAD_NORM_GROUP = 'mtp'
+GDN_GRAD_NORM_GROUP = 'gated_delta_net'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
-SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
+
+# Parameters tagged with one of these groups are excluded from the *global* gradient
+# norm and clipped independently against their own group norm. This isolates
+# pathological-gradient parameters -- e.g. a GatedDeltaNet ``in_proj`` whose gradient
+# is empirically several orders of magnitude larger than every other tensor -- so that
+# a single exploding tensor cannot dominate the global clip coefficient and starve
+# (drive toward zero the update of) every other parameter. The mechanism behind the
+# large in_proj gradient is under separate investigation; this isolation is
+# cause-agnostic and only relies on the observed magnitude.
+#
+# The registry must stay globally consistent: it is iterated to issue per-group
+# collectives, so every rank has to hold the same groups in the same order. Keep
+# group names as module-level constants registered at import time, or call
+# ``register_grad_norm_group`` from model-construction code that runs on all ranks.
+SEPARATE_GRAD_NORM_GROUPS = [MTP_GRAD_NORM_GROUP, GDN_GRAD_NORM_GROUP]
+
+
+def register_grad_norm_group(name: str) -> str:
+    """Register ``name`` as a separate gradient-norm group (idempotent).
+
+    Tag parameters with ``param.grad_norm_group = name`` to have every optimizer
+    variant exclude them from the main grad norm and clip them against their own
+    group norm. Must be called identically on all ranks (e.g. at model
+    construction) so the per-group collectives issued in
+    ``_compute_grad_norms_by_group`` stay aligned across ranks.
+    """
+    if name not in SEPARATE_GRAD_NORM_GROUPS:
+        SEPARATE_GRAD_NORM_GROUPS.append(name)
+    return name
 
 
 def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
@@ -109,8 +138,8 @@ def _validate_grad_norm_group(grad_norm_group: str) -> None:
     """Raise if the grad-norm group is not registered for separate clipping."""
     if grad_norm_group not in SEPARATE_GRAD_NORM_GROUPS:
         raise ValueError(
-            f"Unknown grad_norm_group '{grad_norm_group}'. Register it in "
-            "SEPARATE_GRAD_NORM_GROUPS before tagging parameters with it."
+            f"Unknown grad_norm_group '{grad_norm_group}'. Register it with "
+            "register_grad_norm_group() before tagging parameters with it."
         )
 
 

@@ -165,6 +165,17 @@ class GatedDeltaNet(MegatronModule):
             name=(name + ".in_proj") if name is not None else None,
         )
 
+        if getattr(self.config, "gated_delta_net_separate_grad_norm", False):
+            # Isolate in_proj grads from the global grad-norm clip: in_proj's
+            # gradient is empirically orders of magnitude larger than other tensors,
+            # which would otherwise dominate the global clip coefficient and starve
+            # every other parameter. Clip it against its own norm via a dedicated
+            # grad-norm group. (Exact cause of the large gradient is under separate
+            # investigation; this isolation is cause-agnostic.) Mirrors the MTP idiom;
+            # literal kept in sync with optimizer.optimizer.GDN_GRAD_NORM_GROUP.
+            for param in self.in_proj.parameters():
+                param.grad_norm_group = 'gated_delta_net'
+
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size

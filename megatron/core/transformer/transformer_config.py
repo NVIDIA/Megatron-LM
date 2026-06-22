@@ -86,6 +86,14 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    gated_delta_net_separate_grad_norm: bool = False
+    """If True, isolate GatedDeltaNet ``in_proj`` gradients into their own grad-norm
+    group: they are excluded from the global gradient-norm clip and clipped against
+    their own norm instead. in_proj's gradient is empirically orders of magnitude
+    larger than other tensors; left in the global norm it dominates the clip
+    coefficient and starves (freezes) every other parameter. (Exact cause under
+    investigation; the isolation is cause-agnostic.) Default off."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
