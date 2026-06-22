@@ -1517,7 +1517,7 @@ def validate_args(args, defaults={}):
         args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'
     ), (
         "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+        "Use --cross-entropy-fusion-impl native or liger, or omit --cross-entropy-loss-fusion."
     )
 
     # Deterministic mode

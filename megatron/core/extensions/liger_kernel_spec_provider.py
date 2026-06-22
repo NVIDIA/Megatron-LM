@@ -5,6 +5,11 @@ This is a thin extension over ``LocalSpecProvider`` that swaps Liger
 implementations into select slots. Currently overrides only ``layer_norm``
 (returns Liger's RMSNorm); other slots inherit the local defaults. The
 provider is enabled via ``use_liger=True`` in ``get_gpt_layer_local_submodules``.
+
+Cross-entropy is wired through the existing ``cross_entropy_fusion_impl``
+config field (``'native' | 'te' | 'liger'``) and lives outside the spec
+system; this provider does not configure it. See
+``megatron/core/fusions/liger_cross_entropy.py``.
 """
 from __future__ import annotations
 
@@ -27,8 +32,11 @@ class LigerSpecProvider(LocalSpecProvider):
 
     Inherits all defaults from ``LocalSpecProvider``; currently overrides only
     ``layer_norm`` to return ``LigerMegatronRMSNorm`` when ``rms_norm=True``.
-    As more Liger kernels are integrated (RoPE, SwiGLU MLP, fused linear
-    cross-entropy), this provider will gain the corresponding overrides.
+    Cross-entropy is selected separately via
+    ``TransformerConfig.cross_entropy_fusion_impl='liger'`` (with
+    ``cross_entropy_loss_fusion=True``). As more Liger kernels are integrated
+    (RoPE, SwiGLU MLP, fused linear cross-entropy), this provider will gain
+    the corresponding overrides.
     """
 
     def __init__(self) -> None:
