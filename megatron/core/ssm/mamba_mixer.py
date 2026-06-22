@@ -520,10 +520,19 @@ class MambaMixer(MegatronModule):
         # (just buffers, existing data is overwritten)
         int_conv_state = None
         int_ssm_state = None
+        immediate_state_update = False
+        factorized_state_rollback = False
+        factor_dx = factor_B = factor_alpha = None
         if context.num_speculative_tokens > 0:
             int_conv_state, int_ssm_state = context.mamba_states_cache(
                 self.layer_number - self.pp_layer_offset, intermediate=True
             )
+            immediate_state_update = context.mamba_immediate_free_token_state_update
+            factorized_state_rollback = context.mamba_factorized_state_rollback
+            if factorized_state_rollback:
+                factor_dx, factor_B, factor_alpha = context.mamba_factor_cache(
+                    self.layer_number - self.pp_layer_offset
+                )
 
         padded_dims = context.padded_batch_dimensions
         token_count = padded_dims.token_count
@@ -554,6 +563,11 @@ class MambaMixer(MegatronModule):
                 batch_indices=context.mamba_metadata.batch_indices_decode,
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
+                immediate_state_update=immediate_state_update,
+                factorized_state_rollback=factorized_state_rollback,
+                factor_dx=factor_dx,
+                factor_B=factor_B,
+                factor_alpha=factor_alpha,
             )
 
             # Flatten back to [N*S, 1, d] to match merge logic
@@ -1107,6 +1121,11 @@ class MambaMixer(MegatronModule):
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        immediate_state_update: bool = False,
+        factorized_state_rollback: bool = False,
+        factor_dx: Optional[torch.Tensor] = None,
+        factor_B: Optional[torch.Tensor] = None,
+        factor_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -1164,6 +1183,7 @@ class MambaMixer(MegatronModule):
                 self.activation,
                 conv_state_indices=batch_indices,
                 intermediate_conv_states=intermediate_conv_state,
+                immediate_state_update=immediate_state_update,
             ).to(xBC_dtype)
 
         x, B, C = torch.split(
@@ -1238,9 +1258,31 @@ class MambaMixer(MegatronModule):
         else:
             A = self._get_decode_A_neg_exp()
 
-            # Incorporate sequence dimension in einops rearrengements
-            dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+            if factorized_state_rollback:
+                # The fused factor store + single-GEMM reconstruction require a per-head
+                # scalar decay alpha_h = exp(A_h * delta) (Mamba-2 / TIE_HDIM). `A` is
+                # already a stride-0 per-head expand; dt/dt_bias are broadcast the same way
+                # below so the SSU kernel takes the TIE_HDIM scalar path and emits the
+                # rank-1 factors (dx = delta * x, alpha = exp(A * delta), B) directly.
+                assert A.stride(-1) == 0 and A.stride(-2) == 0, (
+                    "mamba_factorized_state_rollback requires a per-head scalar A "
+                    "(Mamba-2 / TIE_HDIM); got a non-scalar A, which would break the "
+                    "single-GEMM state reconstruction."
+                )
+                assert (
+                    factor_dx is not None and factor_B is not None and factor_alpha is not None
+                ), "Factorized rollback enabled but factor buffers were not provided"
+
+            # Incorporate sequence dimension in einops rearrengements. In the factorized
+            # path, broadcast dt/dt_bias with stride-0 expands (rather than materializing
+            # via repeat) so the kernel runs the TIE_HDIM per-head-scalar path required by
+            # the factor store.
+            if factorized_state_rollback:
+                dt = dt.unsqueeze(-1).expand(-1, -1, -1, self.headdim)
+                dt_bias = self.dt_bias.unsqueeze(-1).expand(-1, self.headdim)
+            else:
+                dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
+                dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
             D = repeat(self.D, "h -> h p", p=self.headdim)
             B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
             C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
@@ -1260,7 +1302,19 @@ class MambaMixer(MegatronModule):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=batch_indices,
-                intermediate_ssm_states=intermediate_ssm_state,  # SSM only
+                # In factorized mode the live SSM state is reconstructed from the stored
+                # rank-1 factors at rewind, so the kernel neither checkpoints intermediate
+                # states nor writes the live state during the decode forward pass.
+                intermediate_ssm_states=(
+                    None if factorized_state_rollback else intermediate_ssm_state
+                ),
+                immediate_state_update=(
+                    False if factorized_state_rollback else immediate_state_update
+                ),
+                skip_state_write=factorized_state_rollback,
+                factor_dx=factor_dx if factorized_state_rollback else None,
+                factor_B=factor_B if factorized_state_rollback else None,
+                factor_alpha=factor_alpha if factorized_state_rollback else None,
             )
             y = rearrange(y, "b s h p -> b s (h p)")
 

@@ -67,6 +67,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    mamba_state_factorized_rollback,
     mamba_state_selective_copy,
     prepare_next_forward_pass,
     verify_speculative_tokens,
@@ -842,6 +843,7 @@ class TextGenerationController:
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
+            # Conv state rollback (full-window checkpoint copy; immediate-free-token aware).
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -849,15 +851,32 @@ class TextGenerationController:
                 state_idx=mamba_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
+                immediate_state_update=context.mamba_immediate_free_token_state_update,
             )
-            mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_ssm_states,
-                current_states=context.mamba_ssm_states,
-                prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
-                accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
-            )
+            # SSM state rollback: fused rank-1 reconstruction from stored factors, or the
+            # full intermediate-state copy when factorization is disabled.
+            if context.mamba_factorized_state_rollback:
+                mamba_state_factorized_rollback(
+                    factor_dx=context.mamba_factor_dx,
+                    factor_B=context.mamba_factor_B,
+                    factor_alpha=context.mamba_factor_alpha,
+                    current_states=context.mamba_ssm_states,
+                    prefill_status=prefill_status_gpu,
+                    state_idx=mamba_state_idx,
+                    accepted_counts=accepted_counts_gpu,
+                    num_layers=context.num_mamba_layers,
+                    nheads_per_group=context.mamba_nheads_per_group,
+                )
+            else:
+                mamba_state_selective_copy(
+                    intermediate_states=context.mamba_intermediate_ssm_states,
+                    current_states=context.mamba_ssm_states,
+                    prefill_status=prefill_status_gpu,
+                    state_idx=mamba_state_idx,
+                    accepted_counts=accepted_counts_gpu,
+                    num_layers=context.num_mamba_layers,
+                    immediate_state_update=context.mamba_immediate_free_token_state_update,
+                )
 
         return blocks_to_release, remove_mask
 

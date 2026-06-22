@@ -314,6 +314,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"block_size_tokens ({inference_config.block_size_tokens})"
         )
 
+        # Mamba speculative decoding: when enabled, the guaranteed-accepted free token
+        # (speculative position 0) is written straight into the live Mamba state, so the
+        # intermediate (rollback) buffers only need to checkpoint the drafted tokens — one
+        # fewer slot than the full verification window.
+        self.mamba_immediate_free_token_state_update = (
+            inference_config.mamba_immediate_free_token_state_update
+        )
+        self.num_mamba_intermediate_states = (
+            self.num_speculative_tokens
+            if self.mamba_immediate_free_token_state_update
+            else self.num_speculative_tokens + 1
+        )
+        # Factorized SSM rollback: store rank-1 factors (dx, B, alpha) of each per-step SSM
+        # update instead of full intermediate states, and reconstruct the accepted state at
+        # rewind via a fused GEMM. Affects only the SSM state; the conv intermediate (sized by
+        # num_mamba_intermediate_states above) is unchanged.
+        self.mamba_factorized_state_rollback = inference_config.mamba_factorized_state_rollback
+
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
         # Otherwise:
@@ -419,21 +437,52 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
+            # Infer the (TP-local) number of SSM groups from the conv/ssm shapes:
+            #   conv_dim = d_inner + 2*ngroups*d_state, with d_inner = nheads*headdim.
+            _nheads, _headdim, _dstate = self.mamba_ssm_states_shape
+            _bc = self.mamba_conv_states_shape[0] - _nheads * _headdim
+            assert _bc > 0 and _bc % (2 * _dstate) == 0, (
+                f"Cannot infer ngroups from conv_dim={self.mamba_conv_states_shape[0]}, "
+                f"nheads={_nheads}, headdim={_headdim}, dstate={_dstate}"
+            )
+            self.mamba_ngroups_local = _bc // (2 * _dstate)
+            assert _nheads % self.mamba_ngroups_local == 0
+            self.mamba_nheads_per_group = _nheads // self.mamba_ngroups_local
+
+            conv_bytes_per_layer = (
                 math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
             )
-            mamba_states_memory_per_request += (
+            ssm_bytes_per_layer = (
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request += (
+                conv_bytes_per_layer + ssm_bytes_per_layer
+            ) * self.num_mamba_layers
             if self.num_speculative_tokens > 0:
-                # Add memory for intermediate conv and SSM states
+                # Conv intermediate (checkpointed full conv windows).
                 intermediate_memory_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                    conv_bytes_per_layer
+                    * self.num_mamba_layers
+                    * self.num_mamba_intermediate_states
                 )
-                intermediate_memory_per_request *= self.num_mamba_layers
-                intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                if self.mamba_factorized_state_rollback:
+                    # SSM intermediate stored as rank-1 factors over the full speculative
+                    # window (free token + drafts): dx/B at the SSM-state precision, alpha
+                    # (scalar/head) in fp32.
+                    _ssm_itemsize = self.mamba_ssm_states_dtype.itemsize
+                    _factor_bytes = (
+                        (_nheads * _headdim + self.mamba_ngroups_local * _dstate) * _ssm_itemsize
+                        + _nheads * 4
+                    )
+                    intermediate_memory_per_request += (
+                        _factor_bytes * self.num_mamba_layers * (self.num_speculative_tokens + 1)
+                    )
+                else:
+                    intermediate_memory_per_request += (
+                        ssm_bytes_per_layer
+                        * self.num_mamba_layers
+                        * self.num_mamba_intermediate_states
+                    )
                 mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
@@ -773,11 +822,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
 
             if self.num_speculative_tokens > 0:
-                spec_multiplier = self.num_speculative_tokens + 1
-                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                conv_int_bytes = mamba_conv_bytes * self.num_mamba_intermediate_states
+                if self.mamba_factorized_state_rollback:
+                    _ne, _he, _ds = self.mamba_ssm_states_shape
+                    _fb = (
+                        (_ne * _he + self.mamba_ngroups_local * _ds)
+                        * self.mamba_ssm_states_dtype.itemsize
+                        + _ne * 4
+                    )
+                    ssm_int_bytes = _fb * self.num_mamba_layers * (self.num_speculative_tokens + 1)
+                    spec_label = "factorized rank-1 factors"
+                else:
+                    ssm_int_bytes = mamba_ssm_bytes * self.num_mamba_intermediate_states
+                    spec_label = "full intermediate states"
+                spec_bytes_per_req = conv_int_bytes + ssm_int_bytes
                 spec_total_bytes = spec_bytes_per_req * self.max_requests
                 log_lines += [
-                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"  Mamba speculative buffers ({spec_label}, "
+                    f"num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
                     f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
                 ]
@@ -889,22 +951,52 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         self.num_mamba_layers,
                         self.max_requests,
-                        self.num_speculative_tokens + 1,
+                        self.num_mamba_intermediate_states,
                         *self.mamba_conv_states_shape,
                     ),
                     dtype=self.mamba_conv_states_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_intermediate_ssm_states = torch.empty(
-                    (
-                        self.num_mamba_layers,
-                        self.max_requests,
-                        self.num_speculative_tokens + 1,
-                        *self.mamba_ssm_states_shape,
-                    ),
-                    dtype=self.mamba_ssm_states_dtype,
-                    device=torch.cuda.current_device(),
-                )
+                if self.mamba_factorized_state_rollback:
+                    # Rank-1 SSM factors (fp32) over the full speculative window
+                    # (free token + drafts); replaces the full intermediate SSM buffer.
+                    nheads, headdim, dstate = self.mamba_ssm_states_shape
+                    factor_window = self.num_speculative_tokens + 1
+                    # dx and B factors are stored at the SSM-state precision (e.g. bf16);
+                    # the scalar per-head decay alpha is kept in fp32 (its products over
+                    # the window scale the persistent state and are precision-sensitive).
+                    self.mamba_factor_dx = torch.empty(
+                        (self.num_mamba_layers, self.max_requests, factor_window, nheads, headdim),
+                        dtype=self.mamba_ssm_states_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                    self.mamba_factor_B = torch.empty(
+                        (
+                            self.num_mamba_layers,
+                            self.max_requests,
+                            factor_window,
+                            self.mamba_ngroups_local,
+                            dstate,
+                        ),
+                        dtype=self.mamba_ssm_states_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                    self.mamba_factor_alpha = torch.empty(
+                        (self.num_mamba_layers, self.max_requests, factor_window, nheads),
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    )
+                else:
+                    self.mamba_intermediate_ssm_states = torch.empty(
+                        (
+                            self.num_mamba_layers,
+                            self.max_requests,
+                            self.num_mamba_intermediate_states,
+                            *self.mamba_ssm_states_shape,
+                        ),
+                        dtype=self.mamba_ssm_states_dtype,
+                        device=torch.cuda.current_device(),
+                    )
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
@@ -925,12 +1017,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                             self.mamba_intermediate_conv_states, device="cpu"
                         ).pin_memory()
                     )
-                    self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
-                    self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
-                        torch.empty_like(
-                            self.mamba_intermediate_ssm_states, device="cpu"
-                        ).pin_memory()
-                    )
+                    if self.mamba_factorized_state_rollback:
+                        for _fname in ("mamba_factor_dx", "mamba_factor_B", "mamba_factor_alpha"):
+                            self._offloadable_tensor_names.add(_fname)
+                            self._offloadable_cpu_backups[_fname] = torch.empty_like(
+                                getattr(self, _fname), device="cpu"
+                            ).pin_memory()
+                    else:
+                        self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
+                        self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
+                            torch.empty_like(
+                                self.mamba_intermediate_ssm_states, device="cpu"
+                            ).pin_memory()
+                        )
         else:
             self.mamba_metadata = None
 
@@ -1659,12 +1758,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
             conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
-            ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
+            # When the SSM rollback is factorized, there is no full intermediate SSM buffer.
+            ssm_state = (
+                None
+                if self.mamba_factorized_state_rollback
+                else self.mamba_intermediate_ssm_states[mamba_layer_number]
+            )
         else:
             conv_state = self.mamba_conv_states[mamba_layer_number]
             ssm_state = self.mamba_ssm_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
+
+    def mamba_factor_cache(self, layer_number: int) -> Tuple[Tensor, Tensor, Tensor]:
+        """Returns the per-layer rank-1 SSM rollback factor buffers ``(dx, B, alpha)``.
+
+        Only valid when ``mamba_factorized_state_rollback`` is enabled.
+        """
+        assert self.is_hybrid_model and self.mamba_factorized_state_rollback
+        mamba_layer_number = self.layer_map[layer_number - 1]
+        return (
+            self.mamba_factor_dx[mamba_layer_number],
+            self.mamba_factor_B[mamba_layer_number],
+            self.mamba_factor_alpha[mamba_layer_number],
+        )
 
     # =========================================================================
     # Mamba prefix cache infrastructure

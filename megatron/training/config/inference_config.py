@@ -164,6 +164,20 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    mamba_immediate_free_token_state_update: bool = False
+    """For Mamba speculative decoding: write the guaranteed-accepted free token (speculative
+    position 0) state directly into the live Mamba state during the decode forward pass instead of
+    checkpointing it, shrinking the intermediate Mamba state buffers by one slot. Requires
+    ``state_len == d_conv`` (holds for Mamba-2). Mirrors
+    ``--mamba-immediate-free-token-state-update``."""
+
+    mamba_factorized_state_rollback: bool = False
+    """For Mamba speculative decoding: store the rank-1 factors (dx=delta*x, B, alpha) of each
+    per-step SSM update instead of the full intermediate SSM state, and reconstruct the accepted
+    state at rewind with a single fused GEMM. Shrinks the intermediate SSM buffer ~100x. Only
+    affects the SSM state (conv is untouched). Requires a per-head scalar A (Mamba-2 / TIE_HDIM).
+    Mirrors ``--mamba-factorized-state-rollback``."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -362,6 +376,8 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
+            mamba_immediate_free_token_state_update=self.mamba_immediate_free_token_state_update,
+            mamba_factorized_state_rollback=self.mamba_factorized_state_rollback,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,

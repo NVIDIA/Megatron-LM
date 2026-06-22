@@ -237,13 +237,25 @@ def prepare_next_forward_pass(
 
 
 def mamba_state_selective_copy(
-    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
+    intermediate_states,
+    current_states,
+    prefill_status,
+    state_idx,
+    accepted_counts,
+    num_layers,
+    immediate_state_update=False,
 ):
     """Mamba speculative rewind state update.
 
     For each decode request, copies
     `intermediate[layer, slot, accepted_count, ...]` →
     `current[layer, slot, ...]` for every Mamba layer.
+
+    When ``immediate_state_update`` is True, the free token (speculative position
+    0) was already persisted to ``current_states`` during the forward pass and
+    ``intermediate_states`` only holds the drafted tokens, so the copy targets
+    ``intermediate[accepted_count - 1]`` and is skipped when no drafted token was
+    accepted (``accepted_count == 0``).
     """
     N = prefill_status.shape[0]
     for i in range(N):
@@ -251,5 +263,57 @@ def mamba_state_selective_copy(
             continue
         slot = state_idx[i].item()
         accepted = accepted_counts[i].item()
+        if immediate_state_update:
+            if accepted == 0:
+                continue
+            spec_index = accepted - 1
+        else:
+            spec_index = accepted
         for layer in range(num_layers):
-            current_states[layer, slot] = intermediate_states[layer, slot, accepted]
+            current_states[layer, slot] = intermediate_states[layer, slot, spec_index]
+
+
+def mamba_state_factorized_rollback(
+    factor_dx,
+    factor_B,
+    factor_alpha,
+    current_states,
+    prefill_status,
+    state_idx,
+    accepted_counts,
+    num_layers,
+    nheads_per_group,
+):
+    """Reference for the fused factorized SSM rollback (rank-1 reconstruction).
+
+    Mirrors ``mamba_state_factorized_rollback`` (Triton). For each decode request,
+    reconstructs the accepted SSM state from the stored rank-1 update factors:
+
+        S_new = (prod_{i=0}^{m} alpha_i) * S_prev
+                + sum_{t=0}^{m} (prod_{i=t+1}^{m} alpha_i) * (dx_t (outer) B_t)
+
+    over window positions ``0..m`` where ``m = accepted_counts[req]``.
+    """
+    N = prefill_status.shape[0]
+    window = factor_dx.shape[2]
+    nheads = current_states.shape[2]
+    for i in range(N):
+        if int(prefill_status[i].item()) == 1:
+            continue
+        slot = int(state_idx[i].item())
+        if slot < 0:
+            continue
+        m = int(accepted_counts[i].item())
+        for layer in range(num_layers):
+            for h in range(nheads):
+                g = h // nheads_per_group
+                acc = torch.zeros_like(current_states[layer, slot, h], dtype=torch.float32)
+                c = 1.0
+                for t in range(window - 1, -1, -1):
+                    if t <= m:
+                        dxt = factor_dx[layer, slot, t, h].to(torch.float32)
+                        bt = factor_B[layer, slot, t, g].to(torch.float32)
+                        acc = acc + c * torch.outer(dxt, bt)
+                        c = c * float(factor_alpha[layer, slot, t, h].item())
+                h_old = current_states[layer, slot, h].to(torch.float32)
+                current_states[layer, slot, h] = (c * h_old + acc).to(current_states.dtype)
