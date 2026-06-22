@@ -216,6 +216,11 @@ class GroupedRolloutGenerator(Agent, ABC):
         consume_at_batch_granularity = (
             request.consumption_granularity == "B"
         )
+        # TODO: Refactor to better generalize submission gate release timing.
+        release_gate_at_inference_finish = (
+            request.submission_granularity == "G"
+            and request.consumption_granularity == "B"
+        )
         assert request.consumption_granularity != "R", \
             "Rollout consumption granularity is not currently supported."
         assert not (
@@ -265,10 +270,14 @@ class GroupedRolloutGenerator(Agent, ABC):
                         generate_and_enqueue(batch_id, i)
                         for i in range(groups_per_worker)
                     ])
+                    if release_gate_at_inference_finish:
+                        submission_gate.release()
                 else:
                     if consume_at_batch_granularity:
                         while not await generate_and_enqueue(batch_id, 0):
                             pass
+                        if release_gate_at_inference_finish:
+                            submission_gate.release()
                     elif not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
                         if not submit_at_rollout_granularity:
@@ -304,7 +313,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                         next_batch_id += 1
                         for g in batch:
                             yield g
-                        if not submit_at_rollout_granularity:
+                        if (
+                            not submit_at_rollout_granularity
+                            and not release_gate_at_inference_finish
+                        ):
                             submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
