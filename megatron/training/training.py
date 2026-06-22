@@ -2517,7 +2517,10 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
+    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
+        learning_rate, group=_lr_mp_group
+    )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
@@ -2758,7 +2761,10 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
-            report_memory(f'(after {iteration} iterations)')
+            report_memory(
+                f'(after {iteration} iterations)',
+                group=pg_collection.dp if pg_collection is not None else None,
+            )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
             if iteration > (loaded_iteration + 1):
@@ -2766,7 +2772,10 @@ def training_log(
                 report_memory_flag = False
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
-            report_memory(f'(after {iteration} iterations)')
+            report_memory(
+                f'(after {iteration} iterations)',
+                group=pg_collection.dp if pg_collection is not None else None,
+            )
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -3210,6 +3219,18 @@ def train(
 
             args.no_load_optim = no_load_optim
 
+    # Resolve the language-model process groups when a hetero MultiModule collection
+    # is passed; None for stock single-module runs, which fall back to the global
+    # mpu groups below (byte-identical behavior).
+    lang_pgc = (
+        schedule_pg_collection.get_language_model_collection()
+        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
+        else None
+    )
+
+    def _dp_world_size():
+        return lang_pgc.dp.size() if lang_pgc is not None else mpu.get_data_parallel_world_size()
+
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
@@ -3225,7 +3246,7 @@ def train(
             rank=args.rank,
             global_batch_size=args.global_batch_size,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_size=_dp_world_size(),
             decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
             step_batch_size_schedule=args.step_batch_size_schedule,
             seq_length=args.seq_length,
@@ -3544,7 +3565,7 @@ def train(
                 start_iteration = iteration + 1
             iteration += 1
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
@@ -3671,12 +3692,12 @@ def train(
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_bins += bin_count
         else:
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             iteration_sequences = batch_size
 
