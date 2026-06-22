@@ -7,11 +7,11 @@ import random
 import time
 import warnings
 from datetime import timedelta
-from typing import Callable
+from typing import Callable, Protocol
 
 import numpy as np
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
-from megatron.training.config.container import PretrainConfigContainer
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.training.utils.common_utils import get_local_rank_preinit
 import torch
 import torch.nn.functional as F
@@ -42,15 +42,42 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.config import DistributedInitConfig, RNGConfig, RerunStateMachineConfig
+from megatron.training.config import (
+    CheckpointConfig,
+    DistributedInitConfig,
+    LoggerConfig,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    TrainingConfig,
+)
 from megatron.training.models import HybridModelConfig, GPTModelConfig
 from megatron.training.utils.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
+class InitializeConfig(Protocol):
+    """Sub-configs ``initialize_megatron`` reads, as a structural type.
+
+    Any container exposing these fields satisfies the protocol via duck typing,
+    so ``initialize_megatron`` stays generic over the workload (pretraining,
+    inference, etc.) rather than tied to a concrete container.
+    """
+
+    model: HybridModelConfig | GPTModelConfig
+    dist: DistributedInitConfig
+    rng: RNGConfig
+    rerun_state_machine: RerunStateMachineConfig
+    train: TrainingConfig
+    logger: LoggerConfig
+    checkpoint: CheckpointConfig
+    profiling: ProfilingConfig | None
+    ddp: DistributedDataParallelConfig
+
+
 def initialize_megatron(
-    cfg: PretrainConfigContainer,
+    cfg: InitializeConfig,
     allow_no_cuda: bool = False,
     skip_mpu_initialization: bool = False,
     get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
@@ -63,7 +90,9 @@ def initialize_megatron(
     configures microbatch calculator, and sets random seeds.
 
     Args:
-        cfg: The main configuration container.
+        cfg: A configuration container exposing the sub-configs required for
+            initialization (see ``InitializeConfig``); e.g. a
+            ``PretrainConfigContainer`` for pretraining.
         allow_no_cuda: If True, allows initialization without CUDA. Should not
             be set unless using megatron for cpu only data processing. In
             general this arg should not be set unless you know what you are doing.
