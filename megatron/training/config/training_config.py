@@ -567,6 +567,25 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_pg_tensors_cache_path: Optional[str] = None
+    """Directory of the parallelization-group distribution cache for fully parallel
+    save/load of distributed checkpoints. When set, the expensive
+    ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
+    replaced by a single per-group file read (the load and save distributions are
+    loaded from this directory). Only safe when the config and world size match the
+    run that created the cache (see ``--ckpt-fsdp-dtensor-cache-create``); no
+    existence/validity checks are performed, for the lowest possible latency.
+    Default (None) preserves the original collective-based behaviour."""
+
+    ckpt_pg_tensors_cache_create: bool = False
+    """Create (rather than read) the parallelization-group distribution cache at
+    ``--ckpt-pg-tensors-cache-path``. Set this for a single run with a matching
+    config/world size: the collective runs as usual but both the save and load
+    distributions are derived from that single gather and written to disk, one
+    file per parallelization group. Subsequent runs set only
+    ``--ckpt-pg-tensors-cache-path`` (leave this False) to skip the collective.
+    Default: False."""
+
     ckpt_load_validate_sharding_integrity: bool = True
     """Whether to validate sharding access integrity when loading a distributed checkpoint.
     When True (default), each tensor shard is checked to be accessed exactly once as main
