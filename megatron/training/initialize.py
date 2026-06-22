@@ -10,19 +10,18 @@ from datetime import timedelta
 from typing import Callable, Protocol
 
 import numpy as np
-from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.training.utils.common_utils import get_local_rank_preinit
 import torch
 import torch.nn.functional as F
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.parallel_state import create_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -33,7 +32,13 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version, get_pg_rank, configure_nvtx_profiling
+from megatron.core.utils import (
+    configure_nvtx_profiling,
+    get_pg_rank,
+    get_te_version,
+    is_te_min_version,
+    is_torch_min_version,
+)
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -41,7 +46,6 @@ from megatron.training import (
     inprocess_restart,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -51,7 +55,9 @@ from megatron.training.config import (
     RNGConfig,
     TrainingConfig,
 )
-from megatron.training.models import HybridModelConfig, GPTModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig
+from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.utils.common_utils import get_local_rank_preinit
 from megatron.training.utils.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -893,8 +899,8 @@ def destroy_global_state() -> None:
     Cleans up resources used by microbatch calculator, global memory buffer,
     model parallel groups, and the rerun state machine.
     """
-    from megatron.core.rerun_state_machine import destroy_rerun_state_machine
     from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+    from megatron.core.rerun_state_machine import destroy_rerun_state_machine
 
     destroy_num_microbatches_calculator()
     mpu.destroy_global_memory_buffer()
