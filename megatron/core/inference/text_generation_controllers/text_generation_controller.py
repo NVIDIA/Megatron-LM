@@ -1931,7 +1931,10 @@ class TextGenerationController:
         return active_requests_mask.numel() > 0 and (active_requests_mask != 0).any().item()
 
     def _get_decode_request_update_unsupported_reason(
-        self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
+        self,
+        mode: AsyncSchedulingMode,
+        prepared_update: Optional[Dict] = None,
+        skip_bookkeeping: bool = False,
     ) -> Optional[str]:
         """Return the first reason a decode step cannot use the new update path.
 
@@ -1959,6 +1962,8 @@ class TextGenerationController:
                 validate.
             prepared_update (Optional[Dict]): Prepared request-update payload
                 when sampled-step data is already available.
+            skip_bookkeeping (bool): If true, reject split decode because the
+                split paths always update request bookkeeping.
 
         Returns:
             Optional[str]: First unsupported-feature reason, or `None` when the
@@ -1970,6 +1975,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         # Step 1: Check request-queue, stop-word, and controller speculative state.
+        if skip_bookkeeping:
+            return "skip_bookkeeping"
         if context.request_update_has_waiting_requests:
             return "waiting_requests"
         if active_request_count > 0 and context.request_has_stop_words[active_slice].any().item():
@@ -2019,7 +2026,10 @@ class TextGenerationController:
         return None
 
     def _raise_if_decode_request_update_unsupported(
-        self, mode: AsyncSchedulingMode, prepared_update: Optional[Dict] = None
+        self,
+        mode: AsyncSchedulingMode,
+        prepared_update: Optional[Dict] = None,
+        skip_bookkeeping: bool = False,
     ) -> None:
         """Raise a clear error when a requested new update mode is unsupported.
 
@@ -2041,6 +2051,8 @@ class TextGenerationController:
                 validate.
             prepared_update (Optional[Dict]): Prepared request-update payload
                 when sampled-step data is already available.
+            skip_bookkeeping (bool): If true, reject split decode because the
+                split paths always update request bookkeeping.
 
         Returns:
             None: This method raises `RuntimeError` when the requested mode is
@@ -2048,7 +2060,9 @@ class TextGenerationController:
         """
 
         # Step 1: Query the unsupported-feature reason.
-        reason = self._get_decode_request_update_unsupported_reason(mode, prepared_update)
+        reason = self._get_decode_request_update_unsupported_reason(
+            mode, prepared_update, skip_bookkeeping=skip_bookkeeping
+        )
         if reason is not None:
 
             # Step 2: Raise when a reason is present.
@@ -2189,10 +2203,10 @@ class TextGenerationController:
                 sampled_step, resolve_result, cuda_graph_request_count
             )
 
-    async def async_generate_output_tokens_dynamic_batch(
+    async def _run_legacy_dynamic_step(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
-        """Forward step the model and update the inference context.
+        """Run the preserved full-feature dynamic generation step.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
@@ -2208,23 +2222,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-
-        # No tokens and no active requests?
-        if context.active_token_count == 0 and active_request_count == 0:
-            self._decode_forward_primer.clear()
-            context.clear_pending_finished_rows()
-            return None
-
-        if not skip_bookkeeping:
-            mode = context.config.async_scheduling_mode
-            if mode != AsyncSchedulingMode.LEGACY and context.is_decode_only():
-                self._raise_if_decode_request_update_unsupported(mode)
-                if mode == AsyncSchedulingMode.SERIAL:
-                    return await self._run_serial_decode_step()
-                elif mode == AsyncSchedulingMode.ASYNC:
-                    return await self._run_async_decode_step()
-                else:
-                    raise AssertionError(f"Unexpected split decode mode: {mode}")
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -2353,6 +2350,46 @@ class TextGenerationController:
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return ret
+
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Returns:
+            (Optional[Dict]): A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # No tokens and no active requests?
+        if context.active_token_count == 0 and active_request_count == 0:
+            self._decode_forward_primer.clear()
+            context.clear_pending_finished_rows()
+            return None
+
+        mode = context.config.async_scheduling_mode
+        if mode == AsyncSchedulingMode.LEGACY or not context.is_decode_only():
+            return await self._run_legacy_dynamic_step(skip_bookkeeping)
+
+        self._raise_if_decode_request_update_unsupported(
+            mode, skip_bookkeeping=skip_bookkeeping
+        )
+        if mode == AsyncSchedulingMode.SERIAL:
+            return await self._run_serial_decode_step()
+        elif mode == AsyncSchedulingMode.ASYNC:
+            return await self._run_async_decode_step()
+        else:
+            raise AssertionError(f"Unexpected request-update mode: {mode}")
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

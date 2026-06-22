@@ -245,6 +245,41 @@ class TestAsyncSchedulingControllerHelpers:
         assert not primer.is_primed
         assert primer.cuda_graph_request_count is None
 
+    def test_dynamic_batch_routes_legacy_mode_to_legacy_step(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.LEGACY
+        context.active_token_count = 1
+        controller._run_legacy_dynamic_step = mock.AsyncMock(return_value={"path": "legacy"})
+        controller._run_serial_decode_step = mock.AsyncMock()
+        controller._run_async_decode_step = mock.AsyncMock()
+
+        result = asyncio.run(
+            controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+        )
+
+        assert result == {"path": "legacy"}
+        controller._run_legacy_dynamic_step.assert_awaited_once_with(True)
+        controller._run_serial_decode_step.assert_not_called()
+        controller._run_async_decode_step.assert_not_called()
+
+    def test_dynamic_batch_routes_non_decode_to_legacy_step_with_skip_bookkeeping(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.is_decode_only.return_value = False
+        context.active_token_count = 1
+        controller._run_legacy_dynamic_step = mock.AsyncMock(return_value={"path": "legacy"})
+        controller._run_serial_decode_step = mock.AsyncMock()
+        controller._run_async_decode_step = mock.AsyncMock()
+
+        result = asyncio.run(
+            controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+        )
+
+        assert result == {"path": "legacy"}
+        controller._run_legacy_dynamic_step.assert_awaited_once_with(True)
+        controller._run_serial_decode_step.assert_not_called()
+        controller._run_async_decode_step.assert_not_called()
+
     def test_dynamic_batch_routes_serial_decode_to_split_step(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
@@ -270,6 +305,23 @@ class TestAsyncSchedulingControllerHelpers:
         assert result == {"path": "async"}
         controller._run_serial_decode_step.assert_not_called()
         controller._run_async_decode_step.assert_awaited_once()
+
+    def test_dynamic_batch_rejects_skip_bookkeeping_for_split_decode(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.active_token_count = 1
+        controller._run_legacy_dynamic_step = mock.AsyncMock()
+        controller._run_serial_decode_step = mock.AsyncMock()
+        controller._run_async_decode_step = mock.AsyncMock()
+
+        with pytest.raises(RuntimeError, match="skip_bookkeeping"):
+            asyncio.run(
+                controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+            )
+
+        controller._run_legacy_dynamic_step.assert_not_called()
+        controller._run_serial_decode_step.assert_not_called()
+        controller._run_async_decode_step.assert_not_called()
 
     def test_dynamic_step_context_bookkeeping_uses_legacy_update(self):
         controller, context, _ = self._make_async_eligibility_controller()
