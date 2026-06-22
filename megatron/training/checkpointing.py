@@ -1716,7 +1716,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
-        with trace_region("Part1"):
+        with trace_region("prepare_load_state_dict"):
             ckpt_args = types.SimpleNamespace()
             if state_dict is not None and "args" in state_dict:
                 ckpt_args = state_dict.get("args")
@@ -1837,11 +1837,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if args.finetune and hasattr(model[0], "hide_loss_modules"):
                     for m in model:
                         stack.enter_context(m.hide_loss_modules())
-                load_kwargs['sharded_state_dict'] = generate_state_dict(
-                    args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
-                    optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
-                    rerun_state=gen_sd_rerun_state
-                )
+                with trace_region("generate_state_dict"):
+                    load_kwargs['sharded_state_dict'] = generate_state_dict(
+                        args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
+                        optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
+                        rerun_state=gen_sd_rerun_state
+                    )
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -1954,21 +1955,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
-    # Model.
-    if not skip_load_to_model_and_opt:
-        if len(ddp_model) == 1:
-            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
-        else:
-            for i in range(len(ddp_model)):
-                # If there is no corresponding model in the state_dict, it will be ignored.
-                # It means that this is an empty stage.
-                if 'model%d' % i not in state_dict:
-                    continue
-                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-    # Fix up query/key/value matrix ordering if needed.
-    checkpoint_version = get_checkpoint_version()
-    print_rank_0(f' checkpoint version {checkpoint_version}')
-    fix_query_key_value_ordering(model, checkpoint_version)
+    # Model. Copies the loaded tensors into the live model parameters (and runs
+    # any TransformerEngine `_extra_state` post-processing), which is a sizeable
+    # part of the post-`_load_base_checkpoint` tail.
+    with trace_region("load_state_dict_into_model"):
+        if not skip_load_to_model_and_opt:
+            if len(ddp_model) == 1:
+                load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            else:
+                for i in range(len(ddp_model)):
+                    # If there is no corresponding model in the state_dict, it will be ignored.
+                    # It means that this is an empty stage.
+                    if 'model%d' % i not in state_dict:
+                        continue
+                    load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+        # Fix up query/key/value matrix ordering if needed.
+        checkpoint_version = get_checkpoint_version()
+        print_rank_0(f' checkpoint version {checkpoint_version}')
+        fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
@@ -1980,7 +1984,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                with trace_region("load_optimizer_state"):
+                    optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -2080,9 +2085,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
-    # Some utilities want to load a checkpoint without distributed being initialized
+    # Some utilities want to load a checkpoint without distributed being initialized.
+    # This barrier also absorbs cross-rank load skew, so it can dominate the tail.
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        with trace_region("load_checkpoint_barrier"):
+            torch.distributed.barrier()
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
@@ -2094,7 +2101,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
        or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
-    torch.cuda.empty_cache()
+    with trace_region("empty_cache"):
+        torch.cuda.empty_cache()
 
     if iteration > 0:
         # Notify FT that a checkpoint was loaded.
