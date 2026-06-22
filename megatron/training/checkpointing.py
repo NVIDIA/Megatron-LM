@@ -684,6 +684,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         replicate_local_replicas=getattr(
                             args, 'ckpt_fully_parallel_save_replicate_local', False
                         ),
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_fsdp_dtensor_cache_create', False),
                     )
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -1283,7 +1285,11 @@ def _load_global_dist_base_checkpoint(
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_fsdp_dtensor_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
