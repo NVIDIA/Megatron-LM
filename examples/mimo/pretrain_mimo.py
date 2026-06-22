@@ -5,8 +5,8 @@
 Drives the Nemotron6-MoE VLM (20L) over the non-colocated path (encoder/language
 grids on disjoint rank spans) with mock data: replicates the non-MPU pieces of
 ``initialize_megatron``, feeds E4 ``build_mimo_runtime``'s model to ``train()``,
-re-keys ``data_parallel_size`` to ``llm_dp``, and pins ``parallel_state`` to this
-rank's own grid so the stock checkpoint/FLOPs/logging paths work without MPU init.
+re-keys ``data_parallel_size`` to ``llm_dp``, and sets NO ``parallel_state``
+globals -- stock ``train()`` resolves its groups from the schedule's language PGC.
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ from examples.mimo.training.distributed import (
     shutdown_distributed,
 )
 from examples.mimo.training.step import mimo_forward_step
-from megatron.core import parallel_state
 from megatron.core.config import set_experimental_flag
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -113,12 +112,6 @@ def _build_optimizer(args: argparse.Namespace, model):
     )
 
 
-def _set_mpu_data_parallel_world_size(args: argparse.Namespace) -> None:
-    """Pin the MPU DP world size to llm_dp so train()'s sample accounting needs no MPU init."""
-    # Bootstrap/MPU-materialization compatibility point (see CLAUDE.md).
-    parallel_state._MPU_DATA_PARALLEL_WORLD_SIZE = args.llm_dp
-
-
 def _mimo_branch_name(topology) -> str:
     """Return this rank's MIMO branch ("language" or the encoder grid name)."""
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -143,7 +136,6 @@ def main() -> None:
     _setup_globals(args)
     initialize_distributed()
     _seed_everything(args)
-    _set_mpu_data_parallel_world_size(args)
 
     # Per-rank runtime: per-submodule-DDP MimoModel + topology + communicator +
     # role-aware data iterator + grad-sync hook (E4).
@@ -165,19 +157,8 @@ def main() -> None:
     # (not the LLM world size), so per-GPU TFLOP/s is cosmetic for the hetero layout.
     # Proper per-module hetero FLOPs accounting is deferred (NMFW-516).
 
-    # Pin parallel_state to this rank's per-module groups so stock-path reads
-    # (training_log, report_memory, checkpoint shard/RNG) work without full mpu init.
-    _pgc = rt.pg_collection
-    if getattr(_pgc, "mp", None) is not None:
-        parallel_state._MODEL_PARALLEL_GROUP = _pgc.mp
-    if getattr(_pgc, "tp", None) is not None:
-        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = _pgc.tp
-    if getattr(_pgc, "pp", None) is not None:
-        parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = _pgc.pp
-    if getattr(_pgc, "dp", None) is not None:
-        parallel_state._DATA_PARALLEL_GROUP = _pgc.dp
-        if getattr(_pgc, "dp_cp", None) is not None:
-            parallel_state._DATA_PARALLEL_GROUP_WITH_CP = _pgc.dp_cp
+    # No parallel_state globals are set: stock train() resolves its DP/MP groups from
+    # schedule_pg_collection's language PGC (sample accounting, LR-log reductions).
 
     # Bookkeeping fields stock train() reads that setup_model_and_optimizer /
     # the dataset builder would normally set.
@@ -204,8 +185,11 @@ def main() -> None:
     checkpointing_context = {}
 
     # Resume LOAD: stock load_checkpoint normally runs inside the bypassed
-    # setup_model_and_optimizer, so we drive it here (after the parallel_state pins +
-    # use_distributed_optimizer so the load request's sharded keys match the save).
+    # setup_model_and_optimizer, so we drive it here (after use_distributed_optimizer
+    # so the load request's sharded keys match the save).
+    # TODO(reuse): zero-global checkpoint (thread dp/expert ranks through
+    # get_rng_state / _build_sharded_state_dict_metadata) is a follow-up; the smoke
+    # run uses no --save/--load.
     if args.load:
         resume_iter, resume_nfpo = load_checkpoint(
             rt.model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
