@@ -152,11 +152,6 @@ def main() -> None:
         "finalize_model_grads_func on the language config"
     )
 
-    # TODO(reuse): stock num_floating_point_operations computes the language model's
-    # FLOPs on every rank and the throughput print divides by the full world_size
-    # (not the LLM world size), so per-GPU TFLOP/s is cosmetic for the hetero layout.
-    # Proper per-module hetero FLOPs accounting is deferred (NMFW-516).
-
     # No parallel_state globals are set: stock train() resolves its DP/MP groups from
     # schedule_pg_collection's language PGC (sample accounting, LR-log reductions).
 

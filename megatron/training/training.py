@@ -2434,6 +2434,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    throughput_world_size: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2676,7 +2677,7 @@ def training_log(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (
-            elapsed_time_per_iteration * 10**12 * args.world_size
+            elapsed_time_per_iteration * 10**12 * (throughput_world_size or args.world_size)
         )
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -2786,10 +2787,15 @@ def training_log(
     return report_memory_flag
 
 
-def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
+def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far,
+                                                   throughput_world_size=None):
     args = get_args()
     if args.save is None:
         return
+
+    # GPU count the per-GPU throughput is normalized by (LLM grid for hetero MIMO,
+    # else the full world); None keeps the stock args.world_size behavior.
+    world_size = throughput_world_size or args.world_size
 
     # Compute job throughput.
     # args.num_floating_point_operations_so_far keeps track of floating-point operations
@@ -2797,7 +2803,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     global _TRAIN_START_TIME
     job_throughput = (
         num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
-    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
     # `get_start_time_from_progress_log` returns start time and number of floating-point
@@ -2806,7 +2812,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     elapsed_time = (datetime.now() - start_time).total_seconds()
     cumulative_throughput = (
         num_floating_point_operations_so_far - start_num_floating_point_operations
-    ) / (elapsed_time * 10**12 * args.world_size)
+    ) / (elapsed_time * 10**12 * world_size)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
@@ -2850,6 +2856,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    throughput_world_size=None,
 ):
     args = get_args()
     timers = get_timers()
@@ -2913,7 +2920,8 @@ def save_checkpoint_and_time(
 
     if args.log_progress and not non_persistent_ckpt:
         compute_throughputs_and_append_to_progress_log(
-            iteration, num_floating_point_operations_so_far
+            iteration, num_floating_point_operations_so_far,
+            throughput_world_size=throughput_world_size,
         )
 
     # Recover timing
@@ -3022,6 +3030,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    throughput_world_size=None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -3043,6 +3052,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    throughput_world_size=throughput_world_size,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -3058,6 +3068,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            throughput_world_size=throughput_world_size,
         )
         saved_checkpoint = True
 
@@ -3075,6 +3086,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            throughput_world_size=throughput_world_size,
         )
         saved_checkpoint = True
 
@@ -3096,6 +3108,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    throughput_world_size=throughput_world_size,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -3118,6 +3131,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                throughput_world_size=throughput_world_size,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -3230,6 +3244,12 @@ def train(
 
     def _dp_world_size():
         return lang_pgc.dp.size() if lang_pgc is not None else mpu.get_data_parallel_world_size()
+
+    # LLM grid GPU count (mp = tp*pp, dp_cp = dp*cp) for hetero throughput scoping;
+    # None lets training_log fall back to args.world_size (byte-identical for stock).
+    llm_world_size = (
+        get_pg_size(lang_pgc.mp) * get_pg_size(lang_pgc.dp_cp) if lang_pgc is not None else None
+    )
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -3540,6 +3560,7 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        throughput_world_size=llm_world_size,
                     )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
@@ -3640,6 +3661,7 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                throughput_world_size=llm_world_size,
             )
         if should_exit:
             break
@@ -3761,6 +3783,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            throughput_world_size=llm_world_size,
         )
         is_first_iteration = False
 
@@ -3853,6 +3876,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            throughput_world_size=llm_world_size,
         )
         if should_exit:
             break
