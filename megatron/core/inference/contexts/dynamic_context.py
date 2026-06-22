@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -3772,8 +3773,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def _processed_log_probs(
+        self,
+        logits: Tensor,
+        n_active: int,
+        active_query_lengths: Optional[Tensor],
+        sampling: Optional[Sampling],
+    ) -> Tensor:
+        """Sample the logprobs if desired."""
+        if self.config.logprobs_mode == "raw_logprobs":
+            return F.log_softmax(logits, dim=-1)
+
+        assert sampling is not None, "processed_logprobs requires a sampling backend"
+
+        # Map each logits row to its active request.
+        request_idx = torch.arange(n_active, device=logits.device)
+        row_to_request = (
+            request_idx
+            if active_query_lengths is None
+            else request_idx.repeat_interleave(active_query_lengths)
+        )
+        md = self.active_request_metadata
+        temperature = md["temperature"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        top_k = md["top_k"][:n_active].to(logits.device, torch.long)[row_to_request]
+        top_p = md["top_p"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        return sampling.log_probs_kernel(logits, temperature, top_k, top_p)
+
     def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        sampling: Optional[Sampling] = None,
     ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs for all active requests and return them.
 
@@ -3783,6 +3814,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
             only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            sampling (Optional[Sampling]): Backend used to optionally modify log-probs.
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
@@ -3792,14 +3824,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Calculate log_probs (sequence_length x vocab_size)
         logits_squeezed = logits.squeeze(0).float()
+        n_active = self.total_request_count - self.paused_request_count
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
+            log_probs = self._processed_log_probs(
+                logits_squeezed[seq_idx],
+                n_active,
+                None,
+                sampling,
+            )
             selected_log_probs = log_probs[seq_idx, new_tokens]
             return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -3823,12 +3860,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         #   active_token_ids[new_token_idx] = new_tokens
         #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        n_active = self.total_request_count - self.paused_request_count
         active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
         active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
 
         new_token_idx = active_query_lengths.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
+
+        # Compute (possibly processed) log-probs over all active-token rows.
+        log_probs = self._processed_log_probs(
+            logits_squeezed, n_active, active_query_lengths, sampling
+        )
 
         # Extract the log probs for only the selected tokens.
         # (sequence_length x vocab_size) -> (sequence_length)
