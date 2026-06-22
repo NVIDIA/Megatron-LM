@@ -11,7 +11,6 @@ from typing import Callable
 
 import numpy as np
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
-from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.utils.common_utils import get_local_rank_preinit
 import torch
@@ -150,7 +149,7 @@ def torch_dist_init(
         model_config: Configuration for the specific model (GPTConfig or T5Config).
         dist_config: Configuration for distributed initialization settings.
         rng_config: Configuration for random number generation.
-        micro_batch_size: The micro batch size for JIT warmup.
+        micro_batch_size: The micro batch size for tensor parallel comm overlap user buffers.
         num_distributed_optimizer_instances: Number of parallel optimizer instances.
         get_embedding_ranks: Optional function to determine embedding layer ranks.
         get_position_embedding_ranks: Optional function to determine position embedding ranks.
@@ -230,7 +229,6 @@ def init_rerun_state(rerun_state_machine_config: RerunStateMachineConfig) -> Non
         RerunDiagnostic,
         RerunErrorInjector,
         RerunMode,
-        get_rerun_state_machine,
         initialize_rerun_state_machine,
     )
 
