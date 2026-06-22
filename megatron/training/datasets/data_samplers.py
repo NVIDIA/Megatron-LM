@@ -53,9 +53,16 @@ def build_pretraining_data_loader(dataset, consumed_samples, cfg=None):
 
     is_eval = split in (Split.valid, Split.test)
 
-    # Resolve data-loader knobs + batch sizes from the container or from args.
+    if dataset_cfg is not None and dataset_cfg.dataloader_type is not None:
+        dataloader_type = dataset_cfg.dataloader_type
+    else:
+        dataloader_type = args.dataloader_type
+
+    if dataloader_type == "external":
+        return dataset
+
+    # Resolve the remaining data-loader knobs + batch sizes from the container or args.
     if dataset_cfg is not None:
-        dataloader_type = dataset_cfg.dataloader_type if dataset_cfg.dataloader_type is not None else args.dataloader_type
         num_workers = dataset_cfg.num_workers
         data_sharding = dataset_cfg.data_sharding
         pin_memory = dataset_cfg.pin_memory
@@ -67,18 +74,12 @@ def build_pretraining_data_loader(dataset, consumed_samples, cfg=None):
             micro_batch_size = cfg.train.micro_batch_size
             global_batch_size = cfg.train.global_batch_size
     else:
-        dataloader_type = args.dataloader_type
         num_workers = args.num_workers
         data_sharding = args.data_sharding
         pin_memory = True
         persistent_workers = args.num_workers > 0
         micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
         global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
-
-    if dataloader_type == "external":
-        # External dataloaders are passed through. User is expected to provide a
-        # torch-compatible dataloader and define samplers, if needed.
-        return dataset
 
     def worker_init_fn(_):
         import os
