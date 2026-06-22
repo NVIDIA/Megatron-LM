@@ -38,6 +38,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     """Agent that returns rollouts generated via default inference with a fixed reward function."""
 
     env_id: str | None = None
+    max_turns: int = 1
 
     def get_dataset(self, validation: bool = False):
         """Return validation or train dataset."""
@@ -83,6 +84,116 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return prompts[start_idx:end_idx]
 
+    async def get_observation(
+        self,
+        turn_idx: int,
+        response: InferenceResponse,
+        conversation: list[LLMChatMessage],
+        golden: Any,
+    ) -> tuple[str | None, bool]:
+        """Return (observation, done) after a generation turn.
+
+        Override to implement multi-turn interactions.
+
+        Args:
+            turn_idx: 0-based index of the turn that just completed.
+            response: The inference response for this turn.
+            conversation: Message history before this turn's response was appended.
+            golden: Ground-truth / task data for reward computation.
+
+        Returns:
+            (observation, done): If done is True the episode ends; observation is ignored.
+            If done is False, observation is a non-empty string that becomes the next user message.
+        """
+        return None, True
+
+    async def get_trajectory_reward(
+        self,
+        responses: list[InferenceResponse],
+        conversation: list[LLMChatMessage],
+        golden: Any,
+    ) -> float:
+        """Compute a scalar reward for the full trajectory.
+
+        Override for trajectory-level or per-turn accumulated rewards.
+        """
+        return await self.get_reward(
+            responses[-1].response.content, golden, responses[-1].finish_reason
+        )
+
+    async def _run_episode(
+        self,
+        prompt: str | list[LLMChatMessage],
+        golden: Any,
+        request: RolloutRequest | GroupedRolloutRequest,
+    ) -> Rollout | TokenRollout:
+        """Run a (possibly multi-turn) episode and return a single rollout.
+
+        Each turn:
+          1. Calls inference with the current conversation history.
+          2. Calls get_observation() to get the environment's response.
+          3. If not done, appends the assistant reply and observation to the
+             conversation and loops.
+        After all turns, calls get_trajectory_reward() once and packages
+        everything into a TokenRollout (or Rollout for raw-text interfaces).
+        """
+        inference_interface = request.inference_interface
+        # Build initial message list from prompt (string → single user message).
+        conversation: list[LLMChatMessage] = list(
+            inference_interface.prepare_request(prompt, request.generation_args).prompt
+        )
+
+        responses: list[InferenceResponse] = []
+
+        for turn_idx in range(self.max_turns):
+            turn_request = inference_interface.prepare_request(
+                conversation, request.generation_args
+            )
+            response = await inference_interface.agenerate(turn_request)
+            responses.append(response)
+
+            observation, done = await self.get_observation(
+                turn_idx, response, conversation, golden
+            )
+
+            if done or observation is None or turn_idx == self.max_turns - 1:
+                break
+
+            # Extend conversation: assistant reply + environment observation.
+            conversation = conversation + [
+                response.response,
+                LLMChatMessage(role="user", content=observation),
+            ]
+
+        reward = await self.get_trajectory_reward(responses, conversation, golden)
+        problem_id = golden['problem_id'] if 'problem_id' in golden else None
+
+        if isinstance(inference_interface, ReturnsTokens):
+            return TokenRollout(
+                trajectory=[r.token_ids for r in responses],
+                reward=reward,
+                logprobs=[r.logprobs for r in responses],
+                generation_mask=[
+                    [x >= r.prompt_length for x in range(len(r.token_ids))]
+                    for r in responses
+                ],
+                env_id=self.env_id,
+                problem_id=problem_id,
+                policy_epoch=[r.policy_epoch for r in responses],
+                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
+                num_evictions=[r.num_evictions for r in responses],
+            )
+        else:
+            return Rollout(
+                trajectory=[r.raw_text for r in responses],
+                reward=reward,
+                env_id=self.env_id,
+                problem_id=problem_id,
+                policy_epoch=[r.policy_epoch for r in responses],
+                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
+                num_evictions=[r.num_evictions for r in responses],
+            )
+
     async def rollout_from_response(
         self, request: RolloutRequest, response: InferenceResponse, golden: Any
     ) -> Rollout:
@@ -124,27 +235,15 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return rollout
 
     async def rollout(self, request: RolloutRequest) -> Rollout:
-
         prompt, golden = await self.get_prompt(validation=request.validation)
-
-        inference_request = request.inference_interface.prepare_request(
-            prompt, request.generation_args
-        )
-
-        response = await request.inference_interface.agenerate(inference_request)
-
-        return await self.rollout_from_response(request, response, golden)
+        return await self._run_episode(prompt, golden, request)
 
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
-
         prompt, golden = await self.get_prompt(validation=request.validation)
-
-        inference_request = request.inference_interface.prepare_request(
-            prompt, request.generation_args
-        )
-
-        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
-        return [await self.rollout_from_response(request, response, golden) for response in responses]
+        return list(await asyncio.gather(*[
+            self._run_episode(prompt, golden, request)
+            for _ in range(request.rollouts_per_group)
+        ]))
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
