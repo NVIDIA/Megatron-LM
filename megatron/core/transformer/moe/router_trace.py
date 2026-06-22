@@ -2,28 +2,21 @@
 
 """Router decision tracing for MoE models for both training and inference.
 
-Captures per-layer top-K routing decisions to a JSONL file for offline
-analysis of routing patterns (e.g., expert load balance, predictor accuracy for
-speculative expert prefetch). Enable via `--moe-routing-trace-path` in both training and inference.
+Captures per-layer top-K routing decisions to a JSONL file for offline analysis of routing patterns
+(e.g., expert load balance, overlap between (layer N-2, N)).
+Enable via `--moe-routing-trace-path` in both training and inference.
 
-- Inference mode (default): step boundaries are auto-detected by watching for layer repeats.
-  When a layer that already fired this step fires again, a new step has started.
-
-- Training mode (training_mode=True): the training loop drives step boundaries explicitly by calling
-  `advance_step()` once per iteration.
-
-Output format — one JSONL file per rank, one record per (step, layer):
+Output format: one JSONL file per rank, one record per (step, layer):
     {"step": 0, "layer": 3, "rank": 0, "num_tokens": 128, "topk": 22,
      "top_indices": [[12, 45, ...], ...]}
 
-Optional sidecar binary files (same directory):
+Optional sidecar binary files written:
 - hidden_states_rank{rank}.bin — bfloat16 hidden-state tensors; each
   JSONL record gains `hs_offset`, `hs_bytes`, `hs_shape` fields.
 - logits_rank{rank}.bin — bfloat16 pre-topk routing logits; each JSONL
   record gains `logit_offset`, `logit_bytes`, `logit_shape` fields.
 
-Use `load_hidden_states_for_record` / `load_logits_for_record` to read
-sidecar tensors back from the binary files.
+Use `load_hidden_states_for_record` / `load_logits_for_record` to read sidecar tensors.
 
 Note: Python forward hooks do not fire during CUDA graph replay.  Run with `--cuda-graph-impl none`.
 """
@@ -49,18 +42,14 @@ def init_tracer(
     dump_router_weights: bool = False,
 ) -> None:
     """Initialize the global router tracer.
-
     Call after torch.distributed is initialized and before `register_hooks` is called on the model.
-
 
     Args:
         output_dir: Directory for JSONL trace files (and optional sidecars).
-        max_steps: Maximum steps (iterations in training, decode steps in
-            inference) to capture before the tracer disables.
+        max_steps: Maximum steps (iterations in training, decode steps in inference) to capture.
         rank: Distributed rank.
-        training_mode: If True, step boundaries are driven by explicit
-            advance_step() calls from the training loop rather than the
-            layer-repeat heuristic used during inference.
+        training_mode: If True, step boundaries are driven by advance_step() calls from the training
+        loop rather than the layer-repeat heuristic used during inference.
         capture_hidden_states: Capture the input hidden-state tensor for each router call.
         capture_logits: Capture pre-topk routing logits.
         dump_router_weights: Save router weight tensors to a .pt file.
@@ -110,8 +99,7 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
     """Load the pre-topk routing logits for a single JSONL record.
 
     Args:
-        record: A parsed JSONL line that contains logit_offset, logit_bytes,
-            logit_shape.
+        record: A parsed JSONL line that contains logit_offset, logit_bytes, logit_shape.
         trace_dir: Directory containing logits_rank{rank}.bin.
 
     Returns:
@@ -131,10 +119,9 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
 class RouterTracer:
     """Captures router top-K decisions across all MoE layers per step.
 
-    - Inference mode (training_mode=False): step boundaries are auto-detected.  When a layer that
-      has already fired this step fires again, a new step has started.
-    - Training mode (training_mode=True): the training loop calls `advance_step()` at each iteration
-      boundary.  The layer-repeat heuristic is not used.
+    - Inference mode: step boundaries are auto-detected.  When a layer that has already fired this
+        step fires again, a new step has started.
+    - Training mode: the training loop calls advance_step() at each iteration boundary.
 
     Recording is skipped during CUDA graph capture since D2H copies inside a captured graph would
     record stale values on replay.
@@ -181,13 +168,8 @@ class RouterTracer:
         if self.capture_logits:
             open(self.logits_path, "wb").close()
 
-    # ------------------------------------------------------------------
-    # Hook management
-    # ------------------------------------------------------------------
-
     def register_hooks(self, model) -> None:
         """Walk model and register forward hooks on every TopKRouter module.
-
         Accepts a single model or a list of model chunks.
         """
         from megatron.core.transformer.moe.router import TopKRouter
@@ -203,13 +185,13 @@ class RouterTracer:
                     self._hook_handles.append(handle)
 
     def remove_hooks(self) -> None:
-        """Remove all forward hooks registered by ``register_hooks``."""
+        """Remove all forward hooks registered by register_hooks()."""
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
 
     def advance_step(self) -> None:
-        """Advance to the next step (training mode only).
+        """Advance to the next step (training mode).
 
         Call once per training iteration, after the forward-backward pass.
         Flushes accumulated records to disk and increments the step counter.
@@ -370,7 +352,7 @@ class RouterTracer:
             self._logits_file.flush()
 
     def flush(self) -> None:
-        """Final flush of any remaining records."""
+        """Flush remaining records."""
         with self._lock:
             self._flush_records_to_disk()
             if self._hs_file is not None:
@@ -392,7 +374,6 @@ def _unwrap_model(model):
 
         return unwrap_model(model)
     except Exception:
-        # Fallback: strip common wrappers manually.
         while hasattr(model, "module"):
             model = model.module
         return model
