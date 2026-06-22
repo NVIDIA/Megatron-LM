@@ -86,7 +86,8 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
-def test_fully_shard_losses_match_baseline(distributed_setup):
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
     """Minimal per-module FSDP training should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -105,28 +106,41 @@ def test_fully_shard_losses_match_baseline(distributed_setup):
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    x = torch.randn(3, 8, device=device)
-    target = torch.randn(3, 4, device=device)
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    for step in range(5):
-        baseline_optimizer.zero_grad()
-        optimizer.zero_grad()
+    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+        losses = []
+        for step in range(5):
+            optimizer.zero_grad()
 
-        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
-        loss = torch.nn.functional.mse_loss(model(x), target)
-        logger.info(
-            "FSDP train parity: rank=%s, step=%s, baseline_loss=%s, sharded_loss=%s",
-            rank,
-            step,
-            baseline_loss.item(),
-            loss.item(),
-        )
-        torch.testing.assert_close(loss, baseline_loss, msg=f"Loss mismatch at step {step}.")
+            for microbatch, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                losses.append(loss.detach())
+                logger.debug(
+                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                    log_prefix,
+                    rank,
+                    step,
+                    microbatch,
+                    loss,
+                )
 
-        baseline_loss.backward()
-        loss.backward()
-        baseline_optimizer.step()
-        optimizer.step()
+                (loss / num_microbatches).backward()
+
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
+    sharded_losses = train(model, optimizer, "FSDP")
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="Sharded losses did not match baseline losses.",
+    )
 
 
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
