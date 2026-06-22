@@ -31,6 +31,10 @@ class Gemma4TransformerConfig(TransformerConfig):
     full_rotary_base: float = 1e6
     sliding_window: int = 512
 
+    # Number of trailing layers that borrow K/V from an earlier producer of the same
+    # type (HF ``num_kv_shared_layers``). E4B: layers 24..41 borrow.
+    num_kv_shared_layers: int = 18
+
     # Gemma4 forward-only flags (not folded into weights).
     final_logit_softcapping: float = 30.0
     apply_embedding_scaling: bool = True
@@ -44,6 +48,12 @@ class Gemma4TransformerConfig(TransformerConfig):
         self.softmax_scale = 1.0
         self.window_size = (self.sliding_window, 0)
         self.heterogeneous_block_specs = True
+        # Per-layer attention type ("sliding"/"full"), 0-based, used by the KV bus and
+        # rope/mask selection. Derived from full_attention_layers.
+        self.layer_types = tuple(
+            "full" if i in self.full_attention_layers else "sliding"
+            for i in range(self.num_layers)
+        )
         super().__post_init__()
 
     def is_full_attention(self, global_layer_number: int) -> bool:
@@ -69,4 +79,10 @@ class Gemma4TransformerConfig(TransformerConfig):
         }
         transformer_config_dict.update(keys_to_update)
 
-        return TransformerConfig(**transformer_config_dict)
+        layer_config = TransformerConfig(**transformer_config_dict)
+        # Carry the gemma4-only fields the per-layer modules need (KV bus role,
+        # rope/mask selection); these are not TransformerConfig fields so they would
+        # otherwise be dropped by the dict round-trip above.
+        layer_config.num_kv_shared_layers = self.num_kv_shared_layers
+        layer_config.layer_types = self.layer_types
+        return layer_config

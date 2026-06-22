@@ -31,3 +31,15 @@ class Gemma4RMSNorm(torch.nn.Module):
         if self.with_scale:
             normed = normed * self.weight.float()
         return normed.type_as(x)
+
+
+def gemma4_rms_norm_builder(*, config, hidden_size: int, eps: float, **kwargs) -> Gemma4RMSNorm:
+    """:class:`LayerNormBuilder` for the weighted :class:`Gemma4RMSNorm` (local spec)."""
+    return Gemma4RMSNorm(hidden_size, eps=eps, with_scale=True)
+
+
+def gemma4_rms_norm_scaleless_builder(
+    *, config, hidden_size: int, eps: float, **kwargs
+) -> Gemma4RMSNorm:
+    """:class:`LayerNormBuilder` for the scaleless v_norm :class:`Gemma4RMSNorm`."""
+    return Gemma4RMSNorm(hidden_size, eps=eps, with_scale=False)
