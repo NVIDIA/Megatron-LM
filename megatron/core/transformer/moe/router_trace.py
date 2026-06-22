@@ -42,18 +42,14 @@ def init_tracer(
     dump_router_weights: bool = False,
 ) -> None:
     """Initialize the global router tracer.
-
     Call after torch.distributed is initialized and before `register_hooks` is called on the model.
-
 
     Args:
         output_dir: Directory for JSONL trace files (and optional sidecars).
-        max_steps: Maximum steps (iterations in training, decode steps in
-            inference) to capture before the tracer disables.
+        max_steps: Maximum steps (iterations in training, decode steps in inference) to capture.
         rank: Distributed rank.
-        training_mode: If True, step boundaries are driven by explicit
-            advance_step() calls from the training loop rather than the
-            layer-repeat heuristic used during inference.
+        training_mode: If True, step boundaries are driven by advance_step() calls from the training
+        loop rather than the layer-repeat heuristic used during inference.
         capture_hidden_states: Capture the input hidden-state tensor for each router call.
         capture_logits: Capture pre-topk routing logits.
         dump_router_weights: Save router weight tensors to a .pt file.
@@ -103,8 +99,7 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
     """Load the pre-topk routing logits for a single JSONL record.
 
     Args:
-        record: A parsed JSONL line that contains logit_offset, logit_bytes,
-            logit_shape.
+        record: A parsed JSONL line that contains logit_offset, logit_bytes, logit_shape.
         trace_dir: Directory containing logits_rank{rank}.bin.
 
     Returns:
@@ -126,7 +121,7 @@ class RouterTracer:
 
     - Inference mode: step boundaries are auto-detected.  When a layer that has already fired this
         step fires again, a new step has started.
-    - Training mode: the training loop calls `advance_step()` at each iteration boundary.
+    - Training mode: the training loop calls advance_step() at each iteration boundary.
 
     Recording is skipped during CUDA graph capture since D2H copies inside a captured graph would
     record stale values on replay.
@@ -190,7 +185,7 @@ class RouterTracer:
                     self._hook_handles.append(handle)
 
     def remove_hooks(self) -> None:
-        """Remove all forward hooks registered by ``register_hooks``."""
+        """Remove all forward hooks registered by register_hooks()."""
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
