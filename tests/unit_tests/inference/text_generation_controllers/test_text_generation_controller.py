@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import copy
 import os
 import random
@@ -31,6 +32,8 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DecodeForwardPrimer,
+    SampledStep,
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
@@ -227,30 +230,46 @@ class TestAsyncSchedulingControllerHelpers:
         controller.num_speculative_tokens = 0
         return controller, context, model_config
 
-    def test_request_update_mode_routes_legacy_to_legacy_bookkeeping(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.LEGACY
-        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "legacy"})
+    def test_decode_forward_primer_distinguishes_none_cuda_graph_count(self):
+        primer = DecodeForwardPrimer()
 
-        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
-        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=True)
+        assert not primer.is_primed
 
-    def test_request_update_mode_routes_serial_decode_to_new_bookkeeping(self):
+        primer.mark_primed(None)
+
+        assert primer.is_primed
+        assert primer.cuda_graph_request_count is None
+
+        primer.clear()
+
+        assert not primer.is_primed
+        assert primer.cuda_graph_request_count is None
+
+    def test_dynamic_batch_routes_serial_decode_to_split_step(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
-        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "serial"})
+        context.active_token_count = 1
+        controller._run_serial_decode_step = mock.AsyncMock(return_value={"path": "serial"})
+        controller._run_async_decode_step = mock.AsyncMock()
 
-        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "serial"}
-        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=False)
+        result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-    def test_request_update_mode_routes_non_decode_to_legacy_bookkeeping(self):
+        assert result == {"path": "serial"}
+        controller._run_serial_decode_step.assert_awaited_once()
+        controller._run_async_decode_step.assert_not_called()
+
+    def test_dynamic_batch_routes_async_decode_to_split_step(self):
         controller, context, _ = self._make_async_eligibility_controller()
-        context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
-        context.is_decode_only.return_value = False
-        controller._dynamic_step_context_bookkeeping = mock.Mock(return_value={"path": "legacy"})
+        context.config.async_scheduling_mode = AsyncSchedulingMode.ASYNC
+        context.active_token_count = 1
+        controller._run_serial_decode_step = mock.AsyncMock()
+        controller._run_async_decode_step = mock.AsyncMock(return_value={"path": "async"})
 
-        assert controller._dynamic_step_context_bookkeeping_for_mode() == {"path": "legacy"}
-        controller._dynamic_step_context_bookkeeping.assert_called_once_with(use_legacy=True)
+        result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+        assert result == {"path": "async"}
+        controller._run_serial_decode_step.assert_not_called()
+        controller._run_async_decode_step.assert_awaited_once()
 
     def test_dynamic_step_context_bookkeeping_uses_legacy_update(self):
         controller, context, _ = self._make_async_eligibility_controller()
@@ -260,8 +279,11 @@ class TestAsyncSchedulingControllerHelpers:
             "new_speculative_tokens": None,
         }
         request_bookkeeping = {"active_request_ids": torch.tensor([10, 11], device='cpu')}
-        controller._build_dynamic_step_request_update = mock.Mock(
-            return_value=(prepared_update, request_bookkeeping)
+        controller._build_request_update = mock.Mock(
+            return_value=SampledStep(
+                prepared_update=prepared_update,
+                request_bookkeeping=request_bookkeeping,
+            )
         )
         context.update_requests_legacy.return_value = {"finished_request_ids": torch.tensor([11])}
 
@@ -273,58 +295,31 @@ class TestAsyncSchedulingControllerHelpers:
                 "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
             ),
         ):
-            result = controller._dynamic_step_context_bookkeeping(use_legacy=True)
+            result = controller._dynamic_step_context_bookkeeping()
 
         context.update_requests_legacy.assert_called_once_with(**prepared_update)
-        context.update_requests.assert_not_called()
-        assert result["active_request_ids"] is request_bookkeeping["active_request_ids"]
-        assert torch.equal(result["finished_request_ids"], torch.tensor([11]))
-
-    def test_dynamic_step_context_bookkeeping_uses_split_update(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        prepared_update = {
-            "active_requests_mask": torch.tensor([1, 0], device='cpu'),
-            "new_tokens": torch.tensor([8, 9], device='cpu'),
-            "new_speculative_tokens": None,
-        }
-        request_bookkeeping = {"active_request_ids": torch.tensor([10, 11], device='cpu')}
-        controller._build_dynamic_step_request_update = mock.Mock(
-            return_value=(prepared_update, request_bookkeeping)
-        )
-        context.update_requests.return_value = {"finished_request_ids": torch.tensor([11])}
-
-        with (
-            mock.patch(
-                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
-            ),
-            mock.patch(
-                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
-            ),
-        ):
-            result = controller._dynamic_step_context_bookkeeping(use_legacy=False)
-
-        context.update_requests.assert_called_once_with(**prepared_update)
-        context.update_requests_legacy.assert_not_called()
         assert result["active_request_ids"] is request_bookkeeping["active_request_ids"]
         assert torch.equal(result["finished_request_ids"], torch.tensor([11]))
 
     def test_request_update_mode_rejects_unsupported_serial_decode(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.active_token_count = 1
         context.request_update_has_waiting_requests = True
 
         with pytest.raises(RuntimeError, match="waiting_requests"):
-            controller._dynamic_step_context_bookkeeping_for_mode()
+            asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     def test_request_update_mode_rejects_serial_kv_block_boundary(self):
         controller, context, _ = self._make_async_eligibility_controller()
         context.config.async_scheduling_mode = AsyncSchedulingMode.SERIAL
+        context.active_token_count = 1
         context.request_last_kv_block_offset = torch.tensor([127, 2], device='cpu')
 
         with pytest.raises(RuntimeError, match="kv_block_boundary"):
-            controller._dynamic_step_context_bookkeeping_for_mode()
+            asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-    def test_async_scheduling_prepare_uses_context_adjusted_bookkeeping(self):
+    def test_prepare_sampled_step_uses_context_adjusted_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
         prepared_update = {
             "active_requests_mask": torch.tensor([0, 1], device='cpu'),
@@ -347,122 +342,196 @@ class TestAsyncSchedulingControllerHelpers:
             "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
         }
         context.prepare_requests.return_value = (filtered_update, filtered_bookkeeping)
-        context.resolve_requests.return_value = {
-            "newly_paused_request_ids": None,
-            "evict_request_ids": None,
-        }
-        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(return_value=None)
 
-        actual_bookkeeping, resolve_result = controller._run_async_scheduling_request_update(
-            prepared_update, request_bookkeeping
+        sampled_step = controller._prepare_sampled_step(
+            SampledStep(
+                prepared_update=prepared_update,
+                request_bookkeeping=request_bookkeeping,
+            ),
+            filter_response_bookkeeping=True,
         )
 
         context.prepare_requests.assert_called_once_with(
             **prepared_update, request_bookkeeping=request_bookkeeping
         )
-        context.resolve_requests.assert_called_once_with(filtered_update)
-        assert actual_bookkeeping is filtered_bookkeeping
-        assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+        assert sampled_step.prepared_update is filtered_update
+        assert sampled_step.request_bookkeeping is filtered_bookkeeping
 
-    def test_serial_async_scheduling_call_order(self):
-        controller, context, _ = self._make_async_eligibility_controller()
-        events = []
-
-        def prepare_side_effect(**kwargs):
-            events.append("prepare_requests")
-            return (
-                {
-                    "active_requests_mask": kwargs["active_requests_mask"],
-                    "new_tokens": kwargs["new_tokens"],
-                    "new_speculative_tokens": kwargs["new_speculative_tokens"],
-                },
-                kwargs["request_bookkeeping"],
-            )
-
-        context.prepare_requests.side_effect = prepare_side_effect
-        context.resolve_requests.side_effect = lambda *_args, **_kwargs: events.append(
-            "resolve_requests"
-        ) or {"newly_paused_request_ids": None, "evict_request_ids": None}
-
-        controller._async_schedule_forward_primed = True
-        controller._async_schedule_primed_cuda_graph_request_count = None
-        controller._dynamic_step_sample_logits = mock.Mock(
-            side_effect=lambda: events.append("sample")
-        )
-        controller._build_dynamic_step_request_update = mock.Mock(
-            side_effect=lambda: (
-                {
-                    "active_requests_mask": torch.tensor([1], device='cpu'),
-                    "new_tokens": torch.tensor([7], device='cpu'),
-                    "new_speculative_tokens": None,
-                },
-                {"active_request_ids": torch.tensor([3], device='cpu')},
-            )
-        )
-        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(
-            side_effect=lambda: events.append("forward") or None
-        )
-
-        with (
-            mock.patch(
-                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
-            ),
-            mock.patch(
-                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
-            ),
-        ):
-            controller._run_async_scheduling_step()
-
-        assert events == ["sample", "prepare_requests", "forward", "resolve_requests"]
-        _, kwargs = context.resolve_requests.call_args
-        assert kwargs == {}
-
-    def test_async_scheduling_all_finished_consumes_without_forward(self):
+    def test_prepare_sampled_step_keeps_current_bookkeeping_without_filter(self):
         controller, context, _ = self._make_async_eligibility_controller()
         prepared_update = {
-            "active_requests_mask": torch.tensor([0, 0], device='cpu'),
+            "active_requests_mask": torch.tensor([0, 1], device='cpu'),
             "new_tokens": torch.tensor([100, 101], device='cpu'),
             "new_speculative_tokens": None,
         }
         request_bookkeeping = {
             "active_request_ids": torch.tensor([10, 11], device='cpu'),
             "sample": torch.tensor([100, 101], device='cpu'),
-            "finished_request_ids": torch.tensor([10, 11], device='cpu'),
+            "finished_request_ids": torch.tensor([10], device='cpu'),
         }
-        context.prepare_requests.side_effect = [
-            (prepared_update, request_bookkeeping),
-            prepared_update,
-        ]
-        context.resolve_requests.return_value = {
-            "newly_paused_request_ids": None,
-            "evict_request_ids": None,
+        filtered_update = {
+            "active_requests_mask": torch.tensor([1], device='cpu'),
+            "new_tokens": torch.tensor([101], device='cpu'),
+            "new_speculative_tokens": None,
         }
-        controller._dynamic_step_forward_for_async_scheduling = mock.Mock()
+        context.prepare_requests.return_value = filtered_update
 
-        actual_bookkeeping, resolve_result = controller._run_async_scheduling_request_update(
-            prepared_update, request_bookkeeping
+        sampled_step = controller._prepare_sampled_step(
+            SampledStep(
+                prepared_update=prepared_update,
+                request_bookkeeping=request_bookkeeping,
+            ),
+            filter_response_bookkeeping=False,
         )
 
-        assert context.prepare_requests.call_count == 2
-        first_prepare_kwargs = context.prepare_requests.call_args_list[0].kwargs
-        second_prepare_kwargs = context.prepare_requests.call_args_list[1].kwargs
-        assert (
-            first_prepare_kwargs["active_requests_mask"]
-            is prepared_update["active_requests_mask"]
+        context.prepare_requests.assert_called_once_with(**prepared_update)
+        assert sampled_step.prepared_update is filtered_update
+        assert sampled_step.request_bookkeeping is request_bookkeeping
+
+    def test_serial_decode_step_call_order(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        events = []
+        sampled_step = SampledStep(
+            prepared_update={
+                "active_requests_mask": torch.tensor([1], device='cpu'),
+                "new_tokens": torch.tensor([7], device='cpu'),
+                "new_speculative_tokens": None,
+            },
+            request_bookkeeping={"active_request_ids": torch.tensor([3], device='cpu')},
         )
-        assert first_prepare_kwargs["new_tokens"] is prepared_update["new_tokens"]
-        assert first_prepare_kwargs["request_bookkeeping"] is request_bookkeeping
-        assert (
-            second_prepare_kwargs["active_requests_mask"]
-            is prepared_update["active_requests_mask"]
+        controller._decode_forward_primer = DecodeForwardPrimer(is_primed=True)
+        controller._sample_current_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._build_request_update = mock.Mock(
+            side_effect=lambda: events.append("build") or sampled_step
         )
-        assert second_prepare_kwargs["new_tokens"] is prepared_update["new_tokens"]
-        assert "request_bookkeeping" not in second_prepare_kwargs
-        context.resolve_requests.assert_called_once()
-        assert context.resolve_requests.call_args.args[0] is prepared_update
-        controller._dynamic_step_forward_for_async_scheduling.assert_not_called()
-        assert actual_bookkeeping is request_bookkeeping
-        assert resolve_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+        controller._raise_if_decode_request_update_unsupported = mock.Mock()
+        controller._resolve_sampled_step = mock.Mock(
+            side_effect=lambda _step: events.append("resolve") or {}
+        )
+        controller._prepare_sampled_step = mock.Mock(
+            side_effect=lambda step, **_kwargs: events.append("prepare") or step
+        )
+        controller._sampled_step_has_active_rows = mock.Mock(return_value=True)
+        controller._forward_prepared_requests = mock.Mock(
+            side_effect=lambda: events.append("forward") or None
+        )
+
+        result = asyncio.run(controller._run_serial_decode_step())
+
+        assert events == ["sample", "build", "resolve", "prepare", "forward"]
+        controller._prepare_sampled_step.assert_called_once_with(
+            sampled_step, filter_response_bookkeeping=False
+        )
+        assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
+
+    def test_async_decode_step_call_order(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        events = []
+        sampled_step = SampledStep(
+            prepared_update={
+                "active_requests_mask": torch.tensor([1], device='cpu'),
+                "new_tokens": torch.tensor([7], device='cpu'),
+                "new_speculative_tokens": None,
+            },
+            request_bookkeeping={"active_request_ids": torch.tensor([3], device='cpu')},
+        )
+        controller._decode_forward_primer = DecodeForwardPrimer(is_primed=True)
+        controller._sample_current_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._build_request_update = mock.Mock(
+            side_effect=lambda: events.append("build") or sampled_step
+        )
+        controller._raise_if_decode_request_update_unsupported = mock.Mock()
+        controller._prepare_sampled_step = mock.Mock(
+            side_effect=lambda step, **_kwargs: events.append("prepare") or step
+        )
+        controller._sampled_step_has_active_rows = mock.Mock(return_value=True)
+        controller._forward_prepared_requests = mock.Mock(
+            side_effect=lambda: events.append("forward") or None
+        )
+        controller._resolve_sampled_step = mock.Mock(
+            side_effect=lambda _step: events.append("resolve") or {}
+        )
+
+        result = asyncio.run(controller._run_async_decode_step())
+
+        assert events == ["sample", "build", "prepare", "forward", "resolve"]
+        controller._prepare_sampled_step.assert_called_once_with(
+            sampled_step, filter_response_bookkeeping=True
+        )
+        assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
+
+    def test_decode_step_bootstrap_primes_before_sample(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        events = []
+        sampled_step = SampledStep(
+            prepared_update={
+                "active_requests_mask": torch.tensor([0], device='cpu'),
+                "new_tokens": torch.tensor([7], device='cpu'),
+                "new_speculative_tokens": None,
+            },
+            request_bookkeeping={"active_request_ids": torch.tensor([3], device='cpu')},
+        )
+        controller._decode_forward_primer = DecodeForwardPrimer()
+        controller._forward_prepared_requests = mock.Mock(
+            side_effect=lambda: events.append("bootstrap_forward") or None
+        )
+        controller._sample_current_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._build_request_update = mock.Mock(
+            side_effect=lambda: events.append("build") or sampled_step
+        )
+        controller._raise_if_decode_request_update_unsupported = mock.Mock()
+        controller._resolve_sampled_step = mock.Mock(
+            side_effect=lambda _step: events.append("resolve") or {}
+        )
+        controller._prepare_sampled_step = mock.Mock(
+            side_effect=lambda step, **_kwargs: events.append("prepare") or step
+        )
+        controller._sampled_step_has_active_rows = mock.Mock(return_value=False)
+
+        asyncio.run(controller._run_serial_decode_step())
+
+        assert events == ["bootstrap_forward", "sample", "build", "resolve", "prepare"]
+        assert not controller._decode_forward_primer.is_primed
+
+    def test_async_decode_step_all_finished_consumes_without_forward(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        events = []
+        sampled_step = SampledStep(
+            prepared_update={
+                "active_requests_mask": torch.tensor([0, 0], device='cpu'),
+                "new_tokens": torch.tensor([100, 101], device='cpu'),
+                "new_speculative_tokens": None,
+            },
+            request_bookkeeping={
+                "active_request_ids": torch.tensor([10, 11], device='cpu'),
+                "sample": torch.tensor([100, 101], device='cpu'),
+                "finished_request_ids": torch.tensor([10, 11], device='cpu'),
+            },
+        )
+        controller._decode_forward_primer = DecodeForwardPrimer(is_primed=True)
+        controller._sample_current_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._build_request_update = mock.Mock(
+            side_effect=lambda: events.append("build") or sampled_step
+        )
+        controller._raise_if_decode_request_update_unsupported = mock.Mock()
+        controller._prepare_sampled_step = mock.Mock(
+            side_effect=lambda step, **_kwargs: events.append("prepare") or step
+        )
+        controller._sampled_step_has_active_rows = mock.Mock(return_value=False)
+        controller._resolve_sampled_step = mock.Mock(
+            side_effect=lambda _step: events.append("resolve") or {}
+        )
+        controller._consume_terminal_finished_rows = mock.Mock(
+            side_effect=lambda _step: events.append("consume")
+        )
+        controller._forward_prepared_requests = mock.Mock()
+
+        result = asyncio.run(controller._run_async_decode_step())
+
+        assert events == ["sample", "build", "prepare", "resolve", "consume"]
+        controller._forward_prepared_requests.assert_not_called()
+        assert not controller._decode_forward_primer.is_primed
+        assert result["active_request_ids"] is sampled_step.request_bookkeeping["active_request_ids"]
 
 
 class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
