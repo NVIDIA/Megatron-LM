@@ -89,6 +89,7 @@ def loss_func(
     entropy_term: torch.Tensor,
     truncated_from_above: torch.Tensor,
     truncated_from_below: torch.Tensor,
+    is_weights: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
     """Loss function.
@@ -133,12 +134,19 @@ def loss_func(
     entropy_term_flat = entropy_term.reshape(-1).to(device)
     truncated_from_above_flat = truncated_from_above.float().reshape(-1).to(device)
     truncated_from_below_flat = truncated_from_below.float().reshape(-1).to(device)
+    is_weights_flat = is_weights.float().reshape(-1).to(device)
 
     masked_kl = torch.sum(loss_mask_flat * kl_term_flat)
     masked_ratios = torch.sum(loss_mask_flat * ratios_flat)
     masked_entropy = torch.sum(loss_mask_flat * entropy_term_flat)
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
+    masked_is_weight = torch.sum(loss_mask_flat * is_weights_flat)
+    masked_is_weight_sq = torch.sum(loss_mask_flat * is_weights_flat.square())
+    masked_is_ess_frac = (
+        masked_is_weight.square()
+        / (total_tokens.float() * masked_is_weight_sq).clamp_min(1e-12)
+    )
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
@@ -172,6 +180,14 @@ def loss_func(
     reporting_truncated_from_below = torch.cat(
         [masked_truncated_from_below.clone().detach().view(1), total_tokens.view(1)]
     )
+    reporting_is_weight = torch.cat([masked_is_weight.clone().detach().view(1), total_tokens.view(1)])
+    reporting_is_weight_sq = torch.cat([masked_is_weight_sq.clone().detach().view(1), total_tokens.view(1)])
+    reporting_is_ess_frac = torch.cat( [ masked_is_ess_frac.clone().detach().view(1), torch.ones_like(total_tokens, dtype=torch.float).view(1), ])
+    if args.rl_importance_sampling_truncation_coef is not None:
+        is_at_cap = (is_weights_flat >= float(args.rl_importance_sampling_truncation_coef)).float()
+        masked_is_at_cap = torch.sum(loss_mask_flat * is_at_cap)
+        reporting_is_at_cap = torch.cat([masked_is_at_cap.clone().detach().view(1), total_tokens.view(1)])
+ 
 
     # Create output dictionary
     output_dict = {
@@ -181,7 +197,12 @@ def loss_func(
         'rl/entropy_term': reporting_entropy,
         'rl/truncated_from_above': reporting_truncated_from_above,
         'rl/truncated_from_below': reporting_truncated_from_below,
+        'rl/is_weight': reporting_is_weight,
+        'rl/is_weight_sq': reporting_is_weight_sq,
+        'rl/is_ess_frac': reporting_is_ess_frac,
     }
+    if args.rl_importance_sampling_truncation_coef is not None:
+        output_dict['rl/is_at_cap'] = reporting_is_at_cap
 
     # Add metadata about number of sequences processed in this batch
     # This is crucial for correct sample counting with sequence packing
@@ -296,7 +317,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
-            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below, is_weights = (
+                None,
                 None,
                 None,
                 None,
@@ -306,7 +328,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         else:
             # Calculate loss using unified function
             current_logprobs = logprobs_or_hidden_states
-            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below, is_weights = (
                 calculate_grpo_loss(
                     current_logprobs=current_logprobs,
                     old_logprobs=old_logprobs,
@@ -333,6 +355,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         entropy_term,
         truncated_from_above,
         truncated_from_below,
+        is_weights,
     )
 
 

@@ -1943,7 +1943,7 @@ def calculate_grpo_loss(
         - entropy_weight * entropy_term
     )
 
-    return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
+    return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below, is_weights
 
 
 @contextmanager
