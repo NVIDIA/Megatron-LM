@@ -2536,7 +2536,7 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        if config.sequence_packing_scheduler is not None:
+        if getattr(config, 'sequence_packing_scheduler', None) is not None:
             # Dynamic-CP / sequence packing (dev feature): produce the per-step packed
             # iterator and recompute num_microbatches. wrap_data_iterator returns a
             # RerunDataIterator-compatible iterator so the rerun-state-machine validation
@@ -4055,7 +4055,7 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        if config.sequence_packing_scheduler is not None and not args.skip_train:
+        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
             # Scheduler-based packing does not feed the packed-sequence accumulator.
             # The scheduler already computed these from the real per-sample lengths
             # before CP padding/rerouting, so use them directly here.

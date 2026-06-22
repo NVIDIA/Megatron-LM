@@ -31,6 +31,7 @@ def _run(**kwargs):
         reuse_grad_buf_for_mxfp8_param_ag=False,
         overlap_param_gather=False,
         seq_length=8,
+        global_batch_size=1,
         micro_batch_size=1,
         decoder_seq_length=None,
         empty_unused_memory_level=0,
