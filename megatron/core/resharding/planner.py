@@ -411,10 +411,7 @@ def build_centralized_reshard_plan(
                     # on different stages), e.g. pp=1 (tied) -> pp=2. Source it from
                     # the embedding weight (same shape + vocab/TP shard); that tensor
                     # then feeds both the destination embedding and output_layer.
-                    for emb_name in (
-                        "embedding.word_embeddings.weight",
-                        "word_embeddings.weight",
-                    ):
+                    for emb_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
                         src_meta_list = src_param_metadata.get(emb_name)
                         if src_meta_list:
                             break
