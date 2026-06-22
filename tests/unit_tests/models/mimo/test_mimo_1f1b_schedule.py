@@ -613,6 +613,7 @@ def run_mimo_1f1b_test(
     # Use the production grad-sync hook (finalize per module over its own groups +
     # cross-grid N_global per-token mean) for every config.
     grad_sync_topology = SimpleNamespace(
+        grids=module_to_grid_map,
         module_pgs={
             MIMO_LANGUAGE_MODULE_KEY: language_pg,
             **{name: vision_pg for name in mimo_model.modality_submodules},

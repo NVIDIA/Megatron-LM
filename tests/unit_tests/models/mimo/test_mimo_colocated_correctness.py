@@ -166,7 +166,7 @@ def _set_deterministic_env():
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
-def _wire_training_hooks(mimo_model, language_pg, vision_pg):
+def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg):
     """Attach no_sync plus the production grad-sync hooks to a MimoModel.
 
     Delegates the finalize/grad-scale wiring to ``configure_grad_sync`` (the real
@@ -177,6 +177,7 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
     """
     mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
     topology = SimpleNamespace(
+        grids=module_to_grid_map,
         module_pgs={
             MIMO_LANGUAGE_MODULE_KEY: language_pg,
             **{name: vision_pg for name in mimo_model.modality_submodules},
@@ -927,7 +928,7 @@ class TestColocatedGradientScalingCorrectness:
 
         # Build dist first (heterogeneous TP/DP).
         torch.manual_seed(12345)
-        dist_mimo, _, _, dist_language_pg, dist_vision_pg = get_mimo_model(
+        dist_mimo, dist_module_to_grid_map, _, dist_language_pg, dist_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=dist_enc_grid,
             llm_grid=dist_llm_grid,
@@ -946,7 +947,7 @@ class TestColocatedGradientScalingCorrectness:
 
         # Reference with equal-DP uniform (enc_tp == llm_tp, enc_dp == llm_dp).
         torch.manual_seed(12345)
-        ref_mimo, _, _, ref_language_pg, ref_vision_pg = get_mimo_model(
+        ref_mimo, ref_module_to_grid_map, _, ref_language_pg, ref_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=ref_enc_grid,
             llm_grid=ref_llm_grid,
@@ -981,8 +982,8 @@ class TestColocatedGradientScalingCorrectness:
             dist_llm_grid.get_pg("tp"),
         )
 
-        _wire_training_hooks(dist_mimo, dist_language_pg, dist_vision_pg)
-        _wire_training_hooks(ref_mimo, ref_language_pg, ref_vision_pg)
+        _wire_training_hooks(dist_mimo, dist_module_to_grid_map, dist_language_pg, dist_vision_pg)
+        _wire_training_hooks(ref_mimo, ref_module_to_grid_map, ref_language_pg, ref_vision_pg)
 
         # Distributed optimizers snapshot current param.data into fp32 master
         # weights at __init__, so both must be built AFTER the ref-to-dist
