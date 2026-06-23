@@ -47,6 +47,14 @@ class Gemma4TransformerConfig(TransformerConfig):
         self.rotary_base = self.sliding_rotary_base
         self.softmax_scale = 1.0
         self.window_size = (self.sliding_window, 0)
+        # Gemma4 is RMSNorm-only (HF Gemma4RMSNorm). The local spec hard-wires
+        # Gemma4RMSNorm via its builders and ignores this field, but the TE spec's
+        # TENorm dispatches on config.normalization: the base TransformerConfig
+        # default "LayerNorm" would make every TENorm a (mean-subtracting)
+        # te.pytorch.LayerNorm, which is structurally wrong for Gemma. Force RMSNorm
+        # so TENorm builds te.pytorch.RMSNorm with plain weight
+        # (layernorm_zero_centered_gamma=False), matching the converted HF weights.
+        self.normalization = "RMSNorm"
         self.heterogeneous_block_specs = True
         # Per-layer attention type ("sliding"/"full"), 0-based, used by the KV bus and
         # rope/mask selection. Derived from full_attention_layers.
