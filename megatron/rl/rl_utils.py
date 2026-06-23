@@ -13,6 +13,7 @@ import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional 
 
@@ -289,10 +290,19 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_epoch: list[list[int]]
-    kv_cache_epoch: list[list[int]]
+    # Per-rollout policy/kv-cache epoch summaries, grouped (one inner list per
+    # group). Token-weighted; lag is current_iteration - epoch at log time.
+    policy_first_epoch: list[list[int]]
+    policy_avg_epoch: list[list[float]]
+    policy_last_epoch: list[list[int]]
+    kv_first_epoch: list[list[int]]
+    kv_avg_epoch: list[list[float]]
+    kv_last_epoch: list[list[int]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
+    # Per-rollout identity (grouped like rewards), used to label the rollout table.
+    rollout_env_ids: list[list[str]]
+    problem_ids: list[list[str | None]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -1256,6 +1266,171 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
 
 
+def expand_epoch_segments(
+    per_turn_boundaries: list[list[tuple[int, int]]],
+    per_turn_token_count: list[int],
+) -> list[tuple[int, int]]:
+    """Expand run-length-encoded epoch boundaries into per-token (epoch, count) segments.
+
+    Each turn's ``policy_epoch`` / ``kv_cache_epoch`` is a sparse list of
+    ``(start_token_index, epoch)`` boundaries: a tuple ``(i, e)`` means "tokens
+    from index ``i`` until the next boundary were generated under epoch ``e``".
+    The last boundary of a turn runs to that turn's ``token_count``. Segments are
+    concatenated across turns in order, so the first segment covers the rollout's
+    first token and the last segment covers its last token.
+    """
+    segments: list[tuple[int, int]] = []
+    for boundaries, total_len in zip(per_turn_boundaries, per_turn_token_count):
+        if not boundaries:
+            continue
+        for idx, (start, epoch) in enumerate(boundaries):
+            end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else total_len
+            count = end - start
+            if count > 0:
+                segments.append((epoch, count))
+    return segments
+
+
+def rollout_epoch_summary(
+    per_turn_boundaries: list[list[tuple[int, int]]],
+    per_turn_token_count: list[int],
+) -> tuple[int, float, int] | None:
+    """First, token-weighted-average, and last *epoch* of a rollout across all turns.
+
+    Returns ``None`` if the rollout has no tokens. The token-weighted average is a
+    true per-token average (weighting each epoch by how many tokens it covers),
+    unlike a per-boundary mean. Lag is obtained later as ``current_iteration -
+    epoch``, so ``first`` -> oldest-token lag and ``last`` -> newest-token lag.
+    """
+    segments = expand_epoch_segments(per_turn_boundaries, per_turn_token_count)
+    if not segments:
+        return None
+    first_epoch = segments[0][0]
+    last_epoch = segments[-1][0]
+    total = sum(count for _, count in segments)
+    avg_epoch = sum(epoch * count for epoch, count in segments) / total
+    return first_epoch, avg_epoch, last_epoch
+
+
+def get_rl_logging_dir(args) -> str:
+    """Base directory for RL logging artifacts (staleness dumps, plots).
+
+    Uses --rl-logging-dir when set, else $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.
+    """
+    if args.rl_logging_dir:
+        return args.rl_logging_dir
+    env_dir = os.environ.get("LANGRL_LOG_DIR")
+    if env_dir:
+        return os.path.join(env_dir, "rl_logging")
+    return os.path.join(".", "rl_logging")
+
+
+def _turn_prompt_length(rollout, turn_idx: int) -> Optional[int]:
+    """Best-effort number of prompt tokens for a turn (so plots can mark prompt/gen)."""
+    if isinstance(rollout, TokenRollout):
+        gen_mask = rollout.generation_mask[turn_idx] if rollout.generation_mask else None
+        if gen_mask is None:
+            return None
+        for i, is_gen in enumerate(gen_mask):
+            if is_gen:
+                return i
+        return len(gen_mask)
+    if rollout.prompt_length is not None and turn_idx < len(rollout.prompt_length):
+        return rollout.prompt_length[turn_idx]
+    return None
+
+
+# Lazily-opened JSONL file handle for the per-run staleness dump (rank 0 only).
+_STALENESS_DUMP_FILE = None
+
+
+def dump_staleness_data(
+    rollouts: GroupedRollouts, group_stats: RolloutStats, current_iteration: int
+) -> None:
+    """Append a focused, labeled per-rollout staleness/length record (rank 0, opt-in).
+
+    One JSON object per rollout per line, tagged by iteration/batch_id/group/env so
+    rl_profiling can render per-batch/env/group/rollout views offline. Stores per-rollout
+    reward + GRPO advantage, the run-length-encoded epoch boundaries and per-turn token
+    counts, not token ids.
+    """
+    args = get_args()
+    if not args.rl_log_staleness_data:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+
+    global _STALENESS_DUMP_FILE
+    if _STALENESS_DUMP_FILE is None:
+        out_dir = Path(get_rl_logging_dir(args)) / "staleness"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        run_id = os.environ.get("LANGRL_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        _STALENESS_DUMP_FILE = open(out_dir / f"staleness_{run_id}.jsonl", "a")
+        logger.info(f"[rl-logging] Writing staleness data to {out_dir}")
+
+    # Per-rollout GRPO advantage (authoritative, from group_stats). `advantages` is a
+    # flat per-turn list in group-major order; a rollout's turns share one advantage,
+    # so take the first turn's value per rollout.
+    adv_flat = group_stats.advantages
+    per_group_adv = []
+    _t = 0
+    for group_num_turns in group_stats.num_turns:
+        adv_row = []
+        for nt in group_num_turns:
+            adv_row.append(float(adv_flat[_t]))
+            _t += nt
+        per_group_adv.append(adv_row)
+
+    for group_idx, group in enumerate(rollouts):
+        group_rewards = group_stats.rewards[group_idx]
+        group_reward_mean = float(np.mean(group_rewards))
+        group_reward_std = float(np.std(group_rewards))
+        # All-equal rewards => ~zero advantage => no gradient (the GRPO group-filter target).
+        group_degenerate = group_reward_std < 1e-6
+        for rollout_idx, rollout in enumerate(group):
+            turns = []
+            for turn_idx, (pe, kve) in enumerate(
+                zip(rollout.policy_epoch, rollout.kv_cache_epoch)
+            ):
+                evicts = (
+                    int(rollout.num_evictions[turn_idx])
+                    if turn_idx < len(rollout.num_evictions)
+                    else 0
+                )
+                turns.append({
+                    "token_count": len(rollout.trajectory[turn_idx]),
+                    "prompt_length": _turn_prompt_length(rollout, turn_idx),
+                    "policy_epoch": [[int(s), int(e)] for s, e in pe],
+                    "kv_cache_epoch": [[int(s), int(e)] for s, e in kve],
+                    "num_evictions": evicts,
+                })
+            reward = (
+                [float(x) for x in rollout.reward]
+                if isinstance(rollout.reward, list)
+                else float(rollout.reward)
+            )
+            record = {
+                "iteration": int(current_iteration),
+                "batch_id": int(group.batch_id),
+                "index_in_batch": int(group.index_in_batch),
+                "group_idx": int(group_idx),
+                "rollout_idx": int(rollout_idx),
+                "env_id": rollout.env_id,
+                "problem_id": rollout.problem_id,
+                "reward": reward,
+                "advantage": per_group_adv[group_idx][rollout_idx],
+                "group_reward_mean": group_reward_mean,
+                "group_reward_std": group_reward_std,
+                "group_degenerate": group_degenerate,
+                "traj_len": int(sum(len(t) for t in rollout.trajectory)),
+                "num_turns": len(rollout.trajectory),
+                "num_evictions": int(sum(rollout.num_evictions)),
+                "turns": turns,
+            }
+            _STALENESS_DUMP_FILE.write(json.dumps(record) + "\n")
+    _STALENESS_DUMP_FILE.flush()
+
+
 def compute_group_stats(
     rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
 ) -> RolloutStats:
@@ -1278,19 +1453,31 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    all_policy_epoch = []
-    all_kv_cache_epoch = []
+    all_policy_first = []
+    all_policy_avg = []
+    all_policy_last = []
+    all_kv_first = []
+    all_kv_avg = []
+    all_kv_last = []
     all_completed_epochs = []
     all_num_evictions = []
+    all_rollout_env_ids = []
+    all_problem_ids = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_policy_epoch = []
-        group_kv_epoch = []
+        group_policy_first = []
+        group_policy_avg = []
+        group_policy_last = []
+        group_kv_first = []
+        group_kv_avg = []
+        group_kv_last = []
         group_completed_epochs = []
         group_num_evictions = []
+        group_rollout_env_ids = []
+        group_problem_ids = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -1319,14 +1506,32 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
-            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
+            # Token-weighted first/avg/last epoch from the per-turn RLE boundaries.
+            policy_summary = rollout_epoch_summary(rollout.policy_epoch, roll_turn_lens)
+            kv_summary = rollout_epoch_summary(rollout.kv_cache_epoch, roll_turn_lens)
+            assert (
+                policy_summary is not None and kv_summary is not None
+            ), "Rollout has no tokens to summarize epochs over"
+            group_policy_first.append(policy_summary[0])
+            group_policy_avg.append(policy_summary[1])
+            group_policy_last.append(policy_summary[2])
+            group_kv_first.append(kv_summary[0])
+            group_kv_avg.append(kv_summary[1])
+            group_kv_last.append(kv_summary[2])
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
-        all_policy_epoch.append(group_policy_epoch)
-        all_kv_cache_epoch.append(group_kv_epoch)
+            group_rollout_env_ids.append(rollout.env_id)
+            group_problem_ids.append(rollout.problem_id)
+        all_policy_first.append(group_policy_first)
+        all_policy_avg.append(group_policy_avg)
+        all_policy_last.append(group_policy_last)
+        all_kv_first.append(group_kv_first)
+        all_kv_avg.append(group_kv_avg)
+        all_kv_last.append(group_kv_last)
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
+        all_rollout_env_ids.append(group_rollout_env_ids)
+        all_problem_ids.append(group_problem_ids)
         traj_lens.append(group_traj_lengths)
         # Guard against an all-placeholder group (every sub-request failed, e.g.
         # workplace_assistant prompts already exceeding seq_length at turn 1).
@@ -1357,10 +1562,16 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        policy_epoch=all_policy_epoch,
-        kv_cache_epoch=all_kv_cache_epoch,
+        policy_first_epoch=all_policy_first,
+        policy_avg_epoch=all_policy_avg,
+        policy_last_epoch=all_policy_last,
+        kv_first_epoch=all_kv_first,
+        kv_avg_epoch=all_kv_avg,
+        kv_last_epoch=all_kv_last,
         completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
+        rollout_env_ids=all_rollout_env_ids,
+        problem_ids=all_problem_ids,
     )
     return stats
 
@@ -1373,16 +1584,27 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_epoch: List[List[List[int]]],
-        kv_cache_epoch: List[List[List[int]]],
+        policy_first_epoch: List[List[int]],
+        policy_avg_epoch: List[List[float]],
+        policy_last_epoch: List[List[int]],
+        kv_first_epoch: List[List[int]],
+        kv_avg_epoch: List[List[float]],
+        kv_last_epoch: List[List[int]],
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
+        env_ids: List[List[str]],
+        problem_ids: List[List[str | None]],
         current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
 
     """Make a wandb-parseable dictionary of metrics for logging.
+
+    Staleness (a.k.a. lag) is ``current_iteration - epoch`` and is reported in a
+    consistent ``staleness/{policy|kv_cache}/{first|avg|last}/...`` scheme. The
+    ``first``/``avg``/``last`` epochs are per-rollout summaries (the ``avg`` is
+    token-weighted, computed upstream in ``compute_group_stats``).
 
     Args:
         wandb_writer: Wandb run to log to.
@@ -1391,109 +1613,133 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-token policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
+        policy_first_epoch: Grouped per-rollout first-token policy epoch.
+        policy_avg_epoch: Grouped per-rollout token-weighted average policy epoch.
+        policy_last_epoch: Grouped per-rollout last-token policy epoch.
+        kv_first_epoch: Grouped per-rollout first-token KV-cache epoch.
+        kv_avg_epoch: Grouped per-rollout token-weighted average KV-cache epoch.
+        kv_last_epoch: Grouped per-rollout last-token KV-cache epoch.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
+        env_ids: Grouped per-rollout environment ids (labels the rollout table).
+        problem_ids: Grouped per-rollout problem/prompt ids (labels the rollout table).
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+
+    def _flat(grouped):
+        return [x for g in grouped for x in g]
+
+    def _lag(grouped_epochs):
+        return [current_iteration - e for g in grouped_epochs for e in g]
+
+    def _dist(prefix, values, title, native_hist=True):
+        """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
+        native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
+        The Table is always kept, so the raw values stay queryable."""
+        if not values:
+            return {}
+        arr = np.asarray(values, dtype=float)
+        out = {
+            f'{prefix}/mean': float(arr.mean()),
+            f'{prefix}/min': float(arr.min()),
+            f'{prefix}/max': float(arr.max()),
+            f'{prefix}/p50': float(np.percentile(arr, 50)),
+            f'{prefix}/p90': float(np.percentile(arr, 90)),
+            f'{prefix}/p99': float(np.percentile(arr, 99)),
+            f'{prefix}_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
+                'value', title,
+            ),
+        }
+        if native_hist:
+            out[f'{prefix}/histogram'] = wandb_writer.Histogram(values)
+        return out
+
+    rewards_flat = _flat(rewards)
+    traj_lens_flat = _flat(traj_lens)
+    turn_lens_flat = _flat(turn_lens)
+    evictions_flat = _flat(num_evictions)
+    env_ids_flat = _flat(env_ids)
+    problem_ids_flat = _flat(problem_ids)
+
+    # Lag = current_iteration - epoch, per rollout, by category and source.
+    policy_first = _lag(policy_first_epoch)
+    policy_avg = _lag(policy_avg_epoch)
+    policy_last = _lag(policy_last_epoch)
+    kv_first = _lag(kv_first_epoch)
+    kv_avg = _lag(kv_avg_epoch)
+    kv_last = _lag(kv_last_epoch)
 
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch for r in g]
-    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch for r in g]
-    # Per-rollout staleness (newest token)
-    rollout_policy_last_token_staleness = [current_iteration - r[-1] for g in policy_epoch for r in g]
-    rollout_kv_last_token_staleness = [current_iteration - r[-1] for g in kv_cache_epoch for r in g]
-    # Per-token staleness
-    per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
-    per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
-
     metrics = {
-            'group_means_hist': wandb_writer.plot.histogram(
-                group_table, 'group_means', 'Group Means'
-            ),
-            'group_stds_hist': wandb_writer.plot.histogram(
-                group_table, 'group_stds', 'Group STDs'
-            ),
-            'rewards_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['reward'], data=[[r] for g in rewards for r in g]
-                ),
-                'reward', 'All Rewards'
-            ),
-            'advantages_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['advantages'], data=[[x] for x in advantages]
-                ),
-                'advantages', 'Advantages'
-            ),
-            'rollout_table': wandb_writer.Table(
-                columns=[
-                    'reward', 'traj_length', 'num_evictions',
-                    'policy_staleness', 'kv_staleness',
-                    'policy_last_token_staleness', 'kv_last_token_staleness',
-                ],
-                data=list(zip(
-                    [r for g in rewards for r in g],
-                    [l for g in traj_lens for l in g],
-                    [e for g in num_evictions for e in g],
-                    rollout_policy_staleness,
-                    rollout_kv_staleness,
-                    rollout_policy_last_token_staleness,
-                    rollout_kv_last_token_staleness,
-                )),
-            ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
-            'per_token_table': wandb_writer.Table(
-                columns=['policy_staleness', 'kv_staleness'],
-                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
-            ),
-            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
-            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
-            'max_turn_length': max([max(g) for g in turn_lens]),
-            'min_turn_length': min([min(g) for g in turn_lens]),
-            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
-            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
-            'max_traj_length': max([max(g) for g in traj_lens]),
-            'min_traj_length': min([min(g) for g in traj_lens]),
-            'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
-            'max_num_turns': max([max(g) for g in num_turns]),
-            'min_num_turns': min([min(g) for g in num_turns]),
-            'mean_reward': np.mean([np.mean(g) for g in rewards]),
-            'mean_advantage': np.mean(advantages),
-            'nonzero_groups_ratio': np.count_nonzero(advantages)
-            / len(advantages),
-            'mean_policy_staleness': np.mean(rollout_policy_staleness),
-            'max_policy_staleness': max(rollout_policy_staleness),
-            'min_policy_staleness': min(rollout_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
-            'max_kv_cache_staleness': max(rollout_kv_staleness),
-            'min_kv_cache_staleness': min(rollout_kv_staleness),
-            'mean_policy_last_token_staleness': np.mean(rollout_policy_last_token_staleness),
-            'max_policy_last_token_staleness': max(rollout_policy_last_token_staleness),
-            'min_policy_last_token_staleness': min(rollout_policy_last_token_staleness),
-            'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
-            'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
-            'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
-            'total_eviction_count': sum([sum(g) for g in num_evictions]),
-            'max_num_evictions': max([max(g) for g in num_evictions]),
-            'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
-            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
-                'staleness', 'Per-Token Policy Staleness'
-            ),
-            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
-                'staleness', 'Per-Token KV Cache Staleness'
-            ),
+        'group_means_hist': wandb_writer.plot.histogram(group_table, 'group_means', 'Group Means'),
+        'group_stds_hist': wandb_writer.plot.histogram(group_table, 'group_stds', 'Group STDs'),
+        'rewards_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(columns=['reward'], data=[[r] for r in rewards_flat]),
+            'reward', 'All Rewards',
+        ),
+        'advantages_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(columns=['advantages'], data=[[x] for x in advantages]),
+            'advantages', 'Advantages',
+        ),
+        # One row per rollout: identity (env/problem), reward, length, evictions,
+        # and first/avg/last lag.
+        'rollout_table': wandb_writer.Table(
+            columns=[
+                'env_id', 'problem_id',
+                'reward', 'traj_length', 'num_evictions',
+                'policy_first', 'policy_avg', 'policy_last',
+                'kv_cache_first', 'kv_cache_avg', 'kv_cache_last',
+            ],
+            data=list(zip(
+                env_ids_flat, problem_ids_flat,
+                rewards_flat, traj_lens_flat, evictions_flat,
+                policy_first, policy_avg, policy_last,
+                kv_first, kv_avg, kv_last,
+            )),
+        ),
+        'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
+        'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
+        'max_turn_length': max([max(g) for g in turn_lens]),
+        'min_turn_length': min([min(g) for g in turn_lens]),
+        'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
+        'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
+        'max_traj_length': max([max(g) for g in traj_lens]),
+        'min_traj_length': min([min(g) for g in traj_lens]),
+        'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
+        'max_num_turns': max([max(g) for g in num_turns]),
+        'min_num_turns': min([min(g) for g in num_turns]),
+        'mean_reward': np.mean([np.mean(g) for g in rewards]),
+        'mean_advantage': np.mean(advantages),
+        'nonzero_groups_ratio': np.count_nonzero(advantages) / len(advantages),
+        'total_eviction_count': sum(evictions_flat),
+        'max_num_evictions': max(evictions_flat) if evictions_flat else 0,
+        'mean_completion_gap': np.mean(
+            [current_iteration - s for g in completed_epochs for s in g]
+        ),
     }
+
+    # Staleness distributions: staleness/{policy|kv_cache}/{first|avg|last}/...
+    metrics.update(_dist('staleness/policy/first', policy_first, 'Policy lag (first token)'))
+    metrics.update(_dist('staleness/policy/avg', policy_avg, 'Policy lag (avg token)'))
+    metrics.update(_dist('staleness/policy/last', policy_last, 'Policy lag (last token)'))
+    metrics.update(_dist('staleness/kv_cache/first', kv_first, 'KV-cache lag (first token)'))
+    metrics.update(_dist('staleness/kv_cache/avg', kv_avg, 'KV-cache lag (avg token)'))
+    metrics.update(_dist('staleness/kv_cache/last', kv_last, 'KV-cache lag (last token)'))
+
+    # Rollout-length and eviction distributions.
+    metrics.update(_dist('length/traj', traj_lens_flat, 'Trajectory lengths'))
+    metrics.update(_dist('length/turn', turn_lens_flat, 'Turn lengths'))
+    # Evictions: keep the Table-backed chart only (no native histogram, per request).
+    metrics.update(
+        _dist('evictions/per_rollout', evictions_flat, 'Evictions per rollout', native_hist=False)
+    )
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -1551,15 +1797,26 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    policy_epoch = group_stats.policy_epoch
-    kv_cache_epoch = group_stats.kv_cache_epoch
+    policy_first_epoch = group_stats.policy_first_epoch
+    policy_avg_epoch = group_stats.policy_avg_epoch
+    policy_last_epoch = group_stats.policy_last_epoch
+    kv_first_epoch = group_stats.kv_first_epoch
+    kv_avg_epoch = group_stats.kv_avg_epoch
+    kv_last_epoch = group_stats.kv_last_epoch
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
+    rollout_env_ids = group_stats.rollout_env_ids
+    problem_ids = group_stats.problem_ids
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+        policy_first_epoch=policy_first_epoch, policy_avg_epoch=policy_avg_epoch,
+        policy_last_epoch=policy_last_epoch, kv_first_epoch=kv_first_epoch,
+        kv_avg_epoch=kv_avg_epoch, kv_last_epoch=kv_last_epoch,
+        completed_epochs=completed_epochs,
+        num_evictions=num_evictions,
+        env_ids=rollout_env_ids, problem_ids=problem_ids,
+        current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1578,10 +1835,16 @@ def maybe_log_training_metrics(
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
-            policy_epoch=env_stats(policy_epoch, env_idx),
-            kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
+            policy_first_epoch=env_stats(policy_first_epoch, env_idx),
+            policy_avg_epoch=env_stats(policy_avg_epoch, env_idx),
+            policy_last_epoch=env_stats(policy_last_epoch, env_idx),
+            kv_first_epoch=env_stats(kv_first_epoch, env_idx),
+            kv_avg_epoch=env_stats(kv_avg_epoch, env_idx),
+            kv_last_epoch=env_stats(kv_last_epoch, env_idx),
             completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
+            env_ids=env_stats(rollout_env_ids, env_idx),
+            problem_ids=env_stats(problem_ids, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
@@ -1893,6 +2156,10 @@ def prepare_data_for_update(
         for g in rollouts:
             if g[0].env_id not in example_groups:
                 example_groups[g[0].env_id] = g
+
+        # Dump labeled per-rollout staleness/length data (rank 0, opt-in) while the
+        # rollouts are still grouped (so batch_id / group index are available).
+        dump_staleness_data(rollouts, group_stats, args.curr_iteration)
 
         # Let's expand rollouts getting rid of the groups.
         # We need this to correctly split the rollouts across dp groups.

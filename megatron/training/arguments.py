@@ -2561,6 +2561,15 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+
+    # Per-rollout staleness logging (research metric).
+    group.add_argument('--rl-log-staleness-data', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Dump labeled per-rollout staleness/length data (per-turn epoch RLE, '
+                            'token counts, evictions) to JSONL for per batch/env/group/rollout plots.')
+    group.add_argument('--rl-logging-dir', type=str, default=None,
+                       help='Directory for RL logging artifacts (staleness dumps, plots). '
+                            'Defaults to $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.')
     return parser
 
 def _add_training_args(parser):
