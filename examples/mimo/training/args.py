@@ -12,16 +12,12 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the hetero per-module parallelism args (--encoder-*/--llm-*)."""
+    """Register hetero parallelism args for the single-encoder MIMO example."""
     grid = parser.add_argument_group("hetero module grids")
 
-    # Encoder grid factorization (the encoder span always starts at rank 0).
+    # Single encoder grid; CP/PP stay fixed at 1.
     grid.add_argument("--encoder-tp", type=int, default=2,
                       help="Encoder tensor-model-parallel size.")
-    grid.add_argument("--encoder-cp", type=int, default=1,
-                      help="Encoder context-parallel size (CP=1 only for now).")
-    grid.add_argument("--encoder-pp", type=int, default=1,
-                      help="Encoder pipeline-model-parallel size.")
     grid.add_argument("--encoder-dp", type=int, default=2,
                       help="Encoder data-parallel size.")
 
@@ -42,8 +38,6 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     grid.add_argument("--llm-expt-tp", type=int, default=None,
                       help="Language expert tensor-parallel size; defaults to 1 when unset "
                            "(experts default to TP=1; the 20L MoE recipe passes --llm-expt-tp 1).")
-    grid.add_argument("--llm-expt-dp", type=int, default=None,
-                      help="Language expert data-parallel size; derived from the grid when unset.")
 
     grid.add_argument(
         "--llm-only",
@@ -59,7 +53,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
-    if args.encoder_cp != 1 or args.llm_cp != 1:
+    if args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
     # MoE expert count must divide evenly across the language grid's expert parallelism.
@@ -93,7 +87,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"(got {args.micro_batch_size} * {args.llm_dp} % {args.encoder_dp} != 0)"
         )
 
-    encoder_size = args.encoder_tp * args.encoder_cp * args.encoder_pp * args.encoder_dp
+    encoder_size = args.encoder_tp * args.encoder_dp
     encoder_ranks = set(range(encoder_size))  # encoder span always starts at rank 0
     llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
     all_ranks = set(range(world_size))
@@ -115,7 +109,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 def build_module_grid_specs(
     args: argparse.Namespace, world_size: int, encoder_module_name: str
 ) -> List[ModuleGridSpec]:
-    """Map grid args to the ModuleGridSpec list create_topology consumes; caller supplies encoder_module_name."""
+    """Map grid args to the ModuleGridSpec list create_topology consumes."""
     encoder_size, llm_size = validate_hetero_grid_args(args, world_size)
 
     language_grid_spec = ModuleGridSpec(
@@ -136,8 +130,8 @@ def build_module_grid_specs(
         name=encoder_module_name,
         num_ranks=encoder_size,
         tp=args.encoder_tp,
-        cp=args.encoder_cp,
-        pp=args.encoder_pp,
+        cp=1,
+        pp=1,
         ep=1,
         rank_offset=0,
         expt_tp=1,

@@ -26,9 +26,9 @@ def _parse(argv):
 
 
 def _layout_8gpu_20l(**overrides):
-    """Canonical 8-GPU layout: encoder 0-3 (tp2/pp1/dp2), llm 4-7 (tp2/pp1/dp2/ep4)."""
+    """Canonical 8-GPU layout: encoder 0-3 (tp2/dp2), llm 4-7 (tp2/pp1/dp2/ep4)."""
     argv = (
-        "--encoder-tp 2 --encoder-pp 1 --encoder-dp 2 "
+        "--encoder-tp 2 --encoder-dp 2 "
         "--llm-offset 4 --llm-tp 2 --llm-pp 1 --llm-dp 2 --llm-ep 4"
     ).split()
     args = _parse(argv)
@@ -51,7 +51,9 @@ def test_canonical_layout_validates_and_maps_specs():
     assert encoder_grid_spec.name == "radio_encoder"
     assert encoder_grid_spec.num_ranks == 4
     assert encoder_grid_spec.rank_offset == 0  # encoder span always starts at rank 0
-    assert encoder_grid_spec.dp == 2  # derived: 4 // (tp2 * cp1 * pp1)
+    assert encoder_grid_spec.cp == 1
+    assert encoder_grid_spec.pp == 1
+    assert encoder_grid_spec.dp == 2  # derived: 4 // tp2
     assert language_grid_spec.name == MIMO_LANGUAGE_MODULE_KEY
     assert language_grid_spec.num_ranks == 4
     assert language_grid_spec.rank_offset == 4
@@ -88,7 +90,14 @@ def test_ep_divisibility_raises():
         validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
-def test_cp_must_be_one():
+def test_parser_does_not_expose_unsupported_grid_knobs():
+    args = _parse([])
+    assert not hasattr(args, "encoder_cp")
+    assert not hasattr(args, "encoder_pp")
+    assert not hasattr(args, "llm_expt_dp")
+
+
+def test_llm_cp_must_be_one():
     args = _layout_8gpu_20l(llm_cp=2)
     with pytest.raises(ValueError, match="CP=1 only"):
         validate_hetero_grid_args(args, WORLD_SIZE_8)
