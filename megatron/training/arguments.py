@@ -2741,6 +2741,50 @@ def _add_network_size_args(parser):
         help='Sequence length interpolation factor for rotary embeddings.',
     )
     group.add_argument(
+        '--yarn-rotary-scaling-factor',
+        type=float,
+        default=1.0,
+        help='Scaling factor for YaRN RoPE (used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--yarn-original-max-position-embeddings',
+        type=int,
+        default=4096,
+        help='Original (pre-extension) max sequence length for YaRN RoPE '
+        '(used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--yarn-beta-fast',
+        type=float,
+        default=32.0,
+        help='Fast beta value for YaRN RoPE (used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--yarn-beta-slow',
+        type=float,
+        default=1.0,
+        help='Slow beta value for YaRN RoPE (used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--yarn-mscale',
+        type=float,
+        default=1.0,
+        help='Mscale value for YaRN RoPE (used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--yarn-mscale-all-dim',
+        type=float,
+        default=0.0,
+        help='Mscale-all-dim value for YaRN RoPE (used with --position-embedding-type yarn).',
+    )
+    group.add_argument(
+        '--no-yarn-correction-range-round-to-int',
+        action='store_false',
+        dest='yarn_correction_range_round_to_int',
+        help='Do not round YaRN correction dimension range bounds to integers '
+        '(used with --position-embedding-type yarn). Rounding is enabled by default.',
+    )
+    group.add_argument(
         '--use-rope-scaling', action='store_true', help='Apply rope scaling as used in llama3.x'
     )
     group.add_argument(

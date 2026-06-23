@@ -1,5 +1,6 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import os
 from datetime import timedelta
 from itertools import accumulate
@@ -777,21 +778,26 @@ class TestHybridWithDynamicInference:
 
 def _make_yarn_config(**kwargs):
     """Build a TransformerConfig with yarn positional embedding attributes."""
+    # Yarn-specific attributes are formal TransformerConfig fields and are passed directly to
+    # the constructor (overridable via kwargs).
+    yarn_defaults = dict(
+        yarn_rotary_scaling_factor=2.0,
+        yarn_original_max_position_embeddings=4,
+        yarn_beta_fast=32.0,
+        yarn_beta_slow=1.0,
+        yarn_mscale=1.0,
+        yarn_mscale_all_dim=0.0,
+        yarn_correction_range_round_to_int=True,
+    )
+    yarn_defaults.update({k: kwargs.pop(k) for k in list(kwargs) if k in yarn_defaults})
     cfg = TransformerConfig(
         num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
         hidden_size=256,
         num_attention_heads=4,
         use_cpu_initialization=True,
+        **yarn_defaults,
         **kwargs,
     )
-    # Yarn-specific attributes are set dynamically on the config (not TransformerConfig fields).
-    cfg.yarn_rotary_scaling_factor = 2.0
-    cfg.yarn_original_max_position_embeddings = 4
-    cfg.yarn_beta_fast = 32.0
-    cfg.yarn_beta_slow = 1.0
-    cfg.yarn_mscale = 1.0
-    cfg.yarn_mscale_all_dim = 0.0
-    cfg.yarn_correction_range_round_to_int = True
     return cfg
 
 
@@ -821,6 +827,17 @@ class TestHybridModelWithYarn:
         assert self.model.position_embedding_type == 'yarn'
         # YaRN creates a YarnRotaryEmbedding rather than a plain RotaryEmbedding.
         assert isinstance(self.model.rotary_pos_emb, YarnRotaryEmbedding)
+
+    def test_config_values_flow_into_embedding(self):
+        # The yarn_* config fields must be plumbed through to the YarnRotaryEmbedding instance.
+        emb = self.model.rotary_pos_emb
+        assert emb.scaling_factor == 2.0
+        assert emb.original_max_position_embeddings == 4
+        assert emb.beta_fast == 32.0
+        assert emb.beta_slow == 1.0
+        assert emb.mscale == 1.0
+        assert emb.mscale_all_dim == 0.0
+        assert emb.correction_range_round_to_int is True
 
     def test_forward(self):
         sequence_length = self.model.max_sequence_length
@@ -881,3 +898,21 @@ class TestHybridModelWithYarn:
                 # StaticInferenceContext always sets materialize_only_last_token_logits=True.
                 assert logits.shape[1] == 1
                 assert logits.shape[2] == self.model.vocab_size
+
+
+def test_yarn_config_fields_are_formal_dataclass_fields():
+    """The yarn_* attributes consumed by HybridModel must be real TransformerConfig fields
+    (with defaults), so `--position-embedding-type yarn` works without dynamic patching."""
+    field_defaults = {f.name: f.default for f in dataclasses.fields(TransformerConfig)}
+    expected = {
+        "yarn_rotary_scaling_factor": 1.0,
+        "yarn_original_max_position_embeddings": 4096,
+        "yarn_beta_fast": 32.0,
+        "yarn_beta_slow": 1.0,
+        "yarn_mscale": 1.0,
+        "yarn_mscale_all_dim": 0.0,
+        "yarn_correction_range_round_to_int": True,
+    }
+    for name, default in expected.items():
+        assert name in field_defaults, f"{name} is not a TransformerConfig field"
+        assert field_defaults[name] == default, f"unexpected default for {name}"

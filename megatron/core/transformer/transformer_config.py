@@ -233,6 +233,30 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    yarn_rotary_scaling_factor: float = 1.0
+    """Scaling factor for YaRN RoPE, used when position_embedding_type == 'yarn'. Default 1.0
+    (no scaling)."""
+
+    yarn_original_max_position_embeddings: int = 4096
+    """Original (pre-extension) maximum sequence length the model was trained on, used by YaRN
+    RoPE when position_embedding_type == 'yarn'."""
+
+    yarn_beta_fast: float = 32.0
+    """Fast beta value for YaRN RoPE, used when position_embedding_type == 'yarn'."""
+
+    yarn_beta_slow: float = 1.0
+    """Slow beta value for YaRN RoPE, used when position_embedding_type == 'yarn'."""
+
+    yarn_mscale: float = 1.0
+    """Mscale value for YaRN RoPE, used when position_embedding_type == 'yarn'."""
+
+    yarn_mscale_all_dim: float = 0.0
+    """Mscale-all-dim value for YaRN RoPE, used when position_embedding_type == 'yarn'."""
+
+    yarn_correction_range_round_to_int: bool = True
+    """Whether to round the YaRN correction dimension range bounds to integers, used when
+    position_embedding_type == 'yarn'."""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
