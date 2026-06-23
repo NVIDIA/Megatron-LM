@@ -98,6 +98,27 @@ def gemma4_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     config.activation_func = partial(torch.nn.functional.gelu, approximate="tanh")
     config.bias_activation_fusion = False
 
+    # Gemma4 architectural flags that have NO dedicated CLI flag (or whose CLI default is
+    # wrong for this model) and are mandatory for the layer spec to build correctly. Force
+    # them here so a training command can't silently mis-build (esp. under TP>1/SP):
+    #   * qk_layernorm: the spec wires q/k RMSNorm builders; base attention rejects them
+    #     unless qk_layernorm=True (attention.py), and the CLI default is False.
+    #   * add_bias_linear / add_qkv_bias: Gemma4 has no linear biases; CLI default is True.
+    config.qk_layernorm = True
+    config.add_bias_linear = False
+    config.add_qkv_bias = False
+    # num_query_groups is a real dimension (E4B = 2 kv groups vs 8 q heads). It must be set
+    # to a GQA value; the CLI defaults it to num_attention_heads, which silently breaks
+    # GQA head-sharding at TP>num_query_groups (e.g. TP=8). Fail loudly if mis-set.
+    assert (
+        config.num_query_groups is not None
+        and config.num_query_groups < config.num_attention_heads
+    ), (
+        f"Gemma4 requires GQA: num_query_groups ({config.num_query_groups}) must be set "
+        f"< num_attention_heads ({config.num_attention_heads}); pass "
+        f"--group-query-attention --num-query-groups 2 (E4B)."
+    )
+
     # The PLE per-layer token table is indexed by the SAME vocab as embed_tokens
     # (HF: vocab_size_per_layer_input == vocab_size). Keep them consistent with the
     # model vocab so a smaller --vocab-size (e.g. for a smoke run) shrinks the PLE

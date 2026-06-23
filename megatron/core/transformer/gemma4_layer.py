@@ -57,20 +57,25 @@ class Gemma4TransformerLayer(TransformerLayer):
         )
 
         ple_dim = self.config.hidden_size_per_layer_input
-        # gather_output=True so the gate is full-width [ple_dim] on every TP rank.
-        # The PLE sub-block runs replicated across TP: ``per_layer_input`` (p_i) is
-        # threaded in full-width from the block and ``per_layer_projection`` is a
-        # RowParallel with input_is_parallel=False (it expects a full input and
-        # scatters internally). With gather_output=False the gate would be sharded
-        # to ple_dim/TP while p_i stayed full, so ``gate * per_layer_input`` mismatched
-        # (e.g. 32 vs 256 at TP=8). Gathering is a no-op at TP=1 and numerically
-        # identical to the TP=1 path; it does not affect weight sharding / ckpt load.
+        # The PLE sub-block is a standard Column->Row pair, so it inherits the SP
+        # all-gather/reduce-scatter dance and is correct at TP=1, TP>1 (no SP), and TP>1+SP:
+        #   gate = per_layer_input_gate (Column, gather_output=False) -> [s, b, ple_dim/TP]
+        #          (under SP the Column linear all-gathers the sequence internally, so the
+        #           gate is full-sequence with the ple_dim partitioned across TP);
+        #   the threaded ``per_layer_input`` is full-sequence and ple_dim-sharded
+        #          ([s, b, ple_dim/TP]) -- Gemma4Model.forward scatters per_layer_inputs on
+        #          the ple_dim with scatter_to_tensor_model_parallel_region -- so
+        #          ``gate * per_layer_input`` is an elementwise [s, b, ple_dim/TP] product;
+        #   per_layer_projection (Row, input_is_parallel=True) consumes the partitioned
+        #          input and reduce-scatters (SP) / all-reduces (no SP) back to [s(/TP), b, h].
+        # All of this is a no-op at TP=1 (the scatter is identity) and does not affect weight
+        # sharding / ckpt load.
         self.per_layer_input_gate = submodules.per_layer_input_gate(
             self.config.hidden_size,
             ple_dim,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=True,
+            gather_output=False,
             bias=False,
             skip_bias_add=True,
             is_expert=False,
@@ -82,7 +87,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=False,
-            input_is_parallel=False,
+            input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name="per_layer_projection",

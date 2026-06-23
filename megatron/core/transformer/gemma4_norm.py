@@ -35,7 +35,16 @@ class Gemma4RMSNorm(torch.nn.Module):
 
 def gemma4_rms_norm_builder(*, config, hidden_size: int, eps: float, **kwargs) -> Gemma4RMSNorm:
     """:class:`LayerNormBuilder` for the weighted :class:`Gemma4RMSNorm` (local spec)."""
-    return Gemma4RMSNorm(hidden_size, eps=eps, with_scale=True)
+    norm = Gemma4RMSNorm(hidden_size, eps=eps, with_scale=True)
+    # Under sequence parallelism the norm weight is replicated across TP but each rank only
+    # sees a partition of the activations (the sequence shard for the hidden-size sandwich
+    # norms; the head shard for the q/k norms), so its gradient is a partial sum. Tagging
+    # the weight ``sequence_parallel`` makes grad finalization all-reduce it across TP
+    # (megatron/core/distributed/finalize_model_grads.py), recovering the full gradient.
+    # This mirrors TENorm (extensions/transformer_engine.py), which passes
+    # ``sequence_parallel=config.sequence_parallel`` for the TE spec. No-op when SP is off.
+    norm.weight.sequence_parallel = config.sequence_parallel
+    return norm
 
 
 def gemma4_rms_norm_scaleless_builder(

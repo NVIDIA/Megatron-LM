@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.models.gemma4.gemma4_block import Gemma4TransformerBlock
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.gemma4_mask import (
@@ -104,9 +105,29 @@ class Gemma4Model(GPTModel):
         # PLE precompute. The foundation Gemma4PLE consumes inputs_embeds in [B,S,H];
         # decoder_input is [s,b,h] so transpose. Result [B,S,L,P] -> [s,b,L,P] for the
         # seq-first decoder.
-        inputs_embeds = decoder_input.transpose(0, 1).contiguous()  # [b, s, h]
+        #
+        # Under sequence parallelism the embedding has reduce-scattered decoder_input to
+        # [s/TP, b, h], but PLE needs the FULL-sequence embeddings (E_proj projects the
+        # whole-sequence inputs_embeds). Gather the sequence back for the PLE precompute
+        # only; the residual stream handed to the decoder stays sequence-sharded.
+        # ``tensor_parallel_output_grad=False`` is REQUIRED: the gather's default backward
+        # reduce-scatters+sums over TP, but the PLE branch's ple-dim scatter backward
+        # already all-gathers the full (duplicated) PLE gradient onto every rank, so a
+        # second TP reduction would overcount the PLE->decoder_input gradient by TP. The
+        # split-only backward takes each rank's own sequence slice. No-op at TP=1.
+        ple_embeds = decoder_input
+        if self.config.sequence_parallel:
+            ple_embeds = tensor_parallel.gather_from_sequence_parallel_region(
+                decoder_input, tensor_parallel_output_grad=False
+            )
+        inputs_embeds = ple_embeds.transpose(0, 1).contiguous()  # [b, s, h]
         per_layer_inputs = self.ple(input_ids, inputs_embeds)  # [b, s, L, P]
         per_layer_inputs = per_layer_inputs.transpose(0, 1).contiguous()  # [s, b, L, P]
+        # Shard the PLE dim (last) across TP so each rank's slice matches its gate output
+        # [s, b, P/TP]. Identity at TP=1.
+        per_layer_inputs = tensor_parallel.scatter_to_tensor_model_parallel_region(
+            per_layer_inputs
+        )  # [s, b, L, P/TP]
 
         # Per-layer-type rope cos/sin and additive masks (finfo.min fill).
         dtype = decoder_input.dtype
