@@ -643,11 +643,13 @@ class TopKRouter(Router):
                 valid_mask = ~padding_mask
                 z_loss_values = z_loss_values * valid_mask
                 num_local_tokens = valid_mask.sum()
+                z_loss_sum = z_loss_values.sum()
+                z_loss_mean = z_loss_sum / torch.clamp(num_local_tokens, min=1)
             else:
-                num_local_tokens = torch.tensor(logits.shape[0], device=logits.device)
-
-            z_loss_sum = z_loss_values.sum()
-            z_loss_mean = z_loss_sum / torch.clamp(num_local_tokens, min=1)
+                z_loss_sum = z_loss_values.sum()
+                # Keep the token count as a Python scalar so CUDA graph capture does not
+                # record a CPU-to-CUDA tensor creation.
+                z_loss_mean = z_loss_sum / max(logits.shape[0], 1)
 
             mtp_loss_scale = 1
             if (
