@@ -8,6 +8,7 @@ import torch
 from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -694,3 +695,30 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
+
+
+class TestAbstractTokenizerSpecialIdAliases:
+    """Regression tests for the special-id property aliases on
+    ``MegatronTokenizerTextAbstract`` (cls_id / sep_id / pad_id / bos_id / eos_id / mask_id).
+
+    Each alias previously checked ``hasattr(self, '<name>_id')`` and returned
+    ``self.<name>_id`` — i.e. it re-entered itself — so accessing an alias that a
+    subclass did not override raised ``RecursionError`` instead of returning the
+    backing short-name attribute (``self.cls`` ...) or a clean ``AttributeError``.
+    ``ByteLevelTokenizer`` overrides pad_id/bos_id/eos_id but not cls_id/sep_id/mask_id,
+    so those reach the base implementation and exercise the shared fix.
+    """
+
+    def test_unoverridden_alias_raises_attributeerror_not_recursion(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        # No backing short-name attribute -> a clean AttributeError, not RecursionError.
+        for name in ("cls_id", "sep_id", "mask_id"):
+            with pytest.raises(AttributeError):
+                getattr(tok, name)
+
+    def test_alias_returns_backing_short_name_attribute(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        tok.cls, tok.sep, tok.mask = 5, 6, 7
+        assert tok.cls_id == 5
+        assert tok.sep_id == 6
+        assert tok.mask_id == 7
