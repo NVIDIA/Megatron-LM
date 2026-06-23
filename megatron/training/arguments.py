@@ -2144,6 +2144,21 @@ def _add_network_size_args(parser):
                        help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
+    group.add_argument('--yarn-rotary-scaling-factor', type=float, default=1.0,
+                       help='YaRN RoPE scaling factor (position-embedding-type=yarn).')
+    group.add_argument('--yarn-original-max-position-embeddings', type=int, default=4096,
+                       help='YaRN original (pre-extension) max sequence length.')
+    group.add_argument('--yarn-beta-fast', type=float, default=32.0,
+                       help='YaRN RoPE fast beta value (position-embedding-type=yarn).')
+    group.add_argument('--yarn-beta-slow', type=float, default=1.0,
+                       help='YaRN RoPE slow beta value (position-embedding-type=yarn).')
+    group.add_argument('--yarn-mscale', type=float, default=1.0,
+                       help='YaRN RoPE mscale value (position-embedding-type=yarn).')
+    group.add_argument('--yarn-mscale-all-dim', type=float, default=0.0,
+                       help='YaRN RoPE mscale-all-dim value (position-embedding-type=yarn).')
+    group.add_argument('--no-yarn-correction-range-round-to-int', action='store_false',
+                       dest='yarn_correction_range_round_to_int',
+                       help='Disable integer rounding of YaRN correction range bounds.')
     group.add_argument('--use-rope-scaling', action='store_true',
                        help='Apply rope scaling as used in llama3.x')
     group.add_argument('--rope-scaling-factor', type=float, default=8.0,
