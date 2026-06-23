@@ -47,16 +47,16 @@ This focus drives the major design benefits:
 
 - **Consistency between training and inference.** RL is extremely sensitive to
   numerical mismatch between the framework that *trains* the policy and the one
-  that *generates* rollouts. Running both in MCore eliminates the
-  training–inference software gap and the subtle reward/KL drift it causes.
+  that *generates* rollouts. Running both in MCore removes the cross-framework
+  portion of this gap and makes the remaining numerical mismatch far easier to
+  control (see batch-invariant kernels below).
 - **No model conversion.** Because rollouts run on the same MCore model, there
   is **no Hugging Face ↔ MCore conversion** step between training and
   generation, and **day-0 inference** for any model trainable in Megatron Core.
 - **Cheap training ↔ inference transitions.** Tight coupling enables
   in-place weight refit and shared memory management, drastically cutting
-  re-initialization cost. (For reference, NeMo-RL reported ~22 min reinit cost
-  for DSV3 at 1k scale with the previous stack, with the external inference
-  engine responsible for >50% of that.)
+  re-initialization cost relative to standing up an external inference engine
+  each rollout.
 - **Colocated and non-colocated deployments.** Megatron Inference supports
   **weight refit / resharding between training and inference**, so the same
   weights can be moved between the two phases under different parallelism
@@ -65,8 +65,7 @@ This focus drives the major design benefits:
   separate resources), with the engine resharding weights to the inference-time
   parallel configuration during the swap.
 - **First-class parallelism reuse.** Rollouts reuse Megatron-LM's existing TP /
-  EP / PP / CP parallelism infrastructure and TransformerEngine low-precision
-  kernels directly.
+  EP / PP parallelism infrastructure directly.
 
 This work is developed in tight collaboration with the Megatron-RL team. If you
 just need a quick offline generation or an OpenAI-style endpoint, that works too
@@ -85,6 +84,11 @@ The plots below show a sample comparison of decode step times against vLLM
 during rollouts (lower is better). The two engines track each other closely
 across batch sizes, with MCore comparable or slightly faster at larger batch
 sizes:
+
+<!-- TODO: These decode-step plots are pre-async-scheduling; refresh them once
+async scheduling is merged, and add a prefill-perf analysis section. -->
+<!-- TODO: Add a "Benchmark setup" note documenting the versions benched with
+(vLLM version, MCore commit/version, GPU/hardware, model sizes). -->
 
 ![Sample rollout decode step times — Nemotron 3 Ultra](images/inference_performance/ultra-performance.png)
 
@@ -108,7 +112,7 @@ training/inference consistency benefits of MCore inference.
 | **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher (notably faster than the all-to-all dispatchers other frameworks use) plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs |
 | **Parallelism** | Data-parallel coordinator with full multi-node support; tensor model parallelism with low-latency comm primitives; expert model parallelism |
 | **Model families** | GPT-style dense models, MoE models, and Mamba / hybrid (SSM + attention) models |
-| **Precision** | Low-precision functionality (e.g. MXFP8); native TransformerEngine quantization kernels |
+| **Precision** | Low-precision functionality (e.g. MXFP8) using latency-optimized inference kernels |
 | **RL** | Weight refit / resharding between training ↔ inference, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments; batch-invariant kernels for train/inference log-prob consistency |
 | **Sampling** | Temperature / top-k / top-p, stop words, log-probs, top-N log-probs; pluggable torch or FlashInfer sampling backend |
 
@@ -535,9 +539,13 @@ engine = DynamicInferenceEngine(controller, context)
 ### 6.3 Customizing the `DynamicInferenceContext`
 
 The `DynamicInferenceContext` holds the KV cache, paging, and the
-scheduling/bookkeeping state. Configure it through `InferenceConfig`
-(buffer size, block size, prefix caching, chunked prefill, CUDA graphs,
-suspend/resume memory mode, Mamba state — see
+scheduling/bookkeeping state. For hybrid / SSM models it also manages the
+recurrent Mamba (SSM) state alongside the attention KV cache, sized via
+`mamba_inference_state_config` / `mamba_memory_ratio`. (Gated delta-net (GDN)
+layers are not yet supported in inference — see
+[Known Limitations](#8-known-limitations).) Configure it through
+`InferenceConfig` (buffer size, block size, prefix caching, chunked prefill,
+CUDA graphs, suspend/resume memory mode, Mamba/SSM state — see
 [Section 4.6](#46-engine-configuration)). For deeper changes — custom KV-cache
 layouts, eviction, or scheduling — subclass the context and pass it into the
 wrapper and engine.
@@ -604,6 +612,9 @@ All supported modes produce numerically identical generated text.
 ## 8. Known Limitations
 
 - **`MLA models are not supported`**.
+- **Gated delta-net (GDN) layers are not yet supported in inference.** The
+  dynamic context raises `NotImplementedError` if a model contains GDN layers;
+  Mamba (SSM) and attention hybrid layers are supported.
 - **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
   internal asyncio primitives that suspended waiters still reference) or
   silently re-route to direct-mode branches. The offline example therefore
