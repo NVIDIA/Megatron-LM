@@ -6,10 +6,10 @@ spec:
   name: '{test_case}_{environment}_{platforms}'
   model: moe
   build: mcore-pyt-{environment}
-  nodes: 1
-  gpus: 8
+  nodes: 2
+  gpus: 4
   n_repeat: 1
-  platforms: dgx_a100
+  platforms: dgx_gb200
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -37,6 +37,7 @@ spec:
     set -euo pipefail
     ls
     cd /opt/megatron-lm
+    export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
@@ -57,28 +58,8 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_logitsmatch]
-    products:
-      - environment: [dev]
-        scope: [mr-broken]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_cuda_graphs_pad_tp4_pp1_ep4_16B_logitsmatch]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_ep2_gptoss_20b_swa]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_chunked_prefill]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+        platforms: [dgx_gb200]
