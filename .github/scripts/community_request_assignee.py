@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -135,10 +135,7 @@ def post_issue_comment(issue: IssueContext, body: str, dry_run: bool) -> None:
 
     url = f"{GITHUB_API_URL}/repos/{issue.owner}/{issue.repo}/issues/{issue.number}/comments"
     response = requests.post(
-        url,
-        headers=get_headers("ISSUE_COMMENT_TOKEN"),
-        json={"body": body},
-        timeout=30,
+        url, headers=get_headers("ISSUE_COMMENT_TOKEN"), json={"body": body}, timeout=30
     )
     if response.status_code >= 400:
         print(f"GitHub API request failed: POST {url}: {response.status_code} {response.text}")
@@ -573,9 +570,7 @@ def run(dry_run: bool = False, require_slack: bool = True) -> AssignmentPlan:
     if plan.mode == "manual_rejected":
         rejected_candidate = plan.rejected_candidate or "requested-user"
         post_issue_comment(
-            issue,
-            manual_assignee_rejection_comment(rejected_candidate),
-            dry_run=dry_run,
+            issue, manual_assignee_rejection_comment(rejected_candidate), dry_run=dry_run
         )
         if not dry_run:
             sys.exit(1)
