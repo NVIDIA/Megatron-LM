@@ -1624,7 +1624,6 @@ def validate_args(args, defaults={}):
         args.async_strategy = "mcore"
 
     if args.logits_save_dir is not None:
-        assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
@@ -3411,8 +3410,10 @@ def _add_sft_args(parser):
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
-
-    group.add_argument('--logits-save-top-k', type=int, default=None,
+    # -- Teacher saving --
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-top-k', type=int, default=128,
                        help='Number of top logits to save.')
     group.add_argument('--logits-save-top-p', type=float, default=None,
                        help='Top-P (nucleus) threshold applied after top-K '
@@ -3423,11 +3424,10 @@ def _add_logits_distillation_args(parser):
                        help='Minimum number of entries kept per token when '
                             'top-P masking is active, regardless of '
                             'cumulative mass. Default: 1.')
-    group.add_argument('--logits-save-dir', type=str, default=None,
-                       help='Directory to save logits.')
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
+    # -- Student loading --
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
