@@ -49,6 +49,9 @@ class _PlanCacheKey:
     # global ranks.
     src_rank_offset: int = 0
     dst_rank_offset: int = 0
+    # Multi-pool refit: keep each destination pool's plan distinct so source-only
+    # ranks (dst_config=None on every pool) don't alias them. See swap_model_weights.
+    pool_index: int = 0
 
 
 def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
@@ -83,6 +86,7 @@ def _build_plan_cache_key(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    pool_index: int = 0,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
     # group.rank() supports cross-cluster ProcessGroups.
@@ -94,6 +98,7 @@ def _build_plan_cache_key(
         num_experts=num_experts,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
     )
 
 
@@ -191,7 +196,9 @@ def _unwrap_model_cores(src_model, target_model):
     return src_core, tgt_core, num_experts
 
 
-def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset):
+def _build_or_get_plan(
+    src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index=0
+):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
@@ -205,6 +212,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
     )
     if cache_key not in _plan_cache:
         _plan_cache[cache_key] = build_centralized_reshard_plan(
@@ -326,6 +334,8 @@ def swap_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    num_dst_pools: int = 1,
+    dst_pool_index: int = 0,
 ):
     """
     Orchestrate weight swap/refit.
@@ -345,6 +355,12 @@ def swap_model_weights(
         transform: Optional ReshardTransform for custom format conversion.
             If None, the cached transform (from prepare_swap_model_weights)
             is used automatically when the receiver needs MXFP8 conversion.
+        num_dst_pools / dst_pool_index: refit into ``num_dst_pools`` disjoint
+            destination pools (e.g. disaggregated prefill/decode instances on
+            separate rank windows), one collective pass per pool. This rank
+            receives into ``target_model`` only on its own pool's pass
+            (``pool == dst_pool_index``) and is a pure source otherwise.
+            Defaults ``(1, 0)`` reproduce the single-destination behavior.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -353,24 +369,33 @@ def swap_model_weights(
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
-    # Auto-resolve MXFP8 transform from the cached plan when no
-    # explicit transform was provided.
-    if transform is None:
-        src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-        plan = _build_or_get_plan(
-            src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
-        )
-        transform = plan.transform
+    for pool in range(num_dst_pools):
+        target = target_model if pool == dst_pool_index else None
 
-    reshard_model_weights(
-        src_model,
-        target_model,
-        service=service,
-        group=group,
-        src_rank_offset=src_rank_offset,
-        dst_rank_offset=dst_rank_offset,
-        transform=transform,
-    )
+        # The plan-build is collective. Pass ``pool`` so a source-only rank
+        # (target=None, same cache key every pool) doesn't cache-hit and skip the
+        # collective on a later pass while target ranks run it -> deadlock. Each
+        # pool's plan is then built once and reused across refits in lockstep.
+        # Auto-resolve MXFP8 transform from the cached plan when no explicit
+        # transform was provided (re-resolved per pool: the target differs).
+        pass_transform = transform
+        if pass_transform is None:
+            src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
+            plan = _build_or_get_plan(
+                src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool
+            )
+            pass_transform = plan.transform
+
+        reshard_model_weights(
+            src_model,
+            target,
+            service=service,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
+            transform=pass_transform,
+            pool_index=pool,
+        )
 
 
 def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
@@ -431,6 +456,7 @@ def reshard_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    pool_index: int = 0,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -448,7 +474,7 @@ def reshard_model_weights(
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
     execute_reshard_plan(
