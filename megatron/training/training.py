@@ -3266,7 +3266,11 @@ def train(
     )
 
     def _dp_world_size():
-        return lang_pgc.dp.size() if lang_pgc is not None else mpu.get_data_parallel_world_size()
+        if lang_pgc is not None:
+            return lang_pgc.dp.size()
+        if mpu.model_parallel_is_initialized():
+            return mpu.get_data_parallel_world_size()
+        return args.data_parallel_size
 
     # LLM grid GPU count (mp = tp*pp, dp_cp = dp*cp) for hetero throughput scoping;
     # None lets training_log fall back to args.world_size (byte-identical for stock).

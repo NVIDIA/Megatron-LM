@@ -1,13 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Hetero MIMO (NMFW-516) on the stock Megatron ``pretrain()`` loop.
+"""Heterogeneous MIMO (Nemotron6-MoE VLM) training entry point.
 
-Drives the Nemotron6-MoE VLM (20L) over the non-colocated path (encoder/language
-grids on disjoint rank spans) with mock data. The entry owns distributed bring-up,
-host seeding, and the per-module model/comms (E4 ``build_mimo_runtime``); it then
-runs stock ``pretrain()`` with the default-off seams: skip_model_parallel_init,
-the setup + data-iterator hooks, and the p2p/schedule comms forwarded to train().
-No ``parallel_state`` globals are set -- train() resolves groups from the language PGC.
+Builds the per-module model and process groups for the disjoint vision/language
+grids, then drives training through ``pretrain()`` with model/optimizer and
+data-iterator hooks.
 """
 
 from __future__ import annotations
@@ -41,7 +38,7 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import set_global_variables as _stock_set_global_variables
+from megatron.training.global_vars import set_global_variables
 from megatron.training.training import get_optimizer_param_scheduler, pretrain
 
 
@@ -54,10 +51,10 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 
 def _parse_and_validate() -> argparse.Namespace:
-    """Stock arg pipeline plus the MIMO preset/validation hooks and the dp_size fix."""
+    """Parse and validate args with the model-provider preset and grid checks."""
     args = parse_args(extra_args_provider)
 
-    # Apply the Nemotron preset BEFORE stock validation so preset-derived sizes flow in.
+    # Apply the model-provider preset before validation so preset-derived sizes flow in.
     prepare_model_provider_args(args)
 
     validate_args(args, {})  # no dataset path / tokenizer for the mock run
@@ -66,33 +63,36 @@ def _parse_and_validate() -> argparse.Namespace:
     world_size = int(os.environ.get("WORLD_SIZE", args.world_size))
     validate_hetero_grid_args(args, world_size)
 
-    # Re-key DP on the language grid (stock keyed it on the world-spanning flags).
+    # Data-parallel size follows the language grid.
     args.data_parallel_size = args.llm_dp
 
-    # Nemotron preset leaves mtp_num_layers None; stock FLOPs/throughput needs an int.
+    # The preset leaves mtp_num_layers None; FLOPs/throughput accounting needs an int.
     if getattr(args, "mtp_num_layers", None) is None:
         args.mtp_num_layers = 0
+
+    # Mock runs build no tokenizer; derive the padded vocab from the configured vocab.
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = args.vocab_size
 
     return args
 
 
 def _setup_globals(args: argparse.Namespace) -> None:
-    """Set non-MPU global state; the calculator is keyed on the already-fixed llm_dp."""
-    _stock_set_global_variables(args, build_tokenizer=False)
+    """Set global state; the microbatch calculator keys on the language data-parallel size."""
+    set_global_variables(args, build_tokenizer=False)
     if args.enable_experimental:
         set_experimental_flag(True)
 
 
 def _seed_everything(args: argparse.Namespace) -> None:
-    """Seed host (python/numpy/torch) RNG; E4 configure_module_rng owns the CUDA tracker."""
-    # TODO(reuse): stock _set_random_seed would clobber E4's per-module CUDA RNG offsets (#5285).
+    """Seed host RNG; per-module CUDA RNG is seeded inside build_mimo_runtime."""
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
 
 def _build_optimizer(args: argparse.Namespace, model):
-    """Build the MimoOptimizer (one shared OptimizerConfig, distributed, bf16 unless --fp32)."""
+    """Build the MimoOptimizer from a shared OptimizerConfig."""
     return get_mimo_optimizer(
         model[0],
         OptimizerConfig(
@@ -103,7 +103,8 @@ def _build_optimizer(args: argparse.Namespace, model):
             adam_beta1=args.adam_beta1,
             adam_beta2=args.adam_beta2,
             clip_grad=args.clip_grad,
-            bf16=not args.fp32,
+            bf16=args.bf16,
+            fp16=args.fp16,
             use_distributed_optimizer=True,
             log_num_zeros_in_grad=args.log_num_zeros_in_grad,
         ),
@@ -132,32 +133,29 @@ def _noop_provider(*_args, **_kwargs):
 
 
 def main() -> None:
-    """Hetero MIMO run on the stock pretrain() loop (Option 1 wiring)."""
+    """Run heterogeneous MIMO training."""
     args = _parse_and_validate()
 
-    # Entry owns: global setup, dist bring-up (no MPU), host seeding, per-rank runtime.
     _setup_globals(args)
     initialize_distributed()
     _seed_everything(args)
 
-    # Per-rank runtime: per-submodule-DDP MimoModel, topology, comms, data iter, grad-sync, CUDA RNG (E4).
+    # Per-rank runtime: per-submodule-DDP MimoModel, topology, comms, data iterator, grad sync.
     rt = build_mimo_runtime(args)
     assert rt.model[0].config.finalize_model_grads_func is not None, (
-        "expected build_mimo_runtime -> configure_grad_sync to install a MIMO "
-        "finalize_model_grads_func on the language config"
+        "build_mimo_runtime must install a finalize_model_grads_func on the language config"
     )
 
     cfg = pretrain_cfg_container_from_args(args, rt.model[0].config)
 
     def _setup_model_and_optimizer(model_provider, model_type, checkpointing_context=None):
-        # Hook owns build + resume-load + args.iteration (replaces stock setup).
+        # Build the optimizer/scheduler, drive resume load, and set args.iteration.
         optimizer = _build_optimizer(args, rt.model)
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
-        # Per-branch RNG key namespace + dp_reshardable optimizer sharding for ckpt.
+        # Per-branch RNG key namespace + distributed-optimizer sharding for checkpoints.
         args.rng_state_key_prefix = f"mimo.{_mimo_branch_name(rt.topology)}."
         args.use_distributed_optimizer = True
         if args.load:
-            # TODO(reuse): full zero-global checkpoint (save-path threading + get_rng_state dp-rank) is a follow-up.
             args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 rt.model,
                 optimizer,
@@ -173,12 +171,15 @@ def main() -> None:
         return rt.model, optimizer, opt_param_scheduler
 
     def _build_data_iterators():
-        # Hook owns the iterators + do_train/do_valid/do_test (replaces stock build).
-        valid_iter = None
+        from megatron.core.rerun_state_machine import RerunDataIterator
+
         args.do_train = True
         args.do_valid = False
         args.do_test = False
-        return rt.data_iterator, valid_iter, None
+        train_iter = rt.data_iterator
+        if train_iter is not None and not isinstance(train_iter, RerunDataIterator):
+            train_iter = RerunDataIterator(train_iter)
+        return train_iter, None, None
 
     try:
         pretrain(
