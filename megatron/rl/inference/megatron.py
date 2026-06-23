@@ -130,9 +130,15 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        # rl_parallel_generation_tasks is already measured in prompt groups.
-        # Each group can fan out to grpo_group_size rollout requests.
-        concurrency_limit = args.grpo_group_size * args.rl_parallel_generation_tasks
+        # Maximum rollout-level requests in flight: (lag + 1) trainer batches, each
+        # grpo_prompts_per_step groups fanning out to grpo_group_size rollouts. Do not
+        # multiply the granularity-scaled generation-task count by these factors again —
+        # that double-counts prompt groups.
+        concurrency_limit = (
+            (args.rl_generation_lag + 1)
+            * args.grpo_prompts_per_step
+            * args.grpo_group_size
+        )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,

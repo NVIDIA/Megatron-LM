@@ -153,7 +153,11 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )
@@ -186,8 +190,6 @@ class WeightedMultiTask(
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
-        agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-
         # In streaming mode, ensure every active (non-evaluation, non-zero-weight) agent
         # gets a sub-generator even when num_groups < num_active_agents.  Without this,
         # _distribute_counts(1) with 5 equal-weight envs gives [1,0,0,0,0]: only env 0
@@ -197,23 +199,35 @@ class WeightedMultiTask(
             for i, (config, w) in enumerate(zip(self.agent_configs, self.weights)):
                 if not config.evaluation_only and w > 0 and agent_groups[i] == 0:
                     agent_groups[i] = 1
-            # Redistribute parallel_generation_tasks proportional to agent_groups,
-            # floored at agent_groups[i] so each sub-agent has at least num_groups
-            # parallel slots — required by GroupedRolloutGenerator.get_grouped_rollouts's
-            # `assert self.parallel_generation_tasks >= groups_per_worker`.
-            # Even distribution (the previous logic) fails this assertion for high-weight
-            # envs when parallel_generation_tasks is small (e.g. lag=0 + HF blend weights:
-            # parallel_generation_tasks=64 / n_active=6 → base=10, but code_gen gets
-            # num_groups=16 and 10 < 16 → assertion fails silently in the async generator,
-            # zero rollouts for that env).
-            total_active_groups = sum(g for g in agent_groups if g > 0)
-            if total_active_groups > 0:
-                for i, g in enumerate(agent_groups):
-                    if g > 0:
-                        proportional = int(self.parallel_generation_tasks * g / total_active_groups)
-                        agent_pgts[i] = max(g, proportional)
-                    else:
-                        agent_pgts[i] = 0
+
+        if request.submission_granularity == "B":
+            # In BATCH mode, pgt counts local batches in flight. agent_groups already
+            # splits each batch by weight, so copy pgt to every active agent.
+            agent_pgts = [
+                self.parallel_generation_tasks if num_groups > 0 else 0
+                for num_groups in agent_groups
+            ]
+        else:
+            # In GROUP/ROLLOUT mode, pgt counts fine-grained work units, so split it by weight.
+            agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
+            if request.streaming:
+                # Redistribute parallel_generation_tasks proportional to agent_groups,
+                # floored at agent_groups[i] so each sub-agent has at least num_groups
+                # parallel slots — required by GroupedRolloutGenerator.get_grouped_rollouts's
+                # `assert self.parallel_generation_tasks >= groups_per_worker`.
+                # Even distribution (the previous logic) fails this assertion for high-weight
+                # envs when parallel_generation_tasks is small (e.g. lag=0 + HF blend weights:
+                # parallel_generation_tasks=64 / n_active=6 → base=10, but code_gen gets
+                # num_groups=16 and 10 < 16 → assertion fails silently in the async generator,
+                # zero rollouts for that env).
+                total_active_groups = sum(g for g in agent_groups if g > 0)
+                if total_active_groups > 0:
+                    for i, g in enumerate(agent_groups):
+                        if g > 0:
+                            proportional = int(self.parallel_generation_tasks * g / total_active_groups)
+                            agent_pgts[i] = max(g, proportional)
+                        else:
+                            agent_pgts[i] = 0
 
         # agent_slots controls how many groups each agent yields per outer-loop round.
         # Derive it from the (possibly corrected) agent_groups so that all active agents
@@ -232,7 +246,9 @@ class WeightedMultiTask(
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
+        for agent, num_groups, pgt in zip(
+            self.agents, agent_groups, agent_pgts, strict=True
+        ):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
@@ -242,12 +258,13 @@ class WeightedMultiTask(
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
-                    enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
+                    submission_granularity=request.submission_granularity,
+                    consumption_granularity=request.consumption_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:

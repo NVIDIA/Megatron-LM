@@ -250,12 +250,22 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
         return await self._run_episode(prompt, golden, request)
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
         prompt, golden = await self.get_prompt(validation=request.validation)
-        return list(await asyncio.gather(*[
-            self._run_episode(prompt, golden, request)
-            for _ in range(request.rollouts_per_group)
-        ]))
+
+        async def generate_one():
+            if submission_gate is None:
+                return await self._run_episode(prompt, golden, request)
+            async with submission_gate:
+                return await self._run_episode(prompt, golden, request)
+
+        return list(
+            await asyncio.gather(*[generate_one() for _ in range(request.rollouts_per_group)])
+        )
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest

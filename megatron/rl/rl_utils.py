@@ -15,7 +15,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional 
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
@@ -88,6 +88,7 @@ from megatron.rl.inflight_tracker import (
 )
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -267,7 +268,7 @@ def verify_model_weights_swap(
             assert train_output.shape == inf_output.shape, (
                 f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
             )
-            
+
             max_diff = (train_output - inf_output).abs().max().item()
             assert torch.allclose(train_output, inf_output, atol=atol, rtol=rtol), (
                 f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
@@ -638,10 +639,11 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         # across iterations (and so does their in-flight count), so this only fires
         # on (re)creation, never on a reused streaming generator.
         reset_inflight()
-        agent = get_agent(
-            args,
-            parallel_generation_tasks=args.rl_parallel_generation_tasks if streaming else n_prompts,
-        )
+        parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
+        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
+        num_groups = n_prompts
+        if streaming and args.rl_submission_granularity != "B":
+            num_groups = 1
 
         # When speculative rollout is enabled, inflate rollouts_per_group so the
         # draft engine generates oversample_factor * samples_per_group candidates.
@@ -654,9 +656,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             else samples_per_group
         )
 
-
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            num_groups=num_groups,
             streaming=streaming,
             rollouts_per_group=effective_rollouts_per_group,
             inference_interface=inference_interface,
@@ -667,7 +668,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            submission_granularity=args.rl_submission_granularity,
+            consumption_granularity=args.rl_consumption_granularity,
         )
         base_gen = agent.get_grouped_rollouts(request)
 
@@ -2052,7 +2054,7 @@ def prepare_trajectories(
     else:
         assert (
             tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
-        ), "First token should not be bos"  
+        ), "First token should not be bos"
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -2190,8 +2192,8 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
-        # Note :- For EP, do not use the expert data parallel group here. Always 
-        # use the regular data parallel group. 
+        # Note :- For EP, do not use the expert data parallel group here. Always
+        # use the regular data parallel group.
 
         # Get example group per environment to log their rollouts.
         example_groups = {}
@@ -2322,15 +2324,15 @@ def prepare_data_for_update(
         if sequence_packing:
             with nvtx_range("rl/sequence-packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
-                    trajs, 
-                    generation_masks, 
-                    inference_logprobs, 
-                    global_advantages, 
-                    args.seq_length, 
+                    trajs,
+                    generation_masks,
+                    inference_logprobs,
+                    global_advantages,
+                    args.seq_length,
                     args.rl_sequence_packing_max_sequences_per_bin,
                     args.rl_sequence_packing_algo
                     )
-    
+
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
                 # Use batch_size=1 for packed computation to enable proper attention masking
@@ -3098,7 +3100,7 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
-    
+
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
     """Pad each element of a list of tensors to the length required.
     Args:
