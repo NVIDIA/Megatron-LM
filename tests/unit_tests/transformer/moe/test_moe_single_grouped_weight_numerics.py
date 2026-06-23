@@ -1,0 +1,312 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+import gc
+import inspect
+import os
+import sys
+
+import pytest
+import torch
+
+from megatron.core.enums import ModelType
+from megatron.core.fp4_utils import is_grouped_nvfp4tensor
+from megatron.core.fp8_utils import (
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
+)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.global_vars import (
+    destroy_global_vars,
+    get_args,
+    set_args,
+    set_global_variables,
+)
+from megatron.training.training import setup_model_and_optimizer
+from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.test_utilities import Utils
+
+try:
+    from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
+
+    _FP8_AVAILABLE, _NO_FP8_REASON = check_fp8_support()
+    _NVFP4_AVAILABLE, _NO_NVFP4_REASON = check_nvfp4_support()
+except ImportError:
+    _FP8_AVAILABLE = False
+    _NO_FP8_REASON = "Transformer Engine FP8 support is unavailable"
+    _NVFP4_AVAILABLE = False
+    _NO_NVFP4_REASON = "Transformer Engine NVFP4 support is unavailable"
+
+
+_SEED = 1234
+_BLACKWELL_AVAILABLE = torch.cuda.is_available() and get_device_arch_version() >= 10
+try:
+    from transformer_engine.pytorch import GroupedLinear as TEGroupedLinear
+
+    _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM = (
+        "single_grouped_weight" in inspect.signature(TEGroupedLinear.__init__).parameters
+    )
+except (ImportError, AttributeError):
+    _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM = False
+
+pytestmark = [
+    pytest.mark.internal,
+    pytest.mark.skipif(
+        not _BLACKWELL_AVAILABLE,
+        reason="Single grouped MXFP8/NVFP4 parity tests require Blackwell (SM >= 10)",
+    ),
+    pytest.mark.skipif(
+        not is_te_min_version("2.14.0"),
+        reason="moe_single_grouped_weight requires Transformer Engine >= 2.14.0",
+    ),
+    pytest.mark.skipif(
+        not _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM,
+        reason="Installed TE GroupedLinear does not expose single_grouped_weight",
+    ),
+]
+
+
+def _skip_if_unsupported(precision: str) -> None:
+    if Utils.world_size < 2:
+        pytest.skip("distributed optimizer parity test requires torchrun with at least 2 ranks")
+
+    if precision == "mxfp8" and not _FP8_AVAILABLE:
+        pytest.skip(_NO_FP8_REASON)
+    if precision == "nvfp4" and not _NVFP4_AVAILABLE:
+        pytest.skip(_NO_NVFP4_REASON)
+
+
+class TestMoESingleGroupedWeightNumerics:
+    """Numerical parity tests for MoE single grouped weights under DistOpt."""
+
+    seq_length = 128
+    micro_batch_size = 2
+    num_train_steps = 4
+
+    def setup_method(self, method):
+        self._old_single_param_env = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
+        self._old_cutedsl_fused_grouped_mlp_env = os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP")
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+        os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
+
+    def teardown_method(self, method):
+        try:
+            self._cleanup()
+        finally:
+            if self._old_single_param_env is None:
+                os.environ.pop("NVTE_GROUPED_LINEAR_SINGLE_PARAM", None)
+            else:
+                os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = self._old_single_param_env
+            if self._old_cutedsl_fused_grouped_mlp_env is None:
+                os.environ.pop("NVTE_CUTEDSL_FUSED_GROUPED_MLP", None)
+            else:
+                os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = (
+                    self._old_cutedsl_fused_grouped_mlp_env
+                )
+
+    def _cleanup(self):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def model_provider(self, pre_process=True, post_process=True):
+        model_parallel_cuda_manual_seed(_SEED)
+        args = get_args()
+        config = core_transformer_config_from_args(args)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.vocal_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+        )
+
+    def create_test_args(self, precision: str, primary_param_gather: bool, single_weight: bool):
+        self._cleanup()
+
+        sys.argv = ["test_moe_single_grouped_weight_numerics.py"]
+        args = parse_args()
+        args.num_layers = 1
+        args.vocal_size = 1024
+        args.hidden_size = 256
+        args.ffn_hidden_size = 256
+        args.num_attention_heads = 8
+        args.max_position_embeddings = self.seq_length
+        args.seq_length = self.seq_length
+        args.micro_batch_size = self.micro_batch_size
+        args.global_batch_size = self.micro_batch_size * Utils.world_size
+        args.create_attention_mask_in_dataloader = True
+        args.tensor_model_parallel_size = 1
+        args.pipeline_model_parallel_size = 1
+        args.context_parallel_size = 1
+        args.expert_model_parallel_size = 1
+        args.train_iters = self.num_train_steps
+        args.lr = 3e-5
+        args.bf16 = True
+        args.attention_backend = "unfused"
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.use_distributed_optimizer = True
+        args.use_transformer_engine_op_fuser = True
+        args.overlap_param_gather = False
+        args.overlap_grad_reduce = False
+        args.ddp_bucket_size = 40960
+
+        args.num_experts = 2
+        args.moe_layer_freq = 1
+        args.moe_grouped_gemm = True
+        args.moe_single_grouped_weight = single_weight
+        args.moe_token_dispatcher_type = "alltoall"
+        args.moe_router_topk = 1
+        args.moe_router_pre_softmax = True
+        args.moe_router_load_balancing_type = "none"
+        args.moe_aux_loss_coeff = 0.0
+        args.moe_ffn_hidden_size = 256
+        args.moe_mlp_glu_interleave_size = 32
+
+        if precision == "mxfp8":
+            args.fp8 = "e4m3"
+            args.fp8_recipe = "mxfp8"
+            args.fp8_param_gather = primary_param_gather
+            args.reuse_grad_buf_for_mxfp8_param_ag = primary_param_gather
+        elif precision == "nvfp4":
+            args.fp4 = "e2m1"
+            args.fp4_recipe = "nvfp4"
+            args.fp4_param_gather = primary_param_gather
+        elif precision != "bf16":
+            raise ValueError(f"Unknown precision test case: {precision}")
+
+        validate_args(args)
+        set_global_variables(args, False)
+        return args
+
+    def get_batch(self):
+        data = torch.arange(self.seq_length, dtype=torch.int64, device="cuda")
+        input_ids = data.repeat((self.micro_batch_size, 1))
+        labels = (data + 1).repeat((self.micro_batch_size, 1))
+        position_ids = data.repeat((self.micro_batch_size, 1))
+        attention_mask = torch.ones(
+            (self.micro_batch_size, 1, self.seq_length, self.seq_length), dtype=bool, device="cuda"
+        )
+        loss_mask = torch.ones(
+            (self.micro_batch_size, self.seq_length), dtype=torch.float32, device="cuda"
+        )
+        return input_ids, labels, position_ids, attention_mask, loss_mask
+
+    def assert_storage_path_is_exercised(
+        self, model, precision: str, primary_param_gather: bool, single_weight: bool
+    ):
+        params = list(model.named_parameters())
+        if not single_weight:
+            assert not any(is_grouped_tensor(param) for _, param in params)
+            return
+
+        grouped_params = [param for _, param in params if is_grouped_tensor(param)]
+        assert grouped_params, "Expected at least one TE GroupedTensor MoE parameter"
+
+        if not primary_param_gather or precision == "bf16":
+            assert any(
+                not is_grouped_tensor_with_quantized_storage(param) for param in grouped_params
+            ), "Expected high-precision grouped primary weights"
+            return
+
+        if precision == "mxfp8":
+            assert any(is_grouped_mxfp8tensor(param) for param in grouped_params)
+        elif precision == "nvfp4":
+            assert any(is_grouped_nvfp4tensor(param) for param in grouped_params)
+
+    def run_training_case(self, precision: str, primary_param_gather: bool, single_weight: bool):
+        args = self.create_test_args(precision, primary_param_gather, single_weight)
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
+        )
+
+        batch = self.get_batch()
+        model, optimizer, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+        assert len(model) == 1
+        self.assert_storage_path_is_exercised(
+            model[0], precision, primary_param_gather, single_weight
+        )
+
+        losses = []
+        for _ in range(self.num_train_steps):
+            model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+            model[0].set_is_first_microbatch()
+            output = model[0].forward(
+                input_ids=batch[0],
+                labels=batch[1],
+                position_ids=batch[2],
+                attention_mask=batch[3],
+                loss_mask=batch[4],
+            )
+            loss = output.mean()
+            assert torch.isfinite(loss)
+            loss.backward()
+
+            if args.overlap_grad_reduce:
+                model[0].finish_grad_sync()
+
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+            losses.append(loss.detach().float().cpu())
+
+        return torch.stack(losses)
+
+    @staticmethod
+    def assert_loss_parity(precision: str, single_weight_losses, discrete_weight_losses):
+        if precision == "bf16":
+            atol = rtol = 5e-3
+        else:
+            atol = rtol = 2e-2
+        torch.testing.assert_close(
+            single_weight_losses, discrete_weight_losses, atol=atol, rtol=rtol
+        )
+
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    def test_single_grouped_weight_parity_with_primary_param_gather(self, precision):
+        """Compare single vs discrete MoE weights with primary param gather enabled if applicable."""
+        _skip_if_unsupported(precision)
+
+        single_losses = self.run_training_case(
+            precision=precision, primary_param_gather=True, single_weight=True
+        )
+        discrete_losses = self.run_training_case(
+            precision=precision, primary_param_gather=True, single_weight=False
+        )
+        self.assert_loss_parity(precision, single_losses, discrete_losses)
+
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    def test_single_grouped_weight_parity_without_primary_param_gather(self, precision):
+        """Compare single vs discrete MoE weights when primary weights stay BF16."""
+        _skip_if_unsupported(precision)
+
+        single_losses = self.run_training_case(
+            precision=precision, primary_param_gather=False, single_weight=True
+        )
+        discrete_losses = self.run_training_case(
+            precision=precision, primary_param_gather=False, single_weight=False
+        )
+        self.assert_loss_parity(precision, single_losses, discrete_losses)
