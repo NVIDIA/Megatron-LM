@@ -36,6 +36,8 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         self._call_count += 1
         if idx < self.num_slow_calls:
             await asyncio.sleep(0.03)
+        else:
+            await asyncio.sleep(0)
         return [
             Rollout(
                 trajectory=[f"t{idx}"],
