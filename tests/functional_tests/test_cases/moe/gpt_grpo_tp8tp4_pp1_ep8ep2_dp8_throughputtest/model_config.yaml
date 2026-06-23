@@ -94,7 +94,7 @@ MODEL_ARGS:
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
-  --rl-num-parallel-generations: 2
+  --rl-generation-lag: 0
   --cuda-graph-impl: local
   --micro-batch-size: 1
   --global-batch-size: 4
@@ -136,4 +136,3 @@ METRICS:
   - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
-
