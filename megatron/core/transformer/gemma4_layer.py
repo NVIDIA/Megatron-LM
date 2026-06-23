@@ -56,14 +56,6 @@ class Gemma4TransformerLayer(TransformerLayer):
             config=self.config, hidden_size=self.config.hidden_size, eps=self.config.layernorm_epsilon
         )
 
-        # Sandwich: post-norm the sublayer output BEFORE its residual add. The base
-        # layer adds the raw sublayer output to the residual inside *_bda; we wrap the
-        # bda factories so they normalize ``x_with_bias[0]`` first (HF applies the norm
-        # before the add, modeling_gemma4.py:1421-1422,1442-1443). Bias is None for
-        # gemma4 (no attention/MLP bias), so wrapping the [0] element is sufficient.
-        self.self_attn_bda = _wrap_bda_with_post_norm(self.self_attn_bda, self.post_self_attn_layernorm)
-        self.mlp_bda = _wrap_bda_with_post_norm(self.mlp_bda, self.post_mlp_layernorm)
-
         ple_dim = self.config.hidden_size_per_layer_input
         self.per_layer_input_gate = submodules.per_layer_input_gate(
             self.config.hidden_size,
@@ -108,27 +100,35 @@ class Gemma4TransformerLayer(TransformerLayer):
         side-inputs (per-layer-type rope cos/sin and the cross-layer kv_bus) into the
         attention, then appends the PLE sub-block and the ``layer_scalar`` multiply.
         """
-        # Attention sub-block (input_ln -> attn -> post_self_attn_layernorm -> +residual).
+        # HF gemma4 uses explicit sandwich residuals: ``h = residual + post_norm(
+        # sublayer(pre_norm(h)))`` (modeling_gemma4.py:1409-1443). We add the residual
+        # explicitly (rather than via bias_dropout_add) because the gemma4 sublayers have
+        # no bias, dropout is 0, and the in-place bda path aliases the post-norm tensor.
+        # Attention sub-block.
         residual = hidden_states
         attn_input = apply_module(self.input_layernorm)(hidden_states)
-        attention_output_with_bias = self.self_attention(
+        attn_output, _ = self.self_attention(
             attn_input,
             attention_mask=attention_mask,
             rotary_cos_sin=rotary_cos_sin,
             kv_bus=kv_bus,
         )
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        attn_output = apply_module(self.post_self_attn_layernorm)(attn_output)
+        hidden_states = residual + attn_output
 
-        # MLP sub-block (pre_mlp_ln -> mlp -> post_mlp_layernorm -> +residual).
-        hidden_states = self._forward_mlp(hidden_states)
+        # MLP sub-block.
+        residual = hidden_states
+        mlp_input = apply_module(self.pre_mlp_layernorm)(hidden_states)
+        mlp_output, _ = self.mlp(mlp_input)
+        mlp_output = apply_module(self.post_mlp_layernorm)(mlp_output)
+        hidden_states = residual + mlp_output
 
         # PLE injection sub-block + layer_scalar.
         hidden_states = self._forward_per_layer_input(hidden_states, per_layer_input)
         hidden_states = hidden_states * self.layer_scalar
-        return hidden_states, None
+        return make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        ), None
 
     def _forward_per_layer_input(self, hidden_states: Tensor, per_layer_input: Tensor) -> Tensor:
         """PLE injection sub-block (HF modeling_gemma4.py:1445-1452)."""
@@ -142,24 +142,3 @@ class Gemma4TransformerLayer(TransformerLayer):
         return make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
-
-
-def _wrap_bda_with_post_norm(bda_factory, post_norm):
-    """Wrap a bias-dropout-add factory so the sublayer output is post-normed first.
-
-    The base layer calls ``bda_factory(training, fused)(x_with_bias, residual, prob)``
-    and adds ``x_with_bias[0]`` to ``residual``. Gemma4's sandwich norm must normalize
-    that output before the add, so we replace it with
-    ``(post_norm(x_with_bias[0]), x_with_bias[1])`` and defer to the original bda.
-    """
-
-    def factory(training, fused):
-        inner = bda_factory(training, fused)
-
-        def bda(x_with_bias, residual, prob):
-            x, bias = x_with_bias
-            return inner((apply_module(post_norm)(x), bias), residual, prob)
-
-        return bda
-
-    return factory
