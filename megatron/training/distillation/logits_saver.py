@@ -42,7 +42,6 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
-from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -54,9 +53,12 @@ from megatron.training.distillation.utils_logits import (
     is_remote_storage_path,
     open_logit_file,
     pack_indices,
+    pad_topk_dim,
+    reassemble_cp_sequence,
     storage_makedirs,
     storage_move,
 )
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ class LogitsSaverHooks:
     - Computing local top-K on fp32 logits to reduce memory and communication
     - Concatenating values and indices before all_gather
     - Computing global top-K from gathered results
-    - Having TP rank 0 save the full top-K for each CP/DP rank
+    - Having TP rank 0 gather CP shards so CP rank 0 can save one DP shard
 
     When ``p`` is set, a top-P (nucleus) mask is applied after global top-K
     selection.  The K dimension is truncated to the maximum per-token nucleus
@@ -101,7 +103,7 @@ class LogitsSaverHooks:
     At least ``min_k`` entries are always kept per token.
 
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
-    CP and DP ranks are stored in the tar filename for flexibility with multi-digit values.
+    CP rank 0 stores one CP-group payload per DP rank; tar filenames are DP-only.
 
     Iteration data is accumulated in memory and flushed as a tar archive at
     checkpoint time via the async checkpoint queue.  Call :meth:`flush` at
@@ -163,8 +165,11 @@ class LogitsSaverHooks:
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         self.cp_rank = parallel_state.get_context_parallel_rank()
+        self.cp_size = parallel_state.get_context_parallel_world_size()
+        self.cp_group = parallel_state.get_context_parallel_group()
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
+        self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
 
         # Track number of MTP outputs to ignore
         args = get_args()
@@ -190,7 +195,7 @@ class LogitsSaverHooks:
         ).encode("utf-8")
 
         # Hook states – store already-processed top-K results (not full logits)
-        self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor]] = []
         self._hook_handles: List[Any] = []
         self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
@@ -285,10 +290,19 @@ class LogitsSaverHooks:
         all_indices_low = []
         all_high_bits = []
 
-        for values, indices_low, high_bit in self._accumulated_results:
-            all_values.append(values.cpu())
+        for values, indices in self._accumulated_results:
+            gathered = self._gather_full_cp_microbatch(values, indices)
+            if gathered is None:
+                continue
+            full_values, full_indices = gathered
+            indices_low, high_bit = pack_indices(full_indices)
+            all_values.append(full_values.cpu())
             all_indices_low.append(indices_low.cpu())
             all_high_bits.append(high_bit.cpu())
+
+        if self.cp_rank != 0:
+            self._topp_kept_counts.clear()
+            return
 
         self._buffer_iteration(all_values, all_indices_low, all_high_bits)
 
@@ -301,7 +315,7 @@ class LogitsSaverHooks:
 
     def _process_single_microbatch(
         self, logits: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Process a single logits tensor and return top-K log-probability data.
 
         Selects local top-K positions on raw logits first, then computes
@@ -319,7 +333,7 @@ class LogitsSaverHooks:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
 
         Returns:
-            Tuple of (log_prob_values, indices_low, high_bit) on TP rank 0,
+            Tuple of (log_prob_values, global_indices) on TP rank 0,
             ``None`` on other TP ranks.
         """
         local_vocab_size = logits.shape[-1]
@@ -370,9 +384,41 @@ class LogitsSaverHooks:
             )
 
         global_values = global_values.to(self._save_dtype)
-        indices_low, high_bit = pack_indices(global_indices)
 
-        return global_values, indices_low, high_bit
+        return global_values, global_indices
+
+    def _gather_full_cp_microbatch(
+        self,
+        values: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Gather CP-local top-K tensors and reconstruct full sequence order on CP rank 0."""
+        if self.cp_size == 1:
+            return values, indices
+
+        local_k = torch.tensor([values.size(-1)], dtype=torch.int64, device=values.device)
+        dist.all_reduce(local_k, op=dist.ReduceOp.MAX, group=self.cp_group)
+        max_k = int(local_k.item())
+        values = pad_topk_dim(values, max_k, CACHED_LOGITS_LOGPROB_SENTINEL)
+        indices = pad_topk_dim(indices, max_k, CACHED_LOGITS_INDEX_SENTINEL)
+
+        if self.cp_rank == 0:
+            values_gather_list = [torch.empty_like(values) for _ in range(self.cp_size)]
+            indices_gather_list = [torch.empty_like(indices) for _ in range(self.cp_size)]
+        else:
+            values_gather_list = None
+            indices_gather_list = None
+
+        dist.gather(values, values_gather_list, dst=self._cp_dst_rank_global, group=self.cp_group)
+        dist.gather(indices, indices_gather_list, dst=self._cp_dst_rank_global, group=self.cp_group)
+
+        if self.cp_rank != 0:
+            return None
+
+        return (
+            reassemble_cp_sequence(values_gather_list),
+            reassemble_cp_sequence(indices_gather_list),
+        )
 
     def _compute_global_topk(
         self,
@@ -533,8 +579,8 @@ class LogitsSaverHooks:
 
         Returns:
             Tuple of (tar_path, writes, meta_bytes, msc_enabled).  If there is
-            no pending data (e.g. non-TP-rank-0), ``writes`` will be an empty
-            OrderedDict and ``tar_path`` will be an empty string.
+            no pending data (e.g. non-TP-rank-0 or non-CP-rank-0), ``writes``
+            will be an empty OrderedDict and ``tar_path`` will be an empty string.
         """
         # NOTE: We need to re-enabled MSC in the async saving process, so we pass this flag.
         msc_enabled = MultiStorageClientFeature.is_enabled()
@@ -546,9 +592,7 @@ class LogitsSaverHooks:
         self._pending_writes = OrderedDict()
 
         last_iter = max(writes.keys())
-        tar_filename = batched_tar_filename(
-            self.cp_rank, self.dp_rank, last_iter,
-        )
+        tar_filename = batched_tar_filename(self.dp_rank, last_iter)
         tar_path = os.path.join(self.save_dir, tar_filename)
         print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
         return (tar_path, writes, self._meta_bytes, msc_enabled)
@@ -563,7 +607,7 @@ class LogitsSaverHooks:
         """Write a tar archive containing multiple iterations.
 
         Called in the async checkpoint background process.  Early-returns
-        when there is nothing to write (non-TP-rank-0 ranks).
+        when there is nothing to write (non-TP-rank-0 or non-CP-rank-0 ranks).
 
         The dataset-identity metadata is written as the **first** member
         (named :data:`META_TAR_MEMBER`) so the student-side tar reader
