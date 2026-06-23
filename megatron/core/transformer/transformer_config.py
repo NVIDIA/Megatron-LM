@@ -804,7 +804,7 @@ class TransformerConfig(ModelParallelConfig):
     This is needed when the frontend supplies locally packed THD inputs whose token counts
     can differ across ranks, without using Megatron Core's sequence_packing_scheduler.
     """
-    
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
