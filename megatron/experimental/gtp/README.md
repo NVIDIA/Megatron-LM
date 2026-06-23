@@ -115,7 +115,7 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 - **TP** (intra-layer): orthogonal axis — GTP shards `out_features` regardless of TP's parallel mode (column or row). 2D grid naturally formed via `tp_group × gtp_group`.
 - **SP** (sequence-parallel): transparent — GTP operates at weight dim, SP at sequence dim.
 - **EP** (MoE): `GroupedLinear` with GTP → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP AG/RS (NCCL/IB).
-- **DDP**: GTP bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). `register_grad_accum_hook` + manual invocation from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) serializes DDP RS strictly after GTP RS — critical at IB scale to avoid deadlock between DDP and GTP on the same NIC.
+- **DDP**: GTP bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). DDP registers its grad-ready hook on GTP params via `register_grad_accum_hook` (not autograd's `AccumulateGrad`); GTP invokes it from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) **after** the wgrad lands in `main_grad`, so a bucket's DDP reduce-scatter runs strictly after every GTP param's `{RS → main_grad add}` — never over a stale `main_grad` — and DDP↔GTP NIC deadlock at IB scale is avoided. See §3.2.
 
 ### 1.5 Opt-in, minimally invasive integration
 
@@ -324,10 +324,13 @@ Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_as
 
 ![DDP + (E)GTP interaction with the distributed optimizer](images/0611_ddp_egtp_orthogonal_bucketing.png)
 
-**(E)GTP is *super loosely coupled* to DDP and the distributed optimizer — they stay completely GTP-agnostic.** GTP is just another sub-axis of the rank grid (`world = TP×GTP×CP×DP`); a GTP-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP/EGTP-specific buffers, optimizers, gradient-scaling factors, or bucket groups. The entire DDP/DistOpt stack touches GTP in only **two** narrow places:
+**(E)GTP is *super loosely coupled* to DDP and the distributed optimizer — they stay completely GTP-agnostic.** GTP is just another sub-axis of the rank grid (`world = TP×GTP×CP×DP`); a GTP-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP/EGTP-specific buffers, optimizers, gradient-scaling factors, or bucket groups. The entire DDP/DistOpt stack touches GTP in only **three** narrow places:
 
 1. **finalize SUM all-reduce** (`_allreduce_replicated_grads_over_gtp_group`) — completes the gtp axis for *replicated* (non-GTP) params; a no-op when GTP is inactive.
 2. **`is_gtp` / `allreduce` tags** propagated onto the optimizer's master shards — consumed only by the grad-norm dedup filter.
+3. **grad-ready hook routing** (`DistributedDataParallel.__init__`) — for a GTP param, DDP registers its backward post-hook via GTP's `register_grad_accum_hook` instead of autograd's `AccumulateGrad`. GTP fires it from `_handle_megatron_grad_accum` **after** the per-param `{wgrad RS → main_grad add}`. This enforces the invariant below; a no-op (plain autograd path) when GTP is inactive.
+
+> **Ordering invariant.** A bucket's DDP gradient reduction (the reduce-scatter / all-to-all + local fp32 accumulation) runs **strictly after every GTP param in that bucket has finished `{GTP wgrad RS → main_grad add}`**. `register_grad_ready` only fires the bucket collective once *all* its params are ready, and for GTP params "ready" is signalled by GTP after the add — never by autograd's `AccumulateGrad`, which (because the wgrad RS is async and its `main_grad` accumulation is deferred to a later backward node) can fire **before** the add and would make the bucket reduce read a stale/empty `main_grad` (notably under `reduce_scatter_with_fp32_accumulation`).
 
 Everything else — bucketing, the reduce-scatter/all-reduce schedule and its overlap, master-state sharding, grad clipping, the checkpoint format — is unchanged and unaware of GTP.
 
@@ -336,7 +339,7 @@ Everything else — bucketing, the reduce-scatter/all-reduce schedule and its ov
 - **Free reuse of a mature stack.** GTP inherits DDP's bucketing + comm/compute overlap, the distributed optimizer's fp32-master + Adam-moment sharding, grad-norm/clip, and the existing checkpoint format — no parallel re-implementation to write or maintain (contrast FSDP, which replaces all of these).
 - **Orthogonal composability.** Because GTP is a rank-grid sub-axis cut like TP (along `out_features`), it composes with TP/EP/CP/PP and the DistOpt the same way TP does — no special nesting logic.
 - **Zero-cost when off.** With GTP disabled the `*_no_gtp` groups alias the regular DP groups and both hooks become no-ops, so non-GTP runs hit byte-identical behavior — GTP can be toggled without forking the DDP/optimizer code paths.
-- **Small, auditable surface.** Two hooks is the whole integration contract, which is what makes the correctness argument below tractable.
+- **Small, auditable surface.** These three hooks are the whole integration contract, which is what makes the correctness argument below tractable.
 
 DDP groups parameters into **two buffers** by `is_expert_parallel` (MoE tag) — a dense buffer and an expert buffer. GTP/EGTP shards are **merged into** these buffers like ordinary params (no separate GTP/EGTP buckets): they reduce over the gtp/egtp-EXCLUDED replicate group (`intra_dp_cp_no_gtp_group` for dense, `intra_expt_dp_no_egtp_group` for expert) with the standard `1/full = 1/(replicate*gtp)` scaling.
 

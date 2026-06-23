@@ -400,6 +400,15 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
+                elif getattr(param, 'is_gtp', False) and hasattr(param, 'register_grad_accum_hook'):
+                    # GTP: drive the post-hook from GTP's manual invocation, not autograd's
+                    # AccumulateGrad. GTP issues the wgrad RS async and defers the main_grad add
+                    # to a later backward node, so AccumulateGrad can fire register_grad_ready
+                    # before the wgrad lands in main_grad, dispatching the bucket reduce-scatter on
+                    # stale grad_data (corrupts reduce_scatter_with_fp32_accumulation for
+                    # chain-boundary weights). GTP fires this hook from _handle_megatron_grad_accum
+                    # after the add instead.
+                    param.register_grad_accum_hook(None, self._make_backward_post_hook(param))
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)

@@ -27,6 +27,7 @@ Test groups
 21. TestGTPGradAccumHook         - main_grad updated after reduce-scatter backward (multi-GPU)
 22. TestWaitAsyncCommsFallback   - wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
 23. TestGTPDDPBucketAlignment    - GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
+24. TestGTPDDPGradReadyWiring    - GTP params drive DDP grad-ready via the manual hook after wgrad add, not autograd (multi-GPU)
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` doesn't match the required
 world size (4 for everything in this file).
@@ -1414,3 +1415,72 @@ class TestGTPDDPBucketAlignment:
         """Regular buf bucket ends must be padded even when gtp_params forces layoutrecompute."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_regular_buffer_padded_when_gtp_params_present, 4)
+
+
+# ---------------------------------------------------------------------------
+# 24. GTP DDP grad-ready wiring: register_grad_ready must fire AFTER the wgrad add
+# ---------------------------------------------------------------------------
+
+
+def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
+    """GTP params must drive DDP grad-ready from GTP's manual hook, not autograd.
+
+    GTP defers the main_grad accumulation to a later backward node, so autograd's AccumulateGrad can
+    fire register_grad_ready before the grad lands and dispatch the bucket reduce-scatter on stale
+    grad_data (corrupts reduce_scatter_with_fp32_accumulation). The fix routes grad-ready through
+    register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
+    wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    # The module fixture initialized model_parallel without GTP; re-init with GTP=2.
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        gtp_group = ps.get_gtp_weight_remat_group()
+
+        class _TwoLayerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # bias=False -> all params are GTP weights, so grad_accs must end up empty.
+                self.fc0 = te.Linear(64, 128, bias=False, device="cuda")
+                self.fc1 = te.Linear(64, 128, bias=False, device="cuda")
+
+        model = _TwoLayerModel()
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+
+        config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, overlap_grad_reduce=True
+        )
+        ddp_model = DistributedDataParallel(config, ddp_config, model)
+
+        for name, w in [("fc0", model.fc0.weight), ("fc1", model.fc1.weight)]:
+            assert isinstance(w, GTPShardedParam), f"{name}.weight should be a GTP param"
+            # Manual hook set -> grad-ready fires after the add; None -> early autograd path (bug).
+            assert getattr(w, "_grad_accum_hook", None) is not None, (
+                f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
+            )
+
+        # bias=False -> all params are GTP -> none took the autograd path.
+        assert len(ddp_model.grad_accs) == 0, (
+            "GTP params must not register an autograd AccumulateGrad hook "
+            f"(grad_accs has {len(ddp_model.grad_accs)} entries)"
+        )
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()  # restore default for remaining tests
+
+
+class TestGTPDDPGradReadyWiring:
+    def test_gtp_params_use_manual_grad_ready_hook(self):
+        """GTP params route DDP grad-ready through register_grad_accum_hook, not autograd."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)

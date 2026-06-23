@@ -1247,12 +1247,15 @@ class GTPShardedParam(torch.nn.Parameter):
                 if finalize_grad:
                     cache = get_global_GTP_cache()
                     for w in self._weights:
-                        w._set_rs_state(GTPWeightState.NONE)
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
-                        if hasattr(w, "grad_added_to_main_grad"):
-                            w.grad_added_to_main_grad = True
+                    # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
+                    # grad-ready can't dispatch the RS before a sibling's add). With autograd
+                    # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
+                    # is the only grad-ready for a weight finalized here; else the bucket orphans.
+                    for w in self._weights:
+                        self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
