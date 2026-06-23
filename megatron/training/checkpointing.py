@@ -371,10 +371,7 @@ def read_metadata(tracker_filename):
 def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup, key_prefix: str = '') -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
-    key_prefix: optional namespace for the torch_dist rng ShardedObject key
-        (default '' = stock 'rng_state'). Lets disjoint grids (e.g. hetero MIMO
-        branches that share a (pp,tp) factorization) avoid an identical-key
-        collision by using distinct prefixes.
+    key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
     rng_state = {

@@ -17,10 +17,9 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 
 
 def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the MIMO data-selection args (stock extra_args_provider compatible).
+    """Register the MIMO data-selection args (extra_args_provider compatible).
 
-    Only the mock provider is supported for now; energon/mistral backends are
-    deferred to a later PR.
+    Only the mock provider is currently supported.
     """
     group = parser.add_argument_group("mimo data")
     group.add_argument(
@@ -35,7 +34,7 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 def select_data_iterator(args: argparse.Namespace, topology: HeteroTopology) -> Optional[object]:
     """Create the per-role data iterator this rank needs, or None if it consumes no data."""
     if getattr(args, "dataset_provider", "mock") != "mock":
-        # Energon/mistral provider backends are deferred to a later PR.
+        # Only the mock provider is currently supported.
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
     return select_mock_data_iterator(args, topology)
 
@@ -96,14 +95,7 @@ def _encoder_name(topology: HeteroTopology) -> Optional[str]:
 
 
 def _even_patch_grid(num_patches: int) -> tuple[int, int]:
-    """Factor ``num_patches`` into an even (rows, cols) patch grid.
-
-    The dynamic-resolution RADIO path runs ``_pixel_shuffle_dynamic_res``, which
-    reshapes each image's patches into ``(rows, cols, c)`` and then halves both
-    axes (scale_factor=0.5). Both ``rows`` and ``cols`` must therefore be even.
-    A near-square factorization keeps the synthetic aspect ratio sane and the CPE
-    position-embedding interpolation well-conditioned.
-    """
+    """Factor ``num_patches`` into a near-square even (rows, cols) patch grid (both axes even)."""
     assert num_patches % 4 == 0, (
         f"per-image patch count {num_patches} must be divisible by 4 so the "
         "pixel-shuffle (0.5x on each axis) produces an integer token count"
@@ -134,13 +126,7 @@ class MockVLMIterator:
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
         self.vision_encoder_key = getattr(args, "vision_encoder_key", "clip_encoder")
-        # Pixel-input encoders (e.g. the Nemotron RADIO provider sets
-        # ``vision_input_mode="pixels"``) take a raw image tensor as the
-        # positional ``x`` arg of their wrapper's forward. Hidden-state encoders
-        # (the CLIP/mock path) instead receive a precomputed ``hidden_states``
-        # tensor. Feeding the wrong key/shape makes ``ModalitySubmodules.encode``
-        # call the encoder with kwargs its forward never accepts, which aborts
-        # the encoder forward before it reaches send_forward.
+        # "pixels" encoders take a raw image tensor; hidden-state encoders take precomputed states.
         self.vision_input_mode = getattr(args, "vision_input_mode", "hidden_states")
         self.dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
         self.patch_dim = getattr(args, "patch_dim", 16)
@@ -177,18 +163,7 @@ class MockVLMIterator:
         modality_inputs = {}
         if self.encoder_name is not None:
             if self.vision_input_mode == "pixels" and self.dynamic_resolution:
-                # Dynamic-resolution RADIO (the Nemotron6-MoE VLM preset sets
-                # ``dynamic_resolution=True``) does NOT accept a fixed-tile
-                # (N, 3, H, W) pixel batch. Its forward expects the packed-patch
-                # format produced by DynamicResolutionImageTilingStrategy.stack:
-                #   x:                [1, total_patches, 3*p*p]   (pre-patchified)
-                #   imgs_sizes:       (N_images, 2) int32 (H, W) in *pixels*
-                #   packed_seq_params: THD PackedSeqParams over the per-image
-                #                      patch counts (variable-length attention).
-                # Feeding the fixed-tile (N,3,H,W) tensor with imgs_sizes=None
-                # drives RADIOViTModel.forward down its dynamic branch with no
-                # per-image splits, stalling/desyncing the encoder before it can
-                # send_forward. Replicate the prototype's packed mock exactly.
+                # Dynamic-resolution RADIO consumes packed-patch inputs (x/imgs_sizes/packed_seq_params).
                 encoder_inputs = self._build_dynamic_resolution_pixels(args)
             elif self.vision_input_mode == "pixels":
                 # Fixed-tile RADIO (``--no-dynamic-resolution``): the wrapper's
@@ -237,20 +212,7 @@ class MockVLMIterator:
         }
 
     def _build_dynamic_resolution_pixels(self, args: argparse.Namespace) -> dict:
-        """Build the packed-patch RADIO inputs for the dynamic-resolution path.
-
-        Emits ``micro_batch_size * num_image_tiles`` synthetic images whose
-        per-image RADIO output token count sums to exactly ``image_seq_length``
-        per sample, so the count matches the ``image_seq_length`` placeholder
-        image tokens MimoModel scatters embeddings into (a hard equality check
-        in ``combine_embeddings``). RADIO drops ``class_token_len`` tokens per
-        image and applies a 0.5x pixel shuffle on each axis (output = patches/4),
-        so per-image patches = 4 * (image_seq_length / num_image_tiles).
-
-        Returns the encoder-input dict with ``x``/``imgs_sizes``/
-        ``packed_seq_params`` keyed under ``vision_encoder_key``, matching
-        DynamicResolutionImageTilingStrategy.stack.
-        """
+        """Build packed-patch RADIO inputs whose per-image token counts sum to ``image_seq_length``."""
         num_images = self.num_image_tiles
         if self.image_seq_length % num_images != 0:
             raise ValueError(
@@ -263,9 +225,7 @@ class MockVLMIterator:
         h_pix = rows * self.patch_dim
         w_pix = cols * self.patch_dim
 
-        # Per-image patchified features: rearrange (c, py*p, px*p) -> (py*px, c*p*p).
-        # The mock emits random patch features directly (shape-equivalent to the
-        # tiling-strategy rearrange) since RADIO's embedder only sees the last dim.
+        # Per-image patchified features of shape (py*px, c*p*p), emitted as random patches.
         feat_dim = 3 * self.patch_dim * self.patch_dim
         total_patches = self.micro_batch_size * num_images * patches_per_image
         x = torch.randn(
@@ -278,16 +238,8 @@ class MockVLMIterator:
         )
 
         n_images_total = self.micro_batch_size * num_images
-        # imgs_sizes and the packed-seq cu_seqlens/max_seqlen are *metadata*, not
-        # data, and must live on CPU to match the prototype's energon tiling
-        # strategy (DynamicResolutionImageTilingStrategy.stack builds plain CPU
-        # tensors). RADIOViTModel.forward iterates imgs_sizes in Python and uses
-        # the per-image patch counts as slice bounds and as the THD cu_seqlens fed
-        # to TE attention; placing them on CUDA forces a blocking device->host
-        # sync on every iteration (and TE expects int32 cu_seqlens on CPU), which
-        # is the kind of degenerate host<->device round-trip that stalls the
-        # encode before the transformer layers. Only ``x`` (the real activation)
-        # is created on CUDA.
+        # imgs_sizes and cu_seqlens/max_seqlen are CPU metadata (TE expects int32 cu_seqlens
+        # on CPU); only ``x`` is created on CUDA.
         imgs_sizes = torch.tensor(
             [[h_pix, w_pix]] * n_images_total, dtype=torch.int32
         )

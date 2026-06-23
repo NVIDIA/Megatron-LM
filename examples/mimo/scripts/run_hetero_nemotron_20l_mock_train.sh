@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Run a heterogeneous mock-data loop with the Nemotron6-MoE VLM 20L architecture
-# on the STOCK megatron/training train() loop (NMFW-516 PR-E5 entry).
+# Run a heterogeneous mock-data training loop with the Nemotron6-MoE VLM 20L architecture.
 
 set -euo pipefail
 

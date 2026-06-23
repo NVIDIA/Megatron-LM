@@ -1,29 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Runtime orchestrator for hetero MIMO training on the stock Megatron loop.
-
-This is PR-E4 of the NMFW-516 hetero-MIMO upstreaming effort. It wires together
-the merged glue (E1 model provider, E2 topology/grid args, E3 forward step) plus
-the in-flight RNG/DDP (MM2), grad-sync (MM3), and data-selection modules into a
-single :func:`build_mimo_runtime` entry the stock ``train()`` can consume.
-
-Scope: the NON-COLOCATED nemotron VLM path only (encoder grid and language grid
-occupy disjoint rank spans). The colocated three-phase schedule is out of scope
-here.
-
-``build_mimo_runtime`` is deliberately kept in this ``bootstrap.py`` module rather
-than ``runtime.py`` (which MM2 / #5285 owns). At final integration the two may
-fold together, but keeping them separate avoids clobbering MM2's file while both
-PRs are in flight.
-
-Boundary with the stock loop (handoff section 3): the entry PR (E5) bypasses
-``setup_model_and_optimizer`` -- which would call ``get_model`` and re-wrap a
-single top-level DDP -- and instead calls ``build_mimo_runtime`` to assemble the
-per-submodule-DDP MimoModel, then hands the resulting model list straight to the
-stock ``train()``. The optimizer is built separately (the prototype's
-``get_mimo_optimizer`` needs the per-submodule DDP wrapping this function
-performs, which is why no top-level DDP wrap is applied here).
-"""
+"""Per-rank heterogeneous MIMO runtime assembly for the non-colocated nemotron VLM path."""
 
 from __future__ import annotations
 
@@ -48,44 +25,22 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 
-# RNG role offsets, matched to the prototype (hetero/runtime.py): the language
-# module seeds from +20_000, the vision encoder from +10_000. Distinct offsets
-# keep the (process-global) CUDA RNG tracker independent across module roles.
+# RNG role offsets: distinct offsets keep the process-global CUDA RNG tracker
+# independent across module roles (language +20_000, vision encoder +10_000).
 _LANGUAGE_SEED_OFFSET = 20_000
 _ENCODER_SEED_OFFSET = 10_000
 
 
 @dataclass
 class MimoRuntime:
-    """Everything the stock ``train()`` entry (E5) needs to drive a hetero MIMO run.
+    """Per-rank state the stock ``train()`` needs to drive a hetero MIMO run.
 
-    Fields:
-        model:
-            The DDP-wrapped :class:`MimoModel` for this rank, returned as a
-            single-element list so it drops straight into the stock ``train()``
-            ``model`` argument (which always expects a list of model chunks).
-            ``model[0].pg_collection`` carries this rank's per-module PGC (see
-            below); ``model[0].config`` is the language ``TransformerConfig``
-            already carrying the MIMO ``finalize_model_grads_func`` /
-            ``grad_scale_func`` installed by :func:`configure_grad_sync`.
-        topology:
-            The :class:`HeteroTopology`. The schedule reads
-            ``topology.schedule_pg_collection`` (the per-rank
-            ``MultiModuleProcessGroupCollection``) and the p2p communicator is
-            built from ``topology.grids``.
-        communicator:
-            The :class:`MultiModulePipelineCommunicator` the MIMO schedule uses
-            for cross-module (encoder->language) P2P.
-        data_iterator:
-            This rank's role-aware data iterator, or ``None`` when the rank
-            consumes no data (interior PP stages).
-        pg_collection:
-            This rank's per-module :class:`ProcessGroupCollection` (the language
-            PGC on language-grid ranks, else the encoder PGC). Identical object
-            to ``model.pg_collection``; surfaced here so the entry need not reach
-            into the model. Distinct from ``topology.schedule_pg_collection``
-            (the multi-module collection) -- see the module docstring and the
-            ``pg_collection`` note in :func:`build_mimo_runtime`.
+    Attributes:
+        model: Single-element list holding this rank's DDP-wrapped :class:`MimoModel`.
+        topology: The :class:`HeteroTopology` carrying grids and the schedule PGC.
+        communicator: The :class:`MultiModulePipelineCommunicator` for cross-module P2P.
+        data_iterator: This rank's role-aware data iterator, or ``None`` if it consumes no data.
+        pg_collection: This rank's per-module PGC (language on LLM ranks, else encoder).
     """
 
     model: list
@@ -104,9 +59,8 @@ def _encoder_module_name(topology: HeteroTopology) -> Optional[str]:
 def _module_dependency_map(topology: HeteroTopology) -> dict:
     """Build the encoder->language dependency map the communicator's topology arg needs.
 
-    Mirrors the prototype's ``HeteroTopology.module_dependency_map``: the encoder
-    feeds the language module, the language module feeds nothing. LLM-only runs
-    have no edges.
+    The encoder feeds the language module, the language module feeds nothing;
+    LLM-only runs have no edges.
     """
     encoder_name = _encoder_module_name(topology)
     if encoder_name is None:
@@ -115,30 +69,13 @@ def _module_dependency_map(topology: HeteroTopology) -> dict:
 
 
 def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
-    """Assemble the per-rank hetero MIMO runtime for the stock training loop.
+    """Assemble the per-rank hetero MIMO runtime and return a :class:`MimoRuntime`.
 
-    Ports the prototype build sequence (hetero/runtime.py +
-    hetero/loop.py:86-150), dropping the prototype's bespoke loop, logging,
-    prefetch, timeline, and checkpoint machinery: those are owned by the stock
-    ``train()`` (E5) or deferred to later PRs.
-
-    Steps:
-      1. Build the per-module grid specs (E2) and the topology (E2/E3).
-      2. Determine which module(s) live on this rank from the topology grids.
-      3. Seed RNG per active module role (encoder vs language get distinct
-         offsets) via MM2's :func:`configure_module_rng`.
-      4. Assemble the language and/or vision ``ModuleSpec`` (E1) and construct
-         the role ``MimoModel`` -- WITHOUT a top-level DDP wrap, because the MIMO
-         optimizer needs per-submodule DDP.
-      5. DDP-wrap the active submodules (MM2 :func:`wrap_active_modules_with_ddp`).
-      6. Attach this rank's per-module PGC as ``mimo_model.pg_collection`` for the
-         stock ``train()`` / ``training_log`` path.
-      7. Install the dual grad-finalization hook (MM3
-         :func:`configure_grad_sync`).
-      8. Build the p2p communicator and select this rank's data iterator.
-
-    Returns a :class:`MimoRuntime` (see its docstring for the consumption
-    contract).
+    Builds the grid specs and topology, seeds per-role RNG, constructs the role
+    ``MimoModel`` without a top-level DDP wrap (the MIMO optimizer needs
+    per-submodule DDP), DDP-wraps the active submodules, attaches the per-module
+    PGC, installs the grad-finalization hook, and builds the p2p communicator and
+    data iterator.
     """
     world_size = torch.distributed.get_world_size()
     specs = build_module_grid_specs(args, world_size)
@@ -231,12 +168,11 @@ def build_pipeline_communicator(
 ) -> MultiModulePipelineCommunicator:
     """Build the MIMO cross-module P2P communicator the train schedule uses.
 
-    Ported from the prototype (hetero/loop.py:250). The vision encoder emits a
-    2D ``[B*S, H]`` activation, so its ``module_output_ndim`` is 2; the language
-    module keeps the default 3D. ``model.config`` is the canonical
-    ``ModelParallelConfig`` (the MimoModel's language config), identical on every
-    rank, which the communicator uses for shape/dtype bookkeeping on cross-module
-    transfers.
+    The vision encoder emits a 2D ``[B*S, H]`` activation, so its
+    ``module_output_ndim`` is 2; the language module keeps the default 3D.
+    ``model.config`` is the canonical ``ModelParallelConfig`` (the MimoModel's
+    language config), identical on every rank, used for shape/dtype bookkeeping
+    on cross-module transfers.
     """
     encoder_name = _encoder_module_name(topology)
     module_output_ndim = {}
