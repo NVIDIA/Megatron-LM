@@ -34,7 +34,11 @@ class FsdpModule:
     _num_training_parameters: int
 
     def __init__(
-        self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
+        self,
+        mesh: DeviceMesh,
+        placements: Placements,
+        mixed_precision_policy: MixedPrecisionPolicy,
+        use_symm_mem: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         owned_parameters = _collect_owned_parameters(self)
@@ -49,6 +53,7 @@ class FsdpModule:
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
+                use_symm_mem=use_symm_mem,
             )
             for group_parameters in _group_parameters(owned_parameters)
         ]

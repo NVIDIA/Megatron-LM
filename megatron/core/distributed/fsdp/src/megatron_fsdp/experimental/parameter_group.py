@@ -15,15 +15,17 @@
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate
+from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -47,6 +49,7 @@ class FsdpParameterGroup:
     model_weight: DBuffer
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
+    _symm_mem_pool: torch.cuda.MemPool | None
 
     def __init__(
         self,
@@ -55,6 +58,7 @@ class FsdpParameterGroup:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        use_symm_mem: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -64,6 +68,8 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
+            use_symm_mem: Allocate communication staging buffers from PyTorch's
+                NCCL symmetric-memory pool.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -100,13 +106,21 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
         )
 
-        self._unsharded_model_weight = DBuffer(
-            mesh=self.mesh,
-            placements=[Replicate()] * self.mesh.ndim,
-            tensor_shapes=tensor_shapes,
-            dtype=self.dtype,
-            device=self.main_weight.device,
-        )
+        if use_symm_mem:
+            # PyTorch caches this in C++ and returns early when the backend is already NCCL.
+            symm_mem.set_backend("NCCL")
+            self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
+        else:
+            self._symm_mem_pool = None
+
+        with self._symmetric_memory_context():
+            self._unsharded_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=self.dtype,
+                device=self.main_weight.device,
+            )
         if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
@@ -144,7 +158,6 @@ class FsdpParameterGroup:
                     f"Got main_grad placements {self.main_grad.placements} and "
                     f"main_weight placements {self.main_weight.placements}."
                 )
-
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
@@ -166,6 +179,11 @@ class FsdpParameterGroup:
 
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
+
+    def _symmetric_memory_context(self):
+        if self._symm_mem_pool is None:
+            return nullcontext()
+        return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameters(self, parameters: tuple[nn.Parameter, ...]) -> None:
         for name, parameter in zip(self.parameter_names, parameters, strict=True):
@@ -189,15 +207,21 @@ class FsdpParameterGroup:
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        self._unsharded_model_weight.reallocate_storage()
+        with self._symmetric_memory_context():
+            self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
         # Autograd records a tensor's version counter when saving it for backward, and
         # in-place writes like the out= redistribution below increment that counter even
         # under no_grad. Without preserving it, backward can fail with "modified by an
         # inplace operation" even though FSDP only materialized internal storage.
+        gather_axis = changed_mesh_axis(
+            self.model_weight.placements, self._unsharded_model_weight.placements
+        )
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
+            if self._symm_mem_pool is not None and gather_axis is not None:
+                self._unsharded_model_weight.rendezvous(gather_axis)
             self.model_weight.redistribute(
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
             )
@@ -236,9 +260,13 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
             grads.append(parameter.grad)
 
-        partial_grad = DBuffer.distribute_tensors(
-            grads, mesh=self.mesh, placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim
-        )
+        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
+        # Preserve AVG semantics by reducing SUM and scaling the output below.
+        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
+        with self._symmetric_memory_context():
+            partial_grad = DBuffer.distribute_tensors(
+                grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
+            )
 
         # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
@@ -247,10 +275,20 @@ class FsdpParameterGroup:
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )
+        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
+        if reduce_axis is None:
+            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
+        grad_divisor = self.mesh.size(reduce_axis) if partial_op == dist.ReduceOp.SUM else 1
+        if self._symm_mem_pool is not None:
+            partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+            if grad_divisor != 1:
+                self.main_grad.local_buffer.div_(grad_divisor)
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
+            if grad_divisor != 1:
+                reduced_grad.local_buffer.div_(grad_divisor)
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
