@@ -17,14 +17,10 @@ from examples.mimo.model_providers.radio_encoder import (
     radio_vision_config,
     radio_vision_encoder_spec,
 )
-from examples.mimo.utils.hetero import (
-    get_grid_dim_size,
-    get_pg_rank,
-    get_pg_size,
-    is_process_group_member,
-)
+from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.hyper_comm_grid import _is_process_group_member as is_process_group_member
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -34,6 +30,7 @@ from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -97,13 +94,8 @@ def nemotron_language_config(
 ) -> TransformerConfig:
     """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
-    bf16, dtype = _dtype(args)
     # Code-only fields + hetero parallelism pins.
     config.variable_seq_lengths = True
-    # moe dispatcher flags come from CLI so the base config validates at construction.
-    config.params_dtype = dtype
-    config.pipeline_dtype = dtype
-    config.bf16 = bf16
     config.expert_model_parallel_size = ep_size
     config.expert_tensor_parallel_size = expt_tp_size
     config.tensor_model_parallel_size = tp_size
