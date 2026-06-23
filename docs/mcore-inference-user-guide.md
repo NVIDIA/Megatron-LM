@@ -99,12 +99,13 @@ training/inference consistency benefits of MCore inference.
 
 | Area | Features |
 |---|---|
-| **Batching** | Dynamic / in-flight batching with vectorized bookkeeping; chunked prefill (chunked piggybacking); dynamic suspend/resume and request eviction for high input-rate regimes |
+| **Batching** | Dynamic / in-flight batching with vectorized bookkeeping; dynamic suspend/resume and request eviction for high input-rate regimes |
+| **Chunked prefill** | Chunked-prefill scheduling with decode piggybacking, so long prompts don't stall in-flight decodes |
 | **Attention / KV cache** | Optimized PagedAttention; prefix caching (with LRU / ref-zero eviction and prefix-aware coordinator routing) |
 | **CUDA graphs** | Full-model CUDA graphs for prefill, decode, and mixed batches |
 | **Speculative decoding** | MTP-based speculative decoding (with fused MTP bookkeeping + MTP CUDA graphs) |
 | **Serving** | OpenAI-compatible HTTP server with chat templates, tool calling, and reasoning parsers |
-| **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, allgatherv dispatcher optimized for multi-node NVLink, shared-expert overlap with latent MoEs |
+| **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher (notably faster than the all-to-all dispatchers other frameworks use) plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs |
 | **Parallelism** | Data-parallel coordinator with full multi-node support; tensor model parallelism with low-latency comm primitives; expert model parallelism |
 | **Model families** | GPT-style dense models, MoE models, and Mamba / hybrid (SSM + attention) models |
 | **Precision** | Low-precision functionality (e.g. MXFP8); native TransformerEngine quantization kernels |
@@ -638,13 +639,10 @@ for the detailed root-cause notes behind each limitation.
 
 **Models and performance:**
 
-- **Nemotron 4 support** (new SSM and attention variants), in coordination with
-  the broader RL effort.
 - **Disaggregated inference** (prefill/decode separation).
 - **FlashInfer integration** for attention / Mamba kernels (sampling is already
   integrated).
-- **Async dynamic context update** — moves bookkeeping off the critical path
-  (expected to close the small-model gap to vLLM; ~20% boost on Nano).
+- **Async dynamic context update** — moves bookkeeping off the critical path.
 - **All2Allv-based token dispatcher** for MoE.
 - **Large-scale inference optimizations** (large models and long sequences).
 - **Low-precision numerics** for KV cache and Mamba state.
