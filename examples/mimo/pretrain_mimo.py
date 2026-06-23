@@ -77,6 +77,12 @@ def _parse_and_validate() -> argparse.Namespace:
     # The data iterator is pre-built per rank; the external dataloader passes it through.
     args.dataloader_type = "external"
 
+    # Train-only: no eval. eval_iters=0 keeps do_valid/do_test off; a positive
+    # eval_interval avoids a divide-by-None in the train/valid/test sample accounting.
+    args.eval_iters = 0
+    if getattr(args, "eval_interval", None) is None:
+        args.eval_interval = args.train_iters or 1
+
     return args
 
 
