@@ -25,18 +25,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  analyze_community_request:
-    name: Analyze community request
+  authorize_assignment_command:
+    name: Authorize assignment command
     runs-on: ubuntu-latest
     permissions:
-      contents: read
       issues: read
     outputs:
       command_valid: ${{ steps.assignment-command.outputs.valid }}
       requested_assignee: ${{ steps.assignment-command.outputs.requested_assignee }}
       authorized: ${{ steps.command-author.outputs.authorized }}
       issue_unassigned: ${{ steps.live-issue.outputs.unassigned }}
-      analysis_json: ${{ steps.claude-analysis.outputs.structured_output }}
     if: |
       github.event_name == 'issue_comment' &&
       github.repository == 'NVIDIA/Megatron-LM' &&
@@ -107,20 +105,33 @@ jobs:
             echo "unassigned=true" >> "${GITHUB_OUTPUT}"
           fi
 
+  analyze_community_request:
+    name: Analyze community request
+    runs-on: ubuntu-latest
+    needs: authorize_assignment_command
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      analysis_json: ${{ steps.claude-analysis.outputs.structured_output }}
+    if: |
+      needs.authorize_assignment_command.result == 'success' &&
+      needs.authorize_assignment_command.outputs.command_valid == 'true' &&
+      needs.authorize_assignment_command.outputs.authorized == 'true' &&
+      needs.authorize_assignment_command.outputs.issue_unassigned == 'true'
+    env:
+      REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
+      ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+    steps:
       - name: Checkout repository
-        if: |
-          steps.assignment-command.outputs.valid == 'true' &&
-          steps.command-author.outputs.authorized == 'true' &&
-          steps.live-issue.outputs.unassigned == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Analyze issue owner with Claude
-        if: |
-          steps.assignment-command.outputs.valid == 'true' &&
-          steps.command-author.outputs.authorized == 'true' &&
-          steps.live-issue.outputs.unassigned == 'true'
         id: claude-analysis
         uses: anthropics/claude-code-action@v1
         env:
@@ -134,7 +145,7 @@ jobs:
             ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
             ISSUE URL: ${{ env.ISSUE_URL }}
             ISSUE AUTHOR: ${{ env.ISSUE_AUTHOR }}
-            REQUESTED ASSIGNEE: ${{ steps.assignment-command.outputs.requested_assignee }}
+            REQUESTED ASSIGNEE: ${{ needs.authorize_assignment_command.outputs.requested_assignee }}
 
             ISSUE TITLE:
             ${{ github.event.issue.title }}
@@ -157,7 +168,7 @@ jobs:
             4. Use repository search and git history to inspect likely paths:
                - Prefer rg/git ls-files for finding files.
                - Use git log -- <path> and git blame where useful.
-               - Use read-only gh api/gh issue view/gh pr view/gh pr list calls only when needed
+               - Use read-only gh issue view/gh pr view/gh pr list calls only when needed
                  to map commits, PRs, or issue metadata to GitHub logins.
             5. For bugs:
                - Investigate whether you can identify the likely root cause.
@@ -192,21 +203,22 @@ jobs:
             Only return the structured JSON requested by the schema.
           claude_args: |
             --model "claude-opus-4-6"
-            --allowedTools "Read,Bash(rg:*),Bash(git ls-files:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*),Bash(gh api:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --allowedTools "Read,Bash(rg:*),Bash(git ls-files:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr list:*)"
             --json-schema '{"type":"object","properties":{"assignee":{"type":["string","null"]},"potential_assignee":{"type":["string","null"]},"potential_assignee_reason":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"fallback_to_oncall":{"type":"boolean"},"issue_type":{"type":"string","enum":["bug","feature_request","other"]},"feature_topic":{"type":["string","null"]},"root_cause_pr":{"anyOf":[{"type":"object","properties":{"number":{"type":"integer"},"title":{"type":"string"},"url":{"type":"string"},"author":{"type":"string"},"reason":{"type":"string"}},"required":["number","title","url","author","reason"],"additionalProperties":false},{"type":"null"}]},"relevant_paths":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"},"slack_context":{"type":"string"}},"required":["assignee","potential_assignee","potential_assignee_reason","confidence","fallback_to_oncall","issue_type","feature_topic","root_cause_pr","relevant_paths","evidence","rationale","slack_context"],"additionalProperties":false}'
 
   assign_community_request:
     name: Assign community request
     runs-on: ubuntu-latest
-    needs: analyze_community_request
+    needs: [authorize_assignment_command, analyze_community_request]
     permissions:
       contents: read
       issues: write
     if: |
+      needs.authorize_assignment_command.result == 'success' &&
       needs.analyze_community_request.result == 'success' &&
-      needs.analyze_community_request.outputs.command_valid == 'true' &&
-      needs.analyze_community_request.outputs.authorized == 'true' &&
-      needs.analyze_community_request.outputs.issue_unassigned == 'true'
+      needs.authorize_assignment_command.outputs.command_valid == 'true' &&
+      needs.authorize_assignment_command.outputs.authorized == 'true' &&
+      needs.authorize_assignment_command.outputs.issue_unassigned == 'true'
     env:
       REPO: ${{ github.repository }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -239,7 +251,7 @@ jobs:
         if: steps.still-unassigned.outputs.skip != 'true'
         env:
           ANALYSIS_JSON: ${{ needs.analyze_community_request.outputs.analysis_json }}
-          REQUESTED_ASSIGNEE: ${{ needs.analyze_community_request.outputs.requested_assignee }}
+          REQUESTED_ASSIGNEE: ${{ needs.authorize_assignment_command.outputs.requested_assignee }}
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
           ISSUE_COMMENT_TOKEN: ${{ secrets.PAT }}
           SLACK_TOKEN: ${{ secrets.ISSUE_BOT_SLACK_TOKEN }}
