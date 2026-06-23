@@ -57,12 +57,20 @@ class Gemma4TransformerLayer(TransformerLayer):
         )
 
         ple_dim = self.config.hidden_size_per_layer_input
+        # gather_output=True so the gate is full-width [ple_dim] on every TP rank.
+        # The PLE sub-block runs replicated across TP: ``per_layer_input`` (p_i) is
+        # threaded in full-width from the block and ``per_layer_projection`` is a
+        # RowParallel with input_is_parallel=False (it expects a full input and
+        # scatters internally). With gather_output=False the gate would be sharded
+        # to ple_dim/TP while p_i stayed full, so ``gate * per_layer_input`` mismatched
+        # (e.g. 32 vs 256 at TP=8). Gathering is a no-op at TP=1 and numerically
+        # identical to the TP=1 path; it does not affect weight sharding / ckpt load.
         self.per_layer_input_gate = submodules.per_layer_input_gate(
             self.config.hidden_size,
             ple_dim,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
+            gather_output=True,
             bias=False,
             skip_bias_add=True,
             is_expert=False,
