@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from math import ceil, log2
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
