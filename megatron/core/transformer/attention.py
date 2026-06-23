@@ -307,6 +307,11 @@ class Attention(MegatronModule, ABC):
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
+        # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
+        # which is a pure function of the config and is reused on every forward
+        # pass for both static and dynamic batching code paths.
+        self._yarn_concentration_factor = _yarn_get_concentration_factor_from_config(config)
+
         assert self.config.kv_channels is not None
         assert self.config.num_query_groups is not None
 
@@ -679,7 +684,7 @@ class Attention(MegatronModule, ABC):
                     k_pos_emb,
                     self.config,
                     self.pg_collection.cp,
-                    mscale=_yarn_get_concentration_factor_from_config(self.config),
+                    mscale=self._yarn_concentration_factor,
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -1447,7 +1452,7 @@ class Attention(MegatronModule, ABC):
                             q_pos_emb,
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
-                            mscale=_yarn_get_concentration_factor_from_config(self.config),
+                            mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
                         )
                     else:
@@ -1457,7 +1462,7 @@ class Attention(MegatronModule, ABC):
                             self.config,
                             cu_seqlens_q,
                             self.pg_collection.cp,
-                            mscale=_yarn_get_concentration_factor_from_config(self.config),
+                            mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
@@ -1465,7 +1470,7 @@ class Attention(MegatronModule, ABC):
                         k_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
+                        mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
                     )
             else:
