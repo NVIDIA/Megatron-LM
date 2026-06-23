@@ -1980,6 +1980,12 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-logprobs-mode',
+                       type=str, default='raw_logprobs',
+                       choices=['raw_logprobs', 'processed_logprobs'],
+                       help='How returned inference log-probs are computed engine-wide. '
+                            '"raw_logprobs" (default) uses the unmodified model logits; '
+                            '"processed_logprobs" uses temperature and filters by top-k/top-p.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')

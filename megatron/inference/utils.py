@@ -382,6 +382,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
         disable_ep_consensus=args.inference_disable_ep_consensus,
         sampling_backend=args.inference_dynamic_batching_sampling_backend,
+        logprobs_mode=args.inference_dynamic_batching_logprobs_mode,
     )
 
 
