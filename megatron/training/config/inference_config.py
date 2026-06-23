@@ -254,8 +254,7 @@ class InferenceSetupConfig:
                 model's ``pg_collection`` attribute when None.
             kv_cache_management_mode: How large tensors are handled on suspend/resume
                 ("persist"/"offload"/"recompute"). Sourced from the RL arg
-                ``rl_kv_cache_management_mode`` at the call site (not part of the inference
-                argument group, so it is not folded into this dataclass).
+                ``rl_kv_cache_management_mode`` at the call site.
             static_kv_memory_pointers: Whether the KV cache stays at fixed addresses across
                 suspend/resume. Sourced from the RL arg ``rl_persist_cuda_graphs`` (not part
                 of the inference argument group).
