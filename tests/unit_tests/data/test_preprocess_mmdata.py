@@ -74,9 +74,7 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
     dummy_img(path_to_raws_txt, path_to_raws_img)
 
     # build the datasets
-    build_datasets(
-        path_to_raws_txt, path_to_raws_img, path_to_data, extra_args=extra_args,
-    )
+    build_datasets(path_to_raws_txt, path_to_raws_img, path_to_data, extra_args=extra_args)
 
     # merge the datasets
     merge_datasets(path_to_data)

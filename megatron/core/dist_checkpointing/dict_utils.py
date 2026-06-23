@@ -1,15 +1,18 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Utilities for operating with dicts and lists.
+"""Utilities for operating with dicts and lists.
 
 All functions in this module handle nesting of dicts and lists.
 Other objects (e.g. tuples) are treated as atomic leaf types that cannot be traversed.
 """
 
 from collections import defaultdict
-from typing import Any, Callable, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Tuple, TypeVar, Union
 
+import numpy as np
 import torch
+
+U, V = TypeVar("U"), TypeVar("V")
 
 
 def extract_matching_values(
@@ -45,7 +48,7 @@ def extract_matching_values(
                 matching_vals[k] = v
             else:
                 nonmatching_vals[k] = v
-    elif isinstance(x, list):
+    elif isinstance(x, list):  # type: ignore
         matching_vals = {} if return_lists_as_dicts else []
         nonmatching_vals = {} if return_lists_as_dicts else []
         for ind, v in enumerate(x):
@@ -59,7 +62,7 @@ def extract_matching_values(
                 target = matching_vals if predicate(v) else nonmatching_vals
                 _set_elem(target, ind, v)
     else:
-        raise ValueError(f'Unexpected top-level object type: {type(x)}')
+        raise ValueError(f"Unexpected top-level object type: {type(x)}")
     return matching_vals, nonmatching_vals
 
 
@@ -88,9 +91,10 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
             only_left.extend(_left)
             only_right.extend(_right)
             mismatch.extend(_mismatch)
-    elif isinstance(x1, list) and isinstance(x2, list):
+    elif isinstance(x1, list) or isinstance(x1, tuple) or isinstance(x1, np.ndarray):
+        assert type(x1) == type(x2)
         only_left = list(range(len(x1) - 1, len(x2) - 1, -1))
-        only_right = list(range(len(x1) - 1, len(x2) - 1, -1))
+        only_right = list(range(len(x2) - 1, len(x1) - 1, -1))
         for i, (v1, v2) in enumerate(zip(x1, x2)):
             _left, _right, _mismatch = diff(v1, v2, prefix + (i,))
             only_left.extend(_left)
@@ -99,8 +103,26 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
     else:
         only_left = []
         only_right = []
+        mismatch_debug_data = [prefix, type(x1), type(x2)]
         if isinstance(x1, torch.Tensor) and isinstance(x2, torch.Tensor):
-            _is_mismatch = not torch.all(x1 == x2)
+            try:
+                if x1.device != x2.device:
+                    _is_mismatch = not torch.all(x1.cpu() == x2.cpu())
+                else:
+                    _is_mismatch = not torch.all(x1 == x2)
+                mismatch_debug_data.extend(
+                    [(x1 != x2).sum(), (x1 != x2).shape, (x1 != x2).nonzero().tolist()]
+                )
+            except (RuntimeError, TypeError, ValueError):
+                _is_mismatch = True
+                mismatch_debug_data.extend([x1.shape, x2.shape])
+        # TODO: change with concrete type that has both replica_id and data attrs
+        elif hasattr(x1, "replica_id") and hasattr(x2, "replica_id"):
+            assert type(x1) == type(x2)
+            only_left, only_right, mismatch = diff(
+                x1.data, x2.data, prefix + (type(x1),)
+            )  # type: ignore
+            _is_mismatch = False
         else:
             try:
                 _is_mismatch = bool(x1 != x2)
@@ -108,37 +130,37 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
                 _is_mismatch = True
 
         if _is_mismatch:
-            mismatch.append((prefix, type(x1), type(x2)))
+            mismatch.append(tuple(mismatch_debug_data))
 
     return only_left, only_right, mismatch
 
 
 def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
     """Helper to print types of (nested) dict values."""
-    print_indent = lambda: print(' ' * indent * len(prefix), end='')
+    print_indent = lambda: print(" " * indent * len(prefix), end="")
     if isinstance(x, dict):
         print()
         for k, v in x.items():
             print_indent()
-            print(f'> {k}: ', end='')
+            print(f"> {k}: ", end="")
             inspect_types(v, prefix + (k,), indent)
     elif isinstance(x, list):
         print()
         for i, v in enumerate(x):
             print_indent()
-            print(f'- {i}: ', end='')
+            print(f"- {i}: ", end="")
             inspect_types(v, prefix + (i,), indent)
     else:
         if isinstance(x, torch.Tensor):
-            print(f'Tensor of shape {x.shape}')
+            print(f"Tensor of shape {x.shape}")
         else:
             try:
                 x_str = str(x)
-            except Exception:
-                x_str = '<no string repr>'
+            except:
+                x_str = "<no string repr>"
             if len(x_str) > 30:
-                x_str = x_str[:30] + '... (truncated)'
-            print(f'[{type(x)}]: {x_str}')
+                x_str = x_str[:30] + "... (truncated)"
+            print(f"[{type(x)}]: {x_str}")
 
 
 def nested_values(x: Union[dict, list]):
@@ -173,7 +195,7 @@ def dict_map_with_key(f: Callable, d: dict):
         sub_d[k] = f(k, v)
 
 
-def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
+def dict_list_map_inplace(f: Callable[[U], V], x: Union[Dict, List, U]):
     """Maps dicts and lists *in-place* with a given function."""
     if isinstance(x, dict):
         for k, v in x.items():
@@ -185,7 +207,7 @@ def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
     return x
 
 
-def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
+def dict_list_map_outplace(f: Callable[[U], V], x: Union[Dict, List, U]) -> Union[Dict, List, V]:
     """Maps dicts and lists *out-of-place* with a given function."""
     if isinstance(x, dict):
         return {k: dict_list_map_outplace(f, v) for k, v in x.items()}
@@ -195,7 +217,7 @@ def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
         return f(x)
 
 
-def merge(x1: dict, x2: dict, key: Tuple[str, ...] = ()):
+def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, int], ...] = ()):
     """Merges dicts and lists recursively."""
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
@@ -206,13 +228,15 @@ def merge(x1: dict, x2: dict, key: Tuple[str, ...] = ()):
     elif isinstance(x1, list) and isinstance(x2, list):
         if len(x1) != len(x2):
             raise ValueError(
-                f'Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, encountered at level {key})'
+                f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
+                f"encountered at level {key})"
             )
         for i, v2 in enumerate(x2):
             x1[i] = merge(x1[i], v2, key=key + (i,))
     else:
         raise ValueError(
-            f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}` (at level {key})'
+            f"Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}` "
+            f"(at level {key})"
         )
     return x1
 

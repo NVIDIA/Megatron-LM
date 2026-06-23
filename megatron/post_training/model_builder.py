@@ -1,0 +1,388 @@
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+
+"""ModelOpt GPT model provider."""
+
+import logging
+import os
+from argparse import Namespace
+from typing import Any, Dict
+
+import modelopt.torch.distill as mtd
+import modelopt.torch.distill.plugins.megatron as mtd_mcore
+import modelopt.torch.opt as mto
+import yaml
+
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
+from megatron.core.models.hybrid.hybrid_model import HybridModel as MCoreHybridModel
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
+    mcore_gpt_load_te_state_dict_pre_hook,
+)
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.utils import print_distributed_quant_summary
+from megatron.training import get_args, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+
+
+def count_parameters_in_layer(model, layer_name):
+    num_params = 0
+    for name, param in model.named_parameters():
+        if layer_name in name:
+            num_params += param.numel()
+            print_rank_0(f" - {name}: {param.numel()}")
+    return num_params
+
+
+def _add_load_convert_hooks(model: MCoreGPTModel):
+    """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
+    """
+    args = get_args()
+    if args.export_te_mcore_model:
+        model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
+
+
+def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
+    """Reads teacher config from a file.
+
+    The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
+    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
+    This function will translate NeMo field names to MCore as needed.
+    """
+    required_teacher_fields = (
+        "num_layers",
+        "hidden_size",
+        "ffn_hidden_size",
+        "num_attention_heads",
+    )
+
+    args = get_args()
+    if args.export_kd_teacher_model_config is not None:
+        config_path = args.export_kd_teacher_model_config
+    else:
+        config_path = os.path.join(checkpoint_path, "model_config.yaml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Teacher model-config file {config_path} not found.\n"
+            "Teacher checkpoint dir must contain a NeMo-format config named 'model_config.yaml'"
+            " or provide it via --export-kd-teacher-model-config."
+        )
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    if missing_keys := [k for k in required_teacher_fields if k not in config]:
+        raise ValueError(
+            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
+        )
+
+    if "encoder_seq_length" in config:
+        config["seq_length"] = config["encoder_seq_length"]
+    if "bias" in config:
+        config["disable_bias_linear"] = not config["bias"]
+    if config.get("activation") == "swiglu":
+        config["swiglu"] = True
+    if config.get("position_embedding_type", False) is None:
+        config["use_rotary_position_embeddings"] = config["no_position_embedding"] = True
+    if "share_embeddings_and_output_weights" in config:
+        config["untie_embeddings_and_output_weights"] = not config[
+            "share_embeddings_and_output_weights"
+        ]
+    if "tokenizer" in config:
+        config["tokenizer_type"] = config["tokenizer"]["type"]
+        config["tokenizer_model"] = config["tokenizer"]["model"]
+    if "masked_softmax_fusion" in config:
+        config["no_masked_softmax_fusion"] = not config["masked_softmax_fusion"]
+    if config.get("normalization") == "layernorm1p":
+        config["apply_layernorm_1p"] = True
+    if "precision" in config:
+        config[config["precision"]] = True
+    if "mcore_gpt" in config:
+        config["use_mcore_models"] = config["mcore_gpt"]
+
+    args_dict = vars(get_args()).copy()
+    del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
+    args_dict.update(config)
+
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (args_dict.get('hybrid_override_pattern') is not None
+            and args_dict.get('hybrid_layer_pattern') is None):
+        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
+
+    return Namespace(**args_dict)
+
+
+def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+    """Teacher model creator."""
+    args = get_args()
+
+    if config.is_hybrid_model:
+        # This parameter is not part of the TransformerConfig and needs to be passed separately.
+        # Note: hybrid_override_pattern is remapped to hybrid_layer_pattern in
+        # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
+        model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
+
+        teacher = MCoreHybridModel(config=config, **model_kwargs)
+    else:
+        # GPT layer spec needs re-creation since it depends on number of model layers.
+        if config.heterogeneous_block_specs:
+            model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=(args.transformer_impl == "transformer_engine"),
+            )
+        else:
+            model_kwargs["transformer_layer_spec"] = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+                use_arbitrary_attention_mask=False,
+            )
+        teacher = MCoreGPTModel(config=config, **model_kwargs)
+
+    _add_load_convert_hooks(teacher)
+
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
+
+    return teacher
+
+
+def modelopt_gpt_hybrid_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    *,
+    disable_moe_grouped_gemm: bool = False,
+) -> MCoreGPTModel | MCoreHybridModel:
+    """Builds the model.
+
+    Args:
+        disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
+            linears) instead of the default TEGroupedMLP. Pruning sets this so
+            ``mtp.prune`` can operate on individual expert linears; quantize / generate /
+            finetune leave the default so MoE quantization (e.g. QuantTEGroupedMLP) works
+            and TP+EP > 1 doesn't trip the QuantSequentialMLP unsupported-combo check.
+
+    Args:
+        args (Namespace): The arguments namespace.
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        vp_stage (int, optional): The virtual pipeline stage.
+        config (TransformerConfig, optional): The configuration object.
+        pg_collection (ProcessGroupCollection, optional): Collection of process groups
+            used for tensor/context/pipeline/data parallelism. If provided, it will be
+            attached to the returned model for downstream routing/resharding utilities.
+
+    Returns:
+        MCoreGPTModel | MCoreHybridModel: The returned model
+    """
+    print_rank_0("building GPT model ...")
+
+    # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
+    config = core_transformer_config_from_args(args)
+
+    # Handle GPT-OSS mode with YaRN RoPE configuration
+    if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
+        print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
+
+        # Set GPT-OSS YaRN values directly on the config
+        # These defaults are based on Huggingface GPT-OSS configurations
+        config.position_embedding_type = "yarn"
+        config.yarn_rotary_scaling_factor = 32.0
+        config.yarn_original_max_position_embeddings = 131072
+        config.yarn_beta_fast = 32.0
+        config.yarn_beta_slow = 1.0
+        config.yarn_mscale = 1.0
+        config.yarn_mscale_all_dim = 0.0
+        config.yarn_correction_range_round_to_int = False
+
+    if vp_stage is not None:
+        raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
+    if args.spec is not None:
+        raise ValueError("ModelOpt integration does not support custom args.spec.")
+
+    # Llama-4 Scout/Maverick support
+    config.qk_l2_norm = args.export_qk_l2_norm
+    config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input
+
+    if args.export_model_type == "GPTModel":
+        if args.export_offline_model:
+            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
+            config.original_num_layers = config.num_layers
+            # Set num_layers to 0 for base model in offline mode
+            config.num_layers = 0
+            # SP is not used for offline
+            # TODO: DSR1 MTP may require SP
+            config.sequence_parallel = False
+        if config.heterogeneous_block_specs:
+            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=args.transformer_impl == "transformer_engine",
+            )
+        elif args.export_default_te_spec:
+            # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
+            # of the modelopt-customized spec. Required by pruning, which operates on the
+            # un-customized layer graph. ``disable_moe_grouped_gemm`` (set by prune.py)
+            # forces SequentialMLP so mtp.prune can act on individual expert linears.
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                config.num_moe_experts,
+                not disable_moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                config.experimental_attention_variant,
+                qk_l2_norm=config.qk_l2_norm,
+            )
+        else:
+            if config.context_parallel_size > 1:
+                print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
+                local_core_attention=False
+            else:
+                local_core_attention=args.export_force_local_attention
+
+            transformer_layer_spec = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=local_core_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+                use_arbitrary_attention_mask=False,
+            )
+
+        model_kwargs = {
+            "transformer_layer_spec": transformer_layer_spec,
+            "vocab_size": args.padded_vocab_size,
+            "max_sequence_length": args.max_position_embeddings,
+            "pre_process": pre_process,
+            "post_process": post_process,
+            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "parallel_output": True,
+            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_percent": args.rotary_percent,
+            "rotary_base": args.rotary_base,
+            "rope_scaling": args.use_rope_scaling,
+            "pg_collection": pg_collection,
+        }
+        model = MCoreGPTModel(config=config, **model_kwargs)
+    elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+        if args.export_model_type == "MambaModel":
+            import warnings
+
+            warnings.warn(
+                '--export-model-type "MambaModel" is deprecated. '
+                'Use --export-model-type "HybridModel" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        if args.export_default_te_spec and args.export_te_mcore_model:
+            logging.getLogger(__name__).warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            args.export_te_mcore_model = False
+
+        # Default to grouped MLP for the export spec (matches the pre-modernization
+        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
+        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
+        # mtp.prune can act on individual expert linears.
+        hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
+            moe_grouped_gemm=not disable_moe_grouped_gemm,
+        )
+        model_kwargs = {
+            "hybrid_stack_spec": hybrid_stack_spec,
+            "vocab_size": args.padded_vocab_size,
+            "max_sequence_length": args.max_position_embeddings,
+            "hybrid_layer_pattern": args.hybrid_layer_pattern,
+            "pre_process": pre_process,
+            "post_process": post_process,
+            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "parallel_output": True,
+            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_percent": args.rotary_percent,
+            "rotary_base": args.rotary_base,
+            "pg_collection": pg_collection,
+        }
+
+        model = MCoreHybridModel(config=config, **model_kwargs)
+
+        for l in range(model.decoder.num_layers_per_pipeline_rank):
+            layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
+            print_rank_0(f" == params layer {l}: {layer_params}")
+
+    else:
+        raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
+
+    # [IMPORTANT] Load modelopt_state immediately before returning the model back to `get_model()`.
+    #
+    # ModelOpt can create additional trainable parameters (e.g. for online speculative
+    # decoding training or PEFT). Hence resuming modelopt_state during checkpoint loading is already
+    # too late since Megatron created the optimizer right after calling model_provider before loading
+    # the checkpoint. To ensure all trainable parameters are reigistered, we try to resume the
+    # modelopt_state (which transforms the model to have additional parameters) before returning.
+    if args.load is not None:
+        load_modelopt_state(model=model)
+
+    _add_load_convert_hooks(model)
+
+    # Distillation mode.
+    if args.export_kd_teacher_load:
+        print_rank_0("Distillation: Enabled.")
+
+        # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
+        # is converted to a `modelopt.torch.opt.DynamicModule`.
+        # Argument `--manual-gc` can result in an eventual OOM.
+        assert (
+            not args.manual_gc
+        ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        assert (
+            not args.tp_comm_overlap
+        ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
+        if args.pipeline_model_parallel_size > 1:
+            assert (
+                args.virtual_pipeline_model_parallel_size is None
+            ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
+
+        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
+
+        distill_cfg = mtd_mcore.setup_distillation_config(
+            args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
+        )
+        kd_config = {
+            "teacher_model": _build_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
+            "criterion": distill_cfg.criterion,
+            "loss_balancer": distill_cfg.loss_balancer,
+        }
+        model = mtd.convert(model, mode=[("kd_loss", kd_config)])
+
+        # Additional tweaks needed for MCore.
+        # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
+        mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Also remove KD mode state to prevent issues with re-conversion after restore.
+        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
+
+    print_distributed_quant_summary(model)
+    return model
+
+
+# Backward-compatible alias
+modelopt_gpt_mamba_builder = modelopt_gpt_hybrid_builder

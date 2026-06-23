@@ -1,199 +1,768 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
-from pkg_resources import packaging
-from importlib.metadata import version
+import argparse
+import sys
+from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.training.arguments import parse_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_layer import MoELayer
+import megatron.core.transformer.moe.experts as experts_module
+from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import _add_network_size_args, parse_args
 from megatron.training.initialize import _set_random_seed
-from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
-DEVICE_CAPABILITY = None
-if torch.cuda.is_available():
-    DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
-_te_version = packaging.version.Version(version("transformer-engine"))
+def test_op_fuser_transformer_config_args_are_exposed():
+    parser = argparse.ArgumentParser()
+    _add_network_size_args(parser)
 
-
-class TestParallelGroupedMLP:
-
-    def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
-        print("============")
-        print("Test for use_cpu_initilization={} and swiglu={}.".format(use_cpu_initialization, swiglu))
-        print("============")
-        Utils.initialize_model_parallel(1,1)
-        num_layers = 1 # 2
-        self.hidden_size = 16 # must be an multiple of 16, otherwise trigger CUTLASS misaligned issue
-        self.num_experts = 2
-        self.gated_linear_unit = swiglu
-        self.activation_func = F.silu if swiglu else F.gelu
-        self.use_cpu_initialization = use_cpu_initialization
-
-        tf_config = TransformerConfig(
-            num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
-            num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
-            add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
-            activation_func=self.activation_func,
-            bias_activation_fusion=False,
-            bf16=True, params_dtype=torch.bfloat16, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
-
-        self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
-        self.fc2_ffn_hidden_size = tf_config.ffn_hidden_size
-        # If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        if self.gated_linear_unit:
-            self.fc1_ffn_hidden_size *= 2
-
-        ## Vanilla sequential GEMM
-        # Set random seed for reproducability
-        _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(tf_config,
-            transformer_layer_spec.submodules.mlp.submodules)
-
-        self.args = parse_args(ignore_unknown_args=True)
-        self.args.bf16=True
-        # Bias is not supported in grouped gemm currently, thus we disable the
-        # bias in the linear layer.
-        self.args.add_bias_linear=False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
-        print("done intializing for sequential gemm")
-
-        ## Grouped GEMM
-        _set_random_seed(seed_=123, data_parallel_random_init=False)
-        tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
-        print("done intializing for grouped gemm")
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    def test_constructor(self):
-        assert isinstance(self.sequential_mlp, MoELayer)
-        assert isinstance(self.grouped_mlp, MoELayer)
-
-        num_weights_smm = sum([p.numel() for p in self.sequential_mlp.parameters()])
-        num_weights_gmm = sum([p.numel() for p in self.grouped_mlp.parameters()])
-
-        # For the same hyper-parm model configs except the `moe_grouped_gemm`,
-        # GroupedGEMM and sequential GEMMs should hold the same number of parms.
-        assert num_weights_smm == num_weights_gmm
-        # expected num weights: router linear weights+bias + MLP weights(no bias) of all experts
-        expected_num_weights = \
-            self.hidden_size * self.num_experts + \
-            self.hidden_size * (self.fc1_ffn_hidden_size + self.fc2_ffn_hidden_size) * self.num_experts
-        assert num_weights_smm == expected_num_weights
-
-        assert torch.equal(self.sequential_mlp.router.weight, self.grouped_mlp.router.weight)
-
-        # weight1: [h, num_experts*4h]
-        # weight2: [num_experts*4h, h]
-        assert self.grouped_mlp.experts.weight1.shape[0] == self.hidden_size
-        assert self.grouped_mlp.experts.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
-        if self.gated_linear_unit:
-            assert self.grouped_mlp.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
-            assert self.grouped_mlp.experts.weight2.shape[1] == self.hidden_size
-        else:
-            assert self.grouped_mlp.experts.weight1.shape == self.grouped_mlp.experts.weight2.t().shape
-
-    def test_weight_init_value_the_same(self):
-        gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
-        gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
-        gmm_expert1_fc1 = gmm_w1[0]
-        gmm_expert1_fc2 = gmm_w2[0]
-        gmm_expert2_fc1 = gmm_w1[1]
-        gmm_expert2_fc2 = gmm_w2[1]
-
-        smm_expert1_fc1 = self.sequential_mlp.experts.local_experts[0].linear_fc1.weight
-        smm_expert1_fc2 = self.sequential_mlp.experts.local_experts[0].linear_fc2.weight
-        smm_expert2_fc1 = self.sequential_mlp.experts.local_experts[1].linear_fc1.weight
-        smm_expert2_fc2 = self.sequential_mlp.experts.local_experts[1].linear_fc2.weight
-
-        assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
-        if not self.use_cpu_initialization:
-            assert torch.equal(gmm_expert1_fc2, smm_expert1_fc2)
-        # the param init value is not exactly the same between gmm and smm (refer to test_weight_init_value_the_same.)
-        # TODO: is it necessary to keep smm and gmm share exactly the same init params?
-        # assert torch.equal(gmm_expert2_fc1, smm_expert2_fc1)
-        if self.use_cpu_initialization:
-            assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.skipif(
-        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
+    args = parser.parse_args(
+        ["--use-transformer-engine-op-fuser", "--moe-mlp-glu-interleave-size", "16"]
     )
-    def test_gpu_forward(self):
-        self.sequential_mlp.cuda()
-        self.grouped_mlp.cuda()
-        # [sequence length, batch size, hidden size]
-        seq_len = 3 #32
-        batch_size = 2
-        hidden_states = torch.rand(
-            (seq_len, batch_size, self.sequential_mlp.config.hidden_size),
-            dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
-        output_smm, _ = self.sequential_mlp(hidden_states)
-        output_gmm, _ = self.grouped_mlp(hidden_states)
 
-        # The following assert fails due to the param init value is not exactly
-        # the same between gmm and smm (refer to test_weight_init_value_the_same.)
-        # assert torch.equal(output_smm, output_gmm)
+    assert args.use_transformer_engine_op_fuser is True
+    assert args.moe_mlp_glu_interleave_size == 16
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.skipif(
-        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
-    )
-    def test_gpu_forward_with_no_tokens_allocated(self):
-        """Test the case when no token is allocated for groupedGEMM kernels."""
-        w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
-        num_allocated_tokens = 0
-        tokens_per_expert = torch.zeros(self.num_experts)
-        hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
-        try:
-            gg.ops.gmm(hidden_states, w1, tokens_per_expert, trans_b=False)
-        except Exception as e:
-            print("Expected error message from groupedGEMM:", e)
-            assert str(e) == "Input batch_sizes should not be all zeros!"
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.skipif(
-        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
-    )
-    def test_gradient_with_no_tokens_allocated(self):
-        """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
-        self.grouped_mlp.cuda()
-        num_allocated_tokens = 0
-        tokens_per_expert = torch.zeros(self.num_experts)
-        hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
-        output_gmm, _ = self.grouped_mlp.experts(
-            hidden_states,
-            tokens_per_expert=tokens_per_expert,
+def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
+    interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
+    expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])
+
+    output = TEGroupedMLP._remove_glu_interleaving(interleaved, interleave_size=2)
+
+    torch.testing.assert_close(output, expected)
+
+
+def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch):
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    fake_te = SimpleNamespace(
+        pytorch=SimpleNamespace(
+            GroupedLinear=FakeGroupedLinear,
+            ops=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ScaledSwiGLU=FakeScaledSwiGLU,
+                Sequential=FakeSequential,
+            ),
         )
-        output_gmm.mean().backward()
-        assert self.grouped_mlp.experts.weight1.grad is not None
+    )
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=16,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func=F.silu,
+    )
+    module.activation_func = F.silu
+    module.config.gated_linear_unit = True
+    module.linear_fc1 = FakeGroupedLinear(
+        2,
+        4,
+        8,
+        bias=True,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=True,
+        single_grouped_weight=False,
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2,
+        8,
+        4,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=True,
+    )
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4) * 2)
+    module.linear_fc1.bias0 = torch.nn.Parameter(torch.zeros(8))
+    module.linear_fc1.bias1 = torch.nn.Parameter(torch.ones(8))
+    module.linear_fc2.weight = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert len(ops) == 3
+    assert ops[0].device == "meta"
+    assert ops[0].weight0 is module.linear_fc1.weight0
+    assert ops[0].weight1 is module.linear_fc1.weight1
+    assert ops[0].bias0 is module.linear_fc1.bias0
+    assert ops[0].bias1 is module.linear_fc1.bias1
+    assert ops[1].glu_interleave_size == 16
+    assert ops[2].device == "meta"
+    assert ops[2].weight is module.linear_fc2.weight
+    assert hasattr(ops, "forward_pre_hook")
+
+
+def test_fused_forward_caches_ops_and_forwards_expected_arguments():
+    class FakeFusedOps:
+        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
+            self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
+            return hidden_states + 1
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
+    # reads `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` after the
+    # `moe_router_padding_for_quantization` short-circuit fails.
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type=None,
+        moe_flex_dispatcher_backend=None,
+        moe_paged_stash=False,
+    )
+    module._fused_ops = None
+    fused_ops = FakeFusedOps()
+    module._make_fused_ops = lambda: fused_ops
+    hidden_states = torch.zeros(2, 4)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.ones(2)
+
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert module._fused_ops[0] is fused_ops
+    assert fused_ops.args[0] is hidden_states
+    assert fused_ops.args[1] is tokens_per_expert
+    assert fused_ops.args[2] is probs
+    assert fused_ops.args[3] is tokens_per_expert
+
+
+def test_apply_bias_returns_input_unchanged_when_bias_is_none():
+    intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
+
+    output = TEGroupedMLP._apply_bias(
+        intermediate, bias_parallel=None, tokens_per_expert=[2, 1], permuted_probs=torch.ones(3)
+    )
+
+    assert output is intermediate
+
+
+def test_apply_bias_combines_per_expert_bias_and_probs():
+    intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
+    tokens_per_expert = [2, 1]
+    permuted_probs = torch.tensor([0.5, 0.5, 1.0])
+    expected = torch.tensor([[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32)
+
+    output = TEGroupedMLP._apply_bias(
+        intermediate, bias_parallel, tokens_per_expert, permuted_probs
+    )
+
+    torch.testing.assert_close(output, expected)
+    assert output.dtype == intermediate.dtype
+
+
+def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    fc1_child = torch.nn.Linear(2, 2)
+    fc2_child = torch.nn.Linear(2, 2)
+    module.linear_fc1 = torch.nn.Sequential(fc1_child)
+    module.linear_fc2 = torch.nn.Sequential(fc2_child)
+
+    calls = []
+
+    def fc1_hook(submodule, _inp):
+        calls.append(("fc1", submodule))
+        return None
+
+    def fc2_hook(submodule, _inp):
+        calls.append(("fc2", submodule))
+        return None
+
+    fc1_child.register_forward_pre_hook(fc1_hook)
+    fc2_child.register_forward_pre_hook(fc2_hook)
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    visited = {label for label, _ in calls}
+    assert visited == {"fc1", "fc2"}
+
+
+def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    fc1_child = torch.nn.Linear(2, 2)
+    module.linear_fc1 = torch.nn.Sequential(fc1_child)
+    module.linear_fc2 = torch.nn.Sequential(torch.nn.Linear(2, 2))
+
+    fc1_child.register_forward_pre_hook(lambda submodule, _inp: torch.zeros(1))
+
+    hook = module._make_fused_impl_pre_forward_hook()
+
+    with pytest.raises(RuntimeError, match="modifies the input tensor"):
+        hook(object())
+
+
+def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    fake_te = SimpleNamespace(
+        pytorch=SimpleNamespace(
+            GroupedLinear=FakeGroupedLinear,
+            ops=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ScaledSwiGLU=FakeScaledSwiGLU,
+                Sequential=FakeSequential,
+            ),
+        )
+    )
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=8,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
+    module.activation_recompute = True
+    module.linear_fc1 = FakeGroupedLinear(
+        2,
+        4,
+        8,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=True,
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2,
+        8,
+        4,
+        bias=True,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=True,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1.weight = torch.nn.Parameter(torch.ones(2, 8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8) * 2)
+    module.linear_fc2.bias0 = torch.nn.Parameter(torch.zeros(4))
+    module.linear_fc2.bias1 = torch.nn.Parameter(torch.ones(4))
+
+    ops = module._make_fused_ops()
+
+    assert ops[0].weight is module.linear_fc1.weight
+    assert ops[1].glu_interleave_size == 8
+    assert ops[1].activation_recompute_in_mlp is True
+    assert ops[2].weight0 is module.linear_fc2.weight0
+    assert ops[2].weight1 is module.linear_fc2.weight1
+    assert ops[2].bias0 is module.linear_fc2.bias0
+    assert ops[2].bias1 is module.linear_fc2.bias1
+
+
+def _make_fake_te_namespace():
+    """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+    class FakeScaledClampedQGeGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.limit = limit
+
+    class FakeScaledSReLU(torch.nn.Module):
+        def __init__(self, *, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    return (
+        SimpleNamespace(
+            pytorch=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ops=SimpleNamespace(
+                    GroupedLinear=FakeGroupedLinear,
+                    ScaledSwiGLU=FakeScaledSwiGLU,
+                    ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
+                    ScaledSReLU=FakeScaledSReLU,
+                    Sequential=FakeSequential,
+                ),
+            )
+        ),
+        FakeGroupedLinear,
+    )
+
+
+def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
+    """quick_gelu + clamp value → ScaledClampedQGeGLU(limit=clamp)."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=4,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=7.0,
+        activation_func=quick_gelu,
+        gated_linear_unit=True,
+    )
+    module.activation_func = quick_gelu
+    module.activation_recompute = True
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    activation = ops[1]
+    assert type(activation).__name__ == "FakeScaledClampedQGeGLU"
+    assert activation.glu_interleave_size == 4
+    assert activation.activation_recompute_in_mlp is True
+    assert activation.limit == 7.0
+
+
+def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):
+    """squared_relu + weighted squared-ReLU fusion -> ScaledSReLU."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=None,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func=squared_relu,
+        gated_linear_unit=False,
+        use_fused_weighted_squared_relu=True,
+    )
+    module.activation_func = squared_relu
+    module.activation_recompute = True
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert type(ops[1]).__name__ == "FakeScaledSReLU"
+    assert ops[1].activation_recompute_in_mlp is True
+
+
+def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=None,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func=squared_relu,
+        gated_linear_unit=True,
+        use_fused_weighted_squared_relu=True,
+    )
+    module.activation_func = squared_relu
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    with pytest.raises(RuntimeError, match="expected SwiGLU, quick_gelu"):
+        module._make_fused_ops()
+
+
+def _install_fake_te_ops_modules(
+    monkeypatch, fake_te, *, include_clamped_qgeglu=True, include_scaled_srelu=True
+):
+    transformer_engine = ModuleType("transformer_engine")
+    pytorch = ModuleType("transformer_engine.pytorch")
+    ops = ModuleType("transformer_engine.pytorch.ops")
+    ops.GroupedLinear = fake_te.pytorch.GroupedLinear
+    ops.ScaledSwiGLU = fake_te.pytorch.ops.ScaledSwiGLU
+    if include_clamped_qgeglu:
+        ops.ScaledClampedQGeGLU = fake_te.pytorch.ops.ScaledClampedQGeGLU
+    if include_scaled_srelu:
+        ops.ScaledSReLU = fake_te.pytorch.ops.ScaledSReLU
+    pytorch.ops = ops
+    transformer_engine.pytorch = pytorch
+    monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.ops", ops)
+
+
+def _make_fused_impl_support_module(
+    FakeGroupedLinear, *, activation_func, gated_linear_unit, use_fused_weighted_squared_relu=False
+):
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        activation_func=activation_func,
+        gated_linear_unit=gated_linear_unit,
+        use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
+        moe_apply_probs_on_input=False,
+    )
+    module.activation_func = object()
+    module.tp_group = SimpleNamespace(size=lambda: 1)
+    module.offload_expert_fc1 = False
+    module.offload_moe_act = False
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    return module
+
+
+def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+
+    assert module._is_fused_impl_supported() is True
+
+
+@pytest.mark.parametrize(
+    ("use_fused_weighted_squared_relu", "gated_linear_unit", "expected"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_flag_and_non_glu(
+    monkeypatch, use_fused_weighted_squared_relu, gated_linear_unit, expected
+):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=squared_relu,
+        gated_linear_unit=gated_linear_unit,
+        use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
+    )
+
+    assert module._is_fused_impl_supported() is expected
+
+
+def test_is_fused_impl_supported_requires_scaled_srelu_op(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te, include_scaled_srelu=False)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=squared_relu,
+        gated_linear_unit=False,
+        use_fused_weighted_squared_relu=True,
+    )
+
+    assert module._is_fused_impl_supported() is False
+
+
+def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
+    """single_grouped_bias=True → bias attached as `bias` (not `bias{idx}`)."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
+    common = dict(device="cuda", dtype=torch.bfloat16, accumulate_into_main_grad=False)
+    # FC1 stores bias as a single grouped tensor; weights still per-GEMM.
+    module.linear_fc1 = FakeGroupedLinear(
+        2, 4, 8, bias=True, single_grouped_weight=False, single_grouped_bias=True, **common
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2, 8, 4, bias=False, single_grouped_weight=False, single_grouped_bias=False, **common
+    )
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.bias = torch.nn.Parameter(torch.zeros(2, 8))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert ops[0].weight0 is module.linear_fc1.weight0
+    assert ops[0].weight1 is module.linear_fc1.weight1
+    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
+    assert not hasattr(
+        ops[0], "bias0"
+    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+
+
+def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
+    """delay_wgrad_compute=True (via wrapper) → backward_dw calls fused [2] then [0],
+    then triggers the wrapper-side wgrad/reduce hooks (PR 4311) so DDP's reduce-scatter
+    fires on the original linear_fc1/fc2 modules."""
+
+    class _Recorder:
+        def __init__(self, label):
+            self.label = label
+            self.calls = []
+
+        def backward_dw(self):
+            self.calls.append("backward_dw")
+
+    class _FakeWrapper:
+        def __init__(self, label):
+            self.label = label
+            self.delay_wgrad_compute = True
+            self.backward_dw_calls = 0
+            self.trigger_calls = 0
+
+        def backward_dw(self):
+            self.backward_dw_calls += 1
+
+        def _trigger_wgrad_accumulation_and_reduce_hooks(self):
+            self.trigger_calls += 1
+
+    class _FakeSequential:
+        def __init__(self, children):
+            self._children = children
+
+        def children(self):
+            return iter(self._children)
+
+    fc1_op = _Recorder("fc1")
+    activation_op = _Recorder("activation")
+    fc2_op = _Recorder("fc2")
+    fake_seq = _FakeSequential([fc1_op, activation_op, fc2_op])
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = True
+    module._fused_ops = (fake_seq,)
+    module.linear_fc1 = _FakeWrapper("fc1_wrapper")
+    module.linear_fc2 = _FakeWrapper("fc2_wrapper")
+    module.config = SimpleNamespace(delay_wgrad_compute=False)  # config flag is irrelevant
+
+    module.backward_dw()
+
+    assert fc2_op.calls == ["backward_dw"]
+    assert fc1_op.calls == ["backward_dw"]
+    assert activation_op.calls == [], "activation op must not be invoked"
+    assert module.linear_fc1.backward_dw_calls == 0, "wrapper backward_dw must be skipped"
+    assert module.linear_fc2.backward_dw_calls == 0
+    # PR 4311: DDP reduce-scatter hooks live on the original wrappers and must be triggered
+    # explicitly because the fused path's backward_dw runs on the new GroupedLinear instances.
+    assert module.linear_fc2.trigger_calls == 1
+    assert module.linear_fc1.trigger_calls == 1
+
+
+def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
+    """delay_wgrad_compute=False on wrappers → use the original wrapper backward_dw path."""
+
+    class _FakeWrapper:
+        def __init__(self):
+            self.delay_wgrad_compute = False
+            self.backward_dw_calls = 0
+
+        def backward_dw(self):
+            self.backward_dw_calls += 1
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = True
+    module._fused_ops = None
+    module.linear_fc1 = _FakeWrapper()
+    module.linear_fc2 = _FakeWrapper()
+    module.config = SimpleNamespace(delay_wgrad_compute=False)
+
+    module.backward_dw()
+
+    assert module.linear_fc1.backward_dw_calls == 1
+    assert module.linear_fc2.backward_dw_calls == 1
 
 
 @pytest.mark.skipif(
-    _te_version < packaging.version.Version("1.9.0.dev0"),
+    not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
         Utils.initialize_model_parallel(1, 1)
-        num_layers = 1 
+        num_layers = 1
         self.hidden_size = 16
         self.num_experts = 2
         self.gated_linear_unit = swiglu
@@ -225,31 +794,36 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False
+        sequential_submodules = get_submodules(
+            get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False).mlp
         )
-        self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        assert isinstance(sequential_submodules, MoESubmodules)
+        self.sequential_mlp = MoELayer(tf_config, sequential_submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear = False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp.config, self.sequential_mlp).module
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=True
-        )
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        grouped_submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        assert isinstance(grouped_submodules, MoESubmodules)
+        self.grouped_mlp = MoELayer(tf_config, grouped_submodules)
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
+        self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -284,6 +858,7 @@ class TestTEGroupedMLP:
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -326,6 +901,7 @@ class TestTEGroupedMLP:
             torch.testing.assert_close(smm_result, gmm_result)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         self.grouped_mlp.cuda()
@@ -333,7 +909,11 @@ class TestTEGroupedMLP:
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
+        probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
+        probs = probs.cuda()
+        output, _ = self.grouped_mlp.experts(
+            hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
+        )
         assert torch.equal(output, torch.zeros_like(output))
         assert output.shape == (num_allocated_tokens, self.hidden_size)
 
@@ -342,17 +922,182 @@ class TestTEGroupedMLP:
             assert getattr(self.grouped_mlp.experts.linear_fc1, f"weight{i}").grad is not None
             assert getattr(self.grouped_mlp.experts.linear_fc2, f"weight{i}").grad is not None
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_make_fused_ops_constructs_with_real_te(self):
+        """Verify `_make_fused_ops` builds a working TE op-fuser pipeline.
 
-if __name__ == "__main__":
-    for use_cpu_unitilization in [True, False]:
-        for swiglu in [True, False]:
-            GMLP_test = TestParallelGroupedMLP()
-            GMLP_test.setup_method(
-                method=None,
-                use_cpu_initialization=use_cpu_unitilization,
-                swiglu=swiglu)
-            GMLP_test.test_constructor()
-            GMLP_test.test_weight_init_value_the_same()
-            GMLP_test.test_gpu_forward()
-            GMLP_test.test_gpu_forward_with_no_tokens_allocated()
-            GMLP_test.teardown_method(method=None)
+        Regression guard for the `device="meta"` shell + weight-reattachment
+        sequence — a TE-side change that allocates state in the constructor
+        would break this without any of the mock-based unit tests catching it.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        import inspect
+
+        if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip(
+                "Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg; "
+                "_make_fused_ops requires a TE build that exposes it."
+            )
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        layer = MoELayer(tf_config, submodules)
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl
+
+        ops = experts._make_fused_ops()
+
+        assert len(ops) == 3
+        assert isinstance(ops[0], GroupedLinear)
+        assert isinstance(ops[1], ScaledSwiGLU)
+        assert isinstance(ops[2], GroupedLinear)
+        # Weights of the wrapper ops must alias the underlying GroupedLinear
+        # parameters so optimizer updates are visible to the fused path.
+        for idx in range(experts.linear_fc1.num_gemms):
+            if not getattr(experts.linear_fc1, "single_grouped_weight", False):
+                assert getattr(ops[0], f"weight{idx}") is getattr(
+                    experts.linear_fc1, f"weight{idx}"
+                )
+        for idx in range(experts.linear_fc2.num_gemms):
+            if not getattr(experts.linear_fc2, "single_grouped_weight", False):
+                assert getattr(ops[2], f"weight{idx}") is getattr(
+                    experts.linear_fc2, f"weight{idx}"
+                )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_fused_path_loss_decreases(self):
+        """End-to-end signal that the Megatron op-fuser wrapper actually trains.
+
+        Builds a small grouped-MLP MoE layer with `use_transformer_engine_op_fuser=True`,
+        runs a few Adam steps driving the output toward a fixed target, and asserts the
+        loss decreases and stays finite. This catches regressions in the Megatron-side
+        wrapper plumbing — `_make_fused_ops` op-sequence construction, the fused-impl
+        pre-forward hook, weight aliasing into the TE op wrappers, and (delayed-)wgrad
+        backward — failure modes that pass our mock-based unit tests but break real
+        training.
+
+        IMPORTANT: this test does NOT verify that TE's underlying cuDSL fused grouped
+        MLP kernel is actually invoked. That kernel additionally requires SM100
+        (Blackwell) compute capability, plus `NVTE_CUTEDSL_FUSED_GROUPED_MLP` set, plus
+        a fusion-registration that happens at TE module import. On H100/A100 hardware
+        (which is the current CI matrix) the kernel is unavailable regardless and TE
+        falls back to its basic-op path — the Megatron wrapper still runs end-to-end
+        and the loss still decreases. So this test covers the wrapper code this PR
+        adds; it does not cover the cuDSL kernel selection. The functional test
+        `moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser` sets the env var
+        in its recipe as Blackwell forward-compat, but on current CI hardware it also
+        runs basic-op.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        import inspect
+
+        if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip("Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        layer = MoELayer(tf_config, submodules)
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        assert isinstance(layer.experts, TEGroupedMLP)
+        assert layer.experts._with_fused_impl
+
+        seq_len = 32
+        batch_size = 2
+        torch.manual_seed(7)
+        hidden_states = torch.rand(
+            (seq_len, batch_size, self.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        # MoE blocks with small-init weights produce near-zero output in bf16,
+        # so a `||output||^2`-style loss starts at zero and never moves the
+        # weights. Drive the output toward a fixed non-zero target so the
+        # gradient is non-trivial even when the initial output is tiny.
+        with torch.no_grad():
+            init_output, _ = layer(hidden_states)
+        target = torch.full_like(init_output, 0.5, dtype=torch.float32)
+        # Adam (not SGD) because bf16 weights quantize SGD updates of tiny
+        # gradients down to zero. Adam's per-parameter adaptive step keeps
+        # the update large enough to move bf16 weights regardless of grad
+        # magnitude — without it, even a working fused path produces only
+        # ~1e-6 loss movement per step, which is below trustable noise.
+        optimizer = torch.optim.Adam(layer.parameters(), lr=0.05)
+
+        losses = []
+        for _ in range(16):
+            optimizer.zero_grad(set_to_none=True)
+            output, _ = layer(hidden_states)
+            loss = (output.float() - target).pow(2).mean()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.detach().item())
+
+        assert all(
+            l == l and l != float("inf") for l in losses
+        ), f"Fused-path produced non-finite loss: {losses}"
+        # Require a meaningful relative drop. If the fused path silently no-ops
+        # weight updates (the historical wgrad-hook bug PR #4311 fixed) the
+        # loss is constant and this fires.
+        assert losses[-1] < losses[0] * 0.5, (
+            f"Fused-path training did not reduce loss enough: "
+            f"initial={losses[0]:.6f}, final={losses[-1]:.6f}, full={losses}"
+        )

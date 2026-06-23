@@ -1,27 +1,46 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
-import pytest
+import gc
 
+import pytest
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
+from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    get_transformer_layer_offset,
+)
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestParallelTransformerLayer:
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1,1)
+        Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        self.parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                           get_gpt_layer_with_transformer_engine_spec().submodules)
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.parallel_transformer_layer = TransformerLayer(
+            transformer_config, get_gpt_layer_with_transformer_engine_submodules()
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -47,10 +66,230 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states, context = parallel_transformer_layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states, context = parallel_transformer_layer(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
+
+    def test_chunked_mlp(self):
+        with torch.no_grad():
+            num_layers = 2
+            hidden_size = 12
+            num_attention_heads = 4
+            sequence_length = 32
+            micro_batch_size = 2
+
+            transformer_config = TransformerConfig(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                mlp_chunks_for_prefill=1,
+                mlp_chunks_for_training=1,
+                add_bias_linear=True,
+                use_cpu_initialization=True,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+            )
+            parallel_transformer_layer = TransformerLayer(
+                transformer_config, get_gpt_layer_with_transformer_engine_submodules()
+            )
+            parallel_transformer_layer.cuda()
+
+            # [sequence length, batch size, hidden size]
+            torch.manual_seed(42)
+            input_hidden_states = torch.randn((sequence_length, micro_batch_size, hidden_size))
+            input_hidden_states = input_hidden_states.cuda()
+
+            attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+            # Test chunked prefill: chunks=1 vs chunks=4 should be identical
+            parallel_transformer_layer.eval()
+            inference_context = StaticInferenceContext(
+                max_batch_size=micro_batch_size, max_sequence_length=sequence_length
+            )
+            outputs = {}
+            with InferenceMode.active():
+                for mlp_chunks_for_prefill in [1, 4]:
+                    transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
+                    hidden_states, context = parallel_transformer_layer(
+                        hidden_states=input_hidden_states,
+                        attention_mask=attention_mask,
+                        inference_context=inference_context,
+                    )
+                    assert hidden_states.shape[0] == sequence_length
+                    assert hidden_states.shape[1] == micro_batch_size
+                    assert hidden_states.shape[2] == hidden_size
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
+
+            assert torch.equal(outputs[1][0], outputs[4][0])
+
+            # Test chunked training: chunks=1 vs chunks=4 should be identical
+            parallel_transformer_layer.train()
+            outputs = {}
+            for mlp_chunks_for_training in [1, 4]:
+                transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
+                hidden_states, context = parallel_transformer_layer(
+                    hidden_states=input_hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=None,
+                )
+                assert hidden_states.shape[0] == sequence_length
+                assert hidden_states.shape[1] == micro_batch_size
+                assert hidden_states.shape[2] == hidden_size
+                outputs[mlp_chunks_for_training] = (hidden_states, context)
+
+            assert torch.equal(outputs[1][0], outputs[4][0])
+
+        # Test gradient equivalence: chunked vs non-chunked training
+        parallel_transformer_layer.train()
+        grads = {}
+        for mlp_chunks_for_training in [1, 4]:
+            transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
+            parallel_transformer_layer.zero_grad()
+            hidden_states, _ = parallel_transformer_layer(
+                hidden_states=input_hidden_states,
+                attention_mask=attention_mask,
+                inference_context=None,
+            )
+            loss = hidden_states.sum()
+            loss.backward()
+            grads[mlp_chunks_for_training] = {
+                name: param.grad.clone()
+                for name, param in parallel_transformer_layer.named_parameters()
+                if param.grad is not None
+            }
+
+        for name in grads[1]:
+            assert torch.allclose(grads[1][name], grads[4][name], atol=1e-6), (
+                f"Gradient mismatch for {name}: "
+                f"max diff={torch.max(torch.abs(grads[1][name] - grads[4][name])).item()}"
+            )
+
+    def test_get_layer_offset(self):
+        config = self.parallel_transformer_layer.config
+        assert get_transformer_layer_offset(config) == 0
+
+    @pytest.mark.parametrize(
+        "config_params,expected_offsets",
+        [
+            # Test case 1: Both first and last stages set (30 layers: 8+6+6+10)
+            (
+                {
+                    "num_layers": 30,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": 8,
+                    "num_layers_in_last_pipeline_stage": 10,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-3
+                    (0, 1): 15,  # Stage 0, VP 1: layers 15-18
+                    (1, 0): 4,  # Stage 1, VP 0: layers 4-6
+                    (1, 1): 19,  # Stage 1, VP 1: layers 19-21
+                    (2, 0): 7,  # Stage 2, VP 0: layers 7-9
+                    (2, 1): 22,  # Stage 2, VP 1: layers 22-24
+                    (3, 0): 10,  # Stage 3, VP 0: layers 10-14
+                    (3, 1): 25,  # Stage 3, VP 1: layers 25-29
+                },
+            ),
+            # Test case 2: Only first stage set (26 layers: 8+6+6+6)
+            (
+                {
+                    "num_layers": 26,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": 8,
+                    "num_layers_in_last_pipeline_stage": None,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-3
+                    (0, 1): 13,  # Stage 0, VP 1: layers 13-16
+                    (1, 0): 4,  # Stage 1, VP 0: layers 4-6
+                    (1, 1): 17,  # Stage 1, VP 1: layers 17-19
+                    (2, 0): 7,  # Stage 2, VP 0: layers 7-9
+                    (2, 1): 20,  # Stage 2, VP 1: layers 20-22
+                    (3, 0): 10,  # Stage 3, VP 0: layers 10-12
+                    (3, 1): 23,  # Stage 3, VP 1: layers 23-25
+                },
+            ),
+            # Test case 3: Only last stage set (26 layers: 6+6+6+8)
+            (
+                {
+                    "num_layers": 26,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": None,
+                    "num_layers_in_last_pipeline_stage": 8,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-2
+                    (0, 1): 13,  # Stage 0, VP 1: layers 13-15
+                    (1, 0): 3,  # Stage 1, VP 0: layers 3-5
+                    (1, 1): 16,  # Stage 1, VP 1: layers 16-18
+                    (2, 0): 6,  # Stage 2, VP 0: layers 6-8
+                    (2, 1): 19,  # Stage 2, VP 1: layers 19-21
+                    (3, 0): 9,  # Stage 3, VP 0: layers 9-12
+                    (3, 1): 22,  # Stage 3, VP 1: layers 22-25
+                },
+            ),
+            # Test case 4: Even distribution (24 layers: 6+6+6+6)
+            (
+                {
+                    "num_layers": 24,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": None,
+                    "num_layers_in_last_pipeline_stage": None,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-2
+                    (0, 1): 12,  # Stage 0, VP 1: layers 12-14
+                    (1, 0): 3,  # Stage 1, VP 0: layers 3-5
+                    (1, 1): 15,  # Stage 1, VP 1: layers 15-17
+                    (2, 0): 6,  # Stage 2, VP 0: layers 6-8
+                    (2, 1): 18,  # Stage 2, VP 1: layers 18-20
+                    (3, 0): 9,  # Stage 3, VP 0: layers 9-11
+                    (3, 1): 21,  # Stage 3, VP 1: layers 21-23
+                },
+            ),
+        ],
+    )
+    def test_get_layer_offset_parametrized(self, config_params, expected_offsets):
+        """
+        Parametrized test for get_transformer_layer_offset with different configurations.
+        Tests various combinations of first/last stage settings and virtual pipeline sizes.
+
+        This test verifies that the layer offset calculation correctly handles:
+        - Asymmetric pipeline stages (different layer counts per stage)
+        - Virtual pipeline parallelism (splitting physical stages into virtual stages)
+        - Various combinations of first/last stage configurations
+
+        The expected_offsets dictionary maps (pipeline_rank, vp_stage) tuples to
+        the expected starting layer index for that stage combination.
+        """
+
+        config = TransformerConfig(
+            hidden_size=512, num_attention_heads=8, use_cpu_initialization=True, **config_params
+        )
+
+        for (pipeline_rank, vp_stage), expected_offset in expected_offsets.items():
+            original_get_pipeline_rank = parallel_state.get_pipeline_model_parallel_rank
+            parallel_state.set_pipeline_model_parallel_rank(pipeline_rank)
+
+            try:
+                actual_offset = get_transformer_layer_offset(config, vp_stage)
+                assert actual_offset == expected_offset, (
+                    f"Expected offset {expected_offset} for pipeline rank {pipeline_rank}, "
+                    f"VP stage {vp_stage}, but got {actual_offset}"
+                )
+            finally:
+                parallel_state.set_pipeline_model_parallel_rank(original_get_pipeline_rank)
 
     @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])
@@ -59,14 +298,19 @@ class TestParallelTransformerLayer:
         Utils.initialize_model_parallel(*tp_pp, order=order)
 
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True)
-        parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                      get_gpt_layer_with_transformer_engine_spec().submodules)
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
+        )
+        parallel_transformer_layer = TransformerLayer(
+            transformer_config, get_gpt_layer_with_transformer_engine_submodules()
+        )
 
         sharded_state_dict = parallel_transformer_layer.sharded_state_dict()
 
         extra_states = {k: v for k, v in sharded_state_dict.items() if k.endswith('extra_state')}
-        sharded_tensors = {k: v for k, v in sharded_state_dict.items() if not k.endswith('extra_state')}
+        sharded_tensors = {
+            k: v for k, v in sharded_state_dict.items() if not k.endswith('extra_state')
+        }
         assert all(isinstance(t, ShardedObject) for t in extra_states.values())
         assert all(isinstance(t, ShardedTensor) for t in sharded_tensors.values())
 
@@ -104,3 +348,73 @@ def get_tensor_shapes_for_tp(transformer_config, tp_size):
         'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
         'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
     }
+
+
+def _make_cuda_graph_gpt_block(**config_kwargs):
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        **config_kwargs,
+    )
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
+
+
+def _reset_cudagraph_state():
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    torch.cuda.synchronize()
+
+
+def _all_layers_have_manager(block) -> bool:
+    return all(hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+def _no_layers_have_manager(block) -> bool:
+    return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="CUDA graph tests require TransformerEngine >= 1.5",
+)
+class TestTransformerLayerCudaGraphManagers:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _reset_cudagraph_state()
+        gc.collect()
+
+    def test_empty_scope_transformer_layer_has_per_layer_manager(self):
+        block = _make_cuda_graph_gpt_block(
+            cuda_graph_impl='local', cuda_graph_modules=[], inference_cuda_graph_scope='layer'
+        )
+        assert _all_layers_have_manager(block)
+        _reset_cudagraph_state()
+
+    def test_empty_scope_transformer_block_no_per_layer_manager(self):
+        block = _make_cuda_graph_gpt_block(
+            cuda_graph_impl='local', cuda_graph_modules=[], inference_cuda_graph_scope='block'
+        )
+        assert _no_layers_have_manager(block)
+        _reset_cudagraph_state()
+
+    def test_deprecated_full_iteration_inference_scope_string_matches_new_granularity(self):
+        with pytest.warns(
+            DeprecationWarning, match="cuda_graph_modules 'full_iteration_inference' is deprecated"
+        ):
+            block = _make_cuda_graph_gpt_block(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration_inference'
+            )
+        assert block.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert block.config.cuda_graph_modules == []
+        assert _no_layers_have_manager(block)
+        _reset_cudagraph_state()

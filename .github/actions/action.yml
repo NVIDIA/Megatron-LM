@@ -1,0 +1,314 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: "Test Template"
+description: "Template for running NeMo tests in a containerized environment"
+
+inputs:
+  container-image:
+    description: "Container image to use for test"
+    required: true
+  timeout:
+    description: "Max runtime of test in minutes"
+    required: false
+    default: "30"
+  script:
+    description: "Test script to execute"
+    required: true
+  is-optional:
+    description: "Pass this job on failure."
+    required: false
+    default: "false"
+  is_unit_test:
+    description: "Upload coverage as unit test"
+    required: false
+    default: "false"
+  tag:
+    description: Latest or legacy test suite
+    required: true
+  test_case:
+    description: Test case to launch
+    required: true
+  model:
+    description: Model to launch
+    required: false
+  PAT:
+    description: "GitHub Personal Access Token"
+    required: true
+  scope:
+    description: "Test scope (e.g. mr-github, mr-github-slim)"
+    required: false
+    default: "mr-github-slim"
+  n_repeat:
+    description: "Number of test repetitions"
+    required: false
+    default: "5"
+  lightweight:
+    description: "Enable lightweight mode"
+    required: false
+    default: "false"
+  platform:
+    description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
+    required: false
+    default: "dgx_h100"
+  cadence:
+    description: "Trigger cadence for cadence filter (pr|nightly|mergegroup). Empty disables filter."
+    required: false
+    default: ""
+  sha:
+    description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+    - name: Print node name
+      shell: bash -x -e -u -o pipefail {0}
+      run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.sha }}
+
+    - name: Change ownership of /home/runner/
+      shell: bash
+      # Tolerate vanishing `.git/objects/pack/.tmp-*` files: the prior
+      # `actions/checkout` may leave a background `git gc --auto` running,
+      # whose `git pack-objects` renames/deletes temp files while `chown`
+      # is walking the tree. On failure, wait 5 s for gc to settle, retry,
+      # then succeed unconditionally.
+      run: |
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null && exit 0
+        sleep 5
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null || true
+
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install uuid-runtime
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        for i in 1 2 3; do
+          apt-get update && apt-get install -y uuid-runtime && break
+          echo "apt attempt $i failed, retrying..."
+          sleep 10
+        done
+
+    - name: Install uv
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        for i in 1 2 3; do
+          curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
+          echo "uv install attempt $i failed, retrying..."
+          sleep 10
+        done
+
+    - name: Create run-script (unit test)
+      shell: bash -x -e -u -o pipefail {0}
+      if: inputs.is_unit_test == 'true'
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        export NCCL_DEBUG=INFO
+        export PIP_DEFAULT_TIMEOUT=120
+        export PIP_RETRIES=5
+        export UV_HTTP_TIMEOUT=120
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          --scope unit-tests \
+          --model unit-tests \
+          --test-case "${{ inputs.test_case }}" \
+          --environment dev \
+          --platform ${{ inputs.platform }} \
+          --tag ${{ inputs.tag }} \
+          --container-image ${{ inputs.container-image }} \
+          --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"
+        echo "::endgroup::"
+
+    - name: Create run-script (e2e test)
+      shell: bash -x -e -u -o pipefail {0}
+      if: inputs.is_unit_test == 'false'
+      env:
+        MODEL: ${{ inputs.model }}
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+        set -euxo pipefail
+
+        ARGS=(
+          --scope ${{ inputs.scope }}
+          --n-repeat ${{ inputs.n_repeat }}
+        )
+        if [ "${{ inputs.lightweight }}" == "true" ]; then
+          ARGS+=(--enable-lightweight-mode)
+        fi
+        if [ -n "${{ inputs.cadence }}" ]; then
+          ARGS+=(--cadence ${{ inputs.cadence }})
+        fi
+
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        export PIP_DEFAULT_TIMEOUT=120
+        export PIP_RETRIES=5
+        export UV_HTTP_TIMEOUT=120
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          ${ARGS[@]} \
+          --model ${{ inputs.model }} \
+          --test-case ${{ inputs.test_case }} \
+          --environment dev \
+          --platform ${{ inputs.platform }} \
+          --container-image ${{ inputs.container-image }} \
+          --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
+          --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"
+        echo "::endgroup::"
+
+    - name: Set timeout
+      shell: bash -x -e -u -o pipefail {0}
+      id: timeout_in_seconds
+      run: echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
+
+    - name: Pull container
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "::group::Pull container"
+        docker pull ${{ inputs.container-image }}
+        echo "::endgroup::"
+
+    - name: Run main script
+      shell: bash -x -e -u -o pipefail {0}
+      id: run-main-script
+      run: |
+        { set +x; } 2>/dev/null
+        echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
+        echo -e "\033[1;34m│  test case : ${{ inputs.test_case }}\033[0m"
+        echo -e "\033[1;34m│  platform  : ${{ inputs.platform }}   scope: ${{ inputs.scope }}\033[0m"
+        echo -e "\033[1;34m│  container : ${{ inputs.container-image }}\033[0m"
+        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
+        { set -x; } 2>/dev/null
+        echo "::group::Logs"
+        EXIT_CODE=0
+        /bin/bash job.sh || EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+        echo "::endgroup::"
+        exit $EXIT_CODE
+
+    - name: Check result
+      id: check
+      shell: bash -e -u -o pipefail {0}
+      if: always()
+      env:
+        IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+        MAIN_CONCLUSION: ${{ steps.run-main-script.conclusion }}
+        MAIN_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
+      run: |
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
+        echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
+        if [[ "$IS_UNIT_TEST" == "true" ]]; then
+          coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
+        else
+          coverage_report=none
+        fi
+        echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
+
+        EXIT_CODE="${MAIN_EXIT_CODE:-${MAIN_CONCLUSION}}"
+        if [[ "$MAIN_CONCLUSION" == "success" ]]; then
+          IS_SUCCESS=true
+        else
+          IS_SUCCESS=false
+        fi
+
+        if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
+          echo "::warning::Test failed but is marked optional — treating as success."
+          IS_SUCCESS=true
+        fi
+
+        LOG_BASE=$([[ "$IS_UNIT_TEST" == "true" ]] && echo "assets_dir/logs" || echo "assets_dir")
+        LATEST_LOG=""
+        if [[ -d "$LOG_BASE" ]]; then
+          LATEST_LOG=$(find "$LOG_BASE" -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
+                         | xargs -r ls -t 2>/dev/null | head -1 || true)
+        fi
+        if [[ -n "$LATEST_LOG" ]]; then
+          echo -e "\033[1;36m\n📋 ── log excerpt ───────────────────────────────────────────────────────\033[0m"
+          echo -e "\033[1;36m   ${LATEST_LOG} — last 40 lines\033[0m"
+          echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m"
+          tail -40 "$LATEST_LOG"
+          echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m\n"
+        else
+          echo -e "\033[33m⚠  no log file found in ${LOG_BASE}\033[0m"
+        fi
+
+        if [[ "$coverage_report" != "none" ]]; then
+          echo "::group::Coverage report"
+          uv run coverage report -i || true
+          echo "::endgroup::"
+        fi
+
+        if [[ "$IS_SUCCESS" == "true" ]]; then
+          echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m║   ✅  PASSED                                                             ║\033[0m"
+          echo -e "\033[1;32m║   ${{ inputs.test_case }}\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::notice title=Result::✅ ${{ inputs.test_case }} — PASSED"
+          exit 0
+        else
+          echo -e "\033[1;31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m║   ❌  FAILED  (exit code: ${EXIT_CODE})                                  ║\033[0m"
+          echo -e "\033[1;31m║   ${{ inputs.test_case }}\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::error title=Result::❌ ${{ inputs.test_case }} — FAILED (exit $EXIT_CODE)"
+          exit 1
+        fi
+
+    - name: Upload coverage
+      uses: actions/upload-artifact@v6
+      if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
+      with:
+        name: ${{ steps.check.outputs.coverage_report }}
+        path: |
+          coverage.xml
+          .coverage
+        include-hidden-files: true
+
+    - name: Upload logs
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: ${{ steps.check.outputs.logs_report }}
+        path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
+        include-hidden-files: true

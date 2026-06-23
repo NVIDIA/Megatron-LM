@@ -5,7 +5,7 @@ import os
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy
 import torch
@@ -33,7 +33,7 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """The maximum length N-gram to consider masking or permuting"""
 
     masking_do_full_word: bool = None
-    """Whether we mask the the whole word or its component parts"""
+    """Whether we mask the whole word or its component parts"""
 
     masking_do_permutation: bool = None
     """Whether we shuffle a subset of candidate N-grams in addition"""
@@ -84,13 +84,15 @@ class MaskedWordPieceDataset(MegatronDataset):
     first token/piece.
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
+                                          MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset.
+                                     When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -112,12 +114,30 @@ class MaskedWordPieceDataset(MegatronDataset):
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
+        """Return the number of documents in the underlying low level dataset.
+
+        Args:
+            low_level_dataset (IndexedDataset): The underlying IndexedDataset
+
+        Returns:
+            int: The number of unique elements in the underlying IndexedDataset
+        """
         return low_level_dataset.document_indices.shape[0] - 1
 
     @staticmethod
     def build_low_level_dataset(
         dataset_path: str, config: MaskedWordPieceDatasetConfig
     ) -> IndexedDataset:
+        """Build the low level dataset (IndexedDataset) from the given path.
+
+        Args:
+            dataset_path (str): The real path prefix to the IndexedDataset .bin and .idx files
+
+            config (MaskedWordPieceDatasetConfig): The config
+
+        Returns:
+            IndexedDataset: The underlying IndexedDataset
+        """
         return IndexedDataset(dataset_path)
 
     @staticmethod
@@ -154,15 +174,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
         path_to_description = get_path_to("description.txt")
         path_to_sample_index = get_path_to("sample_index.npy")
-        cache_hit = all(
-            map(
-                os.path.isfile,
-                [
-                    path_to_description,
-                    path_to_sample_index,
-                ],
-            )
-        )
+        cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index]))
 
         if self.num_samples is not None:
             num_epochs = numpy.iinfo(numpy.int32).max - 1
@@ -175,7 +187,6 @@ class MaskedWordPieceDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
-            self.built_anew_on_cache_miss = True
 
             os.makedirs(path_to_cache, exist_ok=True)
 
@@ -252,7 +263,7 @@ class MaskedWordPieceDataset(MegatronDataset):
                 2. masked_positions -> The indices for the masked token ids
                 3. masked_labels    -> The original token ids for the masked token ids
                 4. boundaries       -> The sentence and word boundaries for the sequence
-                4. masked_spans     -> The masked positions and labels with N-gram info intact
+                5. masked_spans     -> The masked positions and labels with N-gram info intact
         """
         # Build the token sentence and word boundaries and the masking candidates
         # e.g. [cls, id, ##id, ##id, id, ##id, sep, id, ##id, sep]
@@ -282,7 +293,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         ngram_nvals = numpy.arange(self.config.masking_max_ngram, dtype=numpy.int64) + 1
 
-        # By default, the N-gram probabilites are inversely proportional to N
+        # By default, the N-gram probabilities are inversely proportional to N
         # e.g. N = 3
         #    -> P = array([0.54545455, 0.27272727, 0.18181818])
         nprobs = 1.0 / ngram_nvals
@@ -362,7 +373,6 @@ class MaskedWordPieceDataset(MegatronDataset):
         numpy_random_state.shuffle(candidate_ngrams)
 
         if self.config.masking_do_permutation:
-
             n_swappings = n_maskings
 
             permuted_indices = set()
@@ -424,7 +434,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         masked_spans = sorted(masked_spans, key=lambda x: x[0][0])
 
-        return masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans
+        return (masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans)
 
     @abstractmethod
     def _get_token_mask(self, numpy_random_state: numpy.random.RandomState) -> Optional[int]:

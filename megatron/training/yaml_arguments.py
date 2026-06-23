@@ -6,17 +6,18 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import torch
 import types
+import yaml
 
 from itertools import chain, starmap
-from types import SimpleNamespace
-import yaml, re, os
 from types import SimpleNamespace
 
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.utils import get_torch_version, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -58,7 +59,7 @@ def validate_yaml(args, defaults={}):
         (args.world_size // args.model_parallel.tensor_model_parallel_size))
     args.model_parallel.transformer_pipeline_model_parallel_size = (
         args.model_parallel.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage else
+        if args.account_for_embedding_in_pipeline_split else
         args.model_parallel.pipeline_model_parallel_size
     )
     # Checks.
@@ -74,19 +75,13 @@ def validate_yaml(args, defaults={}):
     args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
                   args.model_parallel.pipeline_model_parallel_size), flush=True)
-    if args.model_parallel.pipeline_model_parallel_size > 1:
-        if args.model_parallel.pipeline_model_parallel_split_rank is not None:
-            assert args.model_parallel.pipeline_model_parallel_split_rank < \
-                    args.model_parallel.pipeline_model_parallel_size, 'split rank needs'\
-                    ' to be less than pipeline model parallel size ({})'.format(
-                            args.model_parallel.pipeline_model_parallel_size)
 
     if args.model_parallel.tp_comm_overlap:
         assert args.model_parallel.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -108,12 +103,28 @@ def validate_yaml(args, defaults={}):
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+
+    # Eval batch size.
+    if getattr(args, 'eval_global_batch_size', None) is None:
+        args.eval_global_batch_size = args.global_batch_size
+    if getattr(args, 'eval_micro_batch_size', None) is None:
+        args.eval_micro_batch_size = args.micro_batch_size
+    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
+        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
 
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -184,8 +195,6 @@ def validate_yaml(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -274,10 +283,8 @@ def validate_yaml(args, defaults={}):
         assert args.start_weight_decay is not None
         assert args.end_weight_decay is not None
 
-    TORCH_MAJOR = int(torch.__version__.split('.')[0])
-    TORCH_MINOR = int(torch.__version__.split('.')[1])
     # Persistent fused layer norm.
-    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+    if not is_torch_min_version("1.11.0a0"):
         args.language_model.persist_layer_norm = False
         if args.rank == 0:
             print('Persistent fused layer norm kernel is supported from '
@@ -295,10 +302,10 @@ def validate_yaml(args, defaults={}):
         assert args.language_model.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
+        assert is_torch_min_version("1.10.0a0"), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
-            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+            f'pytorch version is v{get_torch_version()}.'
 
     if args.language_model.recompute_granularity == 'selective':
         assert args.language_model.recompute_method is None, \
@@ -311,44 +318,14 @@ def validate_yaml(args, defaults={}):
     if args.model_parallel.tensor_model_parallel_size == 1:
         args.model_parallel.sequence_parallel = False
 
-    # disable async_tensor_model_parallel_allreduce when
-    # model parallel memory optimization is enabled
-    if args.model_parallel.sequence_parallel:
-        args.model_parallel.async_tensor_model_parallel_allreduce = False
-
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.model_parallel.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.model_parallel.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
-
-    # Retro checks.
-    if getattr(args, 'retro_add_retriever', False):
-        raise Exception("Retro untested for yaml args. See arguments.py.")
-
-        # Sequence parallelism unsupported.
-        assert not args.sequence_parallel, \
-            "retro currently does not support sequence parallelism."
-
-        # Pipeline parallelism unsupported.
-        assert args.pipeline_model_parallel_size == 1, \
-            "retro currently does not support pipeline parallelism."
-
-    #TODO: Retro args loading not tested
-    # Load retro args (used by both Retro & GPT).
-    if getattr(args, 'retro_project_dir', None) is not None:
-        raise Exception("Retro untested for yaml args. See arguments.py.")
-
-    if args.language_model.rotary_interleaved and args.language_model.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
         if args.model_parallel.tensor_model_parallel_size > 1:
             assert args.model_parallel.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
@@ -440,17 +417,25 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     if args.init_method == "xavier_uniform":
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.embedding_init_method == "xavier_uniform":
+        kw_args['embedding_init_method'] = torch.nn.init.xavier_uniform_
     
     # Return Transformer config.
-    return TransformerConfig(**kw_args)
+    if getattr(args, "multi_latent_attention", False):
+        return MLATransformerConfig(**kw_args)
+    else:
+        return TransformerConfig(**kw_args)
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
     with open(yaml_path, "r") as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
+        config = yaml.safe_load(f)
         # Convert to nested namespace
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
+        config_namespace._is_global_batch_size_explicitly_specified = (
+            getattr(config_namespace, "global_batch_size", None) is not None
+        )
         return config_namespace
 

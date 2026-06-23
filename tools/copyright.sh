@@ -1,34 +1,28 @@
 #!/bin/bash
+set -euox pipefail
 
-# Files ending with .py should have Copyright notice in the first line.
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+GIT_VERSION=$(git version | awk '{print $3}')
+GIT_MAJOR=$(echo $GIT_VERSION | awk -F. '{print $1}')
+GIT_MINOR=$(echo $GIT_VERSION | awk -F. '{print $2}')
 
-# Move to the project root
-cd $SCRIPT_DIR/..
-find_files_with_missing_copyright() {
-find ./megatron/ -type f -name '*.py' | while read path; do
-    echo -en $path"\t"
-    head -2 $path | grep -iv 'coding=' | head -1
-done \
-   | egrep -iv 'Copyright.*NVIDIA CORPORATION.*All rights reserved.' \
-   | grep -iv 'BSD 3-Clause License' \
-   | grep -iv 'Copyright.*Microsoft' \
-   | grep -iv 'Copyright.*The Open AI Team' \
-   | grep -iv 'Copyright.*The Google AI' \
-   | grep -iv 'Copyright.*Facebook' | while read line; do
-     echo $line | cut -d' ' -f1
-   done
-}
+if [[ $GIT_MAJOR -eq 2 && $GIT_MINOR -lt 31 ]]; then
+    echo "Git version must be at least 2.31.0. Found $GIT_VERSION"
+    exit 1
+fi
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 
-declare RESULT=($(find_files_with_missing_copyright))  # (..) = array
+BASE_REF=${BASE_REF:-main}
+git remote set-url origin "https://${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+git fetch origin ${BASE_REF}
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 
-if [ "${#RESULT[@]}" -gt 0 ]; then
-   echo "Error: Found files with missing copyright:"
-   for (( i=0; i<"${#RESULT[@]}"; i++ )); do
-      echo "path= ${RESULT[$i]}"
-   done
-   exit 1;
-else
-   echo "Ok: All files start with copyright notice"
+if [[ -n "$CHANGED_FILES" ]]; then
+   CMD="python ${SCRIPT_DIR}/check_copyright.py"
+
+   # Add the files
+   CMD="$CMD --from-year 2019 $CHANGED_FILES"
+
+   # Run the check
+   eval $CMD
 fi

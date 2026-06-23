@@ -1,84 +1,78 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Llama, Mistral and other Llama-like model support in Megatron-LM
 
-NOTE: Llama-3 and Mistral support in Megatron is currently experimental and we are still evaluting benchmark results to confirm model conversion, training and inference correctness.
+NOTE: In order to simplify code we now only support converting llama-3.x and mistral checkpoints downloaded from Hugging Face. For converting other models, see [Megatron Bridge](models/index.md).
 
-The [Llama-2](https://ai.meta.com/llama/) and [Llama-3](https://llama.meta.com/) family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see https://arxiv.org/pdf/2307.09288.pdf and https://ai.meta.com/blog/meta-llama-3/).
+The Llama-2 and Llama-3.x family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see <https://arxiv.org/pdf/2307.09288.pdf>).
 
 Similarly, [Mistral-7b](https://mistral.ai/news/announcing-mistral-7b/) is an open-source model with pretrained and finetuned (for chat) variants that achieve strong benchmark results.
 
 Architecturally Llama-2, Llama-3 and Mistral-7b are very similar. As such Megatron can support loading checkpoints from all three for inference and finetuning. Converting the checkpoints and loading them is slightly different for each model and is detailed for each below.
+
+# Contents
+
+- [Llama, Mistral and other Llama-like model support in Megatron-LM](#llama-mistral-and-other-llama-like-model-support-in-megatron-lm)
+- [Contents](#contents)
+- [Llama-2](#llama-2)
+  - [Download Huggingface checkpoints](#download-huggingface-checkpoints)
+  - [Convert checkpoint format](#convert-checkpoint-format)
+    - [Huggingface format](#huggingface-format)
+  - [Launch model](#launch-model)
+    - [Launch Megatron](#launch-megatron)
+    - [Launch Huggingface](#launch-huggingface)
+  - [Benchmark results](#benchmark-results)
+    - [Big Bench](#big-bench)
+    - [Multilingual](#multilingual)
+    - [LM Evaluation Harness](#lm-evaluation-harness)
+    - [MMLU](#mmlu)
+- [Llama-3.x](#llama-3x)
+  - [Download Huggingface checkpoints](#download-huggingface-checkpoints)
+  - [Convert checkpoint format](#convert-checkpoint-format)
+    - [Huggingface format](#huggingface-format)
+  - [Launch model](#launch-model)
+- [Mistral-7b](#mistral-7b)
+  - [Download Huggingface checkpoints](#download-huggingface-checkpoints)
+  - [Convert checkpoint format](#convert-checkpoint-format)
+  - [Launch model](#launch-model)
+- [Other Llama-like model support](#other-llama-like-model-support)
+- [Known numerical differences](#known-numerical-differences)
 
 # Llama-2
 
 Llama-2 checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of three steps:
 
 1. Get access to download the checkpoints.
-2. Convert the checkpoints from Meta/Huggingface format to Megatron format.
+2. Convert the checkpoints from Huggingface format to Megatron format.
 3. Setup arguments for launching the model.
 
 The following sections detail these steps. The final section lists benchmark result comparisons between: 1) Llama-2 inference code running the Meta-format checkpoints, and 2) Megatron inference code running the converted checkpoints.
 
-## Contents
-  * [Download Meta or Huggingface checkpoints](#download-meta-or-huggingface-checkpoints)
-  * [Convert checkpoint format](#convert-checkpoint-format)
-    * [Meta format](#meta-format)
-    * [Huggingface format](#huggingface-format)
-  * [Launch model](#launch-model)
-    * [Megatron](#launch-megatron)
-    * [Meta](#launch-meta)
-    * [Huggingface](#launch-hf)
-  * [Benchmark results](#benchmark-results)
+## Download Huggingface checkpoints
 
-## Download Meta or Huggingface checkpoints
-
-Users must first apply for access to download the Llama-2 checkpoints either directly from [Meta](https://ai.meta.com/resources/models-and-libraries/llama-downloads/) or through [Huggingface](https://huggingface.co/docs/transformers/main/model_doc/llama2) (HF). The checkpoints are available in two formats, Meta's native format (available from both the Meta and HF links), and HF's format (available only from HF). Either format can be converted to Megatron, as detailed next.
+Users must first apply for access to download the Llama-2 checkpoints either directly [Huggingface](https://huggingface.co/docs/transformers/main/model_doc/llama2) (HF). The checkpoints are available in HF's format (available only from HF). HF format can be converted to Megatron, as detailed next.
 
 ## Convert checkpoint format
 
 We recommend passing `--dtype bf16` for training or finetuning. Inference can be done in bfloat16 or float16.
 
-### Meta format
-
-The Meta format checkpoints are converted to HF format as an intermediate step before converting to Megatron format. The `transformers` package is required, and must have version >=4.31.0 (e.g., `pip install transformers>=4.31.0`). (**Note**: we have specifically tested with versions `4.31.0` and `4.32.0`; your experience may vary with newer versions.) Assuming the downloaded checkpoints are in `$CHECKPOINT_DIR` (with separate sub-directories for 7B, 13B, 70B, etc.), the following example command can be used to convert from Llama-2 format to HF format in bfloat16:
-
-```
-python tools/checkpoint/convert.py --model-type GPT \
->   --loader llama_mistral \
->   --saver megatron \
->   --checkpoint-type meta \
->   --model-size llama2-7B \
->   --load-dir $LLAMA_META_FORMAT_DIR \
->   --save-dir ${MEGATRON_FORMAT_DIR} \
->   --tokenizer-model ${TOKENIZER_MODEL} \
->   --target-tensor-parallel-size ${TP} \
->   --target-pipeline-parallel-size ${PP} \
->   --bf16
-```
-
-Valid values for `--model-size` are `llama2-7B`, `llama2-13B`, and `llama2-70B` (for pretrained-only models), and `llama2-7Bf`, `llama2-13Bf`, and `llama2-70Bf` (for chat-finetuned models).
-
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-2 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
-
-| Model size | Tensor parallel size (`TP`) |
-| ---------- | --------------------------- |
-|  7B        | 1                           |
-| 13B        | 2                           |
-| 70B        | 8                           |
-
-Using these values for `TP`, along with the path to the Llama-2 tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
+The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
 
 ```
-$>: python tools/checkpoint/convert.py \
- >    --model-type GPT \
- >    --loader llama_mistral \
- >    --saver megatron \
- >    --target-tensor-parallel-size ${TP} \
- >    --checkpoint-type hf
- >    --load-dir ${HF_FORMAT_DIR} \
- >    --save-dir ${MEGATRON_FORMAT_DIR} \
- >    --tokenizer-model ${TOKENIZER_MODEL}
+python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+  --hf-model meta-llama/Llama-2-7B \
+  --megatron-path ./checkpoints/llama2_7b \
+  --torch-dtype bfloat16 \
+  --device-map auto
 ```
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
@@ -109,13 +103,9 @@ If loading for either inference or finetuning, use the following arguments:
 --attention-softmax-in-fp32
 ```
 
-### Launch Meta
-
-Meta checkpoints can be launched with: https://github.com/facebookresearch/llama
-
 ### Launch Huggingface
 
-Huggingface checkpoints can be launched with: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+Huggingface checkpoints can be launched with: <https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py>
 
 ## Benchmark results
 
@@ -185,110 +175,49 @@ Note: the number in brackets is the number of sub-tasks for each supercategory.
 | other (business, health, misc.) [14]  | 0.08% | 0.06% | 0.12% |
 | social sciences [12]  | 0.37% | 0.21% | 0.01% |
 
-# Llama-3
+# Llama-3.x
 
-Llama-3 checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of several steps:
+Llama-3.x checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of several steps:
 
 1. Get access to download the checkpoints (weights and tokenizer).
-2. Clone the llama3 loading code from Meta.
-3. Install the llama package from source.
-4. Convert the checkpoints from Meta/Huggingface format to Megatron format.
-5. Setup arguments for launching the model.
+2. Convert the checkpoints from Huggingface format to Megatron format.
+3. (Optional) Validate converted checkpoints
+4. Setup arguments for launching the model.
 
 The following sections detail these steps.
 
-## Contents
-  * [Download Meta or Huggingface checkpoints](#download-meta-or-huggingface-checkpoints)
-  * [Install tiktoken](#install-tiktoken)
-  * [Install llama package from Meta](#install-llama-package)
-  * [Convert checkpoint format](#convert-checkpoint-format)
-    * [Meta format](#meta-format)
-    * [Huggingface format](#huggingface-format)
-  * [Launch model](#launch-model)
-    * [Megatron](#launch-megatron)
-    * [Meta](#launch-meta)
-    * [Huggingface](#launch-hf)
-  * [Benchmark results](#benchmark-results)
+## Download Huggingface checkpoints
 
-## Download Meta or Huggingface checkpoints
-
-Users must first apply for access to download the Llama-3 checkpoints either directly from [Meta](https://llama.meta.com/llama-downloads) or through [Huggingface](https://huggingface.co/meta-llama) (HF). The checkpoints are available in two formats, Meta's native format (available from both the Meta and HF links), and HF's format (available only from HF). Either format can be converted to Megatron, as detailed next.
-
-## Install tiktoken
-
-The Llama-3 tokenizer relies on the availability of the `tiktoken` module which can be installed through `pip`.
-
-## Install llama package from Meta
-
-1. In a location outside of the megatron-lm source directory, e.g `~`: `git clone https://github.com/meta-llama/llama3.git`
-2. `cd $LLAMA3_SOURCE_DIR`
-4. `pip install -e .`
+Users must first apply for access to download the Llama-3.x checkpoints from [Huggingface](https://huggingface.co/meta-llama).
 
 ## Convert checkpoint format
 
 We recommend passing `--dtype bf16` for training or finetuning. Inference can be done in bfloat16 or float16.
 
-### Meta format
-
-The Meta format checkpoints are converted to HF format as an intermediate step before converting to Megatron format. The `transformers` package is required, and must have version >=4.31.0 (e.g., `pip install transformers>=4.31.0`). (**Note**: we have specifically tested with versions `4.31.0` and `4.32.0`; your experience may vary with newer versions.) Assuming the downloaded checkpoints are in `$CHECKPOINT_DIR` (with separate sub-directories for 8B, 70B, etc.), the following example command can be used to convert from Llama-3 format to HF format in bfloat16:
-
-```
-python tools/checkpoint/convert.py \
->   --model-type GPT \
->   --loader llama_mistral \
->   --saver mcore \
->   --checkpoint-type meta \
->   --model-size llama3-8B \
->   --load-dir $LLAMA_META_FORMAT_DIR \
->   --save-dir ${MEGATRON_FORMAT_DIR} \
->   --tokenizer-model ${TOKENIZER_MODEL} \
->   --target-tensor-parallel-size ${TP} \
->   --target-pipeline-parallel-size ${PP} \
->   --bf16
-```
-
-Valid values for `--model_size` are `llama3-8B` and `llama3-70B` (for pretrained-only models), and `llama3-8Bf` and `llama3-70Bf` (for chat-finetuned models).
-
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-3 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
-
-| Model size | Tensor parallel size (`TP`) |
-| ---------- | --------------------------- |
-|  8B        | 1                           |
-| 70B        | 8                           |
-
-Using these values for `TP`, along with the path to the Llama-3 tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
+The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
 
 ```
-$>: python tools/checkpoint/convert.py \
- >    --model-type GPT \
- >    --loader llama_mistral \
- >    --saver mcore \
- >    --target-tensor-parallel-size ${TP} \
- >    --checkpoint-type hf
- >    --load-dir ${HF_FORMAT_DIR} \
- >    --save-dir ${MEGATRON_FORMAT_DIR} \
- >    --tokenizer-model ${TOKENIZER_MODEL}
- >    --model-size llama3-8B \
+python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+  --hf-model meta-llama/Llama-3.2-1B \
+  --megatron-path ./checkpoints/llama3_2_1b \
+  --torch-dtype bfloat16 \
+  --device-map auto
 ```
-
-Valid values for `--model-size` are `llama3-8B` and `llama3-70B` (for pretrained-only models), and `llama3-8Bf` and `llama3-70Bf` (for chat-finetuned models).
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
 
 ## Launch model
 
-### Launch Megatron
-
-If loading for either inference or finetuning, use the following arguments:
+If loading for either inference or finetuning, use the following arguments for Llama 3.0:
 
 ```
 --tensor-model-parallel-size ${TP} \
 --pipeline-model-parallel-size 1 \
---seq-length 4096 \
---max-position-embeddings 4096 \
---tokenizer-type Llama3Tokenizer \
+--seq-length 8192 \
+--max-position-embeddings 8192 \
+--tokenizer-type HuggingFaceTokenizer \
 --tokenizer-model ${TOKENIZER_MODEL} \
 --load ${CHECKPOINT_DIR} \
 --exit-on-missing-checkpoint \
@@ -299,69 +228,81 @@ If loading for either inference or finetuning, use the following arguments:
 --normalization RMSNorm \
 --position-embedding-type rope \
 --no-masked-softmax-fusion \
---attention-softmax-in-fp32
+--attention-softmax-in-fp32 \
+--disable-bias-linear \
+--transformer-impl transformer_engine \
+--group-query-attention 8 \
+--attention-dropout 0.0 \
+--hidden-dropout 0.0 \
+--rotary-base 500000 \
+--rotary-percent 1.0 \
+--ffn-hidden-size 14336 \
+--num-attention-heads 32 \
+--swiglu \
+--bf16 \
 ```
 
-### Launch Meta
+For Llama3.1 please use the following arguments:
 
-Meta checkpoints can be launched with: https://github.com/meta-llama/llama3
-
-### Launch Huggingface
-
-Huggingface checkpoints can be launched by following the instructions here: https://huggingface.co/blog/llama3
-
-## Benchmark results
-
-Llama-3 support in Megatron is currently experimental and we are still carrying out benchmark evaluations.
+```
+--tensor-model-parallel-size ${TP} \
+--pipeline-model-parallel-size 1 \
+--seq-length 8192 \
+--max-position-embeddings 131072 \
+--tokenizer-type HuggingFaceTokenizer \
+--tokenizer-model ${TOKENIZER_MODEL} \
+--load ${CHECKPOINT_DIR} \
+--exit-on-missing-checkpoint \
+--use-checkpoint-args \
+--no-load-optim \
+--no-load-rng \
+--untie-embeddings-and-output-weights \
+--normalization RMSNorm \
+--position-embedding-type rope \
+--no-masked-softmax-fusion \
+--attention-softmax-in-fp32 \
+--disable-bias-linear \
+--transformer-impl transformer_engine \
+--group-query-attention 8 \
+--attention-dropout 0.0 \
+--hidden-dropout 0.0 \
+--rotary-base 500000 \
+--rotary-percent 1.0 \
+--use-rope-scaling \
+--ffn-hidden-size 14336 \
+--num-attention-heads 32 \
+--swiglu \
+--bf16 \
+```
 
 # Mistral-7b
 
-Megatron currently supports loading the v.03 release of Mistral-7b (which does not use sliding window attention and offers a larger 32768 vocabulary) for inference and finetuning. Loading these checkpoints consists of several steps:
+Megatron currently supports loading the v0.3 release of Mistral-7b (which does not use sliding window attention and offers a larger 32768 vocabulary) for inference and finetuning. Loading these checkpoints consists of several steps:
 
 1. Get access to download the checkpoints (weights and tokenizer).
-2. Install the `mistral-common` package
-3. Convert the checkpoints from HuggingFace format to Megatron format.
+2. Convert the checkpoints from HuggingFace format to Megatron format.
+3. (Optional) Validate converted checkpoints
 4. Setup arguments for launching the model.
 
 The following sections detail these steps.
 
-## Contents
-  * [Download Huggingface checkpoints](#download-huggingface-checkpoints)
-  * [Install mistral-common packgage](#install-mistral-common)
-  * [Convert checkpoint format](#convert-checkpoint-format)
-  * [Launch model](#launch-model)
-  * [Benchmark results](#benchmark-results)
-
 ## Download Huggingface checkpoints
 
-Users must first apply for access to download the Mistral-7b checkpoints through [Huggingface](https://huggingface.co/mistralai/Mistral-7B-v0.3) (HF). Megatron does not currently support the v0.1 or v0.2 checkpoints, ensure you download v0.3. Megatron does not currently support using the raw weights directly from [Mistral](https://docs.mistral.ai/getting-started/open_weight_models/).
-
-## Install the mistral-common package
-
-`pip install mistral-common`
+Users must first apply for access to download the Mistral-7b checkpoints through Huggingface. Two variants are available: the base model ([Mistral-7B-v0.3](https://huggingface.co/mistralai/Mistral-7B-v0.3)) and the instruct model ([Mistral-7B-Instruct-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)).
 
 ## Convert checkpoint format
 
-The HF checkpoints can be converted to Megatron format by using Megatron's own Mistral checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`).
-
-Using the path to the Mistral tokenizer model (downloaded alongside the HF checkpoint), run the following command from the root of your Megatron source code to convert from HF format to mcore format:
+The HF checkpoints can be converted to Megatron format by using Megatron-Bridge's checkpoint converter for HF format [see script](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/conversion/convert_checkpoints.py).
 
 ```
-$>: python tools/checkpoint/convert.py \
- >    --model-type GPT \
- >    --loader llama_mistral \
- >    --saver mcore \
- >    --target-tensor-parallel-size ${TP} \
- >    --checkpoint-type hf \
- >    --load-dir ${HF_FORMAT_DIR} \
- >    --save-dir ${MEGATRON_FORMAT_DIR} \
- >    --tokenizer-model ${TOKENIZER_MODEL} \
- >    --model-size mistral-7B \
+python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
+  --hf-model mistralai/Mistral-7B-Instruct-v0.3 \
+  --megatron-path ./checkpoints/mistral_7b \
+  --torch-dtype bfloat16 \
+  --device-map auto
 ```
 
-Valid values for `--model-size` are mistral-7B for the pretrained model or mistral-7Bf for the chat fine-tuned model.
-
-After this conversion, we are ready to load the checkpoints into an mcore GPT model.
+After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
 
 ## Launch model
 
@@ -372,7 +313,7 @@ If loading for either inference or finetuning, use the following arguments:
 --pipeline-model-parallel-size 1 \
 --seq-length 4096 \
 --max-position-embeddings 4096 \
---tokenizer-type MistralTokenizer \
+--tokenizer-type HuggingFaceTokenizer \
 --tokenizer-model ${TOKENIZER_MODEL} \
 --load ${CHECKPOINT_DIR} \
 --exit-on-missing-checkpoint \
@@ -384,14 +325,26 @@ If loading for either inference or finetuning, use the following arguments:
 --position-embedding-type rope \
 --no-masked-softmax-fusion \
 --attention-softmax-in-fp32
+--apply-layernorm-1p \
+--transformer-impl transformer_engine \
+--group-query-attention 8 \
+--disable-bia-linear \
+--rotary-base 1000000 \
+--rotary-percent 1.0 \
+--swiglu \
+--ffn-hidden-size 14336 \
+--num-attention-heads 32
 ```
-
-## Benchmark results
-
-Mistral-7B support in Megatron is currently experimental and we are still carrying out benchmark evaluations.
 
 # Other Llama-like model support
 
 *Note: Experimental*
 
-Many models such as Yi-34B use the Llama architecture and may be converted from HuggingFace to Megatron using the commands in [Llama3](#llama-3).
+Many models such as Yi-34B and Qwen2.x use the Llama architecture and may be converted from HuggingFace to Megatron using the commands in [Llama-3.x](#llama-3x).
+
+# Known numerical differences
+
+It is not expected that the megatron and Huggingface implementations of llama3.x and mistral models will produce numerically identical results. There are multiple points where small numerical differences are expected. This is a non-exhaustive list:
+
+1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: <https://github.com/NVIDIA/TransformerEngine/issues/1132>
+2. Huggingface `transformers` implements the q, k and v projections in self-attention as separate GEMMs whereas Megatron core combines them into a single GEMM for efficiency. This leads to small numerical differences.

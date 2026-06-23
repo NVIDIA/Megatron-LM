@@ -24,7 +24,6 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     bias = torch.zeros((size_per_partition)).cuda()
 
     gradient_accumulation_fusion = False
-    async_grad_allreduce = allreduce_dgrad
     sequence_parallel = False
     grad_output_buffer = None
     wgrad_deferral_limit = None
@@ -34,11 +33,10 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
         weight,
         bias,
         gradient_accumulation_fusion,
-        async_grad_allreduce,
+        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
-        allreduce_dgrad,
     )
     output = gather_from_tensor_model_parallel_region(
         output_parallel
@@ -50,5 +48,25 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
 
     assert torch.allclose(output, expected_output)
     assert torch.allclose(input_data.grad, expected_grad)
+
+    Utils.destroy_model_parallel()
+
+
+def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
+    Utils.initialize_model_parallel(1, 1)
+
+    input_data = torch.randn(4, 3, 8, device="cuda", requires_grad=True)
+    weight = torch.randn(6, 8, device="cuda")
+    bias = torch.randn(6, device="cuda")
+
+    expected_input = input_data.detach().clone().requires_grad_(True)
+    expected = torch.nn.functional.linear(expected_input, weight, bias)
+    expected.sum().backward()
+
+    actual = linear_with_frozen_weight(input_data, weight, bias, False, False, False, None, None)
+    actual.sum().backward()
+
+    assert torch.allclose(actual, expected)
+    assert torch.allclose(input_data.grad, expected_input.grad)
 
     Utils.destroy_model_parallel()
