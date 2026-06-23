@@ -263,12 +263,14 @@ def test_configs_follow_stock_dtype_args():
         assert config.bf16 is True
 
     fp32_args = _parse_validate(_without_flag(_build_argv(*_PRESET_20L), "--bf16"))
-    fp32_config = nemotron_language_config(
-        fp32_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1
-    )
-    assert fp32_config.params_dtype is torch.float32
-    assert fp32_config.pipeline_dtype is torch.float32
-    assert fp32_config.bf16 is False
+    fp32_configs = [
+        nemotron_language_config(fp32_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1),
+        nemotron_projection_config(fp32_args, tp_size=1),
+    ]
+    for config in fp32_configs:
+        assert config.params_dtype is torch.float32
+        assert config.pipeline_dtype is torch.float32
+        assert config.bf16 is False
 
 
 def test_language_model_spec_builds_mamba():

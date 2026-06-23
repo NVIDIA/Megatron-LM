@@ -11,7 +11,6 @@ from typing import Optional
 from examples.mimo.model_providers.radio_encoder import (
     RADIO_ENCODER_MODULE_NAME,
     _base_config,
-    _dtype,
     _make_dense_non_hybrid,
     add_radio_encoder_args,
     radio_vision_config,
@@ -102,7 +101,6 @@ def nemotron_language_config(
     config.pipeline_model_parallel_size = pp_size
     config.sequence_parallel = tp_size > 1
     config.position_embedding_type = "none"
-    # seq_length / max_position_embeddings flow from stock args (no override).
     return config
 
 
@@ -115,9 +113,8 @@ def require_per_token_loss(config: TransformerConfig) -> None:
 def nemotron_projection_config(args: argparse.Namespace, tp_size: int) -> TransformerConfig:
     """RADIO-to-Nemotron projection config: stock from-args base + overrides."""
     config = deepcopy(_base_config(args))
-    bf16, dtype = _dtype(args)
     config.num_layers = 1
-    config.hidden_size = _llm_hidden_size(args)
+    config.hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * 5120
     config.bias_activation_fusion = False
@@ -126,17 +123,9 @@ def nemotron_projection_config(args: argparse.Namespace, tp_size: int) -> Transf
     config.activation_func = squared_relu
     config.normalization = "RMSNorm"
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
-    config.params_dtype = dtype
-    config.pipeline_dtype = dtype
-    config.bf16 = bf16
     config.tensor_model_parallel_size = tp_size
     config.sequence_parallel = False
     return config
-
-
-def _llm_hidden_size(args: argparse.Namespace) -> int:
-    """Language hidden size the projection maps into (from stock --hidden-size)."""
-    return int(args.hidden_size)
 
 
 def language_model_spec(
