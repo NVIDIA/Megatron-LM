@@ -20,7 +20,7 @@ FSDP path, following the same patterns used for FP8 support.
 - After optimizer step: `quantize_nvfp4_param_shard()` calls TE's
   `quantize_master_weights` to cast FP32 → NVFP4 in-place in the packed buffer.
 
-### 2.2 What already works (FSDP v2 FP8 path)
+### 2.2 What already works (Megatron FSDP v2 FP8 path)
 
 - `MixedPrecisionPolicy` (in `v2/mixed_precision.py`) handles
   FP8 / MXFP8 detection, buffer dtype, raw-data extraction, post-unshard
@@ -259,7 +259,7 @@ No changes needed. Existing functions (`is_nvfp4tensor`, `quantize_nvfp4_param_s
   → TE creates NVFP4Tensor params (packed uint8, shape[-1] // 2)
        │
        ▼
-[FSDP v2 ParameterGroup._init_buffers()]
+[Megatron FSDP v2 ParameterGroup._init_buffers()]
   model_weight_buffer:  DataParallelBuffer(uint8, packed shapes, distributed)
   main_weight_buffer:   DataParallelBuffer(fp32, full shapes, distributed)
   main_grad_buffer:     DataParallelBuffer(fp32, full shapes, distributed)

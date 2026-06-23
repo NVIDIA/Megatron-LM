@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
+import time
 
 import pytest
 import torch
@@ -185,6 +186,7 @@ class TestMegatronFSDPE2E:
             padded_vocab_size=VOCAB_SIZE,
             seq_length=MAX_SEQ_LEN,
             sequence_parallel=TP > 1,
+            expert_model_parallel_size=EP,
             tensor_model_parallel_size=TP,
             pipeline_model_parallel_size=PP,
             num_layers_per_virtual_pipeline_stage=VPP,
@@ -211,7 +213,8 @@ class TestMegatronFSDPE2E:
         param_snapshots = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        for step in range(NUM_TRAINING_STEPS):
+            t0 = time.time()
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
@@ -226,6 +229,18 @@ class TestMegatronFSDPE2E:
 
             # Collect loss
             outputs.append(output[-1])
+            if torch.distributed.get_rank() == 0:
+                elapsed = time.time() - t0
+                mem_alloc = torch.cuda.memory_allocated() / 1024**3
+                mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                print(
+                    f"[Step {step + 1}/{NUM_TRAINING_STEPS}] "
+                    f"loss={output[-1]['lm loss'].item():.6f} "
+                    f"time={elapsed:.2f}s "
+                    f"mem_alloc={mem_alloc:.2f}GiB "
+                    f"mem_reserved_max={mem_reserved:.2f}GiB"
+                )
+                torch.cuda.reset_peak_memory_stats()
             if capture_param_snapshots:
                 param_snapshots.append(
                     TestMegatronFSDPE2E._capture_named_params(model_chunks)
@@ -290,6 +305,21 @@ class TestMegatronFSDPE2E:
                 ),
                 id="optim_grads_params_nvfp4_param_gather",
             ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    moe_grouped_gemm=True,
+                    use_megatron_fsdp_v2=True,
+                    moe_token_dispatcher_type="alltoall",
+                    overlap_moe_expert_parallel_comm=True,
+                    delay_wgrad_compute=True,
+                ),
+                id="ep_overlap-optim_grads_params",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
@@ -313,6 +343,12 @@ class TestMegatronFSDPE2E:
                     pytest.skip("NVFP4 not available: " + reason)
             except ImportError:
                 pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
+
+        if spec_configs.get("overlap_moe_expert_parallel_comm"):
+            from megatron.core.utils import is_te_min_version
+
+            if not is_te_min_version("2.3.0"):
+                pytest.skip("EP overlap requires Transformer Engine >= 2.3.0")
 
         reference_kind = "distopt"
         ref_cache_key = (
