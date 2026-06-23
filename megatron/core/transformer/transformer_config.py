@@ -1498,16 +1498,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
         if self.moe_single_grouped_weight:
-            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
-            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
-            # combinations have a known numerical issue tracked in upstream PR
-            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
-            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
-            # biases aren't quantized, so they don't enter the buggy code path.)
-            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+            # Single grouped weights are supported for high-precision primary weights
+            # (BF16/FP16), MXFP8 primary weights, and NVFP4 primary weights.
+            # Other quantized primary-weight paths need grouped partial-cast support
+            # before they are safe to enable.
+            if (self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8) or (
+                self.fp4 and self.fp4_recipe != Fp4Recipe.nvfp4
+            ):
                 raise ValueError(
-                    "moe_single_grouped_weight is currently supported only with fp8 mode "
-                    "and fp8_recipe='mxfp8'."
+                    "moe_single_grouped_weight is currently supported with high-precision "
+                    "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
