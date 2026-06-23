@@ -1126,7 +1126,6 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    # JIT fusion + warmup; hetero derives TP from language PGC (None -> mpu).
     _jit_tp_size = (
         get_pg_size(schedule_pg_collection.get_language_model_collection().tp)
         if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
@@ -1241,16 +1240,11 @@ def pretrain(
     else:
         checkpointing_context = {}
 
-    # Model/optimizer/LR; hook (when set) owns build + resume-load and sets args.iteration.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    if setup_model_and_optimizer_func is not None:
-        model, optimizer, opt_param_scheduler = setup_model_and_optimizer_func(
-            model_provider, model_type, checkpointing_context=checkpointing_context
-        )
-    else:
-        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, model_type, checkpointing_context=checkpointing_context
-        )
+    setup_func = setup_model_and_optimizer_func or setup_model_and_optimizer
+    model, optimizer, opt_param_scheduler = setup_func(
+        model_provider, model_type, checkpointing_context=checkpointing_context
+    )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -3373,8 +3367,6 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    # Don't clobber a finalizer a caller already installed on the config (e.g. the
-    # hetero MIMO dual encoder+language finalizer); fall back to the default.
     if getattr(config, 'finalize_model_grads_func', None) is None:
         config.finalize_model_grads_func = finalize_model_grads
 
