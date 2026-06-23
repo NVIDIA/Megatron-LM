@@ -44,6 +44,7 @@ def initialize_megatron(
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
     store=None,
+    skip_model_parallel_init=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -93,17 +94,23 @@ def initialize_megatron(
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
-
-        # Random seeds for reproducibility.
-        print_rank_0("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(
-            args.seed,
-            args.data_parallel_random_init,
-            args.te_rng_tracker,
-            args.inference_rng_tracker,
-            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+        _initialize_distributed(
+            get_embedding_ranks,
+            get_position_embedding_ranks,
+            store,
+            skip_model_parallel_init=skip_model_parallel_init,
         )
+
+        # Random seeds (skipped when caller owns seeding -- reads mpu ranks).
+        if not skip_model_parallel_init:
+            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            _set_random_seed(
+                args.seed,
+                args.data_parallel_random_init,
+                args.te_rng_tracker,
+                args.inference_rng_tracker,
+                use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            )
 
         # Setup MoE aux loss scale value.
         if args.num_experts is not None:
@@ -243,7 +250,8 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
+def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
+                            skip_model_parallel_init=False):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -334,7 +342,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
-    if device_count > 0:
+    # (skipped when caller owns model-parallel setup)
+    if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
@@ -412,7 +421,7 @@ def write_args_to_tensorboard():
             writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
 
 
-def set_jit_fusion_options():
+def set_jit_fusion_options(tp_size=None):
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
@@ -433,10 +442,10 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    _warmup_jit_function(tp_size=tp_size)
 
 
-def _warmup_jit_function():
+def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
     args = get_args()
     if args.bf16:
@@ -472,7 +481,8 @@ def _warmup_jit_function():
 
     # Warmup fused bias+dropout+add
     if args.sequence_parallel:
-        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+        # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
+        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
     else:
         seq_length = args.seq_length
     input = torch.rand(

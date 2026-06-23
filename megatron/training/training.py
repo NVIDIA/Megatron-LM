@@ -1042,6 +1042,11 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    setup_model_and_optimizer_func=None,
+    build_data_iterators_func=None,
+    skip_model_parallel_init=False,
 ):
     """Main training program.
 
@@ -1105,6 +1110,7 @@ def pretrain(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
+        skip_model_parallel_init=skip_model_parallel_init,
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1120,8 +1126,13 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    # JIT fusion + warmup; hetero derives TP from language PGC (None -> mpu).
+    _jit_tp_size = (
+        get_pg_size(schedule_pg_collection.get_language_model_collection().tp)
+        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
+        else None
+    )
+    set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1230,11 +1241,16 @@ def pretrain(
     else:
         checkpointing_context = {}
 
-    # Model, optimizer, and learning rate.
+    # Model/optimizer/LR; hook (when set) owns build + resume-load and sets args.iteration.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
-    )
+    if setup_model_and_optimizer_func is not None:
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer_func(
+            model_provider, model_type, checkpointing_context=checkpointing_context
+        )
+    else:
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context
+        )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -1329,7 +1345,12 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
+    # The hook (when given) owns the iterators and sets args.do_train/do_valid/do_test.
+    if build_data_iterators_func is not None:
+        train_data_iterator, valid_data_iterator, test_data_iterator = (
+            build_data_iterators_func()
+        )
+    elif args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1398,6 +1419,8 @@ def pretrain(
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
+                p2p_communicator=p2p_communicator,
+                schedule_pg_collection=schedule_pg_collection,
             )
 
         print_datetime('after training is done')
