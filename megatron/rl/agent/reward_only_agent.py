@@ -135,7 +135,11 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return await self.rollout_from_response(request, response, golden)
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
 
         prompt, golden = await self.get_prompt(validation=request.validation)
 
@@ -143,8 +147,15 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
-        return [await self.rollout_from_response(request, response, golden) for response in responses]
+        async def generate_one():
+            if submission_gate is None:
+                response = await request.inference_interface.agenerate(inference_request)
+            else:
+                async with submission_gate:
+                    response = await request.inference_interface.agenerate(inference_request)
+            return await self.rollout_from_response(request, response, golden)
+
+        return await asyncio.gather(*[generate_one() for _ in range(request.rollouts_per_group)])
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
