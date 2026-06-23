@@ -68,7 +68,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
         default="affine",
         help="Projection module from frozen vision features to language hidden size.",
     )
-    provider.add_argument("--fp32", action="store_true", help="Use float32 instead of bfloat16.")
     return parser
 
 
@@ -78,9 +77,7 @@ def _vocab_size(args: argparse.Namespace) -> int:
         value = getattr(args, attr, None)
         if value:
             return int(value)
-    raise ValueError(
-        "vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size"
-    )
+    raise ValueError("vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size")
 
 
 def nemotron_projection_layer_spec() -> ModuleSpec:
@@ -91,9 +88,7 @@ def nemotron_projection_layer_spec() -> ModuleSpec:
     # TE column-parallel linears reject; use core ColumnParallelLinear for fc1.
     return ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(
-            linear_fc1=ColumnParallelLinear, linear_fc2=TERowParallelLinear
-        ),
+        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=TERowParallelLinear),
     )
 
 
@@ -174,8 +169,7 @@ def language_model_spec(
         expt_tp_size = getattr(args, "llm_expt_tp", None) or 1
     else:
         assert all(
-            getattr(pg_collection, name, None) is not None
-            for name in ("pp", "tp", "ep", "expt_tp")
+            getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "ep", "expt_tp")
         ), "language pg_collection is missing a required pp/tp/ep/expt_tp group"
         pp_rank = get_pg_rank(pg_collection.pp)
         pp_size = get_pg_size(pg_collection.pp)
@@ -217,9 +211,9 @@ def vision_submodules_spec(
         tp_size = get_grid_dim_size(encoder_grid, "tp")
         pp_size = get_grid_dim_size(encoder_grid, "pp")
     else:
-        assert pp_pg is not None and tp_pg is not None, (
-            "encoder pg_collection is missing the required pp/tp group"
-        )
+        assert (
+            pp_pg is not None and tp_pg is not None
+        ), "encoder pg_collection is missing the required pp/tp group"
         tp_size = get_pg_size(tp_pg)
         pp_size = get_pg_size(pp_pg)
 

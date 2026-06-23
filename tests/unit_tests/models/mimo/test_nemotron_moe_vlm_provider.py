@@ -100,51 +100,85 @@ pytest.importorskip("torch")
 def _build_argv(num_layers, hybrid_pattern):
     """Full stock + provider CLI for the Nemotron preset (mirrors the run script)."""
     return [
-        "--model-provider", NEMOTRON_MODEL_PROVIDER,
+        "--model-provider",
+        NEMOTRON_MODEL_PROVIDER,
         "--pixel-shuffle",
         "--disable-vision-class-token",
-        "--num-layers", str(num_layers),
-        "--hybrid-layer-pattern", hybrid_pattern,
-        "--hidden-size", "2688",
-        "--num-attention-heads", "32",
-        "--group-query-attention", "--num-query-groups", "8",
-        "--ffn-hidden-size", "1856",
-        "--kv-channels", "128",
+        "--num-layers",
+        str(num_layers),
+        "--hybrid-layer-pattern",
+        hybrid_pattern,
+        "--hidden-size",
+        "2688",
+        "--num-attention-heads",
+        "32",
+        "--group-query-attention",
+        "--num-query-groups",
+        "8",
+        "--ffn-hidden-size",
+        "1856",
+        "--kv-channels",
+        "128",
         "--squared-relu",
         "--disable-bias-linear",
-        "--normalization", "RMSNorm",
-        "--init-method-std", "0.0173",
-        "--num-experts", "128",
-        "--moe-router-topk", "6",
+        "--normalization",
+        "RMSNorm",
+        "--init-method-std",
+        "0.0173",
+        "--num-experts",
+        "128",
+        "--moe-router-topk",
+        "6",
         "--moe-grouped-gemm",
-        "--moe-ffn-hidden-size", "1856",
-        "--moe-router-score-function", "sigmoid",
-        "--moe-router-topk-scaling-factor", "2.5",
+        "--moe-ffn-hidden-size",
+        "1856",
+        "--moe-router-score-function",
+        "sigmoid",
+        "--moe-router-topk-scaling-factor",
+        "2.5",
         "--moe-router-enable-expert-bias",
-        "--moe-router-dtype", "fp32",
-        "--moe-router-load-balancing-type", "seq_aux_loss",
+        "--moe-router-dtype",
+        "fp32",
+        "--moe-router-load-balancing-type",
+        "seq_aux_loss",
         "--moe-router-fusion",
-        "--moe-aux-loss-coeff", "1e-4",
-        "--moe-shared-expert-intermediate-size", "3712",
+        "--moe-aux-loss-coeff",
+        "1e-4",
+        "--moe-shared-expert-intermediate-size",
+        "3712",
         "--moe-shared-expert-overlap",
-        "--moe-token-dispatcher-type", "alltoall",
-        "--moe-flex-dispatcher-backend", "deepep",
+        "--moe-token-dispatcher-type",
+        "alltoall",
+        "--moe-flex-dispatcher-backend",
+        "deepep",
         "--moe-permute-fusion",
         "--use-fused-weighted-squared-relu",
-        "--mamba-num-heads", "64",
-        "--mamba-head-dim", "64",
-        "--mamba-num-groups", "8",
-        "--mamba-state-dim", "128",
-        "--linear-conv-kernel-dim", "4",
-        "--position-embedding-type", "none",
-        "--attention-backend", "flash",
+        "--mamba-num-heads",
+        "64",
+        "--mamba-head-dim",
+        "64",
+        "--mamba-num-groups",
+        "8",
+        "--mamba-state-dim",
+        "128",
+        "--linear-conv-kernel-dim",
+        "4",
+        "--position-embedding-type",
+        "none",
+        "--attention-backend",
+        "flash",
         "--calculate-per-token-loss",
         "--cross-entropy-loss-fusion",
-        "--seq-length", "8192",
-        "--max-position-embeddings", "8192",
-        "--micro-batch-size", "1",
-        "--vocab-size", "131072",
-        "--tokenizer-type", "NullTokenizer",
+        "--seq-length",
+        "8192",
+        "--max-position-embeddings",
+        "8192",
+        "--micro-batch-size",
+        "1",
+        "--vocab-size",
+        "131072",
+        "--tokenizer-type",
+        "NullTokenizer",
         "--bf16",
     ]
 
@@ -167,6 +201,10 @@ def _parse_validate(argv):
         sys.argv = saved
     validate_args(args)
     return args
+
+
+def _without_flag(argv, flag):
+    return [arg for arg in argv if arg != flag]
 
 
 @pytest.mark.parametrize("num_layers,hybrid_pattern", [_PRESET_20L, _PRESET_54L])
@@ -201,6 +239,38 @@ def test_language_config_parity(num_layers, hybrid_pattern):
     assert config.tensor_model_parallel_size == 1
 
 
+def test_configs_follow_stock_dtype_args():
+    """The provider does not add precision flags; tower configs inherit stock dtype args."""
+    import torch
+
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        nemotron_language_config,
+        nemotron_projection_config,
+        vision_submodules_spec,
+    )
+
+    bf16_args = _parse_validate(_build_argv(*_PRESET_20L))
+    bf16_configs = [
+        nemotron_language_config(bf16_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1),
+        nemotron_projection_config(bf16_args, tp_size=1),
+        vision_submodules_spec(bf16_args, pg_collection=None, encoder_grid=None)
+        .submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
+        .params["transformer_config"],
+    ]
+    for config in bf16_configs:
+        assert config.params_dtype is torch.bfloat16
+        assert config.pipeline_dtype is torch.bfloat16
+        assert config.bf16 is True
+
+    fp32_args = _parse_validate(_without_flag(_build_argv(*_PRESET_20L), "--bf16"))
+    fp32_config = nemotron_language_config(
+        fp32_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1
+    )
+    assert fp32_config.params_dtype is torch.float32
+    assert fp32_config.pipeline_dtype is torch.float32
+    assert fp32_config.bf16 is False
+
+
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
@@ -229,6 +299,7 @@ def test_vision_submodules_spec_wires_radio_encoder():
 
     projection = spec.submodules["input_projections"][0]
     assert projection.params["projector_type"] == "affine"
+
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
 # TE + a distributed init and is left to the cog functional check.
