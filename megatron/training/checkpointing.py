@@ -55,7 +55,7 @@ from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
-from . import ft_integration, wandb_utils
+from . import ft_integration, persistent_cache, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -1267,6 +1267,15 @@ def save_checkpoint(
             _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
+
+    # Persistent cache: kick a throttled writeback of newly compiled artifacts after a
+    # successful save (no-op unless a persistent cache write dir is configured).
+    _pc_ctrl = persistent_cache.get()
+    if _pc_ctrl is not None:
+        try:
+            _pc_ctrl.maybe_kick_writeback(iteration)
+        except Exception as _pc_e:
+            logger.warning("persistent_cache writeback kick failed: %s", _pc_e)
 
 
 def save_tokenizer_assets(
