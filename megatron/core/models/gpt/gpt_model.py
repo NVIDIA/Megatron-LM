@@ -28,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -44,7 +45,7 @@ from megatron.core.utils import (
 )
 
 
-class GPTModel(LanguageModule):
+class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
 
     Args:
@@ -496,6 +497,42 @@ class GPTModel(LanguageModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
         )
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            InferenceMode.is_active()
+            and hasattr(self, 'cudagraph_manager')
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
+    def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(config)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -768,6 +805,10 @@ class GPTModel(LanguageModule):
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
         if labels is None:
+            if in_inference_mode and inference_context.is_dynamic_batching():
+                # Optimization: a contiguous [1, s, h] can be re-viewed as a contiguous
+                # [s, 1, h] via squeeze/unsqueeze. Dynamic batching always has B=1.
+                return logits.squeeze(1).unsqueeze(0).float()
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
