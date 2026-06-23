@@ -1151,71 +1151,42 @@ class Attention(MegatronModule, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if HAVE_FA4:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
-                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
-                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
-                    output_total, softmax_lse = flash_attn4_varlen_func(
-                        q_varlen,
-                        k,
-                        v,
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=tokens_per_request,
-                        max_seqlen_k=max_seqlen_k,
-                        seqused_k=seqlens_k,
-                        page_table=block_table,
-                        softmax_scale=softmax_scale,
-                        causal=True,
-                        window_size=window_size,
-                        num_splits=1,
-                    )
-                    if need_lse:
-                        # output_total: (B*S, H, D); softmax_lse: (H, B*S)
-                        output_total = self._apply_sink_softmax_correction_varlen(
-                            output_total, softmax_lse, softmax_offset
-                        )
-                    # Reshape back to (B, S, H, D)
-                    output_total = output_total.reshape(
-                        num_requests, tokens_per_request, *output_total.shape[1:]
+                # FA4 is intentionally not used for decode (regresses long decodes);
+                # prefill still uses FA4 above. Decode falls through to FA3/FA2 kvcache.
+                if getattr(self, "softmax_scale", None) is not None:
+                    softmax_scale = self.softmax_scale
+                else:
+                    softmax_scale = q.shape[-1] ** -0.5
+                flash_attn_args = {
+                    "q": q,
+                    "k_cache": k,
+                    "v_cache": v,
+                    "cache_seqlens": seqlens_k,
+                    "softmax_scale": softmax_scale,
+                    "causal": True,
+                    "window_size": window_size,
+                    "page_table" if HAVE_FA3 else "block_table": block_table,
+                    "num_splits": 0 if not self.batch_invariant_mode else 1,
+                }
+                if need_lse:
+                    flash_attn_args["return_softmax_lse"] = True
+                if HAVE_FA3:
+                    kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
+                else:
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
+                    kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
+                if need_lse:
+                    # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
+                    # return_softmax_lse=True.
+                    output_total, softmax_lse = kvcache_ret
+                    # output_total: (B, S, H, D); softmax_lse: (B, H, S)
+                    output_total = self._apply_sink_softmax_correction_bshd(
+                        output_total, softmax_lse, softmax_offset
                     )
                 else:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
-                    flash_attn_args = {
-                        "q": q,
-                        "k_cache": k,
-                        "v_cache": v,
-                        "cache_seqlens": seqlens_k,
-                        "softmax_scale": softmax_scale,
-                        "causal": True,
-                        "window_size": window_size,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
-                        "num_splits": 0 if not self.batch_invariant_mode else 1,
-                    }
-                    if need_lse:
-                        flash_attn_args["return_softmax_lse"] = True
-                    if HAVE_FA3:
-                        kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
-                    else:
-                        assert (
-                            not self.batch_invariant_mode
-                        ), "Batch invariant mode is not supported for flash attention 2"
-                        kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
-                    if need_lse:
-                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
-                        # return_softmax_lse=True.
-                        output_total, softmax_lse = kvcache_ret
-                        # output_total: (B, S, H, D); softmax_lse: (B, H, S)
-                        output_total = self._apply_sink_softmax_correction_bshd(
-                            output_total, softmax_lse, softmax_offset
-                        )
-                    else:
-                        output_total = kvcache_ret
+                    output_total = kvcache_ret
 
             # Reshape back to (B*S, 1, H, D) for consistent output shape.
             output_total = output_total.reshape(
