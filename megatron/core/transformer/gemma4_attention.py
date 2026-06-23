@@ -8,7 +8,7 @@ from torch import Tensor
 
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 
@@ -63,9 +63,11 @@ class Gemma4SelfAttention(SelfAttention):
 
         # Scaleless per-head V RMSNorm (no weight) over head_dim. Built only on
         # producer/own layers; borrowers reuse a producer's already-normed V.
+        # The v_layernorm submodule is a norm BUILDER (a plain function, like
+        # q/k_layernorm), so it is called directly rather than via build_module
+        # (build_module returns a FunctionType unchanged instead of invoking it).
         self.v_layernorm = (
-            build_module(
-                submodules.v_layernorm,
+            submodules.v_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
