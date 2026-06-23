@@ -29,6 +29,15 @@ try:
 except ImportError:
     HAVE_TE = False
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import (
+    _mg_tensor_info,
+    _mg_grad_info,
+    is_log_enabled as _is_log_enabled,
+    mg_dump_grad_hook as _mg_dump_grad_hook,
+)
+# === save_tensor 插桩结束 ===
+
 
 @dataclass
 class MoESubmodules:
@@ -170,10 +179,44 @@ class MoELayer(BaseMoELayer):
         hidden states and probabilities for the token dispatcher. The original
         hidden states are returned as a residual connection.
         """
-        residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+        # === [反向对齐 align-grad] 探针: 把 hidden_states 拆三路独立 grad 节点 ===
+        # 与 PF moe_layer.py 中相同, clone 三份:
+        #   - residual (shared_expert 路)
+        #   - hidden_states (dispatcher 路, 在 dispatch_preprocess 后输出)
+        #   - hidden_states_for_router (router 路)
+        # 反向时三个 clone.grad 之和 = 原 hidden_states.grad.
+        if _is_log_enabled() and hidden_states.requires_grad:
+            _DUMP_TAG_TP_MG = f"moe_three_paths_LMG{self.layer_number}"
+
+            _hs_router_path_mg = hidden_states.clone()
+            _hs_dispatcher_path_mg = hidden_states.clone()
+            _hs_shared_path_mg = hidden_states.clone()
+
+            _hs_router_path_mg.register_hook(_mg_grad_info(
+                "cp11b_three_paths_router_grad",
+                layer_num=self.layer_number, prefix="GRAD MG MoE"))
+            _hs_dispatcher_path_mg.register_hook(_mg_grad_info(
+                "cp11b_three_paths_dispatcher_grad",
+                layer_num=self.layer_number, prefix="GRAD MG MoE"))
+            _hs_shared_path_mg.register_hook(_mg_grad_info(
+                "cp11b_three_paths_shared_grad",
+                layer_num=self.layer_number, prefix="GRAD MG MoE"))
+            # 跨框架 npy dump (与 PF 共享文件命名), 由 align_dump_utils 统一管理
+            _hs_router_path_mg.register_hook(_mg_dump_grad_hook(_DUMP_TAG_TP_MG, "router"))
+            _hs_dispatcher_path_mg.register_hook(_mg_dump_grad_hook(_DUMP_TAG_TP_MG, "dispatcher"))
+            _hs_shared_path_mg.register_hook(_mg_dump_grad_hook(_DUMP_TAG_TP_MG, "shared"))
+
+            residual = _hs_shared_path_mg
+            hidden_states_router = _hs_router_path_mg
+            hidden_states_dispatch = _hs_dispatcher_path_mg
+        else:
+            residual = hidden_states
+            hidden_states_router = hidden_states
+            hidden_states_dispatch = hidden_states
+        # === [反向对齐 align-grad] 探针结束 ===
+        probs, routing_map = self.router(hidden_states_router)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
+            hidden_states_dispatch, routing_map, probs
         )
         return hidden_states, probs, residual
 
@@ -200,11 +243,26 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             shared_expert_output = self.shared_experts(residual)
+            _mg_tensor_info("shared_expert_output", shared_expert_output, self.layer_number)
+            if shared_expert_output.requires_grad:
+                shared_expert_output.register_hook(_mg_grad_info("shared_expert_output", layer_num=self.layer_number, prefix="GRAD MG MoE"))
+            # === GRAD DEBUG: shared expert 内部梯度 ===
+            if residual.requires_grad:
+                residual.register_hook(_mg_grad_info("shared_expert_input_grad", layer_num=self.layer_number, prefix="GRAD MG MoE"))
+            # === GRAD DEBUG END ===
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        _mg_tensor_info("permuted_input", dispatched_input, self.layer_number)
+        _mg_tensor_info("tokens_per_expert", tokens_per_expert, self.layer_number)
+        if dispatched_input.requires_grad:
+            dispatched_input.register_hook(_mg_grad_info("permuted_input", layer_num=self.layer_number, prefix="GRAD MG MoE"))
+
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        _mg_tensor_info("expert_raw_output", expert_output, self.layer_number)
+        if expert_output.requires_grad:
+            expert_output.register_hook(_mg_grad_info("expert_raw_output", layer_num=self.layer_number, prefix="GRAD MG MoE"))
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, shared_expert_output, mlp_bias
@@ -218,8 +276,15 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+        _mg_tensor_info("routed_output", output, self.layer_number)
+        if output.requires_grad:
+            output.register_hook(_mg_grad_info("routed_output", layer_num=self.layer_number, prefix="GRAD MG MoE"))
+
         if shared_expert_output is not None:
             output = output + shared_expert_output
+        _mg_tensor_info("final_moe_output", output, self.layer_number)
+        if output.requires_grad:
+            output.register_hook(_mg_grad_info("final_moe_output", layer_num=self.layer_number, prefix="GRAD MG MoE"))
         return output
 
     def forward(self, hidden_states: torch.Tensor):
@@ -242,6 +307,16 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+
+        _mg_tensor_info("input", hidden_states, self.layer_number)
+
+        # === [反向对齐 align-grad] 探针: 在 forward 入口注册聚合 grad hook 并 dump,
+        # 用于和 PF cp11b_grad_aggregated 比对 ===
+        if _is_log_enabled() and hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info(
+                "cp11b_grad_aggregated",
+                layer_num=self.layer_number, prefix="GRAD MG MoE"))
+        # === [反向对齐 align-grad] 探针结束 ===
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):

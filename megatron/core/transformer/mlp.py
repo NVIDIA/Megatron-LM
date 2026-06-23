@@ -8,6 +8,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, save_tensor, save_tensor_grad, is_log_enabled as _is_log_enabled
+_MLP_CALL_COUNT = [0]
+_MLP_DEBUG_EXPERT = [False]  # 由外部 SequentialMLP 设置，True 时打印中间结果
+# === save_tensor 插桩结束 ===
+
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -122,10 +128,23 @@ class MLP(MegatronModule):
 
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
+        _cur_layer = _MLP_CALL_COUNT[0]
+        _MLP_CALL_COUNT[0] += 1
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+
+        # === 插桩: CP12a mlp_fc1_out (只保存第一层 dense MLP) ===
+        if _cur_layer == 0:
+            _mg_tensor_info("cp12a_mlp_fc1_out", intermediate_parallel, layer_num=0, prefix="MG MLP")
+        # === 插桩结束 ===
+        # === DEBUG: expert0 内部中间值 ===
+        if _MLP_DEBUG_EXPERT[0]:
+            _mg_tensor_info("DEBUG_expert0_fc1_out", intermediate_parallel, None, prefix="DEBUG MG MLP")
+            if intermediate_parallel.requires_grad:
+                intermediate_parallel.register_hook(_mg_grad_info("expert0_fc1_out", layer_num=None, prefix="GRAD MG MoE"))
+        # === DEBUG END ===
 
         nvtx_range_push(suffix="activation")
         if self.config.bias_activation_fusion:
@@ -138,6 +157,10 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
+                    # === GRAD DEBUG: expert0 act_out (fused swiglu+probs) ===
+                    if _MLP_DEBUG_EXPERT[0] and intermediate_parallel.requires_grad:
+                        intermediate_parallel.register_hook(_mg_grad_info("expert0_act_out(after_weighted_swiglu)", layer_num=None, prefix="GRAD MG MoE"))
+                    # === GRAD DEBUG END ===
                 else:
                     raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
             else:
@@ -170,19 +193,51 @@ class MLP(MegatronModule):
                     return self.config.activation_func(x[0]) * x[1]
 
                 intermediate_parallel = glu(intermediate_parallel)
+                if _MLP_DEBUG_EXPERT[0] and not hasattr(MLP, '_path_logged'):
+                    MLP._path_logged = True
+                    print(f"[DEBUG MG MLP] BACKWARD PATH: unfused glu (autograd), NOT SwiGLUFunction")
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+            # === DEBUG: expert0 纯 swiglu 输出（probs 乘之前）===
+            if _MLP_DEBUG_EXPERT[0]:
+                _mg_tensor_info("DEBUG_expert0_act_out", intermediate_parallel, None, prefix="DEBUG MG MLP")
+            # === DEBUG END ===
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+                # === GRAD DEBUG: expert0 act_out (unfused: after probs * cast) ===
+                if _MLP_DEBUG_EXPERT[0] and intermediate_parallel.requires_grad:
+                    intermediate_parallel.register_hook(_mg_grad_info("expert0_act_out(after_probs_cast)", layer_num=None, prefix="GRAD MG MoE"))
+                # === GRAD DEBUG END ===
         nvtx_range_pop(suffix="activation")
+
+        # === 插桩: CP12b mlp_swiglu_out ===
+        if _cur_layer == 0:
+            _mg_tensor_info("cp12b_mlp_swiglu_out", intermediate_parallel, layer_num=0, prefix="MG MLP")
+        # === 插桩结束 ===
+        # === DEBUG: expert0 swiglu 后（含 per_token_scale）===
+        if _MLP_DEBUG_EXPERT[0]:
+            _mg_tensor_info("DEBUG_expert0_swiglu_out", intermediate_parallel, None, prefix="DEBUG MG MLP")
+        # === DEBUG END ===
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
+
+        # === 插桩: CP12c mlp_fc2_out ===
+        if _cur_layer == 0:
+            _mg_tensor_info("cp12c_mlp_fc2_out", output, layer_num=0, prefix="MG MLP")
+        # === 插桩结束 ===
+        # === DEBUG: expert0 fc2 输出 ===
+        if _MLP_DEBUG_EXPERT[0]:
+            _mg_tensor_info("DEBUG_expert0_fc2_out", output, None, prefix="DEBUG MG MLP")
+            if output.requires_grad:
+                output.register_hook(_mg_grad_info("expert0_fc2_out(inside_mlp)", layer_num=None, prefix="GRAD MG MoE"))
+            _MLP_DEBUG_EXPERT[0] = False
+        # === DEBUG END ===
 
         if per_token_scale is not None:
             assert output_bias is None, "Bias is not supported with per_token_scale"

@@ -7,6 +7,10 @@ from typing import List, Optional, Union
 import torch
 from torch import Tensor
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, save_tensor, save_tensor_grad
+# === save_tensor 插桩结束 ===
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -608,6 +612,12 @@ class TransformerBlock(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+
+        # === 插桩: CP14 final_layernorm ===
+        _mg_tensor_info("cp14_final_layernorm", hidden_states, prefix="MG TransformerBlock")
+        if hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info("cp14_final_layernorm", prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         # If this TransformerBlock is empty, input and output hidden states will be the same node
         # on the computational graph and will lead to unexpected errors in pipeline schedules.

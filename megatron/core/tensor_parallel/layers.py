@@ -273,11 +273,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        if self.deterministic_mode:
+        # === GLM_ALIGN_BIT_EXACT: 强制走 weight[masked_input] 与 PF VocabParallelEmbedding (deterministic_mode=True) 对齐 ===
+        from megatron.core.align_dump_utils import is_bit_exact as _is_bit_exact_emb, is_log_enabled as _is_log_enabled_emb
+        if _is_bit_exact_emb():
             output_parallel = self.weight[masked_input]
         else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            if self.deterministic_mode:
+                output_parallel = self.weight[masked_input]
+            else:
+                # F.embedding currently has a non-deterministic backward function
+                output_parallel = F.embedding(masked_input, self.weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0

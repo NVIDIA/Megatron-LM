@@ -21,6 +21,16 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+# === Router 调试工具 ===
+# 集中迁移到 megatron.core.align_dump_utils
+from megatron.core.align_dump_utils import (
+    _mg_grad_info,
+    is_log_enabled as _is_log_enabled,
+    _mg_router_info,
+    set_mg_topk_layer_number,
+)
+# === Router 调试工具结束 ===
+
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -199,12 +209,25 @@ class TopKRouter(Router):
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif self.score_function == "sigmoid":
             scores = torch.sigmoid(logits)
+            if scores.requires_grad:
+                scores.register_hook(
+                    _mg_grad_info("cp11c_aux_scores_pre_norm_grad",
+                                  layer_num=self.layer_number, prefix="GRAD MG Router")
+                )
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+            if scores.requires_grad:
+                scores.register_hook(
+                    _mg_grad_info("cp11c_aux_scores_normed_grad",
+                                  layer_num=self.layer_number, prefix="GRAD MG Router")
+                )
+            _mg_router_info("cp11c_aux_scores_normed", scores, self.layer_number, prefix="MG Router")
         else:
             raise ValueError(f"Invalid score_function: {self.score_function}")
 
         _, top_indices = torch.topk(scores, k=self.topk, dim=1)
         topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+        _mg_router_info("cp11c_aux_top_indices", top_indices.float(), self.layer_number, prefix="MG Router")
+        _mg_router_info("cp11c_aux_routing_map", topk_map.float(), self.layer_number, prefix="MG Router")
 
         return scores, topk_map
 
@@ -402,11 +425,17 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        _ln = self.layer_number
+        _P = "MG Router"
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
+
+        # _mg_router_info("logits(after_zloss)", logits, _ln, prefix=_P)  # PF 无对应
+        # 设置全局 layer_number 供 _mg_topk_info 使用 (集中放在 align_dump_utils)
+        set_mg_topk_layer_number(_ln)
 
         if self.routing_type == "sinkhorn":
             scores, routing_map = self.sinkhorn_load_balancing(logits)
@@ -434,8 +463,10 @@ class TopKRouter(Router):
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+            from megatron.core.align_dump_utils import is_bit_exact as _is_bit_exact
+            if not _is_bit_exact():
+                with torch.no_grad():
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
         return scores, routing_map
 
@@ -446,16 +477,39 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
         """
+        _ln = self.layer_number
+        _P = "MG Router"
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
+
+        _mg_router_info("input", input, _ln, prefix=_P)
+        _mg_router_info("gate_weight", self.weight, _ln, prefix=_P)
+
         logits = self.gating(input)
+
+        # === 插桩: router 内部 logits 反向 hook（gate linear 输出） ===
+        if logits.requires_grad:
+            logits.register_hook(
+                _mg_grad_info("cp11c_router_logits_grad(after_gating)",
+                              layer_num=_ln, prefix="GRAD MG Router")
+            )
+        # === 插桩结束 ===
+        _mg_router_info("raw_logits(after_linear)", logits, _ln, prefix=_P)
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
         scores, routing_map = self.routing(logits)
+
+        # === 插桩: router 内部 scores 反向 hook（topk + score_func 输出） ===
+        if scores.requires_grad:
+            scores.register_hook(
+                _mg_grad_info("cp11c_router_scores_grad(final)",
+                              layer_num=_ln, prefix="GRAD MG Router")
+            )
+        # === 插桩结束 ===
 
         return scores, routing_map

@@ -18,6 +18,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.align_dump_utils import is_bit_exact as _is_bit_exact
 
 
 class LanguageModule(MegatronModule):
@@ -95,7 +96,17 @@ class LanguageModule(MegatronModule):
                     logits, labels, parallel_state.get_tensor_model_parallel_group()
                 )
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            if _is_bit_exact():
+                # === 使用 nn.CrossEntropyLoss 对齐 PF (paddle.nn.CrossEntropyLoss) ===
+                # logits: [s, b, vocab], labels: [s, b]
+                s, b = labels.shape
+                loss = torch.nn.functional.cross_entropy(
+                    logits.float().reshape(s * b, -1),  # [s*b, vocab]
+                    labels.reshape(s * b),              # [s*b]
+                    reduction='none',
+                ).reshape(s, b)  # [s, b]
+            else:
+                loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()

@@ -10,6 +10,10 @@ import torch
 import torch.distributed
 from torch import Tensor
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, save_tensor, save_tensor_grad
+# === save_tensor 插桩结束 ===
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -487,6 +491,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        # === 插桩: CP3 layer_input ===
+        _mg_tensor_info("cp3_layer_input", hidden_states, layer_num=self.layer_number, prefix="MG TransformerLayer")
+        if hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info("cp3_layer_input", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -495,6 +505,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
+
+        # === 插桩: CP4 input_layernorm ===
+        _mg_tensor_info("cp4_input_layernorm", input_layernorm_output, layer_num=self.layer_number, prefix="MG TransformerLayer")
+        if input_layernorm_output.requires_grad:
+            input_layernorm_output.register_hook(_mg_grad_info("cp4_input_layernorm", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -527,11 +543,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attn_bda")
 
+        # === 插桩: CP10 attn_residual ===
+        _mg_tensor_info("cp10_attn_residual", hidden_states, layer_num=self.layer_number, prefix="MG TransformerLayer")
+        if hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info("cp10_attn_residual", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         # Residual connection.
         residual = hidden_states
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+
+        # === 插桩: CP11 post_attn_layernorm ===
+        _mg_tensor_info("cp11_post_attn_layernorm", pre_cross_attn_layernorm_output, layer_num=self.layer_number, prefix="MG TransformerLayer")
+        if pre_cross_attn_layernorm_output.requires_grad:
+            pre_cross_attn_layernorm_output.register_hook(_mg_grad_info("cp11_post_attn_layernorm", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
@@ -576,6 +604,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
+        # === GRAD DEBUG: pre_mlp_layernorm 输出 ===
+        if pre_mlp_layernorm_output.requires_grad:
+            pre_mlp_layernorm_output.register_hook(_mg_grad_info("cp11b_pre_mlp_layernorm_out", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === GRAD DEBUG END ===
+
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
@@ -618,6 +651,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
+        # === GRAD DEBUG: mlp output (before bda/residual) ===
+        if mlp_output_with_bias[0].requires_grad:
+            mlp_output_with_bias[0].register_hook(_mg_grad_info("cp12d_mlp_output(before_bda)", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === GRAD DEBUG END ===
+
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -634,6 +672,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
+
+        # === 插桩: CP13 mlp_residual ===
+        _mg_tensor_info("cp13_mlp_residual", hidden_states, layer_num=self.layer_number, prefix="MG TransformerLayer")
+        if hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info("cp13_mlp_residual", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

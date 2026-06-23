@@ -508,6 +508,21 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         timers = self.config.timers
+
+        # [GLM 对齐] optimizer.step() 前 dump
+        # 兼容两套属性命名:
+        #   Float16OptimizerWithFloat16Params: float16_groups / fp32_from_float16_groups
+        #   DistributedOptimizer:              shard_float16_groups / shard_fp32_from_float16_groups
+        _model_groups = getattr(self, "shard_float16_groups", None) or getattr(self, "float16_groups", None)
+        _main_groups = getattr(self, "shard_fp32_from_float16_groups", None) or getattr(self, "fp32_from_float16_groups", None)
+        _probe_ready = (not self.is_stub_optimizer) and (_model_groups is not None) and (_main_groups is not None)
+        if _probe_ready:
+            from megatron.core.align_dump_utils import mg_dump_optim_probe_print
+            mg_dump_optim_probe_print(
+                "pre", _model_groups, _main_groups, self.optimizer.state,
+                param_groups=self.optimizer.param_groups
+            )
+
         # Step the optimizer.
         if timers is not None:
             timers('optimizer-inner-step', log_level=1).start(
@@ -517,6 +532,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self.optimizer.step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
+
+        # [GLM 对齐] optimizer.step() 后, cast 前 dump
+        if _probe_ready:
+            from megatron.core.align_dump_utils import mg_dump_optim_probe_print
+            mg_dump_optim_probe_print(
+                "mid", _model_groups, _main_groups, self.optimizer.state,
+                param_groups=self.optimizer.param_groups
+            )
 
         # Update params from main params.
         if timers is not None:
@@ -531,6 +554,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
+
+        # [GLM 对齐] cast 后 dump (= 下一步 forward 用到的 model_param)
+        if _probe_ready:
+            from megatron.core.align_dump_utils import mg_dump_optim_probe_print
+            mg_dump_optim_probe_print(
+                "post", _model_groups, _main_groups, self.optimizer.state,
+                param_groups=self.optimizer.param_groups
+            )
 
         return True
 

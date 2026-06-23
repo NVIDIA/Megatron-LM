@@ -29,6 +29,10 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, save_tensor, save_tensor_grad
+# === save_tensor 插桩结束 ===
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -264,6 +268,11 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            # === 插桩: CP1 embedding_output ===
+            _mg_tensor_info("cp1_embedding_output", decoder_input, prefix="MG Embedding")
+            if decoder_input.requires_grad:
+                decoder_input.register_hook(_mg_grad_info("cp1_embedding_output", prefix="GRAD MG"))
+            # === 插桩结束 ===
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -355,6 +364,10 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+
+        # === 插桩: CP0 input_ids ===
+        _mg_tensor_info("cp0_input_ids", input_ids, prefix="MG Embedding")
+        # === 插桩结束 ===
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -474,6 +487,12 @@ class GPTModel(LanguageModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
+        # === 插桩: CP15 logits ===
+        _mg_tensor_info("cp15_logits", logits, prefix="MG LMHead")
+        if logits.requires_grad:
+            logits.register_hook(_mg_grad_info("cp15_logits", prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
                 {
@@ -491,6 +510,12 @@ class GPTModel(LanguageModule):
             return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
+
+        # === 插桩: CP16 loss ===
+        _mg_tensor_info("cp16_loss", loss, prefix="MG LanguageLoss")
+        if loss.requires_grad:
+            loss.register_hook(_mg_grad_info("cp16_loss", prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         return loss
 

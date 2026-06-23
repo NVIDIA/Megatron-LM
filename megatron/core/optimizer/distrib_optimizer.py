@@ -485,7 +485,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
+        # [对齐修复] GLM_ALIGN_BIT_EXACT=1 时, optimizer/__init__.py 会强制使用 torch.optim.AdamW(fused=True)
+        # 替代 TE.FusedAdam / apex.FusedAdam, 这里放开 isinstance 断言以兼容该路径。
+        from megatron.core.align_dump_utils import is_bit_exact as _is_bit_exact
+        _allowed_optim_types = (Adam, HybridDeviceOptimizer)
+        if _is_bit_exact():
+            _allowed_optim_types = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
+        assert isinstance(optimizer, _allowed_optim_types) or optimizer is None, (
+        # assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
             "Only Adam and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )
