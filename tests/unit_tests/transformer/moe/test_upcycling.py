@@ -226,6 +226,53 @@ class TestGPTModel:
             moe_logits, dense_logits, rtol=1e-01, atol=1e-01
         ), "The output of moe model do not match the output of dense model."
 
+    @pytest.mark.parametrize(
+        ('tp_ep', 'granularity', 'grouped_gemm', 'swiglu', 'squared_relu'),
+        [pytest.param((1, 1), 1, False, False, False)],
+    )
+    def test_upcycling_multi_model_chunks(
+        self, tp_ep, granularity, grouped_gemm, swiglu, squared_relu
+    ):
+        # Cover the virtual-pipeline path of ``upcycle_state_dict`` where ``moe_model``
+        # and ``dense_model`` hold more than one model chunk. The single-chunk tests above
+        # never exercise the ``len(moe_model) > 1`` branch.
+        tp = tp_ep[0]
+        ep = tp_ep[1]
+        args = create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te=False)
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+
+        dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, ModelType.encoder_or_decoder
+        )
+        dense_model = unwrap_model(dense_model)
+        set_bias_value(dense_model)
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp, expert_model_parallel_size=ep
+        )
+        set_upcycling_args(ep, granularity, num_experts=2)
+        moe_model = unwrap_model(get_model(model_provider, ModelType.encoder_or_decoder))
+
+        # Emulate multiple model chunks by repeating the single chunk; this drives the
+        # ``len(moe_model) > 1`` branch, which previously crashed with an ``AttributeError``
+        # because the converter arguments were swapped and a state_dict was passed in place
+        # of a module.
+        moe_chunks = [moe_model[0], moe_model[0]]
+        dense_chunks = [dense_model[0], dense_model[0]]
+        state_dict = upcycling_utils.upcycle_state_dict(moe_chunks, dense_chunks)
+
+        assert set(state_dict.keys()) == {'model0', 'model1'}
+        # The multi-chunk branch must agree with the single-chunk branch for the same chunk.
+        single = upcycling_utils.upcycle_state_dict([moe_model[0]], [dense_model[0]])
+        for i in range(len(moe_chunks)):
+            chunk = state_dict['model%d' % i]
+            assert chunk.keys() == single['model'].keys()
+            moe_model[0].load_state_dict(chunk, strict=True)
+
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",

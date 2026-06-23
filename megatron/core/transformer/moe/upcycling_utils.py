@@ -320,9 +320,7 @@ def upcycle_state_dict(moe_model, dense_model):
     else:
         assert len(moe_model) == len(dense_model)
         for i in range(len(moe_model)):
-            state_dict['model%d' % i] = _convert_to_moe_state_dict(
-                dense_model[i].state_dict(), moe_model[i]
-            )
+            state_dict['model%d' % i] = _convert_to_moe_state_dict(moe_model[i], dense_model[i])
     return state_dict
 
 
