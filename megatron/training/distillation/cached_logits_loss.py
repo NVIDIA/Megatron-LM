@@ -18,12 +18,12 @@ Design highlights
   with ``pin_memory=True`` streams batched tar shards so that disk I/O overlaps
   with GPU compute, and the CPU→GPU copy can be issued with
   ``non_blocking=True``.
-* **Own-rank loading only** – each rank loads only cp-dp shards matching its
-  parallelism coordinates (no cross-rank file I/O beyond DP resharding).
-* **Multi-threaded decode pipeline** – the tar ``IterableDataset`` runs
-  inside a single DataLoader worker (to preserve shard iteration order) and
-  parallelises the CPU-bound zstd decompression + ``torch.load`` + index
-  unpacking across an internal ``ThreadPoolExecutor``.  This removes the
+* **CP-agnostic loading** – each rank loads a CP-group shard for its DP mapping
+  and extracts its current CP-rank sequence slice locally.
+* **Multi-threaded decode pipeline** – the tar ``IterableDataset`` runs in the
+  main training process (to preserve shard iteration order) and parallelises the
+  CPU-bound zstd decompression + ``torch.load`` + index unpacking across an
+  internal ``ThreadPoolExecutor``.  This removes the
   single-thread bottleneck that dominates per-iteration loader cost when each
   saved tar contains a large multi-microbatch blob.
 
@@ -32,9 +32,10 @@ Assumptions
 * The student run uses the **same random seed** and data pipeline as the
   teacher run that produced the cached log-probs, so the microbatch ordering
   matches.
-* **Same CP layout** (``cp_rank``) as the teacher run.  The DP size may differ:
-  both upscaling (saved < current) and downscaling (saved > current) are
-  supported provided one evenly divides the other.
+* The current CP size may differ from the teacher run for CP-agnostic shards,
+  provided the full sequence length is divisible by ``2 * context_parallel_size``.
+  The DP size may also differ: both upscaling (saved < current) and downscaling
+  (saved > current) are supported provided one evenly divides the other.
 * **Same micro-batch size** as the teacher run.
 * Teacher log-probs were saved by ``LogitsSaverHooks`` (see ``logits_saver.py``).
 
@@ -69,20 +70,21 @@ from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.training.distillation.utils_logits import (
-  BATCHED_TAR_RE,
-  CACHED_LOGITS_LOGPROB_SENTINEL,
-  LogprobsTarEntry,
-  TarShardPrefetcher,
-  batched_tar_prefix,
-  compute_dataset_hash,
-  decode_logprobs_payload,
-  detect_saved_dp_size,
-  get_current_iteration,
-  iter_logprobs_tar_entries,
-  is_remote_storage_path,
-  storage_basename,
-  storage_glob_with_caching,
-  sorted_batched_tars,
+    BATCHED_TAR_RE,
+    CACHED_LOGITS_LOGPROB_SENTINEL,
+    LogprobsTarEntry,
+    TarShardPrefetcher,
+    batched_tar_prefix,
+    compute_dataset_hash,
+    decode_logprobs_payload,
+    detect_saved_dp_size,
+    get_current_iteration,
+    iter_logprobs_tar_entries,
+    is_remote_storage_path,
+    slice_tensor_for_cp_rank,
+    sorted_batched_tars,
+    storage_basename,
+    storage_glob_with_caching,
 )
 from megatron.training.utils import print_rank_0
 
@@ -219,9 +221,10 @@ def _compute_dp_remapping(
 class TeacherTarDataset(torch.utils.data.IterableDataset):
     """Streaming dataset that reads teacher log-probs from batched tar shards.
 
-    Supports a single on-disk layout: ``cp{C}_dp{D}__{B}.tar``.  Shards are
-    saved by TP rank 0 with the full top-K; every TP rank loads the same
-    cp-dp tar.
+    Supports the CP-agnostic on-disk layout ``dp{D}__{B}.tar`` and compatible
+    legacy ``cp0_dp{D}__{B}.tar`` shards.  Each shard stores the full CP-group
+    sequence for one saved DP rank; every current CP rank extracts its local
+    zigzag sequence slice after decoding.
 
     **DP resharding** is supported in both directions:
 
@@ -243,6 +246,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         self,
         logprobs_dir: str,
         cp_rank: int,
+        cp_size: int,
         dp_rank: int,
         dp_size: int,
         start_iteration: int = 0,
@@ -253,6 +257,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     ):
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
+        self.cp_size = cp_size
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
 
@@ -296,15 +301,15 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
 
     def _discover_shards(self, already_processed: set, dp_rank: int) -> list:
-        """Glob for new cp-dp batched tar shards.
+        """Glob for new batched tar shards.
 
         Args:
             already_processed: Set of URLs already processed (to skip).
             dp_rank: Saved DP rank to discover shards for.
         """
-        prefix = batched_tar_prefix(self.cp_rank, dp_rank)
+        prefix = batched_tar_prefix(dp_rank)
         all_urls = sorted_batched_tars(
-            storage_glob_with_caching(self.logprobs_dir, f"{prefix}*.tar", cached=False)
+            storage_glob_with_caching(self.logprobs_dir, f"*{prefix}*.tar", cached=False)
         )
         new_urls = []
         for url in all_urls:
@@ -320,20 +325,37 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         values_list: List[torch.Tensor],
         indices_list: List[torch.Tensor],
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Return only this rank's strided microbatch slice when DP ratio > 1."""
-        if self._dp_ratio <= 1:
-            return values_list, indices_list
+        """Return this rank's DP microbatch slice and CP sequence slice."""
+        if self._dp_ratio > 1:
+            num_mb = len(values_list)
+            if num_mb % self._dp_ratio != 0:
+                raise ValueError(
+                    f"Saved microbatch count ({num_mb}) is not divisible by "
+                    f"DP ratio ({self._dp_ratio}). Cannot evenly split "
+                    f"microbatches across remapped DP ranks."
+                )
+            values_list = values_list[self._sub_rank :: self._dp_ratio]
+            indices_list = indices_list[self._sub_rank :: self._dp_ratio]
 
-        num_mb = len(values_list)
-        if num_mb % self._dp_ratio != 0:
-            raise ValueError(
-                f"Saved microbatch count ({num_mb}) is not divisible by "
-                f"DP ratio ({self._dp_ratio}). Cannot evenly split "
-                f"microbatches across remapped DP ranks."
-            )
+        return self._slice_cp_sequences(values_list, indices_list)
+
+    def _slice_cp_sequences(
+        self,
+        values_list: List[torch.Tensor],
+        indices_list: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Extract this CP rank's zigzag sequence slice from full-CP tensors."""
+        if self.cp_size <= 1:
+            return values_list, indices_list
         return (
-            values_list[self._sub_rank :: self._dp_ratio],
-            indices_list[self._sub_rank :: self._dp_ratio],
+            [
+                slice_tensor_for_cp_rank(values, self.cp_rank, self.cp_size)
+                for values in values_list
+            ],
+            [
+                slice_tensor_for_cp_rank(indices, self.cp_rank, self.cp_size)
+                for indices in indices_list
+            ],
         )
 
     @staticmethod
@@ -369,13 +391,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             dp = dp_ranks[0]
             return FileNotFoundError(
                 f"No batched tar shards for "
-                f"cp{self.cp_rank}_dp{dp} "
+                f"dp{dp} "
                 f"found at or after iteration {self.start_iteration} "
                 f"in '{self.logprobs_dir}'"
             )
         return FileNotFoundError(
             f"No batched tar shards for source dp_ranks "
-            f"{dp_ranks} (cp{self.cp_rank}) "
+            f"{dp_ranks} "
             f"found at or after iteration {self.start_iteration} "
             f"in '{self.logprobs_dir}'"
         )
@@ -498,7 +520,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         pool: Optional[concurrent.futures.ThreadPoolExecutor],
         url: str,
     ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Yield DP-sliced microbatches from one source DP tar stream."""
+        """Yield DP-sliced, CP-sliced microbatches from one source DP tar stream."""
         for _, values_list, indices_list in self._iter_decoded_entries(pool, url):
             yield self._slice_microbatches(values_list, indices_list)
 
@@ -510,7 +532,8 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         """Yield interleaved microbatches from source DP tar streams in lockstep."""
         decoded_iters = [self._iter_decoded_entries(pool, url) for url in urls]
         for decoded_group in zip(*decoded_iters):
-            yield self._interleave_decoded_group(decoded_group)
+            values_list, indices_list = self._interleave_decoded_group(decoded_group)
+            yield self._slice_cp_sequences(values_list, indices_list)
 
     def _iter_group(
         self,
@@ -617,9 +640,9 @@ class CachedLogitsKDLoss:
 
     For each microbatch the loss function:
 
-    1. Retrieves (or prefetches via the DataLoader) this rank's cp-dp tar shard
-       containing the teacher's full top-K log-probabilities and global vocab
-       indices.
+    1. Retrieves (or prefetches via the DataLoader) this rank's mapped DP tar
+       shard containing the teacher's full CP-group top-K log-probabilities and
+       global vocab indices, then extracts the current CP-rank sequence slice.
     2. Computes the student's globally-normalised log-probabilities via a
        TP-aware softmax, gathers them at the teacher's top-K positions, and
        returns the **forward KL divergence**
@@ -632,8 +655,9 @@ class CachedLogitsKDLoss:
     ``tensor.to(device, non_blocking=True)`` call can overlap the DMA transfer
     with ongoing GPU kernels.
 
-    A custom tar reader sequentially streams ``cp{C}_dp{D}__{B}.tar`` shards
-    through the same storage layer used by the writer.
+    A custom tar reader sequentially streams ``dp{D}__{B}.tar`` shards
+    (or compatible legacy ``cp0_dp{D}__{B}.tar`` shards) through the same
+    storage layer used by the writer.
 
     The DataLoader is initialised lazily on the first ``__call__`` because the
     starting iteration is not known at construction time.
@@ -666,6 +690,7 @@ class CachedLogitsKDLoss:
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         self.cp_rank = parallel_state.get_context_parallel_rank()
+        self.cp_size = parallel_state.get_context_parallel_world_size()
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self.dp_size = parallel_state.get_data_parallel_world_size()
 
@@ -687,6 +712,7 @@ class CachedLogitsKDLoss:
         dataset = TeacherTarDataset(
             self.logprobs_dir,
             self.cp_rank,
+            self.cp_size,
             self.dp_rank,
             self.dp_size,
             start_iteration=start_iteration,
@@ -694,8 +720,8 @@ class CachedLogitsKDLoss:
             msc_prefetch_depth=self._msc_prefetch_depth,
             ignore_hash=self._ignore_hash,
         )
-        # Remote shard discovery uses rank-0 collectives, so it must run in the
-        # main training process rather than a DataLoader worker.
+        # Remote shard discovery uses rank-0 collectives, so the iterable
+        # dataset stays in the main training process.
         loader = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=None,
