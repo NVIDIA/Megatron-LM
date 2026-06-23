@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -15,6 +16,7 @@ from megatron.core.inference.config import (
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
+    RequestResolutionMode,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -382,6 +384,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
         disable_ep_consensus=args.inference_disable_ep_consensus,
         sampling_backend=args.inference_dynamic_batching_sampling_backend,
+        request_resolution_mode=RequestResolutionMode(
+            args.inference_dynamic_batching_request_resolution_mode
+        ),
     )
 
 

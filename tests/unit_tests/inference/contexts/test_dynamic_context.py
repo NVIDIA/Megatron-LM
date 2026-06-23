@@ -850,6 +850,57 @@ class TestDynamicContext:
             )
 
     @pytest.mark.internal
+    @rounder_override(8)
+    def test_deferred_prepare_and_resolve_finished_requests(self):
+        """Deferred prepare advances decode rows and resolve compacts survivors."""
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=32,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=32,
+        )
+
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = 3
+        ctx.request_ids[:3] = torch.tensor([10, 11, 12], dtype=torch.int32, device='cpu')
+        ctx.request_query_lengths[:3] = 1
+        ctx.request_kv_length_offsets[:3] = torch.tensor([3, 4, 7], dtype=torch.int32)
+        ctx.request_last_kv_block_offset[:3] = torch.tensor([2, 3, 1], dtype=torch.int32)
+
+        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(3)
+        ctx.request_to_kv_block_ids[:3, 0] = block_ids
+        ctx.request_last_kv_block_id[:3] = block_ids
+        ctx.request_kv_block_counts[:3] = 1
+
+        ctx.prepare_requests(torch.tensor([90, 91, 92], dtype=torch.int64, device='cpu'))
+
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:3], torch.tensor([4, 5, 8], dtype=torch.int32)
+        )
+        assert torch.equal(
+            ctx.request_last_kv_block_offset[:3], torch.tensor([3, 0, 2], dtype=torch.int32)
+        )
+        assert ctx.request_kv_block_counts[1] == 2
+        assert torch.equal(ctx.token_to_input_ids[:3], torch.tensor([90, 91, 92]))
+        assert torch.equal(ctx.token_to_pos_ids[:3], torch.tensor([4, 5, 8]))
+        assert ctx.token_to_block_idx[1] == ctx.request_last_kv_block_id[1]
+
+        finished_request_ids = ctx.resolve_requests(torch.tensor([1, 0, 1], dtype=torch.int32))
+
+        assert torch.equal(finished_request_ids, torch.tensor([11], dtype=torch.int32))
+        assert ctx.total_request_count == 2
+        assert ctx.active_token_count == 2
+        assert torch.equal(ctx.request_ids[:2], torch.tensor([10, 12], dtype=torch.int32))
+        assert torch.equal(ctx.token_to_input_ids[:2], torch.tensor([90, 92]))
+        assert torch.equal(ctx.token_to_request_idx[:2], torch.tensor([0, 1], dtype=torch.int32))
+
+    @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_blocks_for_finished_requests(self, is_hybrid_model):

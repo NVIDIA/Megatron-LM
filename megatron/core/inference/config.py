@@ -133,6 +133,16 @@ class CudaGraphSizingDistribution(str, Enum):
     LINEAR = "linear"
 
 
+class RequestResolutionMode(str, Enum):
+    """Request lifecycle resolution mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    DEFER = "defer"
+    """Prepare and forward speculatively before resolving the sampled requests."""
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -344,6 +354,9 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    request_resolution_mode: RequestResolutionMode = RequestResolutionMode.LEGACY
+    """Mode used to resolve dynamic batching request lifecycle changes."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -381,6 +394,7 @@ class InferenceConfig:
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        self.request_resolution_mode = RequestResolutionMode(self.request_resolution_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "

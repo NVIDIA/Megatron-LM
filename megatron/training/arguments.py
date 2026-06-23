@@ -1980,6 +1980,13 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-request-resolution-mode',
+                       type=str, default='legacy',
+                       choices=['legacy', 'defer'],
+                       help='Request lifecycle resolution mode for dynamic batching. '
+                            '"legacy" (default) preserves the existing resolve-before-prepare '
+                            'path. "defer" speculatively prepares and forwards decode-only '
+                            'greedy GPT steps before resolving finished requests.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')

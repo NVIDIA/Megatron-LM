@@ -23,7 +23,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.config import KVCacheManagementMode, RequestResolutionMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -260,6 +260,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        self._validate_deferred_resolution_support_for_config()
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
@@ -974,11 +975,53 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    def _validate_deferred_resolution_support_for_config(self) -> None:
+        """Validate config-level restrictions for deferred request resolution."""
+        if self.context.config.request_resolution_mode != RequestResolutionMode.DEFER:
+            return
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        if self.num_speculative_tokens > 0:
+            raise ValueError("Deferred request resolution does not support speculative tokens.")
+        if self.context.is_hybrid_model:
+            raise ValueError("Deferred request resolution does not support hybrid/Mamba models.")
+        if self.context.enable_prefix_caching:
+            raise ValueError("Deferred request resolution does not support prefix caching.")
+        if not self.materialize_only_last_token_logits:
+            raise ValueError(
+                "Deferred request resolution requires materialize_only_last_token_logits=True."
+            )
+        if model_config.expert_model_parallel_size > 1:
+            raise ValueError("Deferred request resolution does not support expert parallelism.")
+        if model_config.num_moe_experts is not None:
+            raise ValueError("Deferred request resolution does not support MoE models.")
+        if model_config.moe_enable_routing_replay:
+            raise ValueError("Deferred request resolution does not support routing replay.")
+
+    def _validate_deferred_resolution_support_for_request(
+        self, request: DynamicInferenceRequest
+    ) -> None:
+        """Validate request-level restrictions for deferred request resolution."""
+        if self.context.config.request_resolution_mode != RequestResolutionMode.DEFER:
+            return
+
+        sampling_params = request.sampling_params
+        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
+            raise ValueError(
+                "Deferred request resolution only supports greedy sampling "
+                "(SamplingParams.top_k == 1 and top_p == 0.0)."
+            )
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            raise ValueError("Deferred request resolution does not support log probabilities.")
+        if sampling_params.stop_words:
+            raise ValueError("Deferred request resolution does not support stop words.")
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
+        self._validate_deferred_resolution_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.

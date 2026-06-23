@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -19,6 +20,7 @@ from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
 )
+from megatron.core.inference.config import RequestResolutionMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -67,6 +69,39 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+
+@dataclass
+class DecodeForwardPrimer:
+    """Track whether a decode forward is ready to sample."""
+
+    is_primed: bool = False
+    cuda_graph_request_count: Optional[int] = None
+
+    def mark_primed(self, cuda_graph_request_count: Optional[int]) -> None:
+        """Record that a decode forward has produced logits ready for sampling.
+
+        Args:
+            cuda_graph_request_count (Optional[int]): CUDA graph request count
+                for the primed forward, or `None` when CUDA graphs were not used.
+
+        Returns:
+            None: This method updates primer state in place.
+        """
+        self.is_primed = True
+        self.cuda_graph_request_count = cuda_graph_request_count
+
+    def clear(self) -> None:
+        """Clear any primed-forward state.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method updates primer state in place.
+        """
+        self.is_primed = False
+        self.cuda_graph_request_count = None
 
 
 # pylint: disable=line-too-long
@@ -170,6 +205,7 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
+        self._decode_forward_primer = DecodeForwardPrimer()
         # Speculative path:
         #     - `self._sampled_tokens_cuda` is pre-allocated by `_init_mtp_sampling_tensors`.
         #     - The tensor cannot be reused between the Triton kernel and the sampling graph.
@@ -231,6 +267,65 @@ class TextGenerationController:
         self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
+        )
+
+    def _validate_deferred_resolution_support_for_step(self) -> None:
+        """Validate controller/context state for deferred request resolution."""
+        context = self.inference_wrapped_model.inference_context
+        if not context.config.materialize_only_last_token_logits:
+            raise RuntimeError(
+                "Deferred request resolution requires materialize_only_last_token_logits=True."
+            )
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Deferred request resolution does not support speculative tokens.")
+        if context.is_hybrid_model:
+            raise RuntimeError("Deferred request resolution does not support hybrid/Mamba models.")
+        if context.enable_prefix_caching:
+            raise RuntimeError("Deferred request resolution does not support prefix caching.")
+        if context.paused_request_count != 0:
+            raise RuntimeError("Deferred request resolution does not support paused requests.")
+        if context.chunked_prefill_request_id != -1:
+            raise RuntimeError("Deferred request resolution does not support chunked prefill.")
+        if self.model_config.expert_model_parallel_size > 1:
+            raise RuntimeError("Deferred request resolution does not support expert parallelism.")
+        if self.model_config.num_moe_experts is not None:
+            raise RuntimeError("Deferred request resolution does not support MoE models.")
+        if self.model_config.moe_enable_routing_replay:
+            raise RuntimeError("Deferred request resolution does not support routing replay.")
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        if active_request_count == 0:
+            return
+        if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
+            raise RuntimeError(
+                "Deferred request resolution only supports greedy sampling "
+                "(SamplingParams.top_k == 1)."
+            )
+        if not torch.all(context.request_metadata["top_p"][active_slice] == 0.0):
+            raise RuntimeError(
+                "Deferred request resolution only supports greedy sampling "
+                "(SamplingParams.top_p == 0.0)."
+            )
+        if torch.any(context.request_metadata["return_log_probs"][active_slice]):
+            raise RuntimeError("Deferred request resolution does not support log probabilities.")
+        if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
+            raise RuntimeError("Deferred request resolution does not support top-n log probabilities.")
+
+    def _compact_deferred_resolution_logits(self, survivor_idxs: Tensor) -> None:
+        """Compact cached logits from old active-row order into survivor order."""
+        if survivor_idxs.numel() == 0:
+            self._decode_forward_primer.clear()
+            return
+
+        survivor_idxs_cuda = survivor_idxs.to(self._all_logits_cuda.device)
+        compacted_logits = self._all_logits_cuda[:, survivor_idxs_cuda, :].contiguous()
+        if self._enable_cuda_graph:
+            self._all_logits_cuda[:, : survivor_idxs.numel(), :].copy_(compacted_logits)
+        else:
+            self._all_logits_cuda = compacted_logits
+        self._decode_forward_primer.mark_primed(
+            self._decode_forward_primer.cuda_graph_request_count
         )
 
     @staticmethod
@@ -667,6 +762,22 @@ class TextGenerationController:
             self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
         else:
             self._all_logits_cuda = logits
+
+    def _run_deferred_resolution_forward(self) -> Optional[int]:
+        """Run one dynamic forward pass and cache logits for deferred resolution."""
+        context = self.inference_wrapped_model.inference_context
+        input_ids, position_ids = self._dynamic_step_context_init()
+
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+
+        range_push("forward_pass")
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+        range_pop()
+
+        self._decode_forward_primer.mark_primed(cuda_graph_request_count)
+        return cuda_graph_request_count
 
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -1695,9 +1806,7 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
-    async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
-    ) -> Optional[Dict]:
+    async def _run_legacy_step(self, skip_bookkeeping: Optional[bool] = False) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
@@ -1713,6 +1822,7 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
+        self._decode_forward_primer.clear()
         active_request_count = context.total_request_count - context.paused_request_count
 
         # No tokens and no active requests?
@@ -1846,6 +1956,97 @@ class TextGenerationController:
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return ret
+
+    async def _run_deferred_resolution_step(self) -> Optional[Dict]:
+        """Run one decode-only step using deferred request resolution."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if context.active_token_count == 0 and active_request_count == 0:
+            self._decode_forward_primer.clear()
+            return None
+
+        self._validate_deferred_resolution_support_for_step()
+
+        with torch.inference_mode():
+            if not self._decode_forward_primer.is_primed:
+                self._run_deferred_resolution_forward()
+
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
+            active_request_count = context.total_request_count - context.paused_request_count
+            active_request_slice = slice(context.paused_request_count, context.total_request_count)
+            active_request_ids = context.request_ids[active_request_slice].long()
+
+            cached_cuda_graph_request_count = self._decode_forward_primer.cuda_graph_request_count
+
+            range_push("sampling")
+            sampled_tokens_cuda = torch.argmax(
+                self._all_logits_cuda.squeeze(0)[:active_request_count].float(), dim=-1
+            )
+            sampled_tokens_cpu = sampled_tokens_cuda.cpu()
+            range_pop()
+
+            range_push("active_request_mask")
+            active_sequence_lengths = context.get_active_sequence_lengths()
+            active_sequence_lengths += 1
+            max_sequence_lengths = context.get_max_sequence_lengths()
+            active_request_mask = (
+                sampled_tokens_cpu
+                != context.request_metadata["termination_id"][active_request_slice]
+            ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+            finished_idxs = (
+                torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+                + context.paused_request_count
+            )
+            finished_request_ids = context.request_ids[finished_idxs].clone()
+            survivor_idxs = torch.nonzero(active_request_mask == 1, as_tuple=True)[0]
+            new_sample_copy = sampled_tokens_cpu.clone()
+            range_pop()
+
+            range_push("prepare_requests")
+            context.prepare_requests(new_sample_copy)
+            range_pop()
+
+            range_push("deferred_forward_pass")
+            self._run_deferred_resolution_forward()
+            range_pop()
+
+            range_push("resolve_requests")
+            resolved_finished_request_ids = context.resolve_requests(active_request_mask)
+            range_pop()
+
+            assert torch.equal(finished_request_ids, resolved_finished_request_ids)
+            self._compact_deferred_resolution_logits(survivor_idxs)
+
+            return {
+                "active_request_ids": active_request_ids,
+                "finished_request_ids": finished_request_ids,
+                "sample": sampled_tokens_cpu,
+                "finished_routing_block_ids": {},
+                "newly_paused_request_ids": None,
+                "evict_request_ids": None,
+                "accepted_tokens": None,
+                "log_probs": None,
+                "top_n_logprobs": None,
+                "cuda_graph_request_count": cached_cuda_graph_request_count,
+            }
+
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context."""
+        context = self.inference_wrapped_model.inference_context
+        mode = context.config.request_resolution_mode
+
+        if mode == RequestResolutionMode.LEGACY or context.num_prefill_requests != 0:
+            return await self._run_legacy_step(skip_bookkeeping)
+        if mode == RequestResolutionMode.DEFER:
+            assert not skip_bookkeeping, "Deferred request resolution requires request bookkeeping."
+            return await self._run_deferred_resolution_step()
+        raise AssertionError(f"Unexpected request resolution mode: {mode}")
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
