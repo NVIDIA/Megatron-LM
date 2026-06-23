@@ -308,7 +308,13 @@ class InferenceConfig:
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out, sized to the
+    worst-case 3 * max_requests slots). The scratch is reserved from this budget first,
+    so a larger max_requests leaves fewer durable slots."""
 
     # =================================
     # Logging config
