@@ -118,10 +118,13 @@ class TestMoESingleGroupedWeightNumerics:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def model_provider(self, pre_process=True, post_process=True):
+    def model_provider(
+        self, pre_process=True, post_process=True, config=None, pg_collection=None, vp_stage=None
+    ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
-        config = core_transformer_config_from_args(args)
+        if config is None:
+            config = core_transformer_config_from_args(args)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
         )
@@ -137,6 +140,8 @@ class TestMoESingleGroupedWeightNumerics:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
         )
 
     def create_test_args(self, precision: str, primary_param_gather: bool, single_weight: bool):
