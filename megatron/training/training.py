@@ -2894,6 +2894,14 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+
+    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
+    # falls back to the mpu groups inside save_checkpoint (byte-identical).
+    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
+    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2905,6 +2913,9 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_cp_group=dp_cp_group,
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.

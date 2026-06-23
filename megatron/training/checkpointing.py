@@ -368,10 +368,11 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup, key_prefix: str = '') -> Union[List[Dict[str, Any]], ShardedObject]:
+def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup, key_prefix: str = '', dp_cp_group: Optional[torch.distributed.ProcessGroup] = None) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
+    dp_cp_group threads the data-parallel (with context-parallel) group; None falls back to the mpu API.
     """
     args = get_args()
     rng_state = {
@@ -381,28 +382,30 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         'cuda_rng_state': torch.cuda.get_rng_state(),
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
+    dp_world_size = get_pg_size(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_world_size()
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
-            mpu.get_data_parallel_world_size() > 1:
+            dp_world_size > 1:
         rng_state_list = \
-            [None for i in range(mpu.get_data_parallel_world_size())]
+            [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=mpu.get_data_parallel_group())
+            group=dp_cp_group if dp_cp_group is not None else mpu.get_data_parallel_group())
     else:
         rng_state_list = [rng_state]
 
+    dp_cp_rank = get_pg_rank(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_rank(with_context_parallel=True)
     if ckpt_format == "torch_dist":
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
         rng_state_list = ShardedObject(f'{key_prefix}rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
-                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+                                       replica_id=dp_cp_rank)
     elif ckpt_format == "fsdp_dtensor":
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
+        pp_rank = get_pg_rank(pp_group)
+        tp_rank = get_pg_rank(tp_group)
         rng_state_list = {
             f"({pp_rank}, {tp_rank})": rng_state_list
         }
@@ -561,7 +564,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                              key_prefix=getattr(args, 'rng_state_key_prefix', ''))
+                              key_prefix=getattr(args, 'rng_state_key_prefix', ''),
+                              dp_cp_group=dp_cp_group)
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
@@ -613,9 +617,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
     # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
     if not torch.distributed.is_initialized() \
+            or ckpt_type != CheckpointType.LEGACY \
             or mpu.get_data_parallel_rank() == 0 \
-            or mpu.get_expert_data_parallel_rank() == 0 \
-            or ckpt_type != CheckpointType.LEGACY:
+            or mpu.get_expert_data_parallel_rank() == 0:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
             if args.use_distributed_optimizer:
@@ -1721,7 +1725,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                                             key_prefix=getattr(args, 'rng_state_key_prefix', ''))  # we can load the rng state
+                                             key_prefix=getattr(args, 'rng_state_key_prefix', ''),
+                                             dp_cp_group=dp_cp_group)  # we can load the rng state
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None
@@ -1729,7 +1734,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
 
         if ckpt_type == CheckpointType.LOCAL:
-            sharded_sd_metadata = _build_sharded_state_dict_metadata(args)
+            sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
@@ -2026,8 +2031,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if 'rng_state' in state_dict:
                 if args.ckpt_format == "fsdp_dtensor":
                     # FSDP DTensor checkpoints store rng_state in a different format.
-                    tp_rank = mpu.get_tensor_model_parallel_rank()
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    tp_rank = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
+                    pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
                     if f"({pp_rank}, {tp_rank})" in state_dict['rng_state']:
                         rng_state = state_dict['rng_state'][f"({pp_rank}, {tp_rank})"]
                     else:
@@ -2038,7 +2043,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-                    rng_state = rng_state[mpu.get_data_parallel_rank()]
+                    dp_cp_rank = get_pg_rank(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_rank()
+                    rng_state = rng_state[dp_cp_rank]
                 else:
                     rng_state = rng_state[0]
                 random.setstate(rng_state['random_rng_state'])
