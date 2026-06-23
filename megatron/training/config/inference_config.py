@@ -213,16 +213,28 @@ class InferenceSetupConfig:
     mamba_inference_ssm_states_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     """Dtype for the Mamba inference SSM states tensor."""
 
+    # ---------------- Log-prob and RoPE knobs from _add_inference_args ----------------
+
+    return_log_probs: bool = False
+    """Return the log probabilities of the final output tokens. Mirrors ``--return-log-probs``.
+    Controls ``materialize_only_last_token_logits`` (the engine must materialize all logits when
+    log probs are requested, unless ``skip_prompt_log_probs`` is also True)."""
+
+    skip_prompt_log_probs: bool = False
+    """Skip prompt log probs. Mirrors ``--skip-prompt-log-probs``. When True, only the last
+    token's logits are needed even if ``return_log_probs`` is True, so
+    ``materialize_only_last_token_logits`` stays True."""
+
+    use_flashinfer_fused_rope: bool = False
+    """Use flashinfer's fused rope implementation. Mirrors ``--use-flashinfer-fused-rope``."""
+
     def to_inference_config(
         self,
         model: "MegatronModule",
         *,
         pg_collection: Any = None,
-        return_log_probs: bool = False,
-        skip_prompt_log_probs: bool = False,
         kv_cache_management_mode: str = "persist",
         static_kv_memory_pointers: bool = False,
-        use_flashinfer_fused_rope: bool = False,
         enable_cuda_graphs: bool = True,
         metrics_writer: Any = None,
         verbose: bool = True,
@@ -240,21 +252,16 @@ class InferenceSetupConfig:
                 process group collection when ``pg_collection`` is not provided.
             pg_collection: Process groups for distributed execution. Defaults to the
                 model's ``pg_collection`` attribute when None.
-            return_log_probs: Whether generation returns log probs. Controls
-                ``materialize_only_last_token_logits`` (the engine must materialize all
-                logits when log probs are requested).
-            skip_prompt_log_probs: Whether prompt log probs are skipped. When True, only the
-                last token's logits are needed even if ``return_log_probs`` is True, so
-                ``materialize_only_last_token_logits`` is True. Sourced from the CLI arg
-                ``--skip-prompt-log-probs`` at the call site.
             kv_cache_management_mode: How large tensors are handled on suspend/resume
                 ("persist"/"offload"/"recompute"). Sourced from the RL arg
-                ``rl_kv_cache_management_mode`` at the call site.
+                ``rl_kv_cache_management_mode`` at the call site (not part of the inference
+                argument group, so it is not folded into this dataclass).
             static_kv_memory_pointers: Whether the KV cache stays at fixed addresses across
-                suspend/resume. Sourced from the RL arg ``rl_persist_cuda_graphs``.
-            use_flashinfer_fused_rope: Whether to use flashinfer's fused rope implementation.
+                suspend/resume. Sourced from the RL arg ``rl_persist_cuda_graphs`` (not part
+                of the inference argument group).
             enable_cuda_graphs: When False, ``num_cuda_graphs`` is forced to None (no capture).
-                Callers typically pass ``inference_cuda_graph_scope != none``.
+                Callers typically pass ``inference_cuda_graph_scope != none``; derived, not a
+                 1:1 args field.
             metrics_writer: Optional wandb module for inference metric logging.
             verbose: Whether the context logs detailed configuration at initialization.
 
@@ -323,9 +330,9 @@ class InferenceSetupConfig:
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
             pg_collection=pg_collection,
-            use_flashinfer_fused_rope=use_flashinfer_fused_rope,
+            use_flashinfer_fused_rope=self.use_flashinfer_fused_rope,
             materialize_only_last_token_logits=(
-                not (return_log_probs and not skip_prompt_log_probs)
+                not (self.return_log_probs and not self.skip_prompt_log_probs)
             ),
             track_generated_token_events=(
                 self.inference_dynamic_batching_track_generated_token_events

@@ -344,15 +344,16 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
                 "wandb module is available. Inference logging will be disabled.",
             )
 
+    # Only kwargs that are NOT in the inference argument group are passed explicitly.
+    # The rest (return_log_probs, skip_prompt_log_probs, use_flashinfer_fused_rope, and the
+    # inference_dynamic_batching_* / prefix_caching_* / chunked_prefill knobs) live on
+    # InferenceSetupConfig and are read from ``self`` inside ``to_inference_config``.
     setup_cfg = inference_cfg_from_args(args)
     return setup_cfg.to_inference_config(
         model,
-        return_log_probs=args.return_log_probs,
         kv_cache_management_mode=args.rl_kv_cache_management_mode,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
-        use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         enable_cuda_graphs=(args.inference_cuda_graph_scope != InferenceCudaGraphScope.none),
-        skip_prompt_log_probs=args.skip_prompt_log_probs,
         metrics_writer=metrics_writer,
     )
 
