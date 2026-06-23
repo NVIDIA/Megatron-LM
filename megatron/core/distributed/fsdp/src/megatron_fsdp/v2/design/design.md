@@ -1,4 +1,4 @@
-# Design: Megatron-FSDP2 Implementation
+# Design: Megatron FSDP v2 Implementation
 
 ---
 

@@ -179,6 +179,27 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._annotate_tensor_parallelism(module)
 
+        if config.overlap_moe_expert_parallel_comm:
+            assert not ddp_config.fsdp_double_buffer, (
+                "1F1B overlap with FSDP does not support double buffer. "
+                "Please set fsdp_double_buffer=False in the ddp config."
+            )
+            assert config.cuda_graph_impl in ("none", "full_iteration"), (
+                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
+                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
+                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
+                "(cuda_graph_impl='none')."
+            )
+
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            assert self.fsdp_unit_modules == [TransformerLayer], (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+            )
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -192,7 +213,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
                 enable_fine_grained_param_gather_hook=(
-                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or config.overlap_moe_expert_parallel_comm
+                ),
+                enable_fine_grained_param_gather_backward_hook=(
+                    config.overlap_moe_expert_parallel_comm
+                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
                 ),
             ),
         )
@@ -273,6 +299,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
+            "fine_grained_hooks": config.overlap_moe_expert_parallel_comm,
+            "skip_backward_callback": config.delay_wgrad_compute,
+            "skip_final_backward_callback": config.overlap_moe_expert_parallel_comm,
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None

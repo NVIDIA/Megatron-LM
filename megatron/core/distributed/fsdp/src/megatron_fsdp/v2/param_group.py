@@ -268,7 +268,6 @@ class ParameterGroup:
         # so the first reduce_grad after either event overwrites instead of
         # accumulating — no stale data from uninitialised or zeroed buffers.
         self.main_grad_buffer.reduce_grad(
-            grad_comm_dtype=self.mp_policy.grad_comm_dtype,
             overwrite_grad=self._grad_buffer_is_fresh,
         )
         self._grad_buffer_is_fresh = False

@@ -235,11 +235,13 @@ def count_zeros_fp32(
     use_megatron_fsdp = False
     for param in parameters:
         if getattr(param, "__fsdp_param__", False) and param.grad is not None:
-            # If the parameter is managed by Megatron FSDP, we need to handle it differently.
             use_megatron_fsdp = True
-            grad = param.grad._local_tensor
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros += num_zeros
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+            if is_not_shared and is_not_tp_duplicate:
+                grad = param.grad._local_tensor
+                num_zeros = grad.numel() - torch.count_nonzero(grad)
+                total_num_zeros += num_zeros
             continue
 
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"

@@ -199,7 +199,10 @@ def calc_dtensor_params_l2_norm(params):
     """Calculate l2 norm of DTensor parameters."""
     params_data = defaultdict(list)
     for param in params:
-        params_data[param._spec].append(param._local_tensor)
+        local_tensor = param._local_tensor
+        if local_tensor.dtype != torch.float32 and local_tensor.numel() > 0:
+            local_tensor = local_tensor.float()
+        params_data[param._spec].append(local_tensor)
 
     total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
     dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')

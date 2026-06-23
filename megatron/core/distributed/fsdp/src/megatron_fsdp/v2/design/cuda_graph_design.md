@@ -7,11 +7,11 @@
 
 mcore's CUDA graph system (`cuda_graph_impl="local"`, `cuda_graphs.py`) was
 designed for DDP's memory model — each layer receives freshly-allocated tensor
-inputs/outputs.  FSDP v2 shares the same pool-backed buffers across layers,
+inputs/outputs.  Megatron FSDP v2 shares the same pool-backed buffers across layers,
 and the FSDP hooks (unshard/reshard) are not captured in the graph in the
 same way.
 
-This doc describes a CUDA graph system built INTO FSDP v2, using
+This doc describes a CUDA graph system built INTO Megatron FSDP v2, using
 `TracePoolAllocator` as the stable-memory foundation.  The user enables it
 with a single flag — everything else is automatic.
 

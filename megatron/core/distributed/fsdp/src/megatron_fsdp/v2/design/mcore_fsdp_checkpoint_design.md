@@ -24,10 +24,10 @@ the checkpoint save/load architecture and how it integrates with MCore's
 
 | Source Format | Target Format | Model | Optimizer | Notes |
 |---------------|--------------|-------|-----------|-------|
-| MFSDP v2 | MFSDP v2 | ✓ | ✓ | Full round-trip and cross-setting (`optim_grads` ↔ `optim_grads_params`) |
-| MFSDP v1 baseline | MFSDP v2 | ✗ | ✗ | Currently skipped in tests (``pytest.skip("v1 checkpoint format not available")``).  Both use ``fsdp_dtensor`` format but key names may differ.  Planned for future support. |
-| ND-parallel (`torch_dist`) | MFSDP v2 | ✓ | ✓ (``fully_reshardable`` only) | Online conversion via `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py`. Expert weights are split from flattened multi-expert tensors. Optimizer states (`exp_avg`, `exp_avg_sq`) are loaded into V2's name-based format. Hi-precision FP32 optimizer param copies are used for model weights when available. ``dp_reshardable`` format is not supported (bucket-based layout incompatible with name-based V2 format). |
-| ND-parallel (`torch`) | MFSDP v2 | ✗ | ✗ | Not supported (different serialization) |
+| Megatron FSDP v2 | Megatron FSDP v2 | ✓ | ✓ | Full round-trip and cross-setting (`optim_grads` ↔ `optim_grads_params`) |
+| MFSDP v1 baseline | Megatron FSDP v2 | ✗ | ✗ | Currently skipped in tests (``pytest.skip("v1 checkpoint format not available")``).  Both use ``fsdp_dtensor`` format but key names may differ.  Planned for future support. |
+| ND-parallel (`torch_dist`) | Megatron FSDP v2 | ✓ | ✓ (``fully_reshardable`` only) | Online conversion via `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py`. Expert weights are split from flattened multi-expert tensors. Optimizer states (`exp_avg`, `exp_avg_sq`) are loaded into V2's name-based format. Hi-precision FP32 optimizer param copies are used for model weights when available. ``dp_reshardable`` format is not supported (bucket-based layout incompatible with name-based V2 format). |
+| ND-parallel (`torch`) | Megatron FSDP v2 | ✗ | ✗ | Not supported (different serialization) |
 
 ---
 
@@ -70,7 +70,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `_maybe_wrap_as_uneven_dtensor(tensor, dist_param)` | Wrap a single plain tensor as an uneven DTensor if it matches the parameter's local shard shape; otherwise return unchanged. Shared by ``_build_dtensor_optim_sd`` and ``_preprocess_and_verify_v2_state_dict``. |
 | `load_torch_dist_into_fsdp_v2` | Entry point for online checkpoint conversion from legacy ``torch_dist`` format to ``fsdp_dtensor``. Five-phase pipeline: preprocess/verify, build name mapping, DCP load, expert params, verify. |
 | `add_module_prefix(state_dict)` | Add ``module.`` prefix to all state dict keys. Megatron FSDP v2 lacks ``MegatronFSDP`` wrapper so ``model.state_dict()`` keys have no prefix; this aligns with Megatron's checkpoint format. |
-| `strip_module_prefix(state_dict)` | Remove ``module.`` prefix from state dict keys. Inverse of ``add_module_prefix``, used when loading checkpoint back into FSDP v2 model. |
+| `strip_module_prefix(state_dict)` | Remove ``module.`` prefix from state dict keys. Inverse of ``add_module_prefix``, used when loading checkpoint back into Megatron FSDP v2 model. |
 | `get_model_state_dict(model)` | Get model state dict with ``module.`` prefix. Auto-detects whether prefix is already present; adds it if missing. |
 | `get_optimizer_state_dict(optimizer, is_loading)` | Get optimizer state dict via Path A (``sharded_param_state_fsdp_dtensor``). Delegates to ``optimizer.sharded_state_dict()`` with ``fsdp_dtensor`` sharding type. Returns ``{"state": ..., "param_to_group_meta": ...}``. |
 | `handle_fp8_extra_state_case(model_sd)` | Remove ``._extra_state`` keys from model state dict (FP8 artifact cleanup). |
@@ -92,7 +92,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 
 ### 3.2 Current Save Flow
 
-> **Note:** This describes the current `generate_state_dict`-based flow. For FSDP v2,
+> **Note:** This describes the current `generate_state_dict`-based flow. For Megatron FSDP v2,
 > ``_build_megatron_fsdp_v2_state_dict`` (Section 12) replaces this in the v2 code path.
 
 ```
@@ -120,7 +120,7 @@ save_checkpoint()
 
 ### 3.3 Current Load Flow
 
-> **Note:** This describes the current `generate_state_dict`-based flow. For FSDP v2,
+> **Note:** This describes the current `generate_state_dict`-based flow. For Megatron FSDP v2,
 > ``_build_megatron_fsdp_v2_state_dict`` (Section 12) replaces this in the v2 code path.
 
 ```
@@ -677,7 +677,7 @@ so the model state dict is complete.
 
 Torch_dist stores multi-layer and multi-expert tensors as a single fused tensor (e.g.,
 ``decoder.layers.self_attention.linear_qkv.weight`` of shape ``(num_layers, H, 3*W)``).
-FSDP v2 stores each layer as an individual DTensor
+Megatron FSDP v2 stores each layer as an individual DTensor
 (``decoder.layers.0.self_attention.linear_qkv.weight`` of shape ``(H, 3*W)``).
 DCP cannot split one tensor into many, so Phase 4 handles this in `load_torch_dist_into_fsdp_v2`.
 
@@ -817,7 +817,7 @@ provenance of chunk metadata when debugging size mismatches.
 
 | Source Tag | Set By | When |
 |---|---|---|
-| `"init"` | `update_uneven_dtensor_chunk_metadata` (default) | FSDP v2 construction (`param_group.py`) |
+| `"init"` | `update_uneven_dtensor_chunk_metadata` (default) | Megatron FSDP v2 construction (`param_group.py`) |
 | `"preprocess"` | `preprocess_state_dict_for_uneven_dtensor` | Save Phase 1 (re-computes via all_gather) |
 | `"propagate:<src>"` | `copy_chunk_metadata` | Save Phase 2 (copied from model param; `<src>` is the original tag) |
 | `"split"` | `split_dtensor` | Save Phase 3 (locally derived from parent's metadata) |
@@ -865,7 +865,7 @@ and their consumers.
 | Model state dict keys | Keys have `module.` prefix from `MegatronFSDP` wrapper | Keys lack `module.` prefix; `add_module_prefix()` used for checkpoint alignment |
 | Model `state_dict_for_save_checkpoint` | `model.state_dict()` with `state_dict_pre_hook` | `model.state_dict()` (already DTensors) |
 | Optimizer buffer management | Megatron FSDP managed | Standard Torch optimizer managed |
-| Gradient buffer | Megatron FSDP `param_and_grad_buffer` | None (FSDP v2 handles internally) |
+| Gradient buffer | Megatron FSDP `param_and_grad_buffer` | None (Megatron FSDP v2 handles internally) |
 | Load model state dict | `module.load_state_dict(custom, strict)` with `_load_state_dict_post_hook` | `super().load_state_dict(state_dict, strict)` — after `strip_module_prefix()` |
 | Zero gradient | `model_chunk.zero_grad_buffer()` | `model_chunk._zero_grad_buffer()` |
 
@@ -883,7 +883,7 @@ so the raw model's ``state_dict()`` produces keys **without** the prefix (e.g.,
 - ``add_module_prefix(state_dict)`` — adds ``module.`` prefix to all keys before
   saving, aligning with Megatron's checkpoint format.
 - ``strip_module_prefix(state_dict)`` — removes ``module.`` prefix after loading,
-  aligning with the FSDP v2 model's expected key format.
+  aligning with the Megatron FSDP v2 model's expected key format.
 
 ``get_model_state_dict(model)`` auto-detects whether the prefix is present and adds
 it if missing. ``load_checkpoint`` strips the prefix back before calling
@@ -899,7 +899,7 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 
 ## 12. Implementation Checklist
 
-### Phase 1: `distrib_optimizer.py` — FSDP v2 Guard Propagation
+### Phase 1: `distrib_optimizer.py` — Megatron FSDP v2 Guard Propagation
 
 - [x] `__init__`: Guard early return with `use_megatron_fsdp or use_megatron_fsdp_v2`
 - [x] `state_dict()`: Return `self.optimizer.state_dict()` for FSDP paths

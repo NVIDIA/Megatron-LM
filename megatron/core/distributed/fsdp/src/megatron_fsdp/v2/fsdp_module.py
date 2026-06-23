@@ -15,6 +15,7 @@
 """FSDPModule implementation for Megatron-FSDP2."""
 
 import logging
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -610,7 +611,21 @@ class FSDPModule:
 
             setattr(module, "_fsdp_module_idx", module_idx)
             setattr(module, "_fsdp_module_name", name)
+            module._fsdp_pre_backward_done = False
+            module.post_backward_issued = False
             module_idx += 1
+
+        # Annotate every non-FSDPModule sub-module with its nearest parent
+        # FSDPModule.  Process bottom-up (reverse forward_order) so that
+        # child FSDPModules claim their sub-modules before the root reaches
+        # them.
+        for module in reversed(forward_order):
+            for submodule in module.modules():
+                if isinstance(submodule, FSDPModule):
+                    continue
+                if hasattr(submodule, '_fsdp_parent_module'):
+                    continue
+                submodule._fsdp_parent_module = weakref.ref(module)
 
         if enable_cuda_graph:
             if len(forward_order) > 1:

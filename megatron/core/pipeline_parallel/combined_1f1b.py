@@ -2,9 +2,10 @@
 
 import contextlib
 from contextlib import nullcontext
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
+import torch.nn as nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
@@ -19,6 +20,128 @@ from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+# ---------------------------------------------------------------------------
+# FSDP version-agnostic helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_mfsdp_root_module(model: nn.Module) -> Optional[nn.Module]:
+    """Return the root Megatron FSDP module, or ``None`` if not using M-FSDP.
+
+    Supports both v1 (``MegatronFSDP``) and v2 (``FSDPModule``) via duck
+    typing.  For v2 the model may be wrapped in ``FullyShardedDataParallel``,
+    so we walk the sub-modules.
+    """
+    # v1: the model object itself may be the MegatronFSDP wrapper
+    v1 = find_megatron_fsdp(model)
+    if v1 is not None:
+        return v1
+
+    # v2: walk sub-modules to find the root FSDPModule
+    v2_modules: List[nn.Module] = []
+    for child in model.modules():
+        if hasattr(child, '_fsdp_state'):
+            v2_modules.append(child)
+            if getattr(child._fsdp_state, '_is_root', False):
+                return child
+
+    if v2_modules:
+        raise RuntimeError(
+            "Found M-FSDP v2 modules but none marked as root. "
+            "Ensure the root FSDP module has _fsdp_state._is_root = True. "
+            "This is normally set by fully_shard() on the outermost module. "
+            f"v2 modules found: {[m.__class__.__name__ for m in v2_modules[:5]]}"
+        )
+
+    return None
+
+
+def _get_mfsdp_post_backward_final_callback(root_module: nn.Module):
+    """Return a ``post_backward_final_callback`` callable for *root_module*.
+
+    v1: ``root_module.post_backward`` (MegatronFSDP._root_post_backward).
+    v2: ``mfsdp_post_backward_final_callback`` from the v2 hooks module.
+    """
+    # v2
+    if hasattr(root_module, '_fsdp_root_context'):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_final_callback,
+        )
+        return mfsdp_post_backward_final_callback
+
+    # v1
+    return root_module.post_backward
+
+
+def _get_mfsdp_pre_backward_setup(root_module: nn.Module):
+    """Return a ``pre_backward_setup(hook_module, grads, *, skip_final_callback)``
+    callable for *root_module*.
+
+    v1: calls ``root_module.pre_backward()`` (which has *skip_backward_hook*
+    semantics baked in via the stored partial).
+    v2: ``mfsdp_pre_backward_setup`` from the v2 hooks module.
+    """
+    # v2
+    if hasattr(root_module, '_fsdp_root_context'):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_pre_backward_setup,
+        )
+
+        def _v2_pre_backward(hook_module, grads=None, *, skip_final_callback=True):
+            mfsdp_pre_backward_setup(
+                hook_module, grads, skip_final_callback=skip_final_callback
+            )
+
+        return _v2_pre_backward
+
+    # v1: MegatronFSDP.pre_backward is a partial of _root_pre_backward with
+    # skip_backward_hook=True — exactly what the overlap schedule needs.
+    return root_module.pre_backward
+
+
+def _get_mfsdp_reshard_hooks(root_module: nn.Module):
+    """Return ``(post_forward_hook, post_backward_hook)`` for per-layer
+    parameter release in the overlap schedule.
+
+    v1: ``(post_forward_release_module, post_backward_release_module)``.
+    v2: ``(mfsdp_post_forward_hook, mfsdp_post_backward_hook)`` — these
+        assert ``isinstance(FSDPModule)``, which is satisfied because the
+        schedule plan layer is an FSDPModule.
+    """
+    # v2
+    if hasattr(root_module, '_fsdp_root_context'):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_hook,
+            mfsdp_post_forward_hook,
+        )
+        return mfsdp_post_forward_hook, mfsdp_post_backward_hook
+
+    # v1
+    return root_module.post_forward_release_module, root_module.post_backward_release_module
+
+
+def _get_mfsdp_sharding_strategy(root_module: nn.Module) -> Optional[str]:
+    """Return the data-parallel sharding strategy string, or ``None``."""
+    # v2
+    if hasattr(root_module, '_fsdp_root_context'):
+        for child in root_module.modules():
+            if hasattr(child, '_fsdp_param_groups'):
+                for pg in child._fsdp_param_groups:
+                    return pg.sharding_strategy
+        return "no_shard"
+
+    # v1
+    if hasattr(root_module, 'ddp_config'):
+        return root_module.ddp_config.data_parallel_sharding_strategy
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -54,13 +177,17 @@ def combined_1f1b_schedule_for_no_pipelining(
     """
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
-    fsdp_wrapper = find_megatron_fsdp(model)
 
-    if fsdp_wrapper is not None:
-        # The overlap schedule bypasses MegatronFSDP.forward(), which normally
-        # swaps distributed (optimizer-managed) parameters back to raw parameters.
-        # We must do this explicitly before the schedule accesses layers directly.
-        fsdp_wrapper._replace_param_with_raw_if_needed()
+    # Resolve FSDP root module (v1 or v2)
+    root_module = _find_mfsdp_root_module(model)
+    is_v1 = root_module is not None and hasattr(root_module, 'ddp_config')
+    is_v2 = root_module is not None and hasattr(root_module, '_fsdp_root_context')
+    is_mfsdp = is_v1 or is_v2
+
+    if is_v1:
+        # v1: swap distributed (optimizer-managed) params → raw params before
+        # the schedule accesses layers directly.
+        root_module._replace_param_with_raw_if_needed()
 
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
@@ -79,6 +206,9 @@ def combined_1f1b_schedule_for_no_pipelining(
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
         current_microbatch=0,
+        root_module=root_module,
+        is_mfsdp=is_mfsdp,
+        is_v1=is_v1,
     )
     # The forward step is executed in parallel with the backward step of another microbatch
     # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
@@ -102,7 +232,9 @@ def combined_1f1b_schedule_for_no_pipelining(
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
                 current_microbatch=(i + 1),
-                fsdp_wrapper=fsdp_wrapper,
+                root_module=root_module,
+                is_mfsdp=is_mfsdp,
+                is_v1=is_v1,
             )
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
@@ -119,7 +251,9 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor,  # b_output_tensor
         output_tensor_grad,  # b_output_tensor_grad
         config,
-        fsdp_wrapper=fsdp_wrapper,
+        root_module=root_module,
+        is_mfsdp=is_mfsdp,
+        is_v1=is_v1,
     )
     return forward_data_store, total_num_tokens
 
@@ -191,12 +325,10 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
 
-    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
-    # _replace_param_with_raw_if_needed() and root pre/post_backward() are not
-    # handled for multi-chunk models in this path.
+    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported.
     if isinstance(model, (list, tuple)):
         for m in model:
-            assert find_megatron_fsdp(m) is None, (
+            assert find_megatron_fsdp(m) is None and _find_mfsdp_root_module(m) is None, (
                 "EP overlap 1F1B with FSDP is not supported for interleaved "
                 "pipeline parallelism (virtual_pipeline_model_parallel_size > 1). "
                 "Use pipeline_model_parallel_size=1 or disable FSDP."
@@ -289,7 +421,9 @@ def combined_forward_backward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
-    fsdp_wrapper=None,
+    root_module=None,
+    is_mfsdp=False,
+    is_v1=False,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -303,6 +437,12 @@ def combined_forward_backward_step(
             pre_backward (callable): The function to call before the backward_step.
             post_forward (callable): The function to call after the forward_step.
             post_backward (callable): The function to call after the backward_step.
+
+        root_module: Root Megatron FSDP module (v1 ``MegatronFSDP`` or v2 root
+            ``FSDPModule``), or ``None`` if FSDP is not in use.
+        is_mfsdp: ``True`` if FSDP is active (v1 or v2).
+        is_v1: ``True`` if using v1 (``MegatronFSDP`` with ``ddp_config``);
+            ``False`` for v2.
 
     Returns:
         forward_output_tensor (Tensor or list[Tensor]): The output object(s) from the forward step.
@@ -335,8 +475,12 @@ def combined_forward_backward_step(
 
     from .schedules import set_current_microbatch
 
-    if fsdp_wrapper is not None and b_model is not None:
-        fsdp_wrapper.pre_backward()
+    if is_mfsdp and b_model is not None:
+        if is_v1:
+            root_module.pre_backward()
+        else:
+            pre_backward_fn = _get_mfsdp_pre_backward_setup(root_module)
+            pre_backward_fn(root_module, skip_final_callback=True)
 
     if f_model is not None and config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -387,20 +531,15 @@ def combined_forward_backward_step(
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
         # Only needed for optim_grads_params strategy (where params are sharded).
-        forward_fsdp_wrapper = find_megatron_fsdp(f_model)
-        if (
-            forward_fsdp_wrapper is not None
-            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
-            == "optim_grads_params"
-        ):
-            for i in range(f_schedule_plan.num_layers()):
-                layer_plan = f_schedule_plan.get_layer(i)
-                # Wire explicit FSDP reshard hooks for the EP-overlap schedule,
-                # which bypasses the normal TransformerLayer-level FSDP hooks.
-                layer_plan.set_fsdp_reshard_hooks(
-                    forward_fsdp_wrapper.post_forward_release_module,
-                    forward_fsdp_wrapper.post_backward_release_module,
-                )
+        if is_mfsdp:
+            f_root = _find_mfsdp_root_module(f_model)
+            if f_root is not None:
+                sharding_strategy = _get_mfsdp_sharding_strategy(f_root)
+                if sharding_strategy == "optim_grads_params":
+                    post_fwd, post_bwd = _get_mfsdp_reshard_hooks(f_root)
+                    for i in range(f_schedule_plan.num_layers()):
+                        layer_plan = f_schedule_plan.get_layer(i)
+                        layer_plan.set_fsdp_reshard_hooks(post_fwd, post_bwd)
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
@@ -497,7 +636,11 @@ def combined_forward_backward_step(
         if unwrap_input_tensor_grad:
             input_tensor_grad = input_tensor_grad[0]
 
-    if fsdp_wrapper is not None and b_model is not None:
-        fsdp_wrapper.post_backward()
+    if is_mfsdp and b_model is not None:
+        if is_v1:
+            root_module.post_backward()
+        else:
+            post_backward_fn = _get_mfsdp_post_backward_final_callback(root_module)
+            post_backward_fn(root_module)
 
     return output_tensor, num_tokens, input_tensor_grad
