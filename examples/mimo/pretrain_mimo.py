@@ -74,6 +74,9 @@ def _parse_and_validate() -> argparse.Namespace:
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = args.vocab_size
 
+    # The data iterator is pre-built per rank; the external dataloader passes it through.
+    args.dataloader_type = "external"
+
     return args
 
 
@@ -170,27 +173,20 @@ def main() -> None:
             args.num_floating_point_operations_so_far = 0
         return rt.model, optimizer, opt_param_scheduler
 
-    def _build_data_iterators():
-        from megatron.core.rerun_state_machine import RerunDataIterator
+    def _dataset_provider(train_val_test_num_samples):
+        return rt.data_iterator, None, None
 
-        args.do_train = True
-        args.do_valid = False
-        args.do_test = False
-        train_iter = rt.data_iterator
-        if train_iter is not None and not isinstance(train_iter, RerunDataIterator):
-            train_iter = RerunDataIterator(train_iter)
-        return train_iter, None, None
+    _dataset_provider.is_distributed = True
 
     try:
         pretrain(
             cfg,
-            _noop_provider,
+            _dataset_provider,
             _noop_provider,
             ModelType.encoder_or_decoder,
             mimo_forward_step,
             skip_model_parallel_init=True,
             setup_model_and_optimizer_func=_setup_model_and_optimizer,
-            build_data_iterators_func=_build_data_iterators,
             p2p_communicator=rt.communicator,
             schedule_pg_collection=rt.topology.schedule_pg_collection,
         )

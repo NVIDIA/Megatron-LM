@@ -1045,7 +1045,6 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
     setup_model_and_optimizer_func=None,
-    build_data_iterators_func=None,
     skip_model_parallel_init=False,
 ):
     """Main training program.
@@ -1339,12 +1338,7 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    # The hook (when given) owns the iterators and sets args.do_train/do_valid/do_test.
-    if build_data_iterators_func is not None:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_data_iterators_func()
-        )
-    elif args.virtual_pipeline_model_parallel_size is not None:
+    if args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
