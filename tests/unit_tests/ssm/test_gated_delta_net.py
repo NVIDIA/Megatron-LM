@@ -314,7 +314,6 @@ class TestGatedDeltaNet:
         assert base_gdn.recompute_norm_out is False
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
-        assert base_gdn.norm_out_checkpoint is None
         del base_gdn
         torch.cuda.empty_cache()
 
@@ -324,7 +323,148 @@ class TestGatedDeltaNet:
         rec_gdn = build_gdn(rec_config)
         assert rec_gdn.recompute_norm_out is True
         rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
-        assert rec_gdn.norm_out_checkpoint is not None
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
+
+    def test_selective_recompute_gdn_qkv(self):
+        """gdn_qkv discard-output recompute must be numerically exact.
+
+        recompute_modules=["gdn_qkv"] recomputes only the QKV projection +
+        preparation block (in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta)
+        as a discard-output checkpoint. The block is re-run with the same RNG
+        state and shares storage with the discarded outputs, so the output,
+        all parameter grads and the input grad must match the no-recompute
+        baseline bit-for-bit.
+        """
+        gdn = self.gdn
+        gdn.train()
+        assert gdn.recompute_qkv is False
+
+        micro_batch_size = 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(recompute):
+            gdn.recompute_qkv = recompute
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(recompute=False)
+            out_rc, dinput_rc, pgrad_rc = run(recompute=True)
+        finally:
+            gdn.recompute_qkv = False
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(out_rc, out_ref), f"Output not identical ({rank=})"
+        assert torch.equal(dinput_rc, dinput_ref), f"Input grad not identical ({rank=})"
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            assert torch.equal(
+                pgrad_rc[name], pgrad_ref[name]
+            ), f"Grad not identical for {name} ({rank=})"
+
+    def test_selective_recompute_gdn_qkv_and_norm_out(self):
+        """Combined gdn_qkv + gdn_norm_out recompute must be numerically exact.
+
+        recompute_modules=["gdn_qkv", "gdn_norm_out"] enables both discard-output
+        checkpoints. The QKV-prep output ``gate`` feeds the gated-norm block, so the
+        two checkpoints share a CheckpointManager that replays their recompute in
+        forward order (qkv -> norm_out) from a single unified grad hook on the layer
+        output. The output, all parameter grads and the input grad must match the
+        no-recompute baseline bit-for-bit.
+        """
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        def build_gdn(config):
+            gdn_submodules = get_experimental_attention_variant_module_spec(
+                config=config
+            ).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hidden_states):
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            input_grad = hidden_states.grad.detach().clone()
+            return output.detach(), grads, input_grad
+
+        micro_batch_size = 2
+        seq_length = 64
+        base_config = copy.deepcopy(self.transformer_config)
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_qkv", "gdn_norm_out"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline (no recompute) ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_qkv is False
+        assert base_gdn.recompute_norm_out is False
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        hidden_states.grad = None
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        # --- Recompute (both modules) ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_qkv is True
+        assert rec_gdn.recompute_norm_out is True
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
 
         rank = torch.distributed.get_rank()
         assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
