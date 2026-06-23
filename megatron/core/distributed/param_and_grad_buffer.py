@@ -1088,6 +1088,8 @@ class _ParamAndGradBuffer:
             f"layerwise={self._is_layer_wise_buffer} distopt={self.use_distributed_optimizer} "
             f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
             f"padding={_padding} ({_pad_frac:.1%})",
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
         )
 
         if self.has_nvfp4_params:
