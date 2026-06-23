@@ -706,11 +706,21 @@ def log_iteration_profile(
 
 
 def shutdown_rl_profiler():
-    """Shutdown the global RL profiler and export final data."""
+    """Shutdown the global RL profiler and export final data.
+
+    Also closes the per-step inference batch tracer (its data is already on disk;
+    render it offline with tools/rl_logging_viz.py).
+    """
     global _RL_PROFILER
     if _RL_PROFILER:
         _RL_PROFILER.close()
         _RL_PROFILER = None
+    # Close the per-step inference tracer (lazy import keeps non-RL paths light).
+    try:
+        from megatron.core.inference.inference_step_trace import shutdown_inference_step_tracer
+        shutdown_inference_step_tracer()
+    except ImportError:
+        pass
 
 
 # ============================================================================

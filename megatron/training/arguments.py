@@ -2562,14 +2562,22 @@ def _add_rl_args(parser):
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
 
-    # Per-rollout staleness logging (research metric).
+    # Per-step inference batch-size + staleness logging (systems/research metrics).
+    group.add_argument('--rl-log-inference-batch-trace', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Record per-engine-step inference batch sizes (active/waiting/paused, '
+                            'prefill/decode, active tokens) and the in-flight rollout count to '
+                            'per-rank JSONL for offline plotting via megatron.rl.rl_profiling.')
+    group.add_argument('--rl-inference-batch-trace-stride', type=int, default=1,
+                       help='Record every Nth inference step in the batch trace (1 = every step). '
+                            'Increase to reduce trace file size on long runs.')
     group.add_argument('--rl-log-staleness-data', action=argparse.BooleanOptionalAction,
                        default=False,
                        help='Dump labeled per-rollout staleness/length data (per-turn epoch RLE, '
                             'token counts, evictions) to JSONL for per batch/env/group/rollout plots.')
     group.add_argument('--rl-logging-dir', type=str, default=None,
-                       help='Directory for RL logging artifacts (staleness dumps, plots). '
-                            'Defaults to $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.')
+                       help='Directory for RL logging artifacts (staleness dumps, inference traces, '
+                            'plots). Defaults to $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.')
     return parser
 
 def _add_training_args(parser):
