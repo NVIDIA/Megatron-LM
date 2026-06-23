@@ -1604,7 +1604,7 @@ def partition_buckets(
 
     # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
     # all-reduce otherwise), so buckets merged into one group must agree on the effective
-    # per-buffer ``use_distributed_optimizer`` value. The decoupled LayerWise layout
+    # per-buffer ``use_distributed_optimizer``. The decoupled LayerWise layout
     # (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
     # ``use_distributed_optimizer=False`` while sibling buffers keep True; the no-fp8 Case 2 below
     # keeps every bucket in its own group so they never mix, but the merging Cases 1/3 must assert
@@ -1612,7 +1612,8 @@ def partition_buckets(
     _ddp_config = buffers[0].ddp_config
     _decouple = not getattr(_ddp_config, "use_layer_wise_param_layout", True)
 
-    def _bucket_udo(bucket):
+    def _bucket_distopt(bucket):
+        """This bucket's effective ``use_distributed_optimizer``."""
         is_lw = bool(
             bucket.params_list
             and getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False)
@@ -1622,7 +1623,7 @@ def partition_buckets(
         return _ddp_config.use_distributed_optimizer
 
     def _merged_use_distributed_optimizer(merge_buckets):
-        values = {_bucket_udo(bucket) for bucket in merge_buckets}
+        values = {_bucket_distopt(bucket) for bucket in merge_buckets}
         assert len(values) == 1, (
             "Cannot merge buckets with differing effective use_distributed_optimizer into one "
             "bucket group. This happens when the decoupled LayerWise layout "
@@ -1644,28 +1645,28 @@ def partition_buckets(
         ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
-        ordered_udo_values = []
-        buckets_by_udo = {}
+        ordered_distopt_values = []
+        buckets_by_distopt = {}
         for buffer in buffers:
             assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
             for bucket in buffer.buckets:
-                udo = _bucket_udo(bucket)
-                if udo not in buckets_by_udo:
-                    buckets_by_udo[udo] = []
-                    ordered_udo_values.append(udo)
-                buckets_by_udo[udo].append(bucket)
+                distopt = _bucket_distopt(bucket)
+                if distopt not in buckets_by_distopt:
+                    buckets_by_distopt[distopt] = []
+                    ordered_distopt_values.append(distopt)
+                buckets_by_distopt[distopt].append(bucket)
 
         return [
             _ParamAndGradBucketGroup(
-                buckets_by_udo[udo],
+                buckets_by_distopt[distopt],
                 ddp_config,
                 data_parallel_group,
                 data_parallel_world_size,
-                use_distributed_optimizer=udo,
+                use_distributed_optimizer=distopt,
             )
-            for udo in ordered_udo_values
+            for distopt in ordered_distopt_values
         ]
 
     if fp8_buffer is None:
@@ -1707,7 +1708,7 @@ def partition_buckets(
                             buffer.ddp_config,
                             buffer.data_parallel_group,
                             buffer.data_parallel_world_size,
-                            use_distributed_optimizer=_bucket_udo(bucket),
+                            use_distributed_optimizer=_bucket_distopt(bucket),
                         )
                     )
                     if non_fp8_buckets:
@@ -1718,7 +1719,7 @@ def partition_buckets(
                                     buffer.ddp_config,
                                     buffer.data_parallel_group,
                                     buffer.data_parallel_world_size,
-                                    use_distributed_optimizer=_bucket_udo(non_fp8_bucket),
+                                    use_distributed_optimizer=_bucket_distopt(non_fp8_bucket),
                                 )
                             )
 
