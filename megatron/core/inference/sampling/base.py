@@ -28,10 +28,10 @@ class Sampling(ABC):
         """Sample `n` tokens from `logits` and return them.
 
         Args:
-            logits: Logits tensor of shape `[>=n, vocab_size]`.
+            logits: Logits tensor of shape `[1, >=n, vocab_size]`
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
-            gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
+            gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.

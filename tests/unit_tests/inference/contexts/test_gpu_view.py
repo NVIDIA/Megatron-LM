@@ -20,9 +20,13 @@ TOKEN_VIEWS_INT32 = (
 )
 REQUEST_VIEWS_INT32 = (
     "request_in_prefill_status",
-    "request_query_lengths",
     "request_kv_length_offsets",
     "top_k",
+)
+# These two request views reserve a trailing sentinel slot at index `max_requests`
+# (used by the log-prob indexing kernels), so they are sized `max_requests + 1`.
+REQUEST_VIEWS_INT32_WITH_SENTINEL = (
+    "request_query_lengths",
     "active_request_last_token_idxs",
 )
 REQUEST_VIEWS_FLOAT32 = ("temperature", "top_p")
@@ -72,6 +76,10 @@ class TestContextGPUView:
             t = getattr(v, name)
             assert t.dtype == torch.int32
             assert t.shape == (MAX_REQUESTS,)
+        for name in REQUEST_VIEWS_INT32_WITH_SENTINEL:
+            t = getattr(v, name)
+            assert t.dtype == torch.int32
+            assert t.shape == (MAX_REQUESTS + 1,)
         for name in REQUEST_VIEWS_FLOAT32:
             t = getattr(v, name)
             assert t.dtype == torch.float32
