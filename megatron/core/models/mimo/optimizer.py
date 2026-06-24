@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -179,6 +180,9 @@ class MimoOptimizer(MegatronOptimizer):
                     _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
 
+                # Namespace every internal ShardedBase key with the submodule name
+                # so disjoint grids don't collide on shared distributed-optimizer keys.
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
                 sharded_state[name] = module_sd
             else:
                 sharded_state[name] = {}
