@@ -1310,6 +1310,8 @@ class MambaMixer(MegatronModule):
                 "conv1d_bias": 0,
             },
             sharded_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
         # Submodules
         for name, module in self.named_children():
