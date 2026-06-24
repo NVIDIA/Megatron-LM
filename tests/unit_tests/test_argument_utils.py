@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import ast
+import pathlib
 import signal
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
@@ -896,3 +898,90 @@ class TestTrainingConfigMapping:
         assert result.train.train_iters is None
         assert result.train.micro_batch_size is None
         assert result.train.global_batch_size is None
+
+
+# ---------------------------------------------------------------------------
+# Guard against argparse usage that is incompatible with Python >= 3.14
+# ---------------------------------------------------------------------------
+
+
+class TestArgparseBooleanOptionalActionCompat:
+    """Guard against re-introducing argparse usage that breaks on Python >= 3.14.
+
+    Python 3.14 removed support for the ``type``, ``choices``, and ``metavar``
+    keyword arguments on ``argparse.BooleanOptionalAction``. The action always
+    stores a literal ``True``/``False`` constant, so those kwargs were never
+    applied; passing any of them now raises ``TypeError`` at argument-registration
+    time (i.e. before ``parse_args()`` even runs). Interpreters before 3.14 — including
+    CI's 3.12 — silently accept and ignore them, so the only reliable guard is a
+    static scan of the source rather than a runtime ``parse_args()`` call.
+    """
+
+    _INCOMPATIBLE_KWARGS = frozenset({"type", "choices", "metavar"})
+
+    @classmethod
+    def _find_violations(cls, source: str) -> list[tuple[int, list[str]]]:
+        """Return ``(lineno, sorted_bad_kwargs)`` for every offending call in ``source``."""
+        violations = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            uses_boa = any(
+                kw.arg == "action" and "BooleanOptionalAction" in ast.unparse(kw.value)
+                for kw in node.keywords
+            )
+            if not uses_boa:
+                continue
+            bad = sorted(kw.arg for kw in node.keywords if kw.arg in cls._INCOMPATIBLE_KWARGS)
+            if bad:
+                violations.append((node.lineno, bad))
+        return violations
+
+    def test_no_incompatible_kwargs_on_boolean_optional_action(self):
+        """No file under ``megatron/`` may pass type/choices/metavar to BooleanOptionalAction."""
+        import megatron
+
+        # ``megatron`` is a PEP 420 namespace package (no __init__.py), so __file__ is
+        # None; resolve the source root(s) via __path__ instead (it may list a dir twice).
+        roots = list(dict.fromkeys(pathlib.Path(p).resolve() for p in megatron.__path__))
+        violations = []
+        scanned: set[pathlib.Path] = set()
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                if path in scanned:
+                    continue
+                scanned.add(path)
+                source = path.read_text(encoding="utf-8")
+                if "BooleanOptionalAction" not in source:  # cheap prefilter before parsing
+                    continue
+                for lineno, bad in self._find_violations(source):
+                    violations.append(f"{path.relative_to(root.parent)}:{lineno} -> {', '.join(bad)}")
+
+        assert not violations, (
+            "argparse.BooleanOptionalAction rejects type=/choices=/metavar= on Python >= 3.14 "
+            "(they are silently-ignored no-ops on earlier versions). Remove them from:\n  "
+            + "\n  ".join(violations)
+        )
+
+    def test_rl_boolean_flags_register_and_parse_as_bools(self):
+        """The RL on/off flags must register cleanly and yield real bools (no behavior change)."""
+        from megatron.training.arguments import _add_rl_args
+
+        parser = ArgumentParser()
+        _add_rl_args(parser)
+
+        for dest in (
+            "rl_persist_cuda_graphs",
+            "rl_inference_logprobs_is_correction",
+            "rl_use_sequence_packing",
+            "rl_training_cuda_graphs",
+            "rl_skip_bos_token",
+        ):
+            flag = "--" + dest.replace("_", "-")
+            no_flag = "--no-" + dest.replace("_", "-")
+            default = getattr(parser.parse_args([]), dest)
+            enabled = getattr(parser.parse_args([flag]), dest)
+            disabled = getattr(parser.parse_args([no_flag]), dest)
+            assert default is False, dest
+            assert enabled is True and isinstance(enabled, bool), dest
+            assert disabled is False and isinstance(disabled, bool), dest
