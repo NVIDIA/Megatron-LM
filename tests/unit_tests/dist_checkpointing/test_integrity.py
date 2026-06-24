@@ -59,6 +59,8 @@ class TestIntegrity:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_save_verify_integrity_manifest_directly(self, init_model_parallel, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
