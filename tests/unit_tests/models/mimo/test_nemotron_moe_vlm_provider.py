@@ -252,7 +252,7 @@ def test_configs_follow_stock_dtype_args():
     bf16_args = _parse_validate(_build_argv(*_PRESET_20L))
     bf16_configs = [
         nemotron_language_config(bf16_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1),
-        nemotron_projection_config(bf16_args, tp_size=1),
+        nemotron_projection_config(bf16_args, tp_size=1, projection_input_size=5120),
         vision_submodules_spec(bf16_args, pg_collection=None, encoder_grid=None)
         .submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
         .params["transformer_config"],
@@ -265,7 +265,7 @@ def test_configs_follow_stock_dtype_args():
     fp32_args = _parse_validate(_without_flag(_build_argv(*_PRESET_20L), "--bf16"))
     fp32_configs = [
         nemotron_language_config(fp32_args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1),
-        nemotron_projection_config(fp32_args, tp_size=1),
+        nemotron_projection_config(fp32_args, tp_size=1, projection_input_size=5120),
     ]
     for config in fp32_configs:
         assert config.params_dtype is torch.float32
@@ -301,6 +301,29 @@ def test_vision_submodules_spec_wires_radio_encoder():
 
     projection = spec.submodules["input_projections"][0]
     assert projection.params["projector_type"] == "affine"
+    assert projection.params["input_size"] == encoder.params["transformer_config"].hidden_size * 4
+    assert projection.params["config"].ffn_hidden_size == projection.params["input_size"] * 4
+
+
+@pytest.mark.parametrize(
+    "pixel_shuffle,expected_projection_input_size", [(True, 5120), (False, 1280)]
+)
+def test_projection_input_size_tracks_pixel_shuffle(pixel_shuffle, expected_projection_input_size):
+    """The projector input width follows the encoder output width."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import vision_submodules_spec
+
+    argv = _build_argv(*_PRESET_20L)
+    if not pixel_shuffle:
+        argv = _without_flag(argv, "--pixel-shuffle")
+    args = _parse_validate(argv)
+    spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+
+    encoder = spec.submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
+    projection = spec.submodules["input_projections"][0]
+
+    assert encoder.params["apply_pixel_shuffle"] is pixel_shuffle
+    assert projection.params["input_size"] == expected_projection_input_size
+    assert projection.params["config"].ffn_hidden_size == 4 * expected_projection_input_size
 
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs

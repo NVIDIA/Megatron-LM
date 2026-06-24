@@ -110,13 +110,25 @@ def require_per_token_loss(config: TransformerConfig) -> None:
         raise ValueError("hetero MIMO training requires calculate_per_token_loss=True")
 
 
-def nemotron_projection_config(args: argparse.Namespace, tp_size: int) -> TransformerConfig:
-    """RADIO-to-Nemotron projection config: stock from-args base + overrides."""
+def _vision_projection_input_size(
+    args: argparse.Namespace, vision_config: TransformerConfig
+) -> int:
+    """Return the encoder output width consumed by the projector."""
+    input_size = int(vision_config.hidden_size)
+    if getattr(args, "pixel_shuffle", False):
+        input_size *= 4
+    return input_size
+
+
+def nemotron_projection_config(
+    args: argparse.Namespace, tp_size: int, projection_input_size: int
+) -> TransformerConfig:
+    """Vision-to-Nemotron projection config: stock from-args base + overrides."""
     config = deepcopy(_base_config(args))
     config.num_layers = 1
     config.hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
-    config.ffn_hidden_size = 4 * 5120
+    config.ffn_hidden_size = 4 * projection_input_size
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
     config.add_bias_linear = False
@@ -200,15 +212,16 @@ def vision_submodules_spec(
 
     vision_config = radio_vision_config(args, tp_size, pp_size)
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
+    projection_input_size = _vision_projection_input_size(args, vision_config)
     # affine -> single linear_fc1; mlp -> fc1+act+fc2 (core MultimodalProjector
     # branches on vision_projection_type).
     vision_projection_spec = ModuleSpec(
         module=MultimodalProjector,
         params={
-            "config": nemotron_projection_config(args, tp_size),
+            "config": nemotron_projection_config(args, tp_size, projection_input_size),
             "submodules": nemotron_projection_layer_spec().submodules,
             "projector_type": args.vision_projection_type,
-            "input_size": 5120,
+            "input_size": projection_input_size,
             "tp_group": tp_pg if is_process_group_member(tp_pg) else None,
         },
     )
