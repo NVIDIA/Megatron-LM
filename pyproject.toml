@@ -267,6 +267,7 @@ markers = [
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
+    "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
 ]
 
 [tool.coverage.run]
