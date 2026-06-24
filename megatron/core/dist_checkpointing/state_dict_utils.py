@@ -4,6 +4,8 @@
 
 from typing import Callable, Union
 
+from megatron.core.perfetto_trace import trace_region
+
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
     CommonStateDict,
@@ -37,9 +39,11 @@ def save_preprocess(
         Tuple[ShardedStateDict, dict]:
             The preprocessed sharded state dictionary and the common state dictionary.
     """
-    apply_factories(sharded_state_dict)
+    with trace_region("apply_factories"):
+        apply_factories(sharded_state_dict)
     _, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
-    sharded_part, common_state_dict = extract_sharded_base(sharded_state_dict)
+    with trace_region("extract_sharded_base"):
+        sharded_part, common_state_dict = extract_sharded_base(sharded_state_dict)
     sharded_part = filter_out_empty_flatten_tensor(sharded_part)
     if validate_access_integrity:
         preprocessed_common_state_dict = common_state_dict
@@ -52,10 +56,11 @@ def save_preprocess(
             preprocessed_common_state_dict = preprocess_common_before_consistancy_check(
                 common_state_dict
             )
-        validate_sharding_integrity(
-            determine_global_metadata(sharded_part)[1],
-            common_state_dict=preprocessed_common_state_dict,
-        )
+        with trace_region("validate_sharding_integrity"):
+            validate_sharding_integrity(
+                determine_global_metadata(sharded_part)[1],
+                common_state_dict=preprocessed_common_state_dict,
+            )
     return sharded_part, common_state_dict
 
 

@@ -398,11 +398,13 @@ def save(
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
-    sharded_state_dict, state_dict = save_preprocess(
-        sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
-    )
+    with trace_region("save_preprocess"):
+        sharded_state_dict, state_dict = save_preprocess(
+            sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
+        )
 
-    save_common(state_dict, checkpoint_dir)
+    with trace_region("save_common"):
+        save_common(state_dict, checkpoint_dir)
 
     def metadata_finalize_fn():
         if torch.distributed.get_rank() == 0:

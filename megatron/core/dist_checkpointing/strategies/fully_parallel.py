@@ -151,12 +151,13 @@ class FullyParallelSaveStrategyWrapper:
             load_distribution = self.cached_load_distribution
         else:
             logger.debug(f'Apply save parallelization')
-            precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict,
-                self.parallelization_group,
-                pg_cache_path=self.pg_cache_path,
-                pg_cache_create=self.pg_cache_create,
-            )
+            with trace_region("determine_main_replica_uniform_distribution"):
+                precomputed_distribution = determine_main_replica_uniform_distribution(
+                    sharded_state_dict,
+                    self.parallelization_group,
+                    pg_cache_path=self.pg_cache_path,
+                    pg_cache_create=self.pg_cache_create,
+                )
             # Local-replica mode needs the load-side picker to decide which
             # shards actually cross-read at load time. We compute it here,
             # *before* the save distribution mutates ``replica_id`` values,
