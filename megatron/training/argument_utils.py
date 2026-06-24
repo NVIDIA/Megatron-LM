@@ -20,6 +20,8 @@ from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
     DistributedInitConfig, 
+    InferenceSetupConfig,
+    InferenceConfigContainer,
     PretrainConfigContainer, 
     SchedulerConfig, 
     TokenizerConfig,
@@ -519,6 +521,65 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
+
+    return cfg
+
+
+def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
+    """Build an InferenceSetupConfig from the argparse arguments.
+
+    InferenceSetupConfig field names map one-to-one onto the argparse ``dest`` names produced
+    by ``_add_inference_args``, so this is a direct copy of the relevant values from ``args``.
+
+    This builds the declarative/serializable inference config. To obtain the runtime engine
+    config (``megatron.core.inference.config.InferenceConfig``), call
+    ``inference_cfg_from_args(args).to_inference_config(model, ...)``.
+    """
+    return _default_config_from_args(InferenceSetupConfig, args)
+
+
+def inference_cfg_container_from_args(
+    args: Namespace, model_cfg=None
+) -> InferenceConfigContainer:
+    """Build an InferenceConfigContainer from the argparse arguments.
+
+    This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
+    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
+    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+
+    Args:
+        args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
+        model_cfg: Optional pre-built model config. If None, a model config is constructed from
+            ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
+            GPTModelConfig).
+    """
+    if model_cfg is None:
+        if getattr(args, "hybrid_layer_pattern", None) is not None:
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            model_cfg = gpt_config_from_args(args)
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    cfg = InferenceConfigContainer(
+        model=model_cfg,
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        inference=inference_cfg_from_args(args),
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        profiling=ProfilingConfig(**prof_kwargs),
     )
 
     return cfg
