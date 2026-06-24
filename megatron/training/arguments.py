@@ -2022,6 +2022,16 @@ def _add_inference_args(parser):
 
 def _add_network_size_args(parser):
     exclude = [
+        # YaRN RoPE: CLI flags are added manually in _add_network_size_args
+        # (--yarn-*), so exclude these fields from auto-generation to avoid
+        # duplicate argparse option strings.
+        "yarn_rotary_scaling_factor",
+        "yarn_original_max_position_embeddings",
+        "yarn_beta_fast",
+        "yarn_beta_slow",
+        "yarn_mscale",
+        "yarn_mscale_all_dim",
+        "yarn_correction_range_round_to_int",
         # cannot provide callables over CLI
         "timers",
         "finalize_model_grads_func",
