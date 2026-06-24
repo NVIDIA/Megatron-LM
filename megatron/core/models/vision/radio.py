@@ -208,6 +208,7 @@ class RADIOViTModel(VisionModule):
         self.ln_pre = None
         self.ln_post = None
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.vp_stage = vp_stage
         if ln_pre_impl is not None:
             self.ln_pre = build_module(
