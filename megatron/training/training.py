@@ -491,6 +491,49 @@ def num_floating_point_operations(
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
+    def mla_attn_layer_flops(
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_head_dim,
+        qk_pos_emb_head_dim,
+        v_head_dim,
+    ):
+        """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
+
+        Mirrors the MLA term in ``transformer_flops`` so the hybrid estimate
+        matches the standard-model estimate per attention layer (the DSv4
+        attention layers -- Window/CSA/HCA -- are all MLA-based). The generic
+        ``attn_layer_flops`` above assumes dense MHA/GQA QKV projections and
+        badly overcounts MLA, whose Q/KV go through low-rank ``lora`` ranks.
+
+        Returns a forward-equivalent value (FMA factor 2 baked in, NO fwd+bwd
+        factor): the caller (``hybrid_flops``) applies the global ``* 3`` for
+        forward + wgrad + dgrad, exactly as for the other layer types.
+        """
+        fma = 2
+        if q_lora_rank is None:
+            q_term = hidden_size * num_heads * (qk_head_dim + qk_pos_emb_head_dim)
+        else:
+            q_term = q_lora_rank * (
+                hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
+            )
+        # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
+        token_linear = fma * (
+            q_term
+            + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
+            + hidden_size * qk_pos_emb_head_dim
+            + (num_heads * v_head_dim) * hidden_size
+        )
+        # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
+        core = fma * (
+            num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
+        )
+        return token_linear * total_tokens + core * seqlen_squared_sum
+
     def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
@@ -545,12 +588,23 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0,
+                     multi_latent_attention=False, q_lora_rank=None, kv_lora_rank=0,
+                     qk_head_dim=0, qk_pos_emb_head_dim=0, v_head_dim=0):
         """Calculate total FLOPs for the hybrid model."""
+        # DSv4 attention layers (Window/CSA/HCA) are MLA-based: use the same MLA
+        # formula as the standard-model path, not the dense MHA/GQA one.
+        if multi_latent_attention:
+            attn_flops_per_layer = mla_attn_layer_flops(total_tokens, seqlen_squared_sum,
+                                                        hidden_size, num_attn_heads,
+                                                        q_lora_rank, kv_lora_rank, qk_head_dim,
+                                                        qk_pos_emb_head_dim, v_head_dim)
+        else:
+            attn_flops_per_layer = attn_layer_flops(total_tokens, seqlen_squared_sum,
+                                                    hidden_size, num_attn_heads, gqa,
+                                                    gqa_groups, kv_channels)
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
-                                                   hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
+                num_attn_layers * attn_flops_per_layer +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_layer_flops(total_tokens, hidden_size,
@@ -1015,10 +1069,17 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
-            )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
+        num_mamba_layers, num_gdn_layers, num_mlp_layers, num_moe_layers = itemgetter(
+            Symbols.MAMBA, Symbols.GDN, Symbols.MLP, Symbols.MOE
+        )(layer_counts)
+        # Attention layers = plain ATTENTION ('*') PLUS every MLA variant
+        # (DS_ATTENTION 'D', CSA 'C', HCA 'H', WINDOW 'W'). Previously only '*'
+        # was counted, so a DSv4 pattern (all C/H/W, zero '*') yielded
+        # num_attn_layers=0 and dropped ALL attention FLOPs from the estimate,
+        # roughly halving the reported throughput vs. the gpt_model.
+        num_attn_layers = layer_counts[Symbols.ATTENTION] + sum(
+            layer_counts[s] for s in Symbols.MLA_ATTENTION
         )
 
         mtp_num_layers = args.mtp_num_layers
@@ -1057,6 +1118,12 @@ def num_floating_point_operations(
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            multi_latent_attention=args.multi_latent_attention,
+            q_lora_rank=args.q_lora_rank,
+            kv_lora_rank=args.kv_lora_rank,
+            qk_head_dim=args.qk_head_dim,
+            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+            v_head_dim=args.v_head_dim,
         )
     else:
         # Compute standard Transformer model FLOPs.

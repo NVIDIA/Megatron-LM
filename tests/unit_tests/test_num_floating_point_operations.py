@@ -254,6 +254,32 @@ class TestHybridTHDScaling:
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
 
+    def test_mla_attention_variants_are_counted(self):
+        """Regression: DSv4 MLA attention variants (CSA 'C', HCA 'H', Window 'W',
+        DS_ATTENTION 'D') must contribute attention FLOPs. Previously only the
+        plain ATTENTION symbol '*' was counted, so a pattern made entirely of
+        C/H/W layers reported ZERO attention FLOPs -- roughly halving the
+        throughput estimate vs. the equivalent gpt_model."""
+        args = _make_hybrid_args()
+        args.multi_latent_attention = True
+        # MLA dims (DSv4-like; values only need to be self-consistent and positive).
+        args.q_lora_rank = 256
+        args.kv_lora_rank = 32
+        args.qk_head_dim = 64
+        args.qk_pos_emb_head_dim = 32
+        args.v_head_dim = 64
+        batch_size = 4
+
+        # Two MLA attention layers (C, H) + two Mamba layers.
+        args.hybrid_layer_pattern = "CMHM"
+        flops_with_attn = num_floating_point_operations(args, batch_size)
+        # Same shape but the attention layers replaced by Mamba (no attention at all).
+        args.hybrid_layer_pattern = "MMMM"
+        flops_no_attn = num_floating_point_operations(args, batch_size)
+
+        # The C/H layers must add real attention FLOPs (the old bug made this 0).
+        assert flops_with_attn > flops_no_attn
+
 
 class TestPaddingRemoval:
     """``total_real_tokens_in_batch`` removes padding from token-linear FLOPs.
