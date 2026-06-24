@@ -421,6 +421,7 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"weight{idx}", None)
             else:
+                op.register_parameter("weight", None)
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
 
@@ -432,6 +433,7 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", None)
             else:
+                op.register_parameter("bias", None)
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
