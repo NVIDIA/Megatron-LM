@@ -622,6 +622,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.ckpt_format} distributed checkpoint format')
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    dp_rank = 0
+    expt_dp_rank = 0
+    if torch.distributed.is_initialized():
+        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+        expt_dp_rank = (
+            get_pg_rank(expt_dp_group)
+            if expt_dp_group is not None
+            else mpu.get_expert_data_parallel_rank()
+        )
 
     # Collect args, model, RNG.
     # For LEGACY checkpoints, every unique (tp_rank, ep_rank) shard must be written by
@@ -630,8 +639,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
     if not torch.distributed.is_initialized() \
             or ckpt_type != CheckpointType.LEGACY \
-            or mpu.get_data_parallel_rank() == 0 \
-            or mpu.get_expert_data_parallel_rank() == 0:
+            or dp_rank == 0 \
+            or expt_dp_rank == 0:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
             if args.use_distributed_optimizer:
