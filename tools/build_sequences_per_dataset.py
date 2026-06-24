@@ -60,7 +60,14 @@ def get_paths_from_blend(
 def build_sequences_per_dataset(args):
     print("Building sequences per dataset...")
 
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = get_blend_and_blend_per_split(
+        data_paths=args.data_path,
+        data_args_path=args.data_args_path,
+        per_split_data_args_path=args.per_split_data_args_path,
+        train_data_paths=args.train_data_path,
+        valid_data_paths=args.valid_data_path,
+        test_data_paths=args.test_data_path,
+    )
 
     file_prefixes = get_paths_from_blend(blend, blend_per_split)
 

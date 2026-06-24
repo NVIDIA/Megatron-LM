@@ -96,8 +96,35 @@ class BlendedMegatronDatasetConfig:
        Requires all the dataset caches to be built.
     """
 
+    dataloader_type: Optional[str] = None
+    """The dataloader / sampler strategy used to build the torch DataLoader on top of the dataset:
+       'single' (sequential), 'cyclic' (randomized, resumable), 'batch' (full-global-batch, for
+       variable-length fine-tuning), or 'external' (the dataset is passed through untouched). When
+       None, the consuming training loop selects a default. Carried here so a config container can
+       drive data-loader construction without reading global args.
+    """
+
+    num_workers: int = 2
+    """Number of subprocesses used by the torch DataLoader for data loading."""
+
+    data_sharding: bool = True
+    """Whether the randomized ('cyclic') sampler shards the dataset into per-rank buckets before
+       shuffling. Only consulted by MegatronPretrainingRandomSampler.
+    """
+
+    pin_memory: bool = True
+    """Whether the torch DataLoader pins host memory for faster host-to-device transfer."""
+
+    persistent_workers: bool = True
+    """Whether the torch DataLoader keeps worker subprocesses alive between epochs.
+       Forced to False when num_workers == 0.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
+        # Persistent workers require at least one worker subprocess.
+        if self.num_workers == 0 and self.persistent_workers:
+            self.persistent_workers = False
         if self.fast_cache_load:
             assert (
                 self.path_to_cache is not None
@@ -150,6 +177,50 @@ class BlendedMegatronDatasetConfig:
             split_vector = parse_and_normalize_split(self.split)
             self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
             log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+
+        # Tokenizer-dependent state is materialized eagerly when a tokenizer was
+        # supplied at construction (backwards compatible). When the tokenizer is
+        # deferred (None) -- e.g. for an early, serializable config container that
+        # is built before the tokenizer exists -- call ``finalize(tokenizer)``
+        # later to complete it.
+        if self.tokenizer is not None:
+            self._finalize_with_tokenizer()
+
+    def _finalize_with_tokenizer(self) -> None:
+        """Run tokenizer-dependent validation / derivation.
+
+        Subclasses override this to compute fields that require a built tokenizer.
+        The base config has no tokenizer-derived state, so this is a no-op here.
+        Split into its own method (rather than living inline in ``__post_init__``)
+        so it can be deferred and re-run by ``finalize`` once the tokenizer is
+        available.
+        """
+        pass
+
+    def finalize(self, tokenizer=None) -> "BlendedMegatronDatasetConfig":
+        """Materialize tokenizer-dependent state once the tokenizer is built.
+
+        Config containers are constructed early as a declarative job description,
+        before heavy / environment-specific objects like the tokenizer exist. This
+        injects an already-built ``tokenizer`` and runs the deferred
+        tokenizer-dependent setup. Build the tokenizer via the usual mechanism and
+        pass it here so tokenizer construction stays in its current place / ranks.
+
+        Args:
+            tokenizer: The built tokenizer to inject. If None, the config must
+                already carry one (e.g. supplied at construction).
+
+        Returns:
+            self, for chaining.
+        """
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        assert self.tokenizer is not None, (
+            "Dataset config has no tokenizer; call finalize(tokenizer) with a built "
+            "tokenizer before using the config to build datasets."
+        )
+        self._finalize_with_tokenizer()
+        return self
 
 
 def parse_and_normalize_split(split: str) -> List[float]:

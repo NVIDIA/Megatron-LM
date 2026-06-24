@@ -5,18 +5,17 @@ import json
 import os
 import sys
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from collections import defaultdict
 from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-
 from megatron.core._slurm_utils import resolve_slurm_local_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import open_file
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -36,17 +35,16 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
     unwrap_model,
 )
-
-from megatron.core.transformer.module import param_is_not_shared
+from megatron.training import get_adlr_autoresume, get_args, get_timers
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -472,30 +470,51 @@ def get_device_arch_version():
     return torch.cuda.get_device_properties(torch.device("cuda:0")).major
 
 
-def get_blend_and_blend_per_split(args):
-    """Get blend and blend_per_split from passed-in arguments."""
-    use_data_path = args.data_path is not None or args.data_args_path is not None
+def get_blend_and_blend_per_split(
+    data_paths=None,
+    data_args_path=None,
+    per_split_data_args_path=None,
+    train_data_paths=None,
+    valid_data_paths=None,
+    test_data_paths=None,
+):
+    """Determine dataset blends from explicit path lists / config files.
+
+    This helper is intentionally decoupled from ``argparse``: callers that have an
+    argparse ``Namespace`` pass the individual path fields explicitly (e.g.
+    ``get_blend_and_blend_per_split(data_paths=args.data_path, ...)``), keeping the
+    args-coupling at the call site rather than inside the reusable helper.
+
+    Args:
+        data_paths: Paths/weights for a single blended dataset.
+        data_args_path: File of whitespace-separated paths/weights for one blend.
+        per_split_data_args_path: JSON file with train/valid/test path lists.
+        train_data_paths: Paths/weights for the train split only.
+        valid_data_paths: Paths/weights for the valid split only.
+        test_data_paths: Paths/weights for the test split only.
+
+    Returns:
+        Tuple ``(blend, blend_per_split)``; exactly one is non-None.
+    """
+    use_data_path = data_paths is not None or data_args_path is not None
     use_per_split_data_path = (
-        any(
-            elt is not None
-            for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]
-        )
-        or args.per_split_data_args_path is not None
+        any(elt is not None for elt in [train_data_paths, valid_data_paths, test_data_paths])
+        or per_split_data_args_path is not None
     )
 
     blend = None
     blend_per_split = None
     if use_data_path:
-        if args.data_args_path is not None:
-            assert args.data_path is None
-            with open_file(args.data_args_path, 'r') as f:
+        if data_args_path is not None:
+            assert data_paths is None
+            with open_file(data_args_path, 'r') as f:
                 blend = get_blend_from_list(f.read().split())
         else:
-            assert args.data_path is not None
-            blend = get_blend_from_list(args.data_path)
+            assert data_paths is not None
+            blend = get_blend_from_list(data_paths)
     elif use_per_split_data_path:
-        if args.per_split_data_args_path is not None:
-            with open_file(args.per_split_data_args_path, 'r') as f:
+        if per_split_data_args_path is not None:
+            with open_file(per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
                 # Each element in blend_per_split should be a list of files (and optional
                 # weights), so split string if needed.
@@ -510,9 +529,9 @@ def get_blend_and_blend_per_split(args):
                 ]
         else:
             blend_per_split = [
-                get_blend_from_list(args.train_data_path),
-                get_blend_from_list(args.valid_data_path),
-                get_blend_from_list(args.test_data_path),
+                get_blend_from_list(train_data_paths),
+                get_blend_from_list(valid_data_paths),
+                get_blend_from_list(test_data_paths),
             ]
     else:
         blend, blend_per_split = None, None
