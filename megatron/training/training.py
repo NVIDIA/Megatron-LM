@@ -1013,6 +1013,9 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    skip_model_parallel_init=False,
 ):
     """Main training program.
 
@@ -1071,11 +1074,25 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
+    init_pg_collection = None
+    if schedule_pg_collection is not None:
+        init_pg_collection = (
+            schedule_pg_collection.get_language_model_collection()
+            if schedule_pg_collection.has_language_model()
+            else next(iter(schedule_pg_collection.module_pgs.values()))
+        )
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
+        skip_model_parallel_init=skip_model_parallel_init,
+        seed_pp_group=getattr(init_pg_collection, "pp", None),
+        seed_dp_group=getattr(init_pg_collection, "dp", None),
+        seed_tp_group=getattr(init_pg_collection, "tp", None),
+        seed_ep_group=getattr(init_pg_collection, "ep", None),
+        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1091,8 +1108,8 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
+    set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1393,6 +1410,8 @@ def pretrain(
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
+                p2p_communicator=p2p_communicator,
+                schedule_pg_collection=schedule_pg_collection,
             )
 
         print_datetime('after training is done')
@@ -2523,7 +2542,10 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
+    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
+        learning_rate, group=_lr_mp_group
+    )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
@@ -2678,9 +2700,7 @@ def training_log(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (
-            elapsed_time_per_iteration * 10**12 * args.world_size
-        )
+        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2764,7 +2784,10 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
-            report_memory(f'(after {iteration} iterations)')
+            report_memory(
+                f'(after {iteration} iterations)',
+                process_group=pg_collection.dp if pg_collection is not None else None,
+            )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
             if iteration > (loaded_iteration + 1):
@@ -2772,7 +2795,10 @@ def training_log(
                 report_memory_flag = False
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
-            report_memory(f'(after {iteration} iterations)')
+            report_memory(
+                f'(after {iteration} iterations)',
+                process_group=pg_collection.dp if pg_collection is not None else None,
+            )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
         if args.rl_profile:
@@ -2890,6 +2916,18 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+
+    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
+    # falls back to the mpu groups inside save_checkpoint (byte-identical).
+    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
+    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
+    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
+    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2901,6 +2939,12 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_cp_group=dp_cp_group,
+        dp_group=dp_group,
+        expt_dp_group=expt_dp_group,
+        rng_state_key_prefix=rng_state_key_prefix,
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -3233,6 +3277,19 @@ def train(
 
             args.no_load_optim = no_load_optim
 
+    lang_pgc = (
+        schedule_pg_collection.get_language_model_collection()
+        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
+        else None
+    )
+
+    def _dp_world_size():
+        if lang_pgc is not None:
+            return lang_pgc.dp.size()
+        if mpu.model_parallel_is_initialized():
+            return mpu.get_data_parallel_world_size()
+        return args.data_parallel_size
+
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
@@ -3248,7 +3305,7 @@ def train(
             rank=args.rank,
             global_batch_size=args.global_batch_size,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_size=_dp_world_size(),
             decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
             step_batch_size_schedule=args.step_batch_size_schedule,
             seq_length=args.seq_length,
@@ -3566,7 +3623,7 @@ def train(
                 start_iteration = iteration + 1
             iteration += 1
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
@@ -3693,12 +3750,12 @@ def train(
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_bins += bin_count
         else:
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             iteration_sequences = batch_size
 
