@@ -372,13 +372,13 @@ def get_rng_state(
     ckpt_format: str,
     tp_group: torch.distributed.ProcessGroup,
     pp_group: torch.distributed.ProcessGroup,
-    key_prefix: str = '',
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    key_prefix: str = '',
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
-    key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     dp_cp_group threads the data-parallel (with context-parallel) group; None falls back to the mpu API.
+    key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
     rng_state = {
@@ -570,8 +570,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                              key_prefix=rng_state_key_prefix,
-                              dp_cp_group=dp_cp_group)
+                              dp_cp_group=dp_cp_group,
+                              key_prefix=rng_state_key_prefix)
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
@@ -1732,8 +1732,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                                             key_prefix=rng_state_key_prefix,
-                                             dp_cp_group=dp_cp_group)  # we can load the rng state
+                                             dp_cp_group=dp_cp_group,
+                                             key_prefix=rng_state_key_prefix)  # we can load the rng state
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None
