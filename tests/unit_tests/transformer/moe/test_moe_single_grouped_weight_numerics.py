@@ -151,6 +151,7 @@ class TestMoESingleGroupedWeightNumerics:
         primary_param_gather: bool,
         single_weight: bool,
         gradient_accumulation_fusion: bool,
+        use_transformer_engine_op_fuser: bool,
     ):
         self._cleanup()
 
@@ -178,7 +179,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.swiglu = True
         args.gradient_accumulation_fusion = gradient_accumulation_fusion
         args.use_distributed_optimizer = True
-        args.use_transformer_engine_op_fuser = True
+        args.use_transformer_engine_op_fuser = use_transformer_engine_op_fuser
         args.overlap_param_gather = False
         args.overlap_grad_reduce = False
         args.ddp_bucket_size = 40960
@@ -246,15 +247,37 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision == "nvfp4":
             assert any(is_grouped_nvfp4tensor(param) for param in grouped_params)
 
+    def assert_execution_path_is_exercised(
+        self, model, use_transformer_engine_op_fuser: bool, after_forward: bool = False
+    ):
+        grouped_mlps = [
+            module for module in model.modules() if module.__class__.__name__ == "TEGroupedMLP"
+        ]
+        assert grouped_mlps, "Expected at least one TEGroupedMLP module"
+        assert all(
+            module._with_fused_impl == use_transformer_engine_op_fuser
+            for module in grouped_mlps
+        ), "Unexpected TEGroupedMLP execution path"
+        if after_forward:
+            assert all(
+                (module._fused_ops is not None) == use_transformer_engine_op_fuser
+                for module in grouped_mlps
+            ), "Unexpected TEGroupedMLP fused-op construction state"
+
     def run_training_case(
         self,
         precision: str,
         primary_param_gather: bool,
         single_weight: bool,
         gradient_accumulation_fusion: bool,
+        use_transformer_engine_op_fuser: bool,
     ):
         args = self.create_test_args(
-            precision, primary_param_gather, single_weight, gradient_accumulation_fusion
+            precision,
+            primary_param_gather,
+            single_weight,
+            gradient_accumulation_fusion,
+            use_transformer_engine_op_fuser,
         )
         set_args(args)
         torch.manual_seed(_SEED)
@@ -270,6 +293,7 @@ class TestMoESingleGroupedWeightNumerics:
         self.assert_storage_path_is_exercised(
             model[0], precision, primary_param_gather, single_weight
         )
+        self.assert_execution_path_is_exercised(model[0], use_transformer_engine_op_fuser)
 
         losses = []
         for _ in range(self.num_train_steps):
@@ -294,6 +318,9 @@ class TestMoESingleGroupedWeightNumerics:
             assert update_successful
             losses.append(loss.detach().float().cpu())
 
+        self.assert_execution_path_is_exercised(
+            model[0], use_transformer_engine_op_fuser, after_forward=True
+        )
         return torch.stack(losses)
 
     @staticmethod
@@ -330,6 +357,7 @@ class TestMoESingleGroupedWeightNumerics:
         precision: str,
         primary_param_gather: bool,
         gradient_accumulation_fusion: bool,
+        use_transformer_engine_op_fuser: bool,
     ) -> None:
         local_passed = True
         local_error = ""
@@ -339,12 +367,14 @@ class TestMoESingleGroupedWeightNumerics:
                 primary_param_gather=primary_param_gather,
                 single_weight=True,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
+                use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
             )
             discrete_losses = self.run_training_case(
                 precision=precision,
                 primary_param_gather=primary_param_gather,
                 single_weight=False,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
+                use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
             )
             self.assert_loss_parity(precision, single_losses, discrete_losses)
         except Exception:
@@ -364,6 +394,7 @@ class TestMoESingleGroupedWeightNumerics:
             precision=precision,
             primary_param_gather=True,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
+            use_transformer_engine_op_fuser=True,
         )
 
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
@@ -377,4 +408,20 @@ class TestMoESingleGroupedWeightNumerics:
             precision=precision,
             primary_param_gather=False,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
+            use_transformer_engine_op_fuser=True,
+        )
+
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    @pytest.mark.parametrize("primary_param_gather", [False, True])
+    @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
+    def test_single_grouped_weight_parity_module_grouped_linear(
+        self, precision, primary_param_gather, gradient_accumulation_fusion
+    ):
+        """Compare single vs discrete MoE weights through TE module.GroupedLinear."""
+        _skip_if_unsupported(precision)
+        self.run_parity_case(
+            precision=precision,
+            primary_param_gather=primary_param_gather,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
+            use_transformer_engine_op_fuser=False,
         )

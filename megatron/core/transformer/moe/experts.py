@@ -402,12 +402,6 @@ class TEGroupedMLP(MegatronModule):
             return _unsupported(
                 "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set; CuTe DSL fused kernel disabled"
             )
-        if use_glu_fusion and self.config.moe_mlp_glu_interleave_size != 32:
-            return _unsupported(
-                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
-                f"(CuTe DSL GLU fusion requires 32)"
-            )
-
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
