@@ -372,10 +372,12 @@ def get_rng_state(
     ckpt_format: str,
     tp_group: torch.distributed.ProcessGroup,
     pp_group: torch.distributed.ProcessGroup,
+    key_prefix: str = '',
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
+    key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     dp_cp_group threads the data-parallel (with context-parallel) group; None falls back to the mpu API.
     """
     args = get_args()
@@ -405,7 +407,7 @@ def get_rng_state(
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
+        rng_state_list = ShardedObject(f'{key_prefix}rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
                                        replica_id=dp_cp_rank)
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = get_pg_rank(pp_group)
@@ -504,7 +506,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -567,7 +569,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
-    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group)
+    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
+                              key_prefix=rng_state_key_prefix,
+                              dp_cp_group=dp_cp_group)
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
@@ -1642,7 +1646,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1727,9 +1731,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if tp_group is None and pp_group is None:
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
-            gen_sd_rng_state = get_rng_state(
-                args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group
-            )  # we can load the rng state
+            gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
+                                             key_prefix=rng_state_key_prefix,
+                                             dp_cp_group=dp_cp_group)  # we can load the rng state
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None

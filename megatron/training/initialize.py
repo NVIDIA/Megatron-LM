@@ -7,6 +7,7 @@ import random
 import time
 import warnings
 from datetime import timedelta
+from typing import Optional
 
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import get_pg_rank, get_te_version, is_te_min_version, is_torch_min_version
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -393,20 +394,41 @@ def _set_random_seed(
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ep_group: Optional[torch.distributed.ProcessGroup] = None,
+    etp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Set random seed for reproducability."""
+    """Set random seed for reproducability.
+
+    The optional pp/dp/tp/ep/etp groups let a caller without an initialized mpu
+    (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
+    back to the mpu group when None.
+    """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            seed = seed + (10 * mpu.get_data_parallel_rank())
+            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
+            tp_rank = get_pg_rank(tp_group) if tp_group is not None else None
+            ep_rank = get_pg_rank(ep_group) if ep_group is not None else None
+            etp_rank = get_pg_rank(etp_group) if etp_group is not None else None
             tensor_parallel.model_parallel_cuda_manual_seed(
-                seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
+                seed,
+                te_rng_tracker,
+                inference_rng_tracker,
+                use_cudagraphable_rng,
+                tp_rank=tp_rank,
+                ep_rank=ep_rank,
+                etp_rank=etp_rank,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
