@@ -197,6 +197,6 @@ class DistributedDataParallelConfig:
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
 
-        if megatron_fsdp_max_pool_double_buffer:
+        if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
-            fsdp_double_buffer = True
+            self.fsdp_double_buffer = True

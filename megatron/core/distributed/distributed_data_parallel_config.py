@@ -270,6 +270,6 @@ class DistributedDataParallelConfig:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
 
-        if megatron_fsdp_max_pool_double_buffer:
+        if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
-            fsdp_double_buffer = True
+            self.fsdp_double_buffer = True
