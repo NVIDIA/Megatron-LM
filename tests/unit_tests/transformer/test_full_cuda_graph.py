@@ -26,11 +26,7 @@ rank = Utils.rank
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_clone_tensors_in_struct_replaces_none_tensor_slots():
     target = copy_tensors_in_struct(
-        {
-            "tokens": torch.zeros(2, dtype=torch.int64),
-            "optional": None,
-            "nested": {"value": None},
-        }
+        {"tokens": torch.zeros(2, dtype=torch.int64), "optional": None, "nested": {"value": None}}
     )
 
     updated = clone_tensors_in_struct(
