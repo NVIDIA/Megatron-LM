@@ -6,7 +6,12 @@ from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
 
-import yaml
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import MultiStorageClientFeature
@@ -95,6 +100,12 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to load a config from YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
         from omegaconf import OmegaConf
 
         if MultiStorageClientFeature.is_enabled():
@@ -198,6 +209,12 @@ class ConfigContainerBase:
         Args:
             yaml_path: Path where to save the YAML file.
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to save a config to YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
         config_dict = self.to_dict()
 
         with safe_yaml_representers():
@@ -213,6 +230,12 @@ class ConfigContainerBase:
         """
         Print the config container to the console in YAML format.
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to print a config as YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
         config_dict = self.to_dict()
         with safe_yaml_representers():
             print(yaml.safe_dump(config_dict, default_flow_style=False))
