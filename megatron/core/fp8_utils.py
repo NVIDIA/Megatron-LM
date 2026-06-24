@@ -220,9 +220,7 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
     dst.copy_(src.view(dst.shape))
 
 
-def modify_grouped_tensor_rowwise_storage(
-    tensor: torch.Tensor, new_storage: torch.Tensor
-) -> None:
+def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
     """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
     tensor = _unwrap_parameter_data(tensor)
     if not is_grouped_tensor(tensor):
