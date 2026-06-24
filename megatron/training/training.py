@@ -3265,9 +3265,6 @@ def train(
 
             args.no_load_optim = no_load_optim
 
-    # Resolve the language-model process groups when a hetero MultiModule collection
-    # is passed; None for stock single-module runs, which fall back to the global
-    # mpu groups below (byte-identical behavior).
     lang_pgc = (
         schedule_pg_collection.get_language_model_collection()
         if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
