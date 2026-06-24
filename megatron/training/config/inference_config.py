@@ -136,6 +136,12 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
+    inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
+        "raw_logprobs"
+    )
+    """How returned inference log-probs are computed engine-wide. "raw_logprobs" (default) uses the
+    unmodified model logits; "processed_logprobs" uses temperature and filters by top-k/top-p."""
+
     # ---------------- CUDA graphs ----------------
 
     decode_only_cuda_graphs: bool = False
@@ -353,4 +359,5 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )
