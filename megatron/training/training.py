@@ -72,10 +72,10 @@ import torch
 try:
     from megatron.rl import rl_utils
     from megatron.rl.rl_profiling import (
+        RL_LOGGABLE_TIMER_NAMES,
         initialize_rl_profiler,
         log_iteration_profile,
         shutdown_rl_profiler,
-        RL_LOGGABLE_TIMER_NAMES,
     )
     has_rl_utils = True
 except ImportError:
@@ -106,13 +106,13 @@ from megatron.core.optimizer import get_mup_config_overrides, get_standard_confi
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -120,12 +120,6 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
