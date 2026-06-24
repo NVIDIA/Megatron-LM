@@ -2497,12 +2497,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
-
-        Args:
-            None.
-
-        Returns:
-            None: This method resets context bookkeeping in place.
         """
 
         # Reset request/token counts.
@@ -3372,9 +3366,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Args:
             new_tokens (Tensor): Newly sampled token for each active request.
-
-        Returns:
-            None: This method updates the context state in place.
         """
         if new_tokens.is_cuda:
             new_tokens = new_tokens.cpu()

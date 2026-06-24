@@ -400,9 +400,6 @@ def dump_inference_results_to_json(
         lifetime_prefill_token_count (int): Total prefill tokens processed.
         deferred_resolution_compaction_step_count (int): Number of deferred
             decode steps where post-forward compaction discarded finished rows.
-
-    Returns:
-        None: This function writes JSON when ``args.output_path`` is set.
     """
     if not args.output_path:
         return

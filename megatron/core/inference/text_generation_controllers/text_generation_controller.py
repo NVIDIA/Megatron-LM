@@ -84,22 +84,12 @@ class DecodeForwardPrimer:
         Args:
             cuda_graph_request_count (Optional[int]): CUDA graph request count
                 for the primed forward, or `None` when CUDA graphs were not used.
-
-        Returns:
-            None: This method updates primer state in place.
         """
         self.is_primed = True
         self.cuda_graph_request_count = cuda_graph_request_count
 
     def clear(self) -> None:
-        """Clear any primed-forward state.
-
-        Args:
-            None.
-
-        Returns:
-            None: This method updates primer state in place.
-        """
+        """Clear any primed-forward state."""
         self.is_primed = False
         self.cuda_graph_request_count = None
 
@@ -272,12 +262,7 @@ class TextGenerationController:
     def _validate_deferred_resolution_support_for_step(self) -> None:
         """Validate controller/context state for deferred request resolution.
 
-        Args:
-            None.
-
-        Returns:
-            None: This method raises if the current step does not support
-            deferred request resolution.
+        Raises if the current step does not support deferred request resolution.
         """
         context = self.inference_wrapped_model.inference_context
         if not context.config.materialize_only_last_token_logits:
@@ -326,9 +311,6 @@ class TextGenerationController:
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
                 active after deferred request resolution.
-
-        Returns:
-            None: This method updates cached logits in place.
         """
         if survivor_idxs.numel() == 0:
             self._decode_forward_primer.clear()
@@ -781,9 +763,6 @@ class TextGenerationController:
 
     def _run_deferred_resolution_forward(self) -> Optional[int]:
         """Run one dynamic forward pass and cache logits for deferred resolution.
-
-        Args:
-            None.
 
         Returns:
             Optional[int]: CUDA graph request count for the forward pass, or
@@ -1983,9 +1962,6 @@ class TextGenerationController:
 
     async def _run_deferred_resolution_step(self) -> Optional[Dict]:
         """Run one decode-only step using deferred request resolution.
-
-        Args:
-            None.
 
         Returns:
             Optional[Dict]: Step result for sampled and finished requests, or
