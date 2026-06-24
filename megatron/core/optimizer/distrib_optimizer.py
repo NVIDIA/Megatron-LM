@@ -1115,11 +1115,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Check if tensor should follow quantized parameter path in dist optimizer."""
         return is_float8tensor(tensor) or cls._is_grouped_quantized_tensor(tensor)
 
-    @staticmethod
-    def _unwrap_parameter_data(tensor: torch.Tensor) -> torch.Tensor:
-        """Return tensor subclass data when PyTorch wraps it as a Parameter."""
-        return tensor.data if isinstance(tensor, torch.nn.Parameter) else tensor
-
     @classmethod
     def _get_grouped_quantized_members(cls, tensor: torch.Tensor) -> List[torch.Tensor]:
         """Return cached member tensors from a grouped quantized parameter."""
