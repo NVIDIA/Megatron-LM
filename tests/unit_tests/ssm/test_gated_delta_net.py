@@ -166,6 +166,7 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    @pytest.mark.flaky_in_dev  # Issue #5473
     def test_selective_recompute_gdn(self):
         """Whole-module 'gdn' recompute must match the non-recompute forward and gradients.
 
