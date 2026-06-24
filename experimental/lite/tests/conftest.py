@@ -49,8 +49,11 @@ def transformer_engine_import_stub(monkeypatch):
             import transformer_engine.pytorch  # noqa: F401
 
             return
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"transformer_engine", "transformer_engine.pytorch"}:
+        except (ModuleNotFoundError, OSError) as exc:
+            if isinstance(exc, ModuleNotFoundError) and exc.name not in {
+                "transformer_engine",
+                "transformer_engine.pytorch",
+            }:
                 raise
 
         class _UnavailableTE:
@@ -64,8 +67,38 @@ def transformer_engine_import_stub(monkeypatch):
         pytorch.LayerNormLinear = _UnavailableTE
         pytorch.Linear = _UnavailableTE
         pytorch.RMSNorm = _UnavailableTE
+        permutation = types.ModuleType("transformer_engine.pytorch.permutation")
+        router = types.ModuleType("transformer_engine.pytorch.router")
+        cpp_extensions = types.ModuleType("transformer_engine.pytorch.cpp_extensions")
+        module = types.ModuleType("transformer_engine.pytorch.module")
+        module_base = types.ModuleType("transformer_engine.pytorch.module.base")
+
+        def unavailable_kernel(*args, **kwargs):
+            raise RuntimeError("Transformer Engine fused kernel is not installed.")
+
+        permutation.moe_permute = unavailable_kernel
+        permutation.moe_permute_and_pad_with_probs = unavailable_kernel
+        permutation.moe_permute_with_probs = unavailable_kernel
+        permutation.moe_unpermute = unavailable_kernel
+        router.fused_compute_score_for_moe_aux_loss = unavailable_kernel
+        router.fused_moe_aux_loss = unavailable_kernel
+        router.fused_topk_with_score_function = unavailable_kernel
+        cpp_extensions.general_gemm = lambda *args, **kwargs: None
+        module_base.get_workspace = lambda: None
+        module.base = module_base
+        pytorch.permutation = permutation
+        pytorch.router = router
+        pytorch.cpp_extensions = cpp_extensions
+        pytorch.module = module
         root.pytorch = pytorch
         monkeypatch.setitem(sys.modules, "transformer_engine", root)
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.permutation", permutation)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.router", router)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.cpp_extensions", cpp_extensions
+        )
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module", module)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.base", module_base)
 
     return install

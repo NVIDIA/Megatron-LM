@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from collections.abc import Iterable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 
@@ -54,3 +57,40 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 def apply_runtime_patches() -> None:
     _patch_transformers_rope_ignore_keys()
+
+
+def _load_verl_file(relative_path: str, module_name: str):
+    spec = importlib.util.find_spec("verl")
+    if spec is None or spec.submodule_search_locations is None:
+        raise ModuleNotFoundError("No module named 'verl'")
+
+    path = Path(next(iter(spec.submodule_search_locations))) / relative_path
+    file_spec = importlib.util.spec_from_file_location(module_name, path)
+    if file_spec is None or file_spec.loader is None:
+        raise ImportError(f"Unable to load VERL module from {path}")
+
+    module = importlib.util.module_from_spec(file_spec)
+    sys.modules[module_name] = module
+    file_spec.loader.exec_module(module)
+    return module
+
+
+def load_verl_engine_api():
+    # Prefer the canonical package import so the MLite engine registers into the
+    # SAME EngineRegistry that verl's trainers resolve against. Loading base.py as
+    # a standalone module (below) creates a *duplicate* registry, which silently
+    # drops the mlite backend ("Unknown backend: mlite"). The file-load path is
+    # only a fallback for environments where verl isn't importable as a package.
+    try:
+        from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+        from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
+    except (ModuleNotFoundError, ImportError):
+        base = _load_verl_file("workers/engine/base.py", "_verl_mlite_verl_engine_base")
+        utils = _load_verl_file("workers/engine/utils.py", "_verl_mlite_verl_engine_utils")
+        BaseEngine = base.BaseEngine
+        BaseEngineCtx = base.BaseEngineCtx
+        EngineRegistry = base.EngineRegistry
+        postprocess_batch_func = utils.postprocess_batch_func
+        prepare_micro_batches = utils.prepare_micro_batches
+
+    return BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches

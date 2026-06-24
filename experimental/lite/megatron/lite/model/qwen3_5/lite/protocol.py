@@ -10,15 +10,23 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
+from megatron.lite.model.protocol_utils import (
+    add_cross_entropy_fusion,
+    add_loss_context_kwargs,
+    pack_thd_forward_kwargs,
+    set_cross_entropy_fusion,
+    unpack_thd_forward_output,
+)
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 
 __all__ = [
     "EXPERT_CLASSIFIER",
@@ -28,6 +36,7 @@ __all__ = [
     "build_model_config",
     "export_hf_weights",
     "load_hf_weights",
+    "save_hf_weights",
     "vocab_size",
 ]
 
@@ -39,11 +48,12 @@ def is_expert_param(name: str) -> bool:
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "mc_full"
+    optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
     use_thd: bool = False
+    cross_entropy_fusion: bool = False
     hf_path: str = ""
     attention_backend_override: str | None = None
     router_aux_loss_coef: float | None = None
@@ -56,6 +66,7 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
+    gdn_cp_mode: str = "fla_allgather"
 
 
 def _full_attn_module(layer, name: str):
@@ -86,18 +97,29 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen35Config:
     return cfg
 
 
-def _forward_step(model: nn.Module, batch: dict) -> dict:
-    kwargs: dict[str, Any] = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
-    if "position_ids" in batch:
-        kwargs["position_ids"] = batch["position_ids"]
-    if "packed_seq_params" in batch:
-        kwargs["packed_seq_params"] = batch["packed_seq_params"]
-    for key in ("loss_mask", "temperature", "use_fused_kernels", "calculate_entropy"):
-        if key in batch:
-            kwargs[key] = batch[key]
-    if kwargs["input_ids"].dim() == 1:
-        kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
+    kwargs = pack_thd_forward_kwargs(model, batch)
+    add_loss_context_kwargs(kwargs)
+    add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
+
+
+def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
+    """Dense [b=1, s] forward for a single packed sequence (no THD packing).
+
+    Used for deterministic parity comparison vs a dense Megatron-Core reference:
+    the THD GatedDeltaNet kernel is non-deterministic, whereas the dense path is
+    deterministic. CP=1 only (single unpadded sequence => dense == THD tokens).
+    """
+    input_ids = batch.input_ids.reshape(1, -1)
+    labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
+    kwargs: dict[str, Any] = {"input_ids": input_ids, "labels": labels, "packed_seq_params": None}
+    add_cross_entropy_fusion(kwargs, model)
+    return model(**kwargs)
+
+
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    return unpack_thd_forward_output(model, batch, output)
 
 
 def _make_aux_loss_hook():
@@ -111,10 +133,14 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
+def _build_dist_opt_optimizer(
+    chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState
+):
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_training_optimizer,
+    )
 
-    return build_mc_training_optimizer(
+    return build_dist_opt_training_optimizer(
         chunks,
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
@@ -173,6 +199,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         mount_vision_model=impl_cfg.mount_vision_model,
+        gdn_cp_mode=impl_cfg.gdn_cp_mode,
     )
 
     if vpp is None:
@@ -184,6 +211,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             .cuda()
             for i in range(vpp)
         ]
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:
         for chunk in chunks:
@@ -199,8 +227,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
-    if impl_cfg.optimizer in {"mc", "mc_full"}:
-        optimizer, finalize_grads = _build_mc_optimizer(chunks, model_cfg, impl_cfg, ps)
+    if impl_cfg.optimizer == "dist_opt":
+        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -208,7 +236,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "distopt"
+        optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
@@ -238,7 +266,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         parallel_state=ps,
         optimizer=optimizer,
         finalize_grads=finalize_grads,
-        forward_step=_forward_step,
+        forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         extras={
             "model_cfg": model_cfg,
             "optimizer_backend": optimizer_backend,
@@ -260,6 +288,12 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ):
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(
+    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState
+) -> None:
+    _save_hf_weights_impl(chunks, path, model_cfg, ps)
 
 
 def vocab_size(model_cfg) -> int | None:
