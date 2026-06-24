@@ -48,10 +48,12 @@ def _parse_router_module_name(module_name: str) -> Optional[Tuple[str, Optional[
         decoder.layers.3.mlp.router                         -> ("decoder", None, 3)
         mtp.layers.0.mtp_model_layer.layers.1.mlp.router    -> ("mtp", 0, 1)
     """
-    if m := _MTP_LAYER_RE.search(module_name):
-        return "mtp", int(m.group(1)), int(m.group(2))
-    if m := _DECODER_LAYER_RE.search(module_name):
-        return "decoder", None, int(m.group(1))
+    mtp_match = _MTP_LAYER_RE.search(module_name)
+    if mtp_match:
+        return "mtp", int(mtp_match.group(1)), int(mtp_match.group(2))
+    decoder_match = _DECODER_LAYER_RE.search(module_name)
+    if decoder_match:
+        return "decoder", None, int(decoder_match.group(1))
     return None
 
 
