@@ -72,17 +72,34 @@ def copy_tensors_in_struct(src):
         return src
 
 
+def _static_tensor_matches(tgt, src):
+    """Return whether tgt can be reused as the static CUDA buffer for src."""
+    return (
+        isinstance(tgt, torch.Tensor)
+        and tgt.is_cuda
+        and tgt.shape == src.shape
+        and tgt.dtype == src.dtype
+    )
+
+
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
-        raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
+        if not isinstance(tgt, tuple) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
+        return tuple(clone_tensors_in_struct(t, s) for t, s in zip(tgt, src))
     elif isinstance(src, list):
+        if not isinstance(tgt, list) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
         for i in range(len(src)):
             if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[i], src[i])
+                tgt[i] = clone_tensors_in_struct(tgt[i], src[i])
             else:
                 tgt[i] = src[i]
+        return tgt
     elif isinstance(src, dict):
+        if not isinstance(tgt, dict):
+            return copy_tensors_in_struct(src)
         for k in src:
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[k], src[k])

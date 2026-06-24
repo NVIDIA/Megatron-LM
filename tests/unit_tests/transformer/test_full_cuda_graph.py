@@ -6,7 +6,12 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    clone_tensors_in_struct,
+    copy_tensors_in_struct,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -16,6 +21,48 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_clone_tensors_in_struct_replaces_none_tensor_slots():
+    target = copy_tensors_in_struct(
+        {
+            "tokens": torch.zeros(2, dtype=torch.int64),
+            "optional": None,
+            "nested": {"value": None},
+        }
+    )
+
+    updated = clone_tensors_in_struct(
+        target,
+        {
+            "tokens": torch.ones(2, dtype=torch.int64),
+            "optional": torch.arange(2, dtype=torch.int64),
+            "nested": {"value": torch.full((2,), 3.0)},
+        },
+    )
+
+    assert updated is target
+    assert torch.equal(updated["tokens"].cpu(), torch.ones(2, dtype=torch.int64))
+    assert torch.equal(updated["optional"].cpu(), torch.arange(2, dtype=torch.int64))
+    assert torch.equal(updated["nested"]["value"].cpu(), torch.full((2,), 3.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_static_buffer_loader_keeps_buffer_ids_separate():
+    StaticBufferLoader.static_buffers = {'training': {}, 'validation': {}}
+    loader = StaticBufferLoader()
+
+    first = loader({"tokens": torch.zeros(1), "optional": None}, "training", 0, buffer_id=0)
+    second = loader(
+        {"tokens": torch.ones(1), "optional": torch.ones(1)}, "training", 0, buffer_id=1
+    )
+
+    assert first is StaticBufferLoader.static_buffers["training"][0][0]
+    assert second is StaticBufferLoader.static_buffers["training"][1][0]
+    assert first is not second
+    assert first["optional"] is None
+    assert torch.equal(second["optional"].cpu(), torch.ones(1))
 
 
 @pytest.mark.skipif(
