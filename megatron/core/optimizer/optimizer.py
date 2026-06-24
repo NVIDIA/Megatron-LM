@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -609,6 +610,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
 
+        # Tagged True by LayerWiseDistributedOptimizer on its non-DistOpt children.
+        self._layer_wise_non_distopt_child = False
+
         # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
             assert not self.config.fp16, 'fp16 expects a grad scaler.'
@@ -724,12 +728,19 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            if (
+                self.config.reuse_grad_buf_for_mxfp8_param_ag
+                and not self._layer_wise_non_distopt_child
+            ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
                 if not self.config.overlap_param_gather:
                     self._copy_main_params_to_param_buffer()
             else:
+                # Non-DistOpt LayerWise children have no byte-shard param buffer to stage into
+                # (``_copy_main_params_to_param_buffer`` would raise), so even under reuse_grad_buf
+                # they copy fp32 master straight into model ``param.data`` (fp8 re-quantized in
+                # place, or bf16); the grad-buffer reuse applies to the later param-gather staging.
                 self._copy_main_params_to_model_params()
 
         if timers is not None:
@@ -819,8 +830,20 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Create a copy
-                            main_param = param.detach().clone().float()
+                            # Seed the fp32 master from the high-precision pre-quantization init
+                            # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
+                            # fp8_param_gather ON/OFF hold an identical master at iter 0.
+                            if hasattr(param, 'get_high_precision_init_val'):
+                                main_param = (
+                                    param.get_high_precision_init_val()
+                                    .detach()
+                                    .clone()
+                                    .to(param.device)
+                                    .float()
+                                )
+                                param.clear_high_precision_init_val()
+                            else:
+                                main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
@@ -920,10 +943,41 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        # Non-DistOpt LayerWise fp8: route master->model through bf16 (Q(bf16(master))) to match the
+        # fp8-param-gather-OFF baseline (a direct fp32->fp8 copy would write Q(fp32 master)). This
+        # also covers MoE expert weights at expt_dp==1, which are not gathered.
+        if self._layer_wise_non_distopt_child:
+            other_model_data, other_main_data = [], []
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if is_float8tensor(model_param):
+                        copy_back_gathered_bf16_into_fp8_param(
+                            model_param, main_param.detach().to(torch.bfloat16)
+                        )
+                    else:
+                        other_model_data.append(model_param.data)
+                        other_main_data.append(main_param.data)
+            if other_model_data:
+                _multi_tensor_copy_this_to_that(
+                    this=other_main_data,
+                    that=other_model_data,
+                    overflow_buf=self._dummy_overflow_buf,
+                )
+            return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
+        )
+
+    def _copy_main_params_to_param_buffer(self):
+        """Only ``DistributedOptimizer`` has the byte-shard buffer for this; non-DistOpt LayerWise
+        children route to ``_copy_main_params_to_model_params`` instead."""
+        raise NotImplementedError(
+            "_copy_main_params_to_param_buffer is only implemented for DistributedOptimizer "
+            "(byte-shard staging). Reached it on a plain "
+            f"{type(self).__name__} with reuse_grad_buf_for_mxfp8_param_ag set, which is "
+            "unsupported."
         )
 
     def _copy_model_params_to_main_params(self, state_dict=None):

@@ -118,6 +118,31 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
+def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
+    """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
+
+    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
+    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
+    """
+    if is_mxfp8tensor(model_p):
+        quantizer = model_p.data._get_quantizer()
+        quantizer.set_usage(rowwise=True, columnwise=True)
+    model_p.data.copy_(src_bf16)
+
+
+def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
+    """Stage a param to a detached bf16 whole-param for fp8 param-gather transport.
+
+    Prefer the fp32 master (high-precision source); else dequantize an fp8 param; else copy bf16.
+    """
+    main_param = getattr(p, "main_param", None)
+    if main_param is not None:
+        return main_param.detach().to(torch.bfloat16)
+    if is_float8tensor(p):
+        return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
+    return p.detach().to(torch.bfloat16)
+
+
 def _resolve_callable_from_python_import_path(dotted_path: str):
     """Resolve a Python import path like 'pkg.mod.func' to a callable.
 
