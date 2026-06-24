@@ -344,7 +344,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # fp8 Muon grads key to uint8 (own buffer); partition_buckets later merges the non-fp8
         # bucket groups into the fp8 group to aggregate communication.
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            params,
+            ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
+        )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:

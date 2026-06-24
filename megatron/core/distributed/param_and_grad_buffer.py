@@ -877,7 +877,9 @@ class _ParamAndGradBucketGroup:
 
 
 def group_params_for_buffers(
-    params: List[torch.nn.Parameter], grad_reduce_in_fp32: bool
+    params: List[torch.nn.Parameter],
+    grad_reduce_in_fp32: bool,
+    merge_layerwise_fp8_grads: bool = False,
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
@@ -894,6 +896,8 @@ def group_params_for_buffers(
     Args:
         params: List of parameters to group.
         grad_reduce_in_fp32: Whether gradients are reduced in FP32.
+        merge_layerwise_fp8_grads: Decouple layout only — merge LayerWise (Muon) fp8 grads with
+            their bf16 siblings into one fp32 all_reduce buffer (see below).
 
     Returns:
         Dict mapping BufferKey to (params_list, param_indices).
@@ -915,6 +919,15 @@ def group_params_for_buffers(
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
+
+        # Decouple layout only: key fp8 Muon grads by their bf16 logical dtype so fp8 + bf16 grads
+        # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
+        if (
+            merge_layerwise_fp8_grads
+            and is_float8tensor(param)
+            and is_managed_by_layer_wise_optimizer
+        ):
+            param_dtype = param.dtype
 
         key = BufferKey(
             param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
