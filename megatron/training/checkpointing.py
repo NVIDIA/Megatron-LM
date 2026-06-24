@@ -388,16 +388,25 @@ def get_rng_state(
         'cuda_rng_state': torch.cuda.get_rng_state(),
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
-    dp_world_size = get_pg_size(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_world_size()
+    dp_cp_world_size = (
+        get_pg_size(dp_cp_group)
+        if dp_cp_group is not None
+        else mpu.get_data_parallel_world_size(with_context_parallel=True)
+    )
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
-            dp_world_size > 1:
+            dp_cp_world_size > 1:
         rng_state_list = \
-            [None for i in range(dp_world_size)]
+            [None for i in range(dp_cp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=dp_cp_group if dp_cp_group is not None else mpu.get_data_parallel_group())
+            group=(
+                dp_cp_group
+                if dp_cp_group is not None
+                else mpu.get_data_parallel_group(with_context_parallel=True)
+            ),
+        )
     else:
         rng_state_list = [rng_state]
 
@@ -2055,7 +2064,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-                    dp_cp_rank = get_pg_rank(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_rank()
+                    dp_cp_rank = (
+                        get_pg_rank(dp_cp_group)
+                        if dp_cp_group is not None
+                        else mpu.get_data_parallel_rank(with_context_parallel=True)
+                    )
                     rng_state = rng_state[dp_cp_rank]
                 else:
                     rng_state = rng_state[0]
