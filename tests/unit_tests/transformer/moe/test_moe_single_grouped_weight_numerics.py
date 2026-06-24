@@ -255,8 +255,7 @@ class TestMoESingleGroupedWeightNumerics:
         ]
         assert grouped_mlps, "Expected at least one TEGroupedMLP module"
         assert all(
-            module._with_fused_impl == use_transformer_engine_op_fuser
-            for module in grouped_mlps
+            module._with_fused_impl == use_transformer_engine_op_fuser for module in grouped_mlps
         ), "Unexpected TEGroupedMLP execution path"
         if after_forward:
             assert all(
