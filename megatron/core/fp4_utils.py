@@ -101,7 +101,12 @@ def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: tor
 def modify_grouped_nvfp4_rowwise_storage(
     grouped_tensor: torch.Tensor, new_rowwise_data: torch.Tensor
 ) -> None:
-    """Replace grouped NVFP4 rowwise data with a new uint8 storage view."""
+    """Replace grouped NVFP4 rowwise data with a new uint8 storage view.
+
+    The name intentionally mirrors `modify_nvfp4_rowwise_storage`: only the
+    packed rowwise byte buffer is remapped into the DDP buffer. The grouped
+    scale, amax, and columnwise buffers remain owned by the original tensor.
+    """
     tensor = (
         grouped_tensor.data if isinstance(grouped_tensor, torch.nn.Parameter) else grouped_tensor
     )
