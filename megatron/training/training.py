@@ -1056,7 +1056,7 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
+    # Initialize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
@@ -2350,7 +2350,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     mp_group = pg_collection.mp
     dp_cp_group = pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
+    # when freezing sub-models we may have a mixture of successful and unsuccessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
