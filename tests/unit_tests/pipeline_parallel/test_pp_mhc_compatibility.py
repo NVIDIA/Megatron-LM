@@ -24,9 +24,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
+from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -112,6 +113,34 @@ def _make_config(
         kwargs.setdefault('pipeline_dtype', torch.bfloat16)
     kwargs.update(extra)
     return TransformerConfig(**kwargs)
+
+
+def _make_boundary_block(
+    config,
+    *,
+    pre_process=True,
+    final_layernorm=None,
+    has_final_layernorm=False,
+    num_layers=1,
+    input_tensor=None,
+):
+    """Create a lightweight TransformerBlock instance for boundary helper tests."""
+    block = TransformerBlock.__new__(TransformerBlock)
+    block.config = config
+    block.pre_process = pre_process
+    block.input_tensor = input_tensor
+    block.num_residual_streams = config.num_residual_streams
+    block.final_layernorm = final_layernorm
+    block.layers = [object()] * num_layers
+    block.has_final_layernorm_in_this_stage = lambda: has_final_layernorm
+    if config.enable_hyper_connections:
+        hidden_size = config.hidden_size
+        n_streams = config.num_residual_streams
+        device = input_tensor.device if input_tensor is not None else torch.cuda.current_device()
+        block.hc_head_fn = torch.randn(n_streams, n_streams * hidden_size, device=device)
+        block.hc_head_base = torch.zeros(n_streams, device=device)
+        block.hc_head_scale = torch.ones(1, device=device)
+    return block
 
 
 # ===========================================================================
@@ -402,6 +431,145 @@ class TestTransformerBlockMHCBoundaries:
         assert contracted.shape == x.shape
         # expand copies all streams → mean of identical streams = original
         torch.testing.assert_close(contracted, x)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_schedule_preprocess_helper_expands_first_pp_stage(self):
+        n = 4
+        s, b, C = 8, 2, 64
+        cfg = _make_config(
+            hidden_size=C,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+        )
+        x = torch.randn(s, b, C, device='cuda')
+        block = _make_boundary_block(cfg, pre_process=True, input_tensor=x)
+
+        expanded = block.preprocess_for_layer_schedule(x)
+
+        assert expanded.shape == (s, b, n * C)
+        for stream_idx in range(n):
+            torch.testing.assert_close(
+                expanded[:, :, stream_idx * C : (stream_idx + 1) * C], x
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_schedule_preprocess_helper_does_not_reexpand_non_first_pp_stage(self):
+        n = 4
+        s, b, C = 8, 2, 64
+        cfg = _make_config(
+            hidden_size=C,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+        )
+        received = torch.randn(s, b, n * C, device='cuda')
+        block = _make_boundary_block(
+            cfg, pre_process=False, input_tensor=received, has_final_layernorm=False
+        )
+
+        out = block.preprocess_for_layer_schedule(torch.empty(s, b, C, device='cuda'))
+
+        assert out.shape == (s, b, n * C)
+        torch.testing.assert_close(out, received)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_schedule_postprocess_helper_contracts_before_final_layernorm(self):
+        n = 4
+        s, b, C = 8, 2, 64
+        cfg = _make_config(
+            hidden_size=C,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+        )
+        cfg.mtp_num_layers = 1
+        multistream = torch.randn(s, b, n * C, device='cuda')
+        block = _make_boundary_block(
+            cfg,
+            pre_process=False,
+            final_layernorm=torch.nn.Identity(),
+            has_final_layernorm=True,
+            input_tensor=multistream,
+        )
+
+        contracted, saved_multistream = block.postprocess_for_layer_schedule(
+            multistream, return_mhc_multistream=True
+        )
+
+        assert contracted.shape == (s, b, C)
+        assert saved_multistream is multistream
+
+    def test_preprocess_node_uses_block_boundary_helper(self):
+        decoder_input = torch.randn(8, 2, 64)
+        expanded_input = torch.randn(8, 2, 256)
+        decoder = SimpleNamespace(
+            input_tensor=None, preprocess_for_layer_schedule=MagicMock(return_value=expanded_input)
+        )
+        gpt_model = SimpleNamespace(
+            pre_process=True,
+            decoder=decoder,
+            _preprocess=MagicMock(
+                return_value=(decoder_input, "rotary", "cos", "sin", "seq_offset", "pad_mask")
+            ),
+        )
+        chunk_state = SimpleNamespace(
+            input_ids=torch.ones(2, 8, dtype=torch.long),
+            position_ids=torch.arange(8).repeat(2, 1),
+            decoder_input=None,
+            packed_seq_params=None,
+            padding_mask=None,
+        )
+        node = PreProcessNode.__new__(PreProcessNode)
+        node.gpt_model = gpt_model
+        node.chunk_state = chunk_state
+
+        out = node.forward_impl()
+
+        assert out is expanded_input
+        assert chunk_state.decoder_input is decoder_input
+        assert decoder.preprocess_for_layer_schedule.call_args.args[0] is decoder_input
+
+    def test_empty_decoder_postprocess_node_uses_block_boundary_helper(self):
+        hidden_states = torch.randn(8, 2, 256)
+        contracted = torch.randn(8, 2, 64)
+        loss = torch.randn(8, 2)
+        decoder = SimpleNamespace(
+            layers=[],
+            postprocess_for_layer_schedule=MagicMock(return_value=(contracted, hidden_states)),
+        )
+        gpt_model = SimpleNamespace(
+            decoder=decoder,
+            _postprocess=MagicMock(return_value=loss),
+        )
+        chunk_state = SimpleNamespace(
+            input_ids=torch.ones(2, 8, dtype=torch.long),
+            position_ids=torch.arange(8).repeat(2, 1),
+            labels=torch.ones(2, 8, dtype=torch.long),
+            decoder_input=torch.randn(8, 2, 64),
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            loss_mask=None,
+            attention_mask=None,
+            packed_seq_params=None,
+            sequence_len_offset=None,
+            runtime_gather_output=None,
+            extra_block_kwargs=None,
+            output_processor=None,
+            output_processor_context=None,
+        )
+        node = PostProcessNode.__new__(PostProcessNode)
+        node.gpt_model = gpt_model
+        node.chunk_state = chunk_state
+
+        out = node.forward_impl(hidden_states)
+
+        assert out is loss
+        decoder.postprocess_for_layer_schedule.assert_called_once_with(
+            hidden_states, is_last_decoder_layer=True
+        )
+        assert gpt_model._postprocess.call_args.kwargs["hidden_states"] is contracted
 
 
 # ===========================================================================

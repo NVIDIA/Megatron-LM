@@ -2169,6 +2169,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
         )
 
+    def _forward_mhc_mlp_post(self, mlp_output, mlp_h_res, residual, mlp_hc_h_post):
+        """Run mHC post-MLP fused H_res/H_post/BDA without the surrounding MLP norm offload."""
+        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                (mlp_output, None),
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+                None,
+            )
+        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        return hidden_states
+
     def _forward_post_mlp_with_fused_hyper_connection(
         self,
         mlp_output_with_bias,

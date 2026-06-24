@@ -369,6 +369,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.decoder_input = decoder_input
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
+        self._model_chunk_state.mhc_multistream = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
