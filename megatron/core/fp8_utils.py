@@ -199,8 +199,10 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
                 "Copying into grouped quantized parameters requires uniform member shapes."
             )
 
-        # Avoid GroupedTensor.copy_: TE's generic grouped in-place path can rebuild
-        # members through split_into_quantized_tensors(), which is not graph safe.
+        # Grouped quantized tensors cannot use GroupedTensor.copy_ here because
+        # the generic grouped path can rebuild member tensors through
+        # split_into_quantized_tensors(), which is not graph safe. Update cached
+        # member tensors in place instead.
         quantized_members = get_grouped_quantized_members(dst)
         src_members = src.view(dst.shape).unbind(dim=0)
         if len(src_members) != len(quantized_members):
@@ -213,19 +215,21 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
             dst.quantizer.update_quantized(src_member, dst_member)
         return
 
+    # Plain TE quantized tensors override copy_ to requantize into their
+    # backing storage.
     dst.copy_(src.view(dst.shape))
 
 
-def modify_grouped_tensor_underlying_storage(
+def modify_grouped_tensor_rowwise_storage(
     tensor: torch.Tensor, new_storage: torch.Tensor
 ) -> None:
-    """Replace a high-precision Transformer Engine GroupedTensor's backing storage."""
+    """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
     tensor = _unwrap_parameter_data(tensor)
     if not is_grouped_tensor(tensor):
-        raise ValueError("modify_grouped_tensor_underlying_storage expects a GroupedTensor.")
+        raise ValueError("modify_grouped_tensor_rowwise_storage expects a GroupedTensor.")
     if is_grouped_tensor_with_quantized_storage(tensor):
         raise ValueError(
-            "modify_grouped_tensor_underlying_storage only supports high-precision GroupedTensor "
+            "modify_grouped_tensor_rowwise_storage only supports high-precision GroupedTensor "
             "storage. Quantized grouped storage also owns scale buffers."
         )
 
