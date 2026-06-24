@@ -70,7 +70,7 @@ class TestConstructorValidation:
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
-        llm = MegatronLLM(model=model, tokenizer=tok)
+        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
         assert llm.is_primary_rank is True
         assert llm._use_coordinator is False
 
@@ -80,7 +80,7 @@ class TestConstructorValidation:
         running asyncio loop."""
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="requires use_coordinator=True"):
-            MegatronAsyncLLM(model=model, tokenizer=tok)
+            MegatronAsyncLLM(model=model, tokenizer=tok, use_coordinator=False)
 
     def test_ep_gt_1_requires_use_coordinator(
         self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
@@ -104,7 +104,7 @@ class TestLifecycleGuards:
         self, mock_pipeline, fake_model_and_tokenizer, method
     ):
         model, tok = fake_model_and_tokenizer
-        llm = MegatronLLM(model=model, tokenizer=tok)
+        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
         with pytest.raises(RuntimeError, match="use_coordinator=True"):
             getattr(llm, method)()
 
@@ -112,7 +112,7 @@ class TestLifecycleGuards:
         self, mock_pipeline, fake_model_and_tokenizer
     ):
         model, tok = fake_model_and_tokenizer
-        llm = MegatronLLM(model=model, tokenizer=tok)
+        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
         llm.shutdown()
         assert llm._shutdown_called is True
         llm.shutdown()  # second call is a no-op
