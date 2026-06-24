@@ -314,12 +314,21 @@ class GPTDataset(MegatronDataset):
                 end = cu_seqlens[i].item()
                 position_ids[start:end] = torch.arange(end - start, dtype=torch.long)
 
+            # Pad cu_seqlens to a fixed length so that default_collate can
+            # stack samples with different numbers of documents. Trailing
+            # entries are filled with sequence_length; the merge helper
+            # strips them later.
+            padded_cu_seqlens = torch.full(
+                (self.config.sequence_length + 1,), self.config.sequence_length, dtype=torch.int32
+            )
+            padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
+
             result = {
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
-                "cu_seqlens": cu_seqlens,
+                "cu_seqlens": padded_cu_seqlens,
                 "max_seqlen": max_seqlen,
             }
         elif self.config.create_attention_mask:

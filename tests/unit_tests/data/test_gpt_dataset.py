@@ -14,6 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.utils import _merge_cu_seqlens_across_micro_batch
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -153,7 +154,10 @@ def test_inter_document_masking():
         assert "max_seqlen" in sample
         assert "attention_mask" not in sample
 
-        cu_seqlens = sample["cu_seqlens"]
+        # Strip collation padding before validation.
+        cu_seqlens = _merge_cu_seqlens_across_micro_batch(
+            sample["cu_seqlens"].unsqueeze(0), sequence_length
+        )
         max_seqlen = sample["max_seqlen"]
         tokens = sample["tokens"]
         position_ids = sample["position_ids"]
@@ -165,7 +169,7 @@ def test_inter_document_masking():
         assert cu_seqlens[0] == 0
         assert cu_seqlens[-1] == sequence_length
 
-        # cu_seqlens must be strictly non-decreasing.
+        # cu_seqlens must be strictly increasing.
         diffs = cu_seqlens[1:] - cu_seqlens[:-1]
         assert torch.all(diffs > 0), f"cu_seqlens not strictly increasing: {cu_seqlens}"
 
