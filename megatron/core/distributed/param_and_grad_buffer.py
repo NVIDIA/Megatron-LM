@@ -322,8 +322,7 @@ class _ParamAndGradBucketGroup:
                 # We cannot zero out the entire grad buffer because one grad buffer may
                 # correspond to multiple param buffers. If we zero out the entire grad buffer,
                 # it would clear the data of those param buffers that have not yet completed AG.
-                with torch.no_grad():
-                    bucket.param_data.zero_()
+                bucket.param_data.zero_()
             return
 
         quantized_params = []
@@ -452,8 +451,7 @@ class _ParamAndGradBucketGroup:
                     flat_local_params = _flatten_dense_tensors(
                         bucket.layerwise_params_list[local_rank]
                     ).detach()
-                    with torch.no_grad():
-                        local_slot_view.copy_(flat_local_params)
+                    local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
@@ -482,8 +480,7 @@ class _ParamAndGradBucketGroup:
                     # receive buffer. Without this, accumulation into main_grad
                     # (a view into grad_data) would start from the result of the
                     # latest parameter all-gather instead of zero.
-                    with torch.no_grad():
-                        bucket.grad_data.zero_()
+                    bucket.grad_data.zero_()
                 self.param_gather_handle = None
 
         else:
@@ -577,8 +574,7 @@ class _ParamAndGradBucketGroup:
                     # receive buffer. Without this, accumulation into main_grad
                     # (a view into grad_data) would start from the result of the
                     # latest parameter all-gather instead of zero.
-                    with torch.no_grad():
-                        bucket.grad_data.zero_()
+                    bucket.grad_data.zero_()
             self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -619,11 +615,10 @@ class _ParamAndGradBucketGroup:
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
         # gradient accumulation in a higher precision).
-        with torch.no_grad():
-            for bucket in self.buckets:
-                for param in bucket.params_with_extra_main_grads:
-                    if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
-                        param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
+        for bucket in self.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                    param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
 
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
@@ -633,10 +628,9 @@ class _ParamAndGradBucketGroup:
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        with torch.no_grad():
-            for bucket in self.buckets:
-                if bucket.gradient_scaling_factor != 1.0:
-                    bucket.grad_data *= bucket.gradient_scaling_factor
+        for bucket in self.buckets:
+            if bucket.gradient_scaling_factor != 1.0:
+                bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -822,11 +816,10 @@ class _ParamAndGradBucketGroup:
         FP32 accumulation tensor rather than the communication buffer where the reduced
         gradients are stored.
         """
-        with torch.no_grad():
-            for bucket in self.buckets:
-                for param in bucket.params_with_extra_main_grads:
-                    if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
-                        param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
+        for bucket in self.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                    param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -1441,10 +1434,9 @@ class _ParamAndGradBuffer:
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
-        with torch.no_grad():
-            self.grad_data *= scaling_factor
-            for grad in self.extra_main_grads:
-                grad *= scaling_factor
+        self.grad_data *= scaling_factor
+        for grad in self.extra_main_grads:
+            grad *= scaling_factor
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
@@ -1537,10 +1529,9 @@ class _ParamAndGradBuffer:
         """
         Zero out the underlying grad_buffer.
         """
-        with torch.no_grad():
-            self.grad_data.zero_()
-            for grad in self.extra_main_grads:
-                grad.zero_()
+        self.grad_data.zero_()
+        for grad in self.extra_main_grads:
+            grad.zero_()
 
     def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
         """
