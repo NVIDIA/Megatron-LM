@@ -46,6 +46,11 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     store=None,
     skip_model_parallel_init=False,
+    seed_pp_group=None,
+    seed_dp_group=None,
+    seed_tp_group=None,
+    seed_ep_group=None,
+    seed_etp_group=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -102,16 +107,20 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
-        # Random seeds (skipped when caller owns seeding -- reads mpu ranks).
-        if not skip_model_parallel_init:
-            print_rank_0("> setting random seeds to {} ...".format(args.seed))
-            _set_random_seed(
-                args.seed,
-                args.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
-                use_cudagraphable_rng=args.cuda_graph_impl != "none",
-            )
+        # Random seeds for reproducibility.
+        print_rank_0("> setting random seeds to {} ...".format(args.seed))
+        _set_random_seed(
+            args.seed,
+            args.data_parallel_random_init,
+            args.te_rng_tracker,
+            args.inference_rng_tracker,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            pp_group=seed_pp_group,
+            dp_group=seed_dp_group,
+            tp_group=seed_tp_group,
+            ep_group=seed_ep_group,
+            etp_group=seed_etp_group,
+        )
 
         # Setup MoE aux loss scale value.
         if args.num_experts is not None:

@@ -1059,12 +1059,25 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
+    init_pg_collection = None
+    if schedule_pg_collection is not None:
+        init_pg_collection = (
+            schedule_pg_collection.get_language_model_collection()
+            if schedule_pg_collection.has_language_model()
+            else next(iter(schedule_pg_collection.module_pgs.values()))
+        )
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
+        seed_pp_group=getattr(init_pg_collection, "pp", None),
+        seed_dp_group=getattr(init_pg_collection, "dp", None),
+        seed_tp_group=getattr(init_pg_collection, "tp", None),
+        seed_ep_group=getattr(init_pg_collection, "ep", None),
+        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1080,14 +1093,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    jit_pg_collection = None
-    if schedule_pg_collection is not None:
-        jit_pg_collection = (
-            schedule_pg_collection.get_language_model_collection()
-            if schedule_pg_collection.has_language_model()
-            else next(iter(schedule_pg_collection.module_pgs.values()))
-        )
-    _jit_tp_size = get_pg_size(jit_pg_collection.tp) if jit_pg_collection is not None else None
+    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
     set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
