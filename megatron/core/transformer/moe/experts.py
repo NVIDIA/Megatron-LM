@@ -363,21 +363,27 @@ class TEGroupedMLP(MegatronModule):
         if not (use_glu_fusion or use_srelu_fusion):
             return False
         if self.config.activation_func == F.silu:
-            return True
-        if self.config.activation_func == quick_gelu:
+            pass
+        elif self.config.activation_func == quick_gelu:
             try:
                 from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
             except ImportError:
                 return False
-            return True
-        if self.config.activation_func == squared_relu:
+        elif self.config.activation_func == squared_relu:
             try:
                 from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
             except ImportError:
                 return False
-            return True
+        else:
+            return False
 
-        return False
+        # Check TE CuTe DSL fused kernel conditions (must match TE's
+        # fuse_grouped_mlp_ops matching logic).
+        import os
+
+        if use_glu_fusion and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+            return False
+        return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
