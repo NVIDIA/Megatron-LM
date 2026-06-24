@@ -8,6 +8,7 @@ import torch
 from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -694,3 +695,35 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
+
+
+class TestMegatronTokenizerTextAbstractAliasProperties:
+    """Regression tests for the cls_id/sep_id/pad_id/bos_id/eos_id/mask_id alias properties.
+
+    Each property used to check hasattr(self, '<same_name>'), which always found
+    the property itself and caused infinite recursion (RecursionError) instead of
+    returning a value or raising AttributeError cleanly.
+    """
+
+    def test_unimplemented_aliases_raise_attribute_error_not_recursion(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        for attr in ('cls_id', 'sep_id', 'mask_id'):
+            with pytest.raises(AttributeError):
+                getattr(tok, attr)
+
+    def test_overridden_aliases_return_correct_values(self):
+        tok = ByteLevelTokenizer(vocab_size=512, _eos_id=7, _pad_id=3, _bos_id=5)
+        assert tok.eos_id == 7
+        assert tok.pad_id == 3
+        assert tok.bos_id == 5
+
+    def test_subclass_with_short_name_attributes(self):
+        class _TokWithCls(ByteLevelTokenizer):
+            cls = 42
+            sep = 43
+            mask = 44
+
+        tok = _TokWithCls(vocab_size=512)
+        assert tok.cls_id == 42
+        assert tok.sep_id == 43
+        assert tok.mask_id == 44
