@@ -12,6 +12,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
@@ -247,3 +248,35 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+
+@dataclass(kw_only=True)
+class InferenceConfigContainer(ConfigContainerBase):
+    """Top-level container for inference entry points.
+
+    This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
+    configs that inference actually needs and is intentionally shaped differently from the
+    training container: there is no optimizer, LR schedule, train/validation loop, DDP, rerun
+    state machine, or straggler detection.
+
+    Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
+    ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
+    ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
+    """
+
+    model: HybridModelConfig | GPTModelConfig
+    """Which model to load for inference."""
+
+    checkpoint: CheckpointConfig
+    """Checkpoint configuration used to load model weights."""
+
+    inference: InferenceSetupConfig
+    """Declarative inference settings (the serializable, args-shaped layer). Use
+    ``InferenceSetupConfig.to_inference_config(model, ...)`` to build the runtime
+    ``megatron.core.inference.config.InferenceConfig`` consumed by the engine."""
+
+    dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
+    rng: RNGConfig = field(default_factory=RNGConfig)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    logger: LoggerConfig = field(default_factory=LoggerConfig)
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)

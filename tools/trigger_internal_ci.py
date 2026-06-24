@@ -165,6 +165,15 @@ def main():
         help="FUNCTIONAL_TEST_CASES pipeline variable (default: all)",
     )
     parser.add_argument(
+        "--functional-test-name",
+        default=None,
+        help=(
+            "FUNCTIONAL_TEST_NAME pipeline variable — names the run for "
+            "pre-release/release scopes (used as the run name and W&B experiment). "
+            "Defaults to the commit SHA when omitted."
+        ),
+    )
+    parser.add_argument(
         "--functional-test-time-limit",
         type=int,
         default=None,
@@ -217,6 +226,11 @@ def main():
         "FUNCTIONAL_TEST_REPEAT": str(args.functional_test_repeat),
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }
+
+    # Only override FUNCTIONAL_TEST_NAME when explicitly provided; otherwise the
+    # pipeline default (the commit SHA) applies.
+    if args.functional_test_name is not None:
+        pipeline_vars["FUNCTIONAL_TEST_NAME"] = args.functional_test_name
 
     time_limit = resolve_time_limit(
         args.functional_test_scope, args.functional_test_time_limit
