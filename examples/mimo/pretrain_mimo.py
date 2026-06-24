@@ -161,8 +161,8 @@ def main() -> None:
         # Build the optimizer/scheduler, drive resume load, and set args.iteration.
         optimizer = _build_optimizer(args, rt.model)
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
-        # Per-branch RNG key namespace + distributed-optimizer sharding for checkpoints.
-        args.rng_state_key_prefix = f"mimo.{_mimo_branch_name(rt.topology)}."
+        # Per-grid rng key namespace on the model (read by stock save/load); torch_dist only.
+        rt.model[0].rng_state_key_prefix = f"mimo.{_mimo_branch_name(rt.topology)}."
         args.use_distributed_optimizer = True
         if args.load:
             args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
@@ -173,6 +173,7 @@ def main() -> None:
                 tp_group=rt.pg_collection.tp,
                 pp_group=rt.pg_collection.pp,
                 dp_cp_group=rt.pg_collection.dp_cp,
+                rng_state_key_prefix=rt.model[0].rng_state_key_prefix,
             )
         else:
             args.iteration = 0

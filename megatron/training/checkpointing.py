@@ -500,7 +500,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -564,7 +564,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                              key_prefix=getattr(args, 'rng_state_key_prefix', ''),
+                              key_prefix=rng_state_key_prefix,
                               dp_cp_group=dp_cp_group)
 
     # Collect rerun state across all ranks
@@ -1640,7 +1640,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1726,7 +1726,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
-                                             key_prefix=getattr(args, 'rng_state_key_prefix', ''),
+                                             key_prefix=rng_state_key_prefix,
                                              dp_cp_group=dp_cp_group)  # we can load the rng state
         else:
             ignore_rng_state = True
