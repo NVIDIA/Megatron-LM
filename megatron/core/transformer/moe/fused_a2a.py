@@ -701,8 +701,6 @@ class NcclEpContext:
             raise RuntimeError(_TE_EP_MISSING_MSG)
         if use_symm_mem and ep_group is None:
             raise ValueError("NcclEpContext(use_symm_mem=True) requires ep_group.")
-        # TE selects the symm-mem (zero-copy) payload path when an ep_group is passed (paired with
-        # ep_bootstrap(zero_copy=True)); ep_group=None gives the HBM staged-copy path.
         self.buffer = te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -710,7 +708,6 @@ class NcclEpContext:
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
-            ep_group=ep_group if use_symm_mem else None,
             payload_dtype=payload_dtype,
         )
         self.state = "free"
