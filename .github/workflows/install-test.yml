@@ -77,6 +77,12 @@ jobs:
           package-name: megatron.core
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
+      - name: Check imports for megatron.training
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: megatron.training
+          python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
+
   uv-test-pytorch:
     needs: [pre-flight]
     if: |
