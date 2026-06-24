@@ -3,7 +3,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterator, Awaitable, Callable, Generic, Literal, TypeVar, cast
+from typing import AsyncIterator, Awaitable, Callable, Generic, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -49,7 +49,7 @@ class GroupedRolloutRequest(Request):
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
-    consumption_granularity: Literal["R", "G", "B"] = "B"
+    consumption_granularity: ConsumptionGranularity = "B"
 
 
 class Rollout(AgentBaseModel):
@@ -218,13 +218,9 @@ class _GranularityConfig:
         cls._validate(request)
         return cls(
             submission=request.submission_granularity,
-            consumption=cast(ConsumptionGranularity, request.consumption_granularity),
+            consumption=request.consumption_granularity,
             num_groups_per_batch=request.num_groups,
         )
-
-    @property
-    def release_on(self) -> ReleaseState:
-        return RELEASE_STATE_BY_SUBMISSION[self.submission]
 
     @property
     def consume_in_batch_order(self) -> bool:
@@ -232,9 +228,6 @@ class _GranularityConfig:
 
     @staticmethod
     def _validate(request: GroupedRolloutRequest) -> None:
-        assert (
-            request.consumption_granularity != "R"
-        ), "Rollout consumption granularity is not currently supported."
         assert not (
             request.submission_granularity == "B" and request.consumption_granularity == "G"
         ), "Batch submission with group consumption is not supported."
@@ -252,34 +245,17 @@ class _SubmissionGate:
         *,
         capacity: int,
         submission: SubmissionGranularity,
-        release_on: ReleaseState,
     ) -> None:
         self._sem = asyncio.Semaphore(capacity)
         self._submission = submission
-        self._release_on = release_on
+        self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
 
-    async def acquire_for_one_rollout(self) -> None:
-        if self._submission == "R":
+    async def acquire_for(self, granularity: SubmissionGranularity) -> None:
+        if self._submission == granularity:
             await self._sem.acquire()
 
-    async def acquire_for_group(self) -> None:
-        if self._submission == "G":
-            await self._sem.acquire()
-
-    async def acquire_for_batch(self) -> None:
-        if self._submission == "B":
-            await self._sem.acquire()
-
-    def release_on_inferred(self) -> None:
-        if self._release_on == "inferred":
-            self._sem.release()
-
-    def release_on_assembled(self) -> None:
-        if self._release_on == "assembled":
-            self._sem.release()
-
-    def release_on_consumed(self) -> None:
-        if self._release_on == "consumed":
+    def release_after(self, state: ReleaseState) -> None:
+        if self._release_on == state:
             self._sem.release()
 
 
@@ -318,7 +294,6 @@ class _RolloutPipeline:
         self.gate = _SubmissionGate(
             capacity=parallel_generation_tasks,
             submission=self.gran_policy.submission,
-            release_on=self.gran_policy.release_on,
         )
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
@@ -333,13 +308,13 @@ class _RolloutPipeline:
         group_id = 0
         try:
             while self.request.streaming or group_id < self.request.num_groups:
-                await self.gate.acquire_for_batch()
+                await self.gate.acquire_for("B")
                 batch_id = group_id // self.gran_policy.num_groups_per_batch
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    await self.gate.acquire_for_group()
+                    await self.gate.acquire_for("G")
                     params = await self.agent.group_rollout(self.request)
                     for rollout_idx in range(self.request.rollouts_per_group):
-                        await self.gate.acquire_for_one_rollout()
+                        await self.gate.acquire_for("R")
                         await self.infer_queue.put(
                             _InferWorkItem(
                                 group_id=group_id,
@@ -374,7 +349,7 @@ class _RolloutPipeline:
     @trace_async_exceptions(verbose=True)
     async def _infer_one(self, item: _InferWorkItem) -> None:
         response = await self.request.inference_interface.agenerate(item.params.inference_request)
-        self.gate.release_on_inferred()
+        self.gate.release_after("inferred")
         await self.assemble_queue.put(_InferredItem(item=item, response=response))
 
     async def stage_assemble(self) -> None:
@@ -395,7 +370,7 @@ class _RolloutPipeline:
                 rollouts = await asyncio.gather(
                     *[item.item.params.build_rollout(item.response) for item in completed]
                 )
-                self.gate.release_on_assembled()
+                self.gate.release_after("assembled")
                 keep = (
                     not self.request.filter_groups_with_same_reward
                     or np.std([rollout.reward for rollout in rollouts]) > 1e-6
@@ -437,7 +412,7 @@ class _RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                self.gate.release_on_consumed()
+                self.gate.release_after("consumed")
 
 
 class GroupedRolloutGenerator(Agent, ABC):
