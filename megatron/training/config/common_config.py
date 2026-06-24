@@ -151,3 +151,22 @@ class DistributedInitConfig:
 
     disable_jit_fuser: bool = False
     """Disable the JIT fuser."""
+
+    external_gpu_device_mapping: bool = False
+    """If True, indicates that GPU device mapping has been externally managed
+    (e.g., via CUDA_VISIBLE_DEVICES environment variable). When True, uses device 0
+    instead of local rank for CUDA device selection. This is useful when launching
+    with external process managers that handle GPU visibility.
+    """
+
+    fake_process_group: bool = False
+    """If True, initialize with fake distributed process group and all distributed communication 
+    operations will be skipped. This is quite useful for profiling memory usage of distributed
+    training with just one GPU. Setting WORLD_SIZE and RANK to the specific values for target
+    distributed scale.
+    """
+
+    use_decentralized_pg: bool = False
+    """Use ProcessGroupCollection passed through functions instead of relying on mcore's
+    global parallel state (mpu) variables. When True, parallel groups are obtained from
+    the pg_collection object rather than the global megatron.core.parallel_state module."""

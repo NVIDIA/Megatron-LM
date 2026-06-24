@@ -11,6 +11,7 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from megatron.training.argument_utils import gpt_config_from_args, inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
@@ -284,7 +285,9 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_megatron()
+    model_cfg = gpt_config_from_args(args)
+    inference_cfg_container = inference_cfg_container_from_args(args, model_cfg)
+    initialize_megatron(inference_cfg_container)
 
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):

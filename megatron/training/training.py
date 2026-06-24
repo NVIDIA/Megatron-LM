@@ -1057,7 +1057,8 @@ def pretrain(
     timestamp_after_in_job_setup = time.time()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
+    pg_collection = initialize_megatron(
+        cfg=cfg_container,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -1077,7 +1078,7 @@ def pretrain(
         append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    set_jit_fusion_options(cfg_container.model.transformer, cfg_container.train.micro_batch_size, cfg_container.model.seq_length)
 
     timestamp_after_set_jit_fusion_options = time.time()
 

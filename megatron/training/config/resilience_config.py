@@ -28,6 +28,9 @@ class RerunStateMachineConfig:
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
 
+    result_rejected_tracker_filename: str | None = None
+    """Name of file tracking `result_rejected` events."""
+
 
 @dataclass(kw_only=True)
 class StragglerDetectionConfig:
