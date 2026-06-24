@@ -3364,6 +3364,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Args:
             new_tokens (Tensor): Newly sampled token for each active request.
+
+        Returns:
+            None: This method updates the context state in place.
         """
         if new_tokens.is_cuda:
             new_tokens = new_tokens.cpu()
@@ -3446,7 +3449,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
 
         Returns:
-            Tensor: Finished request IDs.
+            Tensor: Request IDs for requests that finished during resolution.
         """
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()

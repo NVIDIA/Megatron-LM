@@ -270,7 +270,15 @@ class TextGenerationController:
         )
 
     def _validate_deferred_resolution_support_for_step(self) -> None:
-        """Validate controller/context state for deferred request resolution."""
+        """Validate controller/context state for deferred request resolution.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method raises if the current step does not support
+            deferred request resolution.
+        """
         context = self.inference_wrapped_model.inference_context
         if not context.config.materialize_only_last_token_logits:
             raise RuntimeError(
@@ -313,7 +321,15 @@ class TextGenerationController:
             raise RuntimeError("Deferred request resolution does not support top-n log probabilities.")
 
     def _compact_deferred_resolution_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact cached logits from old active-row order into survivor order."""
+        """Compact cached logits from old active-row order into survivor order.
+
+        Args:
+            survivor_idxs (Tensor): Active-row indices for requests that remain
+                active after deferred request resolution.
+
+        Returns:
+            None: This method updates cached logits in place.
+        """
         if survivor_idxs.numel() == 0:
             self._decode_forward_primer.clear()
             return
@@ -764,7 +780,15 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _run_deferred_resolution_forward(self) -> Optional[int]:
-        """Run one dynamic forward pass and cache logits for deferred resolution."""
+        """Run one dynamic forward pass and cache logits for deferred resolution.
+
+        Args:
+            None.
+
+        Returns:
+            Optional[int]: CUDA graph request count for the forward pass, or
+            `None` when CUDA graphs were not used.
+        """
         context = self.inference_wrapped_model.inference_context
         input_ids, position_ids = self._dynamic_step_context_init()
 
@@ -1812,7 +1836,7 @@ class TextGenerationController:
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
-        Return:
+        Returns:
             (Optional[Dict]): A dictionary containing:
                 active_request_ids (Tensor): Current active request IDs.
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
@@ -1958,7 +1982,15 @@ class TextGenerationController:
             return ret
 
     async def _run_deferred_resolution_step(self) -> Optional[Dict]:
-        """Run one decode-only step using deferred request resolution."""
+        """Run one decode-only step using deferred request resolution.
+
+        Args:
+            None.
+
+        Returns:
+            Optional[Dict]: Step result for sampled and finished requests, or
+            `None` when no requests are active.
+        """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -2037,7 +2069,16 @@ class TextGenerationController:
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
-        """Forward step the model and update the inference context."""
+        """Forward step the model and update the inference context.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
+                on the legacy path.
+
+        Returns:
+            Optional[Dict]: Step result for sampled and finished requests, or
+            `None` when no requests are active.
+        """
         context = self.inference_wrapped_model.inference_context
         mode = context.config.request_resolution_mode
 

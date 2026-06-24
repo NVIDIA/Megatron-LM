@@ -976,7 +976,15 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.requests[request_id].record[-1]
 
     def _validate_deferred_resolution_support_for_config(self) -> None:
-        """Validate config-level restrictions for deferred request resolution."""
+        """Validate config-level restrictions for deferred request resolution.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method raises if the config does not support deferred
+            request resolution.
+        """
         if self.context.config.request_resolution_mode != RequestResolutionMode.DEFER:
             return
 
@@ -1001,7 +1009,15 @@ class DynamicInferenceEngine(AbstractEngine):
     def _validate_deferred_resolution_support_for_request(
         self, request: DynamicInferenceRequest
     ) -> None:
-        """Validate request-level restrictions for deferred request resolution."""
+        """Validate request-level restrictions for deferred request resolution.
+
+        Args:
+            request (DynamicInferenceRequest): Request being added to the engine.
+
+        Returns:
+            None: This method raises if the request does not support deferred
+            request resolution.
+        """
         if self.context.config.request_resolution_mode != RequestResolutionMode.DEFER:
             return
 
