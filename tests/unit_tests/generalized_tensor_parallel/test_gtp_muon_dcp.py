@@ -11,10 +11,7 @@ by ``replica_id`` so DCP does not see multiple writers for the same shard.
 import torch
 
 from megatron.core.dist_checkpointing import load, save
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    setup_model_and_optimizer,
-)
+from tests.unit_tests.dist_checkpointing import TempNamedDir, setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -106,7 +103,9 @@ class TestGTPMuonDCP:
 
                 model_sd_A = model_A[0].sharded_state_dict()
                 optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
-                save(optim_sd_A, ckpt_dir_A)  # fails (2 writers) before the LayerWise replica_id fix
+                save(
+                    optim_sd_A, ckpt_dir_A
+                )  # fails (2 writers) before the LayerWise replica_id fix
 
                 model_B, optimizer_B = setup_model_and_optimizer(
                     seed=3,

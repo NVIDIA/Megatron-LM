@@ -242,8 +242,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """
         is_expert = getattr(p, 'expert_tp', False)
         gtp_group = (
-            self.pg_collection.expt_gtp if is_expert else self.pg_collection.gtp
-        ) if self.pg_collection else None
+            (self.pg_collection.expt_gtp if is_expert else self.pg_collection.gtp)
+            if self.pg_collection
+            else None
+        )
 
         if gtp_group is None or get_pg_size(gtp_group) <= 1:
             return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)

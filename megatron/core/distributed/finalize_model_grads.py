@@ -443,11 +443,11 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
 def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
-    """SUM NON-GTP (replicated) param grads over the gtp / egtp group.
+    """Sum wgrads for replicated parameters over the gtp / egtp group.
 
-    DDP already reduced these params over the gtp-EXCLUDED replicate group with 1/full scaling,
-    leaving them 1/gtp short. SUM (not AVG) over the gtp/egtp group recovers the full mean.
-    No-op when GTP is inactive (gtp/egtp group size <= 1).
+    The data-parallel collective already reduced wgrads over the GTP-excluded process groups with
+    1/full scaling, so the gtp-axis terms are still missing. A plain SUM (not AVG) over the gtp/egtp
+    group adds them and yields the exact full mean. No-op when GTP is inactive (group size <= 1).
     """
     gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
     egtp_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
