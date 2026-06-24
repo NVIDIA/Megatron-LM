@@ -21,7 +21,11 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+    make_viewless_tensor,
+)
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -206,11 +210,10 @@ class PostProcessNode(ScheduleNode):
         """
 
         if len(self.gpt_model.decoder.layers) == 0:
+            # Safe for MTP: empty-decoder MTP stages have final_layernorm=None.
             hidden_states = self.gpt_model.decoder.postprocess_for_layer_schedule(
                 hidden_states, is_last_decoder_layer=True
             )
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
 
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
@@ -501,11 +504,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
-    is_mhc_layer = (
-        getattr(layer.config, 'enable_hyper_connections', False)
-        and hasattr(layer, 'mlp_hyper_connection')
-        and hasattr(layer, '_forward_mhc_mlp_post')
-    )
+    is_mhc_layer = is_moe and isinstance(layer, HyperConnectionTransformerLayer)
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -605,7 +604,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
-        if is_mhc_layer and len(forward_outputs) == 6:
+        if is_mhc_layer:
             (
                 hidden_states,
                 local_tokens,
@@ -716,6 +715,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             node.layer_state.mlp_norm_manager = None
         if not node.is_mtp and node.is_last_layer:
+            # Layer nodes exist only for concrete layers; empty decoder chunks use PostProcessNode.
             output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
                 hidden_states,
                 is_last_decoder_layer=True,
@@ -823,6 +823,7 @@ def build_mtp_layer_callables(layer):
             return attn_forward(node, hidden_states)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
+        # Save pre-contraction multi-stream; _postprocess contracts for mtp_hidden_states.
         next_hidden_states = hidden_states if layer.config.enable_hyper_connections else None
         hidden_states = layer._postprocess(hidden_states)
         node.chunk_state.mtp_hidden_states.append(hidden_states)

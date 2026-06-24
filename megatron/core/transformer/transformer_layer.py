@@ -2169,22 +2169,35 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
         )
 
-    def _forward_mhc_mlp_post(self, mlp_output, mlp_h_res, residual, mlp_hc_h_post):
-        """Run mHC post-MLP fused H_res/H_post/BDA without the surrounding MLP norm offload."""
+    def _forward_mhc_mlp_post_core(
+        self,
+        mlp_output_with_bias,
+        mlp_h_res,
+        residual,
+        mlp_hc_h_post,
+        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+    ):
+        """Run the fused mHC post-MLP H_res/H_post/BDA computation."""
         nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
                 mlp_h_res,
                 residual,
                 mlp_hc_h_post,
-                (mlp_output, None),
+                mlp_output_with_bias,
                 self.hidden_dropout,
                 self.training,
                 self.config.bias_dropout_fusion,
-                None,
+                mhc_mlp_bda_recompute_manager,
             )
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
         return hidden_states
+
+    def _forward_mhc_mlp_post(self, mlp_output, mlp_h_res, residual, mlp_hc_h_post):
+        """Run mHC post-MLP fused H_res/H_post/BDA without the surrounding MLP norm offload."""
+        return self._forward_mhc_mlp_post_core(
+            (mlp_output, None), mlp_h_res, residual, mlp_hc_h_post
+        )
 
     def _forward_post_mlp_with_fused_hyper_connection(
         self,
@@ -2216,19 +2229,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
-                mlp_h_res,
-                residual,
-                mlp_hc_h_post,
-                mlp_output_with_bias,
-                self.hidden_dropout,
-                self.training,
-                self.config.bias_dropout_fusion,
-                mhc_mlp_bda_recompute_manager,
-            )
-        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        hidden_states = self._forward_mhc_mlp_post_core(
+            mlp_output_with_bias,
+            mlp_h_res,
+            residual,
+            mlp_hc_h_post,
+            mhc_mlp_bda_recompute_manager,
+        )
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
 

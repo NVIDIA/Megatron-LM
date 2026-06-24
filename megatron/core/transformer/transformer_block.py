@@ -479,7 +479,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         extract_layer_indices: Optional[Set[int]] = None,
         return_mhc_multistream: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
-        """Apply TransformerBlock exit processing shared by normal and scheduled forward paths."""
+        """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
+
+        Returns a Tensor by default. When return_mhc_multistream is True, always returns
+        (hidden_states, mhc_multistream), where mhc_multistream may be None.
+        """
         mhc_multistream = None
         if is_last_decoder_layer:
             # Only contract if the final layer norm is in this stage.
@@ -519,8 +523,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states = hidden_states.clone()
 
         if return_mhc_multistream:
-            return hidden_states, mhc_multistream
-        if mhc_multistream is not None:
             return hidden_states, mhc_multistream
         return hidden_states
 
@@ -1004,14 +1006,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        postprocess_result = self.postprocess_for_layer_schedule(
-            hidden_states, extract_layer_indices=extract_layer_indices
+        hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
+            hidden_states,
+            extract_layer_indices=extract_layer_indices,
+            return_mhc_multistream=True,
         )
-        if isinstance(postprocess_result, tuple):
-            hidden_states, mhc_multistream = postprocess_result
-        else:
-            hidden_states = postprocess_result
-            mhc_multistream = None
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states

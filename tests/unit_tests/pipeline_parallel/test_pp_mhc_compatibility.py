@@ -536,7 +536,7 @@ class TestTransformerBlockMHCBoundaries:
         loss = torch.randn(8, 2)
         decoder = SimpleNamespace(
             layers=[],
-            postprocess_for_layer_schedule=MagicMock(return_value=(contracted, hidden_states)),
+            postprocess_for_layer_schedule=MagicMock(return_value=contracted),
         )
         gpt_model = SimpleNamespace(
             decoder=decoder,
