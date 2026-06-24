@@ -862,6 +862,7 @@ class TestDynamicContext:
             buffer_size_gb=0.01,
             block_size_tokens=4,
             max_tokens=32,
+            max_requests=8,
         )
 
         ctx.total_request_count = 3
