@@ -11,11 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
 import sys
-
-import numpy as np
-import torch
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -93,13 +89,6 @@ def _setup_globals(args: argparse.Namespace) -> None:
         set_experimental_flag(True)
 
 
-def _seed_everything(args: argparse.Namespace) -> None:
-    """Seed host RNG; per-module CUDA RNG is seeded inside build_mimo_runtime."""
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-
 def _build_optimizer(args: argparse.Namespace, model):
     """Build the MimoOptimizer from a shared OptimizerConfig."""
     return get_mimo_optimizer(
@@ -147,9 +136,9 @@ def main() -> None:
 
     _setup_globals(args)
     initialize_distributed()
-    _seed_everything(args)
 
     # Per-rank runtime: per-submodule-DDP MimoModel, topology, comms, data iterator, grad sync.
+    # build_mimo_runtime seeds per-role RNG (host + CUDA) via the stock _set_random_seed.
     rt = build_mimo_runtime(args)
     assert rt.model[0].config.finalize_model_grads_func is not None, (
         "build_mimo_runtime must install a finalize_model_grads_func on the language config"

@@ -17,13 +17,14 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 from examples.mimo.training.args import build_module_grid_specs
 from examples.mimo.training.data import select_data_iterator
 from examples.mimo.training.grad_sync import configure_grad_sync
-from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import wrap_active_modules_with_ddp
 from examples.mimo.training.topology import HeteroTopology, create_topology
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training.initialize import _set_random_seed
 
 # RNG role offsets: distinct offsets keep the process-global CUDA RNG tracker
 # independent across module roles (language +20_000, vision encoder +10_000).
@@ -68,6 +69,28 @@ def _module_dependency_map(topology: HeteroTopology) -> dict:
     return {encoder_name: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
 
 
+def _seed_module_rng(
+    args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_seed_offset: int
+) -> None:
+    """Seed host + per-module CUDA RNG for one module role via the stock _set_random_seed.
+
+    A per-role offset keeps disjoint modules' RNG independent; the role's parallel
+    groups supply the pp/dp/tp/ep/etp ranks since these ranks have no initialized mpu.
+    """
+    _set_random_seed(
+        args.seed + role_seed_offset,
+        args.data_parallel_random_init,
+        args.te_rng_tracker,
+        args.inference_rng_tracker,
+        use_cudagraphable_rng=args.cuda_graph_impl != "none",
+        pp_group=pg_collection.pp,
+        dp_group=pg_collection.dp_cp,
+        tp_group=pg_collection.tp,
+        ep_group=pg_collection.ep,
+        etp_group=pg_collection.expt_tp,
+    )
+
+
 def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
     """Assemble the per-rank hetero MIMO runtime and return a :class:`MimoRuntime`.
 
@@ -97,13 +120,14 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
 
     # --- 3. Seed RNG for the single active module role on this rank. -------
     # The CUDA RNG tracker is process-global; the non-colocated layout puts
-    # exactly one module on each rank, so each rank configures RNG for one role.
+    # exactly one module on each rank, so each rank seeds RNG for one role via
+    # the stock _set_random_seed, threading that role's parallel groups.
     if rank_in_language:
         assert language_pg is not None
-        configure_module_rng(args, language_pg, role_seed_offset=_LANGUAGE_SEED_OFFSET)
+        _seed_module_rng(args, language_pg, _LANGUAGE_SEED_OFFSET)
     elif rank_in_encoder:
         assert encoder_pg is not None
-        configure_module_rng(args, encoder_pg, role_seed_offset=_ENCODER_SEED_OFFSET)
+        _seed_module_rng(args, encoder_pg, _ENCODER_SEED_OFFSET)
 
     # --- 4. Build the role MimoModel (no top-level DDP). -------------------
     modality_submodules_spec = {}
