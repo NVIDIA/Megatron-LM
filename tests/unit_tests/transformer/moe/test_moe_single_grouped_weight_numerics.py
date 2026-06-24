@@ -4,6 +4,7 @@ import gc
 import inspect
 import os
 import sys
+import traceback
 
 import pytest
 import torch
@@ -305,6 +306,53 @@ class TestMoESingleGroupedWeightNumerics:
             single_weight_losses, discrete_weight_losses, atol=atol, rtol=rtol
         )
 
+    @staticmethod
+    def assert_all_ranks_passed(local_passed: bool, local_error: str) -> None:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            if not local_passed:
+                pytest.fail(local_error)
+            return
+
+        pass_flag = torch.tensor(
+            [1 if local_passed else 0], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(pass_flag, op=torch.distributed.ReduceOp.MIN)
+        if pass_flag.item() == 1:
+            return
+
+        rank = torch.distributed.get_rank()
+        if local_passed:
+            pytest.fail("At least one distributed rank failed this parity case.")
+        pytest.fail(f"Rank {rank} failed this parity case:\n{local_error}")
+
+    def run_parity_case(
+        self,
+        precision: str,
+        primary_param_gather: bool,
+        gradient_accumulation_fusion: bool,
+    ) -> None:
+        local_passed = True
+        local_error = ""
+        try:
+            single_losses = self.run_training_case(
+                precision=precision,
+                primary_param_gather=primary_param_gather,
+                single_weight=True,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+            )
+            discrete_losses = self.run_training_case(
+                precision=precision,
+                primary_param_gather=primary_param_gather,
+                single_weight=False,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+            )
+            self.assert_loss_parity(precision, single_losses, discrete_losses)
+        except Exception:
+            local_passed = False
+            local_error = traceback.format_exc()
+
+        self.assert_all_ranks_passed(local_passed, local_error)
+
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_with_primary_param_gather(
@@ -312,20 +360,11 @@ class TestMoESingleGroupedWeightNumerics:
     ):
         """Compare single vs discrete MoE weights with primary param gather enabled if applicable."""
         _skip_if_unsupported(precision)
-
-        single_losses = self.run_training_case(
+        self.run_parity_case(
             precision=precision,
             primary_param_gather=True,
-            single_weight=True,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
-        discrete_losses = self.run_training_case(
-            precision=precision,
-            primary_param_gather=True,
-            single_weight=False,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-        )
-        self.assert_loss_parity(precision, single_losses, discrete_losses)
 
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
@@ -334,17 +373,8 @@ class TestMoESingleGroupedWeightNumerics:
     ):
         """Compare single vs discrete MoE weights when primary weights stay BF16."""
         _skip_if_unsupported(precision)
-
-        single_losses = self.run_training_case(
+        self.run_parity_case(
             precision=precision,
             primary_param_gather=False,
-            single_weight=True,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
-        discrete_losses = self.run_training_case(
-            precision=precision,
-            primary_param_gather=False,
-            single_weight=False,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-        )
-        self.assert_loss_parity(precision, single_losses, discrete_losses)
