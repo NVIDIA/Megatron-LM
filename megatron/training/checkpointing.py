@@ -42,7 +42,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
-from . import ft_integration, wandb_utils
+from . import ft_integration, persistent_cache, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -901,6 +901,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
+
+    # Persistent cache: kick a throttled writeback of newly compiled artifacts after a
+    # successful save (no-op unless a persistent cache write dir is configured).
+    _pc_ctrl = persistent_cache.get()
+    if _pc_ctrl is not None:
+        try:
+            _pc_ctrl.maybe_kick_writeback(iteration)
+        except Exception as _pc_e:
+            logger.warning("persistent_cache writeback kick failed: %s", _pc_e)
+
 
 @_disable_gc()
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,

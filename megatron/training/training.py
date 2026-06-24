@@ -202,7 +202,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 
-from . import ft_integration, one_logger_utils
+from . import ft_integration, one_logger_utils, persistent_cache
 from .activation_logging import (
     disable_activation_logging,
     disable_tokens_per_expert_logging,
@@ -1067,6 +1067,11 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    # Persistent first-iteration cache: validate that the bash bootstrap populated
+    # the env, and register the atexit final writeback. No-op unless a persistent
+    # cache read/write dir is configured.
+    persistent_cache.init(args)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
