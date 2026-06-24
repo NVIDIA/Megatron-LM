@@ -716,6 +716,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -730,6 +732,95 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          sha: ${{ needs.configure.outputs.sha }}
+
+  cicd-parse-unit-tests-gb200:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+    if: |
+      needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest-gb200:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200) }}
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests-gb200
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+    timeout-minutes: 60
+    name: "${{ matrix.bucket }} - gb200 latest"
+    if: |
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests-gb200.result == 'success'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: main
+        uses: ./.github/actions
+        with:
+          test_case: ${{ matrix.bucket }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "true"
+          PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
 
   # Single source of truth for "should integration tests run?".
@@ -865,6 +956,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     if: |
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
@@ -962,6 +1055,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     if: |
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
@@ -995,6 +1090,7 @@ jobs:
       - pre-flight
       - is-not-external-contributor
       - cicd-unit-tests-latest
+      - cicd-unit-tests-latest-gb200
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
     if: |
@@ -1026,6 +1122,7 @@ jobs:
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
@@ -1061,12 +1158,16 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 integration tests are required only when explicitly enabled.
+          # GB200 tests are required only when explicitly enabled.
           if [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            # GB200 integration tests may be skipped only for non-maintainer PRs
+            # GB200 tests may be skipped only for non-maintainer PRs
             # (no GB200 runners available); maintainer runs must always succeed.
             if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
               echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+              FAILED=true
+            fi
+            if [ "$UNIT_GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+              echo "❌ cicd-unit-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
           else
@@ -1236,3 +1337,10 @@ jobs:
       - name: Taint node for cleanup
         shell: bash
         run: taint-node.sh
+
+  DCO_merge_group:
+    name: DCO
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "The real DCO check happens on PRs only. This is a placeholder for the merge queue to keep the DCO check as a required status check."
