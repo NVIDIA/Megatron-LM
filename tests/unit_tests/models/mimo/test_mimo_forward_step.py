@@ -66,11 +66,7 @@ def test_move_batch_to_cuda_handles_packed_seq_params():
     cu_q = torch.tensor([0, 4, 8], dtype=torch.int32)
     cu_kv = torch.tensor([0, 4, 8], dtype=torch.int32)
     psp = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_q,
-        cu_seqlens_kv=cu_kv,
-        max_seqlen_q=8,
-        max_seqlen_kv=8,
+        qkv_format="thd", cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, max_seqlen_q=8, max_seqlen_kv=8
     )
 
     batch = {"packing": psp}
