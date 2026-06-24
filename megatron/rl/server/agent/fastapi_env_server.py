@@ -24,6 +24,7 @@ from ...agent.api import (
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     RolloutGenerator,
     RolloutRequest,
     TokenRollout,
@@ -119,11 +120,10 @@ class FastAPIEnvServer(EnvironmentServer):
     async def group_rollout(
         self,
         request: GroupedRolloutRequest,
-        submission_gate: asyncio.Semaphore | None = None,
-    ):
-        assert (
-            False
-        ), "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
+    ) -> GroupRolloutParams:
+        raise NotImplementedError(
+            "FastAPIEnvServer overrides get_grouped_rollouts; group_rollout is not used."
+        )
 
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest

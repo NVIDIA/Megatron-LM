@@ -15,6 +15,7 @@ from .api import (
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     Rollout,
     RolloutGenerator,
     RolloutRequest,
@@ -156,10 +157,9 @@ class WeightedMultiTask(
     async def group_rollout(
         self,
         request: GroupedRolloutRequest,
-        submission_gate: asyncio.Semaphore | None = None,
-    ) -> list[Rollout]:
+    ) -> GroupRolloutParams:
         raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
+            "WeightedMultiTask overrides get_grouped_rollouts; group_rollout is not used."
         )
 
     async def rollout(self, request: RolloutRequest) -> Rollout:

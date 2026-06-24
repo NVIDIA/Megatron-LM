@@ -9,46 +9,75 @@ from pydantic import ValidationError
 from megatron.rl.agent.api import (
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     Rollout,
     RolloutGenerator,
 )
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
-from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
+
+
+class MockInferenceInterface(ReturnsRaw):
+    """Mock raw-text inference interface with configurable per-prompt delays."""
+
+    num_slow_calls: int = 0
+    active_requests: int = 0
+    max_active_requests: int = 0
+
+    async def base_generate(self, request):
+        prompt = request.prompt[0].content
+        idx = int(prompt.removeprefix("t"))
+        self.active_requests += 1
+        self.max_active_requests = max(self.max_active_requests, self.active_requests)
+        try:
+            if idx < self.num_slow_calls:
+                await asyncio.sleep(0.03)
+            else:
+                await asyncio.sleep(0)
+            return InferenceResponse(
+                response=LLMChatMessage(role="assistant", content=prompt),
+                raw_text=prompt,
+                finish_reason="stop",
+                policy_epoch=[(0, 0)],
+                kv_cache_epoch=[(0, 0)],
+                num_evictions=0,
+            )
+        finally:
+            self.active_requests -= 1
 
 
 class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     """Mock generator with configurable per-call delays."""
 
-    def __init__(self, env_id="test", num_slow_calls=0, **kwargs):
+    def __init__(self, env_id="test", **kwargs):
         super().__init__(**kwargs)
         self.env_id = env_id
-        self.num_slow_calls = num_slow_calls
         self._call_count = 0
-        self.submission_gate_seen = False
+        self.group_rollout_calls = 0
 
     async def rollout(self, request):
         raise NotImplementedError
 
-    async def group_rollout(self, request, submission_gate=None):
-        if submission_gate is not None:
-            self.submission_gate_seen = True
+    async def group_rollout(self, request):
         idx = self._call_count
         self._call_count += 1
-        if idx < self.num_slow_calls:
-            await asyncio.sleep(0.03)
-        else:
-            await asyncio.sleep(0)
-        return [
-            Rollout(
-                trajectory=[f"t{idx}"],
-                reward=float(idx),
+        self.group_rollout_calls += 1
+        inference_request = request.inference_interface.prepare_request(
+            f"t{idx}", request.generation_args
+        )
+
+        async def build_rollout(response):
+            response_idx = int(response.response.content.removeprefix("t"))
+            return Rollout(
+                trajectory=[response.raw_text],
+                reward=float(response_idx),
                 env_id=self.env_id,
-                policy_epoch=[[(0, 0)]],
-                kv_cache_epoch=[[(0, 0)]],
-                num_evictions=[0],
+                policy_epoch=[response.policy_epoch],
+                kv_cache_epoch=[response.kv_cache_epoch],
+                num_evictions=[response.num_evictions],
             )
-            for _ in range(request.rollouts_per_group)
-        ]
+
+        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
 
 
 class TestGroupedRollouts:
@@ -123,11 +152,11 @@ class TestGroupedRollouts:
         expected_batch_ids,
         expected_trajectories,
     ):
-        gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
+        gen = MockGenerator(parallel_generation_tasks=8)
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=1,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            inference_interface=MockInferenceInterface(num_slow_calls=num_slow_calls),
             streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
@@ -147,12 +176,13 @@ class TestGroupedRollouts:
             assert trajectories[: len(expected_trajectories)] == expected_trajectories
 
     @pytest.mark.asyncio
-    async def test_rollout_submission_granularity_passes_submission_gate(self):
+    async def test_rollout_submission_granularity_limits_inference_concurrency(self):
         gen = MockGenerator(parallel_generation_tasks=2)
+        inference_interface = MockInferenceInterface(num_slow_calls=100)
         request = GroupedRolloutRequest(
             num_groups=1,
-            rollouts_per_group=2,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            rollouts_per_group=4,
+            inference_interface=inference_interface,
             streaming=True,
             submission_granularity="R",
             consumption_granularity="B",
@@ -164,8 +194,8 @@ class TestGroupedRollouts:
             break
 
         assert len(groups) == 1
-        assert len(groups[0]) == 2
-        assert gen.submission_gate_seen
+        assert len(groups[0]) == 4
+        assert inference_interface.max_active_requests <= gen.parallel_generation_tasks
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -199,7 +229,7 @@ class TestGroupedRollouts:
         request = GroupedRolloutRequest(
             num_groups=4,
             rollouts_per_group=1,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            inference_interface=MockInferenceInterface(),
             streaming=False,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
