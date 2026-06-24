@@ -41,7 +41,6 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -102,7 +101,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            # Subclasses (e.g. InferenceGroupedMLP) are covered by isinstance.
+            # Lazy import to avoid circular chain.
+            from megatron.core.transformer.moe.experts import TEGroupedMLP
+
             return (TEGroupedMLP,)
         return ()
 
