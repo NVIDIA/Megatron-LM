@@ -280,6 +280,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.deferred_resolution_compaction_step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -2496,12 +2497,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            None.
+
+        Returns:
+            None: This method resets context bookkeeping in place.
         """
 
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
         self.lifetime_prefill_token_count = 0
+        self.deferred_resolution_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0

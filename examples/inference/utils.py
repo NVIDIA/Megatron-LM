@@ -382,6 +382,7 @@ def dump_inference_results_to_json(
     peak_mem_stats: dict,
     step_count: int,
     lifetime_prefill_token_count: int,
+    deferred_resolution_compaction_step_count: int = 0,
 ) -> None:
     """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
 
@@ -389,6 +390,19 @@ def dump_inference_results_to_json(
     Note: ``latency`` is currently always ``None`` in direct mode because the
     low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
     will be populated once that field is wired up upstream.
+
+    Args:
+        args (Namespace): Parsed inference example arguments.
+        results (List[DynamicInferenceRequest]): Finished inference requests.
+        throughputs (List[float]): Recorded throughput values.
+        peak_mem_stats (dict): Peak memory statistics to include in the output.
+        step_count (int): Number of engine steps completed.
+        lifetime_prefill_token_count (int): Total prefill tokens processed.
+        deferred_resolution_compaction_step_count (int): Number of deferred
+            decode steps where post-forward compaction discarded finished rows.
+
+    Returns:
+        None: This function writes JSON when ``args.output_path`` is set.
     """
     if not args.output_path:
         return
@@ -428,6 +442,9 @@ def dump_inference_results_to_json(
         json_results["throughput"] = throughputs
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
+    json_results["deferred_resolution_compaction_step_count"] = (
+        deferred_resolution_compaction_step_count
+    )
 
     print(f' Saving results to {args.output_path}')
     with open(args.output_path, "w") as fp:

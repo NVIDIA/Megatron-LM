@@ -2052,6 +2052,8 @@ class TextGenerationController:
 
             assert torch.equal(finished_request_ids, resolved_finished_request_ids)
             self._compact_deferred_resolution_logits(survivor_idxs)
+            if survivor_idxs.numel() < active_request_count:
+                context.deferred_resolution_compaction_step_count += 1
 
             return {
                 "active_request_ids": active_request_ids,

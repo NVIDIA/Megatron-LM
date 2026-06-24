@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import copy
 import os
 import random
@@ -27,6 +28,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DecodeForwardPrimer,
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
@@ -185,6 +187,73 @@ class TextGenerationControllerTestBase:
         # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
+
+
+def test_deferred_resolution_logits_compaction():
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller._enable_cuda_graph = False
+    controller._decode_forward_primer = DecodeForwardPrimer(
+        is_primed=True, cuda_graph_request_count=None
+    )
+
+    logits = torch.arange(12).reshape(1, 4, 3)
+    controller._all_logits_cuda = logits.clone()
+    controller._compact_deferred_resolution_logits(torch.tensor([0, 1, 2, 3]))
+
+    assert torch.equal(controller._all_logits_cuda, logits)
+    assert controller._decode_forward_primer.is_primed
+
+    controller._all_logits_cuda = logits.clone()
+    controller._compact_deferred_resolution_logits(torch.tensor([0, 2]))
+
+    assert torch.equal(controller._all_logits_cuda, logits[:, [0, 2], :])
+    assert controller._decode_forward_primer.is_primed
+
+    controller._compact_deferred_resolution_logits(torch.empty(0, dtype=torch.int64))
+
+    assert not controller._decode_forward_primer.is_primed
+
+
+def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller._decode_forward_primer = DecodeForwardPrimer(
+        is_primed=True, cuda_graph_request_count=8
+    )
+    controller._all_logits_cuda = torch.tensor(
+        [[[0.0, 3.0, 1.0], [0.0, 1.0, 4.0], [0.0, 5.0, 2.0]]]
+    )
+    controller._validate_deferred_resolution_support_for_step = mock.Mock()
+    controller._run_deferred_resolution_forward = mock.Mock()
+
+    context = mock.Mock()
+    context.total_request_count = 3
+    context.paused_request_count = 0
+    context.active_token_count = 3
+    context.request_ids = torch.tensor([10, 11, 12], dtype=torch.int32)
+    context.request_metadata = {
+        "termination_id": torch.tensor([2, 2, 2], dtype=torch.int64)
+    }
+    context.get_active_sequence_lengths.return_value = torch.tensor(
+        [4, 4, 4], dtype=torch.int32
+    )
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10, 10])
+    context.prepare_requests = mock.Mock()
+    context.resolve_requests.return_value = torch.tensor([11], dtype=torch.int32)
+    context.deferred_resolution_compaction_step_count = 0
+    controller.inference_wrapped_model = mock.Mock(inference_context=context)
+
+    def compact_logits(survivor_idxs):
+        assert torch.equal(survivor_idxs, torch.tensor([0, 2]))
+        assert context.deferred_resolution_compaction_step_count == 0
+
+    controller._compact_deferred_resolution_logits = mock.Mock(side_effect=compact_logits)
+
+    result = asyncio.run(controller._run_deferred_resolution_step())
+
+    controller._compact_deferred_resolution_logits.assert_called_once()
+    assert context.deferred_resolution_compaction_step_count == 1
+    assert result["finished_request_ids"].tolist() == [11]
+    assert result["sample"].tolist() == [1, 2, 1]
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):
