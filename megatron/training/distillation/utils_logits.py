@@ -8,9 +8,9 @@ focused on the current batched tar layout.
 """
 
 import concurrent.futures
-import hashlib
 import fnmatch
 import glob
+import hashlib
 import io
 import json
 import logging
@@ -23,7 +23,6 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import get_worker_info
 import zstandard
 
 from megatron.core.msc_utils import MultiStorageClientFeature
@@ -34,12 +33,14 @@ logger = logging.getLogger(__name__)
 
 MSC_PREFIX = "msc://"
 
-# Matches batched tar filenames (``cp{C}_dp{D}__{I}.tar``).  Named groups:
-#   cp   – CP rank
+# Matches batched tar filenames.  New shards omit the CP prefix
+# (``dp{D}__{I}.tar``); legacy compatible shards may use
+# ``cp0_dp{D}__{I}.tar``.  Named groups:
+#   cp   – optional CP rank
 #   dp   – DP rank
 #   iter – trailing iteration number *I*
 BATCHED_TAR_RE = re.compile(
-    r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
+    r"^(?:cp(?P<cp>\d+)_)?dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
 )
 
 # Name of the metadata member written as the first entry of every batched
@@ -138,11 +139,6 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
     """Glob under *root* and filter the result by basename."""
     if not is_remote_storage_path(root):
         return storage_glob(os.path.join(root, name_pattern))
-    if get_worker_info() is not None:
-        raise RuntimeError(
-            "Remote cached-logits shard listing must run in the main "
-            "training process, not a DataLoader worker."
-        )
     listing = _storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
 
     return [
@@ -188,8 +184,8 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
-    stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
-    fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
+    stream itself: ``seed``, ``train_samples`` (with a fall-back to
+    ``train_iters * global_batch_size``), and the data ``blend``.
     """
     args = get_args()
     train_samples = getattr(args, 'train_samples', None)
@@ -201,7 +197,6 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
 
     identifiers = OrderedDict()
     identifiers["seed"] = getattr(args, 'seed', None)
-    identifiers["sequence_length"] = getattr(args, 'seq_length', None)
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)
 
@@ -212,14 +207,14 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     return md5_hex, dict(identifiers)
 
 
-def batched_tar_filename(cp_rank: int, dp_rank: int, last_iter: int) -> str:
-    """Return the filename for a cp-dp batched tar shard."""
-    return f"cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
+def batched_tar_filename(dp_rank: int, last_iter: int) -> str:
+    """Return the canonical filename for a CP-agnostic DP batched tar shard."""
+    return f"dp{dp_rank}__{last_iter}.tar"
 
 
-def batched_tar_prefix(cp_rank: int, dp_rank: int) -> str:
-    """Return the glob prefix for cp-dp batched tar shards."""
-    return f"cp{cp_rank}_dp{dp_rank}__"
+def batched_tar_prefix(dp_rank: int) -> str:
+    """Return the canonical glob prefix for CP-agnostic DP batched tar shards."""
+    return f"dp{dp_rank}__"
 
 
 def sorted_batched_tars(paths: List[str]) -> List[str]:
@@ -230,6 +225,71 @@ def sorted_batched_tars(paths: List[str]) -> List[str]:
             keyed.append((int(match.group("iter")), path))
     keyed.sort()
     return [path for _, path in keyed]
+
+
+def pad_topk_dim(tensor: torch.Tensor, target_k: int, pad_value: float) -> torch.Tensor:
+    """Pad the top-K dimension so CP ranks can gather variable top-P widths."""
+    current_k = tensor.size(-1)
+    if current_k == target_k:
+        return tensor
+    pad_shape = (*tensor.shape[:-1], target_k - current_k)
+    padding = torch.full(
+        pad_shape,
+        pad_value,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return torch.cat([tensor, padding], dim=-1)
+
+
+def slice_tensor_for_cp_rank(tensor: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
+    """Return this CP rank's zigzag sequence slice from a full sequence tensor."""
+    if cp_size <= 1:
+        return tensor
+
+    num_cp_chunks = 2 * cp_size
+    if tensor.size(0) % num_cp_chunks != 0:
+        raise ValueError(
+            f"Sequence length ({tensor.size(0)}) must be divisible by "
+            f"2 * CP size ({num_cp_chunks}) for CP zigzag slicing."
+        )
+    chunk_size = tensor.size(0) // num_cp_chunks
+    view_shape = (2 * cp_size, chunk_size, *tensor.shape[1:])
+    chunks = tensor.view(*view_shape)
+    index = torch.tensor(
+        [cp_rank, 2 * cp_size - cp_rank - 1],
+        dtype=torch.long,
+        device=tensor.device,
+    )
+    local = chunks.index_select(0, index)
+    return local.reshape(2 * chunk_size, *tensor.shape[1:]).contiguous()
+
+
+def reassemble_cp_sequence(local_tensors: List[torch.Tensor]) -> torch.Tensor:
+    """Reassemble CP-rank zigzag sequence shards into full sequence order."""
+    cp_size = len(local_tensors)
+    if cp_size == 1:
+        return local_tensors[0]
+
+    first = local_tensors[0]
+    if first.size(0) % 2 != 0:
+        raise ValueError(
+            f"Local CP sequence length ({first.size(0)}) must be divisible by 2 "
+            "to reassemble zigzag CP shards."
+        )
+    chunk_size = first.size(0) // 2
+    chunks: List[Optional[torch.Tensor]] = [None] * (2 * cp_size)
+    for cp_rank, tensor in enumerate(local_tensors):
+        if tensor.shape != first.shape:
+            raise ValueError(
+                f"All CP shards must have matching shapes; got {tensor.shape} "
+                f"for rank {cp_rank}, expected {first.shape}."
+            )
+        local_chunks = tensor.view(2, chunk_size, *tensor.shape[1:])
+        chunks[cp_rank] = local_chunks[0]
+        chunks[2 * cp_size - cp_rank - 1] = local_chunks[1]
+
+    return torch.cat([chunk for chunk in chunks if chunk is not None], dim=0).contiguous()
 
 
 def pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -363,11 +423,22 @@ def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch
 
 
 def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
-    """Scan *logprobs_dir* for batched tars and return the saved DP world size."""
+    """Scan *logprobs_dir* for batched tars and return the saved DP world size.
+
+    Legacy prefixed shards are only considered compatible when the saved CP
+    rank is 0.  Higher CP ranks imply old per-CP-rank payloads that cannot be
+    safely re-sliced under a different CP size.
+    """
     dp_ranks_found: set[int] = set()
     for path in storage_glob_with_caching(logprobs_dir, "*.tar"):
         fname = storage_basename(path)
         if match := BATCHED_TAR_RE.match(fname):
+            cp_group = match.group("cp")
+            if cp_group is not None and int(cp_group) > 0:
+                raise ValueError(
+                    f"Found cached-logits tar shards with saved CP rank {cp_group}. "
+                    "Only legacy shards with cp0_ prefix are compatible."
+                )
             dp_ranks_found.add(int(match.group("dp")))
     if not dp_ranks_found:
         return None
@@ -425,31 +496,20 @@ class TarShardPrefetcher:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def schedule(self, url: str) -> None:
-        if not self.enabled or url in self._futures:
-            return
-        assert self._executor is not None
-        self._futures[url] = self._executor.submit(self._prefetch_url, url)
-
     def schedule_group(self, urls: Sequence[str]) -> None:
         for url in urls:
-            self.schedule(url)
-
-    def wait(self, url: str) -> None:
-        future = self._futures.pop(url, None)
-        if future is None:
-            return
-        start = time.monotonic()
-        future.result()
-        waited = time.monotonic() - start
-        if waited > 0.5:
-            logger.warning(
-                "Waited %.3fs for cached-logit tar shard prefetch: %s", waited, url
-            )
+            if not self.enabled or url in self._futures:
+                return
+            assert self._executor is not None
+            self._futures[url] = self._executor.submit(self._prefetch_url, url)
 
     def wait_group(self, urls: Sequence[str]) -> None:
         for url in urls:
-            self.wait(url)
+            future = self._futures.pop(url, None)
+            if future is None:
+                return
+            elapsed = future.result()
+            logger.debug("Prefetch fetch time for %s: %.3fs", url, elapsed)
 
     def iter_prefetched(self, groups: Iterable[Sequence[str]]) -> Iterator[Tuple[str, ...]]:
         """Yield URL groups, waiting only when a prefetched group is not ready."""
@@ -468,8 +528,10 @@ class TarShardPrefetcher:
             self.wait_group(group)
             yield group
 
-    def _prefetch_url(self, url: str) -> None:
+    def _prefetch_url(self, url: str) -> float:
         # Whole-object caching avoids tar-member range bookkeeping while still
         # keeping the object download ahead of the sequential tar reader.
+        start = time.monotonic()
         with open_logit_file(url, "rb", prefetch_file=True) as stream:
             stream.read()
+        return time.monotonic() - start
