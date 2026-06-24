@@ -59,3 +59,35 @@ class NcclTransportBackend(KVTransportBackend):
         buf = torch.empty(shape, dtype=dtype, device=device)
         work = dist.irecv(buf, src=src, tag=tag, group=self._group)
         return TransferHandle(wait_fn=work.wait, tensor=buf)
+
+    def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
+        """Issue many point-to-point ops for one request as a SINGLE coalesced
+        NCCL group, returning ``(handle, recv_buffers)``.
+
+        Posting each request's sub-block sends/recvs as separate ``isend`` /
+        ``irecv`` calls races on NCCL: a single rank with dozens of concurrent
+        ungrouped P2P ops to the same peer can corrupt memory (illegal access)
+        because the ops are not issued atomically. ``batch_isend_irecv`` wraps
+        them in one ``ncclGroupStart/End`` so the whole request's transfer is
+        one atomic, correctly-ordered operation -- and it still overlaps the
+        engine step (the returned handle is waited a step later).
+
+        ``sends``: list of ``(tensor, dst)``. ``recvs``: list of
+        ``(shape, dtype, src)`` -- buffers are allocated here and returned in
+        order so the caller can map them back to its transfers.
+        """
+        ops = []
+        for tensor, dst in sends:
+            ops.append(dist.P2POp(dist.isend, tensor.contiguous(), dst, group=self._group))
+        bufs = []
+        for shape, dtype, src in recvs:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            bufs.append(buf)
+            ops.append(dist.P2POp(dist.irecv, buf, src, group=self._group))
+        works = dist.batch_isend_irecv(ops) if ops else []
+
+        def _wait(_works=works):
+            for w in _works:
+                w.wait()
+
+        return TransferHandle(wait_fn=_wait), bufs

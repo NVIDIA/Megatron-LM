@@ -69,6 +69,31 @@ class KVTransportBackend(abc.ABC):
         """Receive a tensor of the given shape/dtype from ``src`` (non-blocking).
         ``handle.wait()`` returns the received tensor."""
 
+    def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
+        """Issue all of one request's point-to-point ops as a single atomic
+        group, returning ``(handle, recv_buffers)``.
+
+        ``sends``: list of ``(tensor, dst)``. ``recvs``: list of
+        ``(shape, dtype, src)``; the buffers are allocated here and returned in
+        order. The default issues them sequentially via :meth:`send`/:meth:`recv`
+        (preserving post-order); backends with a native grouped primitive (NCCL)
+        override this to avoid the un-grouped-concurrent-P2P hazard.
+        """
+        handles = []
+        for tensor, dst in sends:
+            handles.append(self.send(tensor, dst))
+        bufs = []
+        for shape, dtype, src in recvs:
+            h = self.recv(shape, dtype, src, device=device)
+            bufs.append(h.tensor)
+            handles.append(h)
+
+        def _wait(_hs=handles):
+            for h in _hs:
+                h.wait()
+
+        return TransferHandle(wait_fn=_wait), bufs
+
     def stream(self) -> Optional[torch.cuda.Stream]:
         """Optional dedicated stream; default ``None`` (use current)."""
         return None

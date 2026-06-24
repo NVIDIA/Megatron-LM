@@ -187,7 +187,7 @@ def _nccl_mamba_worker(rank, world, port, q):
     try:
         from megatron.core.inference.disaggregation.kv_transfer import (
             DecodeRecv,
-            _post_recv_mamba_resharded,
+            _build_mamba_recvs,
             _send_mamba_resharded,
         )
         from megatron.core.inference.disaggregation.transfer_backends.nccl import (
@@ -206,20 +206,25 @@ def _nccl_mamba_worker(rank, world, port, q):
         if rank in src_lay:  # prefill
             lay = src_lay[rank]
             conv_l, ssm_l = (t.to(dev) for t in _shard(conv_g, ssm_g, lay))
-            handles = []
+            sends, keep = [], []
             _send_mamba_resharded(
                 {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
-                lay, src_list, dst_list, backend, handles, [],
+                lay, src_list, dst_list, sends, keep,
             )
-            for h in handles:
-                h.wait()
+            handle, _ = backend.batch(sends, [])
+            handle.wait()
             q.put((rank, "prefill"))
         else:                # decode
             lay = dst_lay[rank]
             recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
-            _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, dev)
-            for t, h in recv.mamba_pending:
-                sub = h.wait()
+            recvs = []
+            mamba_transfers = _build_mamba_recvs(
+                recv, meta, lay, src_list, dst_list, dev, recvs
+            )
+            handle, bufs = backend.batch([], recvs, device=dev)
+            handle.wait()
+            recv.mamba_pending = list(zip(mamba_transfers, bufs))
+            for t, sub in recv.mamba_pending:
                 if t.is_conv:
                     recv.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
                 else:
