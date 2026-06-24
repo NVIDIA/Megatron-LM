@@ -34,13 +34,6 @@ class _OwnedRange:
     buffer_relative_offset: int
 
 
-def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
-    if not isinstance(axis, int) or isinstance(axis, bool):
-        raise TypeError(f"Mesh axis must be an int, got {type(axis).__name__}.")
-    if axis < 0 or axis >= mesh.ndim:
-        raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-
-
 def _validate_placements(placements: Iterable[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
     seen_flat = False
@@ -339,7 +332,6 @@ class DBuffer:
 
     def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a sharded axis into Replicate placement."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         if not isinstance(self.placements[mesh_axis], Flat):
             raise ValueError(
                 f"allgather() currently requires Flat placement on axis {mesh_axis!r}."
@@ -358,7 +350,6 @@ class DBuffer:
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         partial_placement = self.placements[axis]
         if not isinstance(partial_placement, Partial):
@@ -377,7 +368,6 @@ class DBuffer:
         self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Reduce-scatter a Partial axis into ``new_placement``."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
@@ -401,7 +391,6 @@ class DBuffer:
         self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Locally chunk a Replicate axis into ``new_placement``."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports scatter() to Flat only.")

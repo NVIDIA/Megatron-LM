@@ -3,7 +3,6 @@
 """Unit tests for Megatron-FSDP DBuffer."""
 
 from collections.abc import Iterable
-from typing import cast
 
 import pytest
 import torch
@@ -306,25 +305,6 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     assert result is destination
     assert destination.local_buffer.data_ptr() == destination_data_ptr
     _assert_dbuffer_local_tensors_close(destination, tensors)
-
-
-def test_mesh_axis_must_be_non_negative_int(distributed_setup):
-    """DBuffer communication methods require explicit non-negative integer mesh axes."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer(
-        mesh=mesh,
-        placements=[Replicate()],
-        tensor_shapes=[torch.Size((4,))],
-        dtype=torch.float32,
-        device=distributed_setup.device,
-    )
-
-    with pytest.raises(TypeError, match="Mesh axis must be an int"):
-        buffer.allgather(cast(int, "dp"))
-    with pytest.raises(TypeError, match="Mesh axis must be an int"):
-        buffer.allgather(True)
-    with pytest.raises(ValueError, match="Mesh axis -1 is out of bounds"):
-        buffer.allgather(-1)
 
 
 def test_replicate_scatter_round_trip(distributed_setup):

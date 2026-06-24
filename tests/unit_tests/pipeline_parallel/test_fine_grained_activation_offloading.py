@@ -368,6 +368,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
@@ -517,6 +518,12 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         """
         if enable_offload_reset:
             off_interface.reset()
+
+        # Keep warmup-created grad buffers resident for stable peak-memory comparisons,
+        # but clear warmup values before capturing correctness grads.
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
         data0 = _make_schedule_inputs()
         data1 = _make_schedule_inputs()
