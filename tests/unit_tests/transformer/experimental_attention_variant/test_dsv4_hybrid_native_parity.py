@@ -4,13 +4,6 @@ import gc
 import math
 import os
 
-# Fragmentation guard: the 8192-seqlen / ratio=4 / pro-variant parametrizations
-# retain ~50 GiB of reserved-but-unallocated blocks after teardown, and OOM the
-# next test in the same process. Expandable segments let the allocator extend
-# existing reservations instead of holding many fixed-size blocks. Must be set
-# BEFORE the first CUDA op so the caching allocator picks it up on init.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import pytest
 import torch
 import torch.nn as nn
@@ -29,6 +22,29 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _expandable_segments_env():
+    """Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True for this module only.
+
+    The 8192-seqlen / ratio=4 / pro-variant parametrizations retain ~50 GiB of
+    reserved-but-unallocated blocks after teardown and OOM the next test in the
+    same process.  Expandable segments let the caching allocator extend existing
+    reservations instead of holding many fixed-size blocks.
+
+    Scoped to *this module* so the env var does not leak into unrelated tests
+    (e.g. test_cuda_graphs.py whose SM<10 guard checks this var).
+    """
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    prev = os.environ.get(key)
+    os.environ.setdefault(key, "expandable_segments:True")
+    yield
+    if prev is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prev
+
 
 _SEED = 1234
 # Parity tolerances (cosine / tensor-sim drift = 1 - sim), split on two axes:
