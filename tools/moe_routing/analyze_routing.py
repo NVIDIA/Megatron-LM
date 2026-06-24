@@ -10,21 +10,19 @@ Trace-path capability matrix:
     Analysis           Needs                        Sink path   Hook path
     -----------------  ---------------------------  ----------  ---------
     concentration      top_indices                  yes         yes
-    predictability     hidden states + router wts   NO          yes
+    predictability     hidden states + router wts   no          yes
 
   - Sink path:  --moe-enable-routing-replay (CUDA graphs on). Captures top-K indices only, from the
         in-pipeline recorder's static buffer.
   - Hook path:  Remove --moe-enable-routing-replay and add
       --moe-routing-trace-capture-hidden-states / --moe-routing-trace-dump-weights.
-      Captures the sidecars for predictability. Forward hooks do not fire under
-      CUDA graph replay, so requires --cuda-graph-impl none.
+      Forward hooks do not fire under graph replay so requires disabling graphs for the MoE layer.
 
 Usage:
     python analyze_routing.py /path/to/trace_dir --num-experts 512
     python analyze_routing.py /path/to/trace_dir --num-experts 512 --output-dir plots/
 
-Each analysis is printed to stdout separated by a header.  Pass --output-dir
-to also write per-analysis CSV files and plots.
+Pass --output-dir to also write per-analysis CSV files and plots.
 """
 
 import argparse

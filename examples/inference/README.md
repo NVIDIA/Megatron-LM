@@ -107,8 +107,6 @@ still target these scripts.
 
 `tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`scripts analyze per-layer top-K routing decisions from MoE models.  The JSONL trace format and the same analysis scripts work for both training and inference.
 
-#### Two capture paths
-
 Inference can collect traces two ways.
 
 | Path | Enable with | Captures | CUDA graphs |
@@ -117,9 +115,9 @@ Inference can collect traces two ways.
 | **Hook** | no replay + `--cuda-graph-impl none` | indices **+ hidden states + router weights** | must be off |
 
 Only the hook path captures the hidden states and router weights that
-`analyze_routing_predictability.py` needs — the sink drains an in-pipeline buffer that
-holds indices only. Use the sink for concentration / load-balance (cheap, graph-safe);
-use the hook when you need predictability. Training always uses the hook path.
+`analyze_routing_predictability.py` needs. The sink fills an in-pipeline buffer that
+holds indices only. Use the sink for concentration / load-balance (cheap and graph-safe);
+use the hook when you need to save hidden states, weights, or other expensive data. 
 
 #### Collecting traces
 
@@ -132,10 +130,9 @@ use the hook when you need predictability. Training always uses the hook path.
 --moe-routing-trace-dump-weights              # for predictability
 ```
 
-Forward hooks do not fire during CUDA graph replay, so add `--cuda-graph-impl none`
-if training with CUDA graphs — otherwise graph-captured layers are silently skipped.
+Forward hooks do not fire during CUDA graph replay. MoE cudagraphs must be disabled during training otherwise graph-captured layers are silently skipped.
 
-**Inference — sink** (indices only, graphs on):
+**Inference — sink** (routing indices only, graphs on):
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
@@ -175,9 +172,8 @@ The dispatcher runs these analyses in order:
 
 `analyze_routing_predictability.py` applies layer L's router weights to the hidden states
 from L_prev and compares the resulting predicted per-expert token-count distribution to
-what L actually routed.  The `cos` and `spearman` columns measure whether the hidden-state signal from the previous MoE layer
-  is sufficient to predict the aggregate expert load distribution of the next layer with high
-  fidelity. Values near zero suggest weak cross-layer signal for this layer pair.
+what L actually routed.  This serves to provide an example on measuring whether the hidden-state signal from the previous MoE layer
+  is sufficient to predict the aggregate expert load distribution of the next layer. Values near zero suggest weak cross-layer signal for this layer pair.
 
 This is a distributional result: per-token assignment errors cancel in the aggregate count
 histogram.
