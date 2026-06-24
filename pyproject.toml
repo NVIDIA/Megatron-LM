@@ -225,7 +225,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [tool.uv.sources]
 
 flash_mla = [
-    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "4220403e831d29e93868f7793693ea83f6b8b05b" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
