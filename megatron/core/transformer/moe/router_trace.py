@@ -6,9 +6,11 @@ Captures per-layer top-K routing decisions to a JSONL file for offline analysis 
 (e.g., expert load balance, overlap between (layer N-2, N)).
 Enable via `--moe-routing-trace-path` in both training and inference.
 
-Output format: one JSONL file per rank, one record per (step, layer):
-    {"step": 0, "layer": 3, "rank": 0, "num_tokens": 128, "topk": 22,
-     "top_indices": [[12, 45, ...], ...]}
+Output format: one JSONL file per rank, one record per (step, block, layer):
+    {"step": 0, "stage": "pre_dispatch", "block": "decoder", "layer": 3,
+     "rank": 0, "num_tokens": 128, "topk": 22, "top_indices": [[12, 45, ...], ...]}
+MTP records carry an extra "mtp_idx" field so they never collide with decoder
+layers that share a layer number.
 
 Optional sidecar binary files written:
 - hidden_states_rank{rank}.bin — bfloat16 hidden-state tensors; each
@@ -24,12 +26,36 @@ Note: Python forward hooks do not fire during CUDA graph replay.  Run with `--cu
 import atexit
 import json
 import os
+import re
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
 _TRACER: Optional["RouterTracer"] = None
+
+# Locate the layer a router module belongs to from its qualified name.  The MTP
+# pattern is matched first because it is the more specific of the two (decoder
+# never matches an ``mtp.``-prefixed name).
+_MTP_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.')
+_DECODER_LAYER_RE = re.compile(r'decoder\.layers\.(\d+)\.')
+
+
+def _parse_router_module_name(module_name: str) -> Optional[Tuple[str, Optional[int], int]]:
+    """Parse a router module name into ``(block, mtp_idx, layer)``.
+
+    Returns ``None`` if the name matches neither the decoder nor the MTP pattern.
+
+    Examples::
+
+        decoder.layers.3.mlp.router                         -> ("decoder", None, 3)
+        mtp.layers.0.mtp_model_layer.layers.1.mlp.router    -> ("mtp", 0, 1)
+    """
+    if m := _MTP_LAYER_RE.search(module_name):
+        return "mtp", int(m.group(1)), int(m.group(2))
+    if m := _DECODER_LAYER_RE.search(module_name):
+        return "decoder", None, int(m.group(1))
+    return None
 
 
 def init_tracer(
@@ -179,9 +205,9 @@ class RouterTracer:
 
         for chunk in model:
             unwrapped = _unwrap_model(chunk)
-            for module in unwrapped.modules():
+            for module_name, module in unwrapped.named_modules():
                 if isinstance(module, TopKRouter):
-                    handle = module.register_forward_hook(self.make_hook())
+                    handle = module.register_forward_hook(self.make_hook(module_name))
                     self._hook_handles.append(handle)
 
     def remove_hooks(self) -> None:
@@ -205,15 +231,21 @@ class RouterTracer:
                 self._stopped = True
                 self.remove_hooks()
 
-    def make_hook(self):
-        """Build a forward hook callable for a single TopKRouter module."""
+    def make_hook(self, module_name: str = ""):
+        """Build a forward hook callable for a single TopKRouter module.
+
+        The module's qualified name is parsed once to recover its
+        ``(block, mtp_idx, layer)`` identity so decoder and MTP layers that share
+        a ``layer_number`` are kept distinct.
+        """
+        identity = _parse_router_module_name(module_name)
 
         def hook(module, inputs, outputs):
             if self._stopped:
                 return
             if torch.cuda.is_current_stream_capturing():
                 return
-            self._record(module, inputs, outputs)
+            self._record(module, inputs, outputs, identity)
 
         return hook
 
@@ -233,30 +265,57 @@ class RouterTracer:
             return None
         return hs
 
-    def _record(self, module, inputs, outputs) -> None:
+    def _make_index_record(self, top_indices_cpu, step, block, mtp_idx, layer) -> dict:
+        """Assemble a JSONL record dict for one layer's top-K indices.
+
+        Shared by the forward-hook path (``_record``) and the sink consumer API
+        (``record_indices``) so both emit an identical schema.
+        """
+        record: dict = {
+            "step": int(step),
+            "stage": "pre_dispatch",
+            "block": block,
+            "layer": int(layer),
+            "rank": self.rank,
+            "num_tokens": int(top_indices_cpu.shape[0]),
+            "topk": int(top_indices_cpu.shape[1]),
+            "_top_indices_tensor": top_indices_cpu,
+        }
+        if mtp_idx is not None:
+            record["mtp_idx"] = int(mtp_idx)
+        return record
+
+    def _record(self, module, inputs, outputs, identity=None) -> None:
         if not isinstance(outputs, tuple) or len(outputs) != 2:
             return
         _, second = outputs
         if not torch.is_tensor(second):
             return
 
-        layer_number = getattr(module, "layer_number", None)
-        if layer_number is None:
-            return
+        # Resolve a collision-free layer identity.  Prefer the name parsed at
+        # registration; fall back to the module's bare ``layer_number``.
+        if identity is not None:
+            block, mtp_idx, layer = identity
+        else:
+            layer_number = getattr(module, "layer_number", None)
+            if layer_number is None:
+                return
+            block, mtp_idx, layer = "decoder", None, int(layer_number)
+        layer_key = (block, mtp_idx, layer)
 
         with self._lock:
             if not self.training_mode:
                 # Inference mode: detect step boundaries via layer repeats.
-                if layer_number in self.layers_seen_this_step:
+                if layer_key in self.layers_seen_this_step:
                     self._flush_records_to_disk()
                     self.step_id += 1
                     self.layers_seen_this_step.clear()
                     if self.step_id >= self.max_steps:
                         self._stopped = True
                         return
-                self.layers_seen_this_step.add(layer_number)
+                self.layers_seen_this_step.add(layer_key)
 
-            if self.dump_router_weights and layer_number not in self._router_state:
+            if self.dump_router_weights and layer_key not in self._router_state:
                 weight = getattr(module, "weight", None)
                 expert_bias = getattr(module, "expert_bias", None)
                 score_fn = getattr(
@@ -264,7 +323,7 @@ class RouterTracer:
                 )
                 topk_attr = getattr(module, "topk", None)
                 if torch.is_tensor(weight):
-                    self._router_state[layer_number] = {
+                    self._router_state[layer_key] = {
                         "weight": weight.detach().to("cpu", dtype=torch.float32).clone(),
                         "expert_bias": (
                             expert_bias.detach().to("cpu", dtype=torch.float32).clone()
@@ -291,12 +350,9 @@ class RouterTracer:
             num_tokens = int(top_indices_cpu.shape[0])
 
             record: dict = {
-                "step": self.step_id,
-                "layer": int(layer_number),
-                "rank": self.rank,
-                "num_tokens": num_tokens,
-                "topk": int(top_indices_cpu.shape[1]),
-                "_top_indices_tensor": top_indices_cpu,
+                **self._make_index_record(
+                    top_indices_cpu, self.step_id, block, mtp_idx, layer
+                ),
             }
 
             if self.capture_hidden_states:
@@ -335,6 +391,69 @@ class RouterTracer:
                         self._logits_offset += len(logits_bytes)
 
             self.records.append(record)
+
+    def record_indices(
+        self,
+        indices,
+        step: Optional[int] = None,
+        layer_ids: Optional[List[int]] = None,
+        block: str = "decoder",
+        mtp_idx: Optional[int] = None,
+    ) -> None:
+        """Serialize already-captured top-K routing indices through the JSONL sink.
+
+        This is the consumer entry point for the in-pipeline recorder
+        (``RouterReplay`` / ``RoutingMetadata``): instead of capturing indices with
+        a forward hook, the caller hands over the indices the router pipeline
+        already recorded.  Unlike the hook path this works under CUDA graphs,
+        because the recorder copies into a static buffer rather than relying on a
+        Python hook firing during replay.
+
+        Only the top-K indices are serialized here; the hidden-state / logit /
+        weight sidecars remain hook-only since the recorder does not hold them.
+
+        Args:
+            indices: Either a single tensor of shape ``[num_tokens, num_layers,
+                topk]`` (the layout ``RoutingMetadata.get_routing_indices()``
+                returns), or a list/tuple of per-layer tensors each shaped
+                ``[num_tokens, topk]``.
+            step: Step id stamped on the emitted records.  Defaults to the
+                tracer's current ``step_id`` (drive boundaries with
+                ``advance_step()``).
+            layer_ids: Layer numbers, one per layer in ``indices``.  Defaults to
+                ``range(num_layers)``.
+            block: Block tag for the records (``"decoder"`` or ``"mtp"``).
+            mtp_idx: MTP head index; recorded only when ``block == "mtp"``.
+        """
+        if self._stopped:
+            return
+
+        if torch.is_tensor(indices):
+            if indices.dim() != 3:
+                raise ValueError(
+                    f"Expected a [num_tokens, num_layers, topk] tensor, got shape "
+                    f"{tuple(indices.shape)}"
+                )
+            per_layer = [indices[:, i, :] for i in range(indices.shape[1])]
+        else:
+            per_layer = list(indices)
+
+        if not per_layer:
+            return
+        if layer_ids is not None and len(layer_ids) != len(per_layer):
+            raise ValueError(
+                f"layer_ids has {len(layer_ids)} entries but indices has "
+                f"{len(per_layer)} layers"
+            )
+
+        step = self.step_id if step is None else step
+        with self._lock:
+            for i, layer_indices in enumerate(per_layer):
+                layer = i if layer_ids is None else layer_ids[i]
+                top_indices_cpu = layer_indices.detach().to("cpu", torch.int32, non_blocking=True)
+                self.records.append(
+                    self._make_index_record(top_indices_cpu, step, block, mtp_idx, layer)
+                )
 
     def _flush_records_to_disk(self) -> None:
         if not self.records:
