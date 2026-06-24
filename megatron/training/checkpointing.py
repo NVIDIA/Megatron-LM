@@ -515,7 +515,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -532,6 +532,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
+        expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
     args = get_args()
@@ -689,8 +690,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     if args.ckpt_fully_parallel_save_process_group == 'dp':
                         process_group = dp_cp_group if dp_cp_group is not None else mpu.get_data_parallel_group(with_context_parallel=True)
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
-                        # NOTE: expert-DP save group not threaded yet; falls back to mpu (not on the disjoint-grid path).
-                        process_group = mpu.get_expert_data_parallel_group()
+                        process_group = expt_dp_group if expt_dp_group is not None else mpu.get_expert_data_parallel_group()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves

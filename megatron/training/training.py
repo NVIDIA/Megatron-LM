@@ -2905,6 +2905,7 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
 
@@ -2922,6 +2923,7 @@ def save_checkpoint_and_time(
         tp_group=tp_group,
         pp_group=pp_group,
         dp_cp_group=dp_cp_group,
+        expt_dp_group=expt_dp_group,
         rng_state_key_prefix=rng_state_key_prefix,
     )
 
