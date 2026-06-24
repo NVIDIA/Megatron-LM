@@ -672,8 +672,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
                 if args.ckpt_fully_parallel_save:
                     if args.ckpt_fully_parallel_save_process_group == 'dp':
-                        process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+                        process_group = dp_cp_group if dp_cp_group is not None else mpu.get_data_parallel_group(with_context_parallel=True)
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
+                        # NOTE: expert-DP save group not threaded yet; falls back to mpu (not on the disjoint-grid path).
                         process_group = mpu.get_expert_data_parallel_group()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
