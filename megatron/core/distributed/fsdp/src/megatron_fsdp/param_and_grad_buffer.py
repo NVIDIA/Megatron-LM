@@ -657,7 +657,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         name: str,
         fsdp_param_groups: List["ParameterGroup"],
         size: int = 2,
-        dtype_attr: str = "dtype",
+        dtype_attr: str | torch.dtype = "dtype",
         fallback_to_persistent_buffer: bool = False,
     ):
         self.name = name
@@ -740,7 +740,17 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             pg_b = self.fsdp_param_groups[b]
             a_size = sum(p.numel() for p in pg_a.params)
             b_size = sum(p.numel() for p in pg_b.params)
-            if getattr(pg_a, self.dtype_attr) != getattr(pg_b, self.dtype_attr) or a_size != b_size:
+            pg_a_dtype = (
+                self.dtype_attr
+                if isinstance(self.dtype_attr, torch.dtype)
+                else getattr(pg_a, self.dtype_attr)
+            )
+            pg_b_dtype = (
+                self.dtype_attr
+                if isinstance(self.dtype_attr, torch.dtype)
+                else getattr(pg_b, self.dtype_attr)
+            )
+            if pg_a_dtype != pg_b_dtype or a_size != b_size:
                 return False
         return True
 
@@ -892,7 +902,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         name: str,
         fsdp_param_groups: List["ParameterGroup"],
         size: int = 2,
-        dtype_attr: str = "dtype",
+        dtype_attr: str | torch.dtype = "dtype",
         fallback_to_persistent_buffer: bool = False,
     ):
         self.name = name
@@ -967,8 +977,13 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 # Get the parameter group dtype and size.
                 pg = self.fsdp_param_groups[bucket_id]
                 num_group_elements = sum(p.numel() for p in pg.params)
+                bucket_dtype = (
+                    self.dtype_attr
+                    if isinstance(self.dtype_attr, torch.dtype)
+                    else getattr(pg, self.dtype_attr)
+                )
                 dtype_bucket_sizes = unit_dtype_bucket_sizes.setdefault(
-                    getattr(pg, self.dtype_attr), []
+                    bucket_dtype, []
                 )
                 dtype_bucket_sizes.append(
                     (num_group_elements, bucket_id)  # For immediate assignment later.
@@ -2533,7 +2548,11 @@ class ParamAndGradBuffer:
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
-                dtype_attr="grad_dtype",
+                dtype_attr=(
+                    self.mp_policy.grad_comm_dtype
+                    if isinstance(self.mp_policy.grad_comm_dtype, torch.dtype)
+                    else "grad_dtype"
+                ),
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
@@ -2547,7 +2566,11 @@ class ParamAndGradBuffer:
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,
-                    dtype_attr="grad_dtype",
+                    dtype_attr=(
+                        self.mp_policy.grad_comm_dtype
+                        if isinstance(self.mp_policy.grad_comm_dtype, torch.dtype)
+                        else "grad_dtype"
+                    ),
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
@@ -4412,11 +4435,16 @@ class AllGatherPipeline:
                 )
 
         # Do not release the buckets that are being all-gathered.
+        no_fsdp_units = True
         for bucket_id in ag_buckets:
             self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
+            fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id is not None and fsdp_unit_id >= 0:
+                no_fsdp_units = False
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
-        if prefetch:
+        # If there are no FSDP units associated with params, we should not prefetch.
+        if prefetch and not no_fsdp_units:
 
             def next_bucket_id(ag_buckets):
                 """
