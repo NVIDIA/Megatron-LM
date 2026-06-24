@@ -323,6 +323,15 @@ class OptimizerConfig:
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
+    use_layer_wise_param_layout: bool = True
+    """Layer-wise (Muon) optimizer only. When True (default), LayerWise-managed buffers use
+    the shard-aligned padded LayerWise param layout. When False, the compact decoupled layout
+    is selected: LayerWise-managed (Muon) buffers use a compact no-padding DDP layout with
+    all-reduce gradients and legacy whole-param ping-pong ownership + ``allgather_params``
+    param sync, while non-LayerWise buffers keep the standard byte-level
+    :class:`DistributedOptimizer` layout. Removes the persistent ``dp_size * max(shard_load)``
+    LayerWise padding. Mirrors ``DistributedDataParallelConfig.use_layer_wise_param_layout``."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 

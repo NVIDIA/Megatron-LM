@@ -317,7 +317,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
+        from ..distributed.param_and_grad_buffer import _compute_default_per_buffer_param_layout
         from .distrib_optimizer import DistributedOptimizer
+
+        # Decoupled layout (use_layer_wise_param_layout=False): LayerWise (Muon) buffers use a
+        # compact no-padding DDP layout (and locally disable DistributedOptimizer semantics in
+        # DDP), so they must NOT receive the shard-aligned ``dp_size * max(shard_load)`` padded
+        # layout here. Non-LayerWise buffers keep DistOpt's byte-level layout regardless.
+        decouple_ddp_layout = not getattr(ddp_config, 'use_layer_wise_param_layout', True)
 
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
@@ -334,6 +341,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
             # get DistOpt's byte-level layout.
+            if buffer_key.is_managed_by_layer_wise_optimizer and decouple_ddp_layout:
+                # Compact no-padding layout (DDP treats this buffer as non-DistOpt). Attach
+                # param_indices so DDP's layout/grouping consistency check passes.
+                per_buffer_layout = _compute_default_per_buffer_param_layout(
+                    group_params, bucket_size
+                )
+                per_buffer_layout.param_indices = param_indices
+                layouts[buffer_key] = per_buffer_layout
+                continue
             if buffer_key.is_managed_by_layer_wise_optimizer:
                 compute_per_buffer_layout = (
                     LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
@@ -366,8 +382,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
 
+        # Decoupled layout (use_layer_wise_param_layout=False): LayerWise (Muon) buffers use a
+        # compact no-padding DDP layout that does NOT encode whole-param shard ownership, and DDP
+        # treats them as non-DistOpt (all-reduce gradients). Ownership must therefore use the
+        # legacy whole-param ping-pong assignment and param sync must use ``allgather_params``,
+        # even though the model chunks carry a (compact) full_param_layout for DDP's benefit.
+        self.decouple_ddp_layout = not getattr(config, 'use_layer_wise_param_layout', True)
+
         full_param_layouts = None
-        if model_chunks is not None:
+        if model_chunks is not None and not self.decouple_ddp_layout:
             full_param_layouts = [
                 chunk.full_param_layout
                 for chunk in model_chunks
@@ -375,12 +398,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ] or None
         self.shard_params(optimizers, full_param_layouts)
 
-        # When a full_param_layout is available, ddp_config.use_distributed_optimizer
-        # is True and model params are views into the DDP param buffer.  After the
-        # optimizer step copies updated fp32 main params → bf16 model params, the
-        # buffer is already up-to-date in-place.  We can use DDP's buffer-based
-        # all-gather (start_param_sync) instead of the flatten/unflatten allgather_params
-        # path.
+        # When a full_param_layout is available (and we are not decoupling),
+        # ddp_config.use_distributed_optimizer is True and model params are views into the
+        # DDP param buffer.  After the optimizer step copies updated fp32 main params → bf16
+        # model params, the buffer is already up-to-date in-place.  We can use DDP's
+        # buffer-based all-gather (start_param_sync) instead of the flatten/unflatten
+        # allgather_params path.  In the decouple path, Muon buffers are non-DistOpt and own
+        # whole params via ping-pong, so we use the legacy allgather_params path instead.
         self.use_buffer_param_sync = full_param_layouts is not None
 
         # Set up overlap param gather using DDP bucket infrastructure.
