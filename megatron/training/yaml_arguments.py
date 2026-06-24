@@ -140,11 +140,22 @@ def validate_yaml(args, defaults={}):
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.model_parallel.virtual_pipeline_model_parallel_size = None
-        # Overlap P2P communication is disabled if not using the interleaved schedule.
-        args.model_parallel.overlap_p2p_comm = False
-        if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+        # v1: non-interleaved steady-state overlap is now allowed.
+        # align_param_gather remains unsupported for non-interleaved.
+        if getattr(args, 'align_param_gather', False):
+            args.align_param_gather = False
+            if args.rank == 0 and args.model_parallel.pipeline_model_parallel_size > 1:
+                print('WARNING: Setting args.align_param_gather to False since '
+                      'non-interleaved schedule does not support aligned param AG')
+        if (
+            args.rank == 0
+            and args.model_parallel.pipeline_model_parallel_size > 1
+            and args.model_parallel.overlap_p2p_comm
+        ):
+            print('WARNING: Non-interleaved overlap_p2p_comm v1 only supports training + fixed-shape '
+                  'steady-state 1F1B; adjust_tensor_shapes_fn, multimodule, forward_only, '
+                  'variable_seq_lengths, mtp_standalone, overlap_p2p_comm_warmup_flush, and '
+                  'ring_exchange remain unsupported')
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
