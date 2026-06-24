@@ -60,7 +60,7 @@ def add_convert_args(parser):
     )
     group.add_argument(
         "--mix-hidden-states",
-        type=bool,
+        action="store_true",
         default=False,
         help="Whether to mix hidden states from previous TTT step.",
     )

@@ -919,6 +919,22 @@ class TestArgparseBooleanOptionalActionCompat:
 
     _INCOMPATIBLE_KWARGS = frozenset({"type", "choices", "metavar"})
 
+    @staticmethod
+    def _iter_megatron_sources():
+        """Yield ``(relative_path, source)`` for every .py file in the megatron package."""
+        import megatron
+
+        # ``megatron`` is a PEP 420 namespace package (no __init__.py), so __file__ is
+        # None; resolve the source root(s) via __path__ instead (it may list a dir twice).
+        roots = list(dict.fromkeys(pathlib.Path(p).resolve() for p in megatron.__path__))
+        seen: set[pathlib.Path] = set()
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                if path in seen:
+                    continue
+                seen.add(path)
+                yield path.relative_to(root.parent), path.read_text(encoding="utf-8")
+
     @classmethod
     def _find_violations(cls, source: str) -> list[tuple[int, list[str]]]:
         """Return ``(lineno, sorted_bad_kwargs)`` for every offending call in ``source``."""
@@ -939,28 +955,44 @@ class TestArgparseBooleanOptionalActionCompat:
 
     def test_no_incompatible_kwargs_on_boolean_optional_action(self):
         """No file under ``megatron/`` may pass type/choices/metavar to BooleanOptionalAction."""
-        import megatron
-
-        # ``megatron`` is a PEP 420 namespace package (no __init__.py), so __file__ is
-        # None; resolve the source root(s) via __path__ instead (it may list a dir twice).
-        roots = list(dict.fromkeys(pathlib.Path(p).resolve() for p in megatron.__path__))
         violations = []
-        scanned: set[pathlib.Path] = set()
-        for root in roots:
-            for path in sorted(root.rglob("*.py")):
-                if path in scanned:
-                    continue
-                scanned.add(path)
-                source = path.read_text(encoding="utf-8")
-                if "BooleanOptionalAction" not in source:  # cheap prefilter before parsing
-                    continue
-                for lineno, bad in self._find_violations(source):
-                    violations.append(f"{path.relative_to(root.parent)}:{lineno} -> {', '.join(bad)}")
+        for rel_path, source in self._iter_megatron_sources():
+            if "BooleanOptionalAction" not in source:  # cheap prefilter before parsing
+                continue
+            for lineno, bad in self._find_violations(source):
+                violations.append(f"{rel_path}:{lineno} -> {', '.join(bad)}")
 
         assert not violations, (
             "argparse.BooleanOptionalAction rejects type=/choices=/metavar= on Python >= 3.14 "
             "(they are silently-ignored no-ops on earlier versions). Remove them from:\n  "
             + "\n  ".join(violations)
+        )
+
+    def test_no_type_bool_on_argparse_add_argument(self):
+        """No argparse ``add_argument`` under ``megatron/`` may use ``type=bool``.
+
+        ``type=bool`` on a value-taking argument is a footgun: argparse feeds the raw
+        string to ``bool()``, and ``bool()`` of any non-empty string is ``True`` — so
+        ``--flag False`` silently *enables* the flag. Use ``action="store_true"`` /
+        ``"store_false"`` or ``BooleanOptionalAction`` for boolean flags instead.
+        """
+        violations = []
+        for rel_path, source in self._iter_megatron_sources():
+            if "add_argument" not in source or "type=bool" not in source:  # cheap prefilter
+                continue
+            for node in ast.walk(ast.parse(source)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"
+                    and any(kw.arg == "type" and ast.unparse(kw.value) == "bool" for kw in node.keywords)
+                ):
+                    violations.append(f"{rel_path}:{node.lineno}")
+
+        assert not violations, (
+            "argparse add_argument(type=bool) is a footgun: bool() of any non-empty string is "
+            "True, so '--flag False' silently enables it. Use action='store_true'/'store_false' "
+            "or BooleanOptionalAction. Found at:\n  " + "\n  ".join(violations)
         )
 
     def test_rl_boolean_flags_register_and_parse_as_bools(self):

@@ -2182,7 +2182,7 @@ def _add_network_size_args(parser):
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
-    group.add_argument('--onnx-safe', type=bool, required=False,
+    group.add_argument('--onnx-safe', action='store_true',
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
     group.add_argument('--bert-no-binary-head', action='store_false',
