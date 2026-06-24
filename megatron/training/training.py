@@ -1080,11 +1080,14 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = (
-        get_pg_size(schedule_pg_collection.get_language_model_collection().tp)
-        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
-        else None
-    )
+    jit_pg_collection = None
+    if schedule_pg_collection is not None:
+        jit_pg_collection = (
+            schedule_pg_collection.get_language_model_collection()
+            if schedule_pg_collection.has_language_model()
+            else next(iter(schedule_pg_collection.module_pgs.values()))
+        )
+    _jit_tp_size = get_pg_size(jit_pg_collection.tp) if jit_pg_collection is not None else None
     set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
@@ -1194,6 +1197,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
