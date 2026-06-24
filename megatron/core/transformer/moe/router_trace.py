@@ -34,8 +34,12 @@ import torch
 
 _MOE_ROUTER_TRACER: Optional["RouterTracer"] = None
 
-# Locate the layer that a router module belongs to based on its name.
-_MTP_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.')
+# Locate the layer that a router module belongs to based on its name.  MTP heads
+# attach under "mtp.layers.<head>"; their inner block is "mtp_model_layer", which
+# is a stack ("...mtp_model_layer.layers.<inner>") for hybrid models and a single
+# layer (no inner ".layers") otherwise.  Decoder layers are "decoder.layers.<n>".
+_MTP_STACK_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.')
+_MTP_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.')
 _DECODER_LAYER_RE = re.compile(r'decoder\.layers\.(\d+)\.')
 
 
@@ -47,10 +51,16 @@ def _parse_router_module_name(module_name: str) -> Optional[Tuple[str, Optional[
     Examples:
         decoder.layers.3.mlp.router                         -> ("decoder", None, 3)
         mtp.layers.0.mtp_model_layer.layers.1.mlp.router    -> ("mtp", 0, 1)
+        mtp.layers.0.mtp_model_layer.mlp.router             -> ("mtp", 0, 0)
     """
+    # Stacked MTP (hybrid): recover both the head index and the inner layer.
+    mtp_stack_match = _MTP_STACK_LAYER_RE.search(module_name)
+    if mtp_stack_match:
+        return "mtp", int(mtp_stack_match.group(1)), int(mtp_stack_match.group(2))
+    # Single-layer MTP: no inner stack, so the inner layer index is 0.
     mtp_match = _MTP_LAYER_RE.search(module_name)
     if mtp_match:
-        return "mtp", int(mtp_match.group(1)), int(mtp_match.group(2))
+        return "mtp", int(mtp_match.group(1)), 0
     decoder_match = _DECODER_LAYER_RE.search(module_name)
     if decoder_match:
         return "decoder", None, int(decoder_match.group(1))
@@ -218,14 +228,26 @@ class RouterTracer:
             handle.remove()
         self._hook_handles.clear()
 
-    def advance_step(self) -> None:
+    def advance_step(self, step_id: Optional[int] = None) -> None:
         """Advance to the next step (training mode).
 
         Call once per training iteration, after the forward-backward pass.
-        Flushes accumulated records to disk and increments the step counter.
-        Disables the tracer once max_steps is reached.
+        Flushes accumulated records to disk and disables the tracer once
+        ``max_steps`` is reached.
+
+        Args:
+            step_id: Authoritative step id for the records just captured (e.g. the
+                training iteration). When provided, buffered records are stamped
+                with it and the tracer adopts it, so traces stay aligned with the
+                caller's step numbering (e.g. across checkpoint resumes) rather
+                than a private 0-based counter. When omitted, the tracer falls
+                back to incrementing its own counter.
         """
         with self._lock:
+            if step_id is not None:
+                for rec in self.records:
+                    rec["step"] = step_id
+                self.step_id = step_id
             self._flush_records_to_disk()
             self.step_id += 1
             self.layers_seen_this_step.clear()

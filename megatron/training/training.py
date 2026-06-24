@@ -2244,7 +2244,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Advance the router tracer step if active.
         tracer = get_moe_router_tracer()
         if tracer is not None:
-            tracer.advance_step()
+            tracer.advance_step(iteration)
 
         # Reset force_all_reduce field.
         for model_chunk in model:

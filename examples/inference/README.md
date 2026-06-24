@@ -103,32 +103,57 @@ prefer `offline_inference.py` and `launch_inference_server.py`. CI
 recipes under `tests/test_utils/recipes/h100/{gpt,moe,mamba}-*-inference.yaml`
 still target these scripts.
 
-### MoE routing analysis
+### MoE routing analysis tooling
 
-`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`scripts analyze per-layer top-K routing decisions from MoE models.  The same JSONL trace format and the same analysis scripts work for both training and inference.
+`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`scripts analyze per-layer top-K routing decisions from MoE models.  The JSONL trace format and the same analysis scripts work for both training and inference.
+
+#### Two capture paths
+
+Inference can collect traces two ways.
+
+| Path | Enable with | Captures | CUDA graphs |
+|------|-------------|----------|------------|
+| **Sink** | `--moe-enable-routing-replay` | top-K indices only | on |
+| **Hook** | no replay + `--cuda-graph-impl none` | indices **+ hidden states + router weights** | must be off |
+
+Only the hook path captures the hidden states and router weights that
+`analyze_routing_predictability.py` needs — the sink drains an in-pipeline buffer that
+holds indices only. Use the sink for concentration / load-balance (cheap, graph-safe);
+use the hook when you need predictability. Training always uses the hook path.
 
 #### Collecting traces
 
-**During training**, enable these flags:
+**Training** (hook path):
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir   # enable tracing
 --moe-routing-trace-max-training-iters 500    # optional: stop after N iters
---moe-routing-trace-capture-hidden-states     # required for distribution predictability
---moe-routing-trace-dump-weights              # required for distribution predictability
+--moe-routing-trace-capture-hidden-states     # for predictability
+--moe-routing-trace-dump-weights              # for predictability
 ```
 
-**During inference**, add these flags (e.g. to
-`advanced/gpt_dynamic_inference_with_coordinator.py`):
+Forward hooks do not fire during CUDA graph replay, so add `--cuda-graph-impl none`
+if training with CUDA graphs — otherwise graph-captured layers are silently skipped.
+
+**Inference — sink** (indices only, graphs on):
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
 --moe-routing-trace-max-inference-steps 200
+--moe-enable-routing-replay
+```
+
+**Inference — hook** (adds hidden states + weights for predictability):
+
+```bash
+--moe-routing-trace-path /path/to/trace_dir
+--moe-routing-trace-max-inference-steps 200
+--cuda-graph-impl none
 --moe-routing-trace-capture-hidden-states
 --moe-routing-trace-dump-weights
 ```
 
-Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).
+All write `router_trace_rank{N}.jsonl` (one file per rank).
 `--moe-routing-trace-capture-hidden-states` also writes `hidden_states_rank{N}.bin` and
 `--moe-routing-trace-dump-weights` writes `router_state_rank{N}.pt`; both are required by
 `analyze_routing_predictability.py`.
@@ -150,15 +175,12 @@ The dispatcher runs these analyses in order:
 
 `analyze_routing_predictability.py` applies layer L's router weights to the hidden states
 from L_prev and compares the resulting predicted per-expert token-count distribution to
-what L actually routed.  The `cos` and `spearman` columns measure that agreement:
-
-- `cos` ≥ 0.90 and `spearman` ≥ 0.70: the hidden-state signal from the previous MoE layer
+what L actually routed.  The `cos` and `spearman` columns measure whether the hidden-state signal from the previous MoE layer
   is sufficient to predict the aggregate expert load distribution of the next layer with high
-  fidelity.
-- Values near zero: weak cross-layer signal for this layer pair.
+  fidelity. Values near zero suggest weak cross-layer signal for this layer pair.
 
 This is a distributional result: per-token assignment errors cancel in the aggregate count
-histogram, so this measure is far more forgiving than per-token index overlap.
+histogram.
 
 #### Adding new routing metrics
 

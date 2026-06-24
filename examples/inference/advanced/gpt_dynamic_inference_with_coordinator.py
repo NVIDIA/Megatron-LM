@@ -227,7 +227,7 @@ if __name__ == "__main__":
         )
 
         if getattr(args, 'moe_routing_trace_path', None):
-            rank = dist.get_rank() if dist.is_initialized() else 0
+            rank = dist.get_rank()
             max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
             init_moe_router_tracer(
                 output_dir=args.moe_routing_trace_path,
@@ -242,9 +242,10 @@ if __name__ == "__main__":
 
         tracer = get_moe_router_tracer()
         if tracer is not None:
-            # When MoE routing replay is enabled, the in-pipeline recorder
-            # (RouterReplay/RoutingMetadata) writes routing indices into a CUDA-graph-safe static
-            # buffer, and the controller tees that buffer into the tracer once per decode step.
+            # When router replay is enabled, the in-pipeline recorder (RouterReplay/RoutingMetadata)
+            # writes routing indices into a static buffer, and the text generation controller tees
+            # that buffer into the tracer once per decode step. If router replay is not on,
+            # use the forward hook method which allows for additionally saving hidden states.
             from megatron.core.utils import get_model_config
             if not get_model_config(model).moe_enable_routing_replay:
                 tracer.register_hooks(model)
