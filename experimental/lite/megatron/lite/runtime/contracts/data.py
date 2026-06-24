@@ -28,10 +28,6 @@ class Batch:
         """Per-sequence token counts.  Shape ``[num_seqs]``."""
         raise NotImplementedError
 
-    def __getitem__(self, key: str) -> Any:
-        """Dict-like field access (``batch["input_ids"]``)."""
-        raise NotImplementedError
-
 
 @dataclass(slots=True)
 class PackedBatch(Batch):
@@ -54,11 +50,6 @@ class PackedBatch(Batch):
 
     def sizes(self) -> torch.Tensor:
         return self.seq_lens
-
-    def __getitem__(self, key: str) -> Any:
-        if key in self.__slots__:
-            return getattr(self, key)
-        return self.extras[key]
 
     @property
     def cu_seqlens(self) -> torch.Tensor:
@@ -120,4 +111,10 @@ class ForwardResult:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
-__all__ = ["Batch", "ForwardResult", "ModelOutputs", "PackedBatch", "TrainBatch"]
+__all__ = [
+    "Batch",
+    "ForwardResult",
+    "ModelOutputs",
+    "PackedBatch",
+    "TrainBatch",
+]

@@ -11,6 +11,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -133,19 +134,16 @@ def _batch_get(batch, key: str):
     return getattr(batch, key, None)
 
 
-def _batch_input_ids(batch):
-    input_ids = _batch_get(batch, "input_ids")
-    if input_ids is not None and input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    return input_ids
-
-
 def _apply_external_loss(
-    out: dict, batch, loss_fn
+    out: dict, batch, loss_fn, loss_context=None
 ) -> tuple[torch.Tensor, dict] | tuple[None, None]:
     if loss_fn is None:
         return None, None
-    loss, metrics = loss_fn(out, batch)
+    # Mirror run_microbatch_loop: pass loss_context as 3rd arg when present.
+    if loss_context is None:
+        loss, metrics = loss_fn(out, batch)
+    else:
+        loss, metrics = loss_fn(out, batch, loss_context)
     out["loss"] = loss
     out["_loss_fn_metrics"] = metrics
     return loss, metrics
@@ -155,15 +153,15 @@ def _compact_pipeline_output(out: dict | None) -> dict:
     if not out:
         return {}
     compact: dict = {}
-    if "_verl_model_output" in out:
-        compact["model_output"] = out["_verl_model_output"]
+    if "model_output" in out:
+        compact["model_output"] = out["model_output"]
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
         compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
     if "_loss_fn_metrics" in out:
         compact["metrics"] = out["_loss_fn_metrics"]
-    elif "_verl_metrics" in out:
-        compact["metrics"] = out["_verl_metrics"]
+    elif "metrics" in out:
+        compact["metrics"] = out["metrics"]
     return compact
 
 
@@ -236,7 +234,9 @@ def _1f1b_schedule(
     num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
     num_steady = num_microbatches - num_warmup
 
-    batches = [next(data_iter) for _ in range(num_microbatches)]
+    # Split each microbatch into (PackedBatch, LossContext) like run_microbatch_loop; the connector
+    # yields (batch, loss_context) tuples, so forward_step must receive the unwrapped batch.
+    batches = [split_loss_context(next(data_iter)) for _ in range(num_microbatches)]
     mb_idx = 0
 
     input_tensors: list[torch.Tensor | None] = []
@@ -256,31 +256,18 @@ def _1f1b_schedule(
         else None
     )
 
-    def _run_forward(input_tensor, batch):
+    def _run_forward(input_tensor, batch, loss_context=None):
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-        position_ids = _batch_get(batch, "position_ids")
-        packed_seq_params = _batch_get(batch, "packed_seq_params")
-        if ps.pp_is_first:
-            return forward_step_fn(model, batch)
-        if ps.pp_is_last:
-            out = model(
-                input_ids=_batch_input_ids(batch),
-                hidden_states=input_tensor,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                labels=_batch_get(batch, "labels"),
-                loss_mask=_batch_get(batch, "loss_mask"),
-                temperature=_batch_get(batch, "temperature") or 1.0,
-                use_fused_kernels=bool(_batch_get(batch, "use_fused_kernels") or False),
-                calculate_entropy=bool(_batch_get(batch, "calculate_entropy") or False),
-            )
-            _apply_external_loss(out, batch, loss_fn)
-            return out
-        return model(
-            hidden_states=input_tensor,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        if not ps.pp_is_first:
+            # `model` is the dist_opt DDP-wrapped chunk; set_input_tensor lives on the base lite model.
+            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+            unwrap_model(model).set_input_tensor(input_tensor)
+        with use_loss_context(loss_context):
+            out = forward_step_fn(model, batch)
+            if ps.pp_is_last:
+                _apply_external_loss(out, batch, loss_fn, loss_context)
+        return out
 
     def _run_backward(inp_t, hid_t, loss_t, grad_t):
         if ps.pp_is_last:
@@ -309,10 +296,10 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch = batches[mb_idx]
+        batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
         current_input = fwd_input
-        out = _run_forward(fwd_input, batch)
+        out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
@@ -336,9 +323,9 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0 and num_warmup == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch = batches[mb_idx]
+        batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
-        out = _run_forward(fwd_input, batch)
+        out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
@@ -502,18 +489,13 @@ def _pipeline_stage_barrier(ps: ParallelState) -> None:
         dist.barrier(group=ps.pp_cpu_group)
 
 
-def _set_virtual_pipeline_rank(chunk_id: int | None, num_chunks: int) -> None:
+def _set_virtual_pipeline_rank(ps: ParallelState, chunk_id: int | None, num_chunks: int) -> None:
     if chunk_id is None or num_chunks <= 1:
+        ps.virtual_pipeline_size = None
+        ps.virtual_pipeline_rank = None
         return
-    try:
-        from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
-    except Exception:
-        return
-    if not mpu.is_initialized():
-        return
-    vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-    if vpp_size is not None and vpp_size > 1:
-        mpu.set_virtual_pipeline_model_parallel_rank(chunk_id)
+    ps.virtual_pipeline_size = num_chunks
+    ps.virtual_pipeline_rank = chunk_id
 
 
 def _run_pipeline_chunk_forward(
@@ -529,27 +511,12 @@ def _run_pipeline_chunk_forward(
     loss_fn=None,
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-    position_ids = _batch_get(batch, "position_ids")
-    packed_seq_params = _batch_get(batch, "packed_seq_params")
-    if is_first_stage:
-        return forward_step_fn(model, batch)
+    if not is_first_stage:
+        model.set_input_tensor(input_tensor)
+    out = forward_step_fn(model, batch)
     if is_last_stage:
-        out = model(
-            input_ids=_batch_input_ids(batch),
-            hidden_states=input_tensor,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            labels=_batch_get(batch, "labels"),
-            loss_mask=_batch_get(batch, "loss_mask"),
-            temperature=_batch_get(batch, "temperature") or 1.0,
-            use_fused_kernels=bool(_batch_get(batch, "use_fused_kernels") or False),
-            calculate_entropy=bool(_batch_get(batch, "calculate_entropy") or False),
-        )
         _apply_external_loss(out, batch, loss_fn)
-        return out
-    return model(
-        hidden_states=input_tensor, position_ids=position_ids, packed_seq_params=packed_seq_params
-    )
+    return out
 
 
 def _forward_only_pipeline_schedule(
@@ -579,7 +546,7 @@ def _forward_only_pipeline_schedule(
             hidden: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
                 model = model_chunks[chunk_id]
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
@@ -619,6 +586,7 @@ def _forward_only_pipeline_schedule(
 
         outputs.append(_compact_pipeline_output(last_output) if last_output is not None else {})
 
+    _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
 
 
@@ -675,7 +643,7 @@ def _interleaved_1f1b_schedule(
             hidden: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
                 model = model_chunks[chunk_id]
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
@@ -747,7 +715,7 @@ def _interleaved_1f1b_schedule(
             inp_grad: torch.Tensor | None = None
             if is_local_stage:
                 chunk_id = stage_id // ps.pp_size
-                _set_virtual_pipeline_rank(chunk_id, num_chunks)
+                _set_virtual_pipeline_rank(ps, chunk_id, num_chunks)
                 is_first_stage = stage_id == 0
                 is_last_stage = stage_id == total_stages - 1
                 inp, out_t, loss, _out = saved[stage_id]
@@ -788,6 +756,7 @@ def _interleaved_1f1b_schedule(
         if _dbg:
             print(f"[VPP r{rank}] mb={mb_id} complete", flush=True)
 
+    _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
 
 

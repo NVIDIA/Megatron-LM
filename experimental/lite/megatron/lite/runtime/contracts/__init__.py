@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         TrainBatch,
     )
     from megatron.lite.runtime.contracts.handle import ModelHandle
+    from megatron.lite.runtime.contracts.loss import LossContext
 
 __all__ = [
     "MegatronLiteConfig",
@@ -34,6 +35,7 @@ __all__ = [
     "BridgeConfig",
     "DebugConfig",
     "ForwardResult",
+    "LossContext",
     "ModelHandle",
     "ModelOutputs",
     "OptimizerConfig",
@@ -51,6 +53,7 @@ def __getattr__(name: str):
         "DebugConfig": "megatron.lite.runtime.backends.mlite.config",
         "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
         "ForwardResult": "megatron.lite.runtime.contracts.data",
+        "LossContext": "megatron.lite.runtime.contracts.loss",
         "ModelHandle": "megatron.lite.runtime.contracts.handle",
         "ModelOutputs": "megatron.lite.runtime.contracts.data",
         "OptimizerConfig": "megatron.lite.runtime.contracts.config",
