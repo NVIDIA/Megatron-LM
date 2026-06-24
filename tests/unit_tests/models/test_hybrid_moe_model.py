@@ -319,6 +319,13 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "yarn_rotary_scaling_factor": 1.0,
+    "yarn_original_max_position_embeddings": 4096,
+    "yarn_beta_fast": 32.0,
+    "yarn_beta_slow": 1.0,
+    "yarn_mscale": 1.0,
+    "yarn_mscale_all_dim": 0.0,
+    "yarn_correction_range_round_to_int": True,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
