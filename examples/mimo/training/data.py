@@ -155,6 +155,13 @@ class MockVLMIterator:
             device="cuda",
             generator=self.generator,
         )
+        # Mock text tokens must never equal the image placeholder id: otherwise input_ids
+        # holds more image_token_id positions than there are image embeddings, and the
+        # MimoModel embedding alignment raises ValueError (crashing the language ranks).
+        _collision = text_tokens == args.image_token_id
+        if _collision.any():
+            text_tokens = text_tokens.clone()
+            text_tokens[_collision] = (args.image_token_id % (args.vocab_size - 1)) + 1
         input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         labels = torch.full_like(input_ids, -100)
         labels[:, :-1] = input_ids[:, 1:]
