@@ -9,6 +9,7 @@ import warnings
 from collections import defaultdict
 from typing import List
 
+from megatron.training.argument_utils import gpt_config_from_args, inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 import torch.distributed as dist
@@ -208,7 +209,9 @@ if __name__ == "__main__":
             extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
-        initialize_megatron()
+        model_cfg = gpt_config_from_args(args)
+        inference_cfg_container = inference_cfg_container_from_args(args, model_cfg)
+        initialize_megatron(inference_cfg_container)
         configure_nvtx_profiling(True)
 
         tokenizer = get_tokenizer()

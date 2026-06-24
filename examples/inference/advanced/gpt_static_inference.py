@@ -5,6 +5,7 @@ import sys
 import time
 from argparse import Namespace
 
+from megatron.training.argument_utils import gpt_config_from_args, inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 
@@ -131,7 +132,9 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_megatron()
+    model_cfg = gpt_config_from_args(args)
+    inference_cfg_container = inference_cfg_container_from_args(args, model_cfg)
+    initialize_megatron(inference_cfg_container)
 
     model = get_model_for_inference()
 
