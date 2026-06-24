@@ -2137,6 +2137,17 @@ def _add_network_size_args(parser):
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
                         choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
+    group.add_argument('--yarn-original-max-position-embeddings', type=int, default=None,
+                       help='Original maximum position embeddings for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-beta-fast', type=float, default=None,
+                       help='Beta fast for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-beta-slow', type=float, default=None,
+                       help='Beta slow for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-correction-range-round-to-int', action='store_true', default=None,
+                       help='Round YaRN correction range endpoints to integers.')
+    group.add_argument('--no-yarn-correction-range-round-to-int', action='store_false',
+                       dest='yarn_correction_range_round_to_int',
+                       help='Do not round YaRN correction range endpoints to integers.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
     group.add_argument('--relative-attention-max-distance', type=int, default=128,
