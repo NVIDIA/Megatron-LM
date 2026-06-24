@@ -227,7 +227,7 @@ jobs:
       - name: Check issue is still unassigned
         id: still-unassigned
         env:
-          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           assignee="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.assignee.login // empty')"
           if [ -n "${assignee}" ]; then
@@ -250,7 +250,7 @@ jobs:
         env:
           ANALYSIS_JSON: ${{ needs.analyze_community_request.outputs.analysis_json }}
           REQUESTED_ASSIGNEE: ${{ needs.authorize_assignment_command.outputs.requested_assignee }}
-          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT }}
           ISSUE_COMMENT_TOKEN: ${{ secrets.PAT }}
           SLACK_TOKEN: ${{ secrets.ISSUE_BOT_SLACK_TOKEN }}
           GITHUB_REPOSITORY: ${{ env.REPO }}
