@@ -12,6 +12,10 @@ import logging
 import torch
 from torch import Tensor
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, is_log_enabled as _is_log_enabled
+# === save_tensor 插桩结束 ===
+
 from megatron.core import parallel_state
 from megatron.core.utils import is_te_min_version
 
@@ -118,7 +122,24 @@ def _apply_rotary_pos_emb_bshd(
     cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
     sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
 
-    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+    if _is_log_enabled():
+        # === RoPE BACKWARD GRAD DEBUG: 拆分中间变量追踪梯度 (受 GLM_ALIGN_LOG 控制) ===
+        _tag = "Q" if t.shape[2] > 8 else "K"  # Q=96 heads, K=8 heads
+
+        rotate_t = _rotate_half(t, rotary_interleaved)      # rotate_half(t)
+        t_cos = t * cos_                                      # t * cos_
+        rot_sin = rotate_t * sin_                             # rotate_half(t) * sin_
+        t = t_cos + rot_sin                                   # final sum
+
+        if t.requires_grad:
+            rotate_t.register_hook(_mg_grad_info(f"rope_{_tag}_rotate_half_t", prefix="MG RoPE BWD"))
+            t_cos.register_hook(_mg_grad_info(f"rope_{_tag}_t_mul_cos", prefix="MG RoPE BWD"))
+            rot_sin.register_hook(_mg_grad_info(f"rope_{_tag}_rot_mul_sin", prefix="MG RoPE BWD"))
+            t.register_hook(_mg_grad_info(f"rope_{_tag}_t_out", prefix="MG RoPE BWD"))
+        # === END ===
+    else:
+        t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+
     return torch.cat((t, t_pass), dim=-1)
 
 

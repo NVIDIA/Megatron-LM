@@ -7,6 +7,10 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, is_log_enabled as _is_log_enabled
+# === save_tensor 插桩结束 ===
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -140,6 +144,15 @@ class DotProductAttention(MegatronModule):
             value = value.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
             )
+            # === 插桩: GQA repeat_interleave fwd + grad hooks (受 GLM_ALIGN_LOG 控制) ===
+            _mg_tensor_info("cp7c_gqa_key_after_repeat", key, layer_num=self.layer_number, prefix="MG Attention")
+            _mg_tensor_info("cp7c_gqa_value_after_repeat", value, layer_num=self.layer_number, prefix="MG Attention")
+            if self.layer_number == 1:
+                if key.requires_grad:
+                    key.register_hook(_mg_grad_info("gqa_key_after_repeat", layer_num=self.layer_number, prefix="GRAD MG"))
+                if value.requires_grad:
+                    value.register_hook(_mg_grad_info("gqa_value_after_repeat", layer_num=self.layer_number, prefix="GRAD MG"))
+            # === 插桩结束 ===
 
         # [b, np, sq, sk]
         output_size = (query.size(1), query.size(2), query.size(0), key.size(0))

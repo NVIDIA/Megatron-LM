@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.moe_utils import (
     unpermute,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.align_dump_utils import _mg_grad_info
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -597,6 +598,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
+        if permutated_local_input_tokens.requires_grad:
+            permutated_local_input_tokens.register_hook(_mg_grad_info("ep_after_dispatch_preprocess", layer_num=getattr(self, "layer_number", None), prefix="GRAD MG MoE"))
         return permutated_local_input_tokens, permuted_probs
 
     def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
@@ -625,6 +628,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.ep_group, permuted_probs, self.output_splits, self.input_splits
         )
 
+        if global_input_tokens.requires_grad:
+            global_input_tokens.register_hook(_mg_grad_info("ep_after_dispatch", layer_num=getattr(self, "layer_number", None), prefix="GRAD MG MoE"))
         return global_input_tokens, global_probs
 
     def dispatch_postprocess(self, global_input_tokens, global_probs):
@@ -696,6 +701,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish", self.tokens_per_expert
         )
         self.tokens_per_expert = None
+        if global_input_tokens.requires_grad:
+            global_input_tokens.register_hook(_mg_grad_info("ep_permuted_input_to_experts", layer_num=getattr(self, "layer_number", None), prefix="GRAD MG MoE"))
         return global_input_tokens, tokens_per_expert, global_probs
 
     def combine_preprocess(self, hidden_states):
@@ -737,6 +744,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes=input_split_sizes,
             ).to(hidden_states.dtype)
 
+        if hidden_states.requires_grad:
+            hidden_states.register_hook(_mg_grad_info("ep_after_combine_preprocess", layer_num=getattr(self, "layer_number", None), prefix="GRAD MG MoE"))
         return hidden_states
 
     def token_combine(
@@ -801,6 +810,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+        if output.requires_grad:
+            output.register_hook(_mg_grad_info("ep_after_combine_postprocess", layer_num=getattr(self, "layer_number", None), prefix="GRAD MG MoE"))
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

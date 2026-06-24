@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+import os
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
@@ -10,6 +11,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+
+# === DEBUG 临时 import ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, is_log_enabled as _is_log_enabled
+# === DEBUG END ===
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -861,6 +866,24 @@ class TEGroupedMLP(MegatronModule):
         return sharded_state_dict
 
 
+class _SeqMLPProxy:
+    """Make SequentialMLP expose a GroupedMLP-compatible weight{i}/bias{i} interface,
+    so the swift bridge code (which assumes mg_mlp.linear_fc1 exists with weight0..N)
+    works on local SequentialMLP without touching the bridge.
+    """
+
+    def __init__(self, experts, attr):
+        self._experts = experts
+        self._attr = attr
+
+    def __getattr__(self, name):
+        if name.startswith('weight'):
+            return getattr(self._experts[int(name[6:])], self._attr).weight
+        if name.startswith('bias'):
+            return getattr(self._experts[int(name[4:])], self._attr).bias
+        raise AttributeError(name)
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
@@ -901,6 +924,10 @@ class SequentialMLP(MegatronModule):
                 tp_group=parallel_state.get_expert_tensor_parallel_group(),
             )
             self.local_experts.append(expert)
+
+        # Bridge compat: expose GroupedMLP-style linear_fc1/linear_fc2 with weight{i}/bias{i}.
+        self.linear_fc1 = _SeqMLPProxy(self.local_experts, 'linear_fc1')
+        self.linear_fc2 = _SeqMLPProxy(self.local_experts, 'linear_fc2')
 
     def _pad_tensor_for_fp8(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
@@ -957,13 +984,28 @@ class SequentialMLP(MegatronModule):
             output_local_list = []
             output_bias_list = []
 
-            for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+            for _ei, (expert, tokens, probs) in enumerate(zip(self.local_experts, tokens_list, probs_list)):
                 if self.config.fp8:
                     hidden, probs = self._pad_tensor_for_fp8(tokens, probs)
                     output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:
                     output, output_bias = expert(tokens, probs)
+                # === GRAD DEBUG: expert0 中间梯度 (内部 hook 受 GLM_ALIGN_LOG 控制) ===
+                if _ei == 0 and tokens.numel() > 0:
+                    if tokens.requires_grad:
+                        tokens.register_hook(_mg_grad_info("expert0_input(permuted_input_slice)", layer_num=None, prefix="GRAD MG MoE"))
+                    if output.requires_grad:
+                        output.register_hook(_mg_grad_info("expert0_fc2_out", layer_num=None, prefix="GRAD MG MoE"))
+                # === GRAD DEBUG END ===
+                # === DEBUG 临时打印：只打印 expert_0 (受 GLM_ALIGN_LOG 控制) ===
+                if _ei == 0 and tokens.numel() > 0:
+                    _mg_tensor_info("DEBUG_expert0_input", tokens, layer_num=None, prefix="MG MoE")
+                    _mg_tensor_info("DEBUG_expert0_fc1_weight", expert.linear_fc1.weight, layer_num=None, prefix="MG MoE")
+                    _mg_tensor_info("DEBUG_expert0_fc2_weight", expert.linear_fc2.weight, layer_num=None, prefix="DMG MoE")
+                    _mg_tensor_info("DEBUG_expert0_output", output, layer_num=None, prefix="MG MoE")
+                    _mg_tensor_info("DEBUG_expert0_probs", probs, layer_num=None, prefix="MG MoE")
+                # === DEBUG END ===
                 output_local_list.append(output)
                 if self.add_bias:
                     output_bias_list.append(output_bias.expand_as(output))

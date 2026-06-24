@@ -29,6 +29,17 @@ except ImportError:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
+# === Router 调试工具 ===
+# 集中迁移到 megatron.core.align_dump_utils, 这里直接复用即可
+from megatron.core.align_dump_utils import (
+    is_log_enabled as _is_log_enabled,
+    is_bit_exact as _is_bit_exact,
+    _mg_topk_info,
+    _mg_topk_grad_info,
+    mg_dump_grad_hook as _mg_dump_grad_hook,
+)
+# === Router 调试工具结束 ===
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -68,13 +79,30 @@ def switch_load_balancing_loss_func(
     num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
 
+    # === 插桩: aux loss 入参 probs 反向 hook ===
+    if probs.requires_grad:
+        probs.register_hook(_mg_topk_grad_info("cp11d_aux_probs_in_grad", prefix="GRAD MG AuxLoss"))
+    # === 插桩结束 ===
+
     # The formula of aux_loss: aux_loss = sum((probs_per_expert/num_tokens) *
     # (tokens_per_expert/(num_tokens*topk))) * num_experts * moe_aux_loss_coeff.
     # This can be simplified to fuse the division and multiplication operations.
     aggregated_probs_per_expert = probs.sum(dim=0)
-    aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
+    # === 插桩: aggregated_probs_per_expert 反向 hook ===
+    if aggregated_probs_per_expert.requires_grad:
+        aggregated_probs_per_expert.register_hook(_mg_topk_grad_info("cp11d_aux_aggregated_grad", prefix="GRAD MG AuxLoss"))
+    # === 插桩结束 ===
+    # 拆分以便对中间项 (aggregated * tokens_per_expert) 注册 hook
+    _per_expert = aggregated_probs_per_expert * tokens_per_expert
+    if _per_expert.requires_grad:
+        _per_expert.register_hook(_mg_topk_grad_info("cp11d_aux_loss_pre_mean_grad", prefix="GRAD MG AuxLoss"))
+    aux_loss = torch.sum(_per_expert) * (
         num_experts * moe_aux_loss_coeff / (num_tokens * num_tokens * topk)
     )
+    # === 插桩: 最终 aux loss 反向 hook ===
+    if aux_loss.requires_grad:
+        aux_loss.register_hook(_mg_topk_grad_info("cp12_aux_loss_grad", prefix="GRAD MG AuxLoss"))
+    # === 插桩结束 ===
     return aux_loss
 
 
@@ -111,6 +139,15 @@ def sequence_load_balancing_loss_func(
     num_sub_sequence = 1
     num_experts = probs.shape[1]
 
+    # === [反向对齐 align-grad] 打印 routing_map / probs 便于和 PF 修复后对照 ===
+    _mg_topk_info("cp11d_aux_routing_map", routing_map)
+    _mg_topk_info("cp11d_aux_probs_in", probs)
+    # === [反向对齐 align-grad] log 结束 ===
+    # === 插桩: seq aux loss 入参 probs 反向 hook ===
+    if probs.requires_grad:
+        probs.register_hook(_mg_topk_grad_info("cp11d_aux_probs_in_grad", prefix="GRAD MG AuxLoss"))
+    # === 插桩结束 ===
+
     probs_for_aux_loss = probs.view(seq_length, batch_size, -1)
     routing_map = routing_map.view(seq_length, batch_size, -1)
 
@@ -125,8 +162,24 @@ def sequence_load_balancing_loss_func(
         )
 
     cost_coeff = routing_map.sum(dim=0, dtype=torch.float).div_(seq_length * topk / num_experts)
-    seq_aux_loss = (cost_coeff * probs_for_aux_loss.mean(dim=0)).sum(dim=1).mean()
+    # === 插桩: cost_coeff (no grad path, routing_map.sum 不参与反向) 仍打印以便对照 ===
+    # === aggregated 反向 hook ===
+    # 跨框架 dump tag (与 PF 侧对应); _mg_dump_grad_hook 内部根据 GLM_ALIGN_LOG 自动 no-op
+    _DUMP_TAG_AUX = "auxloss_LMG"
+    _aggregated = probs_for_aux_loss.mean(dim=0)
+    if _aggregated.requires_grad:
+        _aggregated.register_hook(_mg_topk_grad_info("cp11d_aux_aggregated_grad", prefix="GRAD MG AuxLoss"))
+        _aggregated.register_hook(_mg_dump_grad_hook(_DUMP_TAG_AUX, "aggregated"))
+    _per_batch = (cost_coeff * _aggregated).sum(dim=1)
+    if _per_batch.requires_grad:
+        _per_batch.register_hook(_mg_topk_grad_info("cp11d_aux_loss_pre_mean_grad", prefix="GRAD MG AuxLoss"))
+        _per_batch.register_hook(_mg_dump_grad_hook(_DUMP_TAG_AUX, "per_batch"))
+    seq_aux_loss = _per_batch.mean()
     seq_aux_loss *= moe_aux_loss_coeff
+    # === 插桩: 最终 aux loss 反向 hook ===
+    if seq_aux_loss.requires_grad:
+        seq_aux_loss.register_hook(_mg_topk_grad_info("cp12_aux_loss_grad", prefix="GRAD MG AuxLoss"))
+    # === 插桩结束 ===
 
     return seq_aux_loss
 
@@ -235,6 +288,33 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
+class _PermuteAlignedAutogradFn(torch.autograd.Function):
+    """MG-aligned deterministic permute (matches PF _PermuteAlignedPyLayer).
+
+    Forward:  tokens.index_select(0, sorted_indices)
+    Backward: gather(reverse_indices) → reshape [N, topk, H] → sum(dim=1)
+              with fp32 internal accumulation.
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, sorted_indices, reverse_indices_flat, num_tokens, topk, hidden):
+        ctx.input_dtype = tokens.dtype
+        ctx.num_tokens = num_tokens
+        ctx.topk = topk
+        ctx.hidden = hidden
+        ctx.save_for_backward(reverse_indices_flat)
+        permuted_input = tokens.index_select(0, sorted_indices)
+        return permuted_input
+
+    @staticmethod
+    def backward(ctx, grad_permuted):
+        (reverse_indices_flat,) = ctx.saved_tensors
+        gathered = grad_permuted.float().index_select(0, reverse_indices_flat)
+        gathered = gathered.reshape(ctx.num_tokens, ctx.topk, ctx.hidden)
+        grad_tokens = gathered.sum(dim=1)
+        return grad_tokens.to(ctx.input_dtype), None, None, None, None, None
+
+
 def permute(
     tokens,
     routing_map,
@@ -304,8 +384,10 @@ def permute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
+        # === BIT-EXACT: 保留原始 [num_tokens, num_experts] 形态用于构造 reverse_indices ===
+        rm_orig_bool = routing_map.bool()  # [num_tokens, num_experts]
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.bool().T.contiguous()
+        routing_map = rm_orig_bool.T.contiguous()
 
         # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
         token_indices = (
@@ -316,8 +398,31 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().masked_select(routing_map)
 
-    # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    # === BIT-EXACT permute backward (gated by MOE_DETERMINISTIC_UNPERMUTE) ===
+    if (
+        _is_bit_exact()
+        and not (drop_and_pad and num_out_tokens is not None)
+    ):
+        rm_T_int = routing_map.long()  # [num_experts, num_tokens]
+        tokens_per_expert = rm_T_int.sum(dim=-1)  # [num_experts]
+        expert_offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=tokens.device)
+        expert_offsets[1:] = torch.cumsum(tokens_per_expert, dim=0)
+        position_in_expert_T = rm_T_int.cumsum(dim=-1) - 1  # [num_experts, num_tokens]
+        global_position = (position_in_expert_T + expert_offsets[:-1].unsqueeze(1)).T  # [num_tokens, num_experts]
+
+        topk_val = int(rm_orig_bool.long().sum(dim=-1)[0].item())
+        valid_positions = global_position * rm_orig_bool.long()
+        reverse_indices_flat = torch.masked_select(
+            valid_positions, rm_orig_bool
+        ).reshape(num_tokens * topk_val)
+        reverse_indices_flat.requires_grad_(False)
+
+        permuted_input = _PermuteAlignedAutogradFn.apply(
+            tokens, sorted_indices, reverse_indices_flat, num_tokens, topk_val, hidden,
+        )
+    else:
+        # use the mapping to permute the tokens
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices
 
@@ -391,12 +496,49 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+        # === 插桩: permuted_tokens (乘 probs 之后) 反向 ===
+        if permuted_tokens.requires_grad:
+            permuted_tokens.register_hook(_mg_topk_grad_info("dispatch_permuted_tokens_after_probs", prefix="GRAD MG MoE"))
+        # === 插桩结束 ===
+
+    # === unpermute: 通过 GLM_ALIGN_BIT_EXACT 切换确定性/原生路径 ===
+    _use_deterministic = _is_bit_exact()
+
+    if _use_deterministic and routing_map is not None:
+        # 确定性 gather+sum 实现（用于逐位对齐）
+        num_tokens = restore_shape[0]
+        num_experts = routing_map.shape[1]
+        routing_map_bool = routing_map.bool()
+        routing_map_T = routing_map_bool.T.contiguous()  # [num_experts, num_tokens]
+        tokens_per_expert = routing_map_T.long().sum(dim=-1)  # [num_experts]
+        expert_offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=permuted_tokens.device)
+        expert_offsets[1:] = torch.cumsum(tokens_per_expert, dim=0)
+        position_in_expert_T = routing_map_T.long().cumsum(dim=-1) - 1  # [num_experts, num_tokens]
+        global_position = position_in_expert_T + expert_offsets[:-1].unsqueeze(1)  # [num_experts, num_tokens]
+        global_position_per_token = global_position.T  # [num_tokens, num_experts]
+        topk = int(routing_map_bool.long().sum(dim=-1)[0].item())
+        valid_positions = global_position_per_token * routing_map_bool.long()
+        reverse_indices = valid_positions[routing_map_bool].reshape(num_tokens, topk)
+        # 用 embedding lookup 替代 index_select（反向是确定性的 scatter，无累加）
+        gathered = torch.nn.functional.embedding(reverse_indices.reshape(-1), permuted_tokens)
+        gathered = gathered.reshape(num_tokens, topk, hidden)
+
+        # === 插桩: dispatch 反向中间节点 ===
+        if gathered.requires_grad:
+            gathered.register_hook(_mg_topk_grad_info("dispatch_gathered(before_sum)", prefix="GRAD MG MoE"))
+
+        output_tokens = gathered.sum(dim=1)
+
+        if output_tokens.requires_grad:
+            output_tokens.register_hook(_mg_topk_grad_info("dispatch_output_tokens(after_sum)", prefix="GRAD MG MoE"))
+        # === 插桩结束 ===
+    else:
+        # Create an output tensor filled with zeros
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -593,13 +735,46 @@ def topk_softmax_with_capacity(
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits.float()).type_as(logits)
+        _mg_topk_info("scores(after_sigmoid)", scores)
+        # === 插桩: scores(after_sigmoid) 反向 hook ===
+        if scores.requires_grad:
+            scores.register_hook(_mg_topk_grad_info("cp11c_scores_after_sigmoid_grad"))
+        # === 插桩结束 ===
+
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias
+            _mg_topk_info("e_score_correction_bias", expert_bias)
+            _mg_topk_info("scores_for_choice", scores_for_routing)
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            _mg_topk_info("topk_indices", top_indices.float())
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            _mg_topk_info("topk_weights_raw(before_norm)", scores)
+            # === 插桩: topk_weights_raw(before_norm) 反向 hook ===
+            if scores.requires_grad:
+                scores.register_hook(_mg_topk_grad_info("cp11c_topk_weights_raw_grad"))
+            # === 插桩结束 ===
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+            _mg_topk_info("topk_indices", top_indices.float())
+            _mg_topk_info("topk_weights_raw(before_norm)", scores)
+            # === 插桩: topk_weights_raw(before_norm) 反向 hook ===
+            if scores.requires_grad:
+                scores.register_hook(_mg_topk_grad_info("cp11c_topk_weights_raw_grad"))
+            # === 插桩结束 ===
+        if _is_bit_exact():
+            # [对齐修复] fp64 sum 归一化（与 PF 对齐）
+            _scores_f64 = scores.double()
+            _sum_f64 = _scores_f64.sum(dim=-1, keepdim=True)
+            _denom = _sum_f64.float() + 1e-20
+            probs = scores / _denom if topk > 1 else scores
+        else:
+            # [原始代码] fp32 sum 归一化
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        _mg_topk_info("topk_weights(after_norm)", probs)
+        # === 插桩: topk_weights(after_norm) 反向 hook ===
+        if probs.requires_grad:
+            probs.register_hook(_mg_topk_grad_info("cp11c_topk_weights_normed_grad"))
+        # === 插桩结束 ===
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -610,6 +785,7 @@ def topk_softmax_with_capacity(
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     tokens_per_expert = topk_map.sum(dim=0)
+    _mg_topk_info("mask", topk_map.float())
 
     if capacity_factor is None:
         # TopK without capacity
@@ -881,6 +1057,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
+            if _is_log_enabled():
+                print(f"[MG RouterGatingLinear] BRANCH=te_general_gemm | inp: {list(inp.shape)} {inp.dtype} | weight: {list(weight.shape)} {weight.dtype} | router_dtype={router_dtype}", flush=True)
             output = te_general_gemm(weight, inp, router_dtype, layout="TN")
             output = output[0]
         else:
@@ -910,8 +1088,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = grad_input[0].to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+                grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+                grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, None

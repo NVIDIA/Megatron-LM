@@ -205,6 +205,14 @@ class FusedScaleMaskSoftmax(nn.Module):
         mask_output = self.mask_func(input, mask) if mask is not None else input
         probs = torch.nn.Softmax(dim=-1)(mask_output)
 
+        # === GRAD DEBUG: nn.Softmax 前后 (内部 _mg_grad_info 受 GLM_ALIGN_LOG 控制) ===
+        from megatron.core.align_dump_utils import _mg_grad_info
+        if mask_output.requires_grad:
+            mask_output.register_hook(_mg_grad_info("softmax_input(mask_output_fp32)"))
+        if probs.requires_grad:
+            probs.register_hook(_mg_grad_info("softmax_output(probs_fp32)"))
+        # === GRAD DEBUG END ===
+
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:
                 probs = probs.half()

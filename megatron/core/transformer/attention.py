@@ -7,6 +7,10 @@ from typing import NoReturn, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+# === save_tensor 插桩 ===
+from megatron.core.align_dump_utils import _mg_tensor_info, _mg_grad_info, save_tensor, save_tensor_grad, is_log_enabled as _is_log_enabled
+# === save_tensor 插桩结束 ===
+
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -607,6 +611,18 @@ class Attention(MegatronModule, ABC):
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
 
+        # === 插桩: CP7 query/key/value ===
+        _mg_tensor_info("cp7_query", query, layer_num=self.layer_number, prefix="MG Attention")
+        _mg_tensor_info("cp7_key", key, layer_num=self.layer_number, prefix="MG Attention")
+        _mg_tensor_info("cp7_value", value, layer_num=self.layer_number, prefix="MG Attention")
+        if query.requires_grad:
+            query.register_hook(_mg_grad_info("cp7_query", layer_num=self.layer_number, prefix="GRAD MG"))
+        if key.requires_grad:
+            key.register_hook(_mg_grad_info("cp7_key", layer_num=self.layer_number, prefix="GRAD MG"))
+        if value.requires_grad:
+            value.register_hook(_mg_grad_info("cp7_value", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
@@ -716,6 +732,15 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        # === 插桩: CP7b after_rope Q/K ===
+        _mg_tensor_info("cp7b_after_rope_q", query, layer_num=self.layer_number, prefix="MG Attention")
+        _mg_tensor_info("cp7b_after_rope_k", key, layer_num=self.layer_number, prefix="MG Attention")
+        if query.requires_grad:
+            query.register_hook(_mg_grad_info("cp7b_after_rope_q", layer_num=self.layer_number, prefix="GRAD MG"))
+        if key.requires_grad:
+            key.register_hook(_mg_grad_info("cp7b_after_rope_k", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         # ==================================
         # core attention computation
         # ==================================
@@ -774,6 +799,12 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        # === 插桩: CP8 core_attention ===
+        _mg_tensor_info("cp8_core_attention", core_attn_out, layer_num=self.layer_number, prefix="MG Attention")
+        if core_attn_out.requires_grad:
+            core_attn_out.register_hook(_mg_grad_info("cp8_core_attention", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -781,6 +812,12 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
+
+        # === 插桩: CP9 o_proj ===
+        _mg_tensor_info("cp9_o_proj", output, layer_num=self.layer_number, prefix="MG Attention")
+        if output.requires_grad:
+            output.register_hook(_mg_grad_info("cp9_o_proj", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         return output, bias
 
@@ -921,7 +958,22 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        # === 插桩: CP5 详细输入 log ===
+        _mg_tensor_info("cp5_input_hidden", hidden_states, layer_num=self.layer_number, prefix="MG Attention")
+        _w = self.linear_qkv.weight
+        _mg_tensor_info("cp5_qkv_weight", _w, layer_num=self.layer_number, prefix="MG Attention")
+        if hasattr(self.linear_qkv, 'bias') and self.linear_qkv.bias is not None:
+            _mg_tensor_info("cp5_qkv_bias", self.linear_qkv.bias, layer_num=self.layer_number, prefix="MG Attention")
+        elif _is_log_enabled():
+            print(f"| MG Attention:L{self.layer_number}:cp5_qkv_bias   | NO BIAS          |")
+        # === 插桩结束 ===
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        # === 插桩: CP5 mixed_qkv ===
+        _mg_tensor_info("cp5_mixed_qkv", mixed_qkv, layer_num=self.layer_number, prefix="MG Attention")
+        if mixed_qkv.requires_grad:
+            mixed_qkv.register_hook(_mg_grad_info("cp5_mixed_qkv", layer_num=self.layer_number, prefix="GRAD MG"))
+        # === 插桩结束 ===
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -953,6 +1005,12 @@ class SelfAttention(Attention):
             # [sq, b, ng, (np/ng + 2) * hn]
             # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
             (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # === 插桩: CP6 qkv_split ===
+        _mg_tensor_info("cp6_qkv_split_q", query, layer_num=self.layer_number, prefix="MG Attention")
+        _mg_tensor_info("cp6_qkv_split_k", key, layer_num=self.layer_number, prefix="MG Attention")
+        _mg_tensor_info("cp6_qkv_split_v", value, layer_num=self.layer_number, prefix="MG Attention")
+        # === 插桩结束 ===
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
