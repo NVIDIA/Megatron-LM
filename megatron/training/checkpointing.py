@@ -373,11 +373,13 @@ def get_rng_state(
     tp_group: torch.distributed.ProcessGroup,
     pp_group: torch.distributed.ProcessGroup,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
     key_prefix: str = '',
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
-    dp_cp_group threads the data-parallel (with context-parallel) group; None falls back to the mpu API.
+    dp_group threads the data-parallel group used for RNG gather/indexing.
+    dp_cp_group threads the data-parallel (with context-parallel) group used for checkpoint replica id.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
@@ -388,24 +390,16 @@ def get_rng_state(
         'cuda_rng_state': torch.cuda.get_rng_state(),
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
-    dp_cp_world_size = (
-        get_pg_size(dp_cp_group)
-        if dp_cp_group is not None
-        else mpu.get_data_parallel_world_size(with_context_parallel=True)
-    )
+    dp_world_size = get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
-            dp_cp_world_size > 1:
+            dp_world_size > 1:
         rng_state_list = \
-            [None for i in range(dp_cp_world_size)]
+            [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=(
-                dp_cp_group
-                if dp_cp_group is not None
-                else mpu.get_data_parallel_group(with_context_parallel=True)
-            ),
+            group=dp_group if dp_group is not None else mpu.get_data_parallel_group(),
         )
     else:
         rng_state_list = [rng_state]
@@ -515,7 +509,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -532,6 +526,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
+        dp_group: Data parallel group (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
@@ -581,6 +576,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
                               dp_cp_group=dp_cp_group,
+                              dp_group=dp_group,
                               key_prefix=rng_state_key_prefix)
 
     # Collect rerun state across all ranks
@@ -1655,7 +1651,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1664,6 +1660,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
+    dp_group: Data parallel group (default: None, falls back to mpu API)
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -1742,6 +1739,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group,
                                              dp_cp_group=dp_cp_group,
+                                             dp_group=dp_group,
                                              key_prefix=rng_state_key_prefix)  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -1846,7 +1844,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             "optimizer": optimizer_sd,
             "args": None,
             "iteration": 1,
-            "rng_state": get_rng_state(args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group),
+            "rng_state": get_rng_state(
+                args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+            ),
             "checkpoint_version": None,
             "opt_param_scheduler": opt_param_scheduler.state_dict(),
             "num_floating_point_operations_so_far": 0,
@@ -1870,7 +1870,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 )
             if not args.no_load_rng:
                 gen_sd_rng_state = get_rng_state(
-                    args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group
+                    args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
                 )
             if not args.no_load_optim:
                 gen_sd_optim = optimizer
@@ -2064,12 +2064,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-                    dp_cp_rank = (
-                        get_pg_rank(dp_cp_group)
-                        if dp_cp_group is not None
-                        else mpu.get_data_parallel_rank(with_context_parallel=True)
-                    )
-                    rng_state = rng_state[dp_cp_rank]
+                    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+                    rng_state = rng_state[dp_rank]
                 else:
                     rng_state = rng_state[0]
                 random.setstate(rng_state['random_rng_state'])
