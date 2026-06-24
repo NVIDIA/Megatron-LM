@@ -34,20 +34,17 @@ import torch
 
 _TRACER: Optional["RouterTracer"] = None
 
-# Locate the layer a router module belongs to from its qualified name.  The MTP
-# pattern is matched first because it is the more specific of the two (decoder
-# never matches an ``mtp.``-prefixed name).
+# Locate the layer that a router module belongs to based on its name.
 _MTP_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.')
 _DECODER_LAYER_RE = re.compile(r'decoder\.layers\.(\d+)\.')
 
 
 def _parse_router_module_name(module_name: str) -> Optional[Tuple[str, Optional[int], int]]:
-    """Parse a router module name into ``(block, mtp_idx, layer)``.
+    """Parse a router module name into (block, mtp_idx, layer).
 
-    Returns ``None`` if the name matches neither the decoder nor the MTP pattern.
+    Returns None if the name matches neither the decoder nor the MTP pattern.
 
-    Examples::
-
+    Examples:
         decoder.layers.3.mlp.router                         -> ("decoder", None, 3)
         mtp.layers.0.mtp_model_layer.layers.1.mlp.router    -> ("mtp", 0, 1)
     """
@@ -234,9 +231,8 @@ class RouterTracer:
     def make_hook(self, module_name: str = ""):
         """Build a forward hook callable for a single TopKRouter module.
 
-        The module's qualified name is parsed once to recover its
-        ``(block, mtp_idx, layer)`` identity so decoder and MTP layers that share
-        a ``layer_number`` are kept distinct.
+        The module's qualified name is parsed once to recover its (block, mtp_idx, layer) identity
+        so decoder and MTP layers that share a layer_number are kept distinct.
         """
         identity = _parse_router_module_name(module_name)
 
@@ -266,11 +262,7 @@ class RouterTracer:
         return hs
 
     def _make_index_record(self, top_indices_cpu, step, block, mtp_idx, layer) -> dict:
-        """Assemble a JSONL record dict for one layer's top-K indices.
-
-        Shared by the forward-hook path (``_record``) and the sink consumer API
-        (``record_indices``) so both emit an identical schema.
-        """
+        """Assemble a JSONL record dict for one layer's top-K indices."""
         record: dict = {
             "step": int(step),
             "stage": "pre_dispatch",
@@ -293,7 +285,7 @@ class RouterTracer:
             return
 
         # Resolve a collision-free layer identity.  Prefer the name parsed at
-        # registration; fall back to the module's bare ``layer_number``.
+        # registration; fall back to the module's bare layer_number.
         if identity is not None:
             block, mtp_idx, layer = identity
         else:
@@ -315,7 +307,11 @@ class RouterTracer:
                         return
                 self.layers_seen_this_step.add(layer_key)
 
-            if self.dump_router_weights and layer_key not in self._router_state:
+            # The router-weight dump is keyed by the integer `layer` to match the
+            # JSONL records' `layer` field, which is how downstream analysis joins
+            # weights to traces. (`layers_seen_this_step` above uses the full
+            # `layer_key` only for collision-free step-boundary detection.)
+            if self.dump_router_weights and layer not in self._router_state:
                 weight = getattr(module, "weight", None)
                 expert_bias = getattr(module, "expert_bias", None)
                 score_fn = getattr(
@@ -323,7 +319,7 @@ class RouterTracer:
                 )
                 topk_attr = getattr(module, "topk", None)
                 if torch.is_tensor(weight):
-                    self._router_state[layer_key] = {
+                    self._router_state[layer] = {
                         "weight": weight.detach().to("cpu", dtype=torch.float32).clone(),
                         "expert_bias": (
                             expert_bias.detach().to("cpu", dtype=torch.float32).clone()
@@ -350,9 +346,7 @@ class RouterTracer:
             num_tokens = int(top_indices_cpu.shape[0])
 
             record: dict = {
-                **self._make_index_record(
-                    top_indices_cpu, self.step_id, block, mtp_idx, layer
-                ),
+                **self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
             }
 
             if self.capture_hidden_states:
@@ -402,28 +396,24 @@ class RouterTracer:
     ) -> None:
         """Serialize already-captured top-K routing indices through the JSONL sink.
 
-        This is the consumer entry point for the in-pipeline recorder
-        (``RouterReplay`` / ``RoutingMetadata``): instead of capturing indices with
-        a forward hook, the caller hands over the indices the router pipeline
-        already recorded.  Unlike the hook path this works under CUDA graphs,
-        because the recorder copies into a static buffer rather than relying on a
-        Python hook firing during replay.
+        This is the entry point for the in-pipeline recorder (RouterReplay/RoutingMetadata).
+        Instead of capturing indices with a forward hook, the caller hands over the indices the
+        router pipeline recorded.  This works under CUDA graphs, because the recorder copies into a
+        static buffer rather than relying on a Python hook firing during replay.
 
-        Only the top-K indices are serialized here; the hidden-state / logit /
-        weight sidecars remain hook-only since the recorder does not hold them.
+        Only the top-K indices are serialized here. The hidden-state / logit /
+        weight sidecars remain hook-only.
 
         Args:
-            indices: Either a single tensor of shape ``[num_tokens, num_layers,
-                topk]`` (the layout ``RoutingMetadata.get_routing_indices()``
-                returns), or a list/tuple of per-layer tensors each shaped
-                ``[num_tokens, topk]``.
+            indices: Either a single tensor of shape [num_tokens, num_layers, topk]
+                (the layout RoutingMetadata.get_routing_indices() returns), or a list/tuple of
+                per-layer tensors each shaped [num_tokens, topk].
             step: Step id stamped on the emitted records.  Defaults to the
-                tracer's current ``step_id`` (drive boundaries with
-                ``advance_step()``).
-            layer_ids: Layer numbers, one per layer in ``indices``.  Defaults to
-                ``range(num_layers)``.
-            block: Block tag for the records (``"decoder"`` or ``"mtp"``).
-            mtp_idx: MTP head index; recorded only when ``block == "mtp"``.
+                tracer's current step_id (drive boundaries with advance_step()).
+            layer_ids: Layer numbers, one per layer in `indices`.  Defaults to
+                range(num_layers).
+            block: Block tag for the records ("decoder" or "mtp").
+            mtp_idx: MTP head index.
         """
         if self._stopped:
             return

@@ -241,7 +241,12 @@ if __name__ == "__main__":
         model = get_model_for_inference()
 
         if get_tracer() is not None:
-            get_tracer().register_hooks(model)
+            # When MoE routing replay is enabled, the in-pipeline recorder
+            # (RouterReplay/RoutingMetadata) writes routing indices into a CUDA-graph-safe static
+            # buffer, and the controller tees that buffer into the tracer once per decode step.
+            from megatron.core.utils import get_model_config
+            if not get_model_config(model).moe_enable_routing_replay:
+                get_tracer().register_hooks(model)
 
         requests = build_requests(args, tokenizer, sampling_params)
 
