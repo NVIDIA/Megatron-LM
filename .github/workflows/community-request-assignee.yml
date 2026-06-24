@@ -111,7 +111,6 @@ jobs:
     needs: authorize_assignment_command
     permissions:
       contents: read
-      issues: read
     outputs:
       analysis_json: ${{ steps.claude-analysis.outputs.structured_output }}
     if: |
@@ -168,7 +167,7 @@ jobs:
             4. Use repository search and git history to inspect likely paths:
                - Prefer rg/git ls-files for finding files.
                - Use git log -- <path> and git blame where useful.
-               - Use read-only gh issue view/gh pr view/gh pr list calls only when needed
+               - Use read-only gh pr view/gh pr list calls only when needed
                  to map commits, PRs, or issue metadata to GitHub logins.
             5. For bugs:
                - Investigate whether you can identify the likely root cause.
@@ -203,7 +202,7 @@ jobs:
             Only return the structured JSON requested by the schema.
           claude_args: |
             --model "claude-opus-4-6"
-            --allowedTools "Read,Bash(rg:*),Bash(git ls-files:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --allowedTools "Read,Bash(rg:*),Bash(git ls-files:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr list:*)"
             --json-schema '{"type":"object","properties":{"assignee":{"type":["string","null"]},"potential_assignee":{"type":["string","null"]},"potential_assignee_reason":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"fallback_to_oncall":{"type":"boolean"},"issue_type":{"type":"string","enum":["bug","feature_request","other"]},"feature_topic":{"type":["string","null"]},"root_cause_pr":{"anyOf":[{"type":"object","properties":{"number":{"type":"integer"},"title":{"type":"string"},"url":{"type":"string"},"author":{"type":"string"},"reason":{"type":"string"}},"required":["number","title","url","author","reason"],"additionalProperties":false},{"type":"null"}]},"relevant_paths":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"},"slack_context":{"type":"string"}},"required":["assignee","potential_assignee","potential_assignee_reason","confidence","fallback_to_oncall","issue_type","feature_topic","root_cause_pr","relevant_paths","evidence","rationale","slack_context"],"additionalProperties":false}'
 
   assign_community_request:
@@ -212,7 +211,6 @@ jobs:
     needs: [authorize_assignment_command, analyze_community_request]
     permissions:
       contents: read
-      issues: write
     if: |
       needs.authorize_assignment_command.result == 'success' &&
       needs.analyze_community_request.result == 'success' &&
