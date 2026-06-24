@@ -270,15 +270,21 @@ class TestHybridTHDScaling:
         args.v_head_dim = 64
         batch_size = 4
 
-        # Two MLA attention layers (C, H) + two Mamba layers.
+        # MLA attention variants (C, H) must be counted exactly like the plain
+        # ATTENTION symbol '*'. Both patterns are 2 attention + 2 Mamba layers, so
+        # with the fix they yield identical FLOPs. Under the old bug, C/H counted
+        # as ZERO attention layers while '*' counted as 2, so the two diverged.
         args.hybrid_layer_pattern = "CMHM"
-        flops_with_attn = num_floating_point_operations(args, batch_size)
-        # Same shape but the attention layers replaced by Mamba (no attention at all).
+        flops_mla_variants = num_floating_point_operations(args, batch_size)
+        args.hybrid_layer_pattern = "*M*M"
+        flops_plain_attn = num_floating_point_operations(args, batch_size)
+
+        assert flops_mla_variants == flops_plain_attn
+        # And attention must be a non-trivial contributor: dropping the two
+        # attention layers entirely (all Mamba) changes the estimate.
         args.hybrid_layer_pattern = "MMMM"
         flops_no_attn = num_floating_point_operations(args, batch_size)
-
-        # The C/H layers must add real attention FLOPs (the old bug made this 0).
-        assert flops_with_attn > flops_no_attn
+        assert flops_mla_variants != flops_no_attn
 
 
 class TestPaddingRemoval:

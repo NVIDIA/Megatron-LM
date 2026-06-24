@@ -100,15 +100,22 @@ def clone_tensors_in_struct(tgt, src):
     elif isinstance(src, dict):
         if not isinstance(tgt, dict):
             return copy_tensors_in_struct(src)
+        for k in list(tgt.keys()):
+            if k not in src:
+                del tgt[k]
         for k in src:
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[k], src[k])
+                tgt[k] = clone_tensors_in_struct(tgt.get(k), src[k])
             else:
                 tgt[k] = src[k]
+        return tgt
     elif isinstance(src, torch.Tensor):
+        if not _static_tensor_matches(tgt, src):
+            return copy_tensors_in_struct(src)
         tgt.copy_(src, non_blocking=True)
+        return tgt
     else:
-        raise Exception(f"Expect top-level as container type but got: {type(src)}")
+        return src
 
 
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
@@ -116,40 +123,32 @@ def clone_tensors_in_struct(tgt, src):
 class StaticBufferLoader:
     """Load data to static buffers."""
 
-    static_buffers: dict = {'training': [], 'validation': []}
+    static_buffers: dict = {'training': {}, 'validation': {}}
 
     def __init__(self):
         self.stream = torch.cuda.Stream()
 
-    def __call__(self, inputs, stage, microbatch):
+    def __call__(self, inputs, stage, microbatch, buffer_id=0):
         assert stage in ['training', 'validation']
-        assert microbatch <= len(StaticBufferLoader.static_buffers[stage])
+        # Separate static buffers per buffer_id so that distinct data iterators
+        # (e.g. one per virtual-pipeline model chunk) do not alias the same
+        # microbatch buffer and overwrite each other's captured inputs.
+        buffers = StaticBufferLoader.static_buffers[stage].setdefault(buffer_id, [])
+        assert microbatch <= len(buffers)
         if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
             inputs = inputs[0]
 
         assert isinstance(inputs, dict)
-        if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+        if microbatch == len(buffers):
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
-                StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
+                buffers.append(copy_tensors_in_struct(inputs))
         else:
-
-            for k in inputs.keys():
-                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    if isinstance(inputs[k], torch.Tensor):
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                            inputs[k], device="cuda"
-                        )
-                    else:
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
-
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
-                clone_tensors_in_struct(
-                    StaticBufferLoader.static_buffers[stage][microbatch], inputs
-                )
+                buffers[microbatch] = clone_tensors_in_struct(buffers[microbatch], inputs)
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        return buffers[microbatch]
 
 
 class FullCudaGraphWrapper:
@@ -175,7 +174,10 @@ class FullCudaGraphWrapper:
                 for b in range(num_microbatches):
                     data_list.append(
                         self.static_loader(
-                            next(iterator0), 'training' if training else 'validation', b
+                            next(iterator0),
+                            'training' if training else 'validation',
+                            b,
+                            buffer_id=0,
                         )
                     )
                 data_list = [iter(data_list)]
@@ -190,7 +192,10 @@ class FullCudaGraphWrapper:
                     for b in range(num_microbatches):
                         data_list_i.append(
                             self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
+                                next(data_iterator[i]),
+                                'training' if training else 'validation',
+                                b,
+                                buffer_id=i,
                             )
                         )
                     data_list.append(iter(data_list_i))
