@@ -2761,7 +2761,7 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(
                 f'(after {iteration} iterations)',
-                group=pg_collection.dp if pg_collection is not None else None,
+                process_group=pg_collection.dp if pg_collection is not None else None,
             )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
@@ -2772,7 +2772,7 @@ def training_log(
             not reported_memory_in_this_iteration:
             report_memory(
                 f'(after {iteration} iterations)',
-                group=pg_collection.dp if pg_collection is not None else None,
+                process_group=pg_collection.dp if pg_collection is not None else None,
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.

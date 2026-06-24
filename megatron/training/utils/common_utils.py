@@ -294,10 +294,10 @@ def logical_and_across_model_parallel_group(
     return bool(input.item())
 
 
-def report_memory(name, group=None):
+def report_memory(name, process_group=None):
     """Simple GPU memory report.
 
-    group: optional data-parallel group to gate the rank-0 print on; None falls back
+    process_group: optional data-parallel group to gate the rank-0 print on; None falls back
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
     args = get_args()
@@ -309,7 +309,11 @@ def report_memory(name, group=None):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    is_dp_rank_0 = get_pg_rank(group) == 0 if group is not None else mpu.get_data_parallel_rank() == 0
+    is_dp_rank_0 = (
+        get_pg_rank(process_group) == 0
+        if process_group is not None
+        else mpu.get_data_parallel_rank() == 0
+    )
     if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
