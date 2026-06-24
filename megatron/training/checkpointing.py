@@ -690,13 +690,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     if ckpt_metadata_path:
                         if getattr(args, 'ckpt_metadata_create', False):
                             save_strategy.ckpt_metadata_create_path = ckpt_metadata_path
-                            logger.debug(
+                            logger.info(
                                 f"Will create prepared checkpoint metadata at {ckpt_metadata_path}"
                             )
                         else:
                             with open(ckpt_metadata_path, 'rb') as f:
                                 save_strategy.prepared_metadata = pickle.load(f)
-                            logger.debug(
+                            logger.info(
                                 f"Using prepared checkpoint metadata from {ckpt_metadata_path}"
                             )
 
@@ -715,6 +715,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
                         pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
