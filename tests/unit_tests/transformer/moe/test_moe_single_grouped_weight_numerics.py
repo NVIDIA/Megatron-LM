@@ -144,7 +144,13 @@ class TestMoESingleGroupedWeightNumerics:
             vp_stage=vp_stage,
         )
 
-    def create_test_args(self, precision: str, primary_param_gather: bool, single_weight: bool):
+    def create_test_args(
+        self,
+        precision: str,
+        primary_param_gather: bool,
+        single_weight: bool,
+        gradient_accumulation_fusion: bool,
+    ):
         self._cleanup()
 
         sys.argv = ["test_moe_single_grouped_weight_numerics.py"]
@@ -169,6 +175,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.attention_backend = "unfused"
         args.add_bias_linear = False
         args.swiglu = True
+        args.gradient_accumulation_fusion = gradient_accumulation_fusion
         args.use_distributed_optimizer = True
         args.use_transformer_engine_op_fuser = True
         args.overlap_param_gather = False
@@ -238,8 +245,16 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision == "nvfp4":
             assert any(is_grouped_nvfp4tensor(param) for param in grouped_params)
 
-    def run_training_case(self, precision: str, primary_param_gather: bool, single_weight: bool):
-        args = self.create_test_args(precision, primary_param_gather, single_weight)
+    def run_training_case(
+        self,
+        precision: str,
+        primary_param_gather: bool,
+        single_weight: bool,
+        gradient_accumulation_fusion: bool,
+    ):
+        args = self.create_test_args(
+            precision, primary_param_gather, single_weight, gradient_accumulation_fusion
+        )
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
@@ -291,27 +306,45 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
-    def test_single_grouped_weight_parity_with_primary_param_gather(self, precision):
+    @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
+    def test_single_grouped_weight_parity_with_primary_param_gather(
+        self, precision, gradient_accumulation_fusion
+    ):
         """Compare single vs discrete MoE weights with primary param gather enabled if applicable."""
         _skip_if_unsupported(precision)
 
         single_losses = self.run_training_case(
-            precision=precision, primary_param_gather=True, single_weight=True
+            precision=precision,
+            primary_param_gather=True,
+            single_weight=True,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
         discrete_losses = self.run_training_case(
-            precision=precision, primary_param_gather=True, single_weight=False
+            precision=precision,
+            primary_param_gather=True,
+            single_weight=False,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
         self.assert_loss_parity(precision, single_losses, discrete_losses)
 
     @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
-    def test_single_grouped_weight_parity_without_primary_param_gather(self, precision):
+    @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
+    def test_single_grouped_weight_parity_without_primary_param_gather(
+        self, precision, gradient_accumulation_fusion
+    ):
         """Compare single vs discrete MoE weights when primary weights stay BF16."""
         _skip_if_unsupported(precision)
 
         single_losses = self.run_training_case(
-            precision=precision, primary_param_gather=False, single_weight=True
+            precision=precision,
+            primary_param_gather=False,
+            single_weight=True,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
         discrete_losses = self.run_training_case(
-            precision=precision, primary_param_gather=False, single_weight=False
+            precision=precision,
+            primary_param_gather=False,
+            single_weight=False,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
         self.assert_loss_parity(precision, single_losses, discrete_losses)
