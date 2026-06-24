@@ -113,7 +113,7 @@ still target these scripts.
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir   # enable tracing
---moe-routing-trace-max-iters 500             # optional: stop after N iters
+--moe-routing-trace-max-training-iters 500    # optional: stop after N iters
 --moe-routing-trace-capture-hidden-states     # required for distribution predictability
 --moe-routing-trace-dump-weights              # required for distribution predictability
 ```
@@ -123,7 +123,7 @@ still target these scripts.
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
---moe-routing-trace-max-steps 200
+--moe-routing-trace-max-inference-steps 200
 --moe-routing-trace-capture-hidden-states
 --moe-routing-trace-dump-weights
 ```

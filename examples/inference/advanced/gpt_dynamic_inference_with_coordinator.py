@@ -18,7 +18,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.transformer.moe.router_trace import get_tracer, init_tracer
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
@@ -228,8 +228,8 @@ if __name__ == "__main__":
 
         if getattr(args, 'moe_routing_trace_path', None):
             rank = dist.get_rank() if dist.is_initialized() else 0
-            max_steps = getattr(args, 'moe_routing_trace_max_steps', None) or 10**9
-            init_tracer(
+            max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
+            init_moe_router_tracer(
                 output_dir=args.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
@@ -240,13 +240,14 @@ if __name__ == "__main__":
 
         model = get_model_for_inference()
 
-        if get_tracer() is not None:
+        tracer = get_moe_router_tracer()
+        if tracer is not None:
             # When MoE routing replay is enabled, the in-pipeline recorder
             # (RouterReplay/RoutingMetadata) writes routing indices into a CUDA-graph-safe static
             # buffer, and the controller tees that buffer into the tracer once per decode step.
             from megatron.core.utils import get_model_config
             if not get_model_config(model).moe_enable_routing_replay:
-                get_tracer().register_hooks(model)
+                tracer.register_hooks(model)
 
         requests = build_requests(args, tokenizer, sampling_params)
 

@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-_TRACER: Optional["RouterTracer"] = None
+_MOE_ROUTER_TRACER: Optional["RouterTracer"] = None
 
 # Locate the layer that a router module belongs to based on its name.
 _MTP_LAYER_RE = re.compile(r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.')
@@ -55,7 +55,7 @@ def _parse_router_module_name(module_name: str) -> Optional[Tuple[str, Optional[
     return None
 
 
-def init_tracer(
+def init_moe_router_tracer(
     output_dir: str,
     max_steps: int,
     rank: int,
@@ -77,10 +77,10 @@ def init_tracer(
         capture_logits: Capture pre-topk routing logits.
         dump_router_weights: Save router weight tensors to a .pt file.
     """
-    global _TRACER
-    if _TRACER is not None:
+    global _MOE_ROUTER_TRACER
+    if _MOE_ROUTER_TRACER is not None:
         return
-    _TRACER = RouterTracer(
+    _MOE_ROUTER_TRACER = RouterTracer(
         output_dir,
         max_steps,
         rank,
@@ -89,12 +89,12 @@ def init_tracer(
         capture_logits=capture_logits,
         dump_router_weights=dump_router_weights,
     )
-    atexit.register(_TRACER.flush)
+    atexit.register(_MOE_ROUTER_TRACER.flush)
 
 
-def get_tracer() -> Optional["RouterTracer"]:
+def get_moe_router_tracer() -> Optional["RouterTracer"]:
     """Return the active tracer, or None if tracing is disabled."""
-    return _TRACER
+    return _MOE_ROUTER_TRACER
 
 
 def load_hidden_states_for_record(record: dict, trace_dir: str) -> torch.Tensor:
@@ -113,9 +113,10 @@ def load_hidden_states_for_record(record: dict, trace_dir: str) -> torch.Tensor:
     with open(path, "rb") as f:
         f.seek(record["hs_offset"])
         data = f.read(record["hs_bytes"])
+    # torch.frombuffer keeps the bytearray alive via the tensor's storage, so the
+    # view is safe to return without copying.
     arr = torch.frombuffer(bytearray(data), dtype=torch.int16)
-    arr = arr.view(torch.bfloat16).reshape(record["hs_shape"])
-    return arr.clone()
+    return arr.view(torch.bfloat16).reshape(record["hs_shape"])
 
 
 def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
@@ -134,9 +135,10 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
     with open(path, "rb") as f:
         f.seek(record["logit_offset"])
         data = f.read(record["logit_bytes"])
+    # torch.frombuffer keeps the bytearray alive via the tensor's storage, so the
+    # view is safe to return without copying.
     arr = torch.frombuffer(bytearray(data), dtype=torch.int16)
-    arr = arr.view(torch.bfloat16).reshape(record["logit_shape"])
-    return arr.clone()
+    return arr.view(torch.bfloat16).reshape(record["logit_shape"])
 
 
 class RouterTracer:
@@ -196,12 +198,13 @@ class RouterTracer:
         Accepts a single model or a list of model chunks.
         """
         from megatron.core.transformer.moe.router import TopKRouter
+        from megatron.core.utils import unwrap_model
 
         if not isinstance(model, (list, tuple)):
             model = [model]
 
         for chunk in model:
-            unwrapped = _unwrap_model(chunk)
+            unwrapped = unwrap_model(chunk)
             for module_name, module in unwrapped.named_modules():
                 if isinstance(module, TopKRouter):
                     handle = module.register_forward_hook(self.make_hook(module_name))
@@ -474,15 +477,3 @@ class RouterTracer:
                 weights_path = os.path.join(self.output_dir, f"router_state_rank{self.rank}.pt")
                 torch.save(self._router_state, weights_path)
                 self._router_state = {}
-
-
-def _unwrap_model(model):
-    """Unwrap DDP/FSDP wrappers to get the underlying module."""
-    try:
-        from megatron.core.utils import unwrap_model
-
-        return unwrap_model(model)
-    except Exception:
-        while hasattr(model, "module"):
-            model = model.module
-        return model

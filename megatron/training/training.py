@@ -231,7 +231,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.transformer.moe.router_trace import get_tracer, init_tracer
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 
 from . import ft_integration, one_logger_utils
 from .activation_logging import (
@@ -2242,7 +2242,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             disable_dgrad_logging()
 
         # Advance the router tracer step if active.
-        tracer = get_tracer()
+        tracer = get_moe_router_tracer()
         if tracer is not None:
             tracer.advance_step()
 
@@ -3260,8 +3260,8 @@ def train(
     # layer).  advance_step() is called at the end of each train_step().
     if getattr(args, 'moe_routing_trace_path', None):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        max_steps = getattr(args, 'moe_routing_trace_max_iters', None) or args.train_iters
-        init_tracer(
+        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        init_moe_router_tracer(
             output_dir=args.moe_routing_trace_path,
             max_steps=max_steps,
             rank=rank,
@@ -3270,7 +3270,7 @@ def train(
             capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
             dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
         )
-        get_tracer().register_hooks(model)
+        get_moe_router_tracer().register_hooks(model)
 
     report_memory_flag = True
     pre_hook_enabled = False

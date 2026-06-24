@@ -38,7 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
-from megatron.core.transformer.moe.router_trace import get_tracer
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
@@ -1753,7 +1753,7 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(routing_indices)
 
             # Save routing indices.
-            tracer = get_tracer()
+            tracer = get_moe_router_tracer()
             if tracer is not None and routing_indices is not None:
                 tracer.record_indices(torch.from_numpy(routing_indices))
                 tracer.advance_step()

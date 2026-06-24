@@ -392,10 +392,11 @@ class CheckpointConfig:
     Traces are written in the same format as inference traces so the analysis scripts under
     tools/moe_routing work on both."""
 
-    moe_routing_trace_max_iters: int | None = None
+    moe_routing_trace_max_training_iters: int | None = None
     """Maximum number of training iterations to trace.  Tracing stops
     automatically after this many calls to advance_step().  Defaults
-    to tracing all iterations when moe_routing_trace_path is set."""
+    to tracing all iterations when moe_routing_trace_path is set.
+    (Inference uses --moe-routing-trace-max-inference-steps instead.)"""
 
     moe_routing_trace_capture_logits: bool = False
     """Capture pre-topk routing logits for each router call."""
