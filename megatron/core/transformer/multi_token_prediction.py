@@ -70,6 +70,7 @@ def tie_word_embeddings_state_dict(
     word_emb_weight_key: str,
     tp_group: torch.distributed.ProcessGroup,
     dp_cp_group: torch.distributed.ProcessGroup,
+    use_dtensor_format: bool = False,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -79,6 +80,8 @@ def tie_word_embeddings_state_dict(
         word_emb_weight_key (str): key of the word embedding in the sharded state dict.
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
+        use_dtensor_format (bool): forwarded to ``make_tp_sharded_tensor_for_checkpoint``
+            so the produced ShardedTensor carries DTensor placement metadata.
 
     Returns: None, acts in-place
     """
@@ -96,6 +99,7 @@ def tie_word_embeddings_state_dict(
         allow_shape_mismatch=True,
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
+        use_dtensor_format=use_dtensor_format,
     )
 
 
@@ -105,6 +109,7 @@ def tie_output_layer_state_dict(
     output_layer_weight_key: str,
     tp_group: torch.distributed.ProcessGroup,
     dp_cp_group: torch.distributed.ProcessGroup,
+    use_dtensor_format: bool = False,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -114,6 +119,8 @@ def tie_output_layer_state_dict(
         output_layer_weight_key (str): key of the output layer in the sharded state dict.
         tp_group (torch.distributed.ProcessGroup): The tensor parallel group
         dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
+        use_dtensor_format (bool): forwarded to ``make_tp_sharded_tensor_for_checkpoint``
+            so the produced ShardedTensor carries DTensor placement metadata.
 
     Returns: None, acts in-place
     """
@@ -131,6 +138,7 @@ def tie_output_layer_state_dict(
         allow_shape_mismatch=True,
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
+        use_dtensor_format=use_dtensor_format,
     )
 
 
