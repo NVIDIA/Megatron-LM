@@ -58,16 +58,22 @@ _SAVE_PLANNER_METHODS = (
     "set_up_planner",
     "create_local_plan",
     "create_global_plan",
+    # Decentralized plan path (nvrx/mcore async w/ can_run_decentralized_global_plan):
+    # each rank turns its local plan into the central plan without a gather.
+    "create_decentralized_global_plan",
     "finish_plan",
 )
 # StorageWriter methods. ``prepare_write_data`` is nvrx-only (the staging step)
 # and is skipped gracefully on writers that don't define it. ``write_data`` /
 # ``write_preloaded_data`` cover the actual write (the latter runs in the async
 # worker, so it only shows up on that process's trace, if any).
+# ``prepare_decentralized_global_plan`` is the writer side of the decentralized
+# plan path (nvrx async).
 _SAVE_WRITER_METHODS = (
     "set_up_storage_writer",
     "prepare_local_plan",
     "prepare_global_plan",
+    "prepare_decentralized_global_plan",
     "prepare_write_data",
     "write_data",
     "write_preloaded_data",

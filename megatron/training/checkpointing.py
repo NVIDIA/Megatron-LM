@@ -673,20 +673,32 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             save_strategy.cached_global_metadata = cached_global_metadata
                         else:
                             logger.debug("Failed to plug in the read metadata from the load strategy...")
-                    # `--ckpt-metadata`: read a prepared, complete `.metadata`
-                    # from a (container-local) path and reuse it for every save.
-                    # Takes precedence over the loaded-checkpoint metadata above
-                    # and avoids reading metadata from the checkpoint store.
+                    # `--ckpt-metadata`: reuse a prepared, complete `.metadata`
+                    # file (container-local) for every SAVE, skipping the
+                    # save-side gathers (nvrx). The LOAD path is unaffected — it
+                    # always reads each checkpoint's own `.metadata`. Two modes,
+                    # mirroring the PG-tensors cache:
+                    #   * read (default): read the file now and reuse it from the
+                    #     first save.
+                    #   * create (`--ckpt-metadata-create`): the first save of
+                    #     this job runs the full collectives and *creates* the
+                    #     file; subsequent saves in this job reuse it.
+                    # Either way, every checkpoint dir still gets its own complete
+                    # `.metadata` (self-contained), so the metadata is stored both
+                    # per-checkpoint and at the `--ckpt-metadata` path.
                     ckpt_metadata_path = getattr(args, 'ckpt_metadata', None)
                     if ckpt_metadata_path:
-                        with open(ckpt_metadata_path, 'rb') as f:
-                            prepared_metadata = pickle.load(f)
-                        save_strategy.prepared_metadata = prepared_metadata
-                        # Also feed it as the cached global metadata so the
-                        # planning gather can be reused (nvrx PR #353) when the
-                        # file carries `__nvrx_all_local_plans`.
-                        save_strategy.cached_global_metadata = prepared_metadata
-                        logger.debug(f"Using prepared checkpoint metadata from {ckpt_metadata_path}")
+                        if getattr(args, 'ckpt_metadata_create', False):
+                            save_strategy.ckpt_metadata_create_path = ckpt_metadata_path
+                            logger.debug(
+                                f"Will create prepared checkpoint metadata at {ckpt_metadata_path}"
+                            )
+                        else:
+                            with open(ckpt_metadata_path, 'rb') as f:
+                                save_strategy.prepared_metadata = pickle.load(f)
+                            logger.debug(
+                                f"Using prepared checkpoint metadata from {ckpt_metadata_path}"
+                            )
 
                 if args.ckpt_fully_parallel_save:
                     if args.ckpt_fully_parallel_save_process_group == 'dp':
