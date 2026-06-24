@@ -180,8 +180,6 @@ class MimoOptimizer(MegatronOptimizer):
                     _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
 
-                # Namespace every internal ShardedBase key with the submodule name
-                # so disjoint grids don't collide on shared distributed-optimizer keys.
                 add_prefix_for_sharding(module_sd, f'mimo.{name}.')
                 sharded_state[name] = module_sd
             else:
