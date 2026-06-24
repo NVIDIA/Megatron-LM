@@ -50,7 +50,6 @@ def load_script(config_path: str) -> str:
     is_flag=True,
     show_default=True,
     required=False,
-    type=bool,
     default=False,
     help="Run 2-step smoke tests instead of full training",
 )
@@ -59,7 +58,6 @@ def load_script(config_path: str) -> str:
     is_flag=True,
     show_default=True,
     required=False,
-    type=bool,
     default=False,
     help="Save checkpoints, do not run pytest",
 )

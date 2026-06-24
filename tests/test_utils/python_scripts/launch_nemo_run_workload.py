@@ -103,7 +103,6 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
     is_flag=True,
     show_default=True,
     required=False,
-    type=bool,
     default=False,
     help="To enable lightweight mode",
 )

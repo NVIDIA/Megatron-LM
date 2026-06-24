@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 @click.option("--output-path", required=False, type=str, help="Path to write golden values")
 @click.option(
     "--is-convergence-test/--is-normal-test",
-    type=bool,
     help="Use first or all tensorboard logs",
     default=False,
 )

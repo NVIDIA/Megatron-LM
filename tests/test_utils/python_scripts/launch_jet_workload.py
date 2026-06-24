@@ -454,7 +454,6 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     is_flag=True,
     show_default=True,
     required=False,
-    type=bool,
     default=False,
     help="Wandb experiment (only relevant for release tests)",
 )

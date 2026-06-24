@@ -48,7 +48,6 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     is_flag=True,
     show_default=True,
     required=False,
-    type=bool,
     default=False,
     help="Run 2-step smoke tests instead of full training",
 )
@@ -57,7 +56,6 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     required=False,
     is_flag=True,
     default=True,
-    type=bool,
     help="Run one job as dependency to others as to warm up cache",
 )
 @click.option(
