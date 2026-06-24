@@ -2083,9 +2083,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    _tp_r = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
+    _tp_w = get_pg_size(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_world_size()
+    _pp_r = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+    _pp_w = get_pg_size(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_world_size()
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
-                 f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
-                 f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
+                 f'[ t {_tp_r + 1}/{_tp_w}, '
+                 f'p {_pp_r + 1}/{_pp_w} ] '
                  f'at iteration {iteration}')
 
     # Additional callback for wandb (last rank)
