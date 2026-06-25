@@ -54,7 +54,7 @@ to try our latest features.
 > be downloaded and provided through `${HF_MODEL_CKPT}`.
 
 
-### ⭐ NVFP4 Quantization, Qauntization-Aware Training, and Model Export
+### ⭐ NVFP4 Quantization, Quantization-Aware Training, and Model Export
 
 Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and provide variable
 `${MLM_MODEL_SAVE}` which stores a resumeable Megatron-LM distributed checkpoint. To export
@@ -96,6 +96,44 @@ export the model with flag `--export-vllm-fq`:
 ```
 
 For KV cache quantization, add a flag like `MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` while specifying your desired KV cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
+
+### ⭐ Auto Quantize (Mixed-Precision Search)
+
+Auto Quantize uses `mtq.auto_quantize` to perform a per-layer mixed-precision search, assigning each
+layer the best quantization format (e.g. NVFP4 or FP8) subject to a target effective-bits constraint.
+This produces a model that is more accurate than uniform quantization at the same average bit-width.
+
+Pass `auto` as the second positional argument to `quantize.sh` and provide `--auto-quantize-bits`
+through `MLM_EXTRA_ARGS`. The script will skip `--export-quant-cfg` entirely and drive the search
+via the auto-quantize arguments.
+
+> **Note:** Auto Quantize requires `--pipeline-model-parallel-size 1` (PP=1).
+
+```sh
+\
+    TP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_auto_quant \
+    MLM_EXTRA_ARGS="--auto-quantize-bits 4.0" \
+    ./quantize.sh meta-llama/Llama-3.2-1B-Instruct auto
+
+\
+    PP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_auto_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_auto_quant_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+Key arguments (passed via `MLM_EXTRA_ARGS`):
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--auto-quantize-bits` | *(required)* | Target effective bits per weight (e.g. `4.0`, `4.8`). |
+| `--auto-quantize-formats` | `NVFP4_DEFAULT_CFG FP8_DEFAULT_CFG` | Space-separated list of quant configs to search over. |
+| `--auto-quantize-method` | `gradient` | Sensitivity scoring method (`gradient` or `kl_div`). |
+| `--auto-quantize-score-size` | `128` | Number of samples used for sensitivity scoring. |
+| `--auto-quantize-checkpoint` | `None` | Optional path to save/restore search state across runs. |
 
 ### ⭐ Online BF16 EAGLE3 Training
 
