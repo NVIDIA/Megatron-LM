@@ -160,7 +160,7 @@ def _mamba_chunk_scan_combined_fwd(
         return final_states
 
 
-def mamba_chunk_scan_combined_varlen(
+def _mamba_chunk_scan_combined_varlen_triton(
     x,
     dt,
     A,
@@ -232,3 +232,134 @@ def mamba_chunk_scan_combined_varlen(
     )
 
     return varlen_states
+
+
+_CUTEDSL_SSD_ENABLED = None
+
+
+def _cutedsl_ssd_enabled():
+    """Decide whether to use the CuteDSL SSD backend.
+
+    Controlled by env ``MEGATRON_SSD_BACKEND`` in {auto, cutedsl, triton}
+    (default ``auto``). In ``auto`` mode the CuteDSL kernel is used on Blackwell
+    (SM 10.0) when the CuteDSL runtime is importable; otherwise Triton is used.
+    """
+    global _CUTEDSL_SSD_ENABLED
+    if _CUTEDSL_SSD_ENABLED is not None:
+        return _CUTEDSL_SSD_ENABLED
+
+    import os
+
+    mode = os.environ.get("MEGATRON_SSD_BACKEND", "auto").lower()
+    if mode == "triton":
+        _CUTEDSL_SSD_ENABLED = False
+        return False
+
+    enabled = False
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            from .cutedsl_mamba2_ssd import is_cutedsl_ssd_available
+
+            enabled = is_cutedsl_ssd_available()
+    except Exception:
+        enabled = False
+    if mode == "cutedsl":
+        enabled = True  # force, even off Blackwell (will error loudly if unusable)
+    _CUTEDSL_SSD_ENABLED = enabled
+    return enabled
+
+
+def mamba_chunk_scan_combined_varlen(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    cu_chunk_seqlens,
+    last_chunk_indices,
+    seq_idx,
+    out,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    return_intermediate_states=False,
+    intermediate_chunk_indices=None,
+    state_dtype=None,
+):
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend.
+
+    The CuteDSL backend is a faster drop-in for the common prefill case; it
+    falls back to Triton for argument combinations it does not yet support
+    (gating ``z``, non-zero ``initial_states``, intermediate-state extraction).
+    See :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument
+    contract.
+    """
+    if _cutedsl_ssd_enabled():
+        import os
+
+        from .cutedsl_mamba2_ssd import (
+            mamba_chunk_scan_combined_varlen_cutedsl,
+            mamba_chunk_scan_combined_varlen_cutedsl_thd,
+        )
+
+        # The THD-native variant (X fed as a zero-copy headdim-contiguous view)
+        # avoids the largest host transpose; prefer it, then the dense
+        # CuteDSL path, then Triton. Set MEGATRON_SSD_BACKEND=cutedsl_dense to
+        # force the dense CuteDSL path.
+        kwargs = dict(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            chunk_size=chunk_size,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx,
+            out=out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            return_intermediate_states=return_intermediate_states,
+            intermediate_chunk_indices=intermediate_chunk_indices,
+            state_dtype=state_dtype,
+        )
+        mode = os.environ.get("MEGATRON_SSD_BACKEND", "auto").lower()
+        if mode != "cutedsl_dense":
+            try:
+                return mamba_chunk_scan_combined_varlen_cutedsl_thd(**kwargs)
+            except NotImplementedError:
+                pass
+        try:
+            return mamba_chunk_scan_combined_varlen_cutedsl(**kwargs)
+        except NotImplementedError:
+            pass  # unsupported argument combination -> Triton fallback
+
+    return _mamba_chunk_scan_combined_varlen_triton(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        out,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        return_intermediate_states=return_intermediate_states,
+        intermediate_chunk_indices=intermediate_chunk_indices,
+        state_dtype=state_dtype,
+    )
