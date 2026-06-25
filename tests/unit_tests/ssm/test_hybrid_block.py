@@ -3,21 +3,34 @@
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net_2 import (
+    HAVE_FLA,
+    HAVE_GDN2_KERNEL,
+    GatedDeltaNet2,
+    GatedDeltaNet2Submodules,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from tests.unit_tests.test_utilities import Utils
+
+HAVE_GDN2 = HAVE_FLA and HAVE_GDN2_KERNEL
 
 
 @pytest.mark.internal
@@ -47,6 +60,78 @@ class TestHybridBlock:
             modules,
             layer_type_list=layer_type_list,
             pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+    def get_local_gdn_hybrid_block(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            activation_func=torch.nn.functional.silu,
+            normalization="RMSNorm",
+            layernorm_zero_centered_gamma=False,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+        backend = LocalSpecProvider()
+        rms_norm = transformer_config.normalization == "RMSNorm"
+        modules = hybrid_stack_spec.submodules.__class__(
+            gdn_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=ModuleSpec(
+                        module=GatedDeltaNet,
+                        submodules=GatedDeltaNetSubmodules(
+                            in_proj=backend.column_parallel_linear(),
+                            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                            out_proj=backend.row_parallel_linear(),
+                        ),
+                    ),
+                    self_attn_bda=get_bias_dropout_add,
+                ),
+            ),
+            gdn2_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=ModuleSpec(
+                        module=GatedDeltaNet2,
+                        submodules=GatedDeltaNet2Submodules(
+                            in_proj=backend.column_parallel_linear(),
+                            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                            out_proj=backend.row_parallel_linear(),
+                        ),
+                    ),
+                    self_attn_bda=get_bias_dropout_add,
+                ),
+            ),
+            attention_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=ModuleSpec(
+                        module=SelfAttention,
+                        params={"attn_mask_type": AttnMaskType.causal},
+                        submodules=SelfAttentionSubmodules(
+                            linear_qkv=backend.column_parallel_linear(),
+                            core_attention=backend.core_attention(),
+                            linear_proj=backend.row_parallel_linear(),
+                        ),
+                    ),
+                    self_attn_bda=get_bias_dropout_add,
+                ),
+            ),
+        )
+        return HybridStack(
+            transformer_config,
+            modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            post_layer_norm=False,
             pg_collection=self.get_pg_collection(),
         )
 
@@ -222,17 +307,33 @@ class TestHybridBlock:
         Make sure that G creates a TransformerLayer wrapping GatedDeltaNet,
         while * creates a TransformerLayer wrapping SelfAttention.
         """
-        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
-        block = self.get_hybrid_block(layer_pattern)
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION
+        block = self.get_local_gdn_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet)
         assert isinstance(layers[1], TransformerLayer)
         assert isinstance(layers[1].self_attention, SelfAttention)
-        assert isinstance(layers[2], MambaLayer)
+
+    def test_gdn2_layer_types(self):
+        """
+        Make sure that N creates a TransformerLayer wrapping GatedDeltaNet2,
+        while * creates a TransformerLayer wrapping SelfAttention.
+        """
+        if not HAVE_GDN2:
+            pytest.skip("A GDN2 chunk_gdn2 kernel is not installed.")
+        layer_pattern = Symbols.GDN2 + Symbols.ATTENTION
+        block = self.get_local_gdn_hybrid_block(layer_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet2)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
 
     def test_gdn_gpu_forward(self):
         """Test GPU forward pass with GDN, attention, and Mamba layers."""
+        if not HAVE_TE:
+            pytest.skip("The production hybrid GDN spec uses Transformer Engine modules.")
         layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
