@@ -40,6 +40,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.utils import (
     StragglerDetector,
+    flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -135,6 +136,8 @@ def get_batch(data_iterator, vp_stage=None):
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
+
+    batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert is_sft
@@ -292,11 +295,11 @@ def forward_step(data_iterator, model: HybridModel):
 
     packed_seq_params = None
     if cu_seqlens is not None:
-        # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
-        # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
-        cu_seqlens = cu_seqlens[0]
+        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
+        # for consistency, but PackedSeqParams and TE expect 1-D.
+        cu_seqlens = cu_seqlens.squeeze(0)
         if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded[0]
+            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
         # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)

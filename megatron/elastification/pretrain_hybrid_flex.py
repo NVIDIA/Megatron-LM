@@ -35,6 +35,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import (
     StragglerDetector,
+    flatten_batch_for_packed_sequences,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
 )
@@ -215,6 +216,8 @@ def get_batch(data_iterator, vp_stage=None):
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    batch = flatten_batch_for_packed_sequences(batch)
+
     # Intermediate PP stage under SFT only needs THD metadata (matches the
     # pretrain_hybrid.py PP-SFT shortcut, collapsed to the flex 7-tuple shape).
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -228,15 +231,10 @@ def get_batch(data_iterator, vp_stage=None):
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
     )
 
-    # cu_seqlens / max_seqlen arrive with the dataloader's batch dim (shape (1, n)
-    # and (1,) respectively when micro_batch_size==1). Squeeze to match the historical
-    # 1-D / scalar shape the flextron forward path was built around.
     cu_seqlens = batch.get('cu_seqlens')
     max_seqlen = batch.get('max_seqlen')
-    if cu_seqlens is not None:
-        cu_seqlens = cu_seqlens[0]
     if max_seqlen is not None:
-        max_seqlen = int(max_seqlen.item()) if max_seqlen.dim() == 0 else int(max_seqlen[0].item())
+        max_seqlen = int(max_seqlen.item())
 
     return (
         batch.get('tokens'),
