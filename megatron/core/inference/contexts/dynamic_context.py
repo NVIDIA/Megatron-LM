@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -35,6 +36,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -49,7 +51,7 @@ from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMet
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
-from .mamba_slot_allocator import MambaSlotAllocator
+from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -555,6 +557,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = model_config.params_dtype
+        self.hidden_size = model_config.hidden_size
+        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.max_sequence_length = inference_config.max_sequence_length
 
         # Block ids. With speculative decoding, blocks are pre-allocated when the
@@ -698,6 +702,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
         self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
 
+        # Placeholder for the MTP decoder hidden-states buffer; allocated inside
+        # initialize_all_tensors() when num_speculative_tokens > 0.
+        self.mtp_decoder_hidden_states = None
+
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.initialize_all_tensors()
@@ -763,11 +771,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb > 0
             ):
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                # Mirror the split done in _allocate_mamba_cache so this preview
+                # matches what is actually allocated: the "scratch" buffers
+                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
+                # budget first, then the rest sizes the "durable" cache
+                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
+                # per-slot footprint of both.
+                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+                scratch_bytes = scratch_slots * mamba_bytes_per_req
+                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
+                durable_slots = max(durable_slots, 0)
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
-                    f"    slots:                 {prefix_cache_slots}",
+                    f"    extraction_scratch:    {scratch_slots} slots "
+                    f"({get_mem_size_str(scratch_bytes)})",
+                    f"    durable_slots:         {durable_slots} "
+                    f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
@@ -1269,6 +1289,40 @@ class DynamicInferenceContext(BaseInferenceContext):
             and self.config.enable_prefix_caching
         ):
             self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
+        elif self.is_hybrid_model and self.config.enable_prefix_caching:
+            # Memory-only mode: prefix caching on a hybrid model without a Mamba
+            # cache budget deduplicates identical KV prefixes for memory savings,
+            # but does NOT cache Mamba recurrent state. Prefill skipping is
+            # therefore disabled (prefix_skip_tokens is forced to 0) and every
+            # token is recomputed, so results stay correct -- but the main latency
+            # benefit of prefix caching is forgone. Warn so a user who expected
+            # full caching knows to set prefix_caching_mamba_gb.
+            logging.warning(
+                "enable_prefix_caching is set on a hybrid (Mamba) model but "
+                "prefix_caching_mamba_gb is not configured (got %r). Running in "
+                "memory-only mode: identical KV prefixes are deduplicated for "
+                "memory savings, but Mamba state caching and prefill skipping are "
+                "disabled (every token is recomputed). Set prefix_caching_mamba_gb "
+                "> 0 to enable full prefix caching.",
+                self.config.prefix_caching_mamba_gb,
+            )
+
+        # MTP speculative decoding: persistent buffer for decoder hidden states.
+        # Only needed for block-scope CUDA graphs, where the Python assignment in
+        # forward() runs only during graph capture. Using copy_() into a fixed
+        # buffer ensures every batch-size graph replay writes to the same GPU
+        # address. Sized to max_tokens; only [:actual_tokens] is valid each step.
+        if (
+            self.num_speculative_tokens > 0
+            and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        ):
+            self.mtp_decoder_hidden_states = torch.empty(
+                self.max_tokens,
+                1,
+                self.hidden_size,
+                device=torch.cuda.current_device(),
+                dtype=self.params_dtype,
+            )
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1597,15 +1651,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_size = _math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
-        max_slots = total_bytes // per_slot_bytes
+
+        # MambaSlotAllocator allocates two GPU buffer families with the same
+        # per-slot footprint, both of which must fit in this budget:
+        #   - "durable" cache:  self.ssm_states / self.conv_states, sized to
+        #                       `max_slots` slots (computed below).
+        #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
+        #                       fixed CUDA-graph-safe staging for intermediate-state
+        #                       extraction, sized to the per-step worst case of
+        #                       `scratch_slots` = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        #                       * max_requests slots.
+        # The scratch is not part of the durable cache but consumes the same
+        # per-slot bytes, so reserve it from the budget up front before sizing the
+        # durable cache; otherwise total usage silently exceeds mamba_gb (and can
+        # OOM) when scratch_slots > max_slots.
+        scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+        scratch_bytes = scratch_slots * per_slot_bytes
+        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
         if max_slots < 1:
-            logging.warning(
-                "Mamba cache budget (%.3f GB) too small for even 1 slot "
-                "(need %.3f GB per slot). Mamba caching disabled.",
-                mamba_gb,
-                per_slot_bytes / 1024**3,
+            raise ValueError(
+                f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                f"is too small. The CUDA-graph extraction scratch reserves "
+                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots = "
+                f"{MAX_INTERMEDIATE_OFFSETS_PER_REQUEST} offsets x {self.max_requests} "
+                f"requests x {per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
+                f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
+                f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
+                f"reduce max_requests."
             )
-            return
 
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
@@ -1621,9 +1694,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         logging.info(
-            "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
+            "Mamba prefix cache: %d durable slots (%.3f GB) + %d scratch slots "
+            "(%.3f GB) = %.3f GB total within %.3f GB budget, per-slot %.1f KB",
             max_slots,
             max_slots * per_slot_bytes / 1024**3,
+            scratch_slots,
+            scratch_bytes / 1024**3,
+            (max_slots + scratch_slots) * per_slot_bytes / 1024**3,
+            mamba_gb,
             per_slot_bytes / 1024,
         )
 
@@ -2563,12 +2641,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         return logits.squeeze(0)[self.active_logit_idxs[: self.num_last_token_logits], :]
 
+    def _find_mamba_match_count(
+        self, req: DynamicInferenceRequest, start_block: int, end_block: int
+    ) -> int:
+        """Find the farthest cached Mamba state within a chunk-local block range.
+
+        Mamba state restore is only valid for blocks that the current chunk also
+        assigns from the KV cache. Chunked prefill can schedule a prompt prefix
+        that is shorter than the farthest cached full-prompt Mamba boundary, so
+        this helper intentionally uses the same block domain as KV matching.
+        """
+        if self.mamba_slot_allocator is None or not req.precomputed_block_hashes:
+            return 0
+
+        end_block = min(end_block, len(req.precomputed_block_hashes))
+        if start_block >= end_block:
+            return 0
+
+        mamba_map = self.mamba_slot_allocator.hash_to_block_id
+        hashes = req.precomputed_block_hashes[start_block:end_block]
+        for i in range(len(hashes) - 1, -1, -1):
+            if hashes[i] in mamba_map:
+                return i + 1
+        return 0
+
     def _compute_prefix_match(
-        self, req: DynamicInferenceRequest, prefill_chunk_length: int
+        self,
+        req: DynamicInferenceRequest,
+        prefill_chunk_length: int,
+        record_mamba_match: bool = False,
     ) -> Tuple[list, int, int, int, int, int]:
         """Compute prefix match results and skip counts for a request chunk.
 
         Shared by check_availability (budget checks) and add_request (execution).
+
+        Args:
+            req: Request being scheduled.
+            prefill_chunk_length: Number of prompt tokens considered in this chunk.
+            record_mamba_match: If True, store the chunk-local executable Mamba
+                match count on the request for diagnostics/tests.
 
         Returns:
             Tuple of (matched_block_ids, num_blocks_from_pool,
@@ -2608,7 +2719,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Only applies to the first chunk (finished == 0); continuation chunks
         # already had Mamba state restored during the first chunk.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
-            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            num_mamba_matched = self._find_mamba_match_count(
+                req, already_allocated_blocks, already_allocated_blocks + num_matched
+            )
+            if record_mamba_match:
+                req._mamba_num_matched_blocks = num_mamba_matched
             assert (
                 num_mamba_matched <= num_matched
             ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
@@ -2628,6 +2743,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 prefix_skip_tokens = 0
         elif self.is_hybrid_model and finished == 0:
+            if record_mamba_match:
+                req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
         # Clamp so that effective_prefill_chunk_length >= 2 when possible.
@@ -2754,7 +2871,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             overall_required_blocks,
             prefix_skip_tokens,
             effective_prefill_chunk_length,
-        ) = self._compute_prefix_match(req, prefill_chunk_length)
+        ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
@@ -3695,8 +3812,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def _processed_log_probs(
+        self,
+        logits: Tensor,
+        n_active: int,
+        active_query_lengths: Optional[Tensor],
+        sampling: Optional[Sampling],
+    ) -> Tensor:
+        """Sample the logprobs if desired."""
+        if self.config.logprobs_mode == "raw_logprobs":
+            return F.log_softmax(logits, dim=-1)
+
+        assert sampling is not None, "processed_logprobs requires a sampling backend"
+
+        # Map each logits row to its active request.
+        request_idx = torch.arange(n_active, device=logits.device)
+        row_to_request = (
+            request_idx
+            if active_query_lengths is None
+            else request_idx.repeat_interleave(active_query_lengths)
+        )
+        md = self.active_request_metadata
+        temperature = md["temperature"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        top_k = md["top_k"][:n_active].to(logits.device, torch.long)[row_to_request]
+        top_p = md["top_p"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        return sampling.log_probs_kernel(logits, temperature, top_k, top_p)
+
     def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        sampling: Optional[Sampling] = None,
     ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs for all active requests and return them.
 
@@ -3706,6 +3853,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
             only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            sampling (Optional[Sampling]): Backend used to optionally modify log-probs.
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
@@ -3715,14 +3863,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Calculate log_probs (sequence_length x vocab_size)
         logits_squeezed = logits.squeeze(0).float()
+        n_active = self.total_request_count - self.paused_request_count
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
+            log_probs = self._processed_log_probs(
+                logits_squeezed[seq_idx], n_active, None, sampling
+            )
             selected_log_probs = log_probs[seq_idx, new_tokens]
             return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -3746,12 +3896,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         #   active_token_ids[new_token_idx] = new_tokens
         #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        n_active = self.total_request_count - self.paused_request_count
         active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
         active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
 
         new_token_idx = active_query_lengths.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
+
+        # Compute (possibly processed) log-probs over all active-token rows.
+        log_probs = self._processed_log_probs(
+            logits_squeezed, n_active, active_query_lengths, sampling
+        )
 
         # Extract the log probs for only the selected tokens.
         # (sequence_length x vocab_size) -> (sequence_length)

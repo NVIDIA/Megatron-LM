@@ -164,8 +164,12 @@ class TestPrefixCachingCudaGraphs:
             use_cuda_graphs_for_non_decode_steps=True,
         )
         if mamba_config is not None:
+            # max_requests is not capped here, so it auto-derives from the KV buffer
+            # size. The Mamba cache budget must cover the per-step extraction scratch
+            # (which scales with max_requests) on top of the durable cache.
+            # max_requests is left uncapped to preserve this test's CUDA-graph buckets.
             inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=0.05
+                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=2.0
             )
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
@@ -394,9 +398,12 @@ class TestHybridChunkedPrefillIntermediateState:
             max_requests=128,
         )
         if enable_prefix_caching:
+            # The Mamba cache budget must cover both the durable cache and the
+            # per-step extraction scratch (which scales with max_requests), so it
+            # needs enough headroom to fit the scratch and still leave durable slots.
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-                prefix_caching_mamba_gb=0.05,
+                prefix_caching_mamba_gb=0.2,
             )
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens
