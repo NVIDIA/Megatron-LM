@@ -4,8 +4,8 @@
 
 MAJOR = 0
 MINOR = 18
-PATCH = 0
-PRE_RELEASE = ''
+PATCH = 1
+PRE_RELEASE = ""
 
 # Use the following formatting: (major, minor, patch, pre-release)
 VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
