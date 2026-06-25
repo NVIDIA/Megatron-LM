@@ -353,6 +353,7 @@ def _update_router_expert_bias(
                 hasattr(module, 'expert_bias')
                 and module.training
                 and module.expert_bias is not None
+                and not getattr(module, 'frozen_expert_bias', False)
             ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)

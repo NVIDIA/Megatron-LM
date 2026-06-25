@@ -278,6 +278,19 @@ class MimoModel(MegatronModule):
         if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
+    def _active_submodules(self):
+        """Yield this rank's present submodules."""
+        if self.language_model is not None:
+            yield self.language_model
+        for submodule in self.modality_submodules.values():
+            if submodule is not None:
+                yield submodule
+
+    def zero_grad_buffer(self):
+        """Zero each active submodule's DDP grad buffer."""
+        for module in self._active_submodules():
+            module.zero_grad_buffer()
+
     def get_text_embeddings(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor, special_token_ids: Dict[str, int]
     ) -> torch.Tensor:

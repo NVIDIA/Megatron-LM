@@ -2918,6 +2918,47 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for i, tensor in enumerate(split_tensors):
                         state_dict_flat[f"{key_prefix}{indexed_suffixes[i]}"] = tensor
 
+    @staticmethod
+    def _synthesize_state_dict_params_for_model(state_dict_flat, model_chunk):
+        """Let modules materialize runtime params before optimizer state-dict matching.
+
+        This covers modules whose runtime parameter is assembled from multiple checkpoint
+        tensors. Normal model loading can handle this in _load_from_state_dict(), but
+        reload_model_params(state_dict=...) matches optimizer master params directly by name.
+        """
+        for module_name, module in model_chunk.named_modules():
+            synthesize = getattr(module, '_synthesize_fused_qkv_down_weight', None)
+            key_suffixes = getattr(module, '_synthetic_state_dict_key_suffixes', None)
+            if not callable(synthesize) or not callable(key_suffixes):
+                continue
+
+            # Optional compatibility hook contract:
+            # - key_suffixes() returns source checkpoint keys under this module, used only
+            #   to infer checkpoint prefixes despite wrapper-added path segments.
+            # - synthesize(state_dict_flat, module_prefix) mutates the flat checkpoint dict
+            #   in place, materializing runtime parameter names from checkpoint tensors.
+            for inner_key in key_suffixes():
+                for module_prefix in DistributedOptimizer._state_dict_module_prefixes(
+                    state_dict_flat, module_name, inner_key
+                ):
+                    synthesize(state_dict_flat, module_prefix)
+
+    @staticmethod
+    def _state_dict_module_prefixes(state_dict_flat, module_name, inner_key):
+        """Find checkpoint prefixes for a module by suffix-matching one inner key."""
+        module_parts = module_name.split(".") if module_name else []
+        for start_idx in range(len(module_parts) + 1):
+            module_suffix = ".".join(module_parts[start_idx:])
+            key_suffix = f"{module_suffix}.{inner_key}" if module_suffix else inner_key
+            prefixes = {
+                state_key[: len(state_key) - len(inner_key)]
+                for state_key in state_dict_flat
+                if state_key.endswith(key_suffix)
+            }
+            if prefixes:
+                return prefixes
+        return set()
+
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""
         state_dict_list = []
@@ -2940,6 +2981,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
             self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
+            self._synthesize_state_dict_params_for_model(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):

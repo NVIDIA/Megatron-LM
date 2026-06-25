@@ -331,6 +331,8 @@ def apply_rotary_pos_emb(
     # Keep for backward compatibility. Will deprecate in the future.
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = config.multi_latent_attention
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
