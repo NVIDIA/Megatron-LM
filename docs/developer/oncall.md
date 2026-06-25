@@ -19,9 +19,11 @@ The oncall's primary responsibility is helping community contributors and users.
 [community-request](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Acommunity-request) 
 label.
 
+We have a useful Claude tool that will send a Slack DM with context to the assignee:
+
 - if you know who to assign: comment `/claude assign @gh-username`
-- if you do not know who to assign: comment `/claude assign` and Claude will
-  - the assignee may reach out to you if there is a mistake. Do your best to find the best assignee.
+- if you do not know who to assign: comment `/claude assign` and Claude will figure it out for you
+  - the assignee may reach out to you if there is a mistake. Do your best to find the best assignee
 
 ## PR Responsibilities
 
