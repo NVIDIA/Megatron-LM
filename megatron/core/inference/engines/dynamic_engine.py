@@ -1757,28 +1757,67 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available and token_partially_can_be_added:
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
-                max_chunk = min(remaining_len, token_budget)
+
+                # Prefix-cache skip: on a request's first chunk, the tokens covered
+                # by a cached prefix are reused rather than recomputed, so they do
+                # NOT consume the compute budget. Extend this chunk's SPAN to cover
+                # the entire skippable prefix plus up to `token_budget` newly computed
+                # tokens. Without this the span is capped at the budget, forcing the
+                # rest of a long cached prefix to be re-prefilled over many chunks
+                # (latency then scales with prompt length instead of the delta).
+                # add_request() only computes `effective = span - skip` tokens.
+                prefix_skip = 0
+                if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                    (_, _, _, _, prefix_skip, _) = self.context._compute_prefix_match(
+                        req, remaining_len
+                    )
+                    prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
+
+                computed_budget = min(remaining_len - prefix_skip, token_budget)
 
                 # Skip CG gating for the continuation of an in-flight chunked prefill:
                 # the request is already mid-flight, deferring it would deadlock progress.
                 if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
-                    # Snap chunk size to the largest captured-CG boundary within budget.
-                    # Fall back to eager (max_chunk) if no CG shape covers the budget.
-                    snapped_chunk = self._find_cg_chunk_size(max_chunk)
-                    prefill_chunk_length = snapped_chunk if snapped_chunk is not None else max_chunk
+                    # Snap the COMPUTED chunk size to the largest captured-CG boundary
+                    # within budget (skipped tokens don't affect the CG batch shape).
+                    # Fall back to eager (computed_budget) if no CG shape covers it.
+                    snapped_chunk = self._find_cg_chunk_size(computed_budget)
+                    computed_chunk = snapped_chunk if snapped_chunk is not None else computed_budget
                     req.cg_wait_iters = 0
                 else:
-                    prefill_chunk_length = max_chunk
+                    computed_chunk = computed_budget
+
+                prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
-                # final chunk, reduce by 1 (or defer if we only have 1 token of budget).
+                # final chunk, reduce by 1 (or defer if we only have 1 computed token).
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
                 # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
                 # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
                 if remaining_len - prefill_chunk_length == 1:
-                    if prefill_chunk_length > 1:
+                    if computed_chunk > 1:
                         prefill_chunk_length -= 1
                     else:
+                        can_schedule = False
+                        break
+
+                # add_request recomputes the skip for this exact chunk and applies a
+                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
+                # 2 tokens (tight budget late in a batched step, or a prompt that is
+                # all-but-one cached) that clamp shrinks the skip and grows the computed
+                # count by up to one block, which can exceed the token budget
+                # (TokenOverflowError). Only then re-derive the exact effective length
+                # add_request will use and defer on overflow (a later full-budget step
+                # admits the request). For >= 2 computed tokens add_request computes
+                # exactly this chunk, which already fits the budget.
+                if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
+                    (_, _, _, _, _, actual_effective) = self.context._compute_prefix_match(
+                        req, prefill_chunk_length
+                    )
+                    if (
+                        self.context.active_token_count + actual_effective
+                        > self.context.max_tokens
+                    ):
                         can_schedule = False
                         break
 
