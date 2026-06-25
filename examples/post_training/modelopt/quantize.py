@@ -24,7 +24,7 @@ import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
-from modelopt.torch.utils.dataset_utils import get_dataloader_from_dataset, get_dataset_dataloader
+from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
 # modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to the
@@ -70,17 +70,6 @@ from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
-
-
-class _TensorDictDataset(torch.utils.data.Dataset):
-    def __init__(self, tensors):
-        self.tensors = tensors
-
-    def __getitem__(self, idx):
-        return {key: tensor[idx] for key, tensor in self.tensors.items()}
-
-    def __len__(self):
-        return len(next(iter(self.tensors.values())))
 
 
 QUANT_CFG_CHOICES = {}
@@ -345,18 +334,11 @@ def get_calib_dataloader(
     max_sequence_length=512,
     use_random_offset=False,
     batch_size=1,
-    pad_to_max_length=False,
 ):
     """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
-    dp_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
-    distributed = dp_size > 1
-    sampler_kwargs = {
-        "num_replicas": dp_size,
-        "rank": parallel_state.get_data_parallel_rank() if torch.distributed.is_initialized() else 0,
-    }
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
@@ -401,18 +383,8 @@ def get_calib_dataloader(
         tokens = tokenizer(
             all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length, truncation=True
         )
-        tokenized_dataset = _TensorDictDataset(
-            {
-                "input_ids": tokens.input_ids.cuda(),
-                "attention_mask": tokens.attention_mask.cuda(),
-            }
-        )
-        return get_dataloader_from_dataset(
-            tokenized_dataset,
-            batch_size=batch_size,
-            distributed=distributed,
-            sampler_kwargs=sampler_kwargs,
-        )
+        all_input_ids = tokens.input_ids.cuda()
+        return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
     else:
         # HuggingFace dataset
         if use_random_offset:
@@ -425,10 +397,6 @@ def get_calib_dataloader(
             max_sample_length=max_sequence_length,
             batch_size=batch_size,
             device="cuda",
-            distributed=distributed,
-            sampler_kwargs=sampler_kwargs,
-            pad_to_max_length=pad_to_max_length,
-            warn_on_right_padding=False,
         )
 
 
@@ -441,7 +409,6 @@ def _get_calib_dataloader_from_args(tokenizer):
         max_sequence_length=args.calib_max_sequence_length,
         use_random_offset=args.calib_use_random_offset,
         batch_size=args.calib_batch_size,
-        pad_to_max_length=True,
     )
 
 
