@@ -308,7 +308,13 @@ class InferenceConfig:
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out, sized to the
+    worst-case 3 * max_requests slots). The scratch is reserved from this budget first,
+    so a larger max_requests leaves fewer durable slots."""
 
     # =================================
     # Logging config
@@ -337,6 +343,9 @@ class InferenceConfig:
 
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
@@ -379,6 +388,19 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
             )
 
         if self.sampling_backend == 'flashinfer':

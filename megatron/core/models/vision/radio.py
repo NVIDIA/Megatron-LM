@@ -17,6 +17,7 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 # RADIO reference code: https://github.com/NVlabs/RADIO
 
@@ -173,6 +174,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
             self.video_embedder = ColumnParallelLinear(
                 input_size=3 * self.temporal_patch_dim * self.patch_dim * self.patch_dim,
@@ -182,6 +184,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
         else:
             self.embedder = ColumnParallelLinear(
@@ -192,6 +195,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
         transformer_config.sequence_parallel = orig_sequence_parallel
 
@@ -208,6 +212,9 @@ class RADIOViTModel(VisionModule):
         self.ln_pre = None
         self.ln_post = None
         self.pg_collection = pg_collection
+        self.tp_group = get_tensor_model_parallel_group_if_none(
+            pg_collection.tp if pg_collection is not None else None
+        )
         self.vp_stage = vp_stage
         if ln_pre_impl is not None:
             self.ln_pre = build_module(

@@ -80,6 +80,16 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     def _get_host_valid_tokens_estimate(cls) -> Optional[int]:
         return cls._host_valid_tokens_estimate
 
+    @classmethod
+    def allocate_valid_tokens_tensor(cls) -> None:
+        """Allocate the per-step valid-tokens scalar shared across all dispatcher subclasses.
+
+        Called at model init from the dynamic context to ensure the buffer receives a valid pointer.
+        Must run outside CUDA graph capture so the stable address is available during replay.
+        """
+        device = torch.cuda.current_device()
+        cls._valid_tokens_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata refresh fired from the first instance's token_dispatch.
 
@@ -178,6 +188,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [total_tokens, topk].
         """
         if self.ep_size == 1:
+            if self._runs_metadata_sync:
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -505,6 +517,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
+            if self._runs_metadata_sync:
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
             return hidden_states, probs
 
         if self._runs_metadata_sync:

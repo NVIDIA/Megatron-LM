@@ -6,7 +6,12 @@ import inspect
 from contextlib import contextmanager
 from typing import Generator
 
-import yaml
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 
 @contextmanager
@@ -22,6 +27,12 @@ def safe_yaml_representers() -> Generator[None, None, None]:
         with safe_yaml_representers():
             yaml_str = yaml.safe_dump(my_complex_object)
     """
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to register YAML representers. "
+            "Install via `pip install pyyaml`."
+        )
+
     # Save original representers
     original_representers = yaml.SafeDumper.yaml_representers.copy()
     original_multi_representers = yaml.SafeDumper.yaml_multi_representers.copy()

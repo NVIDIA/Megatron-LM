@@ -76,6 +76,12 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
+
+
 def _try_parse_jsonish(value):
     if not isinstance(value, str):
         return value
@@ -328,12 +334,14 @@ def _replace_prefix_tokens(
     from the previous generation (rather than the ones from the chat template application)."""
 
     # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
     # Find the last EOS token id in the previous turn token ids
     last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+    # Note that the current conversation stat may be shorter than the previous conversation state.
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
         if current_turn_token_ids[i] == eos_token_id:
             last_eos_token_id_index = i
             break
@@ -539,20 +547,20 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            temperature = float(_get_non_none(req, "temperature", 1.0))
+            top_p = float(_get_non_none(req, "top_p", 1.0))
+            top_k = int(_get_non_none(req, "top_k", 0))
+            n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
                 top_p = 0.0
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            return_log_probs = bool(_get_non_none(req, "logprobs", False))
+            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
+            skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
+            add_BOS = bool(_get_non_none(req, "add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
