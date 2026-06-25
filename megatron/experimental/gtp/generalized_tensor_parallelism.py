@@ -1566,8 +1566,11 @@ class GTPWeightCache:
 
         buf_bytes = self._buf_bytes(out_shape, dtype)
         self._total_bytes += buf_bytes
+        dtype_str = (
+            str(dtype) if isinstance(dtype, torch.dtype) else getattr(dtype, "name", str(dtype))
+        )
         print_rank_0(
-            f"[GTP Cache] +{buf_bytes / 1024**2:.1f} MB  (shape={out_shape}, dtype={dtype})  "
+            f"[GTP Cache] +{buf_bytes / 1024**2:.1f} MB  (shape={out_shape}, dtype={dtype_str})  "
             f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} fwd: {fwd}"
         )
         return buf

@@ -457,7 +457,7 @@ class ProcessGroupCollection:
             dp_group = pg_collection.dp
 
             # 2. dp_cp group: fallback logic based on context_parallel_size
-            if hasattr(pg_collection, 'dp_cp'):
+            if 'dp_cp' in pg_set:
                 dp_cp_group = pg_collection.dp_cp
             else:
                 model_config = get_model_config(model_chunks[0])
@@ -542,7 +542,7 @@ class ProcessGroupCollection:
             # EGTP-MERGED variant of tp_ep_pp: includes the egtp axis, so each EGTP peer gets a
             # distinct rank — used for the distopt ShardedObject keys. Falls back to tp_ep_pp
             # when not provided.
-            if hasattr(pg_collection, 'tp_ep_pp_with_egtp'):
+            if 'tp_ep_pp_with_egtp' in pg_set:
                 expt_tp_pp_with_egtp_group = pg_collection.tp_ep_pp_with_egtp
             else:
                 expt_tp_pp_with_egtp_group = expt_tp_pp_group
@@ -550,11 +550,11 @@ class ProcessGroupCollection:
             # 6. no_gtp groups — the gtp-EXCLUDED replicate groups that DDP and the optimizer
             #    shard over: intra (per-distopt-instance) and full (cross-instance). Fall back to
             #    the non-GTP variants when not provided.
-            if hasattr(pg_collection, 'intra_dp_cp_no_gtp'):
+            if 'intra_dp_cp_no_gtp' in pg_set:
                 intra_dp_cp_no_gtp_group = pg_collection.intra_dp_cp_no_gtp
             else:
                 intra_dp_cp_no_gtp_group = intra_dp_cp_group
-            if hasattr(pg_collection, 'dp_cp_no_gtp'):
+            if 'dp_cp_no_gtp' in pg_set:
                 dp_cp_no_gtp_group = pg_collection.dp_cp_no_gtp
             else:
                 dp_cp_no_gtp_group = dp_cp_group
@@ -562,11 +562,11 @@ class ProcessGroupCollection:
             # 7. no_egtp groups — the expert analog of §6: the egtp-EXCLUDED replicate groups,
             #    intra (per-distopt-instance) and full (cross-instance). Fall back to the
             #    non-EGTP variants when not provided.
-            if hasattr(pg_collection, 'intra_expt_dp_no_egtp'):
+            if 'intra_expt_dp_no_egtp' in pg_set:
                 intra_expt_dp_no_egtp_group = pg_collection.intra_expt_dp_no_egtp
             else:
                 intra_expt_dp_no_egtp_group = intra_expt_dp_group
-            if hasattr(pg_collection, 'expt_dp_no_egtp'):
+            if 'expt_dp_no_egtp' in pg_set:
                 expt_dp_no_egtp_group = pg_collection.expt_dp_no_egtp
             else:
                 expt_dp_no_egtp_group = expt_dp_group
@@ -684,7 +684,7 @@ class ProcessGroupCollection:
             result['dp_group'] = pg_collection.dp
 
             # 2. dp_cp group: fallback logic based on context_parallel_size
-            if hasattr(pg_collection, 'dp_cp'):
+            if 'dp_cp' in pg_set:
                 result['dp_cp_group'] = pg_collection.dp_cp
             else:
                 cp_size = getattr(config, 'context_parallel_size', 1)
@@ -743,13 +743,13 @@ class ProcessGroupCollection:
             result['ep_group'] = pg_collection.ep
 
             # 6. GTP partial group (fallback to intra_dp_cp if not provided)
-            if hasattr(pg_collection, 'intra_dp_cp_no_gtp'):
+            if 'intra_dp_cp_no_gtp' in pg_set:
                 result['intra_dp_cp_no_gtp_group'] = pg_collection.intra_dp_cp_no_gtp
             else:
                 result['intra_dp_cp_no_gtp_group'] = result['intra_dp_cp_group']
 
             # 7. EGTP partial group (fallback to intra_expt_dp if not provided)
-            if hasattr(pg_collection, 'intra_expt_dp_no_egtp'):
+            if 'intra_expt_dp_no_egtp' in pg_set:
                 result['intra_expt_dp_no_egtp_group'] = pg_collection.intra_expt_dp_no_egtp
             else:
                 result['intra_expt_dp_no_egtp_group'] = result['intra_expt_dp_group']
@@ -757,11 +757,11 @@ class ProcessGroupCollection:
             # 8. Full (cross-instance) with-GTP-excluded variants for callers that need to
             # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
             # to the corresponding non-GTP-excluded full group when not provided.
-            if hasattr(pg_collection, 'dp_cp_no_gtp'):
+            if 'dp_cp_no_gtp' in pg_set:
                 result['dp_cp_no_gtp_group'] = pg_collection.dp_cp_no_gtp
             else:
                 result['dp_cp_no_gtp_group'] = result['dp_cp_group']
-            if hasattr(pg_collection, 'expt_dp_no_egtp'):
+            if 'expt_dp_no_egtp' in pg_set:
                 result['expt_dp_no_egtp_group'] = pg_collection.expt_dp_no_egtp
             else:
                 result['expt_dp_no_egtp_group'] = result['expt_dp_group']
