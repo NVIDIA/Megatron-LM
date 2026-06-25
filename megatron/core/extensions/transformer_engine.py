@@ -3109,8 +3109,116 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
         self._is_initialized = True
 
 
+_TE_CHECKPOINT_FGAO_RESIZE_PATCHED = False
+_TE_CHECKPOINT_FGAO_RESIZE_STATE = None
+
+
+def _get_te_checkpoint_fgao_resize_state():
+    """Return per-thread state used while TE checkpoint backward runs."""
+    global _TE_CHECKPOINT_FGAO_RESIZE_STATE
+    if _TE_CHECKPOINT_FGAO_RESIZE_STATE is None:
+        import threading
+
+        _TE_CHECKPOINT_FGAO_RESIZE_STATE = threading.local()
+    return _TE_CHECKPOINT_FGAO_RESIZE_STATE
+
+
+def _resize_fgao_checkpoint_input(tensor):
+    """Release FGAO-reloaded checkpoint input storage after TE recompute backward."""
+    tensor.grad = None
+    if tensor.is_cuda:
+        tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.untyped_storage().resize_(0)
+
+
+def _install_te_checkpoint_fgao_resize_patch():
+    """Patch TE reentrant checkpoint to resize FGAO-reloaded inputs after nested backward."""
+    global _TE_CHECKPOINT_FGAO_RESIZE_PATCHED
+    if _TE_CHECKPOINT_FGAO_RESIZE_PATCHED:
+        return
+
+    import transformer_engine.pytorch.distributed as te_dist
+
+    checkpoint_cls = getattr(te_dist, "_CheckpointFunction", None)
+    if checkpoint_cls is None:
+        _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
+        return
+
+    if not getattr(te_dist.detach_variable, "_mcore_fgao_resize_patch", False):
+        original_detach_variable = te_dist.detach_variable
+
+        def detach_variable_with_fgao_resize(inputs):
+            """Track detached inputs created inside marked TE checkpoint backward calls."""
+            detached_inputs = original_detach_variable(inputs)
+            state = _get_te_checkpoint_fgao_resize_state()
+            if not getattr(state, "enabled", False):
+                return detached_inputs
+
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                consume_reloaded_tensor_mark,
+            )
+
+            resize_tensors = getattr(state, "resize_tensors", None)
+            if resize_tensors is None:
+                resize_tensors = []
+                state.resize_tensors = resize_tensors
+
+            for inp, detached in zip(inputs, detached_inputs):
+                if (
+                    torch.is_tensor(inp)
+                    and torch.is_tensor(detached)
+                    and consume_reloaded_tensor_mark(inp)
+                ):
+                    resize_tensors.append(detached)
+            return detached_inputs
+
+        te_dist._mcore_original_detach_variable = original_detach_variable
+        te_dist.detach_variable = detach_variable_with_fgao_resize
+        te_dist.detach_variable._mcore_fgao_resize_patch = True
+
+    if getattr(checkpoint_cls, "_mcore_fgao_resize_patch", False):
+        _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
+        return
+
+    original_backward = checkpoint_cls.backward
+
+    @staticmethod
+    def backward(ctx, *args):
+        """TE reentrant checkpoint backward with post-backward FGAO input resize."""
+        if not getattr(ctx.run_function, "_mcore_release_fgao_reloaded_inputs", False):
+            return original_backward(ctx, *args)
+
+        state = _get_te_checkpoint_fgao_resize_state()
+        prev_enabled = getattr(state, "enabled", False)
+        prev_resize_tensors = getattr(state, "resize_tensors", None)
+        state.enabled = True
+        state.resize_tensors = []
+        try:
+            result = original_backward(ctx, *args)
+            for tensor in state.resize_tensors:
+                _resize_fgao_checkpoint_input(tensor)
+            return result
+        finally:
+            state.enabled = prev_enabled
+            if prev_resize_tensors is None:
+                del state.resize_tensors
+            else:
+                state.resize_tensors = prev_resize_tensors
+
+    checkpoint_cls._mcore_original_backward = original_backward
+    checkpoint_cls.backward = backward
+    checkpoint_cls._mcore_fgao_resize_patch = True
+    _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
+
+
 def te_checkpoint(
-    forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    forward_func,
+    distribute_saved_activations,
+    get_rng_state_tracker,
+    tp_group,
+    *args,
+    release_fgao_reloaded_inputs=False,
+    **kwargs,
 ):
     """Checkpointing with Transformer-Engine."""
     if not HAVE_TE:
@@ -3122,6 +3230,16 @@ def te_checkpoint(
     from transformer_engine.pytorch.distributed import checkpoint
 
     if is_te_min_version("1.5.0"):
+        if release_fgao_reloaded_inputs:
+            _install_te_checkpoint_fgao_resize_patch()
+            original_forward_func = forward_func
+
+            def forward_func_with_fgao_release(*inner_args, **inner_kwargs):
+                return original_forward_func(*inner_args, **inner_kwargs)
+
+            forward_func_with_fgao_release._mcore_release_fgao_reloaded_inputs = True
+            forward_func = forward_func_with_fgao_release
+
         return checkpoint(
             forward_func,
             *args,
