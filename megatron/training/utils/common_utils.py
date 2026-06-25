@@ -64,15 +64,23 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     )
 
 
-def calc_params_raw_moments_by_param(model, force_create_fp32_copy=False):
+def calc_params_raw_moments_by_param(
+    model, force_create_fp32_copy=False, expert_model_parallel_group=None
+):
     """Calculate per-parameter raw moments of parameters."""
     return _calc_params_l2_norm_or_raw_moments(
-        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=True
+        model,
+        force_create_fp32_copy=force_create_fp32_copy,
+        raw_moments_by_param=True,
+        expert_model_parallel_group=expert_model_parallel_group,
     )
 
 
 def _calc_params_l2_norm_or_raw_moments(
-    model, force_create_fp32_copy=False, raw_moments_by_param=False
+    model,
+    force_create_fp32_copy=False,
+    raw_moments_by_param=False,
+    expert_model_parallel_group=None,
 ):
     """Calculate scalar parameter norm or per-parameter raw moments.
 
@@ -117,8 +125,15 @@ def _calc_params_l2_norm_or_raw_moments(
 
         return calc_dtensor_params_l2_norm(params)
 
+    if raw_moments_by_param and expert_model_parallel_group is None:
+        expert_model_parallel_group = mpu.get_expert_model_parallel_group(check_initialized=False)
+
     raw_moments_registry = (
-        get_or_create_per_parameter_stat_registry(model) if raw_moments_by_param else None
+        get_or_create_per_parameter_stat_registry(
+            model, expert_model_parallel_group=expert_model_parallel_group
+        )
+        if raw_moments_by_param
+        else None
     )
 
     # Seperate moe and dense params

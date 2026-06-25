@@ -321,18 +321,28 @@ class MegatronOptimizer(ABC):
         return [NamedTensorBucket(names, grads, reduce_groups)]
 
     def get_grad_raw_moments_by_param(
-        self, registry: PerParameterStatRegistry | None = None
+        self,
+        registry: PerParameterStatRegistry | None = None,
+        expert_model_parallel_group: torch.distributed.ProcessGroup | None = None,
     ) -> tuple[list[tuple[str, dict[str, float]]], dict[str, float]]:
         """Compute per-parameter gradient raw moments and aggregate moments."""
         if registry is None:
-            registry = get_or_create_per_parameter_stat_registry(self.model_chunks)
+            registry = get_or_create_per_parameter_stat_registry(
+                self.model_chunks, expert_model_parallel_group=expert_model_parallel_group
+            )
         return reduce_raw_moments_by_param(
             registry, self.get_raw_moment_buckets_for_grad_norm(registry)
         )
 
-    def request_grad_raw_moments_by_param(self, model_chunks: Any) -> None:
+    def request_grad_raw_moments_by_param(
+        self,
+        model_chunks: Any,
+        expert_model_parallel_group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
         """Request per-parameter gradient raw moments for the next optimizer step."""
-        self._per_param_stat_registry = get_or_create_per_parameter_stat_registry(model_chunks)
+        self._per_param_stat_registry = get_or_create_per_parameter_stat_registry(
+            model_chunks, expert_model_parallel_group=expert_model_parallel_group
+        )
         self._per_param_grad_raw_moments_requested = True
         self._latest_grad_raw_moments_by_param = None
 

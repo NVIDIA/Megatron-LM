@@ -19,12 +19,38 @@ class TwoParamModel(torch.nn.Module):
         self.b = torch.nn.Parameter(torch.zeros(1))
 
 
+class SequentialExpertModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Config", (), {"num_moe_experts": 4})()
+        self.mlp = torch.nn.Module()
+        self.mlp.experts = torch.nn.Module()
+        self.mlp.experts.local_experts = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(1, 1, bias=False),
+                torch.nn.Linear(1, 1, bias=False),
+            ]
+        )
+
+
 class _FakeCudaTensor:
     device = torch.device("cuda:0")
     dtype = torch.float32
 
     def is_contiguous(self) -> bool:
         return True
+
+
+class _FakeExpertGroup:
+    def __init__(self, rank=0, size=1):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
 
 
 def test_reduce_raw_moments_by_param_on_cpu():
@@ -82,6 +108,37 @@ def test_registry_cache_is_per_model_identity():
     first_registry = get_or_create_per_parameter_stat_registry(first_model)
     assert get_or_create_per_parameter_stat_registry(first_model) is first_registry
     assert get_or_create_per_parameter_stat_registry(second_model) is not first_registry
+
+
+def test_registry_cache_includes_expert_group_identity():
+    model = TwoParamModel()
+    expert_group = _FakeExpertGroup(rank=0, size=2)
+
+    first_registry = get_or_create_per_parameter_stat_registry(model)
+    expert_registry = get_or_create_per_parameter_stat_registry(
+        model, expert_model_parallel_group=expert_group
+    )
+
+    assert expert_registry is not first_registry
+    assert get_or_create_per_parameter_stat_registry(
+        model, expert_model_parallel_group=expert_group
+    ) is expert_registry
+
+
+def test_registry_uses_explicit_expert_group_for_expert_names(monkeypatch):
+    expert_group = _FakeExpertGroup(rank=1, size=2)
+
+    monkeypatch.setattr(pps, "get_pg_rank", lambda group: 1 if group is expert_group else 0)
+    monkeypatch.setattr(pps, "get_pg_size", lambda group: 2 if group is expert_group else 1)
+
+    registry = PerParameterStatRegistry(
+        SequentialExpertModel(), expert_model_parallel_group=expert_group
+    )
+
+    assert set(registry.param_to_name.values()) == {
+        "mlp.experts.local_experts.2.weight",
+        "mlp.experts.local_experts.3.weight",
+    }
 
 
 def test_local_raw_moments_multi_tensor_path_preserves_order(monkeypatch):

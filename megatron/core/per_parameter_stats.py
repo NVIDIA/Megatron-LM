@@ -17,8 +17,7 @@ except ImportError:
     multi_tensor_applier = None
     multi_tensor_raw_moments = None
 
-from megatron.core import parallel_state
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
 _LAYER_NAME_PATTERN = re.compile(r"layers\.(\d+)")
 _GROUPED_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.linear_fc\d\.weight)(\d+)(.*)$")
@@ -46,9 +45,22 @@ class NamedTensorBucket:
 class PerParameterStatRegistry:
     """Canonical parameter-name registry for per-parameter statistics."""
 
-    def __init__(self, model_chunks: Iterable[torch.nn.Module] | torch.nn.Module):
+    def __init__(
+        self,
+        model_chunks: Iterable[torch.nn.Module] | torch.nn.Module,
+        expert_model_parallel_group: torch.distributed.ProcessGroup | None = None,
+    ):
         self.model_chunks = unwrap_model(_normalize_model_chunks(model_chunks))
-        self.cache_key = tuple(id(model_chunk) for model_chunk in self.model_chunks)
+        self.expert_model_parallel_group = expert_model_parallel_group
+        self.expert_model_parallel_rank, self.expert_model_parallel_size = (
+            _get_expert_model_parallel_rank_size(expert_model_parallel_group)
+        )
+        self.cache_key = _registry_cache_key(
+            self.model_chunks,
+            expert_model_parallel_group,
+            self.expert_model_parallel_rank,
+            self.expert_model_parallel_size,
+        )
         self.param_to_name = self._build_local_param_to_name()
         self.name_to_index = self._build_name_to_index()
         self.index_to_name = sorted(self.name_to_index, key=self.name_to_index.get)
@@ -65,10 +77,13 @@ class PerParameterStatRegistry:
     def _build_local_param_to_name(self) -> dict[torch.nn.Parameter, str]:
         param_to_name = {}
         num_experts = _get_num_moe_experts(self.model_chunks)
+        expert_offset = _get_local_expert_offset(
+            num_experts, self.expert_model_parallel_rank, self.expert_model_parallel_size
+        )
         for model_chunk in self.model_chunks:
             for local_name, param in model_chunk.named_parameters():
                 param_to_name[param] = _canonical_param_name(
-                    model_chunk, local_name, param, num_experts
+                    model_chunk, local_name, param, num_experts, expert_offset
                 )
         return param_to_name
 
@@ -87,17 +102,28 @@ class PerParameterStatRegistry:
 
 def get_or_create_per_parameter_stat_registry(
     model_chunks: Iterable[torch.nn.Module] | torch.nn.Module,
+    expert_model_parallel_group: torch.distributed.ProcessGroup | None = None,
 ) -> PerParameterStatRegistry:
     """Return a per-model cached parameter-stat registry."""
     unwrapped_model_chunks = unwrap_model(_normalize_model_chunks(model_chunks))
     if not unwrapped_model_chunks:
         raise ValueError("Cannot build a per-parameter stat registry for an empty model list.")
 
-    cache_key = tuple(id(model_chunk) for model_chunk in unwrapped_model_chunks)
+    expert_model_parallel_rank, expert_model_parallel_size = (
+        _get_expert_model_parallel_rank_size(expert_model_parallel_group)
+    )
+    cache_key = _registry_cache_key(
+        unwrapped_model_chunks,
+        expert_model_parallel_group,
+        expert_model_parallel_rank,
+        expert_model_parallel_size,
+    )
     cache_owner = unwrapped_model_chunks[0]
     registry = getattr(cache_owner, "_per_parameter_stat_registry", None)
     if registry is None or registry.cache_key != cache_key:
-        registry = PerParameterStatRegistry(unwrapped_model_chunks)
+        registry = PerParameterStatRegistry(
+            unwrapped_model_chunks, expert_model_parallel_group=expert_model_parallel_group
+        )
         cache_owner._per_parameter_stat_registry = registry
     return registry
 
@@ -297,9 +323,10 @@ def _canonical_param_name(
     local_name: str,
     param: torch.nn.Parameter,
     num_experts: int | None,
+    expert_offset: int,
 ) -> str:
     name = _global_layer_param_name(model_chunk, local_name, param)
-    return _global_expert_param_name(name, num_experts)
+    return _global_expert_param_name(name, num_experts, expert_offset)
 
 
 def _global_layer_param_name(
@@ -319,11 +346,12 @@ def _global_layer_param_name(
     return local_name
 
 
-def _global_expert_param_name(local_name: str, num_experts: int | None) -> str:
+def _global_expert_param_name(
+    local_name: str, num_experts: int | None, expert_offset: int
+) -> str:
     if not num_experts:
         return local_name
 
-    expert_offset = _get_local_expert_offset(num_experts)
     if expert_offset == 0:
         return local_name
 
@@ -340,15 +368,34 @@ def _global_expert_param_name(local_name: str, num_experts: int | None) -> str:
     return local_name
 
 
-def _get_local_expert_offset(num_experts: int) -> int:
-    expert_group = parallel_state.get_expert_model_parallel_group(check_initialized=False)
-    if expert_group is None:
-        return 0
-    expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
-    if expert_parallel_size <= 1:
+def _get_expert_model_parallel_rank_size(
+    expert_model_parallel_group: torch.distributed.ProcessGroup | None,
+) -> tuple[int, int]:
+    return get_pg_rank(expert_model_parallel_group), get_pg_size(expert_model_parallel_group)
+
+
+def _registry_cache_key(
+    model_chunks: Sequence[torch.nn.Module],
+    expert_model_parallel_group: torch.distributed.ProcessGroup | None,
+    expert_model_parallel_rank: int,
+    expert_model_parallel_size: int,
+) -> tuple[tuple[int, ...], int | None, int, int]:
+    group_id = id(expert_model_parallel_group) if expert_model_parallel_group is not None else None
+    return (
+        tuple(id(model_chunk) for model_chunk in model_chunks),
+        group_id,
+        expert_model_parallel_rank,
+        expert_model_parallel_size,
+    )
+
+
+def _get_local_expert_offset(
+    num_experts: int | None, expert_parallel_rank: int, expert_parallel_size: int
+) -> int:
+    if not num_experts or expert_parallel_size <= 1:
         return 0
     local_experts = num_experts // expert_parallel_size
-    return parallel_state.get_expert_model_parallel_rank() * local_experts
+    return expert_parallel_rank * local_experts
 
 
 def _get_num_moe_experts(model_chunks: Sequence[torch.nn.Module]) -> int | None:

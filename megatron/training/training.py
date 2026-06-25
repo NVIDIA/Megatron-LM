@@ -336,6 +336,14 @@ def _should_write_global_training_stats(args):
     return rank == world_size - 1
 
 
+def _get_expert_model_parallel_group(pg_collection):
+    if pg_collection is not None:
+        expert_model_parallel_group = getattr(pg_collection, 'ep', None)
+        if expert_model_parallel_group is not None:
+            return expert_model_parallel_group
+    return mpu.get_expert_model_parallel_group(check_initialized=False)
+
+
 def _warn_missing_statistics_log_dir():
     global _STATS_LOG_DIR_WARNING_SHOWN
     if not _STATS_LOG_DIR_WARNING_SHOWN:
@@ -2458,7 +2466,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         and iteration is not None
         and (iteration + 1) % args.tensorboard_log_interval == 0
     ):
-        optimizer.request_grad_raw_moments_by_param(model)
+        optimizer.request_grad_raw_moments_by_param(
+            model, expert_model_parallel_group=_get_expert_model_parallel_group(pg_collection)
+        )
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -3901,7 +3911,10 @@ def train(
             getattr(args, 'log_param_raw_moments_by_param', False)
             and iteration % args.tensorboard_log_interval == 0
         ):
-            param_raw_moments_by_param = calc_params_raw_moments_by_param(model)
+            param_raw_moments_by_param = calc_params_raw_moments_by_param(
+                model,
+                expert_model_parallel_group=_get_expert_model_parallel_group(model_pg_collection),
+            )
             statistics_log_dir = _get_statistics_log_dir(args)
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
