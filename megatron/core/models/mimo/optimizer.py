@@ -20,6 +20,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 if TYPE_CHECKING:
     from megatron.core.hyper_comm_grid import HyperCommGrid
 
+# Name of the grid's expert rank view; must match the view registered on the grid.
+_EXPERT_VIEW = "expert"
+
 
 @dataclass
 class ModuleOptimizerInfo:
@@ -336,9 +339,9 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         grid.create_pg(["tp"])
         grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+        grid.create_pg(["tp", "cp", "dp", "pp"])
+        grid.create_pg(["expt_tp", "ep", "pp"], view="expert")
+        grid.create_pg(["expt_dp"], view="expert")
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
@@ -361,16 +364,18 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
+    # Expert groups. 'ep' belongs to the grid's expert view (a re-factorization of
+    # the same rank span), not the base view; fetch them there. A non-expert grid
+    # (e.g. a vision encoder) still has a degenerate expert view with ep == 1.
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
 
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Distributed optimizer grad stats group: must span all ranks holding a unique
+    # gradient shard so grad-norm and found-inf all-reduces are complete. The expert
+    # view re-views the same ranks (ep adds no new ranks), so the full base grid
+    # already spans them. Mirrors standard Megatron's intra-distributed-optimizer
+    # group when num_distributed_optimizer_instances == 1.
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
 
     return pg
 
