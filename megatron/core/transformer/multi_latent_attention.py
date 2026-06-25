@@ -15,7 +15,6 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -371,6 +370,10 @@ class MultiLatentAttention(Attention):
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
+        core_attention_extra_kwargs = {}
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
+
         # ==================================
         # core attention computation
         # ==================================
@@ -378,16 +381,15 @@ class MultiLatentAttention(Attention):
         needs_output_trim = False
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                extra_kwargs = {}
-                if self.config.experimental_attention_variant == "dsa":
-                    # For dsa we need to pass in the original hidden states and the compressed
-                    # query representation.
-                    extra_kwargs["x"] = hidden_states
-                    extra_kwargs["qr"] = q_compressed
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
@@ -398,7 +400,7 @@ class MultiLatentAttention(Attention):
                         attention_mask,
                         packed_seq_params=packed_seq_params,
                         attn_mask_type=attn_mask_type,
-                        **extra_kwargs,
+                        **core_attention_extra_kwargs,
                     )
             elif self.cache_mla_latents:
                 value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
@@ -1404,8 +1406,6 @@ class FusedMLASelfAttention(MLASelfAttention):
                 sharded_state_dict[q_extra_key] = fused_obj
                 sharded_state_dict[kv_extra_key] = fused_obj
 
-        # Keep fused layernorm params so TransformerLayer's key map can load old
-        # input_layernorm checkpoints into the fused TE down-proj module.
         for key in list(sharded_state_dict.keys()):
             suffix = key[len(fused_prefix) :] if key.startswith(fused_prefix) else ""
             if key.startswith(fused_prefix) and not suffix.startswith("layer_norm_"):
