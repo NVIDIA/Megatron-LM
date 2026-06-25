@@ -45,7 +45,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     build_causal_mask_from_positions,
     build_fused_indexer_varlen_bounds,
-    generate_varlen_mask_params,
+    generate_varlen_mask_params_for_positions,
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -712,10 +712,7 @@ class TestDSACPPositionHelpers:
             device=torch.device("cpu"),
         )
 
-        # Build varlen starts/ends for local query rows.
-        starts_all, ends_all = generate_varlen_mask_params(cu_seqlens.to(torch.int64))
-        starts = starts_all.index_select(0, query_idx)
-        ends = ends_all.index_select(0, query_idx)
+        starts, ends = generate_varlen_mask_params_for_positions(cu_seqlens, query_idx)
 
         q = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32)
         k_for_index = torch.randn(skv, bsz, dim, dtype=torch.float32)
@@ -789,9 +786,7 @@ class TestDSACPPositionHelpers:
         )
         assert query_idx.tolist() == [3, 4, 5, 6, 7]
 
-        starts_all, ends_all = generate_varlen_mask_params(cu_seqlens.to(torch.int64))
-        starts = starts_all.index_select(0, query_idx)
-        ends = ends_all.index_select(0, query_idx)
+        starts, ends = generate_varlen_mask_params_for_positions(cu_seqlens, query_idx)
 
         q = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32)
         k_for_index = torch.randn(skv, bsz, dim, dtype=torch.float32)
@@ -869,9 +864,7 @@ class TestDSACPPositionHelpers:
         gathered_key_order = torch.empty_like(key_reorder_idx)
         gathered_key_order[key_reorder_idx] = torch.arange(skv, dtype=torch.int64)
 
-        starts_all, ends_all = generate_varlen_mask_params(cu_seqlens.to(torch.int64))
-        starts = starts_all.index_select(0, query_pos)
-        ends = ends_all.index_select(0, query_pos)
+        starts, ends = generate_varlen_mask_params_for_positions(cu_seqlens, query_pos)
 
         q = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32)
         k_for_index_global = torch.randn(skv, bsz, dim, dtype=torch.float32)
@@ -967,9 +960,7 @@ class TestDSACPPositionHelpers:
                 gathered_key_order.index_select(0, key_reorder_idx), key_pos, rtol=0, atol=0
             )
 
-            starts_all, ends_all = generate_varlen_mask_params(cu_seqlens.to(torch.int64))
-            starts = starts_all.index_select(0, query_pos)
-            ends = ends_all.index_select(0, query_pos)
+            starts, ends = generate_varlen_mask_params_for_positions(cu_seqlens, query_pos)
 
             q_local = q_global.index_select(0, query_pos)
             weights_local = weights_global.index_select(0, query_pos)
