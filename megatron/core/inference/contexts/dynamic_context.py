@@ -2491,12 +2491,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self) -> None:
+    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV block allocator's prefix-cache
+                state (hash index, ref counts, cached blocks) intact. Used by the idle
+                ``dummy_forward`` path, which only needs to clear the transient one-token
+                step state -- wiping the allocator there would destroy cross-request prefix
+                reuse for any subsequent request (the engine idles between requests at low
+                concurrency, especially with EP > 1).
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
         # Reset request/token counts.
         self.total_request_count = 0
@@ -2517,7 +2528,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
-        self.kv_block_allocator.reset()
+        if not preserve_prefix_cache:
+            self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset chunked prefill state
@@ -2529,7 +2541,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self) -> None:
+    def reset(self, preserve_prefix_cache: bool = False) -> None:
         """Reset entire context.
 
         This method does:
@@ -2540,18 +2552,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
+                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                the idle ``dummy_forward`` path so an idle step between requests does
+                not destroy cross-request prefix reuse.
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
         self.reset_tensors()
-        self.reset_metadata()
+        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
         # called during suspend/resume where these must persist).
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
+        if not preserve_prefix_cache:
+            self.step_count = 0
+            self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state
-        if self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
+            # Reset Mamba cache state
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.reset()
+        # When preserving prefix cache (idle dummy_forward), keep step_count
+        # monotonic so the engine's periodic logging cadence
+        # (step_count % logging_step_interval) still fires for short requests.
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
