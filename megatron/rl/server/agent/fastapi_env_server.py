@@ -117,12 +117,12 @@ class FastAPIEnvServer(EnvironmentServer):
         rollouts = [ContrastiveRollout.model_validate(r) for r in response.json()]
         return rollouts
 
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:
         raise NotImplementedError(
-            "FastAPIEnvServer overrides get_grouped_rollouts; group_rollout is not used."
+            "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
         )
 
     async def get_grouped_rollouts(

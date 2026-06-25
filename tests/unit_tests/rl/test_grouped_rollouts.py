@@ -53,15 +53,18 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         super().__init__(**kwargs)
         self.env_id = env_id
         self._call_count = 0
-        self.group_rollout_calls = 0
+        self.prepare_group_rollout_calls = 0
 
     async def rollout(self, request):
         raise NotImplementedError
 
-    async def group_rollout(self, request):
+    async def _agenerate(self, request, inference_request):
+        return await request.inference_interface.agenerate(inference_request)
+
+    async def prepare_group_rollout(self, request):
         idx = self._call_count
         self._call_count += 1
-        self.group_rollout_calls += 1
+        self.prepare_group_rollout_calls += 1
         inference_request = request.inference_interface.prepare_request(
             f"t{idx}", request.generation_args
         )

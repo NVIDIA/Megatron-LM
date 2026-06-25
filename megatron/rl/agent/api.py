@@ -104,7 +104,7 @@ GroupedRollouts = list[RolloutGroup]
 
 @dataclass
 class GroupRolloutParams:
-    """Returned by agent.group_rollout.
+    """Returned by agent.prepare_group_rollout.
 
     One instance is created per group call and reused for all rollouts in that group.
     """
@@ -159,7 +159,15 @@ class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
 
 
 class Agent(ABC, AgentBaseModel):
-    pass
+
+    @abstractmethod
+    async def _agenerate(
+        self,
+        request: "RolloutRequest | GroupedRolloutRequest | EvaluationRequest",
+        inference_request: InferenceRequest,
+    ) -> InferenceResponse:
+        """Run a single inference call. Subclasses implement how."""
+        ...
 
 
 class RolloutGenerator(Agent, ABC):
@@ -310,9 +318,11 @@ class _RolloutPipeline:
             while self.request.streaming or group_id < self.request.num_groups:
                 await self.gate.acquire_for("B")
                 batch_id = group_id // self.gran_policy.num_groups_per_batch
+
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
-                    params = await self.agent.group_rollout(self.request)
+                    params: GroupedRolloutRequest = await self.agent.prepare_group_rollout(self.request)
+
                     for rollout_idx in range(self.request.rollouts_per_group):
                         await self.gate.acquire_for("R")
                         await self.infer_queue.put(
@@ -348,7 +358,7 @@ class _RolloutPipeline:
 
     @trace_async_exceptions(verbose=True)
     async def _infer_one(self, item: _InferWorkItem) -> None:
-        response = await self.request.inference_interface.agenerate(item.params.inference_request)
+        response = await self.agent._agenerate(self.request, item.params.inference_request)
         self.gate.release_after("inferred")
         await self.assemble_queue.put(_InferredItem(item=item, response=response))
 
@@ -427,7 +437,7 @@ class GroupedRolloutGenerator(Agent, ABC):
             self.parallel_generation_tasks = parallel_generation_tasks
 
     @abstractmethod
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:

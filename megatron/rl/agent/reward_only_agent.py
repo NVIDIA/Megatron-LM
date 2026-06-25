@@ -5,7 +5,13 @@ from typing import Any
 import numpy as np
 from tqdm.asyncio import tqdm
 
-from ..inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
+from ..inference import (
+    InferenceRequest,
+    InferenceResponse,
+    LLMChatMessage,
+    ReturnsRaw,
+    ReturnsTokens,
+)
 from .api import (
     EvaluationAgent,
     EvaluationRequest,
@@ -118,6 +124,13 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return rollout
 
+    async def _agenerate(
+        self,
+        request: RolloutRequest | GroupedRolloutRequest | EvaluationRequest,
+        inference_request: InferenceRequest,
+    ) -> InferenceResponse:
+        return await request.inference_interface.agenerate(inference_request)
+
     async def rollout(self, request: RolloutRequest) -> Rollout:
 
         prompt, golden = await self.get_prompt(validation=request.validation)
@@ -126,11 +139,11 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        response = await request.inference_interface.agenerate(inference_request)
+        response = await self._agenerate(request, inference_request)
 
         return await self._rollout_from_response(request, response, golden)
 
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:
@@ -154,7 +167,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        response = await request.inference_interface.agenerate(inference_request)
+        response = await self._agenerate(request, inference_request)
         response_text = response.response.content
 
         result = RewardEvaluationResult(
