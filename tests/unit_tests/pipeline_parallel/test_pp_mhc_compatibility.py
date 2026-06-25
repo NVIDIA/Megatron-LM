@@ -566,9 +566,7 @@ class TestTransformerBlockMHCBoundaries:
         out = node.forward_impl(hidden_states)
 
         assert out is loss
-        decoder.postprocess_for_layer_schedule.assert_called_once_with(
-            hidden_states, is_last_decoder_layer=True
-        )
+        decoder.postprocess_for_layer_schedule.assert_called_once_with(hidden_states)
         assert gpt_model._postprocess.call_args.kwargs["hidden_states"] is contracted
 
 

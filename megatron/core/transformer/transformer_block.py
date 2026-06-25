@@ -475,7 +475,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         hidden_states: Tensor,
         *,
-        is_last_decoder_layer: bool = True,
         extract_layer_indices: Optional[Set[int]] = None,
         return_mhc_multistream: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
@@ -485,42 +484,41 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         (hidden_states, mhc_multistream), where mhc_multistream may be None.
         """
         mhc_multistream = None
-        if is_last_decoder_layer:
-            # Only contract if the final layer norm is in this stage.
-            if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-                # When MTP is enabled, save pre-contraction multi-stream for MTP input.
-                if self.config.mtp_num_layers is not None:
-                    if extract_layer_indices is not None:
-                        assert (
-                            len(extract_layer_indices) == 0
-                        ), "Feature extraction is not supported with mHC + MTP."
-                    mhc_multistream = hidden_states
-                # DSv4 introduced the new output contraction for mHC.
-                # [s, b, n*C] -> [s, b, C]
-                hidden_states = learned_output_contract(
-                    hidden_states,
-                    self.hc_head_fn,
-                    self.hc_head_base,
-                    self.hc_head_scale,
-                    self.config.num_residual_streams,
-                    self.config.layernorm_epsilon,
-                )
+        # Only contract if the final layer norm is in this stage.
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
+            if self.config.mtp_num_layers is not None:
+                if extract_layer_indices is not None:
+                    assert (
+                        len(extract_layer_indices) == 0
+                    ), "Feature extraction is not supported with mHC + MTP."
+                mhc_multistream = hidden_states
+            # DSv4 introduced the new output contraction for mHC.
+            # [s, b, n*C] -> [s, b, C]
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
-            # Final layer norm.
-            if self.final_layernorm is not None:
-                hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
-                # TENorm produces a "viewed" tensor. This will result in schedule.py's
-                # deallocate_output_tensor() throwing an error, so a viewless tensor is
-                # created to prevent this.
-                hidden_states = make_viewless_tensor(
-                    inp=hidden_states, requires_grad=True, keep_graph=True
-                )
+        # Final layer norm.
+        if self.final_layernorm is not None:
+            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
-            # If this TransformerBlock is empty, input and output hidden states will be the same
-            # node on the computational graph and will lead to unexpected errors in pipeline
-            # schedules.
-            if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
-                hidden_states = hidden_states.clone()
+        # If this TransformerBlock is empty, input and output hidden states will be the same
+        # node on the computational graph and will lead to unexpected errors in pipeline
+        # schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
 
         if return_mhc_multistream:
             return hidden_states, mhc_multistream
