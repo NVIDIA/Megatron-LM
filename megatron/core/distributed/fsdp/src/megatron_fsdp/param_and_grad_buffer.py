@@ -2313,13 +2313,11 @@ class ParamAndGradBuffer:
     ) -> torch.dtype:
         """Resolve the main gradient dtype for a parameter group."""
         if self.mp_policy.main_grads_dtype is not None:
+            # Custom gradient accumulation precision.
             return self.mp_policy.main_grads_dtype
-        one_param = group.params[0]
-        is_fp8 = (
-            is_float8tensor(one_param)
-            or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
-        )
-        return torch.bfloat16 if is_fp8 else one_param.dtype
+        is_fp8 = isinstance(group.dtype, str) and group.dtype == "float8"
+        # BF16 for FP8 parameters, otherwise grad.dtype == param.dtype.
+        return torch.bfloat16 if is_fp8 else group.dtype
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -2626,18 +2624,14 @@ class ParamAndGradBuffer:
                 if not group.is_expert_param
                 else self.expert_gradient_scaling_factor
             )
-            # Check if the parameter group is FP8.
-            one_param = group.params[0]
-            is_dtype_float8 = (
-                is_float8tensor(one_param)
-                or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
-            )
 
             # Model weight buffer (compute) precision.
-            param_dtype = torch.uint8 if is_dtype_float8 else one_param.dtype
+            is_dtype_float8 = isinstance(group.dtype, str) and group.dtype == "float8"
+            param_dtype = torch.uint8 if is_dtype_float8 else group.dtype
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
+            one_param = group.params[0]
             need_transpose_data = is_float8tensor(one_param) and fp8_need_transpose_data(one_param)
             need_transpose_data_for_meta_device_init = meta_device_init_fp8_params.get(
                 self.param_to_name[one_param], (False, False)
