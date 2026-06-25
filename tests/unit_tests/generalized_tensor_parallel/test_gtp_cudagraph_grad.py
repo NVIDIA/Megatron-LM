@@ -13,9 +13,14 @@ Fix: create_fwd_graph / create_bwd_graph snapshot the grads their capture touche
 the module's own params and their cross-graph ``next_w`` must survive a simulated capture clobber.
 """
 
+import pytest
 import torch
 
 from megatron.core.transformer.cuda_graphs import _backup_capture_grads, _restore_capture_grads
+from megatron.experimental.gtp import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
 
 
 def _gtp_param(value: float, numel: int = 8) -> torch.nn.Parameter:

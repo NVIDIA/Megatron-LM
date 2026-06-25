@@ -506,25 +506,22 @@ class ModelParallelConfig:
         if self.expert_tensor_parallel_size is None:
             self.expert_tensor_parallel_size = self.tensor_model_parallel_size
 
-        # Reconcile the user-facing tensor_parallel_num_weight_shards with the internal
-        # gtp_weight_remat_size (num_weight_shards = tensor_model_parallel_size * gtp_weight_remat).
-        (self.tensor_parallel_num_weight_shards, self.gtp_weight_remat_size) = (
-            resolve_tensor_parallel_weight_shards(
-                self.tensor_model_parallel_size,
-                self.tensor_parallel_num_weight_shards,
-                self.gtp_weight_remat_size,
-            )
+        # Derive the internal gtp_weight_remat_size from the user-facing
+        # tensor_parallel_num_weight_shards:
+        #   num_weight_shards = tensor_model_parallel_size * gtp_weight_remat
+        _, self.gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_weight_shards,
+            self.gtp_weight_remat_size,
         )
 
         # Same reconciliation for expert layers (expert_tensor_parallel_size finalized above).
-        (self.expert_tensor_parallel_num_weight_shards, self.expert_gtp_weight_remat_size) = (
-            resolve_tensor_parallel_weight_shards(
-                self.expert_tensor_parallel_size,
-                self.expert_tensor_parallel_num_weight_shards,
-                self.expert_gtp_weight_remat_size,
-                shards_field="expert_tensor_parallel_num_weight_shards",
-                tp_field="expert_tensor_parallel_size",
-            )
+        _, self.expert_gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+            self.expert_tensor_parallel_size,
+            self.expert_tensor_parallel_num_weight_shards,
+            self.expert_gtp_weight_remat_size,
+            shards_field="expert_tensor_parallel_num_weight_shards",
+            tp_field="expert_tensor_parallel_size",
         )
 
         if self.pipeline_model_parallel_size > 1:

@@ -412,6 +412,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_moe_egtp.py` | EGTP on MoE routed-expert weights. |
 | `test_gtp_loss_correctness.py` | End-to-end: GTP per-step loss trajectory matches a no-GTP baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
+| `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_capture_grads`/`_restore_capture_grads` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_dcp.py` | Distributed-checkpoint sharding (§3.3): TP×GTP composite/cross-axis offsets, alignment-pad `allow_shape_mismatch`, cross-topology reshard metadata, and quantize-cache reset. |
 | `test_gtp_muon_dcp.py` | GTP + Muon (LayerWise) optimizer-state checkpoint roundtrip (§1.6): `replica_id` fold for GTP-replicated whole params (router, latent-proj). |
 

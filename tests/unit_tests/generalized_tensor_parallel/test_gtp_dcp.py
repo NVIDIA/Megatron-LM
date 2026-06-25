@@ -14,16 +14,20 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.experimental.gtp import (
+from megatron.experimental.gtp import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
+
+from megatron.experimental.gtp import (  # noqa: E402
     GTP_CONFIG,
-    HAVE_GTP,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp,
     reset_gtp_quantize_cache,
     update_gtp_config,
     wrap_module_params_gtp,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +40,6 @@ def _no_pad_alignment():
     update_gtp_config(pad_for_alignment=0)
     yield
     update_gtp_config(pad_for_alignment=orig)
-
-
-pytestmark = pytest.mark.skipif(not HAVE_GTP, reason="GTP requires TE with hook registry")
 
 
 @pytest.fixture(scope="module", autouse=True)
