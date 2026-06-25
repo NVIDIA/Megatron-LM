@@ -1277,6 +1277,8 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
+    if args.activation_log_interval is not None:
+        assert args.activation_log_interval > 0, '--activation-log-interval must be greater than 0'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'

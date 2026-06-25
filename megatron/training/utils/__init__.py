@@ -2,6 +2,7 @@
 
 from megatron.training.utils.common_utils import (
     calc_params_l2_norm,
+    calc_params_raw_moments_by_param,
     calc_dtensor_params_l2_norm,
     average_losses_across_data_parallel_group,
     reduce_max_stat_across_model_parallel_group,

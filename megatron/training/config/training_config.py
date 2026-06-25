@@ -251,6 +251,30 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_param_raw_moments_by_param: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for each parameter separately
+    (keyed by parameter name) to JSONL statistics files."""
+
+    log_grad_raw_moments_by_param: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for each parameter's
+    pre-clipping gradient separately (keyed by parameter name) to JSONL statistics files."""
+
+    log_activation_raw_moments_by_layer: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for activations keyed by
+    module site to JSONL statistics files."""
+
+    log_dgrad_raw_moments_by_layer: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for backward data gradients
+    keyed by module site to JSONL statistics files."""
+
+    activation_log_interval: int | None = None
+    """Interval for activation and dgrad raw-moment statistics. If unset, uses
+    tensorboard_log_interval."""
+
+    statistics_log_dir: str | None = None
+    """Directory for high-cardinality JSONL statistics. If unset, statistics use
+    tensorboard_dir when available, then save as a fallback."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 

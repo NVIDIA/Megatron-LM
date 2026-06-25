@@ -16,6 +16,11 @@ from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.msc_utils import open_file
+from megatron.core.per_parameter_stats import (
+    NamedTensorBucket,
+    get_or_create_per_parameter_stat_registry,
+    reduce_raw_moments_by_param,
+)
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -47,16 +52,58 @@ from megatron.core.utils import (
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
 
+# Relative tolerance for the raw-moments self-check: sqrt(sum_2), recombined into an aggregate,
+# must match the independently-computed scalar norm to within this much.
+_RAW_MOMENTS_BY_PARAM_NORM_RTOL = 1e-2
+
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
-    """Calculate l2 norm of parameters"""
+    """Calculate l2 norm of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=False
+    )
+
+
+def calc_params_raw_moments_by_param(model, force_create_fp32_copy=False):
+    """Calculate per-parameter raw moments of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=True
+    )
+
+
+def _calc_params_l2_norm_or_raw_moments(
+    model, force_create_fp32_copy=False, raw_moments_by_param=False
+):
+    """Calculate scalar parameter norm or per-parameter raw moments.
+
+    If ``raw_moments_by_param`` is False, returns the aggregate l2 norm as a scalar float.
+
+    If ``raw_moments_by_param`` is True, returns a list of ``(parameter_name, moments)`` tuples.
+    The raw moments are reduced across the same process groups as the aggregate norm.
+
+    Expert parallelism: expert params are named by *local* expert index, which collides
+    across expert-parallel ranks. With ``--moe-grouped-gemm`` each rank's experts are stacked into
+    a single tensor, so the collision is benign. Sequential experts collide on distinct global
+    experts and are not supported here (see the asserts below).
+    """
     args = get_args()
     if not isinstance(model, list):
         model = [model]
 
+    if raw_moments_by_param and getattr(args, 'expert_model_parallel_size', 1) > 1:
+        assert getattr(args, 'moe_grouped_gemm', False), (
+            "calc_params_raw_moments_by_param() with expert parallelism is only supported with "
+            "--moe-grouped-gemm; sequential experts collide on local expert names across expert-"
+            "parallel ranks."
+        )
+
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.
+        if raw_moments_by_param:
+            raise RuntimeError(
+                "calc_params_raw_moments_by_param() is not implemented for --use-megatron-fsdp"
+            )
         params = []
         for model_chunk in model:
             model_chunk.stop_communication()
@@ -70,51 +117,107 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
+    raw_moments_registry = (
+        get_or_create_per_parameter_stat_registry(model) if raw_moments_by_param else None
+    )
+
     # Seperate moe and dense params
     params_data = []
     moe_params_data = []
     sharded_params_data = []
+    sharded_moe_params_data = []
+    # Parallel lists of parameter names, kept in lock-step with the *_params_data lists above.
+    # Only populated/used when raw_moments_by_param=True.
+    params_data_names = []
+    moe_params_data_names = []
+    sharded_params_data_names = []
+    sharded_moe_params_data_names = []
     data_parallel_group = None
 
-    for model_chunk in model:
-        for param in model_chunk.parameters():
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if not is_not_tp_duplicate:
-                continue
-            assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
-                assert param_is_not_shared(param)
+    if raw_moments_by_param:
+        named_params = (
+            (param_name, param) for param, param_name in raw_moments_registry.param_to_name.items()
+        )
+    else:
+        named_params = (
+            (name, param)
+            for model_chunk in model
+            for name, param in unwrap_model(model_chunk).named_parameters()
+        )
+
+    for param_name, param in named_params:
+        data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        if not is_not_tp_duplicate:
+            continue
+        assert is_not_tp_duplicate
+        if not getattr(param, 'allreduce', True):
+            assert param_is_not_shared(param)
+            param = to_local_if_dtensor(param)
+            if args.bf16:
+                if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                    if getattr(param, 'main_param_sharded', False):
+                        if param.main_param is not None:
+                            sharded_moe_params_data.append(param.main_param)
+                            sharded_moe_params_data_names.append(param_name)
+                    else:
+                        moe_params_data.append(param.main_param)
+                        moe_params_data_names.append(param_name)
+                else:
+                    # Fallback to original logic of making a fp32 copy of the
+                    # parameter if `.main_param` attribute is not available.
+                    moe_params_data.append(param.data.float())
+                    moe_params_data_names.append(param_name)
+            else:
+                moe_params_data.append(param.data)
+                moe_params_data_names.append(param_name)
+        else:
+            if param_is_not_shared(param):
                 param = to_local_if_dtensor(param)
                 if args.bf16:
                     if not force_create_fp32_copy and hasattr(param, 'main_param'):
                         if getattr(param, 'main_param_sharded', False):
                             if param.main_param is not None:
                                 sharded_params_data.append(param.main_param)
+                                sharded_params_data_names.append(param_name)
                         else:
-                            moe_params_data.append(param.main_param)
+                            params_data.append(param.main_param)
+                            params_data_names.append(param_name)
                     else:
                         # Fallback to original logic of making a fp32 copy of the
                         # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
+                        params_data.append(param.data.float())
+                        params_data_names.append(param_name)
                 else:
-                    moe_params_data.append(param.data)
-            else:
-                if param_is_not_shared(param):
-                    param = to_local_if_dtensor(param)
-                    if args.bf16:
-                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                            if getattr(param, 'main_param_sharded', False):
-                                if param.main_param is not None:
-                                    sharded_params_data.append(param.main_param)
-                            else:
-                                params_data.append(param.main_param)
-                        else:
-                            # Fallback to original logic of making a fp32 copy of the
-                            # parameter if `.main_param` attribute is not available.
-                            params_data.append(param.data.float())
-                    else:
-                        params_data.append(param.data)
+                    params_data.append(param.data)
+                    params_data_names.append(param_name)
+
+    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
+    dense_reduce_group = mpu.get_model_parallel_group()
+    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
+    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+
+    if raw_moments_by_param:
+        dense_reduce_groups = (
+            (data_parallel_group,) if data_parallel_group is not None else ()
+        ) + (dense_reduce_group,)
+        buckets = [
+            NamedTensorBucket(params_data_names, params_data, dense_reduce_groups),
+            NamedTensorBucket(
+                sharded_params_data_names,
+                sharded_params_data,
+                (mpu.get_data_parallel_group(with_context_parallel=True), dense_reduce_group),
+            ),
+            NamedTensorBucket(moe_params_data_names, moe_params_data, (expert_reduce_group,)),
+            NamedTensorBucket(
+                sharded_moe_params_data_names,
+                sharded_moe_params_data,
+                (mpu.get_expert_data_parallel_group(), expert_reduce_group),
+            ),
+        ]
+        raw_moments_by_param_result, aggregate_moments = reduce_raw_moments_by_param(
+            raw_moments_registry, buckets
+        )
 
     # Calculate norm.
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
@@ -170,12 +273,26 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
 
+    if len(sharded_moe_params_data) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        sharded_moe_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [sharded_moe_params_data],
+            False,  # no per-parameter norm.
+        )
+        sharded_moe_norm_2 = sharded_moe_norm * sharded_moe_norm
+    else:
+        sharded_moe_norm_2 = torch.zeros_like(norm_2)
+    torch.distributed.all_reduce(
+        sharded_moe_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_expert_data_parallel_group(),
+    )
+    moe_norm_2 += sharded_moe_norm_2
+
     # Reduce norm across model parallel groups (dense and expert).
-    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
-    dense_reduce_group = mpu.get_model_parallel_group()
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
-    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
-    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
     # If dense and expert reduce groups are the same, sum then reduce.
@@ -194,7 +311,23 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         norm_2 += moe_norm_2
 
-    return norm_2.item() ** 0.5
+    scalar_norm = norm_2.item() ** 0.5
+
+    if raw_moments_by_param:
+        # Self-check: sqrt(sum_2) from the per-parameter raw moments should equal the scalar norm.
+        reconstructed_norm = aggregate_moments["sum_2"] ** 0.5
+        rel_diff = abs(reconstructed_norm - scalar_norm) / scalar_norm if scalar_norm > 0 else 0.0
+        if rel_diff > _RAW_MOMENTS_BY_PARAM_NORM_RTOL:
+            warn_rank_0(
+                "calc_params_raw_moments_by_param(): per-parameter sum_2 recombines to an "
+                f"aggregate of {reconstructed_norm:.6e}, but the directly-computed norm is "
+                f"{scalar_norm:.6e} (relative difference {rel_diff:.2e} > "
+                f"{_RAW_MOMENTS_BY_PARAM_NORM_RTOL:.0e}). The per-parameter reduction is likely "
+                "incorrect for this parallelism configuration; treat the raw moments with caution."
+            )
+        return raw_moments_by_param_result
+
+    return scalar_norm
 
 
 def calc_dtensor_params_l2_norm(params):

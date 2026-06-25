@@ -54,6 +54,7 @@ from ..distributed.param_and_grad_buffer import (
 )
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..per_parameter_stats import PerParameterStatRegistry
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -777,6 +778,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         with the non-distributed optimizer).
         """
         return getattr(self, 'grad_stats_parallel_group', None)
+
+    def _get_param_to_name_for_per_param_stats(
+        self, registry: PerParameterStatRegistry
+    ) -> Dict[torch.nn.Parameter, str]:
+        param_to_name = super()._get_param_to_name_for_per_param_stats(registry)
+
+        def add_shard_names(model_groups, shard_groups):
+            for model_group, shard_group in zip(model_groups, shard_groups):
+                for model_param, shard_param in zip(model_group, shard_group):
+                    if shard_param is not None and model_param in registry.param_to_name:
+                        param_to_name[shard_param] = registry.name_for_param(model_param)
+
+        add_shard_names(self.model_fp32_groups, self.shard_fp32_groups)
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            add_shard_names(self.model_float16_groups, self.shard_float16_groups)
+        else:
+            add_shard_names(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+
+        return param_to_name
 
     def state_dict(self):
         """

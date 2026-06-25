@@ -174,9 +174,26 @@ from .global_vars import (
     get_wandb_writer,
 )
 from .theoretical_memory_usage import report_theoretical_memory
+from .raw_moment_logging import (
+    consume_activation_raw_moments_by_layer,
+    consume_dgrad_raw_moments_by_layer,
+    disable_activation_raw_moment_logging,
+    disable_dgrad_raw_moment_logging,
+    enable_activation_raw_moment_logging,
+    enable_dgrad_raw_moment_logging,
+    finalize_activation_raw_moments_by_layer,
+    finalize_dgrad_raw_moments_by_layer,
+)
+from .statistics_logging import (
+    save_activation_raw_moments_by_layer,
+    save_dgrad_raw_moments_by_layer,
+    save_grad_raw_moments_by_param,
+    save_param_raw_moments_by_param,
+)
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
+    calc_params_raw_moments_by_param,
     check_adlr_autoresume_termination,
     is_last_rank,
     logical_and_across_model_parallel_group,
@@ -256,6 +273,8 @@ _seqlen_stats_active: bool = False
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
 
+_STATS_LOG_DIR_WARNING_SHOWN = False
+
 
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
@@ -293,6 +312,46 @@ def print_datetime(string, override_timestamp=None):
     else:
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
+
+def _get_statistics_log_dir(args):
+    return (
+        getattr(args, 'statistics_log_dir', None)
+        or getattr(args, 'tensorboard_dir', None)
+        or getattr(args, 'save', None)
+    )
+
+
+def _should_write_global_training_stats(args):
+    rank = getattr(args, 'rank', None)
+    if rank is None:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    world_size = getattr(args, 'world_size', None)
+    if world_size is None:
+        world_size = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
+
+    return rank == world_size - 1
+
+
+def _warn_missing_statistics_log_dir():
+    global _STATS_LOG_DIR_WARNING_SHOWN
+    if not _STATS_LOG_DIR_WARNING_SHOWN:
+        print_rank_0(
+            "WARNING: per-parameter statistics logging was requested, but no statistics log "
+            "directory is available. Set --statistics-log-dir, --tensorboard-dir, or --save "
+            "to write high-cardinality JSONL statistics."
+        )
+        _STATS_LOG_DIR_WARNING_SHOWN = True
+
+
+def _get_activation_log_interval(args):
+    activation_log_interval = getattr(args, 'activation_log_interval', None)
+    if activation_log_interval is not None:
+        return activation_log_interval
+    return getattr(args, 'tensorboard_log_interval', None)
 
 
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
@@ -2250,6 +2309,25 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
+    activation_log_interval = _get_activation_log_interval(args)
+    log_activation_raw_moments_in_this_iteration = (
+        getattr(args, 'log_activation_raw_moments_by_layer', False)
+        and iteration is not None
+        and activation_log_interval is not None
+        and (iteration + 1) % activation_log_interval == 0
+    )
+    log_dgrad_raw_moments_in_this_iteration = (
+        getattr(args, 'log_dgrad_raw_moments_by_layer', False)
+        and iteration is not None
+        and activation_log_interval is not None
+        and (iteration + 1) % activation_log_interval == 0
+    )
+    if (
+        log_activation_raw_moments_in_this_iteration or log_dgrad_raw_moments_in_this_iteration
+    ) and getattr(args, 'cuda_graph_impl', 'none') != 'none':
+        raise RuntimeError(
+            "Activation/dgrad raw moment logging is not supported with CUDA graph modes."
+        )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -2299,6 +2377,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if log_activation_raw_moments_in_this_iteration:
+            enable_activation_raw_moment_logging(model)
+        if log_dgrad_raw_moments_in_this_iteration:
+            loss_scale_for_dgrad_raw_moments = None
+            if optimizer is not None and not optimizer.is_stub_optimizer:
+                loss_scale_for_dgrad_raw_moments = optimizer.get_loss_scale().item()
+            enable_dgrad_raw_moment_logging(model, loss_scale=loss_scale_for_dgrad_raw_moments)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2322,6 +2407,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+        if log_activation_raw_moments_in_this_iteration:
+            finalize_activation_raw_moments_by_layer()
+            disable_activation_raw_moment_logging()
+        if log_dgrad_raw_moments_in_this_iteration:
+            finalize_dgrad_raw_moments_by_layer()
+            disable_dgrad_raw_moment_logging()
 
         # Reset force_all_reduce field.
         for model_chunk in model:
@@ -2361,6 +2452,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if (
+        optimizer is not None
+        and getattr(args, 'log_grad_raw_moments_by_param', False)
+        and iteration is not None
+        and (iteration + 1) % args.tensorboard_log_interval == 0
+    ):
+        optimizer.request_grad_raw_moments_by_param(model)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -3799,6 +3897,76 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+        if (
+            getattr(args, 'log_param_raw_moments_by_param', False)
+            and iteration % args.tensorboard_log_interval == 0
+        ):
+            param_raw_moments_by_param = calc_params_raw_moments_by_param(model)
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif _should_write_global_training_stats(args):
+                save_param_raw_moments_by_param(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    param_raw_moments_by_param,
+                )
+        if (
+            getattr(args, 'log_grad_raw_moments_by_param', False)
+            and iteration % args.tensorboard_log_interval == 0
+            and optimizer is not None
+        ):
+            grad_raw_moments_by_param = optimizer.consume_grad_raw_moments_by_param()
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif (
+                grad_raw_moments_by_param is not None
+                and _should_write_global_training_stats(args)
+            ):
+                save_grad_raw_moments_by_param(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    grad_raw_moments_by_param,
+                )
+        activation_log_interval = _get_activation_log_interval(args)
+        if (
+            getattr(args, 'log_activation_raw_moments_by_layer', False)
+            and activation_log_interval is not None
+            and iteration % activation_log_interval == 0
+        ):
+            activation_raw_moments_by_layer = consume_activation_raw_moments_by_layer()
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif activation_raw_moments_by_layer:
+                save_activation_raw_moments_by_layer(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    activation_raw_moments_by_layer,
+                )
+        if (
+            getattr(args, 'log_dgrad_raw_moments_by_layer', False)
+            and activation_log_interval is not None
+            and iteration % activation_log_interval == 0
+        ):
+            dgrad_raw_moments_by_layer = consume_dgrad_raw_moments_by_layer()
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif dgrad_raw_moments_by_layer is not None:
+                dgrad_raw_moments, dgrad_loss_scale = dgrad_raw_moments_by_layer
+                if dgrad_raw_moments:
+                    save_dgrad_raw_moments_by_layer(
+                        statistics_log_dir,
+                        iteration,
+                        args.consumed_train_samples,
+                        dgrad_raw_moments,
+                        loss_scale=dgrad_loss_scale,
+                    )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
