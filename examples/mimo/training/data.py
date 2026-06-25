@@ -34,6 +34,12 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=511,
         help="Token id marking image positions in the input sequence.",
     )
+    group.add_argument(
+        "--image-seq-length",
+        type=int,
+        default=None,
+        help="Image-token span per sample; defaults to seq_length // 2 when unset.",
+    )
     return parser
 
 
@@ -137,7 +143,7 @@ class MockVLMIterator:
         self.dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
         self.patch_dim = getattr(args, "patch_dim", 16)
         self.num_image_tiles = getattr(args, "num_image_tiles", 1)
-        self.dtype = torch.float32 if args.fp32 else torch.bfloat16
+        self.dtype = torch.float32 if getattr(args, "fp32", False) else torch.bfloat16
         self.generator = torch.Generator(device="cuda")
         self.generator.manual_seed(seed)
         if self.image_seq_length >= args.seq_length:
