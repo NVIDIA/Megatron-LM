@@ -569,6 +569,10 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
+        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"  # better for calibration
+
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
         elif hasattr(unwrapped_model, "calibration_mode"):
