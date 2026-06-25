@@ -1849,6 +1849,78 @@ class TestFusedMLALoadFromStateDict:
             'linear_qkv_down_proj.weight' in k for k in sharded_sd
         ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
 
+    def test_set_for_recompute_input_layernorm_uses_fused_down_proj(self, monkeypatch):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        seen = []
+
+        def mock_set_save_original_input(module):
+            seen.append(module)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_latent_attention.set_save_original_input",
+            mock_set_save_original_input,
+        )
+
+        fused.set_for_recompute_input_layernorm()
+
+        assert seen == [fused.linear_qkv_down_proj]
+
+    def test_sharded_state_dict_preserves_fused_layernorm_keys(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        sharded_sd = fused.sharded_state_dict(prefix="")
+        layernorm_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.layer_norm_")]
+        if not layernorm_keys:
+            pytest.skip("Fused test backend did not expose linear_qkv_down_proj layernorm keys")
+
+        fused_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.")]
+        assert all(k.startswith("linear_qkv_down_proj.layer_norm_") for k in fused_keys)
+
+    def test_synthetic_state_dict_hooks_fuse_legacy_down_proj_weights(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        config = self.transformer_config
+        q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
+        kv_weight = torch.randn(
+            config.kv_lora_rank + config.qk_pos_emb_head_dim, config.hidden_size
+        )
+        state_dict = {
+            "linear_q_down_proj.weight": q_weight,
+            "linear_kv_down_proj.weight": kv_weight,
+        }
+
+        assert fused._synthetic_state_dict_key_suffixes() == ("linear_q_down_proj.weight",)
+        fused._synthesize_fused_qkv_down_weight(state_dict, "")
+
+        assert "linear_q_down_proj.weight" not in state_dict
+        assert "linear_kv_down_proj.weight" not in state_dict
+        torch.testing.assert_close(
+            state_dict["linear_qkv_down_proj.weight"], torch.cat([q_weight, kv_weight], dim=0)
+        )
+
 
 class TestFusedMLARequiresQLora:
 
