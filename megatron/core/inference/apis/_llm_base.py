@@ -257,7 +257,7 @@ class _MegatronLLMBase:
         model,
         tokenizer,
         inference_config: Optional[InferenceConfig] = None,
-        use_coordinator: bool = False,
+        use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
     ) -> None:
