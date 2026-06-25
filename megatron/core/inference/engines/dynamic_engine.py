@@ -1816,10 +1816,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     (_, _, _, _, _, actual_effective) = self.context._compute_prefix_match(
                         req, prefill_chunk_length
                     )
-                    if (
-                        self.context.active_token_count + actual_effective
-                        > self.context.max_tokens
-                    ):
+                    if self.context.active_token_count + actual_effective > self.context.max_tokens:
                         can_schedule = False
                         break
 
