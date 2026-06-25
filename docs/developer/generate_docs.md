@@ -16,7 +16,7 @@ cd docs
 SKIP_PUBLIC_DOCS_FEATURES=true uv run --only-group docs sphinx-autobuild . _build/html --port 8080 --host 127.0.0.1
 ```
 
-Docs will be generated at <http://localhost:8080/>.
+Access the generated docs at <http://localhost:8080/>.
 
 **Recommended:** set the environment variable `SKIP_AUTODOC=true` when generating docs 
 to skip the generation of `apidocs`.
