@@ -993,6 +993,8 @@ class ChunkOffloadHandler:
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
+        if getattr(tensor, "offloading_activation", None) is False:
+            return False
         # Respect tensor's offload preference if specified
         if getattr(tensor, "_TE_do_not_offload", False) or getattr(
             tensor, "_do_not_offload", False
