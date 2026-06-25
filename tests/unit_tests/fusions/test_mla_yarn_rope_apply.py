@@ -364,3 +364,51 @@ class TestApplyRotaryPosEmbMlaFusionConflict:
             call_kw = unfused_spy.call_args[1]
             assert call_kw["mla_rotary_interleaved"] is True
         assert out.shape == t.shape
+
+
+class TestFusedApplyMLARopeCosWidthGuard:
+    """The fused MLA RoPE kernels read ``emb_dim`` cos/sin values per token and assume the
+    cache is ``emb_dim`` wide. A narrower cache (e.g. ``rotary_percent < 1`` shrinks it to
+    ``int(emb_dim * rotary_percent)``) makes the kernel read past the buffer and return
+    garbage. These tests assert the guard rejects that up front, before the kernel launches,
+    so they do not require CUDA."""
+
+    @pytest.mark.skipif(
+        fused_apply_mla_rope_for_q is None, reason="fused MLA RoPE kernels unavailable"
+    )
+    def test_q_rejects_narrow_cos_sin(self):
+        qk_head_dim = 128
+        emb_dim = 64
+        num_heads = 4
+        seqlen = 8
+        batch_size = 2
+        narrow = emb_dim // 8  # mimics rotary_percent=0.125 -> int(64 * 0.125) = 8
+
+        q = torch.randn(seqlen, batch_size, num_heads, qk_head_dim + emb_dim)
+        cos = torch.randn(seqlen, 1, 1, narrow)
+        sin = torch.randn(seqlen, 1, 1, narrow)
+
+        with pytest.raises(AssertionError, match="cos/sin last dim"):
+            fused_apply_mla_rope_for_q(q, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q=None)
+
+    @pytest.mark.skipif(
+        fused_apply_mla_rope_for_kv is None, reason="fused MLA RoPE kernels unavailable"
+    )
+    def test_kv_rejects_narrow_cos_sin(self):
+        emb_dim = 64
+        k_dim = 128
+        v_dim = 128
+        num_heads = 4
+        seqlen = 8
+        batch_size = 2
+        narrow = emb_dim // 8
+
+        kv = torch.randn(seqlen, batch_size, num_heads, k_dim + v_dim)
+        k_pos_emb = torch.randn(seqlen, batch_size, 1, emb_dim)
+        cos = torch.randn(seqlen, 1, 1, narrow)
+        sin = torch.randn(seqlen, 1, 1, narrow)
+
+        with pytest.raises(AssertionError, match="cos/sin last dim"):
+            fused_apply_mla_rope_for_kv(
+                kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, cu_seqlens_kv=None
+            )
