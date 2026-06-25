@@ -982,9 +982,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                     if isinstance(self.dtype_attr, torch.dtype)
                     else getattr(pg, self.dtype_attr)
                 )
-                dtype_bucket_sizes = unit_dtype_bucket_sizes.setdefault(
-                    bucket_dtype, []
-                )
+                dtype_bucket_sizes = unit_dtype_bucket_sizes.setdefault(bucket_dtype, [])
                 dtype_bucket_sizes.append(
                     (num_group_elements, bucket_id)  # For immediate assignment later.
                 )
