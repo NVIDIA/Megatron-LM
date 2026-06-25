@@ -28,21 +28,39 @@ RADIO_ENCODER_MODULE_NAME = "radio_encoder"
 def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register the RADIO-encoder-specific CLI args (stock owns img/patch/hidden)."""
     group = parser.add_argument_group("radio vision encoder")
-    group.add_argument("--class-token-len", type=int, default=8,
-                       help="Number of class tokens prepended by RADIO per tile.")
-    group.add_argument("--pixel-shuffle", action="store_true",
-                       help="Apply pixel shuffle to the RADIO features.")
-    group.add_argument("--disable-vision-class-token", action="store_true",
-                       help="Drop the RADIO class tokens from the emitted features.")
-    group.add_argument("--dynamic-resolution", action="store_true",
-                       help="Patchify each image at native aspect ratio with a token budget.")
+    group.add_argument(
+        "--class-token-len",
+        type=int,
+        default=8,
+        help="Number of class tokens prepended by RADIO per tile.",
+    )
+    group.add_argument(
+        "--pixel-shuffle", action="store_true", help="Apply pixel shuffle to the RADIO features."
+    )
+    group.add_argument(
+        "--disable-vision-class-token",
+        action="store_true",
+        help="Drop the RADIO class tokens from the emitted features.",
+    )
+    group.add_argument(
+        "--dynamic-resolution",
+        action="store_true",
+        help="Patchify each image at native aspect ratio with a token budget.",
+    )
     return parser
 
 
 def _dtype(args: argparse.Namespace):
-    """Resolve params/pipeline dtype: bf16 unless --fp32/--fp16."""
-    bf16 = not getattr(args, "fp32", False) and not getattr(args, "fp16", False)
-    return bf16, (torch.bfloat16 if bf16 else torch.float32)
+    """Resolve params/pipeline dtype from stock Megatron precision args."""
+    dtype = getattr(args, "params_dtype", None)
+    if dtype is None:
+        if getattr(args, "bf16", False):
+            dtype = torch.bfloat16
+        elif getattr(args, "fp16", False):
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+    return bool(getattr(args, "bf16", False)), dtype
 
 
 def _base_config(args: argparse.Namespace) -> TransformerConfig:
@@ -120,10 +138,7 @@ def _pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, versi
         sv = sv.view(n, h, int(w * scale_factor), int(c / scale_factor))
         sv = sv.permute(0, 2, 1, 3).contiguous()
         sv = sv.view(
-            n,
-            int(w * scale_factor),
-            int(h * scale_factor),
-            int(c / (scale_factor * scale_factor)),
+            n, int(w * scale_factor), int(h * scale_factor), int(c / (scale_factor * scale_factor))
         )
 
         if version == 2:
@@ -176,10 +191,7 @@ class RADIOEncoderWrapper(MegatronModule):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        imgs_sizes: Optional[torch.Tensor] = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, imgs_sizes: Optional[torch.Tensor] = None, packed_seq_params=None
     ) -> torch.Tensor:
         """Run RADIO, drop class tokens, and apply pixel shuffle."""
         context = torch.no_grad() if self.force_eval_mode else nullcontext()
