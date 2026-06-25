@@ -6,17 +6,19 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+    is_dsa_skip_topk_layer,
+    source_dsa_compute_layer,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.multi_latent_attention import (
-    MLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
@@ -109,9 +111,9 @@ def get_dsa_module_spec_for_backend(
     )
 
     attention = ModuleSpec(
-        module=MLASelfAttention,
+        module=AbsorbedMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
-        submodules=MLASelfAttentionSubmodules(
+        submodules=AbsorbedMLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
@@ -311,6 +313,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
+    _validate_dsa_index_share_pipeline_split(config, local_layer_ids)
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
@@ -331,6 +334,44 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = ["gated_delta_net"]
     return experimental_attention_variant in linear_attention_variants
+
+
+def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
+    """Ensure DSA top-k sharing does not require top-k indices from another PP stage."""
+    if (
+        config.experimental_attention_variant != "dsa"
+        or getattr(config, "dsa_indexer_topk_freq", 1) <= 1
+    ):
+        return
+
+    local_layer_ids = list(local_layer_ids)
+    local_layer_positions = {
+        layer_id: position for position, layer_id in enumerate(local_layer_ids)
+    }
+    for position, layer_id in enumerate(local_layer_ids):
+        layer_number = layer_id + 1
+        if not is_dsa_skip_topk_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        ):
+            continue
+
+        source_layer_number = source_dsa_compute_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        )
+        source_layer_id = source_layer_number - 1
+        if (
+            source_layer_id not in local_layer_positions
+            or local_layer_positions[source_layer_id] > position
+        ):
+            raise RuntimeError(
+                "DSA index-share pipeline split is invalid: local layer "
+                f"{layer_number} reuses top-k indices from computing layer "
+                f"{source_layer_number}, but that source layer is not earlier in this "
+                "pipeline stage. Cross-layer top-k sharing does not cross PP boundaries. "
+                "Choose a pipeline layout where each stage starts on a computing layer "
+                f"(dsa_indexer_topk_freq={config.dsa_indexer_topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={config.dsa_indexer_skip_topk_offset})."
+            )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
