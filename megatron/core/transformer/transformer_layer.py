@@ -1534,9 +1534,10 @@ class MoETransformerLayer(TransformerLayer):
 
         if is_graph_capturing() and not is_graph_warmup():
             for attr_name, attr in self.token_dispatcher_attrs.items():
+                weak_ref = make_weakref(attr, inplace=False)
+                self.token_dispatcher_attrs[attr_name] = weak_ref
                 obj, name = self._resolve_token_dispatcher_attr(attr_name)
-                make_weakref(getattr(obj, name), inplace=False)
-                make_weakref(self.token_dispatcher_attrs[attr_name], inplace=False)
+                setattr(obj, name, weak_ref)
 
         return out
 

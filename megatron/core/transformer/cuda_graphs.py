@@ -310,8 +310,6 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
 
 
 def make_weakref(ten, inplace=True):
-    if not HAVE_TE_GRAPHS or not torch.is_tensor(ten):
-        return ten
     # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
     # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
     # output reused as this graph's input) are safe to weak-ref since their memory is
@@ -320,11 +318,19 @@ def make_weakref(ten, inplace=True):
     # PackedSeqParams.__post_init__ during dataclasses.replace inside the tree_map) must
     # retain strong refs, or it will cause a use-after-free on replay that manifests as a
     # segfault under memory pressure.
-    if not hasattr(ten, "is_from_global_mempool") or not ten.is_from_global_mempool:
+    if not (
+        HAVE_TE_GRAPHS
+        and torch.is_tensor(ten)
+        and getattr(ten, "is_from_global_mempool", False)
+    ):
         return ten
-
+    
     try:
         wr = make_weak_ref(ten)
+        if inplace:
+            ten.data = wr
+            wr = ten
+
     except RuntimeError:
         # Fallback to keeping a strong reference. There is a known bug where some
         # dtypes (e.g. torch.float64) are not mapped to a representation in
@@ -335,9 +341,6 @@ def make_weakref(ten, inplace=True):
                 f"keeping strong ref with a potential memory overhead."
             )
 
-    if inplace:
-        ten.data = wr
-        return ten
     return wr
 
 
@@ -427,9 +430,6 @@ class _CudagraphGlobalRecord:
                     "is replayed. For more information see: "
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
-
-        gc.collect()
-        torch.cuda.empty_cache()
 
         _set_capture_start()
         if has_te_modules:
