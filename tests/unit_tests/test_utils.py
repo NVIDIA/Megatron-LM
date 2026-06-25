@@ -604,3 +604,56 @@ class TestSingleGroupReductionHelpers:
         default = reduce_max_stat_across_model_parallel_group(float(rank))
         assert default == explicit
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
+class TestTrainStepReductionThreading:
+    """train_step's reductions over a per-module ProcessGroupCollection's mp/pp/dp_cp groups."""
+
+    @staticmethod
+    def _ranks(group):
+        return torch.distributed.get_process_group_ranks(group)
+
+    def test_grid_threaded_reductions(self):
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+        from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+        from megatron.training.utils.common_utils import (
+            logical_and_across_model_parallel_group,
+            reduce_max_stat_across_model_parallel_group,
+        )
+
+        Utils.initialize_distributed()  # torch.distributed only; NOT initialize_model_parallel
+        rank = torch.distributed.get_rank()
+        # tp=2,pp=2,dp=2 over the world: mp == tp+pp, dp_cp == dp.
+        grid = HyperCommGrid([2, 2, 2], ["tp", "pp", "dp"], backend="nccl")
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["pp"])
+        grid.create_pg(["dp"])
+        mp_group = grid.get_pg(["tp", "pp"])
+        pp_group = grid.get_pg(["pp"])
+        dp_cp_group = grid.get_pg(["dp"])
+        mp_ranks = self._ranks(mp_group)
+        pp_ranks = self._ranks(pp_group)
+        dp_cp_ranks = self._ranks(dp_cp_group)
+        try:
+            # reduce_max (grad_norm / num_zeros): MAX over the grid mp group.
+            assert reduce_max_stat_across_model_parallel_group(
+                float(rank), group=mp_group
+            ) == float(max(mp_ranks))
+
+            # logical_and (update_successful): True iff every mp member is True.
+            flag = rank != min(mp_ranks)  # one rank dissents -> AND is False on the whole group.
+            assert logical_and_across_model_parallel_group(flag, group=mp_group) is False
+
+            # is_pp_last_stage: True only on the highest rank of the pp group.
+            assert is_pp_last_stage(pp_group) is (rank == max(pp_ranks))
+
+            # per-key loss all-reduce: SUM over the grid dp_cp group.
+            val = torch.tensor([float(rank), 1.0], device=torch.cuda.current_device())
+            torch.distributed.all_reduce(val, group=dp_cp_group)
+            expected = torch.tensor(
+                [float(sum(dp_cp_ranks)), float(len(dp_cp_ranks))], dtype=torch.float32
+            )
+            torch.testing.assert_close(val.cpu(), expected)
+        finally:
+            grid.destroy()
