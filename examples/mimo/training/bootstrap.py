@@ -25,6 +25,11 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training.initialize import _set_random_seed
+
+# Per-role seed offsets keep the disjoint modules' RNG independent.
+_LANGUAGE_SEED_OFFSET = 20_000
+_ENCODER_SEED_OFFSET = 10_000
 
 
 @dataclass
@@ -74,6 +79,28 @@ def _resolve_role(topology: HeteroTopology):
     language_pg = topology.module_pgs.get(MIMO_LANGUAGE_MODULE_KEY)
     encoder_pg = topology.module_pgs.get(encoder_name) if encoder_name is not None else None
     return encoder_name, rank_in_language, rank_in_encoder, language_pg, encoder_pg
+
+
+def _seed_module_rng(
+    args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_seed_offset: int
+) -> None:
+    """Seed host + per-module CUDA RNG for one role via the stock _set_random_seed.
+
+    These ranks have no initialized mpu, so the role's parallel groups supply the
+    pp/dp/tp/ep/etp ranks.
+    """
+    _set_random_seed(
+        args.seed + role_seed_offset,
+        args.data_parallel_random_init,
+        args.te_rng_tracker,
+        args.inference_rng_tracker,
+        use_cudagraphable_rng=args.cuda_graph_impl != "none",
+        pp_group=pg_collection.pp,
+        dp_group=pg_collection.dp_cp,
+        tp_group=pg_collection.tp,
+        ep_group=pg_collection.ep,
+        etp_group=pg_collection.expt_tp,
+    )
 
 
 def mimo_model_provider(
@@ -130,9 +157,19 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
     specs = build_module_grid_specs(args, world_size, RADIO_ENCODER_MODULE_NAME)
     topology = create_topology(specs)
 
-    # --- 2. Resolve this rank's role and build the bare model. -------------
-    # RNG is seeded by pretrain()/initialize_megatron from the schedule PGC; not here.
-    _, rank_in_language, _, language_pg, encoder_pg = _resolve_role(topology)
+    # --- 2. Resolve this rank's role. --------------------------------------
+    _, rank_in_language, rank_in_encoder, language_pg, encoder_pg = _resolve_role(topology)
+
+    # --- 3. Seed this rank's single module role BEFORE building the model. -
+    # The model is built eagerly here, before pretrain()/initialize_megatron runs,
+    # so weight init's get_cuda_rng_tracker().fork() needs the per-role seed now.
+    # pretrain's later re-seed resets the tracker, so the double seed is harmless.
+    if rank_in_language:
+        assert language_pg is not None
+        _seed_module_rng(args, language_pg, _LANGUAGE_SEED_OFFSET)
+    elif rank_in_encoder:
+        assert encoder_pg is not None
+        _seed_module_rng(args, encoder_pg, _ENCODER_SEED_OFFSET)
 
     # Same provider pretrain() receives; build_mimo_runtime is its single call site.
     mimo_model = mimo_model_provider(topology=topology, args=args)
