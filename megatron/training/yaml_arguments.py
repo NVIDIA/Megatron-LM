@@ -18,10 +18,6 @@ import yaml
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
-# ``import yaml`` above is unconditional, so YAML support is always available once this
-# module imports. ``HAVE_YAML`` is retained for call sites that guard optional-yaml builds.
-HAVE_YAML = True
-
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
 env_pattern = re.compile(r".*?\${(.*?)}.*?")
@@ -494,11 +490,6 @@ def core_transformer_config_from_yaml(args, transfomer_key="language_model"):
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
-    if not HAVE_YAML:
-        raise ImportError(
-            "PyYAML is required to load YAML arguments. "
-            "Install via `pip install pyyaml`."
-        )
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace

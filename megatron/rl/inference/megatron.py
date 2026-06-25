@@ -29,7 +29,6 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -99,10 +98,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 logging.WARNING,
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
-
-        # RL needs log probs, but not prompt log probs.
-        args.return_log_probs = True
-        args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(

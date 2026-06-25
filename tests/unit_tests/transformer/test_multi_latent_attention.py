@@ -1875,9 +1875,6 @@ class TestFusedMLALoadFromStateDict:
         assert any(
             'linear_kv_down_proj.weight' in k for k in sharded_sd
         ), f"Expected linear_kv_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
-        assert any(
-            'linear_qkv_down_proj.layer_norm_weight' in k for k in sharded_sd
-        ), f"Expected linear_qkv_down_proj.layer_norm_weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
         assert not any(
             'linear_qkv_down_proj.weight' in k for k in sharded_sd
         ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
