@@ -14,6 +14,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     language_model_spec,
     vision_submodules_spec,
 )
+from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import build_module_grid_specs
 from examples.mimo.training.data import select_data_iterator
 from examples.mimo.training.grad_sync import configure_grad_sync
@@ -126,7 +127,7 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
     data iterator.
     """
     world_size = torch.distributed.get_world_size()
-    specs = build_module_grid_specs(args, world_size)
+    specs = build_module_grid_specs(args, world_size, RADIO_ENCODER_MODULE_NAME)
     topology = create_topology(specs)
 
     # --- 2. Resolve this rank's role and build the bare model. -------------
