@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1673,6 +1674,45 @@ class TestFusedMLASelfAttention:
             batch,
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         )
+
+    def test_qkv_down_projection_split_tensor_parallel_shard(self, monkeypatch):
+        config = self.transformer_config
+        tp_size = 2
+        seq_len, batch = 2, 1
+        q_split = config.q_lora_rank // tp_size
+        kv_split = (config.kv_lora_rank + config.qk_pos_emb_head_dim) // tp_size
+
+        q_shard = torch.arange(seq_len * batch * q_split, dtype=torch.float32).view(
+            seq_len, batch, q_split
+        )
+        kv_shard = torch.full((seq_len, batch, kv_split), 7.0)
+        qkv_shard = torch.cat([q_shard, kv_shard], dim=-1)
+
+        class FakeQKVDownProjection(torch.nn.Module):
+            def forward(self, hidden_states):
+                return qkv_shard, None
+
+        gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
+        captured = {}
+
+        def fake_gather_from_tensor_model_parallel_region(tensor):
+            captured["q_shard"] = tensor
+            return gathered_q
+
+        monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
+        monkeypatch.setattr(
+            mla_module,
+            "gather_from_tensor_model_parallel_region",
+            fake_gather_from_tensor_model_parallel_region,
+        )
+        self.fused_attention.linear_qkv_down_proj = FakeQKVDownProjection()
+
+        hidden = torch.zeros(seq_len, batch, config.hidden_size)
+        q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
+
+        torch.testing.assert_close(captured["q_shard"], q_shard)
+        torch.testing.assert_close(q_compressed, gathered_q)
+        torch.testing.assert_close(kv_combined, kv_shard)
 
     def test_gpu_forward(self):
         if not is_te_min_version("1.10.0"):
