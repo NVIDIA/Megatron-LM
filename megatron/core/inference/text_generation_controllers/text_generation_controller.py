@@ -303,7 +303,9 @@ class TextGenerationController:
         if torch.any(context.request_metadata["return_log_probs"][active_slice]):
             raise RuntimeError("Deferred request resolution does not support log probabilities.")
         if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
-            raise RuntimeError("Deferred request resolution does not support top-n log probabilities.")
+            raise RuntimeError(
+                "Deferred request resolution does not support top-n log probabilities."
+            )
 
     def _compact_deferred_resolution_logits(self, survivor_idxs: Tensor) -> None:
         """Compact cached logits from old active-row order into survivor order.
@@ -1288,6 +1290,7 @@ class TextGenerationController:
             self._all_logits_cuda[:, :logits_seq_len, :],
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
+            sampling=self._sampling,
         )
 
     def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:

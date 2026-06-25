@@ -121,6 +121,7 @@ class GatedDeltaNet(MegatronModule):
         self.use_qk_l2norm = use_qk_l2norm
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1

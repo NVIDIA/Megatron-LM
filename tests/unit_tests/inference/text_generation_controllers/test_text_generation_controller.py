@@ -245,12 +245,8 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     context.paused_request_count = 0
     context.active_token_count = 3
     context.request_ids = torch.tensor([10, 11, 12], dtype=torch.int32)
-    context.request_metadata = {
-        "termination_id": torch.tensor([2, 2, 2], dtype=torch.int64)
-    }
-    context.get_active_sequence_lengths.return_value = torch.tensor(
-        [4, 4, 4], dtype=torch.int32
-    )
+    context.request_metadata = {"termination_id": torch.tensor([2, 2, 2], dtype=torch.int64)}
+    context.get_active_sequence_lengths.return_value = torch.tensor([4, 4, 4], dtype=torch.int32)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10, 10])
     context.deferred_resolution_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
