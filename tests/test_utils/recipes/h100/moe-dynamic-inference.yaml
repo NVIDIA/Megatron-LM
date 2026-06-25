@@ -67,6 +67,11 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp2_pp2_ep2_gptoss_20b_swa]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching]
     products:
       - environment: [dev]
