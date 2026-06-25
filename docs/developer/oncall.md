@@ -15,8 +15,12 @@ The oncall's primary responsibility is helping community contributors and users.
 
 **Goal: triage, assign, and ensure assignees respond in a timely manner.**
 
+### New Issues
+
 3-4 times per working day you should check if there are any new issues with the 
 [community-request](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Acommunity-request) 
+label. You should also check for issues that are out-of-SLA with the 
+[waiting-on-maintainers](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Awaiting-on-maintainers%20sort%3Aupdated-desc) 
 label.
 
 We have a useful Claude tool that will send a Slack DM with context to the assignee:
@@ -51,7 +55,3 @@ it is acceptable to fix it and re-launch CI (to reduce iteration time).
 
 You may have to reach out to reviewers to help get approvals. Once the PR is fully-approved, please
 merge the PR! Community contributors are unable to do so.
-
-## Out-of-SLA
-
-On a daily basis, track the [out-of-SLA list](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Awaiting-on-maintainers).
