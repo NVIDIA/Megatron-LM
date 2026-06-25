@@ -2424,6 +2424,19 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
+                if self.cuda_graph_impl == "local":
+                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    unsupported_offload_modules = offload_modules - local_supported_offload_modules
+                    assert not unsupported_offload_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
+                        "'fused_group_mlp'. "
+                        f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
+                    )
+                    assert self.cuda_graph_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "is not supported with whole-layer CUDA graph capture."
+                    )
                 local_partial_moe_offload = (
                     self.cuda_graph_impl == "local"
                     and bool(offload_modules)
@@ -2440,21 +2453,6 @@ class TransformerConfig(ModelParallelConfig):
                     "are supported only for expert_fc1, moe_act, or fused_group_mlp "
                     "offload when the full MoE module is not captured."
                 )
-                if self.cuda_graph_impl == "local":
-                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
-                    unsupported_offload_modules = (
-                        set(self.offload_modules) - local_supported_offload_modules
-                    )
-                    assert not unsupported_offload_modules, (
-                        "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
-                        "'fused_group_mlp'. "
-                        f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
-                    )
-                    assert self.cuda_graph_modules, (
-                        "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "is not supported with whole-layer CUDA graph capture."
-                    )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
                 ), "Token-drop MoE is temporarily not supported with activation offloading."
