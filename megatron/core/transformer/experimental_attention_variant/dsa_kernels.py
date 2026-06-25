@@ -1020,6 +1020,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         max_seqlen_q: Optional[int],
         max_seqlen_compressed_idx: Optional[int],  # indexer K max
         compressed_kv: Optional[Tensor] = None,  # THD only — pre-packed compressed KV
+        cu_seqlens_q_unpadded: Optional[Tensor] = None,  # THD only — unpadded Q cu_seqlens
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -1121,6 +1122,26 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
+        # ---- 4b. Derive padding-row mask for loss exclusion. -----------------
+        # When CUDA-graph padding makes cu_seqlens_q cover all total_q rows
+        # (including padding), cu_seqlens_q_unpadded supplies the true
+        # boundaries.  Padding rows must not contribute to the indexer KL
+        # loss or backward gradients — only the sparse-attention output
+        # needs them for static-shape compatibility.
+        # The caller only passes cu_seqlens_q_unpadded when it differs from
+        # cu_seqlens_q (checked via data_ptr), so no GPU→CPU sync is needed.
+        padding_row_mask: Optional[Tensor] = None  # True = padding (excluded from loss)
+        if is_thd and cu_seqlens_q_unpadded is not None:
+            real_seg_lens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
+            row_idx = torch.arange(total_q, device=query.device, dtype=torch.int32)
+            row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+            pos_in_seg = row_idx - cu_seqlens_q[row_batch_ids].to(torch.int32)
+            # Rows whose intra-segment position >= real segment length
+            # are padding (including rows in a dummy trailing segment
+            # whose real length is 0).
+            real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
+            padding_row_mask = pos_in_seg >= real_len_per_row
+
         # ---- 5. Derive predict from indexer_scores, compute target. ----------
         # Layout-specific attn tensors (detached — loss is not differentiable
         # through them).
@@ -1133,6 +1154,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             q_attn_det = query.detach().permute(1, 0, 2, 3).contiguous()
             k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
             lse_indexer_det = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
+
+        # Invalidate padding rows for the loss/backward path.  The sparse
+        # attention (steps 3-4) has already built global_idxs from the
+        # original topk_indices_cmp, so this mutation only affects steps 5-7.
+        if padding_row_mask is not None:
+            topk_indices_cmp = topk_indices_cmp.clone()
+            topk_indices_cmp[padding_row_mask] = -1
+            indexer_scores = indexer_scores.clone()
+            indexer_scores[padding_row_mask] = float('-inf')
 
         if sparse_loss:
             # Derive predict: gather topk scores from indexer_scores → softmax.
@@ -1210,6 +1240,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
         # The actual grad_loss scaling is deferred to backward (when
         # DSAIndexerLossAutoScaler provides the correct scale).
+        # Use total_q (not real token count) for the loss coefficient even
+        # when padding rows are masked.  The cuDNN kernel divides by total_q
+        # internally; since masked rows contribute 0, multiplying back by
+        # total_q still yields the correct real-token sum — and avoids a
+        # GPU→CPU sync that would break CUDA graph capture.
         indexer_loss_coeff = loss_coeff
         if calculate_per_token_loss:
             indexer_loss_coeff = loss_coeff * (total_q if is_thd else b * sq)
@@ -1303,6 +1338,12 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_k_indexer = torch.zeros_like(k_indexer)
             precomputed_grad_weights = torch.zeros_like(weights)
 
+        # Zero out pre-computed indexer gradients for padding rows so they
+        # don't contribute to DSAIndexerLossAutoScaler backward.
+        if padding_row_mask is not None and loss_coeff > 0:
+            precomputed_grad_q_indexer[padding_row_mask] = 0
+            precomputed_grad_weights[padding_row_mask] = 0
+
         # ---- 7. Save context (only sparse-attn bwd tensors + indexer grads). -
         ctx.save_for_backward(
             q_flat,
@@ -1390,7 +1431,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   cu_seqlens_q, cu_seqlens_kv, cu_seqlens_kv_full,
         #   cu_seqlens_compressed_idx,
         #   max_seqlen_q, max_seqlen_compressed_idx,
-        #   compressed_kv
+        #   compressed_kv, cu_seqlens_q_unpadded
         return (
             grad_query,
             grad_kv_full,
@@ -1399,6 +1440,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -1441,6 +1483,7 @@ def fused_indexer_sparse_attn(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
+    cu_seqlens_q_unpadded: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -1512,6 +1555,13 @@ def fused_indexer_sparse_attn(
             so it cannot be sliced uniformly the way SBHD ``kv_full`` is.
         calculate_per_token_loss: if True, report raw local KL sum and
             compensate the cuDNN backward wrappers' local averaging.
+        cu_seqlens_q_unpadded: THD only (optional) — ``(B+1,)`` int32,
+            the *unpadded* cumulative Q sequence lengths.  When CUDA-graph
+            padding makes ``cu_seqlens_q`` cover all ``total_q`` rows
+            (including padding), this tensor supplies the true boundaries
+            so padding rows are excluded from the indexer KL loss and
+            backward gradients.  Ignored when ``None`` or when it equals
+            ``cu_seqlens_q``.
     """
     if cu_seqlens_q is not None:
         missing = [
@@ -1553,6 +1603,7 @@ def fused_indexer_sparse_attn(
         max_seqlen_q,
         max_seqlen_compressed_idx,
         compressed_kv,
+        cu_seqlens_q_unpadded,
     )
 
 

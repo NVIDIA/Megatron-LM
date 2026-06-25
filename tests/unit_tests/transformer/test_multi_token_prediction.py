@@ -169,7 +169,11 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 15216 * config.mtp_num_layers
 
     def test_get_embeddings_rolls_padding_mask(self):
-        """Test that _get_embeddings rolls padding_mask alongside input ids."""
+        """Test that _get_embeddings rolls padding_mask alongside input ids.
+
+        padding_mask uses the router convention: True = padded, False = valid.
+        Boundary positions are filled with True (padded) via fill_value=True.
+        """
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
@@ -180,7 +184,7 @@ class TestMultiTokenPredictionLayer:
         input_ids = torch.tensor([[1, 2, 3, 4, 0, 0], [5, 6, 7, 0, 0, 0]], dtype=torch.int64)
         position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
         padding_mask = torch.tensor(
-            [[True, True, True, True, False, False], [True, True, True, False, False, False]]
+            [[False, False, False, False, True, True], [False, False, False, True, True, True]]
         )
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
 
@@ -200,14 +204,18 @@ class TestMultiTokenPredictionLayer:
 
         expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
         expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1, fill_value=True)
 
         assert torch.equal(rolled_input_ids, expected_input_ids)
         assert torch.equal(rolled_position_ids, expected_position_ids)
         assert torch.equal(rolled_padding_mask, expected_padding_mask)
 
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
-        """Test forward passes rolled padding_mask to transformer path."""
+        """Test forward passes rolled padding_mask to transformer path.
+
+        padding_mask uses the router convention: True = padded, False = valid.
+        Boundary positions are filled with True (padded) via fill_value=True.
+        """
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
@@ -217,7 +225,7 @@ class TestMultiTokenPredictionLayer:
         batch_size = 2
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
         position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
-        padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+        padding_mask = torch.tensor([[False, False, False, True], [False, False, True, True]])
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
         attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
         seen = {}
@@ -260,7 +268,7 @@ class TestMultiTokenPredictionLayer:
             embedding=fake_embedding,
         )
 
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1, fill_value=True)
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 

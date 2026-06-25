@@ -1980,6 +1980,19 @@ class CompressedSparseAttention(MegatronModule):
         w_thd = weights_indexer.squeeze(1)
         k_thd = k_indexer.squeeze(1)
 
+        # Supply unpadded cu_seqlens so padding rows are excluded from
+        # the indexer KL loss (mirrors the unfused path's cu_seqlens_q_for_loss).
+        # Only pass when they actually differ (by reference or storage) to avoid
+        # unnecessary mask computation inside the fused kernel.
+        cu_seqlens_q_unpadded = None
+        if (
+            packed_seq_params.cu_seqlens_q is not None
+            and packed_seq_params.cu_seqlens_q_padded is not None
+            and packed_seq_params.cu_seqlens_q.data_ptr()
+            != packed_seq_params.cu_seqlens_q_padded.data_ptr()
+        ):
+            cu_seqlens_q_unpadded = packed_seq_params.cu_seqlens_q
+
         output, indexer_loss = fused_indexer_sparse_attn(
             query,
             kv_full_thd,
@@ -2003,6 +2016,7 @@ class CompressedSparseAttention(MegatronModule):
             max_seqlen_compressed_idx=max_seqlen_compressed_idx,
             compressed_kv=compressed_kv,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
+            cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
         )
 
         if indexer_loss_coeff > 0:
