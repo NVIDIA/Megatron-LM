@@ -211,9 +211,7 @@ class PostProcessNode(ScheduleNode):
 
         if len(self.gpt_model.decoder.layers) == 0:
             # Safe for MTP: empty-decoder MTP stages have final_layernorm=None.
-            hidden_states = self.gpt_model.decoder.postprocess_for_layer_schedule(
-                hidden_states, is_last_decoder_layer=True
-            )
+            hidden_states = self.gpt_model.decoder.postprocess_for_layer_schedule(hidden_states)
 
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
@@ -718,9 +716,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # Layer nodes exist only for concrete layers; empty decoder chunks use PostProcessNode.
             output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
                 hidden_states,
-                is_last_decoder_layer=True,
                 return_mhc_multistream=True,
             )
+            # The boundary helper may already make final-layernorm outputs viewless; keep this
+            # wrapper for no-layernorm or mHC contraction-only exits.
             output = make_viewless_tensor(
                 inp=output, requires_grad=output.requires_grad, keep_graph=True
             )
@@ -824,15 +823,17 @@ def build_mtp_layer_callables(layer):
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
         # Save pre-contraction multi-stream; _postprocess contracts for mtp_hidden_states.
-        next_hidden_states = hidden_states if layer.config.enable_hyper_connections else None
+        pre_contraction_hidden_states = (
+            hidden_states if layer.config.enable_hyper_connections else None
+        )
         hidden_states = layer._postprocess(hidden_states)
         node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
             hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
             node.chunk_state.mtp_hidden_states = None
             node.chunk_state.mhc_multistream = None
-        elif next_hidden_states is not None:
-            hidden_states = next_hidden_states
+        elif pre_contraction_hidden_states is not None:
+            hidden_states = pre_contraction_hidden_states
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
