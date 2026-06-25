@@ -1016,6 +1016,7 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    setup_model_and_optimizer_func=None,
 ):
     """Main training program.
 
@@ -1220,7 +1221,8 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+    setup_func = setup_model_and_optimizer_func or setup_model_and_optimizer
+    model, optimizer, opt_param_scheduler = setup_func(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
