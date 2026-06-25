@@ -82,12 +82,24 @@ def register_training_hooks(model_list: list, optimizer) -> None:
 # ======================================================================
 
 
+def _is_megatron_ddp(model_chunk: Any) -> bool:
+    try:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+    except Exception:
+        return False
+
+    return (
+        isinstance(model_chunk, DDP)
+        and hasattr(model_chunk, "buffers")
+        and hasattr(model_chunk, "expert_parallel_buffers")
+        and hasattr(model_chunk, "module")
+    )
+
+
 def offload_model_to_cpu(model_list: list) -> None:
     """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
-    from megatron.core.distributed import DistributedDataParallel as DDP
-
     for model_chunk in model_list:
-        if isinstance(model_chunk, DDP):
+        if _is_megatron_ddp(model_chunk):
             all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in all_buffers:
                 for buffer in buffers:
@@ -109,10 +121,8 @@ def offload_model_to_cpu(model_list: list) -> None:
 
 def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
     """Load DDP model back to GPU from pinned CPU copy."""
-    from megatron.core.distributed import DistributedDataParallel as DDP
-
     for model_chunk in model_list:
-        if isinstance(model_chunk, DDP):
+        if _is_megatron_ddp(model_chunk):
             all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in all_buffers:
                 for buffer in buffers:

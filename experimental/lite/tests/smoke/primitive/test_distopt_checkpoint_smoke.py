@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
@@ -15,13 +16,12 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_stack
+from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_stack
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig as LiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
@@ -58,18 +58,42 @@ class TinyTopologyAwareState(nn.Module):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _single_node_cuda_distopt():
+def _single_node_cuda_dist_opt():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for distopt smoke tests.")
+        pytest.skip("CUDA is required for dist_opt smoke tests.")
     if int(os.environ.get("WORLD_SIZE", "1")) > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
-    Utils.set_world_size(
-        int(os.environ.get("WORLD_SIZE", "1")), int(os.environ.get("LOCAL_RANK", "0"))
-    )
-    Utils.initialize_model_parallel()
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29541")
+
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    created_pg = False
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+        created_pg = True
+
+    from megatron.core import parallel_state as mpu
+
+    created_mpu = False
+    if not mpu.is_initialized():
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+        created_mpu = True
     yield
-    Utils.destroy_model_parallel()
+    if created_mpu:
+        mpu.destroy_model_parallel()
+    if created_pg and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _global_tensor(shape: tuple[int, ...], offset: float) -> torch.Tensor:
@@ -93,7 +117,7 @@ def _is_expert_param(name: str) -> bool:
     return "experts" in name
 
 
-def _build_sharded_model_and_distopt(parallel: ParallelConfig):
+def _build_sharded_model_and_dist_opt(parallel: ParallelConfig):
     ps = init_parallel(parallel)
     model = TinyTopologyAwareState(ps)
     model_cfg = SimpleNamespace(
@@ -110,7 +134,7 @@ def _build_sharded_model_and_distopt(parallel: ParallelConfig):
         optimizer=LiteOptimizerConfig(optimizer="adam", lr=1.0e-3, weight_decay=0.0),
         deterministic=False,
     )
-    wrapped_chunks, optimizer = build_mc_stack(
+    wrapped_chunks, optimizer = build_dist_opt_stack(
         [model], model_cfg=model_cfg, engine_cfg=engine_cfg, ps=ps, is_expert=_is_expert_param
     )
     _seed_optimizer_state(optimizer)
@@ -145,7 +169,7 @@ def _inner_optimizers(optimizer):
         yield optimizer
 
 
-def _distopt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: ParallelConfig):
+def _dist_opt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: ParallelConfig):
     return ModelHandle(
         model=wrapped_chunks,
         optimizer=optimizer,
@@ -160,7 +184,7 @@ def _distopt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: Para
     )
 
 
-def _build_model_and_distopt():
+def _build_model_and_dist_opt():
     torch.manual_seed(2468)
     model = TinyDense().bfloat16().cuda()
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
@@ -210,10 +234,10 @@ def _assert_model_close(lhs, rhs):
         torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
 
 
-def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_path):
-    model_for_ckpt, optimizer_for_ckpt = _build_model_and_distopt()
-    direct_model, direct_optimizer = _build_model_and_distopt()
-    loaded_model, loaded_optimizer = _build_model_and_distopt()
+def test_dist_opt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_path):
+    model_for_ckpt, optimizer_for_ckpt = _build_model_and_dist_opt()
+    direct_model, direct_optimizer = _build_model_and_dist_opt()
+    loaded_model, loaded_optimizer = _build_model_and_dist_opt()
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     torch.manual_seed(1357)
@@ -250,9 +274,9 @@ def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_
     _assert_model_close(direct_model, loaded_model)
 
 
-def test_distopt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
+def test_dist_opt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
     if torch.distributed.get_world_size() < 8:
-        pytest.skip("TP2/PP2/EP2/ETP2 distopt reshard smoke requires 8 GPUs.")
+        pytest.skip("TP2/PP2/EP2/ETP2 dist_opt reshard smoke requires 8 GPUs.")
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     checkpoint_root = _shared_tmp_path(tmp_path)
@@ -261,25 +285,25 @@ def test_distopt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
     source_parallel = ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=1)
     target_parallel = ParallelConfig(tp=2, ep=2, etp=2, pp=2, cp=1)
 
-    source_chunks, source_optimizer, source_ps = _build_sharded_model_and_distopt(source_parallel)
+    source_chunks, source_optimizer, source_ps = _build_sharded_model_and_dist_opt(source_parallel)
     runtime.save_checkpoint(
-        _distopt_handle(source_chunks, source_optimizer, source_ps, source_parallel),
+        _dist_opt_handle(source_chunks, source_optimizer, source_ps, source_parallel),
         source_dir,
         step=3,
         save_rng=False,
     )
 
-    target_chunks, target_optimizer, target_ps = _build_sharded_model_and_distopt(target_parallel)
+    target_chunks, target_optimizer, target_ps = _build_sharded_model_and_dist_opt(target_parallel)
     assert (
         runtime.load_checkpoint(
-            _distopt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
+            _dist_opt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
             source_dir,
             load_rng=False,
         )
         == 3
     )
     runtime.save_checkpoint(
-        _distopt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
+        _dist_opt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
         reserialized_dir,
         step=3,
         save_rng=False,

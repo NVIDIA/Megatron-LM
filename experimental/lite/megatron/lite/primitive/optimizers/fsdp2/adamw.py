@@ -65,21 +65,20 @@ def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor)
         param.detach().copy_(local_tensor.to(device=param.device, dtype=param.dtype))
         return
 
+    # Copy straight into the param's local shard. Reconstructing via
+    # DTensor.from_local mis-sizes an unevenly-sharded param (it infers global =
+    # local * mesh, e.g. a (3,) param over 8 ranks -> 0 or 8), so copy local->local
+    # (master is init'd from this same local shard, so shapes match).
     local_param = to_local_tensor(param)
-    local_value = local_tensor.to(device=local_param.device, dtype=local_param.dtype)
-    from torch.distributed.tensor import DTensor
-
-    param.detach().copy_(DTensor.from_local(local_value, param.device_mesh, param.placements))
+    local_param.copy_(local_tensor.to(device=local_param.device, dtype=local_param.dtype))
 
 
 def all_reduce_grad_(grad: torch.Tensor, *, group: dist.ProcessGroup) -> None:
+    # ``to_local_tensor`` returns the DTensor's local shard storage, so the
+    # in-place all-reduce updates the grad directly -- no DTensor.from_local
+    # round-trip (which mis-sizes unevenly-sharded grads, e.g. (3,) over 8 ranks).
     local_grad = to_local_tensor(grad)
     dist.all_reduce(local_grad, op=dist.ReduceOp.SUM, group=group)
-    if local_grad is grad:
-        return
-    from torch.distributed.tensor import DTensor
-
-    grad.copy_(DTensor.from_local(local_grad, grad.device_mesh, grad.placements))
 
 
 class ChainedOptimizer:
@@ -368,10 +367,7 @@ def maybe_build_te_fused_adam_optimizer(
 ) -> Any | None:
     if not get_bool_opt(opt, "fsdp2_use_te_fused_adam", default=False):
         return None
-    try:
-        from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
-    except ImportError:
-        return None
+    from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
 
     all_param_list = list(all_params)
     master_weights = get_bool_opt(
@@ -503,10 +499,23 @@ def iter_torch_optimizers(optimizer: Any) -> Iterable[torch.optim.Optimizer]:
 
 
 def dtensor_from_local(
-    local_tensor: torch.Tensor, device_mesh: Any, placements: Any
+    local_tensor: torch.Tensor,
+    device_mesh: Any,
+    placements: Any,
+    *,
+    shape: Any = None,
+    stride: Any = None,
 ) -> torch.Tensor:
     from torch.distributed.tensor import DTensor
 
+    # ``DTensor.from_local`` infers the global shape as local_shard * mesh, which
+    # is WRONG for unevenly-sharded params (FSDP2 pads the last shard). Pass the
+    # original global shape/stride so the round-trip is exact for any dim not
+    # divisible by the mesh size.
+    if shape is not None:
+        return DTensor.from_local(
+            local_tensor, device_mesh, placements, shape=shape, stride=stride
+        )
     return DTensor.from_local(local_tensor, device_mesh, placements)
 
 

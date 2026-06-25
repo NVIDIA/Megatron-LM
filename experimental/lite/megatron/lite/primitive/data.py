@@ -7,6 +7,8 @@ import os
 
 import torch  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
@@ -114,10 +116,6 @@ def infinite_batches_thd(
     split via zigzag striping. position_ids stay FULL because lite's RoPE
     (is_thd_format=False) auto-slices emb internally, same as BSH path.
     """
-    from megatron.core.packed_seq_params import (  # pyright: ignore[reportMissingImports]  # noqa: I001
-        PackedSeqParams,
-    )
-
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
     if cp_rank < 0 or cp_rank >= cp_size:
