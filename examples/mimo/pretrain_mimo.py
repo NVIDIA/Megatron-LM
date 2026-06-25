@@ -18,11 +18,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.mimo.model_providers.nemotron_moe_vlm import (
-    add_model_provider_args,
-    prepare_model_provider_args,
-    validate_model_provider_args,
-)
+from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import add_hetero_grid_args, validate_hetero_grid_args
 from examples.mimo.training.bootstrap import build_mimo_runtime, mimo_model_provider
 from examples.mimo.training.data import add_data_args
@@ -49,11 +45,9 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 
 def _parse_and_validate() -> argparse.Namespace:
-    """Parse/validate args with the model-provider preset and hetero-grid checks."""
+    """Parse/validate args; architecture flags come from the CLI (run script)."""
     args = parse_args(extra_args_provider)
-    prepare_model_provider_args(args)  # apply preset before validation
     validate_args(args, {})
-    validate_model_provider_args(args)
     validate_hetero_grid_args(args, int(os.environ.get("WORLD_SIZE", args.world_size)))
 
     args.data_parallel_size = args.llm_dp
