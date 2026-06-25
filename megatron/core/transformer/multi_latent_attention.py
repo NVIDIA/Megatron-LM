@@ -505,8 +505,6 @@ class MLASelfAttention(MultiLatentAttention):
             name=name,
         )
 
-        self._validate_qk_norm_spec(submodules)
-
         # Resolve which linear class to use for Q and KV up projections,
         # based on QK-norm selection.
         norm_cls = self._resolve_qk_norm_config(submodules)
@@ -635,69 +633,22 @@ class MLASelfAttention(MultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
-    def _validate_qk_norm_spec(self, submodules):
-        """Check whether the Q/KV norm is configured twice from the spec.
-        This can occur when both a primitive norm submodule and a fused
-        norm+linear layer is used.
-        """
-        backend = get_backend(self.config.transformer_impl)
-        fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
-
-        def is_fused_norm_linear(module_spec):
-            module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
-            return fused_norm_linear_impl is not None and module_cls is fused_norm_linear_impl
-
-        if (
-            self.config.q_lora_rank is None
-            # Q layernorm is not trivial
-            and submodules.q_layernorm not in (None, IdentityOp)
-        ):
-            help_msg = ""
-            # Q projection does not include a norm
-            if not is_fused_norm_linear(submodules.linear_q_proj):
-                help_msg = (
-                    f"Please use a fused norm+linear for "
-                    f"`linear_q_proj={submodules.linear_q_proj}` if "
-                    f"you intend to have a Q-norm."
-                )
-            raise ValueError(
-                f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
-                f"but `q_lora_rank is None`, meaning it will not be used."
-                f"{help_msg}"
-            )
-        if (
-            # Q layernorm is not trivial
-            submodules.q_layernorm not in (None, IdentityOp)
-            # Q up projection includes a norm
-            and is_fused_norm_linear(submodules.linear_q_up_proj)
-        ):
-            raise ValueError(
-                f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
-                f"and `linear_q_up_proj={submodules.linear_q_up_proj}` is a "
-                f"fused norm+linear; either unset `q_layernorm` or use a "
-                f"linear layer without norm fusion for `linear_q_up_proj`"
-            )
-        if (
-            # KV layernorm is not trivial
-            submodules.kv_layernorm not in (None, IdentityOp)
-            # KV up projection includes a norm
-            and is_fused_norm_linear(submodules.linear_kv_up_proj)
-        ):
-            raise ValueError(
-                f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
-                f"and `linear_kv_up_proj={submodules.linear_kv_up_proj}` is a "
-                f"fused norm+linear; either unset `kv_layernorm` or use a "
-                f"linear layer without norm fusion for `linear_kv_up_proj`"
-            )
-
     def _resolve_qk_norm_config(
         self, submodules
     ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
-        # Resolve which linear class to use for Q and KV up projections,
-        # based on QK-norm selection. We can use a fused implementation
-        # for MLA, but not DSA. (see
-        # https://github.com/NVIDIA/Megatron-LM/pull/3026)
-        # Config selects the default class; spec overrides if set.
+        """Validate and resolve Q/KV norm placement for MLA and DSA.
+
+        Q/KV norm can be represented either by a standalone norm module or by
+        a fused norm+linear projection. MLA can use the fused form; DSA cannot
+        because it needs the normalized Q/KV values outside the projection.
+
+        Constraints:
+        - `qk_l2_norm` is unsupported for MLA/DSA.
+        - A standalone Q norm is only usable when `q_lora_rank` is set.
+        - Explicit norm modules cannot be paired with fused norm+linear projections.
+        - Disabled QK norm rejects both explicit norms and fused norm+linear projections.
+        - DSA with QK norm requires non-fused projections and standalone Q/KV norms.
+        """
         is_dsa = self.config.experimental_attention_variant == "dsa"
         variant_str = "DSA" if is_dsa else "MLA"
 
@@ -713,14 +664,6 @@ class MLASelfAttention(MultiLatentAttention):
             module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
             return fused_norm_linear_impl is not None and module_cls is fused_norm_linear_impl
 
-        def non_fused_or_default(module_spec, default, module_name):
-            if is_fused_norm_linear(module_spec):
-                raise ValueError(
-                    f"`{module_name}={module_spec}` is fused norm+linear, but a non-fused linear "
-                    f"is required"
-                )
-            return module_spec or default
-
         def is_trivial(module_spec):
             return module_spec in (None, IdentityOp)
 
@@ -729,112 +672,145 @@ class MLASelfAttention(MultiLatentAttention):
                 return default
             return module_spec
 
+        def qk_layernorm_unavailable(module_name):
+            raise RuntimeError(
+                "qk_layernorm requires TransformerEngine or "
+                "q_layernorm/kv_layernorm to be set in the spec "
+                f"to build `{module_name}`."
+            )
+
+        def require_linear(module_spec, module_name):
+            if module_spec is None:
+                qk_layernorm_unavailable(module_name)
+            return module_spec
+
+        def explicit_q_norm_without_q_lora():
+            help_msg = ""
+            if not is_fused_norm_linear(submodules.linear_q_proj):
+                help_msg = (
+                    f"Please use a fused norm+linear for "
+                    f"`linear_q_proj={submodules.linear_q_proj}` if "
+                    f"you intend to have a Q-norm."
+                )
+            raise ValueError(
+                f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
+                f"but `q_lora_rank is None`, meaning it will not be used."
+                f"{help_msg}"
+            )
+
+        def reject_disabled_norm(module_spec, norm_spec, module_name, norm_name):
+            if is_fused_norm_linear(module_spec) or not is_trivial(norm_spec):
+                raise ValueError(
+                    f"spec sets {module_name}={module_spec} and "
+                    f"{norm_name}={norm_spec}, but "
+                    "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                )
+
+        def reject_explicit_norm_with_fused_linear(module_spec, norm_spec, module_name, norm_name):
+            if not is_trivial(norm_spec) and is_fused_norm_linear(module_spec):
+                raise ValueError(
+                    f"`{norm_name}={norm_spec}` is non-trivial "
+                    f"and `{module_name}={module_spec}` is a "
+                    f"fused norm+linear; either unset `{norm_name}` or use a "
+                    f"linear layer without norm fusion for `{module_name}`"
+                )
+
+        def non_fused_or_default(module_spec, module_name):
+            linear_cls = module_spec or linear_impl
+            require_linear(linear_cls, module_name)
+            if is_fused_norm_linear(linear_cls):
+                raise ValueError(
+                    f"`{module_name}={module_spec}` is fused norm+linear, but a non-fused linear "
+                    f"is required"
+                )
+            return linear_cls
+
+        def dsa_linear_or_default(module_spec, module_name):
+            linear_cls = module_spec or linear_impl
+            require_linear(linear_cls, module_name)
+            if is_fused_norm_linear(linear_cls):
+                raise ValueError(
+                    f"`{module_name}={module_spec}` is fused norm+linear, "
+                    f"which is not supported for DSA."
+                )
+            return linear_cls
+
+        def mla_fused_linear_or_default(module_spec, module_name):
+            if is_fused_norm_linear(module_spec):
+                return module_spec
+            return require_linear(fused_norm_linear_impl, module_name)
+
+        has_q_lora = self.config.q_lora_rank is not None
         linear_q_proj_cls = linear_q_up_proj_cls = IdentityOp
         if self.config.qk_l2_norm:
             raise ValueError(f"qk_l2_norm is not supported with {variant_str}.")
-        elif self.config.qk_layernorm:
+
+        if not has_q_lora and not is_trivial(submodules.q_layernorm):
+            explicit_q_norm_without_q_lora()
+        if has_q_lora:
+            reject_explicit_norm_with_fused_linear(
+                submodules.linear_q_up_proj,
+                submodules.q_layernorm,
+                "linear_q_up_proj",
+                "q_layernorm",
+            )
+        reject_explicit_norm_with_fused_linear(
+            submodules.linear_kv_up_proj,
+            submodules.kv_layernorm,
+            "linear_kv_up_proj",
+            "kv_layernorm",
+        )
+
+        if self.config.qk_layernorm:
             if is_dsa:
-                # Always have to use non-fused linear layers and set
-                # Q/KV layernorms individually for DSA.
-                q_norm_cls = default_if_trivial(submodules.q_layernorm, qk_norm_impl)
-                if self.config.q_lora_rank is not None:
-                    linear_q_up_proj_cls = submodules.linear_q_up_proj or linear_impl
-
-                    if linear_q_up_proj_cls is None:
-                        raise RuntimeError(
-                            "qk_layernorm requires TransformerEngine or "
-                            "q_layernorm/kv_layernorm to be set in the spec."
-                        )
-                    elif is_fused_norm_linear(linear_q_up_proj_cls):
-                        raise ValueError(
-                            f"`linear_q_up_proj={submodules.linear_q_up_proj}` is "
-                            f"fused norm+linear, which is not supported for DSA."
-                        )
-                else:
-                    linear_q_proj_cls = submodules.linear_q_proj or linear_impl
-                    if linear_q_proj_cls is None:
-                        raise RuntimeError(
-                            "qk_layernorm requires TransformerEngine or "
-                            "q_layernorm/kv_layernorm to be set in the spec."
-                        )
-                    elif is_fused_norm_linear(linear_q_proj_cls):
-                        raise ValueError(
-                            f"`linear_q_proj={submodules.linear_q_proj}` is "
-                            f"fused norm+linear, which is not supported for DSA."
-                        )
-
-                kv_norm_cls = default_if_trivial(submodules.kv_layernorm, qk_norm_impl)
-                linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_impl
-                if is_fused_norm_linear(linear_kv_up_proj_cls):
+                if not has_q_lora:
                     raise ValueError(
-                        f"`linear_kv_up_proj={submodules.linear_kv_up_proj}` is "
-                        f"fused norm+linear, which is not supported for DSA."
+                        "`qk_layernorm=True` with `q_lora_rank is None` is not supported for DSA "
+                        "because DSA cannot fuse Q norm into `linear_q_proj`."
                     )
+                q_norm_cls = default_if_trivial(submodules.q_layernorm, qk_norm_impl)
+                linear_q_up_proj_cls = dsa_linear_or_default(
+                    submodules.linear_q_up_proj, "linear_q_up_proj"
+                )
+                kv_norm_cls = default_if_trivial(submodules.kv_layernorm, qk_norm_impl)
+                linear_kv_up_proj_cls = dsa_linear_or_default(
+                    submodules.linear_kv_up_proj, "linear_kv_up_proj"
+                )
             else:
-                # Apply the fused norm+linear optimization automatically, but only if the layernorm
-                # spec is trivial (`None` or `IdentityOp`, the default).
                 q_norm_cls = submodules.q_layernorm or IdentityOp
-                if self.config.q_lora_rank is not None:
-                    if q_norm_cls is IdentityOp:
-                        linear_q_up_proj_cls = (
-                            submodules.linear_q_up_proj
-                            if is_fused_norm_linear(submodules.linear_q_up_proj)
-                            else fused_norm_linear_impl
+                if has_q_lora:
+                    if is_trivial(q_norm_cls):
+                        linear_q_up_proj_cls = mla_fused_linear_or_default(
+                            submodules.linear_q_up_proj, "linear_q_up_proj"
                         )
                     else:
                         linear_q_up_proj_cls = non_fused_or_default(
-                            submodules.linear_q_up_proj, linear_impl, "linear_q_up_proj"
-                        )
-
-                    if linear_q_up_proj_cls is None:
-                        raise RuntimeError(
-                            "qk_layernorm requires TransformerEngine or "
-                            "q_layernorm/kv_layernorm to be set in the spec."
+                            submodules.linear_q_up_proj, "linear_q_up_proj"
                         )
                 else:
-                    linear_q_proj_cls = (
-                        submodules.linear_q_proj
-                        if is_fused_norm_linear(submodules.linear_q_proj)
-                        else fused_norm_linear_impl
+                    if not is_trivial(q_norm_cls):
+                        explicit_q_norm_without_q_lora()
+                    linear_q_proj_cls = mla_fused_linear_or_default(
+                        submodules.linear_q_proj, "linear_q_proj"
                     )
-                    if linear_q_proj_cls is None:
-                        raise RuntimeError(
-                            "qk_layernorm requires TransformerEngine or "
-                            "q_layernorm/kv_layernorm to be set in the spec."
-                        )
-                    elif q_norm_cls is not IdentityOp:
-                        raise ValueError(
-                            f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
-                            f"but `q_lora_rank is None`, meaning it will not be used."
-                        )
 
                 kv_norm_cls = submodules.kv_layernorm or IdentityOp
-                if kv_norm_cls is IdentityOp:
-                    linear_kv_up_proj_cls = (
-                        submodules.linear_kv_up_proj
-                        if is_fused_norm_linear(submodules.linear_kv_up_proj)
-                        else fused_norm_linear_impl
+                if is_trivial(kv_norm_cls):
+                    linear_kv_up_proj_cls = mla_fused_linear_or_default(
+                        submodules.linear_kv_up_proj, "linear_kv_up_proj"
                     )
                 else:
                     linear_kv_up_proj_cls = non_fused_or_default(
-                        submodules.linear_kv_up_proj, linear_impl, "linear_kv_up_proj"
+                        submodules.linear_kv_up_proj, "linear_kv_up_proj"
                     )
-
-            if linear_kv_up_proj_cls is None:
-                raise RuntimeError(
-                    "qk_layernorm requires TransformerEngine or "
-                    "q_layernorm/kv_layernorm to be set in the spec."
-                )
         else:
-            if self.config.q_lora_rank is not None:
-                if is_fused_norm_linear(submodules.linear_q_up_proj) or not is_trivial(
-                    submodules.q_layernorm
-                ):
-                    raise ValueError(
-                        f"spec sets linear_q_up_proj={submodules.linear_q_up_proj} and "
-                        f"q_layernorm={submodules.q_layernorm}, but "
-                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
-                    )
+            if has_q_lora:
+                reject_disabled_norm(
+                    submodules.linear_q_up_proj,
+                    submodules.q_layernorm,
+                    "linear_q_up_proj",
+                    "q_layernorm",
+                )
                 linear_q_up_proj_cls = submodules.linear_q_up_proj or linear_impl
             else:
                 if is_fused_norm_linear(submodules.linear_q_proj):
@@ -843,16 +819,16 @@ class MLASelfAttention(MultiLatentAttention):
                         "qk_layernorm/qk_l2_norm are supposed to be disabled"
                     )
                 linear_q_proj_cls = submodules.linear_q_proj or linear_impl
-            if is_fused_norm_linear(submodules.linear_kv_up_proj) or not is_trivial(
-                submodules.kv_layernorm
-            ):
-                raise ValueError(
-                    f"spec sets linear_kv_up_proj={submodules.linear_kv_up_proj} and "
-                    f"kv_layernorm={submodules.kv_layernorm}, but "
-                    "qk_layernorm/qk_l2_norm are supposed to be disabled"
-                )
+
+            reject_disabled_norm(
+                submodules.linear_kv_up_proj,
+                submodules.kv_layernorm,
+                "linear_kv_up_proj",
+                "kv_layernorm",
+            )
             linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_impl
             q_norm_cls = kv_norm_cls = IdentityOp
+
         return dict(
             linear_q_proj=linear_q_proj_cls,
             linear_q_up_proj=linear_q_up_proj_cls,
@@ -1488,8 +1464,6 @@ class FusedMLASelfAttention(MLASelfAttention):
             "FusedMLASelfAttention requires q_lora_rank to be set; "
             "fallback to MLASelfAttention for q_lora_rank=None."
         )
-        self._validate_qk_norm_spec(submodules)
-
         # Resolve which linear class to use for Q and KV up projections,
         # based on QK-norm selection.
         norm_cls = self._resolve_qk_norm_config(submodules)

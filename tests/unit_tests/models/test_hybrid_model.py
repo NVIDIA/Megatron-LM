@@ -668,7 +668,7 @@ class _MLAQKNormTestBase:
 
 
 class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
-    """Tests `_validate_qk_norm_spec` in `MLASelfAttention`.
+    """Tests QK norm spec validation in `MLASelfAttention`.
 
     These errors guard against silently ignoring a configured norm or
     double-applying one through a fused norm+linear.
@@ -726,7 +726,7 @@ class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
 
 
 class TestMLAQKNormResolution(_MLAQKNormTestBase):
-    """Tests `_resolve_mla_qk_norm_config` branches.
+    """Tests `_resolve_qk_norm_config` for MLA.
 
     Covers fusion auto-selection, spec overrides, and the "disabled"-path
     guards that reject fused/explicit norms when `qk_layernorm` is off.
@@ -820,7 +820,7 @@ class TestMLAQKNormResolution(_MLAQKNormTestBase):
 
 
 class TestDSAQKNormResolution(_MLAQKNormTestBase):
-    """Tests `_resolve_dsa_qk_norm_config`.
+    """Tests `_resolve_qk_norm_config` for DSA.
 
     DSA requires non-fused Q/KV up projections and explicit norms;
     the fused optimization valid for MLA must be rejected here.
@@ -849,6 +849,11 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
         assert not isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
         assert not isinstance(attn.q_layernorm, IdentityOp)
         assert not isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_qk_layernorm_without_q_lora_rank_raises(self):
+        """DSA cannot apply Q norm when `q_lora_rank is None`."""
+        with pytest.raises(ValueError, match=r"q_lora_rank is None.*not supported for DSA"):
+            self._build_model(qk_layernorm=True, q_lora_rank=None)
 
     def test_qk_layernorm_rejects_fused_linear_q_up(self):
         """DSA does not support the fused norm+linear optimization."""
