@@ -117,6 +117,22 @@ class KVCacheManagementMode(str, Enum):
     """Deallocate large tensors and recompute them from scratch during allocation."""
 
 
+class CudaGraphSizingDistribution(str, Enum):
+    """How CUDA graph token-count sizes are spaced when generating the captured graphs.
+
+    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
+    `log2(max_tokens)` total graphs.
+
+    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
+    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
+    Higher graph density at the top end.
+    """
+
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -197,8 +213,18 @@ class InferenceConfig:
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
+    """
+
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
+        CudaGraphSizingDistribution.EXPONENTIAL
+    )
+    """
+    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
+    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    a bigger step size at the top end).
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
@@ -282,7 +308,13 @@ class InferenceConfig:
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out, sized to the
+    worst-case 3 * max_requests slots). The scratch is reserved from this budget first,
+    so a larger max_requests leaves fewer durable slots."""
 
     # =================================
     # Logging config
@@ -311,6 +343,9 @@ class InferenceConfig:
 
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
@@ -353,6 +388,19 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
             )
 
         if self.sampling_backend == 'flashinfer':

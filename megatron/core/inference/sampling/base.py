@@ -10,7 +10,8 @@ from torch import Tensor
 class Sampling(ABC):
     """Abstract base for inference sampling backends.
 
-    Subclasses implement `sample_kernel`. CUDA graphs are added via `CudaGraphManager`.
+    Subclasses implement `sample_kernel` and `log_probs_kernel`.
+    CUDA graphs are added via `CudaGraphManager`.
     """
 
     @abstractmethod
@@ -87,3 +88,18 @@ class Sampling(ABC):
             token_to_request_index=token_to_request_index,
             eager=True,
         )
+
+    @abstractmethod
+    def log_probs_kernel(
+        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+    ) -> Tensor:
+        """Per-row log-probs of the distribution this backend samples from.
+
+        Args:
+            logits: `[num_rows, vocab_size]` raw logits.
+            temperature, top_k, top_p: `[num_rows]` per-row sampling params.
+
+        Returns:
+            `[num_rows, vocab_size]` log-probs; filtered-out tokens are `-inf`.
+        """
+        ...

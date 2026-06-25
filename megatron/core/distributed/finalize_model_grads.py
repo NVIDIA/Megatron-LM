@@ -345,7 +345,11 @@ def _update_router_expert_bias(
             # cases where only the student is in training mode but the teacher is in eval mode
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
-            if hasattr(module, 'expert_bias') and module.training:
+            if (
+                hasattr(module, 'expert_bias')
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
@@ -553,7 +557,10 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+
+        # Clamp to avoid div-by-zero without a host-side branch on a device tensor,
+        # which would otherwise cause a sync that is illegal during CUDA graph capture.
+        safe_num_tokens = torch.clamp(num_tokens, min=1)
+        scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            if num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                model_chunk.scale_gradients(scaling)
+            model_chunk.scale_gradients(scaling)

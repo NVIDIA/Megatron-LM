@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -80,6 +80,11 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
+
+    mtp_detach_heads: bool = False
+    """If True, detach MTP head inputs from the main model graph.
+    This prevents MTP loss gradients from flowing back to the main model,
+    only training the MTP heads themselves."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
@@ -499,7 +504,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -508,7 +514,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -562,6 +569,11 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
+
+    fp8_output_proj: bool = False
+    """If True, run the LM-head output projection with a TE ColumnParallelLinear
+    under the MXFP8 autocast context. Only active when fp8=True and
+    fp8_recipe='mxfp8'."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -1079,6 +1091,10 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
+    """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
+    None causes the states to follow the activation dtype."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )
@@ -1120,7 +1136,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1128,6 +1144,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "fused_group_mlp": offload the input of the whole fused grouped MLP.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1309,6 +1326,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
 
         # FP4 validation
         if self.fp4_param and not self.fp4:
@@ -1598,6 +1623,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1614,6 +1640,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -1669,6 +1704,7 @@ class TransformerConfig(ModelParallelConfig):
                 "core_attn",
                 "attn_proj",
                 "expert_fc1",
+                "fused_group_mlp",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -1686,7 +1722,9 @@ class TransformerConfig(ModelParallelConfig):
                     "which is needed in core_attn.backward()."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1"} & set(self.offload_modules)
+                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
+                    self.offload_modules
+                )
                 assert not offload_inside_moe, (
                     f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
                     f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
@@ -1704,6 +1742,15 @@ class TransformerConfig(ModelParallelConfig):
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
 
+            if "fused_group_mlp" in self.offload_modules:
+                if not self.use_transformer_engine_op_fuser:
+                    raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+                moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+                if moe_partial_offload:
+                    raise ValueError(
+                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
+                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+                    )
         if self.moe_paged_stash:
             if self.cpu_offloading:
                 raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
@@ -1712,11 +1759,14 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
                 )
-            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+                self.offload_modules
+            )
             if moe_offload_conflict:
                 raise ValueError(
                     "When moe_paged_stash is enabled, offload_modules must not include "
-                    f"expert_fc1 or moe_act (paged stash covers those activations). "
+                    f"expert_fc1, moe_act, or fused_group_mlp "
+                    f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
 
@@ -2373,18 +2423,32 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert self.cuda_graph_impl in ("local", "transformer_engine", "full_iteration"), (
+                offload_modules = set(self.offload_modules or [])
+                local_partial_moe_offload = (
+                    self.cuda_graph_impl == "local"
+                    and bool(offload_modules)
+                    and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    and CudaGraphModule.moe not in self.cuda_graph_modules
+                )
+                assert (
+                    self.cuda_graph_impl in ("transformer_engine", "full_iteration")
+                    or local_partial_moe_offload
+                ), (
                     "fine-grained activation offloading is only supported with "
-                    "local, transformer_engine, or full_iteration CUDA graph implementations."
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with partial MoE offload. Local partial CUDA graphs "
+                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
+                    "offload when the full MoE module is not captured."
                 )
                 if self.cuda_graph_impl == "local":
-                    local_supported_offload_modules = {"expert_fc1", "moe_act"}
+                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
                     unsupported_offload_modules = (
                         set(self.offload_modules) - local_supported_offload_modules
                     )
                     assert not unsupported_offload_modules, (
                         "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "only supports offload_modules 'expert_fc1' and 'moe_act'. "
+                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
+                        "'fused_group_mlp'. "
                         f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
                     )
                     assert self.cuda_graph_modules, (
@@ -2476,11 +2540,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
-            if self.mtp_num_layers == 1:
-                assert self.pipeline_model_parallel_size > 1, (
-                    'Pipeline model parallel size must be larger than 1 '
-                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
-                )
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":

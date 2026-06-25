@@ -1051,6 +1051,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         self.setup_model(
             torch.float32,
             static=False,
+            mtp_num_layers=3,
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
@@ -1235,11 +1236,14 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         (top_k > 1, top_p > 0) by flattening 3D MTP logits for torch.multinomial."""
         num_spec = 3
         self.setup_model(
-            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=2
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            mtp_num_layers=num_spec,
+            max_requests=2,
         )
 
         # Enable speculative decoding
-        self.text_generation_controller.num_speculative_tokens = num_spec
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
@@ -1294,6 +1298,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             block_size_tokens=4,
             enable_prefix_caching=True,
             max_requests=16,
+            mtp_num_layers=2,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1343,6 +1348,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
+            mtp_num_layers=3,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1393,7 +1399,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         self.text_generation_controller.num_speculative_tokens = 2
-        self.text_generation_controller.num_mtp_heads = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
@@ -1414,7 +1419,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock the MTP computation to record the position_ids it receives
         unwrapped_model = self.text_generation_controller.inference_wrapped_model.model
-        unwrapped_model._decoder_hidden_states_cache = torch.randn(2, 1, 32, device='cuda')
+        ctx.mtp_decoder_hidden_states = torch.randn(2, 1, 32, device='cuda')
         self.text_generation_controller._last_accepted_seq_indices = torch.tensor(
             [0, 1], device='cuda'
         )
@@ -1502,7 +1507,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-        unwrapped_model._decoder_hidden_states_cache = local_hidden
+        ctx.mtp_decoder_hidden_states = local_hidden
 
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
@@ -1522,7 +1527,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             assert torch.all(sampled >= 0) and torch.all(sampled < self.vocab_size)
 
         # Verify decoder hidden states cache was cleaned up.
-        assert not hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        assert ctx.mtp_decoder_hidden_states is None
 
     def test_mtp_sp_padding_dummy_ranks(self):
         """Test _dummy_serial_mtp_forward with real MTP layers and sequence parallelism.
@@ -1547,8 +1552,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         ctrl = self.text_generation_controller
         unwrapped_model = ctrl.inference_wrapped_model.model
-        # The attribute just needs to exist so the has_mtp check passes.
-        unwrapped_model._decoder_hidden_states_cache = True
+        ctx = ctrl.inference_wrapped_model.inference_context
+        ctx.mtp_decoder_hidden_states = torch.empty(
+            1, 1, self.hidden_size, device='cuda', dtype=torch.float32
+        )
 
         # Run the dummy MTP forward path end-to-end.
         ctrl._dummy_serial_mtp_forward()

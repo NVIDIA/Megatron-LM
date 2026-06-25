@@ -15,6 +15,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1076,7 +1077,8 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_calculate_and_store_log_probs(self):
+    @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
+    def test_calculate_and_store_log_probs(self, logprobs_mode):
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1088,23 +1090,27 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
         )
+        dynamic_context.config.logprobs_mode = logprobs_mode
 
-        # Add a few requests to the context
+        # Add a few requests to the context, each with its own sampling parameters.
         request_data = {
             1001: {
                 "tokens": torch.randint(0, 100, (10,), device='cpu'),
                 "prefill_len": 10,
                 "initial_token_offset": 0,
+                "sampling": dict(temperature=1.0, top_k=0, top_p=0.0),  # raw-equivalent
             },
             1002: {
                 "tokens": torch.randint(0, 100, (5,), device='cpu'),
                 "prefill_len": 5,
                 "initial_token_offset": 10,
+                "sampling": dict(temperature=0.5, top_k=0, top_p=0.0),  # temperature
             },
             1003: {
                 "tokens": torch.randint(0, 100, (7,), device='cpu'),
                 "prefill_len": 7,
                 "initial_token_offset": 15,
+                "sampling": dict(temperature=1.0, top_k=8, top_p=0.0),  # top-k
             },
         }
 
@@ -1115,7 +1121,8 @@ class TestDynamicContext:
                     request_id=req_id,
                     prompt_tokens=data["tokens"],
                     sampling_params=SamplingParams(
-                        num_tokens_to_generate=dynamic_context.max_tokens - len(data["tokens"])
+                        num_tokens_to_generate=dynamic_context.max_tokens - len(data["tokens"]),
+                        **data["sampling"],
                     ),
                 )
             )
@@ -1126,6 +1133,32 @@ class TestDynamicContext:
         # Simulate prefill step
         total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
+
+        # Supplies log_probs_kernel for processed mode (unused by raw mode).
+        sampling = TorchSampling(rng=torch.Generator(), vocab_size=vocab_size)
+
+        def expected_log_probs(logits, active_id_and_counts):
+            """Mode-aware expected log-probs over every active-token row.
+
+            For processed mode, each active request's params are repeated across its token
+            count, mirroring the request->row mapping in `_processed_log_probs`.
+            """
+            logits_2d = logits.squeeze(0).float()
+            if logprobs_mode == "raw_logprobs":
+                return torch.nn.functional.log_softmax(logits_2d, dim=-1)
+            temperatures, top_ks, top_ps = [], [], []
+            for active_id, count in active_id_and_counts:
+                sp = request_data[active_id]["sampling"]
+                temperatures += [sp["temperature"]] * count
+                top_ks += [sp["top_k"]] * count
+                top_ps += [sp["top_p"]] * count
+            device = logits_2d.device
+            return sampling.log_probs_kernel(
+                logits_2d,
+                torch.tensor(temperatures, device=device, dtype=torch.float32),
+                torch.tensor(top_ks, device=device, dtype=torch.long),
+                torch.tensor(top_ps, device=device, dtype=torch.float32),
+            )
 
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
         dynamic_context.initialize_attention_state()
@@ -1143,16 +1176,15 @@ class TestDynamicContext:
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         # Call the function for prefill
-        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
-            prefill_logits, prefill_new_tokens
+        prefill_log_probs, prefill_log_probs_full = dynamic_context.calculate_log_probs(
+            prefill_logits, prefill_new_tokens, sampling=sampling
         )
 
         # Calculate expected prefill log probs for the selected tokens
-        expected_prefill_log_probs = (
-            torch.nn.functional.log_softmax(prefill_logits.squeeze(0), dim=-1)
-            .to(torch.float32)
-            .cpu()
-        )
+        prefill_active = [(req_id, request_data[req_id]["prefill_len"]) for req_id in request_data]
+        expected_prefill_full = expected_log_probs(prefill_logits, prefill_active)
+        assert torch.allclose(prefill_log_probs_full, expected_prefill_full, atol=1e-6)
+        expected_prefill_log_probs = expected_prefill_full.to(torch.float32).cpu()
 
         for i, (req_id, data) in enumerate(request_data.items()):
             req_len = data["tokens"].shape[0]
@@ -1187,12 +1219,15 @@ class TestDynamicContext:
             1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
         )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
-        decode_log_probs, _ = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
+        decode_log_probs, decode_log_probs_full = dynamic_context.calculate_log_probs(
+            decode_logits, decode_new_tokens, sampling=sampling
+        )
 
         # Verify the stored decode log probabilities
-        expected_decode_log_probs = torch.nn.functional.log_softmax(
-            decode_logits.squeeze(0), dim=-1
-        ).to(torch.float32)
+        decode_active = [(req_id, 1) for req_id in request_data]
+        expected_decode_full = expected_log_probs(decode_logits, decode_active)
+        assert torch.allclose(decode_log_probs_full, expected_decode_full, atol=1e-6)
+        expected_decode_log_probs = expected_decode_full.to(torch.float32)
 
         for i, (req_id, data) in enumerate(request_data.items()):
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
@@ -1210,12 +1245,14 @@ class TestDynamicContext:
         new_request_tokens = torch.randint(0, 100, (12,), device='cpu').long()
         new_request_prefill_len = new_request_tokens.shape[0]
         initial_token_offset_new_request = dynamic_context.active_token_count
+        new_request_sampling = dict(temperature=1.0, top_k=0, top_p=0.8)  # top-p
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=new_request_id,
                 prompt_tokens=new_request_tokens,
                 sampling_params=SamplingParams(
-                    num_tokens_to_generate=dynamic_context.max_tokens - len(new_request_tokens)
+                    num_tokens_to_generate=dynamic_context.max_tokens - len(new_request_tokens),
+                    **new_request_sampling,
                 ),
             )
         )
@@ -1223,6 +1260,7 @@ class TestDynamicContext:
             "tokens": new_request_tokens,
             "prefill_len": new_request_prefill_len,
             "initial_token_offset": initial_token_offset_new_request,
+            "sampling": new_request_sampling,
         }
 
         # Simulate the step after adding the new prefill request.
@@ -1243,15 +1281,18 @@ class TestDynamicContext:
             0, 100, (num_active_requests_mixed_step,), device='cuda'
         ).long()
 
-        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
-            mixed_step_logits, mixed_step_new_tokens
+        mixed_step_log_probs, mixed_step_log_probs_full = dynamic_context.calculate_log_probs(
+            mixed_step_logits, mixed_step_new_tokens, sampling=sampling
         )
 
-        expected_mixed_step_log_probs = (
-            torch.nn.functional.log_softmax(mixed_step_logits.squeeze(0), dim=-1)
-            .to(torch.float32)
-            .cpu()
-        )
+        # Existing requests are in decode (1 token each); the new request is in prefill.
+        mixed_active = [
+            (req_id, request_data[req_id]["prefill_len"] if req_id == new_request_id else 1)
+            for req_id in request_data
+        ]
+        expected_mixed_full = expected_log_probs(mixed_step_logits, mixed_active)
+        assert torch.allclose(mixed_step_log_probs_full, expected_mixed_full, atol=1e-6)
+        expected_mixed_step_log_probs = expected_mixed_full.to(torch.float32).cpu()
 
         # Verify log probs for the mixed step
         current_global_token_offset = 0
@@ -1659,10 +1700,16 @@ class TestDynamicContext:
             num_speculative_tokens=num_speculative_tokens,
         )
 
-        smallest = min(ctx.cuda_graph_batch_dimensions_list)
+        # The fast path is decode-only by construction, so pick the smallest decode-only batch_dim.
+        # With the geometric grid for mixed cudagraphs, the global min may now be a P=1 mixed shape
+        # when num_speculative_tokens > 0 makes decode-only token_count > 1)
+        smallest = min(
+            batchdim
+            for batchdim in ctx.cuda_graph_batch_dimensions_list
+            if batchdim.prefill_req_count == 0
+        )
         N = smallest.decode_req_count
         T = smallest.token_count  # N * (num_speculative_tokens + 1)
-        assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
 
         # --- slow path (reference) ---
         ctx.add_dummy_requests_for_cudagraph_capture(smallest)
