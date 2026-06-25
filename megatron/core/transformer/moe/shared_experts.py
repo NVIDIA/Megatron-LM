@@ -108,14 +108,19 @@ class SharedExpertMLP(MLP):
         submodules: MLPSubmodules,
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -229,10 +234,12 @@ class SharedExpertMLP(MLP):
                 self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
-                    input, tensor_parallel_output_grad=True
+                    input, tensor_parallel_output_grad=True, group=self.tp_group
                 )
             else:
-                self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
+                self.cached_fc1_input = copy_to_tensor_model_parallel_region(
+                    input, group=self.tp_group
+                )
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
     @overlap_state_check(
@@ -321,11 +328,11 @@ class SharedExpertMLP(MLP):
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)

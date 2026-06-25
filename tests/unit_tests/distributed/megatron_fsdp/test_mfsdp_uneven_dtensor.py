@@ -7,8 +7,6 @@ Run with torchrun:
     torchrun --nproc_per_node=8 pytest test_mfsdp_uneven_dtensor.py -v
 """
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -19,44 +17,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     split_dtensor,
     uneven_dtensor_to_full_tensor,
 )
-
-# ---------- Helper: distributed setup ----------
-
-
-@pytest.fixture(scope="module")
-def distributed_setup():
-    """Setup torch.distributed and CUDA device for torchrun + pytest."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-
-    if torch.cuda.is_available():
-        device_type = "cuda"
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        backend = "nccl"
-    else:
-        device_type = "cpu"
-        device = torch.device("cpu")
-        backend = "gloo"
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-    yield {
-        "rank": rank,
-        "world_size": world_size,
-        "local_rank": local_rank,
-        "device_type": device_type,
-        "device": device,
-    }
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
 
 # ---------- Helper: broadcast-based global tensor creation ----------
 
@@ -100,13 +60,11 @@ def make_global_arange(shape, dtype=torch.float32, device=torch.device("cpu")):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.distributed
 def test_basic_shard_gather(distributed_setup):
     """Basic 1D shard gather, world_size-agnostic."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_arange((4, 3), dtype=torch.float32, device=setup["device"])
+    global_tensor = make_global_arange((4, 3), dtype=torch.float32, device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -115,13 +73,11 @@ def test_basic_shard_gather(distributed_setup):
     assert torch.allclose(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_replicated_dtensor(distributed_setup):
     """Replicated placement should reconstruct the same tensor."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((8, 4), device=setup["device"])
+    global_tensor = make_global_randn((8, 4), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Replicate()])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -130,23 +86,23 @@ def test_replicated_dtensor(distributed_setup):
     assert torch.allclose(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_uneven_sharding_dim0(distributed_setup):
     """Uneven sharding on dim 0 using manual split + DTensor.from_local."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
-    mesh = DeviceMesh(setup["device_type"], list(range(world_size)))
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
 
     # size intentionally not divisible by world_size
     rows = world_size * 3 + 2
-    global_tensor = make_global_arange((rows, 4), dtype=torch.float32, device=setup["device"])
+    global_tensor = make_global_arange(
+        (rows, 4), dtype=torch.float32, device=distributed_setup.device
+    )
 
     shard = Shard(0)
     local_list, _ = shard._split_tensor(
         global_tensor, world_size, with_padding=False, contiguous=True
     )
 
-    local = local_list[setup["rank"]]
+    local = local_list[distributed_setup.rank]
 
     dtensor = DTensor.from_local(
         local, mesh, (Shard(0),), shape=global_tensor.size(), stride=global_tensor.stride()
@@ -158,21 +114,19 @@ def test_uneven_sharding_dim0(distributed_setup):
     assert torch.allclose(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_uneven_sharding_dim1(distributed_setup):
     """Uneven sharding on dim 1 using manual split + DTensor.from_local."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
-    mesh = DeviceMesh(setup["device_type"], list(range(world_size)))
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
 
     cols = world_size * 2 + 1
-    global_tensor = make_global_randn((8, cols), device=setup["device"])
+    global_tensor = make_global_randn((8, cols), device=distributed_setup.device)
 
     shard = Shard(1)
     local_list, _ = shard._split_tensor(
         global_tensor, world_size, with_padding=False, contiguous=True
     )
-    local = local_list[setup["rank"]]
+    local = local_list[distributed_setup.rank]
 
     dtensor = DTensor.from_local(
         local, mesh, (Shard(1),), shape=global_tensor.size(), stride=global_tensor.stride()
@@ -184,11 +138,9 @@ def test_uneven_sharding_dim1(distributed_setup):
     assert torch.allclose(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_2d_mesh_shard_and_replicate(distributed_setup):
     """2D mesh with Shard + Replicate, for world_size=4 or 8."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -198,9 +150,9 @@ def test_2d_mesh_shard_and_replicate(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
-    global_tensor = make_global_randn((16, 12), device=setup["device"])
+    global_tensor = make_global_randn((16, 12), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -209,11 +161,9 @@ def test_2d_mesh_shard_and_replicate(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_multiple_sharded_dims_even(distributed_setup):
     """Shard on two dimensions with even splits, 2D mesh."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -223,9 +173,9 @@ def test_multiple_sharded_dims_even(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
-    global_tensor = make_global_randn((16, 24), device=setup["device"])
+    global_tensor = make_global_randn((16, 24), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Shard(1)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -234,11 +184,9 @@ def test_multiple_sharded_dims_even(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_multiple_sharded_dims_uneven(distributed_setup):
     """Shard on two dimensions with uneven sizes using manual splitting."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -252,9 +200,9 @@ def test_multiple_sharded_dims_uneven(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
-    global_tensor = make_global_randn((dim0, dim1), device=setup["device"])
+    global_tensor = make_global_randn((dim0, dim1), device=distributed_setup.device)
 
     shard0 = Shard(0)
     shard1 = Shard(1)
@@ -262,13 +210,13 @@ def test_multiple_sharded_dims_uneven(distributed_setup):
     list0, _ = shard0._split_tensor(
         global_tensor, mesh_shape[0], with_padding=False, contiguous=True
     )
-    rank0 = setup["rank"] // mesh_shape[1]
+    rank0 = distributed_setup.rank // mesh_shape[1]
     intermediate = list0[rank0]
 
     list1, _ = shard1._split_tensor(
         intermediate, mesh_shape[1], with_padding=False, contiguous=True
     )
-    rank1 = setup["rank"] % mesh_shape[1]
+    rank1 = distributed_setup.rank % mesh_shape[1]
     local = list1[rank1]
 
     dtensor = DTensor.from_local(
@@ -281,11 +229,9 @@ def test_multiple_sharded_dims_uneven(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_3d_tensor_two_shards(distributed_setup):
     """3D tensor with sharding on two dims on 2D mesh."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -295,9 +241,9 @@ def test_3d_tensor_two_shards(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
-    global_tensor = make_global_randn((16, 8, 24), device=setup["device"])
+    global_tensor = make_global_randn((16, 8, 24), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Shard(2)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -306,14 +252,12 @@ def test_3d_tensor_two_shards(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_different_dtypes(distributed_setup):
     """Verify correctness across several dtypes."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
     for dtype in (torch.float32, torch.float64, torch.int32, torch.int64):
-        global_tensor = make_global_arange((4, 4), dtype=dtype, device=setup["device"])
+        global_tensor = make_global_arange((4, 4), dtype=dtype, device=distributed_setup.device)
         dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
         gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -322,13 +266,11 @@ def test_different_dtypes(distributed_setup):
         assert torch.equal(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_large_tensor(distributed_setup):
     """Scalability: larger tensor, sharded on dim 0."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((1024, 512), device=setup["device"])
+    global_tensor = make_global_randn((1024, 512), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -337,13 +279,11 @@ def test_large_tensor(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_3d_tensor_single_shard(distributed_setup):
     """3D tensor with sharding on dim 0 only."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((8, 6, 4), device=setup["device"])
+    global_tensor = make_global_randn((8, 6, 4), device=distributed_setup.device)
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -352,7 +292,6 @@ def test_3d_tensor_single_shard(distributed_setup):
     assert torch.allclose(gathered, global_tensor)
 
 
-@pytest.mark.distributed
 def test_error_on_invalid_input(distributed_setup):
     """Non-DTensor input should raise TypeError."""
     x = torch.randn(4, 4)
@@ -360,13 +299,11 @@ def test_error_on_invalid_input(distributed_setup):
         uneven_dtensor_to_full_tensor(x)
 
 
-@pytest.mark.distributed
 def test_backward_compatibility(distributed_setup):
     """Check gathered tensor can participate in autograd."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((8, 4), device=setup["device"])
+    global_tensor = make_global_randn((8, 4), device=distributed_setup.device)
     global_tensor.requires_grad_(True)
 
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
@@ -377,14 +314,12 @@ def test_backward_compatibility(distributed_setup):
 
 
 @pytest.mark.skip(reason="distribute_tensor not work for _StridedShard yet")
-@pytest.mark.distributed
 def test_strided_shard_2d_mesh(distributed_setup):
     """
     Test _StridedShard on a 2D mesh, sharding the same dimension across two mesh dims.
     This is similar to TP + DP style strided sharding.
     """
-    setup = distributed_setup
-    world_size = setup["world_size"]
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -394,11 +329,11 @@ def test_strided_shard_2d_mesh(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
     rows = 8
     cols = 8
-    global_tensor = make_global_randn((rows, cols), device=setup["device"])
+    global_tensor = make_global_randn((rows, cols), device=distributed_setup.device)
 
     # Shard dim 0 over both mesh dims; one of them is encoded as _StridedShard.
     # Example pattern: [Shard(0), _StridedShard(0, split_factor=mesh_shape[0])]
@@ -413,7 +348,6 @@ def test_strided_shard_2d_mesh(distributed_setup):
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_wild_random_uneven_shards(distributed_setup):
     """
     Wild random uneven sharding:
@@ -423,10 +357,9 @@ def test_wild_random_uneven_shards(distributed_setup):
     - We build a DTensor via from_local + explicit offsets metadata (through your metadata updater),
       and then use uneven_dtensor_to_full_tensor to reconstruct.
     """
-    setup = distributed_setup
-    rank = setup["rank"]
-    world_size = setup["world_size"]
-    mesh = DeviceMesh(setup["device_type"], list(range(world_size)))
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
 
     # Global logical shape on dim 1 (sharded dim)
     rows = 2
@@ -435,13 +368,13 @@ def test_wild_random_uneven_shards(distributed_setup):
     if rank == 0:
         # Random lengths per rank, allowing zero
         lengths = torch.randint(
-            low=0, high=max_local + 1, size=(world_size,), device=setup["device"]
+            low=0, high=max_local + 1, size=(world_size,), device=distributed_setup.device
         )
         # Ensure at least one element globally to avoid degenerate zero-sized tensor
         if lengths.sum().item() == 0:
             lengths[0] = 1
     else:
-        lengths = torch.empty(world_size, dtype=torch.int64, device=setup["device"])
+        lengths = torch.empty(world_size, dtype=torch.int64, device=distributed_setup.device)
 
     # Broadcast lengths and total from rank 0
     dist.broadcast(lengths, src=0)
@@ -453,7 +386,7 @@ def test_wild_random_uneven_shards(distributed_setup):
 
     # Build a “reference” tensor on all ranks via broadcast from rank 0
     ref_global = make_global_arange(
-        (rows, global_cols), dtype=torch.float32, device=setup["device"]
+        (rows, global_cols), dtype=torch.float32, device=distributed_setup.device
     )
 
     # Local slice for this rank is a contiguous segment in dim 1
@@ -478,7 +411,6 @@ def test_wild_random_uneven_shards(distributed_setup):
     assert torch.allclose(gathered, ref_global, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_wild_random_uneven_shards_multi_dim(distributed_setup):
     """
     Wild uneven shards across a 2D mesh and 2 sharded dims, including zero-sized shards.
@@ -487,9 +419,8 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
       - multiple sharded dims
       - varying per-rank shapes
     """
-    setup = distributed_setup
-    rank = setup["rank"]
-    world_size = setup["world_size"]
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
 
     if world_size == 4:
         mesh_shape = (2, 2)
@@ -499,7 +430,7 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
         pytest.skip(f"2D mesh test expects world_size 4 or 8, got {world_size}")
 
     mesh_ids = torch.arange(world_size).reshape(mesh_shape)
-    mesh = DeviceMesh(setup["device_type"], mesh_ids)
+    mesh = DeviceMesh(distributed_setup.device.type, mesh_ids)
 
     # Logical global shape
     base_rows = 3
@@ -508,18 +439,18 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
     # Each mesh row gets its own random row-count; each mesh col gets its own random col-count
     if rank == 0:
         row_chunks = torch.randint(
-            low=0, high=base_rows + 2, size=(mesh_shape[0],), device=setup["device"]
+            low=0, high=base_rows + 2, size=(mesh_shape[0],), device=distributed_setup.device
         )
         col_chunks = torch.randint(
-            low=0, high=base_cols + 3, size=(mesh_shape[1],), device=setup["device"]
+            low=0, high=base_cols + 3, size=(mesh_shape[1],), device=distributed_setup.device
         )
         if row_chunks.sum().item() == 0:
             row_chunks[0] = 1
         if col_chunks.sum().item() == 0:
             col_chunks[0] = 1
     else:
-        row_chunks = torch.empty(mesh_shape[0], dtype=torch.int64, device=setup["device"])
-        col_chunks = torch.empty(mesh_shape[1], dtype=torch.int64, device=setup["device"])
+        row_chunks = torch.empty(mesh_shape[0], dtype=torch.int64, device=distributed_setup.device)
+        col_chunks = torch.empty(mesh_shape[1], dtype=torch.int64, device=distributed_setup.device)
 
     dist.broadcast(row_chunks, src=0)
     dist.broadcast(col_chunks, src=0)
@@ -529,7 +460,7 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
 
     # Global reference tensor
     ref_global = make_global_arange(
-        (total_rows, total_cols), dtype=torch.float32, device=setup["device"]
+        (total_rows, total_cols), dtype=torch.float32, device=distributed_setup.device
     )
 
     # Determine which row/col block this rank owns
@@ -564,13 +495,13 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.distributed
 def test_split_dtensor_even_shard_dim0(distributed_setup):
     """Even split along sharded dim 0, verify each split matches torch.split of global tensor."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_arange((16, 4), dtype=torch.float32, device=setup["device"])
+    global_tensor = make_global_arange(
+        (16, 4), dtype=torch.float32, device=distributed_setup.device
+    )
     dt = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     # Split evenly into size 4 along dim 0
@@ -587,13 +518,11 @@ def test_split_dtensor_even_shard_dim0(distributed_setup):
         assert torch.allclose(gathered, ref), f"split {i} content mismatch"
 
 
-@pytest.mark.distributed
 def test_split_dtensor_uneven_sections_dim1(distributed_setup):
     """List-of-sections split along dim 1 on a sharded DTensor."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((8, 13), device=setup["device"])
+    global_tensor = make_global_randn((8, 13), device=distributed_setup.device)
     dt = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     sections = [3, 5, 5]  # sum == 13
@@ -608,13 +537,11 @@ def test_split_dtensor_uneven_sections_dim1(distributed_setup):
         assert torch.allclose(gathered, ref, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_split_dtensor_replicate_placement(distributed_setup):
     """Splitting a replicated DTensor should behave like splitting the global tensor, no redistribution."""
-    setup = distributed_setup
-    mesh = DeviceMesh(setup["device_type"], list(range(setup["world_size"])))
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(distributed_setup.world_size)))
 
-    global_tensor = make_global_randn((6, 10), device=setup["device"])
+    global_tensor = make_global_randn((6, 10), device=distributed_setup.device)
     dt = distribute_tensor(global_tensor, mesh, [Replicate()])
 
     splits = list(split_dtensor(dt, 4, dim=1, update_uneven_dtensor_chunk_meta=False))
@@ -629,21 +556,21 @@ def test_split_dtensor_replicate_placement(distributed_setup):
         assert torch.allclose(local, ref, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_split_dtensor_uneven_shard_with_metadata(distributed_setup):
     """Split along dim 0 on an unevenly sharded DTensor and verify correctness."""
-    setup = distributed_setup
-    world_size = setup["world_size"]
-    mesh = DeviceMesh(setup["device_type"], list(range(world_size)))
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
 
     rows = world_size * 3 + 1  # uneven vs world_size
-    global_tensor = make_global_arange((rows, 4), dtype=torch.float32, device=setup["device"])
+    global_tensor = make_global_arange(
+        (rows, 4), dtype=torch.float32, device=distributed_setup.device
+    )
 
     shard = Shard(0)
     local_list, _ = shard._split_tensor(
         global_tensor, world_size, with_padding=False, contiguous=True
     )
-    local = local_list[setup["rank"]]
+    local = local_list[distributed_setup.rank]
 
     dt = DTensor.from_local(
         local, mesh, (Shard(0),), shape=global_tensor.size(), stride=global_tensor.stride()
@@ -661,35 +588,35 @@ def test_split_dtensor_uneven_shard_with_metadata(distributed_setup):
         assert torch.allclose(gathered, ref, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.distributed
 def test_split_dtensor_zero_local_shard(distributed_setup):
     """
     Split DTensor where some ranks have zero local data (after an uneven manual layout),
     ensuring split_dtensor yields correct empty locals but correct global slices.
     """
-    setup = distributed_setup
-    rank = setup["rank"]
-    world_size = setup["world_size"]
-    mesh = DeviceMesh(setup["device_type"], list(range(world_size)))
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
 
     # Create a manual uneven sharding along dim 1 with possible zero-length local on some ranks
     # Similar style to your "wild random uneven" gather test.
     if rank == 0:
         # random but deterministic lengths
         lengths = torch.tensor(
-            [0] + [4] * (world_size - 1), dtype=torch.int64, device=setup["device"]
+            [0] + [4] * (world_size - 1), dtype=torch.int64, device=distributed_setup.device
         )
         if lengths.sum().item() == 0:
             lengths[0] = 1  # fallback
     else:
-        lengths = torch.empty(world_size, dtype=torch.int64, device=setup["device"])
+        lengths = torch.empty(world_size, dtype=torch.int64, device=distributed_setup.device)
 
     dist.broadcast(lengths, src=0)
     total = int(lengths.sum().item())
 
     rows = 4
     cols = total
-    global_tensor = make_global_arange((rows, cols), dtype=torch.float32, device=setup["device"])
+    global_tensor = make_global_arange(
+        (rows, cols), dtype=torch.float32, device=distributed_setup.device
+    )
 
     start = int(lengths[:rank].sum().item())
     length = int(lengths[rank].item())
@@ -714,7 +641,3 @@ def test_split_dtensor_zero_local_shard(distributed_setup):
         ref = ref.to(gathered.device)
         assert gathered.shape == ref.shape
         assert torch.allclose(gathered, ref, rtol=1e-5, atol=1e-5)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

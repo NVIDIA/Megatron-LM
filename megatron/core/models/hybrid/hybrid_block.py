@@ -25,7 +25,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -87,7 +86,12 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -127,6 +131,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -137,6 +142,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
@@ -147,6 +153,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
@@ -155,6 +162,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -163,6 +171,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
@@ -172,6 +181,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
@@ -255,13 +265,7 @@ class HybridStack(MegatronModule):
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         if (
-            (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context
             and inference_context.is_static_batching()
             and InferenceMode.is_active()
