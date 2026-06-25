@@ -112,12 +112,12 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
     tp_rank = rank // 2
     gtp_rank = rank % 2
     expected_offset = (tp_rank * gtp_size + gtp_rank) * per_shard_out
-    assert st.global_offset[0] == expected_offset, (
-        f"rank={rank} expected axis-0 offset {expected_offset}, got {st.global_offset[0]}"
-    )
-    assert st.global_shape[0] == full_out_features, (
-        f"rank={rank} expected global axis-0 size {full_out_features}, got {st.global_shape[0]}"
-    )
+    assert (
+        st.global_offset[0] == expected_offset
+    ), f"rank={rank} expected axis-0 offset {expected_offset}, got {st.global_offset[0]}"
+    assert (
+        st.global_shape[0] == full_out_features
+    ), f"rank={rank} expected global axis-0 size {full_out_features}, got {st.global_shape[0]}"
 
 
 def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
@@ -148,15 +148,16 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
     st = sharded["weight"]
     tp_rank = rank // 2
     gtp_rank = rank % 2
-    assert st.global_offset[0] == gtp_rank * per_shard_out, (
-        f"rank={rank} axis-0 offset wrong: {st.global_offset[0]}"
-    )
-    assert st.global_offset[1] == tp_rank * per_tp_in, (
-        f"rank={rank} axis-1 offset wrong: {st.global_offset[1]}"
-    )
-    assert st.global_shape == (full_out, full_in), (
-        f"rank={rank} global shape {st.global_shape} != ({full_out}, {full_in})"
-    )
+    assert (
+        st.global_offset[0] == gtp_rank * per_shard_out
+    ), f"rank={rank} axis-0 offset wrong: {st.global_offset[0]}"
+    assert (
+        st.global_offset[1] == tp_rank * per_tp_in
+    ), f"rank={rank} axis-1 offset wrong: {st.global_offset[1]}"
+    assert st.global_shape == (
+        full_out,
+        full_in,
+    ), f"rank={rank} global shape {st.global_shape} != ({full_out}, {full_in})"
 
 
 def _worker_helper_no_op_no_gtp(rank, world_size, port):
@@ -224,9 +225,9 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
         dp_cp_group=dist.new_group(list(range(world_size))),
     )
     st = sharded["weight"]
-    assert st.global_shape[0] == dim0, (
-        f"rank={rank} no-pad case: global_shape[0] {st.global_shape[0]} != {dim0}"
-    )
+    assert (
+        st.global_shape[0] == dim0
+    ), f"rank={rank} no-pad case: global_shape[0] {st.global_shape[0]} != {dim0}"
     assert st.global_offset[0] == rank * expected_local
 
 
@@ -255,14 +256,15 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     gtp_group = dist.new_group(list(range(world_size)))
     weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_group)
 
-    assert weight.shape == (per_shard, in_features), (
-        f"rank={rank}: post-pad shard shape {tuple(weight.shape)} != ({per_shard}, {in_features})"
-    )
+    assert weight.shape == (
+        per_shard,
+        in_features,
+    ), f"rank={rank}: post-pad shard shape {tuple(weight.shape)} != ({per_shard}, {in_features})"
     # Only rank-3 (the last GTP rank) carries the trailing pad rows; all ranks
     # report the same pad_length (an invariant set by _gtp_slice_one_param).
-    assert getattr(weight, "pad_length", 0) == pad, (
-        f"rank={rank}: pad_length {getattr(weight, 'pad_length', 0)} != {pad}"
-    )
+    assert (
+        getattr(weight, "pad_length", 0) == pad
+    ), f"rank={rank}: pad_length {getattr(weight, 'pad_length', 0)} != {pad}"
 
     sharded = make_sharded_tensors_for_checkpoint_with_gtp(
         {"weight": weight},
@@ -276,9 +278,9 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     # Helper saves the padded global. ``allow_shape_mismatch=True`` is what
     # makes the saved tensor portable to a different load-time GTP topology
     # (different alignment choice yields a different padded size).
-    assert st.global_shape[0] == dim0_padded, (
-        f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
-    )
+    assert (
+        st.global_shape[0] == dim0_padded
+    ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
     assert st.global_offset[0] == rank * per_shard
     assert st.allow_shape_mismatch is True, (
         f"rank={rank} pad case: allow_shape_mismatch must be True when GTP padding fires; "
@@ -369,9 +371,7 @@ def _worker_reset_quantize_cache(rank, world_size, port):
     class _Dummy(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(
-                torch.zeros(4, 4, dtype=torch.bfloat16, device="cuda")
-            )
+            self.weight = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16, device="cuda"))
 
     mod = _Dummy()
     wrap_module_params_gtp(mod, ["weight"], gtp_group)
@@ -404,9 +404,10 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     global_expert_idx = ep_rank * num_gemms  # + gemm_idx (0)
 
     weight = _make_gtp_shard(per_expert_out, in_features, egtp_group)
-    assert weight.shape == (per_shard_out, in_features), (
-        f"rank={rank} EGTP shard shape {tuple(weight.shape)} != ({per_shard_out}, {in_features})"
-    )
+    assert weight.shape == (
+        per_shard_out,
+        in_features,
+    ), f"rank={rank} EGTP shard shape {tuple(weight.shape)} != ({per_shard_out}, {in_features})"
 
     sharded = make_sharded_tensors_for_checkpoint_with_gtp(
         {"weight": weight},
@@ -425,13 +426,13 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
         f"({num_global_experts}, {per_expert_out}, {in_features})"
     )
     # Prepended expert axis (axis 0): offset == this rank's global expert index.
-    assert st.global_offset[0] == global_expert_idx, (
-        f"rank={rank} expert-axis offset {st.global_offset[0]} != {global_expert_idx}"
-    )
+    assert (
+        st.global_offset[0] == global_expert_idx
+    ), f"rank={rank} expert-axis offset {st.global_offset[0]} != {global_expert_idx}"
     # EGTP axis (weight axis 0, shifted to global axis 1): offset == egtp_rank · per_shard.
-    assert st.global_offset[1] == egtp_rank * per_shard_out, (
-        f"rank={rank} EGTP axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
-    )
+    assert (
+        st.global_offset[1] == egtp_rank * per_shard_out
+    ), f"rank={rank} EGTP axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
 
 
 def _worker_helper_embedding_offsets(rank, world_size, port):
@@ -467,12 +468,12 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
     tp_rank = rank // 2
     gtp_rank = rank % 2
     expected_offset = (tp_rank * gtp_size + gtp_rank) * per_shard
-    assert st.global_offset[0] == expected_offset, (
-        f"rank={rank} embedding axis-0 offset {st.global_offset[0]} != {expected_offset}"
-    )
-    assert st.global_shape[0] == full_vocab, (
-        f"rank={rank} embedding global axis-0 {st.global_shape[0]} != {full_vocab}"
-    )
+    assert (
+        st.global_offset[0] == expected_offset
+    ), f"rank={rank} embedding axis-0 offset {st.global_offset[0]} != {expected_offset}"
+    assert (
+        st.global_shape[0] == full_vocab
+    ), f"rank={rank} embedding global axis-0 {st.global_shape[0]} != {full_vocab}"
 
 
 def _worker_helper_public_wrapper_delegates(rank, world_size, port):
@@ -510,9 +511,9 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
         f"rank={rank} public wrapper did not produce the GTP-composite offset: "
         f"{st.global_offset[0]} != {expected_offset} (delegation to the GTP path failed?)"
     )
-    assert st.global_shape[0] == full_out, (
-        f"rank={rank} global axis-0 {st.global_shape[0]} != {full_out}"
-    )
+    assert (
+        st.global_shape[0] == full_out
+    ), f"rank={rank} global axis-0 {st.global_shape[0]} != {full_out}"
 
 
 def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
@@ -625,9 +626,9 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
         assert bases, "no GTP-replicated tiny params found in MambaMixer sharded_state_dict"
         for base in sorted(bases):
             rids = [g[base] for g in gathered]
-            assert len(set(rids)) == world_size, (
-                f"{base}: replica_id collision across ranks -> DCP write conflict: {rids}"
-            )
+            assert (
+                len(set(rids)) == world_size
+            ), f"{base}: replica_id collision across ranks -> DCP write conflict: {rids}"
             n_writers = sum(is_main_replica(r) for r in rids)
             assert n_writers == 1, f"{base}: expected exactly 1 writer, got {n_writers}: {rids}"
 

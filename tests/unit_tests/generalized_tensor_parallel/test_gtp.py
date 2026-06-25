@@ -1465,9 +1465,9 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
         for name, w in [("fc0", model.fc0.weight), ("fc1", model.fc1.weight)]:
             assert isinstance(w, GTPShardedParam), f"{name}.weight should be a GTP param"
             # Manual hook set -> grad-ready fires after the add; None -> early autograd path (bug).
-            assert getattr(w, "_grad_accum_hook", None) is not None, (
-                f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
-            )
+            assert (
+                getattr(w, "_grad_accum_hook", None) is not None
+            ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
 
         # bias=False -> all params are GTP -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (

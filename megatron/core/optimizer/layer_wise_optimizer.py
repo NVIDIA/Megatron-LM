@@ -574,7 +574,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket_id,
                 ) in layout.param_index_map.items():
                     bucket_start_index, bucket_end_index = layout.bucket_indices[bucket_id]
-                    shard_size = (bucket_end_index - bucket_start_index) // layout.num_optimizer_shards
+                    shard_size = (
+                        bucket_end_index - bucket_start_index
+                    ) // layout.num_optimizer_shards
                     shard_id = (param_start_index - bucket_start_index) // shard_size
                     shard_end_index = bucket_start_index + (shard_id + 1) * shard_size
                     assert param_end_index <= shard_end_index, (
@@ -702,9 +704,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.expt_dp_params_list is not None:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.expt_dp_group))
-                        ]
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp_group))]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
                         ):

@@ -1425,9 +1425,13 @@ class MambaMixer(MegatronModule):
             original_merge_fn = factory.merge_fn
 
             @torch.no_grad()
-            def _gtp_slice_after_cat(sub_state_dict, _orig=original_merge_fn,
-                                     _rank=gtp_local_rank, _size=gtp_local_size,
-                                     _gtp_size=in_proj_gtp_size):
+            def _gtp_slice_after_cat(
+                sub_state_dict,
+                _orig=original_merge_fn,
+                _rank=gtp_local_rank,
+                _size=gtp_local_size,
+                _gtp_size=in_proj_gtp_size,
+            ):
                 full = _orig(sub_state_dict)
                 aligned_total = _size * _gtp_size
                 pad_rows = aligned_total - full.shape[0]

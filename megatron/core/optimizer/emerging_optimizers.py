@@ -230,9 +230,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
-    def scaled_orthogonalize_fn_with_gtp(
-        self, p, grad, tp_group, partition_dim,
-    ):
+    def scaled_orthogonalize_fn_with_gtp(self, p, grad, tp_group, partition_dim):
         """All-gather grad along GTP/EGTP dim 0, orthogonalize, then slice back.
 
         GTP shards weights along dim 0 independently of TP's partition_dim. Newton-Schulz

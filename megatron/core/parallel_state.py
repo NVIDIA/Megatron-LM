@@ -1528,9 +1528,7 @@ def initialize_model_parallel(
     else:
         # EGTP inactive: the replicate group aliases the regular expert-DP group.
         _EXPERT_DATA_PARALLEL_GROUP_NO_GTP = _EXPERT_DATA_PARALLEL_GROUP
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP = (
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
-        )
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP = _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
     ### End of expert related parallel groups initialization
 
@@ -1744,9 +1742,7 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(
-    with_context_parallel=False, no_gtp=False, partial_data_parallel=False
-):
+def get_data_parallel_group(with_context_parallel=False, no_gtp=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to.
 
     Args:
@@ -2114,9 +2110,7 @@ def set_data_parallel_rank(rank):
     _MPU_DATA_PARALLEL_RANK = rank
 
 
-def get_data_parallel_rank(
-    with_context_parallel=False, no_gtp=False, partial_data_parallel=False
-):
+def get_data_parallel_rank(with_context_parallel=False, no_gtp=False, partial_data_parallel=False):
     """Return caller's rank in the data-parallel group."""
     global _MPU_DATA_PARALLEL_RANK
     if _MPU_DATA_PARALLEL_RANK is not None:
@@ -2356,10 +2350,7 @@ def get_expert_data_parallel_group(
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
             "Intra partial expert data parallel group",
         ),
-        (True, False): (
-            _EXPERT_DATA_PARALLEL_GROUP_NO_GTP,
-            "Expert data parallel group (no GTP)",
-        ),
+        (True, False): (_EXPERT_DATA_PARALLEL_GROUP_NO_GTP, "Expert data parallel group (no GTP)"),
         (True, True): (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_NO_GTP,
             "Intra partial expert data parallel group (no GTP)",

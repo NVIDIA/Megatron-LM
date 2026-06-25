@@ -269,9 +269,7 @@ class ProcessGroupCollection:
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
             'dp_cp_no_gtp': partial(
-                parallel_state.get_data_parallel_group,
-                with_context_parallel=True,
-                no_gtp=True,
+                parallel_state.get_data_parallel_group, with_context_parallel=True, no_gtp=True
             ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
@@ -309,9 +307,7 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
             'expt_dp_no_egtp': partial(
-                parallel_state.get_expert_data_parallel_group,
-                check_initialized=False,
-                no_gtp=True,
+                parallel_state.get_expert_data_parallel_group, check_initialized=False, no_gtp=True
             ),
             'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(
@@ -646,9 +642,7 @@ class ProcessGroupCollection:
                     with_context_parallel=True, partial_data_parallel=True
                 ),
                 'expt_dp_group': parallel_state.get_expert_data_parallel_group(),
-                'expt_dp_no_egtp_group': parallel_state.get_expert_data_parallel_group(
-                    no_gtp=True
-                ),
+                'expt_dp_no_egtp_group': parallel_state.get_expert_data_parallel_group(no_gtp=True),
                 'intra_expt_dp_group': parallel_state.get_expert_data_parallel_group(
                     partial_expert_data_parallel=True
                 ),
