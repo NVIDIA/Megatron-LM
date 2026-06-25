@@ -134,8 +134,8 @@ class ModelParallelConfig:
 
     expert_tensor_parallel_num_weight_shards: Optional[int] = None
     """Total number of shards each expert weight is split into across the expert-tensor-parallel +
-       expert-GTP axes (i.e. ``expert_tensor_parallel_size * expert_gtp_weight_remat_size``). This is
-       the user-facing knob for expert layers: it must be ``>= expert_tensor_parallel_size`` and
+       expert-GTP axes (i.e. ``expert_tensor_parallel_size * expert_gtp_weight_remat_size``). This
+       is the user-facing knob for expert layers: it must be ``>= expert_tensor_parallel_size`` and
        divisible by it. When None it defaults to ``expert_tensor_parallel_size`` (no expert GTP
        sharding). It is the source of truth and implies
        ``expert_gtp_weight_remat_size = expert_tensor_parallel_num_weight_shards //
@@ -516,7 +516,7 @@ class ModelParallelConfig:
             )
         )
 
-        # Same reconciliation for the expert layers (expert_tensor_parallel_size is finalized above).
+        # Same reconciliation for expert layers (expert_tensor_parallel_size finalized above).
         (self.expert_tensor_parallel_num_weight_shards, self.expert_gtp_weight_remat_size) = (
             resolve_tensor_parallel_weight_shards(
                 self.expert_tensor_parallel_size,

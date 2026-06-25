@@ -382,6 +382,44 @@ fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
 
 
+def _backup_capture_grads(runner):
+    """Clone main_grad for everything a graph capture re-accumulates into, so capturing stays
+    side-effect-free on the finalized grads (capture *executes* the recorded main_grad.add_).
+
+    Used by both create_fwd_graph (warmup) and create_bwd_graph; restore with
+    ``_restore_capture_grads``.
+
+    The backward always writes main_grad for the module's own params, so those are backed up
+    unconditionally. Under GTP there is one extra target: the cascade also adds into a param's
+    cross-graph ``next_w``, which lives in another module and so isn't among this module's own
+    params.
+    """
+    backup = {}
+    for p in runner.base_module.parameters():
+        mg = getattr(p, "main_grad", None)
+        if mg is not None:
+            backup[id(p)] = (p, mg.clone())
+
+    if runner.gtp_remat:
+        # GTP only: also protect the cross-graph next_w the cascade accumulates into.
+        for p in runner.base_module.parameters():
+            nw = getattr(p, "next_w", None) if getattr(p, "is_gtp", False) else None
+            if nw is None:
+                continue
+            shards = nw.weight_list if getattr(nw, "is_routed_expert", False) else [nw]
+            for w in shards or []:
+                mg = getattr(w, "main_grad", None)
+                if mg is not None and id(w) not in backup:
+                    backup[id(w)] = (w, mg.clone())
+    return backup
+
+
+def _restore_capture_grads(backup):
+    """Restore the main_grad snapshots taken by ``_backup_capture_grads``."""
+    for p, saved in backup.values():
+        p.main_grad.copy_(saved)
+
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -456,7 +494,9 @@ class _CudagraphGlobalRecord:
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
 
-        if any(r[0].gtp_remat for r in cls.cudagraph_record):
+        gtp_active = any(r[0].gtp_remat for r in cls.cudagraph_record)
+        if gtp_active:
+            # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
             GTP_CONFIG.check_param_states = False
 
         gc.collect()
@@ -1025,9 +1065,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for buf in self.base_module.buffers():
                 buffer_backup.append(buf.clone())
 
-            grad_backup = []
-            for param in self.base_module.parameters():
-                grad_backup.append(param.main_grad.clone() if hasattr(param, "main_grad") else None)
+            grad_backup = _backup_capture_grads(self)
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -1132,7 +1170,6 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
-
             for _ in range(self.num_warmup_steps):
                 with self.get_quantization_context():
 
@@ -1189,7 +1226,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     )
 
                     if self.gtp_remat:
-                        wait_async_comms(GTPChain.GRAPHED.value)
+                        # Forward only issues AG prefetches (no wgrad RS), so drain AG and skip RS.
+                        wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
 
                     if self.fwd_side_streams:
                         self._wait_side_streams(self.fwd_side_streams)
@@ -1243,9 +1281,7 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
-            for main_grad_copy, param in zip(grad_backup, self.base_module.parameters()):
-                if main_grad_copy is not None:
-                    param.main_grad.copy_(main_grad_copy)
+            _restore_capture_grads(grad_backup)
 
             # restore cached buffers
             for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
@@ -1301,6 +1337,11 @@ class _CudaGraphRunner(torch.nn.Module):
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
+
+        # GTP's wgrad add runs inside the bwd graph, so capturing it executes a main_grad.add_
+        # that would clobber the finalized grads; snapshot what it touches and restore below.
+        # (Non-GTP returns wgrads as graph outputs and accumulates outside, so nothing to guard.)
+        grad_backup = _backup_capture_grads(self) if self.gtp_remat else {}
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
 
@@ -1364,6 +1405,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # Unfreeze GC.
         if FREEZE_GC:
             gc.unfreeze()
+
+        # restore cached grads
+        _restore_capture_grads(grad_backup)
 
         # See _compute_finalized_during_bwd_capture for what's in this set and why.
         self.finalized_during_bwd_capture = (
