@@ -1231,11 +1231,15 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
+        # RL inference doesn't support CP; when training uses CP>1, always build a
+        # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
+        force_cp1_inference_model = args.context_parallel_size > 1
         if (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
+            or force_cp1_inference_model
         ):
             from megatron.core.inference.shards import build_inference_pg_collection
 
@@ -1243,6 +1247,7 @@ def pretrain(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
                 f"PP={args.rl_inference_pipeline_model_parallel_size}, "
+                f"CP={1 if force_cp1_inference_model else None}, "
                 f"EP={args.rl_inference_expert_model_parallel_size}, "
                 f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
             )
@@ -1250,6 +1255,7 @@ def pretrain(
                 args.world_size,
                 tp_size=args.rl_inference_tensor_model_parallel_size,
                 pp_size=args.rl_inference_pipeline_model_parallel_size,
+                cp_size=1 if force_cp1_inference_model else None,
                 ep_size=args.rl_inference_expert_model_parallel_size,
                 expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
@@ -1263,6 +1269,8 @@ def pretrain(
                 inference_config.pipeline_model_parallel_size = (
                     args.rl_inference_pipeline_model_parallel_size
                 )
+            if force_cp1_inference_model:
+                inference_config.context_parallel_size = 1
             if args.rl_inference_expert_model_parallel_size is not None:
                 inference_config.expert_model_parallel_size = (
                     args.rl_inference_expert_model_parallel_size
