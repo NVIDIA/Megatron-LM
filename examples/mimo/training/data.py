@@ -28,6 +28,12 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="mock",
         help="Which MIMO dataset backend to build (mock only for now).",
     )
+    group.add_argument(
+        "--image-token-id",
+        type=int,
+        default=511,
+        help="Token id marking image positions in the input sequence.",
+    )
     return parser
 
 

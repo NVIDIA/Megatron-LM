@@ -10,8 +10,6 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 GPUS_PER_NODE=8
 TRAIN_ITERS=${TRAIN_ITERS:-1}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
-NUM_IMAGE_TILES=${NUM_IMAGE_TILES:-12}
-TRAINING_STAGE=${TRAINING_STAGE:-stage2}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 LLM_DP=2
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))}
@@ -29,21 +27,11 @@ else
   TOKENIZER_ARGS+=(--image-token-id "${IMAGE_TOKEN_ID}")
 fi
 
-case "${TRAINING_STAGE}" in
-  stage1|stage2|stage3)
-    ;;
-  *)
-    echo "ERROR: Unknown TRAINING_STAGE='${TRAINING_STAGE}'. Use stage1, stage2, or stage3." >&2
-    exit 1
-    ;;
-esac
-
 "${PYTHON_BIN}" -m torch.distributed.run \
   --standalone \
   --nproc-per-node "${GPUS_PER_NODE}" \
   examples/mimo/pretrain_mimo.py \
   --model-provider nemotron-moe-vlm \
-  --training-stage "${TRAINING_STAGE}" \
   --num-layers 20 \
   --hybrid-layer-pattern "MEMEM*EMEMEM*EMEMEM*" \
   --hidden-size 2688 \
@@ -85,7 +73,6 @@ esac
   --max-position-embeddings 8192 \
   --bf16 \
   --encoder-tp 2 \
-  --encoder-pp 1 \
   --encoder-dp 2 \
   --llm-offset 4 \
   --llm-tp 2 \
@@ -93,12 +80,8 @@ esac
   --llm-dp "${LLM_DP}" \
   --llm-ep 4 \
   --llm-expt-tp 1 \
-  --llm-expt-dp 1 \
   --vocab-size 131072 \
-  --num-image-tiles "${NUM_IMAGE_TILES}" \
   "${TOKENIZER_ARGS[@]}" \
-  --tokenizer-prompt-format nemotron6-moe \
-  --image-token "<image>" \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
   --lr 2e-4 \
