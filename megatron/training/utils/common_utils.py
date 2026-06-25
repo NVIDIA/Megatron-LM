@@ -5,18 +5,17 @@ import json
 import os
 import sys
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from collections import defaultdict
 from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-
 from megatron.core._slurm_utils import resolve_slurm_local_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import open_file
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -36,17 +35,17 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
+    get_pg_rank,
     to_local_if_dtensor,
     unwrap_model,
 )
-
-from megatron.core.transformer.module import param_is_not_shared
+from megatron.training import get_adlr_autoresume, get_args, get_timers
 
 
 
@@ -305,8 +304,12 @@ def logical_and_across_model_parallel_group(
     return bool(input.item())
 
 
-def report_memory(name):
-    """Simple GPU memory report."""
+def report_memory(name, process_group=None):
+    """Simple GPU memory report.
+
+    process_group: optional data-parallel group to gate the rank-0 print on; None falls back
+        to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
+    """
     args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
@@ -316,7 +319,12 @@ def report_memory(name):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    if mpu.get_data_parallel_rank() == 0:
+    is_dp_rank_0 = (
+        get_pg_rank(process_group) == 0
+        if process_group is not None
+        else mpu.get_data_parallel_rank() == 0
+    )
+    if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
