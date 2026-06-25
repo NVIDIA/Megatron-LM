@@ -351,6 +351,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
+        self._prefill_tokens_computed = 0
+        self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -2056,8 +2058,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
+            self._prefill_tokens_computed += self.context.prefix_cache_prefill_computed_tokens
+            self._prefill_tokens_skipped += self.context.prefix_cache_prefill_skipped_tokens
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
+            self.context.prefix_cache_prefill_computed_tokens = 0
+            self.context.prefix_cache_prefill_skipped_tokens = 0
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -2185,6 +2191,36 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            if self.context.enable_prefix_caching:
+                # Prefill compute actually saved by prefix caching (cumulative).
+                # computed = prompt tokens run through the model; skipped = prompt
+                # tokens whose prefill was reused from cache. If skipped% stays high
+                # while per-step latency grows, the growth is attention over the
+                # growing KV context, NOT re-prefilling skipped tokens.
+                _computed = self._prefill_tokens_computed
+                _skipped = self._prefill_tokens_skipped
+                _total = _computed + _skipped
+                output_str += " ... prefill (cumul): computed %d, skipped %d (%.1f%% skipped)" % (
+                    _computed,
+                    _skipped,
+                    (100.0 * _skipped / _total) if _total > 0 else 0.0,
+                )
+                # Current cache occupancy (utilization). A Mamba durable-slot count
+                # near its max indicates the cache is saturating and will start
+                # LRU-evicting cached prefixes (hybrid models can only skip prefill
+                # where Mamba state is still cached).
+                kv_alloc = self.context.kv_block_allocator
+                output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
+                    len(kv_alloc.kv_hash_to_block_id),
+                    kv_alloc.total_count,
+                    int(kv_alloc.get_evictable_block_count()),
+                )
+                msa = self.context.mamba_slot_allocator
+                if msa is not None:
+                    output_str += ", mamba %d/%d durable slots" % (
+                        msa.max_slots - msa.free_count,
+                        msa.max_slots,
+                    )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
