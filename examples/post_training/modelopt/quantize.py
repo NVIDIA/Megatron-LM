@@ -24,7 +24,7 @@ import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
-from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from modelopt.torch.utils.dataset_utils import get_dataloader_from_dataset, get_dataset_dataloader
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
 # modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to the
@@ -32,6 +32,7 @@ from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 # releases.
 try:
     from modelopt.torch.utils.plugins.megatron_calibration import (
+        get_megatron_calibration_dataloader,
         get_megatron_calibration_forward_loop,
     )
 
@@ -54,7 +55,9 @@ except ImportError:
 
 from utils import get_hf_tokenizer
 
+from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -69,18 +72,16 @@ from model_provider import model_provider
 warnings.filterwarnings("ignore")
 
 
-def _load_local_get_hf_tokenizer():
-    """Load this directory's utils.py without relying on ambiguous sys.path lookup."""
-    utils_path = os.path.join(_SCRIPT_DIR, "utils.py")
-    spec = importlib.util.spec_from_file_location("_modelopt_ptq_local_utils", utils_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load local utils module from {utils_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.get_hf_tokenizer
+class _TensorDictDataset(torch.utils.data.Dataset):
+    def __init__(self, tensors):
+        self.tensors = tensors
 
+    def __getitem__(self, idx):
+        return {key: tensor[idx] for key, tensor in self.tensors.items()}
 
-get_hf_tokenizer = _load_local_get_hf_tokenizer()
+    def __len__(self):
+        return len(next(iter(self.tensors.values())))
+
 
 QUANT_CFG_CHOICES = {}
 
@@ -102,28 +103,6 @@ if mtq_psx is not None:
 
 if mtq_luts is not None:
     QUANT_CFG_CHOICES.update({k: getattr(mtq_luts, k) for k in mtq_luts.choices})
-
-
-class _TensorDictDataset(torch.utils.data.Dataset):
-    def __init__(self, tensors):
-        self.tensors = tensors
-
-    def __getitem__(self, idx):
-        return {key: tensor[idx] for key, tensor in self.tensors.items()}
-
-    def __len__(self):
-        return len(next(iter(self.tensors.values())))
-
-
-def _get_data_parallel_rank_and_world_size():
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 0, 1
-    return parallel_state.get_data_parallel_rank(), parallel_state.get_data_parallel_world_size()
-
-
-def _get_data_parallel_sampler_kwargs():
-    dp_rank, dp_world_size = _get_data_parallel_rank_and_world_size()
-    return dp_world_size, {"num_replicas": dp_world_size, "rank": dp_rank}
 
 
 def add_text_generate_ptq_args(parser):
@@ -372,9 +351,12 @@ def get_calib_dataloader(
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
-    dp_world_size, sampler_kwargs = _get_data_parallel_sampler_kwargs()
-    distributed = dp_world_size > 1
-
+    dp_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    distributed = dp_size > 1
+    sampler_kwargs = {
+        "num_replicas": dp_size,
+        "rank": parallel_state.get_data_parallel_rank() if torch.distributed.is_initialized() else 0,
+    }
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
@@ -448,12 +430,6 @@ def get_calib_dataloader(
             pad_to_max_length=pad_to_max_length,
             warn_on_right_padding=False,
         )
-
-
-def _prepare_calib_tokenizer(tokenizer):
-    if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
 
 
 def _get_calib_dataloader_from_args(tokenizer):
@@ -564,11 +540,19 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     """
     args = get_args()
 
-    _prepare_calib_tokenizer(tokenizer)
-    calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
+    if _HAS_SHARED_CALIB:
+        calib_dataloader = get_megatron_calibration_dataloader(
+            tokenizer,
+            dataset_name=args.calib_dataset_path_or_name,
+            num_samples=args.calib_size,
+            seq_length=args.calib_max_sequence_length,
+            batch_size=args.calib_batch_size,
+        )
+    else:
+        calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
 
     use_gradient = args.auto_quantize_method == "gradient"
-    pad_token_id = tokenizer.pad_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     def forward_step(model, batch):
         return _run_calib_step(model, batch, pad_token_id, forward_only=True)[0]
@@ -589,7 +573,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         if "parent_class" not in entry
     ]
 
-    _, dp_world_size = _get_data_parallel_rank_and_world_size()
+    dp_world_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
     num_calib_steps = len(calib_dataloader)
     score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
     num_score_steps = min(
@@ -728,18 +712,14 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
-        _prepare_calib_tokenizer(tokenizer)
-
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
+        elif hasattr(unwrapped_model, "calibration_mode"):
+            unwrapped_model.calibration_mode = True
+            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
+            unwrapped_model.calibration_mode = False
         else:
-            calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
-
-            def forward_loop(model):
-                for sample in tqdm(calib_dataloader, disable=torch.distributed.get_rank()):
-                    _calib_forward_step(iter([sample]), model, tokenizer.pad_token_id, with_labels=False)
-
-            mtq.quantize(unwrapped_model, mtq_config, forward_loop)
+            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
 
         if args.compress:
             mtq.compress(unwrapped_model)
