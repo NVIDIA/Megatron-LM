@@ -239,10 +239,11 @@ class _GranularityConfig:
         assert not (
             request.submission_granularity == "B" and request.consumption_granularity == "G"
         ), "Batch submission with group consumption is not supported."
-        if request.num_groups > 1 and request.submission_granularity == "B":
-            assert not request.filter_groups_with_same_reward, (
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
-            )
+        assert not request.filter_groups_with_same_reward, (
+            "filter_groups_with_same_reward is not currently supported: dropped groups "
+            "are not regenerated, so non-streaming callers receive fewer groups than "
+            "requested and batch-order consumers stall on incomplete batches."
+        )
 
 
 class _SubmissionGate:

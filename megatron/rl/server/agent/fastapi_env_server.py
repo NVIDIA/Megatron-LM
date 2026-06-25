@@ -125,6 +125,12 @@ class FastAPIEnvServer(EnvironmentServer):
             "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
         )
 
+    async def _agenerate(self, request, inference_request):
+        raise NotImplementedError(
+            "FastAPIEnvServer overrides get_grouped_rollouts/get_reward_rollouts/run_evaluation; "
+            "_agenerate is not used."
+        )
+
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest
     ) -> AsyncGenerator[list[TokenRollout], None]:

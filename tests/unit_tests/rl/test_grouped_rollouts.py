@@ -98,6 +98,31 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        "num_groups, submission_granularity, consumption_granularity",
+        [
+            pytest.param(1, "B", "B", id="num_groups_1_batch"),
+            pytest.param(4, "G", "G", id="num_groups_gt_1_group"),
+            pytest.param(4, "R", "B", id="num_groups_gt_1_rollout"),
+        ],
+    )
+    async def test_filter_groups_with_same_reward_rejected(
+        self, num_groups, submission_granularity, consumption_granularity
+    ):
+        gen = MockGenerator(parallel_generation_tasks=8)
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            filter_groups_with_same_reward=True,
+            submission_granularity=submission_granularity,
+            consumption_granularity=consumption_granularity,
+        )
+        with pytest.raises(AssertionError, match="filter_groups_with_same_reward"):
+            async for _ in gen.get_grouped_rollouts(request):
+                pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         (
             "num_slow_calls, streaming, num_groups, submission_granularity, "
             "consumption_granularity, expected_count, expected_batch_ids, "
