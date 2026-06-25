@@ -772,6 +772,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
+
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:
@@ -871,7 +872,26 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             wandb_finalize_fn()
 
     if args.async_save:
+        # Schedule logits flush AFTER the checkpoint request so the persistent
+        # worker processes checkpoint preload first (unblocking the main
+        # thread), then writes logits in the background.  Finalize_fns are
+        # moved from the checkpoint request to the logits request so that
+        # "success" callbacks only fire after both writes are confirmed.
+        from megatron.training.distillation import get_logits_saver
+
+        logits_saver = get_logits_saver()
+        if logits_saver is not None:
+            async_request_cls = get_async_strategy(args.async_strategy)[1]["AsyncRequest"]
+            async_logits_request = async_request_cls(
+                async_fn=logits_saver._write_batched_tar,
+                async_fn_args=logits_saver.take_pending_data(),
+                finalize_fns=async_save_request.finalize_fns.copy(),
+            )
+            async_save_request.finalize_fns.clear()
+
         schedule_async_save(async_save_request)
+        if logits_saver is not None:
+            schedule_async_save(async_logits_request)
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
@@ -888,11 +908,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
                                   cpu_priority=None, io_priority=None):
     """Module-level function for async checkpoint deletion.
-    
+
     This function can be pickled and executed by the async worker process.
     Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
     since torch.distributed won't be initialized in the async worker process.
-    
+
     Args:
         save_path (str): Path to the checkpoints directory
         iteration_to_delete (int): Iteration number of checkpoint to delete
@@ -1854,6 +1874,28 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
+    if getattr(args, 'override_ckpt_iteration', None) is not None:
+        target_iter = args.override_ckpt_iteration
+        state_dict['iteration'] = target_iter
+        if 'args' in state_dict:
+            checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            if (
+                checkpoint_global_batch_size is not None
+                and checkpoint_global_batch_size != args.global_batch_size
+            ):
+                raise RuntimeError(
+                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
+                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
+                    f'({checkpoint_global_batch_size}) != current global_batch_size '
+                    f'({args.global_batch_size}). This would replay the data loader from the '
+                    'wrong sample offset.'
+                )
+            state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
+            state_dict['args'].skipped_train_samples = 0
+        print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
+                     f'(consumed_train_samples = {target_iter * args.global_batch_size})')
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))

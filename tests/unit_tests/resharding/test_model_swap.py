@@ -645,7 +645,7 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
         Utils.destroy_model_parallel()
         pytest.skip("Transformer Engine not available")
 
-    from megatron.rl.parallel_utils import build_inference_pg_collection
+    from megatron.core.inference.shards import build_inference_pg_collection
 
     rank = dist.get_rank()
     is_src = rank < src_world

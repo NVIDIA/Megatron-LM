@@ -126,6 +126,7 @@ class _StubEngine(DynamicInferenceEngine):
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
@@ -688,17 +689,13 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx6.add_request(self._req(ctx6, p6.clone()))
         msa6 = ctx6.mamba_slot_allocator
         self._mamba_allocate_and_register(ctx6, self._block_ids(ctx6, 0, 4)[:2])
-        engine6 = _StubEngine(ctx6)
-        assert engine6._find_mamba_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
+        req6 = self._req(ctx6, p6.clone(), request_id=2)
+        assert ctx6._find_mamba_match_count(req6, 0, len(req6.precomputed_block_hashes)) == 2
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
-        assert (
-            _StubEngine(ctx7)._find_mamba_match_count(
-                self._req(ctx7, self._prompt(bs * 3), request_id=2)
-            )
-            == 0
-        )
+        req7 = self._req(ctx7, self._prompt(bs * 3), request_id=2)
+        assert ctx7._find_mamba_match_count(req7, 0, len(req7.precomputed_block_hashes)) == 0
 
         # allocate, free, re-allocate
         ctx8 = self._mctx()
@@ -717,6 +714,34 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             ctx8.mamba_slot_allocator.free_count == initial_free - 3
             and ctx8.mamba_slot_allocator.has_state(bids8[0])
         )
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_without_mamba_budget_warns(self, caplog):
+        # Memory-only mode: prefix caching on a hybrid model without a Mamba cache
+        # budget is allowed (KV prefixes deduplicated for memory savings) but must
+        # warn that Mamba state caching and prefill skipping are disabled, and must
+        # not allocate a slot allocator.
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING):
+            ctx = self._ctx(
+                mamba_config=self._mamba_config(),
+                enable_prefix_caching=True,
+                prefix_caching_mamba_gb=None,
+            )
+        assert ctx.is_hybrid_model
+        assert ctx.mamba_slot_allocator is None
+        assert "memory-only" in caplog.text
+
+    @pytest.mark.internal
+    def test_mamba_cache_budget_too_small_raises(self):
+        # The CUDA-graph extraction scratch (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
+        # max_requests slots) is reserved from prefix_caching_mamba_gb before the
+        # durable cache is sized. A budget too small to fit the scratch plus at
+        # least one durable slot is a hard configuration error, not a silent
+        # over-allocation (which previously could OOM at startup).
+        with pytest.raises(ValueError, match="prefix cache budget"):
+            self._mctx(prefix_caching_mamba_gb=1e-5)
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
@@ -1021,8 +1046,11 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert mixed_slots[0] == pre_slot
         assert msa3.free_count == free_before3 - 2  # only 2 new
 
-        # Eviction: exhaust free pool, verify eviction fires and returns valid slots
-        ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
+        # Eviction: exhaust free pool, verify eviction fires and returns valid slots.
+        # Budget must cover the CUDA-graph extraction scratch (3 * max_requests
+        # slots) plus the durable cache; a budget too small to fit the scratch now
+        # raises (see test_mamba_cache_budget_too_small_raises).
+        ctx4 = self._mctx(prefix_caching_mamba_gb=0.01)
         msa4 = ctx4.mamba_slot_allocator
         total_slots = msa4.max_slots
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))

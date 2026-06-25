@@ -2299,30 +2299,28 @@ def get_batch_on_this_tp_rank(
 ########################
 
 
-def get_sft_batch_on_this_cp_rank(
+def _get_batch_on_this_cp_rank_per_document_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
-    """Partition an SFT packed-sequence batch across context-parallel ranks using THD indexing.
+    """Partition a batch across CP ranks with per-document zigzag load balancing.
 
-    For SFT workloads the batch contains multiple variable-length sub-sequences
-    packed contiguously (THD format). This function uses Transformer Engine's
-    ``thd_get_partitioned_indices`` to compute the token indices assigned to the
-    current CP rank and gathers only those tokens from every sequence-dimension
-    tensor in the batch.
-
-    Metadata keys ('attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-    'max_seqlen', 'local_cp_size', 'hybrid_cp_group') are left unchanged
-    because TE's attention kernels consume them directly.
+    Applies zigzag load-balanced chunking independently within each
+    sub-sequence (document) using Transformer Engine's
+    ``thd_get_partitioned_indices``. Each document length must be
+    divisible by ``2 * cp_size``. Sequence-dimension tensors (tokens,
+    labels, loss_mask, position_ids) are index-selected to this CP
+    rank's partition; metadata keys (cu_seqlens, cu_seqlens_padded,
+    max_seqlen, etc.) are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
             ``[micro_batch_size, seq_length, ...]``.
-        cp_group (torch.distributed.ProcessGroup): The context-parallel process
-            group.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
-        index-selected to this CP rank's partition.
+        partitioned to this CP rank.
     """
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
@@ -2351,31 +2349,31 @@ def get_sft_batch_on_this_cp_rank(
     return batch
 
 
-def get_pretrain_batch_on_this_cp_rank(
+def _get_batch_on_this_cp_rank_per_sequence_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
-    """Partition a pretraining batch across context-parallel ranks with load-balanced chunking.
+    """Partition a batch across CP ranks with per-sequence zigzag load balancing.
 
-    With causal masking, each token only attends to its prior tokens. Simply splitting
-    the sequence into CP chunks can result in severe load imbalance, as chunks at the
-    end of the sequence have bigger workloads than earlier ones. To address this, the
-    sequence is split into ``2 * cp_size`` chunks and assigned in a zigzag pattern:
-    for CP=2 the 4 chunks are assigned as (chunk_0, chunk_3) -> GPU 0 and
-    (chunk_1, chunk_2) -> GPU 1, balancing the workload across the CP group.
-
-    All tensor-valued entries in the batch are partitioned along their sequence
-    dimension (``seq_dim=1`` by default, ``seq_dim=2`` for 'attention_mask').
-    None-valued entries are left unchanged.
+    Applies zigzag load-balanced chunking across the entire sequence. The
+    sequence is split into ``2 * cp_size`` equal chunks and assigned in a
+    zigzag pattern: for CP=2, the 4 chunks are assigned as
+    (chunk_0, chunk_3) -> GPU 0 and (chunk_1, chunk_2) -> GPU 1, balancing
+    compute for causal attention where later tokens attend to more
+    predecessors. The sequence length must be divisible by
+    ``2 * cp_size``. All tensor-valued entries in the batch are
+    partitioned along their sequence dimension; metadata keys
+    (cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) and None-valued
+    entries are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
             ``[micro_batch_size, seq_length, ...]``.
-        cp_group (torch.distributed.ProcessGroup): The context-parallel process
-            group.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
-        sliced to this CP rank's zigzag partition.
+        partitioned to this CP rank.
     """
 
     cp_size = torch.distributed.get_world_size(cp_group)
@@ -2422,15 +2420,14 @@ def get_batch_on_this_cp_rank(
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
-      - **SFT (packed sequences)**: When ``cu_seqlens`` is present and
-        ``is_hybrid_cp`` is False, delegates to ``get_sft_batch_on_this_cp_rank``
-        which uses THD index-based partitioning.
+      - **Per-document zigzag**: When ``cu_seqlens`` is present and
+        ``is_hybrid_cp`` is False, delegates to
+        ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
-        and delegates to ``get_pretrain_batch_on_this_cp_rank`` with that group.
-      - **Pretraining**: When ``cu_seqlens`` is None, delegates to
-        ``get_pretrain_batch_on_this_cp_rank`` with zigzag load-balanced
-        chunking.
+        and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2454,12 +2451,14 @@ def get_batch_on_this_cp_rank(
             ), "local_cp_size is required for hybrid context parallel"
             if batch['local_cp_size'].item() > 1:
                 hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+                batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+                    batch, cp_group=hybrid_cp_group
+                )
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
-            batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
+            batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     else:  # NOTE(asolergi-nv): Pretrain case
-        batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
+        batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     return batch
 
 
