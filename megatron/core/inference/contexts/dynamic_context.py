@@ -281,7 +281,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
-        self.deferred_resolution_compaction_step_count = 0
+        self.async_sched_compaction_step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -2504,7 +2504,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.lifetime_prefill_token_count = 0
-        self.deferred_resolution_compaction_step_count = 0
+        self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -3360,10 +3360,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     def prepare_requests(self, new_tokens: Tensor) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
-        Deferred request resolution only supports decode-only steps with no pause,
+        Async scheduling only supports decode-only steps with no pause,
         evict, or resume lifecycle changes. If preparing the next token would
         require one of those lifecycle changes, this method raises and the caller
-        should treat the deferred mode as unsupported for that workload.
+        should treat async scheduling as unsupported for that workload.
 
         Args:
             new_tokens (Tensor): Newly sampled token for each active request.
@@ -3373,11 +3373,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         active_request_count = self.total_request_count - self.paused_request_count
         if self.num_speculative_tokens != 0:
-            raise RuntimeError("Deferred request resolution does not support speculative tokens.")
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.num_prefill_requests != 0:
-            raise RuntimeError("Deferred request resolution only supports decode-only steps.")
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
-            raise RuntimeError("Deferred request resolution does not support paused requests.")
+            raise RuntimeError("Async scheduling does not support paused requests.")
         if new_tokens.numel() != active_request_count:
             raise RuntimeError(
                 f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
@@ -3396,13 +3396,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_block_count_avail = self.kv_block_allocator.get_active_avail()
             if num_new_blocks > active_block_count_avail:
                 raise RuntimeError(
-                    "Deferred request resolution cannot pause requests to allocate new blocks."
+                    "Async scheduling cannot pause requests to allocate new blocks."
                 )
 
             block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
             if block_ids is None:
                 raise RuntimeError(
-                    "Deferred request resolution cannot evict requests to allocate new blocks."
+                    "Async scheduling cannot evict requests to allocate new blocks."
                 )
 
             row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
@@ -3433,11 +3433,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
 
     def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
-        """Resolve finished requests after a deferred speculative forward pass.
+        """Resolve finished requests after an async scheduling forward pass.
 
-        Deferred mode supports only request completion. The active request rows
+        Async scheduling supports only request completion. The active request rows
         and current decode-token rows are compacted in survivor order so any
-        following legacy or deferred step sees a consistent context.
+        following legacy or async scheduling step sees a consistent context.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
@@ -3449,11 +3449,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask = active_requests_mask.cpu()
 
         if self.num_speculative_tokens != 0:
-            raise RuntimeError("Deferred request resolution does not support speculative tokens.")
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.num_prefill_requests != 0:
-            raise RuntimeError("Deferred request resolution only supports decode-only steps.")
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
-            raise RuntimeError("Deferred request resolution does not support paused requests.")
+            raise RuntimeError("Async scheduling does not support paused requests.")
 
         old_active_request_count = self.total_request_count
         if active_requests_mask.numel() != old_active_request_count:

@@ -115,8 +115,8 @@ def _capture_engine_stats(llm) -> dict:
     return {
         "step_count": llm.engine.context.step_count,
         "lifetime_prefill_token_count": llm.engine.context.lifetime_prefill_token_count,
-        "deferred_resolution_compaction_step_count": (
-            llm.engine.context.deferred_resolution_compaction_step_count
+        "async_sched_compaction_step_count": (
+            llm.engine.context.async_sched_compaction_step_count
         ),
         "capture_stats": llm.engine.capture_stats,
     }
@@ -143,7 +143,7 @@ def _report_results(
         peak_mem_stats,
         captured["step_count"],
         captured["lifetime_prefill_token_count"],
-        captured["deferred_resolution_compaction_step_count"],
+        captured["async_sched_compaction_step_count"],
     )
 
     stats = torch.cuda.memory_stats()
@@ -173,7 +173,7 @@ def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, 
     captured = {
         "step_count": 0,
         "lifetime_prefill_token_count": 0,
-        "deferred_resolution_compaction_step_count": 0,
+        "async_sched_compaction_step_count": 0,
         "capture_stats": None,
     }
     setup_prefix = ""
@@ -222,7 +222,7 @@ async def _run_async(
     captured = {
         "step_count": 0,
         "lifetime_prefill_token_count": 0,
-        "deferred_resolution_compaction_step_count": 0,
+        "async_sched_compaction_step_count": 0,
         "capture_stats": None,
     }
     setup_prefix = ""

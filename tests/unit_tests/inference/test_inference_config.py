@@ -2,7 +2,7 @@
 
 import dataclasses
 
-from megatron.core.inference.config import InferenceConfig, RequestResolutionMode
+from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -16,10 +16,9 @@ class TestInferenceConfig:
         transformer_config_fields = set(dataclasses.fields(TransformerConfig))
         assert len(dynamic_inference_config_fields.intersection(transformer_config_fields)) == 0
 
-    def test_request_resolution_mode_default_and_string_coercion(self):
-        """Ensure request resolution mode defaults to legacy and accepts strings."""
-        assert InferenceConfig().request_resolution_mode == RequestResolutionMode.LEGACY
+    def test_async_sched_mode_default_and_string_coercion(self):
+        """Ensure async scheduling mode defaults to legacy and accepts strings."""
+        assert InferenceConfig().async_sched_mode == AsyncScheduleMode.LEGACY
         assert (
-            InferenceConfig(request_resolution_mode="defer").request_resolution_mode
-            == RequestResolutionMode.DEFER
+            InferenceConfig(async_sched_mode="serial").async_sched_mode == AsyncScheduleMode.SERIAL
         )

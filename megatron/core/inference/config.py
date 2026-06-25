@@ -133,13 +133,13 @@ class CudaGraphSizingDistribution(str, Enum):
     LINEAR = "linear"
 
 
-class RequestResolutionMode(str, Enum):
-    """Request lifecycle resolution mode for dynamic inference."""
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
 
     LEGACY = "legacy"
     """Resolve requests before preparing the next forward pass."""
 
-    DEFER = "defer"
+    SERIAL = "serial"
     """Prepare and forward speculatively before resolving the sampled requests."""
 
 
@@ -354,8 +354,8 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
-    request_resolution_mode: RequestResolutionMode = RequestResolutionMode.LEGACY
-    """Mode used to resolve dynamic batching request lifecycle changes."""
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""
@@ -397,7 +397,7 @@ class InferenceConfig:
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
-        self.request_resolution_mode = RequestResolutionMode(self.request_resolution_mode)
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "

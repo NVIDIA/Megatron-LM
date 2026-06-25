@@ -20,7 +20,7 @@ from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.config import RequestResolutionMode
+from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -259,32 +259,32 @@ class TextGenerationController:
             [1, max_requests], dtype=torch.int64, device=device
         )
 
-    def _validate_deferred_resolution_support_for_step(self) -> None:
-        """Validate controller/context state for deferred request resolution.
+    def _validate_async_sched_support_for_step(self) -> None:
+        """Validate controller/context state for async scheduling.
 
-        Raises if the current step does not support deferred request resolution.
+        Raises if the current step does not support async scheduling.
         """
         context = self.inference_wrapped_model.inference_context
         if not context.config.materialize_only_last_token_logits:
             raise RuntimeError(
-                "Deferred request resolution requires materialize_only_last_token_logits=True."
+                "Async scheduling requires materialize_only_last_token_logits=True."
             )
         if self.num_speculative_tokens != 0:
-            raise RuntimeError("Deferred request resolution does not support speculative tokens.")
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if context.is_hybrid_model:
-            raise RuntimeError("Deferred request resolution does not support hybrid/Mamba models.")
+            raise RuntimeError("Async scheduling does not support hybrid/Mamba models.")
         if context.enable_prefix_caching:
-            raise RuntimeError("Deferred request resolution does not support prefix caching.")
+            raise RuntimeError("Async scheduling does not support prefix caching.")
         if context.paused_request_count != 0:
-            raise RuntimeError("Deferred request resolution does not support paused requests.")
+            raise RuntimeError("Async scheduling does not support paused requests.")
         if context.chunked_prefill_request_id != -1:
-            raise RuntimeError("Deferred request resolution does not support chunked prefill.")
+            raise RuntimeError("Async scheduling does not support chunked prefill.")
         if self.model_config.expert_model_parallel_size > 1:
-            raise RuntimeError("Deferred request resolution does not support expert parallelism.")
+            raise RuntimeError("Async scheduling does not support expert parallelism.")
         if self.model_config.num_moe_experts is not None:
-            raise RuntimeError("Deferred request resolution does not support MoE models.")
+            raise RuntimeError("Async scheduling does not support MoE models.")
         if self.model_config.moe_enable_routing_replay:
-            raise RuntimeError("Deferred request resolution does not support routing replay.")
+            raise RuntimeError("Async scheduling does not support routing replay.")
 
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
@@ -292,27 +292,25 @@ class TextGenerationController:
             return
         if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
             raise RuntimeError(
-                "Deferred request resolution only supports greedy sampling "
+                "Async scheduling only supports greedy sampling "
                 "(SamplingParams.top_k == 1)."
             )
         if not torch.all(context.request_metadata["top_p"][active_slice] == 0.0):
             raise RuntimeError(
-                "Deferred request resolution only supports greedy sampling "
+                "Async scheduling only supports greedy sampling "
                 "(SamplingParams.top_p == 0.0)."
             )
         if torch.any(context.request_metadata["return_log_probs"][active_slice]):
-            raise RuntimeError("Deferred request resolution does not support log probabilities.")
+            raise RuntimeError("Async scheduling does not support log probabilities.")
         if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
-            raise RuntimeError(
-                "Deferred request resolution does not support top-n log probabilities."
-            )
+            raise RuntimeError("Async scheduling does not support top-n log probabilities.")
 
-    def _compact_deferred_resolution_logits(self, survivor_idxs: Tensor) -> None:
+    def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
         """Compact cached logits from old active-row order into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
-                active after deferred request resolution.
+                active after async scheduling.
         """
         if survivor_idxs.numel() == 0:
             self._decode_forward_primer.clear()
@@ -763,8 +761,8 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-    def _run_deferred_resolution_prepare(self, new_sample_copy: Tensor) -> Tuple[Tensor, Tensor]:
-        """Prepare deferred decode requests and GPU-visible forward state.
+    def _run_async_sched_prepare(self, new_sample_copy: Tensor) -> Tuple[Tensor, Tensor]:
+        """Prepare decode requests and GPU-visible forward state for async scheduling.
 
         Args:
             new_sample_copy (Tensor): CPU copy of sampled tokens for active requests.
@@ -776,10 +774,8 @@ class TextGenerationController:
         context.prepare_requests(new_sample_copy)
         return self._dynamic_step_context_init()
 
-    def _run_deferred_resolution_forward(
-        self, input_ids: Tensor, position_ids: Tensor
-    ) -> Optional[int]:
-        """Run one dynamic forward pass and cache logits for deferred resolution.
+    def _run_async_sched_forward(self, input_ids: Tensor, position_ids: Tensor) -> Optional[int]:
+        """Run one dynamic forward pass and cache logits for async scheduling.
 
         Args:
             input_ids (Tensor): The input token IDs.
@@ -1980,8 +1976,8 @@ class TextGenerationController:
             ret.update(request_bookkeeping)
             return ret
 
-    async def _run_deferred_resolution_step(self) -> Optional[Dict]:
-        """Run one decode-only step using deferred request resolution.
+    async def _run_async_sched_serial_step(self) -> Optional[Dict]:
+        """Run one decode-only step using serial async scheduling.
 
         Returns:
             Optional[Dict]: Step result for sampled and finished requests, or
@@ -1994,12 +1990,12 @@ class TextGenerationController:
             self._decode_forward_primer.clear()
             return None
 
-        self._validate_deferred_resolution_support_for_step()
+        self._validate_async_sched_support_for_step()
 
         with torch.inference_mode():
             if not self._decode_forward_primer.is_primed:
                 input_ids, position_ids = self._dynamic_step_context_init()
-                self._run_deferred_resolution_forward(input_ids, position_ids)
+                self._run_async_sched_forward(input_ids, position_ids)
 
         await asyncio.sleep(0)
 
@@ -2036,11 +2032,11 @@ class TextGenerationController:
             range_pop()
 
             range_push("prepare_requests")
-            input_ids, position_ids = self._run_deferred_resolution_prepare(new_sample_copy)
+            input_ids, position_ids = self._run_async_sched_prepare(new_sample_copy)
             range_pop()
 
-            range_push("deferred_forward_pass")
-            self._run_deferred_resolution_forward(input_ids, position_ids)
+            range_push("async_sched_forward_pass")
+            self._run_async_sched_forward(input_ids, position_ids)
             range_pop()
 
             range_push("resolve_requests")
@@ -2048,9 +2044,9 @@ class TextGenerationController:
             range_pop()
 
             assert torch.equal(finished_request_ids, resolved_finished_request_ids)
-            self._compact_deferred_resolution_logits(survivor_idxs)
+            self._compact_async_sched_logits(survivor_idxs)
             if survivor_idxs.numel() < active_request_count:
-                context.deferred_resolution_compaction_step_count += 1
+                context.async_sched_compaction_step_count += 1
 
             return {
                 "active_request_ids": active_request_ids,
@@ -2079,14 +2075,14 @@ class TextGenerationController:
             `None` when no requests are active.
         """
         context = self.inference_wrapped_model.inference_context
-        mode = context.config.request_resolution_mode
+        mode = context.config.async_sched_mode
 
-        if mode == RequestResolutionMode.LEGACY or context.num_prefill_requests != 0:
+        if mode == AsyncScheduleMode.LEGACY or context.num_prefill_requests != 0:
             return await self._run_legacy_step(skip_bookkeeping)
-        if mode == RequestResolutionMode.DEFER:
-            assert not skip_bookkeeping, "Deferred request resolution requires request bookkeeping."
-            return await self._run_deferred_resolution_step()
-        raise AssertionError(f"Unexpected request resolution mode: {mode}")
+        if mode == AsyncScheduleMode.SERIAL:
+            assert not skip_bookkeeping, "Serial async scheduling requires request bookkeeping."
+            return await self._run_async_sched_serial_step()
+        raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

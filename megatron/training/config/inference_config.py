@@ -136,9 +136,9 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
-    inference_dynamic_batching_request_resolution_mode: Literal["legacy", "defer"] = "legacy"
-    """Request lifecycle resolution mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "defer" speculatively prepares and forwards decode-only
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
+    existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
     greedy GPT steps before resolving finished requests."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
@@ -279,13 +279,13 @@ class InferenceSetupConfig:
             A fully-populated runtime ``InferenceConfig``.
         """
         from megatron.core.inference.config import (
+            AsyncScheduleMode,
             CudaGraphSizingDistribution,
             InferenceConfig,
             KVCacheManagementMode,
             MambaInferenceStateConfig,
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
-            RequestResolutionMode,
         )
         from megatron.core.utils import get_attr_wrapped_model
 
@@ -365,8 +365,8 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
-            request_resolution_mode=RequestResolutionMode(
-                self.inference_dynamic_batching_request_resolution_mode
+            async_sched_mode=AsyncScheduleMode(
+                self.inference_dynamic_batching_async_sched_mode
             ),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )
