@@ -984,16 +984,12 @@ class ChunkOffloadHandler:
 
     def tensor_need_offloading_checker(self, tensor):
         """Check if the tensor needs to be offloaded."""
-        debug_rank(
-            f"tensor_need_offloading_checker {getattr(tensor, 'offloading_activation', None)}"
-        )
+        debug_rank("tensor_need_offloading_checker")
         if not self._can_manage_tensor_for_offload(tensor):
             return False
         if _te_do_not_offload(tensor):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
-            return False
-        if getattr(tensor, "offloading_activation", None) is False:
             return False
         # Respect tensor's offload preference if specified
         if getattr(tensor, "_TE_do_not_offload", False) or getattr(
