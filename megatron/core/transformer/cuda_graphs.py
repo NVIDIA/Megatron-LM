@@ -892,9 +892,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 # NCCL into runner_stream before bwd_completion_event fires.
                 if get_expert_gtp_weight_remat_world_size() > 1:
                     self._register_gtp_side_streams(get_expert_gtp_weight_remat_group())
-                # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
-                # so bwd_completion_event records past NCCL_AG completion.
-                self.bwd_ag_fence_event = torch.cuda.Event()
                 # Records after Phase 2 (RS drain + main_grad.add_) completes
                 # on runner.stream. finalize_model_grads waits on this before
                 # reading main_grad for the DP gradient sync.
@@ -1338,13 +1335,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 gtp_group = get_gtp_weight_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
-                self.bwd_ag_fence_event.record(graphed_ag)
-                torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+                torch.cuda.current_stream().wait_stream(graphed_ag)
                 if get_expert_gtp_weight_remat_world_size() > 1:
                     egtp_group = get_expert_gtp_weight_remat_group()
                     egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
-                    self.bwd_ag_fence_event.record(egtp_graphed_ag)
-                    torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+                    torch.cuda.current_stream().wait_stream(egtp_graphed_ag)
 
                 # Record completion AFTER AG drain + fence but BEFORE RS drain,
                 # so main_stream can trigger the next runner while RS is still
