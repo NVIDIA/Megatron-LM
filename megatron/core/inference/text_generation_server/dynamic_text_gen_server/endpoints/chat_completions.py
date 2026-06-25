@@ -641,6 +641,12 @@ try:
         total_completion_tokens = 0
         prompt_tokens_counts = []
 
+        # The big response fields (prompt/generation token ids) are only useful to
+        # a client that echoes them back next turn for prevent_retokenization
+        # (default True). Gate them on that flag so a request that opts out gets a
+        # lean, vLLM-shaped response. The choice-level copies are dropped entirely
+        # (only the message level is ever read back).
+        prevent_retokenization = req.get("prevent_retokenization", True)
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
@@ -714,9 +720,13 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Replicate data in the message field for compatibility.
-            message["prompt_token_ids"] = result["prompt_tokens"]
-            message["generation_token_ids"] = result["generated_tokens"]
+            # Token ids are needed only to round-trip prevent_retokenization; gate
+            # them so the default response stays small and vLLM-shaped.
+            if prevent_retokenization:
+                message["prompt_token_ids"] = result["prompt_tokens"]
+                message["generation_token_ids"] = result["generated_tokens"]
+            # Small RL/debug scalars (a few bytes each); harmless to keep for
+            # NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             message["policy_epoch"] = result["policy_epoch"]
             message["kv_cache_epoch"] = result["kv_cache_epoch"]
@@ -737,15 +747,13 @@ try:
             else:
                 finish_reason = "stop"
 
+            # Choice-level prompt/generation_token_ids, generation_log_probs and
+            # raw_text were duplicates of message-level data (or reconstructable);
+            # dropped to match vLLM's response shape and cut payload size.
             choice_data = {
                 "index": request_idx,
                 "message": message,
-                "prompt_token_ids": result["prompt_tokens"],
-                "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
@@ -760,7 +768,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
+            if result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
