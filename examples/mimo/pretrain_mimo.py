@@ -10,6 +10,7 @@ data-iterator hooks.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 
@@ -23,7 +24,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     validate_model_provider_args,
 )
 from examples.mimo.training.args import add_hetero_grid_args, validate_hetero_grid_args
-from examples.mimo.training.bootstrap import build_mimo_runtime
+from examples.mimo.training.bootstrap import build_mimo_runtime, mimo_model_provider
 from examples.mimo.training.data import add_data_args
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
 from examples.mimo.training.step import mimo_forward_step
@@ -31,6 +32,7 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.enums import ModelType
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -47,38 +49,26 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 
 def _parse_and_validate() -> argparse.Namespace:
-    """Parse and validate args with the model-provider preset and grid checks."""
+    """Parse/validate args with the model-provider preset and hetero-grid checks."""
     args = parse_args(extra_args_provider)
-
-    # Apply the model-provider preset before validation so preset-derived sizes flow in.
-    prepare_model_provider_args(args)
-
-    validate_args(args, {})  # no dataset path / tokenizer for the mock run
-
+    prepare_model_provider_args(args)  # apply preset before validation
+    validate_args(args, {})
     validate_model_provider_args(args)
-    world_size = int(os.environ.get("WORLD_SIZE", args.world_size))
-    validate_hetero_grid_args(args, world_size)
+    validate_hetero_grid_args(args, int(os.environ.get("WORLD_SIZE", args.world_size)))
 
-    # Data-parallel size follows the language grid.
     args.data_parallel_size = args.llm_dp
-
-    # The preset leaves mtp_num_layers None; FLOPs/throughput accounting needs an int.
     if getattr(args, "mtp_num_layers", None) is None:
         args.mtp_num_layers = 0
-
-    # Mock runs build no tokenizer; derive the padded vocab from the configured vocab.
     if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = args.vocab_size
-
-    # The data iterator is pre-built per rank; the external dataloader passes it through.
-    args.dataloader_type = "external"
-
-    # Train-only: no eval. eval_iters=0 keeps do_valid/do_test off; a positive
-    # eval_interval avoids a divide-by-None in the train/valid/test sample accounting.
-    args.eval_iters = 0
+        # No tokenizer in the mock run; pad the vocab for the language TP shard.
+        tp = args.tensor_model_parallel_size
+        args.tensor_model_parallel_size = args.llm_tp
+        args.padded_vocab_size = vocab_size_with_padding(args.vocab_size, args)
+        args.tensor_model_parallel_size = tp
+    args.dataloader_type = "external"  # per-rank iterator passed through
+    args.eval_iters = 0  # train-only; positive eval_interval avoids None-division below
     if getattr(args, "eval_interval", None) is None:
         args.eval_interval = args.train_iters or 1
-
     return args
 
 
@@ -125,29 +115,19 @@ def _mimo_branch_name(topology) -> str:
     )
 
 
-def _noop_provider(*_args, **_kwargs):
-    """Placeholder for pretrain's model/dataset providers (the hooks replace them)."""
-    return None
+class MimoSetup:
+    """pretrain setup_model_and_optimizer_func: return the eagerly-built per-submodule-DDP
+    MimoModel, build the MimoOptimizer + scheduler, and drive resume load with per-module
+    groups. MIMO bypasses stock get_model/get_megatron_optimizer because disjoint grids need
+    per-submodule DDP and a chained per-grid optimizer that neither stock path provides.
+    """
 
+    def __init__(self, rt, args: argparse.Namespace):
+        self.rt = rt
+        self.args = args
 
-def main() -> None:
-    """Run heterogeneous MIMO training."""
-    args = _parse_and_validate()
-
-    _setup_globals(args)
-    initialize_distributed()
-
-    # Per-rank runtime: per-submodule-DDP MimoModel, topology, comms, data iterator, grad sync.
-    # build_mimo_runtime seeds per-role RNG (host + CUDA) via the stock _set_random_seed.
-    rt = build_mimo_runtime(args)
-    assert rt.model[0].config.finalize_model_grads_func is not None, (
-        "build_mimo_runtime must install a finalize_model_grads_func on the language config"
-    )
-
-    cfg = pretrain_cfg_container_from_args(args, rt.model[0].config)
-
-    def _setup_model_and_optimizer(model_provider, model_type, checkpointing_context=None):
-        # Build the optimizer/scheduler, drive resume load, and set args.iteration.
+    def __call__(self, model_provider, model_type, checkpointing_context=None):
+        rt, args = self.rt, self.args
         optimizer = _build_optimizer(args, rt.model)
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
         # Per-grid rng key namespace on the model (read by stock save/load); torch_dist only.
@@ -169,6 +149,23 @@ def main() -> None:
             args.num_floating_point_operations_so_far = 0
         return rt.model, optimizer, opt_param_scheduler
 
+
+def main() -> None:
+    """Run heterogeneous MIMO training."""
+    args = _parse_and_validate()
+
+    _setup_globals(args)
+    initialize_distributed()
+
+    # Per-rank runtime: per-submodule-DDP MimoModel, topology, comms, data iterator, grad sync.
+    # build_mimo_runtime seeds per-role RNG (host + CUDA) via the stock _set_random_seed.
+    rt = build_mimo_runtime(args)
+    assert rt.model[0].config.finalize_model_grads_func is not None, (
+        "build_mimo_runtime must install a finalize_model_grads_func on the language config"
+    )
+
+    cfg = pretrain_cfg_container_from_args(args, rt.model[0].config)
+
     def _dataset_provider(train_val_test_num_samples):
         return rt.data_iterator, None, None
 
@@ -178,11 +175,11 @@ def main() -> None:
         pretrain(
             cfg,
             _dataset_provider,
-            _noop_provider,
+            functools.partial(mimo_model_provider, topology=rt.topology, args=args),
             ModelType.encoder_or_decoder,
             mimo_forward_step,
             skip_model_parallel_init=True,
-            setup_model_and_optimizer_func=_setup_model_and_optimizer,
+            setup_model_and_optimizer_func=MimoSetup(rt, args),
             p2p_communicator=rt.communicator,
             schedule_pg_collection=rt.topology.schedule_pg_collection,
         )

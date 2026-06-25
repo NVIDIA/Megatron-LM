@@ -91,52 +91,37 @@ def _seed_module_rng(
     )
 
 
-def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
-    """Assemble the per-rank hetero MIMO runtime and return a :class:`MimoRuntime`.
-
-    Builds the grid specs and topology, seeds per-role RNG, constructs the role
-    ``MimoModel`` without a top-level DDP wrap (the MIMO optimizer needs
-    per-submodule DDP), DDP-wraps the active submodules, attaches the per-module
-    PGC, installs the grad-finalization hook, and builds the p2p communicator and
-    data iterator.
-    """
-    world_size = torch.distributed.get_world_size()
-    specs = build_module_grid_specs(args, world_size)
-    topology = create_topology(specs)
-
-    # --- 2. Resolve this rank's role from the per-module grids. ------------
-    # Non-colocated: each rank is in exactly one module grid. A grid membership
-    # check (is_current_rank_in_grid) is the source of truth; module_pgs only
-    # carries the collections for modules this rank participates in.
+def _resolve_role(topology: HeteroTopology):
+    """Resolve this rank's module role from the grids (non-colocated: one grid per rank)."""
     encoder_name = _encoder_module_name(topology)
     rank_in_language = topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid()
     rank_in_encoder = (
-        encoder_name is not None
-        and topology.grids[encoder_name].is_current_rank_in_grid()
+        encoder_name is not None and topology.grids[encoder_name].is_current_rank_in_grid()
     )
-
     language_pg = topology.module_pgs.get(MIMO_LANGUAGE_MODULE_KEY)
     encoder_pg = topology.module_pgs.get(encoder_name) if encoder_name is not None else None
+    return encoder_name, rank_in_language, rank_in_encoder, language_pg, encoder_pg
 
-    # --- 3. Seed RNG for the single active module role on this rank. -------
-    # The CUDA RNG tracker is process-global; the non-colocated layout puts
-    # exactly one module on each rank, so each rank seeds RNG for one role via
-    # the stock _set_random_seed, threading that role's parallel groups.
-    if rank_in_language:
-        assert language_pg is not None
-        _seed_module_rng(args, language_pg, _LANGUAGE_SEED_OFFSET)
-    elif rank_in_encoder:
-        assert encoder_pg is not None
-        _seed_module_rng(args, encoder_pg, _ENCODER_SEED_OFFSET)
 
-    # --- 4. Build the role MimoModel (no top-level DDP). -------------------
+def mimo_model_provider(
+    pre_process: bool = True,
+    post_process: bool = True,
+    vp_stage=None,
+    *,
+    config=None,
+    pg_collection=None,
+    topology: HeteroTopology,
+    args: argparse.Namespace,
+) -> MimoModel:
+    """Build this rank's bare ``MimoModel`` (no DDP wrap). get_model-shaped provider."""
+    encoder_name, rank_in_language, rank_in_encoder, language_pg, _ = _resolve_role(topology)
+
     modality_submodules_spec = {}
     special_token_ids = {}
     if encoder_name is not None:
+        encoder_pg = topology.module_pgs.get(encoder_name)
         modality_submodules_spec[encoder_name] = vision_submodules_spec(
-            args,
-            encoder_pg if rank_in_encoder else None,
-            topology.grids[encoder_name],
+            args, encoder_pg if rank_in_encoder else None, topology.grids[encoder_name]
         )
         special_token_ids[encoder_name] = args.image_token_id
 
@@ -150,15 +135,40 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
         special_token_ids=special_token_ids,
         module_to_grid_map=topology.grids,
     )
-
     mimo_model = MimoModel(
         mimo_config,
         cp_group=language_pg.cp if rank_in_language else None,
         tp_group=language_pg.tp if rank_in_language else None,
     )
     mimo_model.to(torch.device("cuda"))
-    if not getattr(args, "fp32", False):
-        mimo_model.to(torch.bfloat16)
+    return mimo_model
+
+
+def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
+    """Assemble the per-rank hetero MIMO runtime and return a :class:`MimoRuntime`.
+
+    Builds the grid specs and topology, seeds per-role RNG, constructs the role
+    ``MimoModel`` without a top-level DDP wrap (the MIMO optimizer needs
+    per-submodule DDP), DDP-wraps the active submodules, attaches the per-module
+    PGC, installs the grad-finalization hook, and builds the p2p communicator and
+    data iterator.
+    """
+    world_size = torch.distributed.get_world_size()
+    specs = build_module_grid_specs(args, world_size)
+    topology = create_topology(specs)
+
+    # --- 2. Resolve this rank's role; seed per-role RNG; build the bare model. --
+    _, rank_in_language, rank_in_encoder, language_pg, encoder_pg = _resolve_role(topology)
+
+    if rank_in_language:
+        assert language_pg is not None
+        _seed_module_rng(args, language_pg, _LANGUAGE_SEED_OFFSET)
+    elif rank_in_encoder:
+        assert encoder_pg is not None
+        _seed_module_rng(args, encoder_pg, _ENCODER_SEED_OFFSET)
+
+    # Same provider pretrain() receives; build_mimo_runtime is its single call site.
+    mimo_model = mimo_model_provider(topology=topology, args=args)
 
     # --- 5. DDP-wrap the active submodules (per-submodule DDP). ------------
     wrap_active_modules_with_ddp(args, mimo_model, topology)
