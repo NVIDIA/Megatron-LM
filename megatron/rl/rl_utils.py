@@ -572,11 +572,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
-        num_groups = n_prompts
-        if streaming and args.rl_submission_granularity != "B":
-            num_groups = 1
         request = GroupedRolloutRequest(
-            num_groups=num_groups,
+            num_groups=n_prompts,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
