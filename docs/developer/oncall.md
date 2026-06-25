@@ -15,8 +15,6 @@ The oncall's primary responsibility is helping community contributors and users.
 
 **Goal: triage, assign, and ensure assignees respond in a timely manner.**
 
-### New Issues
-
 3-4 times per working day you should check if there are any new issues with the 
 [community-request](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Acommunity-request) 
 label. You should also check for issues that are out-of-SLA with the 
@@ -35,12 +33,12 @@ We have a useful Claude tool that will send a Slack DM with context to the assig
 
 ### PR Checklist
 
-- [ ] Should the PR remain a single PR?
+- Should the PR remain a single PR?
   - Each PR should have at most 1 expert reviewer, although there will be some outlier cases
-- [ ] Does this PR have proper testing coverage?
+- Does this PR have proper testing coverage?
   - If new logic is added, is the new logic tested?
-- [ ] Should the PR add documentation for any new features?
-- [ ] Does the PR conform to our style guidelines?
+- Should the PR add documentation for any new features?
+- Does the PR conform to our style guidelines?
   - Code structure
   - Cleanliness
   - Comments
