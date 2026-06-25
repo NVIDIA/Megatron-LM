@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from numbers import Number
 from typing import Any
 
 import torch
@@ -239,20 +238,13 @@ def _local_grad(grad: torch.Tensor, meta: Any | None) -> torch.Tensor:
 
 
 def _scale_grad_(grad: torch.Tensor, scale: float | torch.Tensor) -> None:
-    to_local = getattr(grad, "to_local", None)
-    if not callable(to_local):
-        grad.mul_(_scale_for_tensor(scale, grad))
-        return
-    local_grad = to_local()
-    local_grad.mul_(_scale_for_tensor(scale, local_grad))
-    if DTensor is not None and isinstance(grad, DTensor):
-        grad.copy_(DTensor.from_local(local_grad, grad.device_mesh, grad.placements))
-
-
-def _scale_for_tensor(scale: float | torch.Tensor, tensor: torch.Tensor) -> float | torch.Tensor:
-    if isinstance(scale, Number):
-        return float(scale)
-    return scale.to(device=tensor.device, dtype=tensor.dtype)
+    # clip_coef is a scalar; scale every shard by it in place. A plain scalar mul_
+    # is correct for ANY DTensor placement (Shard/Replicate/Partial) and avoids a
+    # to_local()/from_local() round-trip, which mis-reconstructs the global shape of
+    # an unevenly-sharded param -- e.g. a (3,) mHC scale FSDP-sharded over 8 ranks:
+    # from_local assumes even sharding and infers dim0=8, so copy_ raises
+    # "tensor a (3) must match tensor b (8) at dim 0".
+    grad.mul_(float(scale) if isinstance(scale, torch.Tensor) else scale)
 
 
 def _dtensor_meta(param: nn.Parameter, grad: torch.Tensor) -> Any | None:

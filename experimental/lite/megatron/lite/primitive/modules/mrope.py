@@ -7,9 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.core.models.common.embeddings.rope_utils import (  # pyright: ignore[reportMissingImports]
-    get_pos_emb_on_this_cp_rank,
-)
+from megatron.lite.primitive.utils.rope import get_pos_emb_on_this_cp_rank
 
 __all__ = ["MultimodalRotaryEmbedding"]
 

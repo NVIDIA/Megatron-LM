@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 
 BACKENDS = {
-    "mc": "megatron.lite.primitive.optimizers.megatron_wrap",
+    "dist_opt": "megatron.lite.primitive.optimizers.megatron_wrap",
     "fsdp2": "megatron.lite.primitive.optimizers.fsdp2",
 }
 

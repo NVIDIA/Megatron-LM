@@ -10,9 +10,9 @@ from typing import Any
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-import torch.nn.functional as F  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -37,71 +37,21 @@ def _expert_nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
-@torch.compile
-def _swiglu(y):
-    y_1, y_2 = torch.chunk(y, 2, -1)
-    return F.silu(y_1) * y_2
-
-
-@torch.compile
-def _weighted_swiglu(y, weights):
-    dtype = y.dtype
-    res = _swiglu(y) * weights
-    return res.to(dtype)
-
-
-@torch.compile
-def _swiglu_back(g, y):
-    y_1, y_2 = torch.chunk(y, 2, -1)
-    return torch.cat(
-        (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
-    )
-
-
-@torch.compile
-def _weighted_swiglu_back(g, y, weights):
-    input_dtype = y.dtype
-    w_dtype = weights.dtype
-    input_grad = _swiglu_back(g * weights, y)
-    weights_grad = _swiglu(y) * g.to(w_dtype)
-    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
-    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
-
-
-class _WeightedSwiGLUFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, weights, fp8_input_store):
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        ctx.save_for_backward(input_for_backward, weights)
-        ctx.ori_input_dtype = input.dtype
-        ctx.fp8_input_store = fp8_input_store
-        return _weighted_swiglu(input, weights)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, weights = ctx.saved_tensors
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = _weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
-
-
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
-    """Token-wise-weighted bias swiglu fusion (copied from MC)."""
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    input = input.view(-1, ori_shape[-1])
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    output = _WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
-
-
-def swiglu_with_probs(y: torch.Tensor, probs: torch.Tensor | None) -> torch.Tensor:
+def swiglu_with_probs(
+    y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
+) -> torch.Tensor:
     """SwiGLU with optional expert probability scaling."""
+    if swiglu_limit > 0:
+        gate, up = y.chunk(2, dim=-1)
+        up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
+        gate = torch.clamp(gate.float(), max=swiglu_limit)
+        out = torch.nn.functional.silu(gate) * up
+        if probs is not None:
+            out = out * probs
+        return out.to(dtype=y.dtype)
     if probs is not None:
         return weighted_bias_swiglu_impl(y, bias=None, weights=probs)
-    y1, y2 = torch.chunk(y, 2, -1)
-    return F.silu(y1) * y2
+    return bias_swiglu_impl(y, bias=None)
 
 
 class _AllReduceETP(torch.autograd.Function):
@@ -134,6 +84,7 @@ class Experts(nn.Module):
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
+        self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
 
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
@@ -234,7 +185,7 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs)
+                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -243,7 +194,7 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs)
+                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
