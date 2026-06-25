@@ -1507,14 +1507,15 @@ class _NCCLEPManager(_DispatchManager):
         """Bootstrap NCCL EP and build the per-layer context pool on first use (static shapes)."""
         if self._pool is not None:
             return
-        max_tokens_per_rank = self.num_local_tokens
-        # NCCL EP requires an even number of dispatched tokens per rank
-        # nccl/contrib/nccl_ep/device/hybridep_adapter.cu:547 (nccl_ep::hybridep::dispatch_impl);
-        if max_tokens_per_rank % 2 != 0:
-            raise ValueError(
-                f"The 'ncclep' backend requires an even local token count, got "
-                f"{max_tokens_per_rank} (seq_len/TP * micro_batch_size)."
-            )
+        # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
+        # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage". 
+        # (nccl_ep device/hybridep_adapter.cu).
+        _HT_TOKENS_PER_CHUNK = 64
+        max_tokens_per_rank = (
+            (self.num_local_tokens + _HT_TOKENS_PER_CHUNK - 1)
+            // _HT_TOKENS_PER_CHUNK
+            * _HT_TOKENS_PER_CHUNK
+        )
         budget = int(max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
         if self.alignment != 0:
             budget += -budget % self.alignment
