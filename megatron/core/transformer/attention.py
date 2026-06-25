@@ -292,6 +292,7 @@ class Attention(MegatronModule, ABC):
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """
         Args:
@@ -302,6 +303,7 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -1611,6 +1613,7 @@ class SelfAttention(Attention):
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """
         Args:
@@ -1626,6 +1629,7 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -2027,6 +2031,7 @@ class CrossAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """
         Args:
@@ -2041,6 +2046,7 @@ class CrossAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
