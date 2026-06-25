@@ -198,8 +198,7 @@ def _apply_patch(Autotuner):
             return False
 
         import hashlib
-        from triton._C.libtriton import get_cache_invalidating_env_vars
-        from triton.compiler.compiler import make_backend, triton_key
+        import importlib
         from triton.runtime.cache import get_cache_manager
         from triton.runtime.driver import driver
         from triton.runtime.jit import JITFunction
@@ -208,10 +207,50 @@ def _apply_patch(Autotuner):
         while not isinstance(fn, JITFunction):
             fn = fn.fn
 
-        env_vars = get_cache_invalidating_env_vars()
+        # Version-robust key components. triton_key() / make_backend /
+        # get_cache_invalidating_env_vars all moved (or were removed) across
+        # Triton releases (this patch was authored on 3.4.0; 3.6+ relocates
+        # triton_key out of triton.compiler.compiler). Resolve each defensively
+        # and fall back to triton.__version__, which is still version-specific
+        # -- all the cache key needs is to be deterministic within a run and to
+        # change when Triton changes. Never hard-crash on an unfamiliar layout.
+        _tk = None
+        for _mod, _name in (
+            ("triton.compiler.compiler", "triton_key"),
+            ("triton.runtime.jit", "triton_key"),
+            ("triton._utils", "triton_key"),
+            ("triton.runtime.cache", "triton_key"),
+        ):
+            try:
+                _f = getattr(importlib.import_module(_mod), _name, None)
+                if _f is not None:
+                    _tk = _f()
+                    break
+            except Exception:
+                pass
+        if _tk is None:
+            import triton
+
+            _tk = f"triton-{getattr(triton, '__version__', 'unknown')}"
+        try:
+            from triton.compiler.compiler import make_backend
+
+            _backend = make_backend(driver.active.get_current_target()).hash()
+        except Exception:
+            try:
+                _backend = str(driver.active.get_current_target())
+            except Exception:
+                _backend = "backend-unknown"
+        try:
+            from triton._C.libtriton import get_cache_invalidating_env_vars
+
+            env_vars = get_cache_invalidating_env_vars()
+        except Exception:
+            env_vars = {}
+
         cache_key_parts = [
-            triton_key(),
-            make_backend(driver.active.get_current_target()).hash(),
+            _tk,
+            _backend,
             fn.cache_key,
             str(sorted(env_vars.items())),
             str(tuning_key),
