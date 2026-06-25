@@ -13,7 +13,7 @@ The oncall's primary responsibility is helping community contributors and users.
 
 ## Community Issues
 
-**Triage, assign, and ensure assignees respond in a timely manner.**
+**Goal: triage, assign, and ensure assignees respond in a timely manner.**
 
 3-4 times per working day you should check if there are any new issues with the 
 [community-request](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Acommunity-request) 
@@ -23,11 +23,11 @@ We have a useful Claude tool that will send a Slack DM with context to the assig
 
 - if you know who to assign: comment `/claude assign @gh-username`
 - if you do not know who to assign: comment `/claude assign` and Claude will figure it out for you
-  - the assignee may reach out to you if there is a mistake. Do your best to find the best assignee
+  - the assignee may reach out to you if there is a mistake, do your best to find another assignee
 
 ## PR Responsibilities
 
-**Maintain our high-quality bar, launch CI, get approvals, and merge PRs.**
+**Goal: maintain our high-quality bar, launch CI, get approvals, and merge PRs.**
 
 ### PR Checklist
 
