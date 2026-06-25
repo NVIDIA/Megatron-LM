@@ -761,16 +761,33 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-    def _run_deferred_resolution_forward(self) -> Optional[int]:
+    def _run_deferred_resolution_prepare(self, new_sample_copy: Tensor) -> Tuple[Tensor, Tensor]:
+        """Prepare deferred decode requests and GPU-visible forward state.
+
+        Args:
+            new_sample_copy (Tensor): CPU copy of sampled tokens for active requests.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Input token IDs and position IDs for the speculative forward.
+        """
+        context = self.inference_wrapped_model.inference_context
+        context.prepare_requests(new_sample_copy)
+        return self._dynamic_step_context_init()
+
+    def _run_deferred_resolution_forward(
+        self, input_ids: Tensor, position_ids: Tensor
+    ) -> Optional[int]:
         """Run one dynamic forward pass and cache logits for deferred resolution.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs.
 
         Returns:
             Optional[int]: CUDA graph request count for the forward pass, or
             `None` when CUDA graphs were not used.
         """
         context = self.inference_wrapped_model.inference_context
-        input_ids, position_ids = self._dynamic_step_context_init()
-
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
@@ -1978,7 +1995,8 @@ class TextGenerationController:
 
         with torch.inference_mode():
             if not self._decode_forward_primer.is_primed:
-                self._run_deferred_resolution_forward()
+                input_ids, position_ids = self._dynamic_step_context_init()
+                self._run_deferred_resolution_forward(input_ids, position_ids)
 
         await asyncio.sleep(0)
 
@@ -2015,11 +2033,11 @@ class TextGenerationController:
             range_pop()
 
             range_push("prepare_requests")
-            context.prepare_requests(new_sample_copy)
+            input_ids, position_ids = self._run_deferred_resolution_prepare(new_sample_copy)
             range_pop()
 
             range_push("deferred_forward_pass")
-            self._run_deferred_resolution_forward()
+            self._run_deferred_resolution_forward(input_ids, position_ids)
             range_pop()
 
             range_push("resolve_requests")

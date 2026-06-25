@@ -223,7 +223,22 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
         [[[0.0, 3.0, 1.0], [0.0, 1.0, 4.0], [0.0, 5.0, 2.0]]]
     )
     controller._validate_deferred_resolution_support_for_step = mock.Mock()
-    controller._run_deferred_resolution_forward = mock.Mock()
+    input_ids = torch.tensor([[101, 102, 103]])
+    position_ids = torch.tensor([[0, 1, 2]])
+    call_order = []
+
+    def initialize_step_context():
+        call_order.append("context_init")
+        return input_ids, position_ids
+
+    def forward_step(forward_input_ids, forward_position_ids):
+        call_order.append("forward")
+        assert torch.equal(forward_input_ids, input_ids)
+        assert torch.equal(forward_position_ids, position_ids)
+        return 8
+
+    controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_step_context)
+    controller._run_deferred_resolution_forward = mock.Mock(side_effect=forward_step)
 
     context = mock.Mock()
     context.total_request_count = 3
@@ -237,10 +252,20 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
         [4, 4, 4], dtype=torch.int32
     )
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10, 10])
-    context.prepare_requests = mock.Mock()
-    context.resolve_requests.return_value = torch.tensor([11], dtype=torch.int32)
     context.deferred_resolution_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
+
+    def prepare_requests(new_sample_copy):
+        call_order.append("prepare")
+        assert torch.equal(new_sample_copy, torch.tensor([1, 2, 1]))
+
+    def resolve_requests(active_request_mask):
+        call_order.append("resolve")
+        assert torch.equal(active_request_mask, torch.tensor([1, 0, 1], dtype=torch.uint8))
+        return torch.tensor([11], dtype=torch.int32)
+
+    context.prepare_requests = mock.Mock(side_effect=prepare_requests)
+    context.resolve_requests = mock.Mock(side_effect=resolve_requests)
 
     def compact_logits(survivor_idxs):
         assert torch.equal(survivor_idxs, torch.tensor([0, 2]))
@@ -254,6 +279,73 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     assert context.deferred_resolution_compaction_step_count == 1
     assert result["finished_request_ids"].tolist() == [11]
     assert result["sample"].tolist() == [1, 2, 1]
+    assert call_order == ["prepare", "context_init", "forward", "resolve"]
+
+
+def test_deferred_resolution_primer_initializes_context_before_forward():
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller._decode_forward_primer = DecodeForwardPrimer(
+        is_primed=False, cuda_graph_request_count=None
+    )
+    controller._all_logits_cuda = torch.tensor([[[0.0, 3.0, 1.0], [0.0, 5.0, 2.0]]])
+    controller._validate_deferred_resolution_support_for_step = mock.Mock()
+    input_ids = torch.tensor([[101, 102]])
+    position_ids = torch.tensor([[0, 1]])
+    call_order = []
+
+    def initialize_step_context():
+        call_order.append("context_init")
+        return input_ids, position_ids
+
+    def forward_step(forward_input_ids, forward_position_ids):
+        call_order.append("forward")
+        assert torch.equal(forward_input_ids, input_ids)
+        assert torch.equal(forward_position_ids, position_ids)
+        controller._decode_forward_primer.mark_primed(None)
+        return None
+
+    controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_step_context)
+    controller._run_deferred_resolution_forward = mock.Mock(side_effect=forward_step)
+
+    context = mock.Mock()
+    context.total_request_count = 2
+    context.paused_request_count = 0
+    context.active_token_count = 2
+    context.request_ids = torch.tensor([10, 11], dtype=torch.int32)
+    context.request_metadata = {"termination_id": torch.tensor([2, 2], dtype=torch.int64)}
+    context.get_active_sequence_lengths.return_value = torch.tensor([4, 4], dtype=torch.int32)
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    context.deferred_resolution_compaction_step_count = 0
+    controller.inference_wrapped_model = mock.Mock(inference_context=context)
+
+    def prepare_requests(new_sample_copy):
+        call_order.append("prepare")
+        assert torch.equal(new_sample_copy, torch.tensor([1, 1]))
+
+    def resolve_requests(active_request_mask):
+        call_order.append("resolve")
+        assert torch.equal(active_request_mask, torch.tensor([1, 1], dtype=torch.uint8))
+        return torch.empty(0, dtype=torch.int32)
+
+    context.prepare_requests = mock.Mock(side_effect=prepare_requests)
+    context.resolve_requests = mock.Mock(side_effect=resolve_requests)
+    controller._compact_deferred_resolution_logits = mock.Mock()
+
+    result = asyncio.run(controller._run_deferred_resolution_step())
+
+    assert result["finished_request_ids"].tolist() == []
+    assert result["sample"].tolist() == [1, 1]
+    assert controller._dynamic_step_context_init.call_count == 2
+    assert controller._run_deferred_resolution_forward.call_count == 2
+    context.prepare_requests.assert_called_once()
+    assert call_order == [
+        "context_init",
+        "forward",
+        "prepare",
+        "context_init",
+        "forward",
+        "resolve",
+    ]
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):
