@@ -6,54 +6,52 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
--->
 
 # Oncall Overview
 
-During your oncall week, you will be assigned to all PRs marked “Ready for 
-Review”. From a high-level, your responsibilities include:
+The oncall's primary responsibility is helping community contributors and users.
 
-- Review all new PRs
-- Accelerate the review process
-- Ensure issues and discussion questions are answered
+## Community Issues
+
+**Goal: triage, assign, and ensure assignees respond in a timely manner.**
+
+### New Issues
+
+3-4 times per working day you should check if there are any new issues with the 
+[community-request](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Acommunity-request) 
+label. You should also check for issues that are out-of-SLA with the 
+[waiting-on-maintainers](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Awaiting-on-maintainers%20sort%3Aupdated-desc) 
+label.
+
+We have a useful Claude tool that will send a Slack DM with context to the assignee:
+
+- if you know who to assign: comment `/claude assign @gh-username`
+- if you do not know who to assign: comment `/claude assign` and Claude will figure it out for you
+  - the assignee may reach out to you if there is a mistake, do your best to find another assignee
 
 ## PR Responsibilities
 
-Below is the checklist that the oncall needs to go through for each PR.
+**Goal: maintain our high-quality bar, launch CI, get approvals, and merge PRs.**
 
-- Should the PR remain a single PR?
+### PR Checklist
+
+- [ ] Should the PR remain a single PR?
   - Each PR should have at most 1 expert reviewer, although there will be some outlier cases
-- Label PR as “complexity: low”, “complexity: medium”, or “complexity: high” depending on complexity
-  - Expert reviewers have final say, oncall just sets the initial complexity level
-  - Initial complexity level guideline
-    - Low: <100 lines changed
-    - Medium: 100 < lines changed < 500
-    - High: > 500 lines changed
-- Does this PR have proper testing coverage?
+- [ ] Does this PR have proper testing coverage?
   - If new logic is added, is the new logic tested?
-- Should the PR add documentation for any new features?
-- Does the PR conform to our style guidelines?
+- [ ] Should the PR add documentation for any new features?
+- [ ] Does the PR conform to our style guidelines?
   - Code structure
   - Cleanliness
   - Comments
   - File structure
-- Do all tests pass?
-  - Oncall will need to kick off testing suite for external reviewers
-  - Comment “/ok to test commid_id” to kick off testing suite
-- Expert reviewers are notified after the PR is marked “Ready for Review”
-  - **Expert reviewers should review within 1 business day.** Message the assigned reviewer if it is taking longer. The reviewer either needs to review the PR or suggest an alternate reviewer.
-  - If the reviewer is not responding after 2 business days, escalate to the reviewer’s manager.
-- For `megatron/core` PRs, the “Final Review” label is applied automatically once all expert reviewers approve
-  - Final reviewers should review within 1 business day. Message the assigned reviewer if it is taking longer.
-  - If the reviewer is not responding after 2 business days, escalate to the reviewer’s manager.
-- The “Approved” label is applied automatically once all required reviewers have approved
 
-## Issues and Discussion Questions
+### Launch CI
 
-If you do not know the answer to an issue or discussion question, that's ok, **Delegate to someone who does.**
+Community contributors are unable to launch CI. If there is a basic merge conflict or lint errror,
+it is acceptable to fix it and re-launch CI (to reduce iteration time).
 
-On a daily basis, track the following:
+### Approvals and Merging
 
-- [Dashboard for out of SLA issues](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Awaiting-on-maintainers).
-
-
+You may have to reach out to reviewers to help get approvals. Once the PR is fully-approved, please
+merge the PR! Community contributors are unable to do so.
