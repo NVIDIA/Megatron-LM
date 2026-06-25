@@ -15,6 +15,7 @@ MODEL_ARGS:
   --qk-pos-emb-head-dim: 8
   --v-head-dim: 16
   --experimental-attention-variant: dsa
+  --disable-bias-linear: true
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
   --dsa-indexer-topk: 2048
@@ -61,6 +62,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
-  --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

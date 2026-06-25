@@ -277,6 +277,73 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
     assert output is hidden_states
 
 
+def test_restore_packed_thd_batch_dim_when_core_output_is_2d():
+    """Packed-THD absorbed MLA should restore a missing singleton batch dim."""
+    hidden_states = torch.empty(7, 1, 16)
+    core_attn_out = torch.empty(7, 16)
+    packed_seq_params = PackedSeqParams(qkv_format='thd')
+
+    restored = absorbed_mla_module._restore_packed_thd_batch_dim(
+        core_attn_out, hidden_states, packed_seq_params
+    )
+
+    assert restored.shape == (7, 1, 16)
+
+
+def test_restore_packed_thd_batch_dim_keeps_already_normalized_output():
+    """Packed-THD absorbed MLA should keep an already restored batch dim."""
+    hidden_states = torch.empty(7, 1, 16)
+    core_attn_out = torch.empty(7, 1, 16)
+    packed_seq_params = PackedSeqParams(qkv_format='thd')
+
+    restored = absorbed_mla_module._restore_packed_thd_batch_dim(
+        core_attn_out, hidden_states, packed_seq_params
+    )
+
+    assert restored is core_attn_out
+    assert restored.shape == hidden_states.shape
+
+
+def test_absorbed_v_up_projection_applies_when_core_did_not_consume_weight():
+    """Absorbed MLA should apply V-up when core attention returns latent channels."""
+    torch.manual_seed(123)
+    num_heads, kv_lora_rank, v_head_dim = 2, 3, 3
+    core_attn_out = torch.randn(5, 1, num_heads * kv_lora_rank)
+    v_up_weight = torch.randn(num_heads, v_head_dim, kv_lora_rank)
+
+    projected = absorbed_mla_module._apply_absorbed_v_up_projection(
+        core_attn_out,
+        v_up_weight,
+        num_attention_heads_per_partition=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        core_consumed_v_up_projection=False,
+    )
+    expected = core_attn_out.view(5, 1, num_heads, kv_lora_rank)
+    expected = torch.einsum("...nc,ndc->...nd", expected, v_up_weight)
+    expected = expected.contiguous().view(5, 1, -1)
+
+    torch.testing.assert_close(projected, expected, rtol=0, atol=0)
+
+
+def test_absorbed_v_up_projection_skips_when_core_consumed_weight():
+    """Absorbed MLA should not reapply V-up when core attention already consumed it."""
+    num_heads, kv_lora_rank, v_head_dim = 2, 3, 3
+    core_attn_out = torch.randn(5, 1, num_heads * v_head_dim)
+    v_up_weight = torch.randn(num_heads, v_head_dim, kv_lora_rank)
+
+    projected = absorbed_mla_module._apply_absorbed_v_up_projection(
+        core_attn_out,
+        v_up_weight,
+        num_attention_heads_per_partition=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        core_consumed_v_up_projection=True,
+    )
+
+    assert projected is core_attn_out
+
+
 def test_load_from_state_dict_backwards_compatible_with_split_kv_up_projection(monkeypatch):
     """Pre-refactor split K/V up-projection checkpoints load into the combined layout."""
 

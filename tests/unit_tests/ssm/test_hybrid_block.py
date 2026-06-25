@@ -12,9 +12,11 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -72,6 +74,7 @@ class TestHybridBlock:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            add_bias_linear=False,
         )
         modules = hybrid_stack_spec.submodules
         return HybridStack(
@@ -266,13 +269,13 @@ class TestHybridBlock:
         assert output.dtype == torch.float32
 
     def test_dsa_layer_types(self):
-        """D symbol creates a TransformerLayer with MLASelfAttention."""
+        """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
         block = self.get_dsa_mamba_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
-        assert isinstance(layers[1].self_attention, MLASelfAttention)
+        assert isinstance(layers[1].self_attention, AbsorbedMLASelfAttention)
         assert isinstance(layers[1].self_attention.core_attention, DSAttention)
         assert isinstance(layers[2], MambaLayer)
 
