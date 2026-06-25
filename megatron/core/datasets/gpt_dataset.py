@@ -16,6 +16,7 @@ from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
 from megatron.core.tokenizers import MegatronTokenizerBase
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -308,13 +309,13 @@ class GPTDataset(MegatronDataset):
         """
         if self.shuffle_index is None:
             # NOTE(asolergi-nv): Lazy memmap the indexes
-            self.shuffle_index = numpy.load(
+            self.shuffle_index = safe_numpy_load(
                 self.path_to_shuffle_index, allow_pickle=True, mmap_mode='r'
             )
-            self.sample_index = numpy.load(
+            self.sample_index = safe_numpy_load(
                 self.path_to_sample_index, allow_pickle=True, mmap_mode='r'
             )
-            self.document_index = numpy.load(
+            self.document_index = safe_numpy_load(
                 self.path_to_document_index, allow_pickle=True, mmap_mode='r'
             )
 
@@ -576,7 +577,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
+        document_index = safe_numpy_load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -586,7 +587,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
+        sample_index = safe_numpy_load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -596,7 +597,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
+        shuffle_index = safe_numpy_load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 

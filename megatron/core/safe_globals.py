@@ -7,8 +7,10 @@ from io import BytesIO
 from pathlib import PosixPath
 from signal import Signals
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+import numpy
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
@@ -55,6 +57,17 @@ def register_safe_globals():
 def safe_load_from_bytes(b):
     """Safe version (weights_only=True) of `torch.storage._load_from_bytes`."""
     return torch.load(io.BytesIO(b), weights_only=True)
+
+
+def _safe_pickle_load(file, **kwargs):
+    """Safe version of `pickle.load`."""
+    return SafeUnpickler(file).load()
+
+
+def safe_numpy_load(path, **kwargs):
+    """Safe version of `numpy.load` which calls `pickle.load`."""
+    with patch('numpy.lib.npyio.pickle.load', _safe_pickle_load):
+        return numpy.load(path, **kwargs)
 
 
 class SafeUnpickler(pickle.Unpickler):
