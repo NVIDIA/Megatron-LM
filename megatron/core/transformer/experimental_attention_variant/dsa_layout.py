@@ -159,6 +159,8 @@ def build_packed_allgather_cp_local_positions(
     if seq_lens.numel() == 0:
         return torch.empty(0, dtype=torch.int64, device=device)
 
+    # Host-side guard for CPU/test callers. In CUDA training these lengths are runtime tensors;
+    # checking them here would add a sync, and padding divisibility is guaranteed by the pipeline.
     if cu_seqlens_i64.device.type == "cpu":
         bad_divisible = seq_lens[seq_lens % cp_size != 0]
         if bad_divisible.numel() > 0:

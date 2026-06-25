@@ -37,6 +37,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     unfused_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions,
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_zigzag_allgather_cp_key_reorder,
     get_cp_positions_from_layout,
@@ -653,6 +654,15 @@ class TestDSACPPositionHelpers:
         )
         torch.testing.assert_close(mask, expected, rtol=0, atol=0)
 
+    def test_position_based_causal_mask_supports_reordered_keys(self):
+        """Position-based masking should work when KV order is not already global arange."""
+        query_pos = torch.tensor([2], dtype=torch.int64)
+        key_pos = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+
+        mask = build_causal_mask_from_positions(query_pos, key_pos)
+        expected = torch.tensor([[0.0, 0.0, float("-inf"), 0.0]], dtype=torch.float32)
+        torch.testing.assert_close(mask, expected, rtol=0, atol=0)
+
     def test_packed_position_based_causal_mask(self):
         """Packed causal mask should block cross-sequence attention using cu_seqlens boundaries."""
         # Two packed sequences: [0,1,2] and [3,4]
@@ -820,7 +830,7 @@ class TestDSACPPositionHelpers:
 
     def test_packed_allgather_cp_layout_reorders_gathered_kv_to_global_order(self):
         """Packed allgather-CP helper should mirror zigzag local order and restore global KV order."""
-        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
 
         query_pos, key_reorder_idx = build_packed_allgather_cp_query_positions_and_key_reorder(
             cu_seqlens_q=cu_seqlens,
@@ -830,10 +840,10 @@ class TestDSACPPositionHelpers:
             device=torch.device("cpu"),
         )
 
-        assert query_pos.tolist() == [0, 1, 6, 7, 8, 9, 14, 15]
+        assert query_pos.tolist() == [0, 3, 4, 5, 6, 13, 14, 15]
 
         gathered_key_pos = torch.tensor(
-            [0, 1, 6, 7, 8, 9, 14, 15, 2, 3, 4, 5, 10, 11, 12, 13], dtype=torch.int64
+            [0, 3, 4, 5, 6, 13, 14, 15, 1, 2, 7, 8, 9, 10, 11, 12], dtype=torch.int64
         )
         restored = gathered_key_pos.index_select(0, key_reorder_idx)
         assert restored.tolist() == list(range(16))
@@ -841,7 +851,7 @@ class TestDSACPPositionHelpers:
     def test_cp_packed_zigzag_varlen_matches_dense_mask(self):
         """Packed zigzag CP query positions + gathered-KV reorder should match dense masking."""
         cp_size, cp_rank = 2, 1
-        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
         bsz, nheads, dim, vdim = 1, 2, 8, 6
         topk = 4
         softmax_scale = dim**-0.5
@@ -907,6 +917,101 @@ class TestDSACPPositionHelpers:
         )
 
         torch.testing.assert_close(out_varlen, out_dense, rtol=0, atol=0)
+
+    def test_cp_packed_zigzag_matches_full_sequence_run_with_real_shards(self):
+        """Packed CP rank-local shards should reproduce a cp_size=1 full-sequence run."""
+        torch.manual_seed(123)
+        cp_size = 2
+        cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
+        skv = int(cu_seqlens[-1].item())
+        bsz, nheads, dim, vdim = 1, 2, 8, 6
+        topk = 4
+        softmax_scale = dim**-0.5
+        device = torch.device("cpu")
+
+        q_global = torch.randn(skv, bsz, nheads, dim, dtype=torch.float32)
+        k_for_index_global = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights_global = torch.randn(skv, bsz, nheads, dtype=torch.float32)
+        query_global = torch.randn(skv, bsz, nheads, dim, dtype=torch.float32)
+        key_global = torch.randn(skv, bsz, nheads, dim, dtype=torch.float32)
+        value_global = torch.randn(skv, bsz, nheads, vdim, dtype=torch.float32)
+
+        key_pos = torch.arange(skv, dtype=torch.int64)
+        dense_mask = _build_packed_causal_mask_for_test(key_pos, key_pos, cu_seqlens)
+        _, dense_idx = fused_qk_topk_naive(
+            q_global, k_for_index_global, weights_global, topk, mask=dense_mask
+        )
+        out_full = unfused_dsa_fn(
+            query_global, key_global, value_global, dense_idx, softmax_scale, mask=dense_mask
+        )
+
+        gathered_key_order = torch.cat(
+            [
+                build_packed_allgather_cp_local_positions(cu_seqlens, cp_size, rank, device)
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        out_from_cp = torch.empty_like(out_full)
+        seen = torch.zeros(skv, dtype=torch.bool)
+
+        for cp_rank in range(cp_size):
+            query_pos, key_reorder_idx = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                device=device,
+            )
+            torch.testing.assert_close(
+                gathered_key_order.index_select(0, key_reorder_idx), key_pos, rtol=0, atol=0
+            )
+
+            starts_all, ends_all = generate_varlen_mask_params(cu_seqlens.to(torch.int64))
+            starts = starts_all.index_select(0, query_pos)
+            ends = ends_all.index_select(0, query_pos)
+
+            q_local = q_global.index_select(0, query_pos)
+            weights_local = weights_global.index_select(0, query_pos)
+            query_local = query_global.index_select(0, query_pos)
+
+            k_for_index_reordered = k_for_index_global.index_select(
+                0, gathered_key_order
+            ).index_select(0, key_reorder_idx)
+            key_reordered = key_global.index_select(0, gathered_key_order).index_select(
+                0, key_reorder_idx
+            )
+            value_reordered = value_global.index_select(0, gathered_key_order).index_select(
+                0, key_reorder_idx
+            )
+
+            _, varlen_idx = fused_qk_topk_naive(
+                q_local,
+                k_for_index_reordered,
+                weights_local,
+                topk,
+                mask=None,
+                varlen_starts=starts,
+                varlen_ends=ends,
+                key_positions=key_pos,
+            )
+            out_local = unfused_dsa_fn(
+                query_local,
+                key_reordered,
+                value_reordered,
+                varlen_idx,
+                softmax_scale,
+                mask=None,
+                varlen_starts=starts,
+                varlen_ends=ends,
+                key_positions=key_pos,
+            )
+
+            out_from_cp.index_copy_(0, query_pos, out_local)
+            seen.index_fill_(0, query_pos, True)
+
+        assert seen.all()
+        torch.testing.assert_close(out_from_cp, out_full, rtol=1e-6, atol=1e-6)
 
     def test_unfused_dsa_allows_delayed_backward_after_same_shape_reuse(self):
         """Unfused DSA should not mutate tensors saved by earlier forward graphs."""

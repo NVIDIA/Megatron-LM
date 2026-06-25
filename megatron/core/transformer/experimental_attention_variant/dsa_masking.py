@@ -34,7 +34,11 @@ __all__ = [
 def build_causal_mask_from_positions(
     query_pos: torch.Tensor, key_pos: torch.Tensor
 ) -> torch.Tensor:
-    """Build a causal mask from explicit query/key global positions."""
+    """Build a causal mask from explicit query/key global positions.
+
+    ``key_pos`` is usually arange after gathered KV is restored to global order, but accepting
+    explicit positions also covers callers that mask before reordering or use subset/reordered KV.
+    """
     assert query_pos.dtype in (torch.int32, torch.int64), "query_pos must be integer tensor"
     assert key_pos.dtype in (torch.int32, torch.int64), "key_pos must be integer tensor"
     assert query_pos.device == key_pos.device, "query_pos and key_pos must be on the same device"
