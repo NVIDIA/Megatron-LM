@@ -63,6 +63,24 @@ def distributed_checkpoint_world(process_group):
     return world_size
 
 
+def test_distributed_max_seconds_uses_backend_safe_object_gather(monkeypatch):
+    monkeypatch.setattr(weighted_merge_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(weighted_merge_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(weighted_merge_module.dist, "get_world_size", lambda: 3)
+    monkeypatch.setattr(
+        weighted_merge_module.dist,
+        "all_reduce",
+        lambda *_args, **_kwargs: pytest.fail("CPU all_reduce is not backend safe"),
+    )
+
+    def gather(records, local_value):
+        records[:] = [0.25, local_value, 2.5]
+
+    monkeypatch.setattr(weighted_merge_module.dist, "all_gather_object", gather)
+
+    assert weighted_merge_module._distributed_max_seconds(1.5) == 2.5
+
+
 @pytest.fixture(autouse=True)
 def cpu_only_dcp_save(monkeypatch):
     # GPTModel construction asserts on NVTE_FLASH_ATTN/NVTE_FUSED_ATTN/

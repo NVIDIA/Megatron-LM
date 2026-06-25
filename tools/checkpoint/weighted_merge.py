@@ -849,9 +849,9 @@ def _distributed_max_seconds(seconds: float) -> float:
         or dist.get_world_size() == 1
     ):
         return float(seconds)
-    value = torch.tensor(float(seconds), dtype=torch.float64, device="cpu")
-    dist.all_reduce(value, op=dist.ReduceOp.MAX)
-    return float(value.item())
+    records: list[float | None] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(records, float(seconds))
+    return max(float(record) for record in records if record is not None)
 
 
 def _get_path(root: Any, path: tuple[str | int, ...]) -> Any:
