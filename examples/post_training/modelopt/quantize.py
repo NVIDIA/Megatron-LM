@@ -57,7 +57,6 @@ from utils import get_hf_tokenizer
 
 from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -241,6 +240,12 @@ def check_arguments():
             "--context-parallel-size when context parallelism is enabled."
         )
 
+    if args.auto_quantize_bits is not None and not _HAS_SHARED_CALIB:
+        raise RuntimeError(
+            "auto_quantize requires modelopt 0.46+. "
+            "Upgrade with: pip install nvidia-modelopt>=0.46"
+        )
+
     if args.auto_quantize_bits is not None:
         if args.export_quant_cfg is not None:
             print_rank_0(
@@ -400,106 +405,6 @@ def get_calib_dataloader(
         )
 
 
-def _get_calib_dataloader_from_args(tokenizer):
-    args = get_args()
-    return get_calib_dataloader(
-        dataset_path_or_name=args.calib_dataset_path_or_name,
-        tokenizer=tokenizer,
-        calib_size=args.calib_size,
-        max_sequence_length=args.calib_max_sequence_length,
-        use_random_offset=args.calib_use_random_offset,
-        batch_size=args.calib_batch_size,
-    )
-
-
-def _build_calib_batch(batch, pad_token_id, with_labels=False, use_context_parallel=False):
-    tokens = batch["input_ids"]
-    token_attention_mask = batch.get("attention_mask")
-    if token_attention_mask is None:
-        token_attention_mask = torch.ones_like(tokens)
-    elif token_attention_mask.device != tokens.device:
-        token_attention_mask = token_attention_mask.to(tokens.device)
-
-    bsz, seq_len = tokens.shape
-    position_ids = (
-        torch.arange(seq_len, dtype=torch.long, device=tokens.device)
-        .unsqueeze(0)
-        .expand(bsz, -1)
-        .contiguous()
-    )
-    attention_mask = (
-        torch.triu(
-            torch.ones((bsz, seq_len, seq_len), device=tokens.device, dtype=torch.bool),
-            diagonal=1,
-        ).view(bsz, 1, seq_len, seq_len)
-    )
-    calib_batch = {
-        "tokens": tokens.contiguous(),
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-    }
-
-    if with_labels:
-        labels = torch.empty_like(tokens)
-        labels[:, :-1] = tokens[:, 1:]
-        labels[:, -1] = pad_token_id
-
-        loss_mask = torch.zeros(tokens.shape, dtype=torch.float, device=tokens.device)
-        loss_mask[:, :-1] = token_attention_mask[:, 1:].to(dtype=loss_mask.dtype)
-        calib_batch.update({"labels": labels.contiguous(), "loss_mask": loss_mask.contiguous()})
-
-    if use_context_parallel:
-        calib_batch = get_batch_on_this_cp_rank(calib_batch)
-    return calib_batch
-
-
-def _calib_loss_func(loss_mask, output):
-    losses = output.reshape(-1).float()
-    loss_mask = loss_mask.reshape(-1).float()
-    loss = torch.sum(losses * loss_mask)
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-    return loss, num_tokens, {"lm loss": torch.cat([loss.detach().view(1), num_tokens.view(1)])}
-
-
-def _calib_forward_step(data_iterator, model, pad_token_id, with_labels):
-    args = get_args()
-    batch = _build_calib_batch(
-        next(data_iterator),
-        pad_token_id=pad_token_id,
-        with_labels=with_labels,
-        use_context_parallel=args.context_parallel_size > 1,
-    )
-    model_kwargs = {"labels": batch["labels"]} if with_labels else {}
-    output = model(
-        batch["tokens"],
-        batch["position_ids"],
-        batch["attention_mask"],
-        **model_kwargs,
-    )
-    if not with_labels:
-        return output, None
-    return output, functools.partial(_calib_loss_func, batch["loss_mask"])
-
-
-def _run_calib_step(model, batch, pad_token_id, with_labels=False, forward_only=True):
-    seq_length = batch["input_ids"].shape[-1]
-    return get_forward_backward_func()(
-        forward_step_func=functools.partial(
-            _calib_forward_step,
-            pad_token_id=pad_token_id,
-            with_labels=with_labels,
-        ),
-        data_iterator=iter([batch]),
-        model=model,
-        num_microbatches=1,
-        seq_length=seq_length,
-        micro_batch_size=batch["input_ids"].shape[0],
-        decoder_seq_length=seq_length,
-        forward_only=forward_only,
-        collect_non_loss_data=forward_only,
-    )
-
-
 def auto_quantize_model(unwrapped_model, tokenizer):
     """Run mtq.auto_quantize on the MCore model to search per-layer mixed precision.
 
@@ -507,31 +412,16 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     """
     args = get_args()
 
-    if _HAS_SHARED_CALIB:
-        calib_dataloader = get_megatron_calibration_dataloader(
-            tokenizer,
-            dataset_name=args.calib_dataset_path_or_name,
-            num_samples=args.calib_size,
-            seq_length=args.calib_max_sequence_length,
-            batch_size=args.calib_batch_size,
-        )
-    else:
-        calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
-
-    use_gradient = args.auto_quantize_method == "gradient"
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    calib_dataloader = get_megatron_calibration_dataloader(
+        tokenizer,
+        dataset_name=args.calib_dataset_path_or_name,
+        num_samples=args.calib_size,
+        seq_length=args.calib_max_sequence_length,
+        batch_size=args.calib_batch_size,
+    )
 
     def forward_step(model, batch):
-        return _run_calib_step(model, batch, pad_token_id, forward_only=True)[0]
-
-    def forward_backward_step(model, batch):
-        _run_calib_step(
-            model,
-            batch,
-            pad_token_id,
-            with_labels=True,
-            forward_only=False,
-        )
+        return megatron_prefill(model, batch["input_ids"])
 
     quantization_formats = [QUANT_CFG_CHOICES[fmt] for fmt in args.auto_quantize_formats]
     disabled_layers = [
@@ -561,7 +451,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         data_loader=calib_dataloader,
         forward_step=forward_step,
         loss_func=None,
-        forward_backward_step=forward_backward_step if use_gradient else None,
+        forward_backward_step=None,
         disabled_layers=disabled_layers,
         num_calib_steps=num_calib_steps,
         num_score_steps=num_score_steps,

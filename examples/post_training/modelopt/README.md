@@ -107,7 +107,10 @@ Pass `auto` as the second positional argument to `quantize.sh` and provide `--au
 through `MLM_EXTRA_ARGS`. The script will skip `--export-quant-cfg` entirely and drive the search
 via the auto-quantize arguments.
 
-> **Note:** Auto Quantize requires `--pipeline-model-parallel-size 1` (PP=1).
+> **Note:** Auto Quantize requires `--pipeline-model-parallel-size 1` (PP=1) and
+> [Model-Optimizer](https://github.com/NVIDIA/Model-Optimizer) **0.46 or greater**
+> (`pip install nvidia-modelopt>=0.46`). Alternatively, install from the
+> [main branch](https://github.com/NVIDIA/Model-Optimizer) for the latest features.
 
 ```sh
 \
