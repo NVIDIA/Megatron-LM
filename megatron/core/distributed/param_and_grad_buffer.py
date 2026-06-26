@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import fnmatch
 import functools
 import logging
@@ -175,26 +176,17 @@ class _ParamAndGradBucketGroup:
         ddp_config: DistributedDataParallelConfig,
         collective_group: torch.distributed.ProcessGroup,
         collective_group_size: int,
-        use_distributed_optimizer: Optional[bool] = None,
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        # Effective (per-group) DistributedOptimizer flag. With the decouple-LayerWise-DDP-layout
-        # path, ``use_distributed_optimizer`` is a per-buffer property, so the caller
-        # (``partition_buckets``) passes the value derived from this group's buffers. When None,
-        # fall back to the model-level ddp_config knob.
-        if use_distributed_optimizer is None:
-            use_distributed_optimizer = self.ddp_config.use_distributed_optimizer
-        self.use_distributed_optimizer = use_distributed_optimizer
-
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
-        if self.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
+        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        if not self.use_distributed_optimizer:
+        if not self.ddp_config.use_distributed_optimizer:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -221,12 +213,14 @@ class _ParamAndGradBucketGroup:
                 not self.ddp_config.reduce_scatter_with_fp32_accumulation
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
-        reduction_collective = "reduce-scatter" if self.use_distributed_optimizer else "all-reduce"
+        reduction_collective = (
+            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+        )
         log_single_rank(
             logger,
             logging.INFO,
             f"Using {reduction_collective} for gradient reductions because "
-            f"{self.use_distributed_optimizer=}",
+            f"{self.ddp_config.use_distributed_optimizer=}",
         )
 
         global dist_reduce_scatter_func
@@ -370,7 +364,7 @@ class _ParamAndGradBucketGroup:
         """
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
-        assert self.use_distributed_optimizer or self.ddp_config.overlap_param_gather
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -383,7 +377,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-        if not self.use_distributed_optimizer:
+        if not self.ddp_config.use_distributed_optimizer:
             # Legacy layer-wise optimizer path: use all_gather for variable-size
             # param gather.  Once all layerwise call sites set
             # ddp_config.use_distributed_optimizer=True, this branch can be removed.
@@ -537,7 +531,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            if not self.use_distributed_optimizer:
+            if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -649,7 +643,7 @@ class _ParamAndGradBucketGroup:
         else:
             stream_context = nullcontext()
 
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
@@ -658,7 +652,7 @@ class _ParamAndGradBucketGroup:
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
-                if self.use_distributed_optimizer and not force_all_reduce:
+                if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
@@ -684,7 +678,7 @@ class _ParamAndGradBucketGroup:
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
-            self.use_distributed_optimizer
+            self.ddp_config.use_distributed_optimizer
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
             assert self.inter_distributed_optimizer_instance_group is not None
@@ -1013,21 +1007,16 @@ class _ParamAndGradBuffer:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
 
-        # Effective (per-buffer) DistributedOptimizer flag. ``use_distributed_optimizer`` is a
-        # model-level ddp_config knob, but a LayerWise (Muon) optimizer with the padded LayerWise
-        # param layout disabled (``use_layer_wise_param_layout=False``) turns it into a per-buffer
-        # property: LayerWise-managed (Muon 2D matrix) buffers locally disable DistOpt semantics
-        # (compact no-padding layout, all-reduce gradients, legacy whole-param ping-pong ownership
-        # + allgather_params), while sibling non-LayerWise buffers (embeddings, biases, layernorm)
-        # keep the standard byte-level DistributedOptimizer path.
         self._is_layer_wise_buffer = bool(
             self.params and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False)
         )
-        self.use_distributed_optimizer = self.ddp_config.use_distributed_optimizer
+        # Bake the per-buffer DistOpt decision into this buffer's ddp_config (single source of
+        # truth; bucket groups inherit it): a LayerWise (Muon) buffer on the compact decoupled
+        # layout disables DistributedOptimizer, while sibling buffers keep the model-level setting.
         if self._is_layer_wise_buffer and not getattr(
             self.ddp_config, "use_layer_wise_param_layout", True
         ):
-            self.use_distributed_optimizer = False
+            self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -1089,7 +1078,8 @@ class _ParamAndGradBuffer:
             logging.INFO if (self._is_layer_wise_buffer or _padding > 0) else logging.DEBUG,
             f"ParamAndGradBuffer layout: param_dtype={self.param_dtype} "
             f"grad_dtype={self.grad_dtype} dp_world_size={self.data_parallel_world_size} "
-            f"layerwise={self._is_layer_wise_buffer} distopt={self.use_distributed_optimizer} "
+            f"layerwise={self._is_layer_wise_buffer} "
+            f"distopt={self.ddp_config.use_distributed_optimizer} "
             f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
             f"padding={_padding} ({_pad_frac:.1%})",
             tp_group=self.tp_group,
@@ -1098,7 +1088,7 @@ class _ParamAndGradBuffer:
 
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
             if self.has_nvfp4_params:
                 assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
@@ -1137,7 +1127,9 @@ class _ParamAndGradBuffer:
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
-            if self.use_distributed_optimizer and any(is_mxfp8tensor(p) for p in self.params):
+            if self.ddp_config.use_distributed_optimizer and any(
+                is_mxfp8tensor(p) for p in self.params
+            ):
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -1154,7 +1146,7 @@ class _ParamAndGradBuffer:
                 self.grad_data = self.shared_buffer
             else:
                 # Only re-map param tensors if using distributed optimizer.
-                if self.use_distributed_optimizer:
+                if self.ddp_config.use_distributed_optimizer:
                     numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
                     self.param_data = torch.zeros(
                         numel,
@@ -1350,12 +1342,12 @@ class _ParamAndGradBuffer:
         """
 
         def _pad_start_of_param(param_start_index: int) -> int:
-            if self.use_distributed_optimizer:
+            if self.ddp_config.use_distributed_optimizer:
                 return pad_param_start(param_start_index)
             return param_start_index
 
         def _pad_end_of_bucket(bucket_end_index: int) -> int:
-            if self.use_distributed_optimizer:
+            if self.ddp_config.use_distributed_optimizer:
                 return pad_bucket_end(
                     bucket_end_index,
                     self.data_parallel_world_size,
@@ -1465,7 +1457,7 @@ class _ParamAndGradBuffer:
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
 
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
@@ -1646,17 +1638,18 @@ def partition_buckets(
     # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
     # to exactly one group, identical to the previous behavior.
     if force_single_bucket_group:
-        ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
         ordered_distopt_values = []
         buckets_by_distopt = {}
+        # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
+        ddp_config_by_distopt = {}
         for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
+            distopt = buffer.ddp_config.use_distributed_optimizer
+            ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
             for bucket in buffer.buckets:
-                distopt = _bucket_distopt(bucket)
                 if distopt not in buckets_by_distopt:
                     buckets_by_distopt[distopt] = []
                     ordered_distopt_values.append(distopt)
@@ -1665,10 +1658,9 @@ def partition_buckets(
         return [
             _ParamAndGradBucketGroup(
                 buckets_by_distopt[distopt],
-                ddp_config,
+                ddp_config_by_distopt[distopt],
                 data_parallel_group,
                 data_parallel_world_size,
-                use_distributed_optimizer=distopt,
             )
             for distopt in ordered_distopt_values
         ]
@@ -1685,17 +1677,17 @@ def partition_buckets(
                         buffer.ddp_config,
                         buffer.data_parallel_group,
                         buffer.data_parallel_world_size,
-                        use_distributed_optimizer=buffer.use_distributed_optimizer,
                     )
                 )
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
+        # Track each non-fp8 bucket with its buffer's (authoritative) ddp_config.
+        non_fp8_buckets = []  # list of (bucket, ddp_config)
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
+                    non_fp8_buckets.append((bucket, buffer.ddp_config))
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1709,37 +1701,39 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
+                            fp8_buffer.ddp_config,
                             buffer.data_parallel_group,
                             buffer.data_parallel_world_size,
-                            use_distributed_optimizer=_bucket_distopt(bucket),
                         )
                     )
                     if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
+                        for non_fp8_bucket, non_fp8_ddp_config in non_fp8_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
+                                    non_fp8_ddp_config,
                                     buffer.data_parallel_group,
                                     buffer.data_parallel_world_size,
-                                    use_distributed_optimizer=_bucket_distopt(non_fp8_bucket),
                                 )
                             )
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + non_fp8_buckets
+                    group_buckets = [bucket] + [b for b, _ in non_fp8_buckets]
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
+            # Merged buckets must share the fp8 group's effective use_distributed_optimizer.
+            assert (
+                _merged_use_distributed_optimizer(group_buckets)
+                == fp8_buffer.ddp_config.use_distributed_optimizer
+            )
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
+                    fp8_buffer.ddp_config,
                     buffer.data_parallel_group,
                     buffer.data_parallel_world_size,
-                    use_distributed_optimizer=_merged_use_distributed_optimizer(group_buckets),
                 )
             )
         return bucket_groups
