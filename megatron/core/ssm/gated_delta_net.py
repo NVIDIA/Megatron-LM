@@ -63,6 +63,99 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE = {
+    # External fused backends are guarded as not deterministic-mode certified
+    # until bitwise determinism is validated under Megatron.
+    "fla": False,
+    "flash_qla": False,
+    "torch": True,
+}
+_FLASH_QLA_SUPPORTED_CUDA_CAPABILITY = (9, 0)
+
+
+def _assert_gated_delta_rule_backend_supports_deterministic_mode(
+    backend: str, deterministic_mode: bool
+) -> None:
+    """Validate deterministic-mode support for a Gated Delta Rule backend."""
+    if backend not in _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE:
+        raise ValueError(f"Unsupported gated_delta_rule_backend: {backend!r}.")
+    if (
+        deterministic_mode
+        and not _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE[backend]
+    ):
+        raise ValueError(
+            "deterministic_mode=True requires a deterministic GatedDeltaNet gated "
+            "delta rule backend. Set gated_delta_rule_backend='torch' instead of "
+            f"{backend!r}."
+        )
+
+
+def _current_cuda_device_capability() -> Optional[Tuple[int, int]]:
+    """Return the active CUDA device capability, or None when CUDA is unavailable."""
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(torch.cuda.current_device())
+
+
+def _load_flash_qla_chunk_gated_delta_rule():
+    """Import FlashQLA lazily so non-Hopper runs can still import this module."""
+    try:
+        from flash_qla import chunk_gated_delta_rule as flash_qla_chunk_gated_delta_rule
+    except (ImportError, RuntimeError, ValueError) as exc:
+        raise ImportError(
+            "FlashQLA gated delta rule backend requires the `flash_qla` package "
+            "on a supported Hopper/SM90 CUDA device."
+        ) from exc
+    return flash_qla_chunk_gated_delta_rule
+
+
+def _select_gated_delta_rule_backend(
+    backend: str,
+    *,
+    deterministic_mode: bool,
+    cp_size: int,
+    key_head_dim: int,
+    value_head_dim: int,
+):
+    """Return the callable implementing the requested Gated Delta Rule backend."""
+    _assert_gated_delta_rule_backend_supports_deterministic_mode(
+        backend, deterministic_mode
+    )
+
+    if backend == "torch":
+        return torch_chunk_gated_delta_rule
+
+    if backend == "fla":
+        if not HAVE_FLA:
+            raise ImportError(
+                "FLA gated delta rule backend requires `flash-linear-attention`."
+            )
+        return chunk_gated_delta_rule
+
+    if backend == "flash_qla":
+        if cp_size != 1:
+            raise ValueError(
+                "FlashQLA gated delta rule backend is currently guarded to "
+                "context_parallel_size=1. Use gated_delta_rule_backend='fla' for CP."
+            )
+        if key_head_dim != 128 or value_head_dim != 128:
+            raise ValueError(
+                "FlashQLA gated delta rule backend currently requires "
+                f"linear_key_head_dim=128 and linear_value_head_dim=128, got "
+                f"{key_head_dim=} and {value_head_dim=}."
+            )
+        capability = _current_cuda_device_capability()
+        if capability != _FLASH_QLA_SUPPORTED_CUDA_CAPABILITY:
+            raise ValueError(
+                "FlashQLA gated delta rule backend is supported only on Hopper "
+                f"SM90 ({_FLASH_QLA_SUPPORTED_CUDA_CAPABILITY}); got {capability}. "
+                "Use gated_delta_rule_backend='fla' on other GPUs."
+            )
+        return _load_flash_qla_chunk_gated_delta_rule()
+
+    raise ValueError(f"Unsupported gated_delta_rule_backend: {backend!r}.")
+
+
 @dataclass
 class GatedDeltaNetSubmodules:
     """
@@ -129,6 +222,7 @@ class GatedDeltaNet(MegatronModule):
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
         self.pre_gated_delta_rule_impl = config.pre_gated_delta_rule_impl
+        self.gated_delta_rule_backend = config.gated_delta_rule_backend
         if self.pre_gated_delta_rule_impl != "unfused":
             assert (
                 self.cp_size == 1
@@ -218,10 +312,13 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
         setattr(self.A_log, "partition_dim", 0)
 
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
+        self.gated_delta_rule = _select_gated_delta_rule_backend(
+            self.gated_delta_rule_backend,
+            deterministic_mode=self.config.deterministic_mode,
+            cp_size=self.cp_size,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+        )
 
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -1037,8 +1134,8 @@ def torch_chunk_gated_delta_rule(
 ):
     # pylint: disable=line-too-long
     '''
-    Torch-native implementation of chunked gated delta rule for deterministic mode.
-    Need this because FLA is not deterministic.
+    Torch-native implementation of chunked gated delta rule.
+    This backend is deterministic and is intended for deterministic mode.
 
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''

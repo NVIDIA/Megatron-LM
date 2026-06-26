@@ -373,6 +373,9 @@ class TransformerConfig(ModelParallelConfig):
     pre_gated_delta_rule_impl: Literal["unfused", "fused_streamed", "fused_mega"] = "unfused"
     """Pre-gated-delta-rule implementation for GatedDeltaNet."""
 
+    gated_delta_rule_backend: Literal["fla", "flash_qla", "torch"] = "fla"
+    """Backend for the GatedDeltaNet gated delta rule."""
+
     ####################
     # initialization
     ####################
@@ -1399,6 +1402,12 @@ class TransformerConfig(ModelParallelConfig):
                 "pre_gated_delta_rule_impl must be one of "
                 f"{valid_pre_gdr_impls}, got {self.pre_gated_delta_rule_impl!r}."
             )
+        valid_gdr_backends = ("fla", "flash_qla", "torch")
+        if self.gated_delta_rule_backend not in valid_gdr_backends:
+            raise ValueError(
+                "gated_delta_rule_backend must be one of "
+                f"{valid_gdr_backends}, got {self.gated_delta_rule_backend!r}."
+            )
         if (
             self.pre_gated_delta_rule_impl != "unfused"
             and self.experimental_attention_variant != "gated_delta_net"
@@ -1407,8 +1416,27 @@ class TransformerConfig(ModelParallelConfig):
                 "pre_gated_delta_rule_impl can select a fused path only when "
                 "experimental_attention_variant='gated_delta_net'."
             )
+        if (
+            self.gated_delta_rule_backend != "fla"
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "gated_delta_rule_backend can select a non-default backend only when "
+                "experimental_attention_variant='gated_delta_net'."
+            )
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
+            nondeterministic_gdr_backends = ("fla", "flash_qla")
+            if (
+                self.deterministic_mode
+                and self.gated_delta_rule_backend in nondeterministic_gdr_backends
+            ):
+                raise ValueError(
+                    "deterministic_mode=True requires a deterministic GatedDeltaNet "
+                    "gated delta rule backend. Set gated_delta_rule_backend='torch' "
+                    f"instead of {self.gated_delta_rule_backend!r}."
+                )
+
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear attention."
