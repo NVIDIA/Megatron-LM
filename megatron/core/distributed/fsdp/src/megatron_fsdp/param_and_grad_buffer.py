@@ -4435,8 +4435,16 @@ class AllGatherPipeline:
                 no_fsdp_units = False
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
-        # If there are no FSDP units associated with params, we should not prefetch.
-        if prefetch and not no_fsdp_units:
+        if prefetch and not (
+            # When double buffering, if parameters are not members of FSDP units,
+            # we should skip pre-fetch to efficiently supply buffers from the pool.
+            # Non-unit module pre-fetch can run inside other FSDP unit modules and
+            # un-shard irrelevant model components that pointlessly steal buffer
+            # allocations from the expected FSDP unit allocation and violating
+            # the maximum limit of 2 buffers allocated at any point in time.
+            self.buffer.ddp_config.fsdp_double_buffer
+            and no_fsdp_units
+        ):
 
             def next_bucket_id(ag_buckets):
                 """
