@@ -136,6 +136,12 @@ class GatedDeltaNet(MegatronModule):
 
         # Attributes from config
         self.config = config
+        if self.config.deterministic_mode:
+            if self.gdn_pre_gated_delta_rule_fusion:
+                raise ValueError(
+                    "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
+                    "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+                )
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
