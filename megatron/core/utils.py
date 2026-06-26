@@ -484,7 +484,67 @@ def is_flashinfer_min_version(version, check_equality=True):
         return False
     if check_equality:
         return flashinfer_version >= PkgVersion(version)
-    return flashinver_version > PkgVersion(version)
+    return flashinfer_version > PkgVersion(version)
+
+
+_VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
+
+
+def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
+    """Return missing TileLang DSA kernel dependencies."""
+    try:
+        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+    except (ImportError, OSError):
+        return ["TileLang DSA kernels"]
+
+    missing = []
+    if tilelang_dsa.lighting_indexer is None:
+        missing.append("TileLang DSA indexer")
+    if tilelang_dsa.SparseMLA is None:
+        missing.append("TileLang SparseMLA")
+    return missing
+
+
+def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
+    """Return missing cuDNN DSA kernel dependencies."""
+    missing = []
+    try:
+        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+    except ImportError:
+        missing.append("flash_mla")
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+    return missing
+
+
+def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
+    """Validate optional fused DSA kernel backend dependencies."""
+    if dsa_kernel_backend not in _VALID_DSA_KERNEL_BACKENDS:
+        raise ValueError(
+            "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
+        )
+    if dsa_kernel_backend == "none":
+        return
+    if not torch.cuda.is_available():
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires a CUDA device, "
+            "but none is available."
+        )
+
+    missing = []
+    if dsa_kernel_backend == "tilelang":
+        missing = _missing_tilelang_dsa_kernel_dependencies()
+    elif dsa_kernel_backend == "cudnn":
+        missing = _missing_cudnn_dsa_kernel_dependencies()
+
+    if missing:
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires fused DSA kernels, "
+            f"but the following packages are not available: {', '.join(missing)}. "
+            "Install them or set dsa_kernel_backend=none to use the PyTorch fallback."
+        )
 
 
 def accepts_parameter(func: Callable, name: str) -> bool:
@@ -2253,38 +2313,36 @@ def get_batch_on_this_tp_rank(
 ########################
 
 
-def get_sft_batch_on_this_cp_rank(
+def _get_batch_on_this_cp_rank_per_document_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
-    """Partition an SFT packed-sequence batch across context-parallel ranks using THD indexing.
+    """Partition a batch across CP ranks with per-document zigzag load balancing.
 
-    For SFT workloads the batch contains multiple variable-length sub-sequences
-    packed contiguously (THD format). This function uses Transformer Engine's
-    ``thd_get_partitioned_indices`` to compute the token indices assigned to the
-    current CP rank and gathers only those tokens from every sequence-dimension
-    tensor in the batch.
-
-    Metadata keys ('attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-    'max_seqlen', 'local_cp_size', 'hybrid_cp_group') are left unchanged
-    because TE's attention kernels consume them directly.
+    Applies zigzag load-balanced chunking independently within each
+    sub-sequence (document) using Transformer Engine's
+    ``thd_get_partitioned_indices``. Each document length must be
+    divisible by ``2 * cp_size``. Sequence-dimension tensors (tokens,
+    labels, loss_mask, position_ids) are index-selected to this CP
+    rank's partition; metadata keys (cu_seqlens, cu_seqlens_padded,
+    max_seqlen, etc.) are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
             ``[micro_batch_size, seq_length, ...]``.
-        cp_group (torch.distributed.ProcessGroup): The context-parallel process
-            group.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
-        index-selected to this CP rank's partition.
+        partitioned to this CP rank.
     """
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
-        # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
-        # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze the
-        # batch dim inline without mutating the batch dict.
+        # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
+        # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze
+        # the batch dim inline without mutating the batch dict.
         cu_seqlens_for_te = (
             batch["cu_seqlens_padded"]
             if batch["cu_seqlens_padded"] is not None
@@ -2305,31 +2363,31 @@ def get_sft_batch_on_this_cp_rank(
     return batch
 
 
-def get_pretrain_batch_on_this_cp_rank(
+def _get_batch_on_this_cp_rank_per_sequence_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
-    """Partition a pretraining batch across context-parallel ranks with load-balanced chunking.
+    """Partition a batch across CP ranks with per-sequence zigzag load balancing.
 
-    With causal masking, each token only attends to its prior tokens. Simply splitting
-    the sequence into CP chunks can result in severe load imbalance, as chunks at the
-    end of the sequence have bigger workloads than earlier ones. To address this, the
-    sequence is split into ``2 * cp_size`` chunks and assigned in a zigzag pattern:
-    for CP=2 the 4 chunks are assigned as (chunk_0, chunk_3) -> GPU 0 and
-    (chunk_1, chunk_2) -> GPU 1, balancing the workload across the CP group.
-
-    All tensor-valued entries in the batch are partitioned along their sequence
-    dimension (``seq_dim=1`` by default, ``seq_dim=2`` for 'attention_mask').
-    None-valued entries are left unchanged.
+    Applies zigzag load-balanced chunking across the entire sequence. The
+    sequence is split into ``2 * cp_size`` equal chunks and assigned in a
+    zigzag pattern: for CP=2, the 4 chunks are assigned as
+    (chunk_0, chunk_3) -> GPU 0 and (chunk_1, chunk_2) -> GPU 1, balancing
+    compute for causal attention where later tokens attend to more
+    predecessors. The sequence length must be divisible by
+    ``2 * cp_size``. All tensor-valued entries in the batch are
+    partitioned along their sequence dimension; metadata keys
+    (cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) and None-valued
+    entries are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
             ``[micro_batch_size, seq_length, ...]``.
-        cp_group (torch.distributed.ProcessGroup): The context-parallel process
-            group.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
-        sliced to this CP rank's zigzag partition.
+        partitioned to this CP rank.
     """
 
     cp_size = torch.distributed.get_world_size(cp_group)
@@ -2366,6 +2424,101 @@ def get_pretrain_batch_on_this_cp_rank(
     return batch
 
 
+def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: int) -> torch.Tensor:
+    """Merge per-sample cu_seqlens into one 1-D tensor for THD attention.
+
+    When micro_batch_size > 1, the dataloader produces cu_seqlens with shape
+    (micro_batch_size, padded_length).  THD / FlashAttention expects a
+    single 1-D cu_seqlens covering all tokens.  This function strips
+    per-row padding (trailing copies of ``seq_length`` beyond the first),
+    offsets each sample's cu_seqlens by ``sample_index * seq_length``, and
+    concatenates them, dropping the leading zero of every sample after the
+    first.
+
+    When micro_batch_size == 1, returns the unpadded ``cu_seqlens[0]``.
+
+    Args:
+        cu_seqlens: int32 tensor of shape ``(micro_batch_size, padded_length)``
+            where each row starts at 0, ends at ``seq_length``, and may be
+            right-padded with extra copies of ``seq_length``.
+        seq_length: per-sample sequence length used to compute offsets and
+            to detect padding.
+
+    Returns:
+        1-D int32 tensor of merged cumulative sequence lengths.
+    """
+
+    def _strip_padding(row):
+        """Return the valid prefix of a padded cu_seqlens row.
+
+        Valid entries run from 0 up to and including the first occurrence
+        of ``seq_length``.  Any trailing copies of ``seq_length`` (padding
+        inserted by the dataset for uniform collation) are dropped.
+        """
+        hits = (row == seq_length).nonzero(as_tuple=True)[0]
+        if hits.numel() > 0:
+            return row[: hits[0].item() + 1]
+        return row
+
+    micro_batch_size = cu_seqlens.shape[0]
+    if micro_batch_size == 1:
+        return _strip_padding(cu_seqlens[0])
+
+    parts = [_strip_padding(cu_seqlens[0])]
+    for i in range(1, micro_batch_size):
+        offset = i * seq_length
+        valid = _strip_padding(cu_seqlens[i])
+        parts.append(valid[1:] + offset)
+    return torch.cat(parts)
+
+
+def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a multi-sample batch into a single packed sequence for THD attention.
+
+    When ``micro_batch_size > 1`` and ``cu_seqlens`` is present, THD /
+    FlashAttention still expects one flat token stream with a single 1-D
+    ``cu_seqlens``.  This function merges ``cu_seqlens`` (and
+    ``cu_seqlens_padded`` if present) across samples, reshapes
+    sequence-dimension tensors from ``(mbs, seq_len)`` to
+    ``(1, mbs * seq_len)``, and reduces ``max_seqlen`` to its maximum.
+
+    When ``cu_seqlens`` is absent or ``micro_batch_size == 1``, the batch
+    is returned with only the batch dimension squeezed from ``cu_seqlens``
+    (and ``cu_seqlens_padded``).
+
+    Args:
+        batch: Batch dict produced by ``get_batch_on_this_tp_rank``.
+
+    Returns:
+        The batch dict with packed-sequence tensors flattened.
+    """
+    cu_seqlens = batch.get('cu_seqlens')
+    if cu_seqlens is None:
+        return batch
+
+    seq_length = None
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            seq_length = batch[key].shape[1]
+            break
+    if seq_length is None:
+        seq_length = cu_seqlens[0, -1].item()
+
+    batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(cu_seqlens, seq_length).unsqueeze(0)
+    if batch.get('cu_seqlens_padded') is not None:
+        batch['cu_seqlens_padded'] = _merge_cu_seqlens_across_micro_batch(
+            batch['cu_seqlens_padded'], seq_length
+        ).unsqueeze(0)
+    if batch.get('max_seqlen') is not None:
+        batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
+
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            batch[key] = batch[key].reshape(1, -1)
+
+    return batch
+
+
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     is_hybrid_cp: bool,
@@ -2376,15 +2529,14 @@ def get_batch_on_this_cp_rank(
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
-      - **SFT (packed sequences)**: When ``cu_seqlens`` is present and
-        ``is_hybrid_cp`` is False, delegates to ``get_sft_batch_on_this_cp_rank``
-        which uses THD index-based partitioning.
+      - **Per-document zigzag**: When ``cu_seqlens`` is present and
+        ``is_hybrid_cp`` is False, delegates to
+        ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
-        and delegates to ``get_pretrain_batch_on_this_cp_rank`` with that group.
-      - **Pretraining**: When ``cu_seqlens`` is None, delegates to
-        ``get_pretrain_batch_on_this_cp_rank`` with zigzag load-balanced
-        chunking.
+        and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2408,12 +2560,14 @@ def get_batch_on_this_cp_rank(
             ), "local_cp_size is required for hybrid context parallel"
             if batch['local_cp_size'].item() > 1:
                 hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+                batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+                    batch, cp_group=hybrid_cp_group
+                )
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
-            batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
+            batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     else:  # NOTE(asolergi-nv): Pretrain case
-        batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
+        batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     return batch
 
 
