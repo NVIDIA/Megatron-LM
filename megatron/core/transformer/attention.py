@@ -439,16 +439,27 @@ class Attention(MegatronModule, ABC):
         attn_mask_type=None,
         attention_bias=None,
         packed_seq_params=None,
+        core_attention_extra_kwargs=None,
     ):
         """Forward method with selective activation checkpointing."""
+        if core_attention_extra_kwargs is None:
+            core_attention_extra_kwargs = {}
+        tensor_kwarg_names = []
+        checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
+        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
+        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
+        # closing over the original forward tensors.
+        for name, kwarg_value in core_attention_extra_kwargs.items():
+            if torch.is_tensor(kwarg_value):
+                tensor_kwarg_names.append(name)
+                checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
+            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
+            extra_kwargs = dict(core_attention_extra_kwargs)
+            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
+                extra_kwargs[name] = kwarg_value
             output_ = self._run_core_attention(
                 query,
                 key,
@@ -457,15 +468,17 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                **extra_kwargs,
             )
             return output_
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
+        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
+        # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
-        )
+        checkpoint_inputs[5] = attn_mask_type
+        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
 
         return hidden_states
 
