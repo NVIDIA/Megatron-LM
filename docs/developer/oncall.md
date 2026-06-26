@@ -78,4 +78,5 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
 ### Tips
 
 - Leverage the [CI Dashboard](https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci?orgId=43)
+  - You will need to join the `nemo-fw-eng` DL
 - Setup the GitLab MCP server with Codex
