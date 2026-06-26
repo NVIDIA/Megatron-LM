@@ -135,7 +135,7 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, fill_value=0):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -158,6 +158,10 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                falls back to standard rolling behavior.
         packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
+        fill_value: Value to fill at boundary positions where the original sequence has
+                    no data (default 0). For most tensors (input_ids, loss_mask, labels)
+                    zero is correct.  For a padding_mask with True=padded convention,
+                    pass ``fill_value=True`` so rolled-in boundaries are marked as padded.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
@@ -166,12 +170,14 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        return _roll_tensor_packed_seq(
+            tensor, shifts, dims, packed_seq_params, cp_group, fill_value=fill_value
+        )
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
+        rolled_tensor.select(dims, shifts).fill_(fill_value)
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
@@ -208,8 +214,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
         ops.append(req_recv_second_part)
     else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
+        tensor_recv_list[1] = fill_value
     if local_rank != len(global_ranks) - 1:
         req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
         ops.append(req_recv_first_part)
@@ -236,7 +241,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_tensor.sum()
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None, fill_value=0):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
@@ -269,8 +274,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             end_idx = cu_seqlens[i + 1]
             seq_slice = tensor[..., start_idx:end_idx]
             rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
+            rolled_seq[..., shifts:] = fill_value
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
 
@@ -322,7 +326,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
         else:
-            tensor_recv_list[1].zero_()
+            tensor_recv_list[1].fill_(fill_value)
 
         if local_rank != cp_size - 1:
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
@@ -1283,6 +1287,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
+                fill_value=True,
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
@@ -2054,6 +2059,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 multi-stream decoder output [s, b, n*h] used as input to MTP depths.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            padding_mask (Tensor, optional): Padding mask for MoE routing (True = padded).
+                Each MTP layer rolls this mask in sync with input_ids/position_ids using
+                ``fill_value=True`` so that boundary positions are correctly marked as padded.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
