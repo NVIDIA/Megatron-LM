@@ -10,8 +10,8 @@ from signal import Signals
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
 import numpy
+import torch
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType

@@ -15,8 +15,8 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
-from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.safe_globals import safe_numpy_load
+from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
