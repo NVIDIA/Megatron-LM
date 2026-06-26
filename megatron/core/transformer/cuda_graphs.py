@@ -382,17 +382,9 @@ fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
 
 
-def _backup_capture_grads(runner):
-    """Clone main_grad for everything a graph capture re-accumulates into, so capturing stays
-    side-effect-free on the finalized grads (capture *executes* the recorded main_grad.add_).
-
-    Used by both create_fwd_graph (warmup) and create_bwd_graph; restore with
-    ``_restore_capture_grads``.
-
-    The backward always writes main_grad for the module's own params, so those are backed up
-    unconditionally. Under GTP there is one extra target: the cascade also adds into a param's
-    cross-graph ``next_w``, which lives in another module and so isn't among this module's own
-    params.
+def _backup_grads_before_capture(runner):
+    """Snapshot main_grad so create_fwd_graph's eager warmup can't corrupt the finalized grads;
+    restore with ``_restore_grads_after_capture``.
     """
     backup = {}
     for p in runner.base_module.parameters():
@@ -414,8 +406,8 @@ def _backup_capture_grads(runner):
     return backup
 
 
-def _restore_capture_grads(backup):
-    """Restore the main_grad snapshots taken by ``_backup_capture_grads``."""
+def _restore_grads_after_capture(backup):
+    """Restore the main_grad snapshots taken by ``_backup_grads_before_capture``."""
     for p, saved in backup.values():
         p.main_grad.copy_(saved)
 
@@ -1065,7 +1057,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for buf in self.base_module.buffers():
                 buffer_backup.append(buf.clone())
 
-            grad_backup = _backup_capture_grads(self)
+            grad_backup = _backup_grads_before_capture(self)
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -1281,7 +1273,7 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
-            _restore_capture_grads(grad_backup)
+            _restore_grads_after_capture(grad_backup)
 
             # restore cached buffers
             for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
@@ -1337,11 +1329,6 @@ class _CudaGraphRunner(torch.nn.Module):
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
-
-        # GTP's wgrad add runs inside the bwd graph, so capturing it executes a main_grad.add_
-        # that would clobber the finalized grads; snapshot what it touches and restore below.
-        # (Non-GTP returns wgrads as graph outputs and accumulates outside, so nothing to guard.)
-        grad_backup = _backup_capture_grads(self) if self.gtp_remat else {}
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
 
@@ -1405,9 +1392,6 @@ class _CudaGraphRunner(torch.nn.Module):
         # Unfreeze GC.
         if FREEZE_GC:
             gc.unfreeze()
-
-        # restore cached grads
-        _restore_capture_grads(grad_backup)
 
         # See _compute_finalized_during_bwd_capture for what's in this set and why.
         self.finalized_during_bwd_capture = (

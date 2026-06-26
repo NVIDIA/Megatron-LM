@@ -3,20 +3,23 @@
 """Regression test for the GTP + CUDA-graph capture-step grad-norm bug.
 
 Bug: create_cudagraphs() runs after finalize_model_grads, so main_grad already holds the finalized
-(reduced + per-token-scaled) grads. Capturing the fwd warmup and the bwd graph *executes* GTP's
-wgrad main_grad.add_ while recording it -- including the cascade add into a param's cross-graph
-``next_w`` (which lives in another module) -- clobbering the finalized grads and spiking the step's
-grad norm.
+(reduced + per-token-scaled) grads. create_fwd_graph then runs an eager warmup backward (graph
+capture only records ops, it doesn't run them), and that eager backward executes GTP's wgrad
+main_grad.add_ -- including the cascade add into a param's cross-graph ``next_w`` (in another
+module, via a stale RS ticket) -- clobbering the finalized grads and spiking the step's grad norm.
 
-Fix: create_fwd_graph / create_bwd_graph snapshot the grads their capture touches via
-``_backup_capture_grads`` and restore them after. This test exercises that helper pair directly:
-the module's own params and their cross-graph ``next_w`` must survive a simulated capture clobber.
+Fix: create_fwd_graph snapshots the grads its warmup touches via ``_backup_grads_before_capture``
+and restores them after. This test exercises that helper pair directly: the module's own params
+and their cross-graph ``next_w`` must survive a simulated warmup clobber.
 """
 
 import pytest
 import torch
 
-from megatron.core.transformer.cuda_graphs import _backup_capture_grads, _restore_capture_grads
+from megatron.core.transformer.cuda_graphs import (
+    _backup_grads_before_capture,
+    _restore_grads_after_capture,
+)
 from megatron.experimental.gtp import HAVE_GTP
 
 if not HAVE_GTP:
@@ -38,7 +41,7 @@ class _Mod(torch.nn.Module):
 
 
 class _StubRunner:
-    """The ``base_module`` and ``gtp_remat`` attributes that ``_backup_capture_grads`` reads."""
+    """The ``base_module`` and ``gtp_remat`` attrs that ``_backup_grads_before_capture`` reads."""
 
     def __init__(self, base_module: torch.nn.Module, gtp_remat: bool = True):
         self.base_module = base_module
@@ -54,17 +57,17 @@ class TestGTPCaptureGradSnapshot:
         own.next_w = cross
         runner = _StubRunner(_Mod(own))
 
-        backup = _backup_capture_grads(runner)
+        backup = _backup_grads_before_capture(runner)
         own.main_grad.add_(410.0)  # simulate the capture-time main_grad.add_ clobber
         cross.main_grad.add_(99.0)
-        _restore_capture_grads(backup)
+        _restore_grads_after_capture(backup)
 
         torch.testing.assert_close(own.main_grad, torch.full((8,), 0.0125, device="cuda"))
         torch.testing.assert_close(cross.main_grad, torch.full((8,), 0.02, device="cuda"))
 
     def test_routed_expert_next_w_via_weight_list(self):
-        """A routed-expert next_w exposes its grad-bearing shards via ``weight_list`` (read directly,
-        since the ``_weights`` property raises on non-leaders before capture)."""
+        """A routed-expert next_w exposes its shards via ``weight_list`` (read directly, since the
+        ``_weights`` property raises on non-leaders before capture)."""
         own = _gtp_param(0.0125)
         shard0, shard1 = _gtp_param(0.03), _gtp_param(0.04)
         routed = torch.nn.Parameter(torch.zeros(8, device="cuda"))  # leader wrapper (no own grad)
@@ -73,10 +76,10 @@ class TestGTPCaptureGradSnapshot:
         own.next_w = routed
         runner = _StubRunner(_Mod(own))
 
-        backup = _backup_capture_grads(runner)
+        backup = _backup_grads_before_capture(runner)
         shard0.main_grad.add_(50.0)
         shard1.main_grad.add_(60.0)
-        _restore_capture_grads(backup)
+        _restore_grads_after_capture(backup)
 
         torch.testing.assert_close(shard0.main_grad, torch.full((8,), 0.03, device="cuda"))
         torch.testing.assert_close(shard1.main_grad, torch.full((8,), 0.04, device="cuda"))
@@ -87,6 +90,6 @@ class TestGTPCaptureGradSnapshot:
         own = _gtp_param(0.0125)
         cross = _gtp_param(0.02)
         own.next_w = cross
-        backup = _backup_capture_grads(_StubRunner(_Mod(own), gtp_remat=False))
+        backup = _backup_grads_before_capture(_StubRunner(_Mod(own), gtp_remat=False))
         assert id(own) in backup
         assert id(cross) not in backup
