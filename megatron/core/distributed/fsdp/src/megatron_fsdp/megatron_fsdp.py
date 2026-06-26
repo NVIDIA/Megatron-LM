@@ -558,21 +558,45 @@ class MegatronFSDP(torch.nn.Module):
         def _param_list_for_submodule_unshard(
             module: nn.Module, pass_direction: Literal["forward", "backward"]
         ) -> List[nn.Parameter]:
-            """Build the parameter list for fine-grained or FSDP-unit unshard hooks."""
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                return list(module.parameters())
+            """Build the parameter list for fine-grained or FSDP-unit unshard hooks.
+
+            Parameter buckets designated by this function are all-gathered and may
+            pre-fetch subsequent buckets in FSDP bucket order during runtime.
+            """
+            # Fine-grained hooks are attached to all sub-modules; this function
+            # controls which parameters each hook should unshard.
             fine_grained_enabled = (
                 self.enable_fine_grained_param_gather_backward_hook
                 if pass_direction == "backward"
                 else self.enable_fine_grained_param_gather_hook
             )
-            if (
-                fine_grained_enabled
-                and self.fine_grained_recurse_module_types
-                and isinstance(module, self.fine_grained_recurse_module_types)
-            ):
-                return list(module.parameters(recurse=True))
-            return list(module.parameters(recurse=False))
+            if fine_grained_enabled:
+                # Fine-grained hooks run on every submodule: shallow params by
+                # default, including on FSDP units (e.g. TransformerLayer). Leaf
+                # child hooks gather their own nested weights. Container modules
+                # in fine_grained_recurse_module_types (e.g. TEGroupedMLP,
+                # SharedExpertMLP) need recurse=True because weights live on
+                # children and the container is the compute entry point.
+                if (
+                    self.fine_grained_recurse_module_types
+                    and isinstance(module, self.fine_grained_recurse_module_types)
+                ):
+                    return list(module.parameters(recurse=True))
+                else:
+                    # Only unshard direct parameters. Used when submodules are
+                    # called in isolation of an FSDP-unit forward (e.g. mxfp8
+                    # param gather, EP-overlap 1F1B schedule). Leaf modules
+                    # (e.g. TELinear) still gather their own weights via
+                    # separate hooks. Also limits unshard scope for activation
+                    # recomputation on individual submodules.
+                    return list(module.parameters(recurse=False))
+            else:
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    # FSDP unit modules should be unsharded and communicated together.
+                    return list(module.parameters())
+                else:
+                    # Non-unit modules should only unshard the direct parameters they need.
+                    return list(module.parameters(recurse=False))
 
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """

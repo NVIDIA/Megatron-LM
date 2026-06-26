@@ -103,8 +103,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         ):
             # Lazy import to avoid circular chain.
             from megatron.core.transformer.moe.experts import TEGroupedMLP
+            from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
-            return (TEGroupedMLP,)
+            return (TEGroupedMLP, SharedExpertMLP)
         return ()
 
     def __init__(
