@@ -182,6 +182,17 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert exec_times[0] == exec_times[1]
 
 
+def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[50, 50] for _ in range(14)]
+    assert sample_ids == [[0, 1] for _ in range(14)]
+    assert exec_times == [exec_times[0] for _ in range(14)]
+
+
 def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping_by_default():
     scheduler = DefaultDynamicCPScheduler(
         max_seqlen_per_dp_cp_rank=4096,
@@ -612,14 +623,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             if is_pp_first and (vpp is None or vpp <= 1):
                 dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                 cp_size = parallel_state.get_context_parallel_world_size()
-                cp_group = parallel_state.get_context_parallel_group()
 
                 # Count each sequence exactly once using int64 for bitwise comparison.
                 # THD (dp_balanced): CP siblings hold identical packed data,
                 #   so reduce across DP only (not CP) on both sides.
-                # DCP: a logical sequence is replicated across its local CP group
-                #   before CP slicing. Scale each rank by max_cp / local_cp, then
-                #   reduce across DPxCP.
+                # DCP: wrap_data_iterator returns packed samples before
+                #   get_batch_on_this_rank_for_sequence_packing applies CP
+                #   slicing, so local CP siblings still hold identical packed
+                #   tokens here. Scale each rank by max_cp / local_cp, then
+                #   reduce across DPxCP. A local-CP all-reduce here would
+                #   overcount the pre-slice tokens.
                 # Both sides multiply by max_cp so DCP (with varying local_cp)
                 # can be normalized to the same integer scale without division.
                 max_cp = cp_size
@@ -638,10 +651,6 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # After wrap.
                 token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
                 if is_dynamic_cp:
-                    # DCP: each logical sequence is replicated on local_cp ranks
-                    # before CP slicing. Scale each rank's local contribution by
-                    # max_cp / local_cp, then reduce across DPxCP ranks so each
-                    # sequence contributes exactly max_cp times.
                     for batch in batch_all:
                         mb_sum = batch['tokens'].long().sum().clone()
                         local_cp = batch['local_cp_size']

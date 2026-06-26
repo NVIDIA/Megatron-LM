@@ -547,7 +547,9 @@ def next_hdp_group_packing_aware(
        the local tallest sequence in the microbatch.
 
     The scheduler keeps the legacy invariant that each returned microbatch has
-    no empty DPxCP rank after the fill step.
+    no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
+    it falls back to the full DPxCP group if power-of-two expansion cannot fill
+    every rank.
     """
     if not sample_seqlens:
         return (
@@ -734,8 +736,38 @@ def next_hdp_group_packing_aware(
 
         return False
 
+    def fill_with_full_dpxcp_group() -> None:
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu, leftovers
+
+        selected: List[Tuple[int, int]] = []
+        next_leftovers: List[Tuple[int, int]] = []
+        packed_sequence_len = 0.0
+
+        for sample_id, seq_len in sample_seqlens:
+            per_rank_len = seq_len / total_gpus
+            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+                selected.append((sample_id, seq_len))
+                packed_sequence_len += per_rank_len
+            else:
+                next_leftovers.append((sample_id, seq_len))
+
+        assert selected, (
+            "At least one sequence should fit in the full DPxCP group; "
+            "try to increase 'max-seqlen-per-dp-cp-rank'."
+        )
+
+        selected_ids = [sample_id for sample_id, _ in selected]
+        selected_lens = [seq_len for _, seq_len in selected]
+        per_rank_work = sum(workload(seq_len, total_gpus) for _, seq_len in selected)
+
+        micro_batches = [list(selected_lens) for _ in range(total_gpus)]
+        exec_times = [per_rank_work for _ in range(total_gpus)]
+        sample_ids_per_gpu = [list(selected_ids) for _ in range(total_gpus)]
+        leftovers = next_leftovers
+
     while any(not micro_batch for micro_batch in micro_batches):
         if not fill_empty_gpus_once():
+            fill_with_full_dpxcp_group()
             break
 
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
