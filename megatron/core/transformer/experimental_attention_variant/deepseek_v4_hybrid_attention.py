@@ -153,6 +153,7 @@ class DSv4HybridAttention(Attention):
             "rotary_pos_emb": self.rotary_pos_emb,
             "compress_ratio": compress_ratio,
             "is_mtp_layer": is_mtp_layer,
+            "name": (name + ".core_attention") if name is not None else None,
         }
         self.core_attention = build_module(
             submodules.core_attention,
