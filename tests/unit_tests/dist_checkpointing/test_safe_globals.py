@@ -85,6 +85,7 @@ class TestSafePickleLoad:
 class TestSafeNumpyLoad:
     def test_npy_array(self, tmp_path):
         import numpy as np
+
         from megatron.core.safe_globals import safe_numpy_load
 
         arr = np.array([1, 2, 3], dtype=np.uint32)
@@ -96,6 +97,7 @@ class TestSafeNumpyLoad:
 
     def test_npz_archive(self, tmp_path):
         import numpy as np
+
         from megatron.core.safe_globals import safe_numpy_load
 
         a = np.array([1.0, 2.0])
@@ -113,6 +115,7 @@ class TestSafeNumpyLoad:
         import pickle as _pickle
 
         import numpy as np
+
         from megatron.core.safe_globals import _safe_pickle_load, safe_numpy_load
 
         arr = np.array([0])
@@ -144,6 +147,7 @@ class TestSafeNumpyLoad:
         import threading
 
         import numpy as np
+
         from megatron.core.safe_globals import safe_numpy_load
 
         arrays = {i: np.arange(i, i + 4, dtype=np.float32) for i in range(8)}
