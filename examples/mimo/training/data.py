@@ -141,7 +141,9 @@ class MockVLMIterator:
         # submodule's inner encoders dict (keyed by the module name in the provider).
         self.vision_encoder_key = getattr(args, "vision_encoder_key", None) or encoder_name
         # "pixels" encoders take a raw image tensor; hidden-state encoders take precomputed states.
-        self.vision_input_mode = getattr(args, "vision_input_mode", "hidden_states")
+        # RADIO is a pixel encoder; default to pixel inputs (dynamic-resolution path
+        # below sizes them to image_seq_length when --dynamic-resolution is set).
+        self.vision_input_mode = getattr(args, "vision_input_mode", "pixels")
         self.dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
         self.patch_dim = getattr(args, "patch_dim", 16)
         self.num_image_tiles = getattr(args, "num_image_tiles", 1)

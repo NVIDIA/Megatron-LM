@@ -32,6 +32,7 @@ fi
   --nproc-per-node "${GPUS_PER_NODE}" \
   examples/mimo/pretrain_mimo.py \
   --model-provider nemotron-moe-vlm \
+  --dynamic-resolution \
   --num-layers 20 \
   --hybrid-layer-pattern "MEMEM*EMEMEM*EMEMEM*" \
   --hidden-size 2688 \
