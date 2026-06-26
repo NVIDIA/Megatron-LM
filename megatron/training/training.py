@@ -1620,9 +1620,9 @@ def wrap_model_chunks_with_ddp(
             # LayerWise-managed matrices (Muon's Newton-Schulz domain) to a separate buffer.
             # The padded-vs-compact LayerWise layout decision is made inside
             # compute_full_param_layout / _ParamAndGradBuffer from use_layer_wise_param_layout:
-            # with the default padded layout LayerWise buffers stay DistOpt; with
-            # --no-use-layer-wise-param-layout they get the compact no-padding layout and the
-            # per-buffer override flips use_distributed_optimizer off for them.
+            # by default (compact) LayerWise buffers get the no-padding layout and the per-buffer
+            # override flips use_distributed_optimizer off for them; with
+            # --use-layer-wise-param-layout they stay on the padded DistOpt layout.
             ddp_config.use_distributed_optimizer = True
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
             tag_params_for_buffer_routing(model_chunks)
