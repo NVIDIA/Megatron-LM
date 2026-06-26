@@ -27,7 +27,6 @@ import atexit
 import json
 import os
 import re
-import threading
 from typing import List, Optional, Tuple
 
 import torch
@@ -179,9 +178,9 @@ class RouterTracer:
         self.rank = rank
         self.training_mode = training_mode
         self.step_id = 0
+        self._captured_steps = 0  # count of steps actually captured
         self.layers_seen_this_step: set[int] = set()
         self.records: list[dict] = []
-        self._lock = threading.Lock()
         self._stopped = False
         self.capture_hidden_states = capture_hidden_states
         self.capture_logits = capture_logits
@@ -243,17 +242,17 @@ class RouterTracer:
                 than a private 0-based counter. When omitted, the tracer falls
                 back to incrementing its own counter.
         """
-        with self._lock:
-            if step_id is not None:
-                for rec in self.records:
-                    rec["step"] = step_id
-                self.step_id = step_id
-            self._flush_records_to_disk()
-            self.step_id += 1
-            self.layers_seen_this_step.clear()
-            if self.step_id >= self.max_steps:
-                self._stopped = True
-                self.remove_hooks()
+        if step_id is not None:
+            for rec in self.records:
+                rec["step"] = step_id
+            self.step_id = step_id
+        self._flush_records_to_disk()
+        self.step_id += 1
+        self._captured_steps += 1
+        self.layers_seen_this_step.clear()
+        if self._captured_steps >= self.max_steps:
+            self._stopped = True
+            self.remove_hooks()
 
     def make_hook(self, module_name: str = ""):
         """Build a forward hook callable for a single TopKRouter module.
@@ -273,6 +272,7 @@ class RouterTracer:
         return hook
 
     def _extract_hidden_state(self, inputs, expected_num_tokens):
+        """Return a 2-D [num_tokens, hidden_size] bfloat16 tensor from hook inputs, or None."""
         if not inputs:
             return None
         hs = inputs[0]
@@ -322,96 +322,89 @@ class RouterTracer:
             block, mtp_idx, layer = "decoder", None, int(layer_number)
         layer_key = (block, mtp_idx, layer)
 
-        with self._lock:
-            if not self.training_mode:
-                # Inference mode: detect step boundaries via layer repeats.
-                if layer_key in self.layers_seen_this_step:
-                    self._flush_records_to_disk()
-                    self.step_id += 1
-                    self.layers_seen_this_step.clear()
-                    if self.step_id >= self.max_steps:
-                        self._stopped = True
-                        return
-                self.layers_seen_this_step.add(layer_key)
-
-            # The router-weight dump is keyed by the integer `layer` to match the
-            # JSONL records' `layer` field, which is how downstream analysis joins
-            # weights to traces. (`layers_seen_this_step` above uses the full
-            # `layer_key` only for collision-free step-boundary detection.)
-            if self.dump_router_weights and layer not in self._router_state:
-                weight = getattr(module, "weight", None)
-                expert_bias = getattr(module, "expert_bias", None)
-                score_fn = getattr(
-                    getattr(module, "config", None), "moe_router_score_function", None
-                )
-                topk_attr = getattr(module, "topk", None)
-                if torch.is_tensor(weight):
-                    self._router_state[layer] = {
-                        "weight": weight.detach().to("cpu", dtype=torch.float32).clone(),
-                        "expert_bias": (
-                            expert_bias.detach().to("cpu", dtype=torch.float32).clone()
-                            if torch.is_tensor(expert_bias)
-                            else None
-                        ),
-                        "score_function": score_fn,
-                        "topk": topk_attr,
-                    }
-
-            if second.dtype == torch.bool:
-                topk = getattr(module, "topk", None)
-                if topk is None:
+        if not self.training_mode:
+            # Detect step boundaries via layer repeats.
+            if layer_key in self.layers_seen_this_step:
+                self._flush_records_to_disk()
+                self.step_id += 1
+                self.layers_seen_this_step.clear()
+                if self.step_id >= self.max_steps:
+                    self._stopped = True
                     return
-                num_tokens = second.shape[0]
-                _, expert_idx = second.nonzero(as_tuple=True)
-                if expert_idx.numel() != num_tokens * topk:
-                    return
-                top_indices = expert_idx.view(num_tokens, topk)
-            else:
-                top_indices = second
+            self.layers_seen_this_step.add(layer_key)
 
-            top_indices_cpu = top_indices.detach().to("cpu", torch.int32, non_blocking=True)
-            num_tokens = int(top_indices_cpu.shape[0])
+        if self.dump_router_weights and layer_key not in self._router_state:
+            weight = getattr(module, "weight", None)
+            expert_bias = getattr(module, "expert_bias", None)
+            score_fn = getattr(getattr(module, "config", None), "moe_router_score_function", None)
+            topk_attr = getattr(module, "topk", None)
+            if torch.is_tensor(weight):
+                self._router_state[layer_key] = {
+                    "weight": weight.detach().to("cpu", dtype=torch.float32).clone(),
+                    "expert_bias": (
+                        expert_bias.detach().to("cpu", dtype=torch.float32).clone()
+                        if torch.is_tensor(expert_bias)
+                        else None
+                    ),
+                    "score_function": score_fn,
+                    "topk": topk_attr,
+                }
 
-            record: dict = {
-                **self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
-            }
+        if second.dtype == torch.bool:
+            topk = getattr(module, "topk", None)
+            if topk is None:
+                return
+            num_tokens = second.shape[0]
+            _, expert_idx = second.nonzero(as_tuple=True)
+            if expert_idx.numel() != num_tokens * topk:
+                return
+            top_indices = expert_idx.view(num_tokens, topk)
+        else:
+            top_indices = second
 
-            if self.capture_hidden_states:
-                hs = self._extract_hidden_state(inputs, num_tokens)
-                if hs is not None:
-                    hs_cpu = hs.detach().to("cpu", dtype=torch.bfloat16).contiguous()
-                    hs_bytes = hs_cpu.view(torch.int16).numpy().tobytes()
-                    if self._hs_file is None:
-                        self._hs_file = open(self.hs_path, "ab")
-                    self._hs_file.write(hs_bytes)
-                    record["hs_offset"] = self._hs_offset
-                    record["hs_bytes"] = len(hs_bytes)
-                    record["hs_shape"] = list(hs_cpu.shape)
-                    self._hs_offset += len(hs_bytes)
+        top_indices_cpu = top_indices.detach().to("cpu", torch.int32, non_blocking=True)
+        num_tokens = int(top_indices_cpu.shape[0])
 
-            if self.capture_logits:
-                hs_for_gating = self._extract_hidden_state(inputs, num_tokens)
-                gating_fn = getattr(module, "gating", None)
-                if hs_for_gating is not None and callable(gating_fn):
-                    try:
-                        with torch.no_grad():
-                            logits = gating_fn(hs_for_gating)
-                        if isinstance(logits, tuple):
-                            logits = logits[0]
-                    except Exception:
-                        logits = None
-                    if torch.is_tensor(logits) and logits.shape[0] == num_tokens:
-                        logits_cpu = logits.detach().to("cpu", dtype=torch.bfloat16).contiguous()
-                        logits_bytes = logits_cpu.view(torch.int16).numpy().tobytes()
-                        if self._logits_file is None:
-                            self._logits_file = open(self.logits_path, "ab")
-                        self._logits_file.write(logits_bytes)
-                        record["logit_offset"] = self._logits_offset
-                        record["logit_bytes"] = len(logits_bytes)
-                        record["logit_shape"] = list(logits_cpu.shape)
-                        self._logits_offset += len(logits_bytes)
+        record: dict = {
+            **self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
+        }
 
-            self.records.append(record)
+        if self.capture_hidden_states:
+            hs = self._extract_hidden_state(inputs, num_tokens)
+            if hs is not None:
+                hs_cpu = hs.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+                hs_bytes = hs_cpu.view(torch.int16).numpy().tobytes()
+                if self._hs_file is None:
+                    self._hs_file = open(self.hs_path, "ab")
+                self._hs_file.write(hs_bytes)
+                record["hs_offset"] = self._hs_offset
+                record["hs_bytes"] = len(hs_bytes)
+                record["hs_shape"] = list(hs_cpu.shape)
+                self._hs_offset += len(hs_bytes)
+
+        if self.capture_logits:
+            hs_for_gating = self._extract_hidden_state(inputs, num_tokens)
+            gating_fn = getattr(module, "gating", None)
+            if hs_for_gating is not None and callable(gating_fn):
+                try:
+                    with torch.no_grad():
+                        logits = gating_fn(hs_for_gating)
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
+                except Exception:
+                    logits = None
+                if torch.is_tensor(logits) and logits.shape[0] == num_tokens:
+                    logits_cpu = logits.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+                    logits_bytes = logits_cpu.view(torch.int16).numpy().tobytes()
+                    if self._logits_file is None:
+                        self._logits_file = open(self.logits_path, "ab")
+                    self._logits_file.write(logits_bytes)
+                    record["logit_offset"] = self._logits_offset
+                    record["logit_bytes"] = len(logits_bytes)
+                    record["logit_shape"] = list(logits_cpu.shape)
+                    self._logits_offset += len(logits_bytes)
+
+        self.records.append(record)
 
     def record_indices(
         self,
@@ -464,13 +457,12 @@ class RouterTracer:
             )
 
         step = self.step_id if step is None else step
-        with self._lock:
-            for i, layer_indices in enumerate(per_layer):
-                layer = i if layer_ids is None else layer_ids[i]
-                top_indices_cpu = layer_indices.detach().to("cpu", torch.int32, non_blocking=True)
-                self.records.append(
-                    self._make_index_record(top_indices_cpu, step, block, mtp_idx, layer)
-                )
+        for i, layer_indices in enumerate(per_layer):
+            layer = i if layer_ids is None else layer_ids[i]
+            top_indices_cpu = layer_indices.detach().to("cpu", torch.int32, non_blocking=True)
+            self.records.append(
+                self._make_index_record(top_indices_cpu, step, block, mtp_idx, layer)
+            )
 
     def _flush_records_to_disk(self) -> None:
         if not self.records:
@@ -489,15 +481,14 @@ class RouterTracer:
 
     def flush(self) -> None:
         """Flush remaining records."""
-        with self._lock:
-            self._flush_records_to_disk()
-            if self._hs_file is not None:
-                self._hs_file.close()
-                self._hs_file = None
-            if self._logits_file is not None:
-                self._logits_file.close()
-                self._logits_file = None
-            if self.dump_router_weights and self._router_state:
-                weights_path = os.path.join(self.output_dir, f"router_state_rank{self.rank}.pt")
-                torch.save(self._router_state, weights_path)
-                self._router_state = {}
+        self._flush_records_to_disk()
+        if self._hs_file is not None:
+            self._hs_file.close()
+            self._hs_file = None
+        if self._logits_file is not None:
+            self._logits_file.close()
+            self._logits_file = None
+        if self.dump_router_weights and self._router_state:
+            weights_path = os.path.join(self.output_dir, f"router_state_rank{self.rank}.pt")
+            torch.save(self._router_state, weights_path)
+            self._router_state = {}

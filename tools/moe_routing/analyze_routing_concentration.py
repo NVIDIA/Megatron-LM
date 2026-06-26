@@ -27,7 +27,12 @@ from collections import Counter, defaultdict
 
 
 def load_traces(trace_dir):
-    """Yield (rank, step, layer, num_tokens, top_indices) tuples."""
+    """Yield (rank, step, layer_key, topk, num_tokens, top_indices) tuples.
+
+    layer_key is a (block, mtp_idx, layer) tuple that uniquely identifies a router
+    across decoder and MTP blocks (MTP records carry an "mtp_idx" field so they never
+    collide with decoder layers that share the same layer number).
+    """
     pattern = os.path.join(trace_dir, "router_trace_rank*.jsonl")
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -36,9 +41,10 @@ def load_traces(trace_dir):
         with open(path) as f:
             for line in f:
                 r = json.loads(line)
+                layer_key = (r.get("block", "decoder"), r.get("mtp_idx"), r["layer"])
                 yield (
-                    r["rank"], r["step"], r["layer"],
-                    r["num_tokens"], r["top_indices"],
+                    r["rank"], r["step"], layer_key,
+                    r.get("topk", None), r["num_tokens"], r["top_indices"],
                 )
 
 
@@ -85,17 +91,26 @@ def main():
         default="1,2,4,8,16,22,32,64,128,256",
         help="Comma-separated N values for top-N coverage sweep.",
     )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Router top-K value; auto-detected from traces if omitted.",
+    )
     args = parser.parse_args()
 
     n_values = sorted({int(x) for x in args.n_values.split(",")})
 
     # First pass: detect which steps are full forward passes (have many layers)
     # so we can filter to decode-only if requested.
-    step_layer_count = defaultdict(lambda: defaultdict(set))  # rank -> step -> {layers}
+    step_layer_count = defaultdict(lambda: defaultdict(set))  # rank -> step -> {layer_keys}
     step_token_count = defaultdict(lambda: defaultdict(int))  # rank -> step -> num_tokens
-    for rank, step, layer, ntok, _ in load_traces(args.trace_dir):
-        step_layer_count[rank][step].add(layer)
+    per_layer_topk: dict = {}  # layer_key -> topk (auto-detected from first record)
+    for rank, step, layer_key, topk, ntok, _ in load_traces(args.trace_dir):
+        step_layer_count[rank][step].add(layer_key)
         step_token_count[rank][step] = ntok
+        if topk is not None and layer_key not in per_layer_topk:
+            per_layer_topk[layer_key] = topk
 
     # A "full forward pass" has >= 2 layers in the step
     # (filters out single-layer captures like MTP-only steps).
@@ -107,67 +122,100 @@ def main():
         return step_is_full(rank, step) and step_token_count[rank][step] <= 64
 
     # Second pass: accumulate per-layer expert activation counts.
-    # Key: (layer) -> Counter(expert_id -> count)
-    per_layer_freq = defaultdict(Counter)
-    per_layer_tokens = Counter()  # how many tokens contributed to each layer
+    # Key: (block, mtp_idx, layer) -> Counter(expert_id -> count)
+    per_layer_freq: dict = defaultdict(Counter)
+    per_layer_tokens: Counter = Counter()  # how many tokens contributed to each layer_key
 
     filter_fn = step_is_decode if args.decode_only else step_is_full
     skipped_steps = 0
     accepted_records = 0
-    for rank, step, layer, ntok, top_indices in load_traces(args.trace_dir):
+    for rank, step, layer_key, topk, ntok, top_indices in load_traces(args.trace_dir):
         if not filter_fn(rank, step):
             skipped_steps += 1
             continue
         accepted_records += 1
         for token_top in top_indices:
             for e in token_top:
-                per_layer_freq[layer][e] += 1
-        per_layer_tokens[layer] += len(top_indices)
+                per_layer_freq[layer_key][e] += 1
+        per_layer_tokens[layer_key] += len(top_indices)
 
-    layers = sorted(per_layer_freq.keys())
+    layer_keys = sorted(per_layer_freq.keys())
+    if not layer_keys:
+        print("No data found. Exiting.")
+        return
+
+    # Resolve the router top-K to use for uniform-baseline comparisons.
+    # Prefer per-layer values recorded in the trace; fall back to --top-k; warn if unknown.
+    def _layer_topk(lk):
+        if lk in per_layer_topk:
+            return per_layer_topk[lk]
+        if args.top_k is not None:
+            return args.top_k
+        return None
+
+    global_topk = args.top_k or (
+        max(set(per_layer_topk.values()), key=list(per_layer_topk.values()).count)
+        if per_layer_topk else None
+    )
+    if global_topk is None:
+        print("[WARNING] top-K not found in traces and --top-k not provided; "
+              "uniform-baseline column will be omitted.")
+
+    def _label(lk):
+        block, mtp_idx, layer = lk
+        if block == "decoder":
+            return f"d:{layer}"
+        return f"m{mtp_idx}:{layer}"
+
     print(f"Loaded traces from: {args.trace_dir}")
     print(f"Filter: {'decode-only' if args.decode_only else 'full forward passes (any size)'}")
     print(f"Accepted records: {accepted_records}; skipped: {skipped_steps}")
-    print(f"Layers found: {len(layers)}  ({layers[0]}..{layers[-1]})")
-    if not layers:
-        print("No data to analyze. Exiting.")
-        return
+    print(f"Layers found: {len(layer_keys)}  ({_label(layer_keys[0])}..{_label(layer_keys[-1])})")
+    if global_topk is not None:
+        print(f"Top-K (router): {global_topk}")
 
+    bl_header = f" | uniform-bl@{global_topk}" if global_topk is not None else ""
     print("\nPer-layer concentration:")
     header = (
-        f"  {'layer':>5} | {'tokens':>6} | {'uniq':>4} | "
+        f"  {'layer':>8} | {'tokens':>6} | {'uniq':>4} | "
         + " | ".join(f"top{n}" for n in n_values)
-        + " | uniform-bl@22"
+        + bl_header
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
 
     per_layer_results = []
-    for layer in layers:
-        freqs = per_layer_freq[layer]
-        ntoken = per_layer_tokens[layer]
+    for lk in layer_keys:
+        freqs = per_layer_freq[lk]
+        ntoken = per_layer_tokens[lk]
         unique_experts = len(freqs)
         cov = topk_coverage(freqs, n_values)
-        uniform_bl = 22 / args.num_experts  # random baseline at N=22
+        topk_for_layer = _layer_topk(lk)
+        uniform_bl = (topk_for_layer / args.num_experts) if topk_for_layer is not None else None
         per_layer_results.append({
-            "layer": layer,
+            "layer_key": lk,
+            "layer_label": _label(lk),
             "num_tokens": ntoken,
             "unique_experts": unique_experts,
             **{f"top{n}": cov[n] for n in n_values},
         })
         cov_str = " | ".join(f"{cov[n]:.3f}" for n in n_values)
+        bl_str = f" | {uniform_bl:.3f}" if uniform_bl is not None else ""
         print(
-            f"  {layer:>5} | {ntoken:>6} | {unique_experts:>4} | "
-            f"{cov_str} | {uniform_bl:.3f}"
+            f"  {_label(lk):>8} | {ntoken:>6} | {unique_experts:>4} | "
+            f"{cov_str}{bl_str}"
         )
 
     print("\nAggregate (averaged across layers):")
     for n in n_values:
         cov_vals = [r[f"top{n}"] for r in per_layer_results]
         mean_cov = sum(cov_vals) / len(cov_vals)
-        uniform_bl = n / args.num_experts
-        ratio = mean_cov / uniform_bl
-        print(f"  Mean top-{n} coverage: {mean_cov:.3f}  (uniform baseline: {uniform_bl:.3f}, ratio: {ratio:.2f}×)")
+        if global_topk is not None:
+            uniform_bl = n / args.num_experts
+            ratio = mean_cov / uniform_bl
+            print(f"  Mean top-{n} coverage: {mean_cov:.3f}  (uniform baseline: {uniform_bl:.3f}, ratio: {ratio:.2f}×)")
+        else:
+            print(f"  Mean top-{n} coverage: {mean_cov:.3f}")
 
     print(
         "\nInterpretation: coverage ratio = observed / uniform baseline."
@@ -180,19 +228,26 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         csv_path = os.path.join(args.output_dir, "concentration_per_layer.csv")
         with open(csv_path, "w") as f:
-            cols = ["layer", "num_tokens", "unique_experts"] + [f"top{n}" for n in n_values]
+            cols = ["block", "mtp_idx", "layer", "layer_label", "num_tokens", "unique_experts"] + [
+                f"top{n}" for n in n_values
+            ]
             f.write(",".join(cols) + "\n")
             for r in per_layer_results:
-                f.write(",".join(str(r[c]) for c in cols) + "\n")
+                block, mtp_idx, layer = r["layer_key"]
+                row = [block, str(mtp_idx), str(layer), r["layer_label"],
+                       str(r["num_tokens"]), str(r["unique_experts"])]
+                row += [str(r[f"top{n}"]) for n in n_values]
+                f.write(",".join(row) + "\n")
         print(f"\nWrote {csv_path}")
 
         # Dump per-layer per-expert frequencies too (useful for downstream analyses).
         freq_path = os.path.join(args.output_dir, "expert_frequencies_per_layer.csv")
         with open(freq_path, "w") as f:
-            f.write("layer,expert_id,count\n")
-            for layer in layers:
-                for e, c in sorted(per_layer_freq[layer].items()):
-                    f.write(f"{layer},{e},{c}\n")
+            f.write("block,mtp_idx,layer,expert_id,count\n")
+            for lk in layer_keys:
+                block, mtp_idx, layer = lk
+                for e, c in sorted(per_layer_freq[lk].items()):
+                    f.write(f"{block},{mtp_idx},{layer},{e},{c}\n")
         print(f"Wrote {freq_path}")
 
         # Plots.
@@ -207,8 +262,8 @@ def main():
         # 1) Top-N coverage curve (averaged across layers) vs uniform baseline.
         sweep_n = list(range(1, args.num_experts + 1, max(1, args.num_experts // 100)))
         coverage_curves = []
-        for layer in layers:
-            freqs = per_layer_freq[layer]
+        for lk in layer_keys:
+            freqs = per_layer_freq[lk]
             curve = topk_coverage(freqs, sweep_n)
             coverage_curves.append([curve[n] for n in sweep_n])
         mean_curve = [sum(c[i] for c in coverage_curves) / len(coverage_curves)
@@ -246,18 +301,19 @@ def main():
         show_n = 128
         sorted_experts = sorted_experts[:show_n]
         import numpy as np
-        mat = np.zeros((show_n, len(layers)))
-        for li, layer in enumerate(layers):
-            tot = per_layer_tokens[layer] * 22
+        mat = np.zeros((show_n, len(layer_keys)))
+        for li, lk in enumerate(layer_keys):
+            lk_topk = _layer_topk(lk) or 1
+            tot = per_layer_tokens[lk] * lk_topk
             if tot == 0:
                 continue
             for ei, e in enumerate(sorted_experts):
-                mat[ei, li] = per_layer_freq[layer].get(e, 0) / tot
-        fig, ax = plt.subplots(figsize=(max(8, len(layers) * 0.2), 8))
+                mat[ei, li] = per_layer_freq[lk].get(e, 0) / tot
+        fig, ax = plt.subplots(figsize=(max(8, len(layer_keys) * 0.2), 8))
         im = ax.imshow(mat, aspect="auto", cmap="viridis")
-        ax.set_xticks(range(len(layers)))
-        ax.set_xticklabels(layers, rotation=90, fontsize=6)
-        ax.set_xlabel("MoE layer number")
+        ax.set_xticks(range(len(layer_keys)))
+        ax.set_xticklabels([_label(lk) for lk in layer_keys], rotation=90, fontsize=6)
+        ax.set_xlabel("MoE layer")
         ax.set_ylabel("Expert (top-128 by overall frequency, hottest at top)")
         ax.set_title("Per-(expert × layer) activation rate")
         fig.colorbar(im, ax=ax, label="Fraction of layer's token-expert activations")
