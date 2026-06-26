@@ -2924,10 +2924,6 @@ def save_checkpoint_and_time(
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
     ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
@@ -2938,6 +2934,12 @@ def save_checkpoint_and_time(
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+
+    if should_report_memory:
+        # Track memory before checkpoint save.
+        report_memory(
+            f"(before save_checkpoint for iteration {iteration})", process_group=dp_group
+        )
 
     # Save checkpoint.
     save_checkpoint(
@@ -2964,7 +2966,9 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(
+            f"(after save_checkpoint for iteration {iteration})", process_group=dp_group
+        )
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
