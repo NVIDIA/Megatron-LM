@@ -34,15 +34,7 @@ _ENCODER_SEED_OFFSET = 10_000
 
 @dataclass
 class MimoRuntime:
-    """Per-rank state the stock ``train()`` needs to drive a hetero MIMO run.
-
-    Attributes:
-        model: Single-element list holding this rank's DDP-wrapped :class:`MimoModel`.
-        topology: The :class:`HeteroTopology` carrying grids and the schedule PGC.
-        communicator: The :class:`MultiModulePipelineCommunicator` for cross-module P2P.
-        data_iterator: This rank's role-aware data iterator, or ``None`` if it consumes no data.
-        pg_collection: This rank's per-module PGC (language on LLM ranks, else encoder).
-    """
+    """Per-rank state the stock ``train()`` needs to drive a hetero MIMO run."""
 
     model: list
     topology: HeteroTopology
@@ -84,11 +76,7 @@ def _resolve_role(topology: HeteroTopology):
 def _seed_module_rng(
     args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_seed_offset: int
 ) -> None:
-    """Seed host + per-module CUDA RNG for one role via the stock _set_random_seed.
-
-    These ranks have no initialized mpu, so the role's parallel groups supply the
-    pp/dp/tp/ep/etp ranks.
-    """
+    """Seed host + CUDA RNG for one module role from its parallel groups (no mpu here)."""
     _set_random_seed(
         args.seed + role_seed_offset,
         args.data_parallel_random_init,
@@ -145,25 +133,15 @@ def mimo_model_provider(
 
 
 def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
-    """Assemble the per-rank hetero MIMO runtime and return a :class:`MimoRuntime`.
-
-    Builds the grid specs and topology, seeds per-role RNG, constructs the role
-    ``MimoModel`` without a top-level DDP wrap (the MIMO optimizer needs
-    per-submodule DDP), DDP-wraps the active submodules, attaches the per-module
-    PGC, installs the grad-finalization hook, and builds the p2p communicator and
-    data iterator.
-    """
+    """Assemble this rank's hetero MIMO runtime for the stock ``train()`` loop."""
     world_size = torch.distributed.get_world_size()
     specs = build_module_grid_specs(args, world_size, RADIO_ENCODER_MODULE_NAME)
     topology = create_topology(specs)
 
-    # --- 2. Resolve this rank's role. --------------------------------------
     _, rank_in_language, rank_in_encoder, language_pg, encoder_pg = _resolve_role(topology)
 
-    # --- 3. Seed this rank's single module role BEFORE building the model. -
-    # The model is built eagerly here, before pretrain()/initialize_megatron runs,
-    # so weight init's get_cuda_rng_tracker().fork() needs the per-role seed now.
-    # pretrain's later re-seed resets the tracker, so the double seed is harmless.
+    # The model is built eagerly (before pretrain() seeds), so weight init needs the
+    # per-role seed now; pretrain's later re-seed resets the tracker.
     if rank_in_language:
         assert language_pg is not None
         _seed_module_rng(args, language_pg, _LANGUAGE_SEED_OFFSET)
@@ -171,24 +149,14 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
         assert encoder_pg is not None
         _seed_module_rng(args, encoder_pg, _ENCODER_SEED_OFFSET)
 
-    # Same provider pretrain() receives; build_mimo_runtime is its single call site.
     mimo_model = mimo_model_provider(topology=topology, args=args)
-
-    # --- 5. DDP-wrap the active submodules (per-submodule DDP). ------------
     wrap_active_modules_with_ddp(args, mimo_model, topology)
 
-    # --- 6. Attach this rank's per-module PGC for the stock train() path. --
-    # train()/training_log reads model.pg_collection for DP-keyed reductions and
-    # logging. This is the PER-MODULE PGC (language on LLM ranks, encoder on
-    # encoder ranks) -- NOT topology.schedule_pg_collection (the multi-module
-    # collection the schedule consumes). They are kept distinct deliberately.
+    # Per-module PGC (not the multi-module schedule PGC) for train()'s DP reductions.
     rank_pg_collection = language_pg if rank_in_language else encoder_pg
     mimo_model.pg_collection = rank_pg_collection
 
-    # --- 7. Install the dual (language + encoder) grad-finalization hook. --
     configure_grad_sync(args, mimo_model, topology)
-
-    # --- 8. p2p communicator + role-aware data iterator. ------------------
     communicator = build_pipeline_communicator(mimo_model, topology)
     data_iterator = select_data_iterator(args, topology)
 
@@ -204,14 +172,7 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
 def build_pipeline_communicator(
     model: MimoModel, topology: HeteroTopology
 ) -> MultiModulePipelineCommunicator:
-    """Build the MIMO cross-module P2P communicator the train schedule uses.
-
-    The vision encoder emits a 2D ``[B*S, H]`` activation, so its
-    ``module_output_ndim`` is 2; the language module keeps the default 3D.
-    ``model.config`` is the canonical ``ModelParallelConfig`` (the MimoModel's
-    language config), identical on every rank, used for shape/dtype bookkeeping
-    on cross-module transfers.
-    """
+    """Build the cross-module P2P communicator (vision encoder emits 2D activations)."""
     encoder_name = _encoder_module_name(topology)
     module_output_ndim = {}
     if encoder_name is not None:
