@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
@@ -48,6 +49,22 @@ class NestedModel(nn.Module):
         return self.inner(x) + self.bias
 
 
+class MultiChildModel(nn.Module):
+    """Model with direct parameters and multiple child FSDP units."""
+
+    def __init__(self, dim: int, num_children: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim))
+        self.layers = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_children)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run through every child layer with a root-owned bias."""
+        x = x + self.bias
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return x
+
+
 class SaveNonLeafWeightView(torch.autograd.Function):
     """Autograd function that saves a non-leaf parameter view for backward."""
 
@@ -85,6 +102,13 @@ def _flat_placements() -> Placements:
 
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
+
+
+def _events_overlap(first, second) -> bool:
+    return (
+        first.time_range.start < second.time_range.end
+        and second.time_range.start < first.time_range.end
+    )
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 3])
@@ -158,12 +182,205 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     inner_names = [
-        name for group in model.inner.parameter_groups() for name in group.parameter_names
+        name for group in model.inner.parameter_groups for name in group.parameter_names
     ]
-    outer_names = [name for group in model.parameter_groups() for name in group.parameter_names]
+    outer_names = [name for group in model.parameter_groups for name in group.parameter_names]
 
     assert inner_names == ["weight"]
     assert outer_names == ["bias"]
+
+
+def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setup):
+    """Forward peak memory should stay below three live child all-gathers."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    x = torch.randn(2, dim, device=device, dtype=dtype)
+    with torch.no_grad():
+        model(x)
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+    resting_allocated = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.no_grad():
+        model(x)
+    torch.cuda.synchronize(device)
+    peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
+
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    bound_nbytes = 3 * child_weight_nbytes
+
+    # A parent forward should keep one previous child unsharded until its compute
+    # stream consumer is safe, plus the current child being unsharded. The bound
+    # is looser than two child weights to avoid coupling this test to CUDA
+    # allocator granularity and small temporary buffers, while still catching
+    # delayed releases piling up across the four child layers.
+    assert peak_delta < bound_nbytes, (
+        "FSDP forward peak memory exceeded the in-flight all-gather bound: "
+        f"rank={rank}, peak_delta={_mb(peak_delta)}, "
+        f"three_child_weights={_mb(bound_nbytes)}"
+    )
+
+
+def test_root_forward_returns_to_resting_memory(distributed_setup):
+    """Root forward should release child all-gather storage before returning."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    x = torch.randn(2, dim, device=device, dtype=dtype)
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    resting_allocated = torch.cuda.memory_allocated(device)
+
+    with torch.no_grad():
+        output = model(x)
+    del output
+    torch.cuda.synchronize(device)
+    allocated_after_forward = torch.cuda.memory_allocated(device)
+    extra_allocated = allocated_after_forward - resting_allocated
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+
+    assert extra_allocated < child_weight_nbytes, (
+        "Root forward did not return to resting memory after draining child releases: "
+        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
+        f"one_child_weight={_mb(child_weight_nbytes)}"
+    )
+
+
+def test_root_backward_returns_to_resting_memory(distributed_setup):
+    """Root backward should release child all-gather storage before returning."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
+    output = model(x)
+    loss = output.float().square().mean()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    allocated_before_backward = torch.cuda.memory_allocated(device)
+
+    loss.backward()
+    del loss, output
+    torch.cuda.synchronize(device)
+    allocated_after_backward = torch.cuda.memory_allocated(device)
+    extra_allocated = allocated_after_backward - allocated_before_backward
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+
+    assert extra_allocated < child_weight_nbytes, (
+        "Root backward did not return to resting memory after draining child releases: "
+        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
+        f"one_child_weight={_mb(child_weight_nbytes)}"
+    )
+
+
+def test_overlaps_all_gather_and_compute(distributed_setup):
+    """A shared root context should let child all-gathers overlap GEMM compute."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    num_children = 4
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
+
+    def train_one_iteration() -> None:
+        model.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+
+    train_one_iteration()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_iteration()
+        prof.step()
+    torch.cuda.synchronize(device)
+
+    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
+    all_gather_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower() and "allgather" in event.name.lower()
+    ]
+    compute_events = [
+        event
+        for event in cuda_events
+        if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas"))
+    ]
+    assert all_gather_events, [event.name for event in cuda_events]
+    assert compute_events, [event.name for event in cuda_events]
+
+    all_gather_streams = {event.device_resource_id for event in all_gather_events}
+    compute_streams = {event.device_resource_id for event in compute_events}
+    assert len(all_gather_streams) == 1
+    assert all_gather_streams.isdisjoint(compute_streams)
+
+    overlap_count = sum(
+        any(_events_overlap(all_gather_event, compute_event) for compute_event in compute_events)
+        for all_gather_event in all_gather_events
+    )
+    # This profiles a full forward/backward iteration, so backward all-gathers are
+    # included in all_gather_events. The expected overlap count is from the forward
+    # child pipeline: each child after the first can all-gather while the previous
+    # child computes, giving num_children - 1 overlaps. Backward does not overlap
+    # in this all-gather-only path because gradient reduction is not delayed:
+    # each module synchronously reduces gradients in post_backward before autograd
+    # reaches the next module's pre_backward all-gather. The next PR addresses
+    # this by delaying gradient reduction.
+    expected_overlap_count = num_children - 1
+    assert overlap_count >= expected_overlap_count, (
+        f"Expected at least {expected_overlap_count} all-gather events to overlap compute, "
+        f"got {overlap_count}/{len(all_gather_events)}."
+    )
 
 
 def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
@@ -179,7 +396,7 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    (group,) = model.parameter_groups()
+    (group,) = model.parameter_groups
     assert not group.requires_grad
     assert group.main_grad is None
 
@@ -279,7 +496,7 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    (group,) = model.parameter_groups()
+    (group,) = model.parameter_groups
     full_weight = group.model_weight.allgather(0).get_local_tensor(0)
     assert full_weight.device.type == device.type
     torch.testing.assert_close(full_weight, expected_weight)
@@ -296,7 +513,7 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     model = NonLeafViewModel().to(device)
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    group = model.parameter_groups()[0]
+    group = model.parameter_groups[0]
     x = torch.randn(8, device=device, requires_grad=True)
     loss = model(x).sum()
 
