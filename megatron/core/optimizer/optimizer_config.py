@@ -328,9 +328,7 @@ class OptimizerConfig:
     the shard-aligned padded LayerWise param layout. When False, the compact decoupled layout
     is selected: LayerWise-managed (Muon) buffers use a compact no-padding DDP layout with
     all-reduce gradients and legacy whole-param ping-pong ownership + ``allgather_params``
-    param sync, while non-LayerWise buffers keep the standard byte-level
-    :class:`DistributedOptimizer` layout. Removes the persistent ``dp_size * max(shard_load)``
-    LayerWise padding. Mirrors ``DistributedDataParallelConfig.use_layer_wise_param_layout``."""
+    param sync."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 

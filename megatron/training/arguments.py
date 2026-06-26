@@ -1901,7 +1901,8 @@ def validate_args(args, defaults={}):
         )
         if not args.use_layer_wise_param_layout:
             assert args.num_distributed_optimizer_instances == 1, (
-                "--no-use-layer-wise-param-layout (decoupled compact LayerWise DDP layout) requires "
+                "the decoupled compact LayerWise DDP layout (the default; pass "
+                "--use-layer-wise-param-layout for the padded layout) requires "
                 "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
                 "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
@@ -4218,20 +4219,16 @@ def _add_distributed_args(parser):
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
     group.add_argument(
-        '--no-use-layer-wise-param-layout',
-        action='store_false',
+        '--use-layer-wise-param-layout',
+        action='store_true',
         dest='use_layer_wise_param_layout',
-        help='Opt out of the precomputed shard-aligned (padded) LayerWise param layout. '
-        'With an emerging (Muon) optimizer under --use-distributed-optimizer, this selects '
-        'the experimental compact, decoupled DDP layout: LayerWise-managed (Muon 2D matrix) '
-        'buffers use a compact no-padding DDP layout and locally disable DistributedOptimizer '
-        'semantics (all-reduce gradients + legacy whole-param ping-pong ownership + '
-        'allgather_params param sync), while sibling non-LayerWise buffers (embeddings, '
-        'biases, layernorm) keep the standard byte-level DistributedOptimizer. This removes '
-        'the persistent dp_size * max(shard_load) LayerWise padding from the long-lived '
-        'buffers. Incompatible with FP8 parameter gather (fp8_param_gather=True). Produces '
-        'different bf16 reduction ordering from the default padded layout, so will not match '
-        'its loss curves bit-for-bit.',
+        default=False,
+        help='Opt INTO the padded shard-aligned LayerWise param layout. The default is the compact '
+        'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
+        'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
+        'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
+        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
+        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 
