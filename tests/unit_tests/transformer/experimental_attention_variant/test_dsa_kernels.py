@@ -2855,6 +2855,387 @@ class TestRealKernelFusedIndexerSparseAttnThd:
 
 
 # ---------------------------------------------------------------------------
+# THD padding-row masking: cu_seqlens_q_unpadded excludes padding from loss
+# ---------------------------------------------------------------------------
+
+
+class TestThdPaddingRowMasking:
+    """Verify that **per-segment** padding rows do NOT contribute to the
+    indexer KL loss when ``cu_seqlens_q_unpadded`` is supplied.
+    """
+
+    SHAPES = dict(
+        np_=64,
+        d=512,
+        idx_nh=64,
+        idx_hd=128,
+        indexer_topk=512,
+        ratio=4,
+        win_topk=8,
+        softmax_scale=512**-0.5,
+        indexer_softmax_scale=128**-0.5,
+    )
+    # 3 sequences with per-segment padding.
+    SEG_LENS_REAL = [60, 44, 720]  # real token counts per sequence
+    SEG_LENS_PADDED = [64, 48, 1024]  # padded to multiple of 4
+
+    @staticmethod
+    def _build_multi_seg_inputs(seg_lens, shapes, dev, *, seed=42):
+        """Build THD multi-segment inputs for fused_indexer_sparse_attn.
+
+        Each segment has its own original KV (len = seg_len) and compressed
+        KV (len = seg_len // ratio), concatenated per-segment in kv_full.
+        """
+        torch.manual_seed(seed)
+        s = shapes
+        ratio = s['ratio']
+        total_q = sum(seg_lens)
+        comp_lens = [sl // ratio for sl in seg_lens]
+        total_comp = sum(comp_lens)
+        kv_full_seg_lens = [sl + cl for sl, cl in zip(seg_lens, comp_lens)]
+        total_kv_full = sum(kv_full_seg_lens)
+        max_seqlen_q = max(seg_lens)
+        max_comp = max(comp_lens) if comp_lens else 0
+
+        query = torch.randn(total_q, s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+        kv_full = torch.randn(total_kv_full, s['d'], dtype=torch.bfloat16, device=dev)
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
+
+        # Per-segment local window indices.
+        win_idxs = torch.zeros(total_q, s['win_topk'], dtype=torch.int32, device=dev)
+        offset = 0
+        for sl in seg_lens:
+            if sl > 0:
+                win_idxs[offset : offset + sl] = torch.randint(
+                    0, sl, (sl, s['win_topk']), dtype=torch.int32, device=dev
+                )
+            offset += sl
+
+        q_indexer = torch.randn(total_q, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        k_indexer = torch.randn(total_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
+
+        compressed_parts = []
+        kv_offset = 0
+        for sl, cl in zip(seg_lens, comp_lens):
+            compressed_parts.append(kv_full[kv_offset + sl : kv_offset + sl + cl])
+            kv_offset += sl + cl
+        compressed_kv = torch.cat(compressed_parts, dim=0) if compressed_parts else kv_full[:0]
+
+        cu_q = _make_cu_seqlens(seg_lens, device=dev)
+        cu_kv = _make_cu_seqlens(seg_lens, device=dev)
+        cu_kv_full = _make_cu_seqlens(kv_full_seg_lens, device=dev)
+        cu_comp = _make_cu_seqlens(comp_lens, device=dev)
+
+        return dict(
+            query=query,
+            kv_full=kv_full,
+            attn_sink=attn_sink,
+            win_idxs=win_idxs,
+            q_indexer=q_indexer,
+            k_indexer=k_indexer,
+            weights=weights,
+            compressed_kv=compressed_kv,
+            cu_q=cu_q,
+            cu_kv=cu_kv,
+            cu_kv_full=cu_kv_full,
+            cu_comp=cu_comp,
+            total_q=total_q,
+            max_seqlen_q=max_seqlen_q,
+            max_comp=max_comp,
+            seg_lens=seg_lens,
+            comp_lens=comp_lens,
+        )
+
+    @staticmethod
+    def _build_per_seg_padded(real_inputs, padded_seg_lens, shapes, dev, *, fill_pad_random=False):
+        """Expand real inputs to a per-segment-padded layout.
+
+        Each segment is expanded from its real length to its padded length
+        (padding rows inserted at the tail of each segment).
+
+        Returns (padded_inputs_dict, cu_q_unpadded).
+        """
+        s = shapes
+        ratio = s['ratio']
+        r = real_inputs
+        real_seg_lens = r['seg_lens']
+        num_segs = len(real_seg_lens)
+        total_q_padded = sum(padded_seg_lens)
+        comp_lens_padded = [pl // ratio for pl in padded_seg_lens]
+        total_comp_padded = sum(comp_lens_padded)
+        kv_full_seg_lens_padded = [pl + cl for pl, cl in zip(padded_seg_lens, comp_lens_padded)]
+        total_kv_full_padded = sum(kv_full_seg_lens_padded)
+
+        fill_fn = torch.randn if fill_pad_random else torch.zeros
+
+        # Build padded Q-side tensors by scattering real data into padded slots.
+        query_pad = fill_fn(total_q_padded, s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+        q_idx_pad = fill_fn(
+            total_q_padded, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
+        )
+        w_pad = fill_fn(total_q_padded, s['idx_nh'], dtype=torch.bfloat16, device=dev)
+        win_pad = torch.zeros(total_q_padded, s['win_topk'], dtype=torch.int32, device=dev)
+
+        real_offset = 0
+        pad_offset = 0
+        for i in range(num_segs):
+            rl = real_seg_lens[i]
+            pl = padded_seg_lens[i]
+            query_pad[pad_offset : pad_offset + rl] = r['query'][real_offset : real_offset + rl]
+            q_idx_pad[pad_offset : pad_offset + rl] = r['q_indexer'][real_offset : real_offset + rl]
+            w_pad[pad_offset : pad_offset + rl] = r['weights'][real_offset : real_offset + rl]
+            win_pad[pad_offset : pad_offset + rl] = r['win_idxs'][real_offset : real_offset + rl]
+            real_offset += rl
+            pad_offset += pl
+
+        # Build padded K-side (compressed indexer K).
+        k_idx_pad = fill_fn(total_comp_padded, s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        comp_kv_pad = fill_fn(total_comp_padded, s['d'], dtype=torch.bfloat16, device=dev)
+        real_comp_offset = 0
+        pad_comp_offset = 0
+        for i in range(num_segs):
+            rcl = r['comp_lens'][i]
+            pcl = comp_lens_padded[i]
+            k_idx_pad[pad_comp_offset : pad_comp_offset + rcl] = r['k_indexer'][
+                real_comp_offset : real_comp_offset + rcl
+            ]
+            comp_kv_pad[pad_comp_offset : pad_comp_offset + rcl] = r['compressed_kv'][
+                real_comp_offset : real_comp_offset + rcl
+            ]
+            real_comp_offset += rcl
+            pad_comp_offset += pcl
+
+        # Build padded kv_full: per-segment [orig_kv (padded_len), compressed (padded_comp)].
+        kv_full_pad = fill_fn(total_kv_full_padded, s['d'], dtype=torch.bfloat16, device=dev)
+        real_kv_offset = 0
+        pad_kv_offset = 0
+        real_comp_offset2 = 0
+        pad_comp_offset2 = 0
+        for i in range(num_segs):
+            rl = real_seg_lens[i]
+            pl = padded_seg_lens[i]
+            rcl = r['comp_lens'][i]
+            pcl = comp_lens_padded[i]
+            # Copy real orig-KV rows.
+            src_start = sum(s + c for s, c in zip(real_seg_lens[:i], r['comp_lens'][:i]))
+            kv_full_pad[pad_kv_offset : pad_kv_offset + rl] = r['kv_full'][
+                src_start : src_start + rl
+            ]
+            # Copy real compressed rows.
+            kv_full_pad[pad_kv_offset + pl : pad_kv_offset + pl + rcl] = r['kv_full'][
+                src_start + rl : src_start + rl + rcl
+            ]
+            pad_kv_offset += pl + pcl
+
+        cu_q_padded = _make_cu_seqlens(padded_seg_lens, device=dev)
+        cu_kv_padded = _make_cu_seqlens(padded_seg_lens, device=dev)
+        cu_kv_full_padded = _make_cu_seqlens(kv_full_seg_lens_padded, device=dev)
+        cu_comp_padded = _make_cu_seqlens(comp_lens_padded, device=dev)
+
+        # Unpadded cu_seqlens: cumulative REAL lengths within the padded layout.
+        cu_q_unpadded = _make_cu_seqlens(list(real_seg_lens), device=dev)
+
+        max_seqlen_q_padded = max(padded_seg_lens)
+        max_comp_padded = max(comp_lens_padded)
+
+        return (
+            dict(
+                query=query_pad,
+                kv_full=kv_full_pad,
+                attn_sink=r['attn_sink'],
+                win_idxs=win_pad,
+                q_indexer=q_idx_pad,
+                k_indexer=k_idx_pad,
+                weights=w_pad,
+                compressed_kv=comp_kv_pad,
+                cu_q=cu_q_padded,
+                cu_kv=cu_kv_padded,
+                cu_kv_full=cu_kv_full_padded,
+                cu_comp=cu_comp_padded,
+                total_q=total_q_padded,
+                max_seqlen_q=max_seqlen_q_padded,
+                max_comp=max_comp_padded,
+            ),
+            cu_q_unpadded,
+        )
+
+    def _run_fused(
+        self, inputs, shapes, *, sparse_loss, loss_coeff=0.5, cu_seqlens_q_unpadded=None
+    ):
+        """Run fused_indexer_sparse_attn with the given inputs dict."""
+        s = shapes
+        i = inputs
+        return fused_indexer_sparse_attn(
+            i['query'],
+            i['kv_full'],
+            i['attn_sink'],
+            i['win_idxs'],
+            i['q_indexer'],
+            i['k_indexer'],
+            i['weights'],
+            indexer_topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            softmax_scale=s['softmax_scale'],
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            loss_coeff=loss_coeff,
+            sparse_loss=sparse_loss,
+            kv_offset=0,
+            cu_seqlens_q=i['cu_q'],
+            cu_seqlens_kv=i['cu_kv'],
+            cu_seqlens_kv_full=i['cu_kv_full'],
+            cu_seqlens_compressed_idx=i['cu_comp'],
+            max_seqlen_q=i['max_seqlen_q'],
+            max_seqlen_compressed_idx=i['max_comp'],
+            compressed_kv=i['compressed_kv'],
+            cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
+            # Per-token (sum) reduction — the real training path. Padding
+            # rows contribute 0 to the sum, so the loss is padding-invariant
+            # by construction; the global token divisor is applied later by
+            # DSAIndexerLossAutoScaler.set_loss_scale. Mean reduction would
+            # instead divide by the padded row count and dilute the loss.
+            calculate_per_token_loss=True,
+        )
+
+    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
+    def test_per_seg_padding_excluded_from_loss(self, sparse_loss, reset_lazy_kernel_state):
+        """Per-segment padding rows should not contribute to indexer KL.
+
+        Strategy: compute loss on tightly-packed real data (no padding),
+        then expand each segment with intra-segment padding and supply
+        cu_seqlens_q_unpadded.  Losses should match.
+        """
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        dev = 'cuda'
+
+        # Baseline: tightly packed (real lengths only, no padding).
+        real = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
+        _, loss_no_pad = self._run_fused(real, self.SHAPES, sparse_loss=sparse_loss)
+
+        # Padded: each segment expanded to padded length (zeros in padding).
+        padded, cu_q_unpadded = self._build_per_seg_padded(
+            real, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=False
+        )
+        _, loss_with_pad = self._run_fused(
+            padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+        )
+
+        assert torch.allclose(loss_with_pad, loss_no_pad, atol=5e-2, rtol=1e-1), (
+            f"sparse_loss={sparse_loss}: padded = {loss_with_pad.item():.6f}, "
+            f"no_pad = {loss_no_pad.item():.6f}, "
+            f"abs diff = {(loss_with_pad - loss_no_pad).abs().item():.3e}"
+        )
+
+    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
+    def test_per_seg_padding_unmasked_corrupts_loss(self, sparse_loss, reset_lazy_kernel_state):
+        """Without cu_seqlens_q_unpadded, random per-segment padding rows
+        DO corrupt the loss — confirming the masking is necessary.
+        """
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        dev = 'cuda'
+
+        real = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
+        _, loss_no_pad = self._run_fused(real, self.SHAPES, sparse_loss=sparse_loss)
+
+        # Padded with RANDOM noise in per-segment padding slots.
+        padded, _ = self._build_per_seg_padded(
+            real, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=True
+        )
+        _, loss_unmasked = self._run_fused(padded, self.SHAPES, sparse_loss=sparse_loss)
+
+        assert not torch.allclose(loss_unmasked, loss_no_pad, atol=5e-2, rtol=1e-1), (
+            f"sparse_loss={sparse_loss}: unmasked loss ({loss_unmasked.item():.6f}) should "
+            f"differ from no-pad loss ({loss_no_pad.item():.6f}) since per-segment "
+            "padding has random data producing non-zero KL"
+        )
+
+    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
+    def test_per_seg_padding_grads_are_zeroed(self, sparse_loss, reset_lazy_kernel_state):
+        """Indexer gradients at per-segment padding positions are zero,
+        and gradients at real-token positions match the unpadded baseline.
+        """
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        dev = 'cuda'
+
+        # ---- Unpadded baseline (reference grads) -----------------------------
+        real = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
+        real['q_indexer'] = real['q_indexer'].detach().requires_grad_(True)
+        real['k_indexer'] = real['k_indexer'].detach().requires_grad_(True)
+        real['weights'] = real['weights'].detach().requires_grad_(True)
+
+        _, loss_real = self._run_fused(real, self.SHAPES, sparse_loss=sparse_loss)
+        loss_real.backward()
+        grad_q_real = real['q_indexer'].grad.detach().clone()
+        grad_w_real = real['weights'].grad.detach().clone()
+
+        # ---- Padded run with masking -----------------------------------------
+        real_nograd = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
+        padded, cu_q_unpadded = self._build_per_seg_padded(
+            real_nograd, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=True
+        )
+
+        padded['q_indexer'] = padded['q_indexer'].detach().requires_grad_(True)
+        padded['k_indexer'] = padded['k_indexer'].detach().requires_grad_(True)
+        padded['weights'] = padded['weights'].detach().requires_grad_(True)
+
+        _, indexer_loss = self._run_fused(
+            padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+        )
+        indexer_loss.backward()
+
+        # ---- Identify real and padding positions -----------------------------
+        real_positions = []
+        pad_positions = []
+        pad_offset = 0
+        for rl, pl in zip(self.SEG_LENS_REAL, self.SEG_LENS_PADDED):
+            for pos in range(rl):
+                real_positions.append(pad_offset + pos)
+            for pos in range(rl, pl):
+                pad_positions.append(pad_offset + pos)
+            pad_offset += pl
+        real_positions = torch.tensor(real_positions, dtype=torch.long, device=dev)
+        pad_positions = torch.tensor(pad_positions, dtype=torch.long, device=dev)
+
+        # ---- Assert: padding positions have zero grad ------------------------
+        pad_grad_q = padded['q_indexer'].grad[pad_positions]
+        assert torch.all(pad_grad_q == 0), (
+            f"q_indexer grad at per-segment padding positions should be zero, "
+            f"got max abs = {pad_grad_q.abs().max().item():.3e}"
+        )
+        pad_grad_w = padded['weights'].grad[pad_positions]
+        assert torch.all(pad_grad_w == 0), (
+            f"weights grad at per-segment padding positions should be zero, "
+            f"got max abs = {pad_grad_w.abs().max().item():.3e}"
+        )
+
+        # ---- Assert: real positions match unpadded baseline grads -------------
+        # The cuDNN indexer-backward kernel is non-deterministic (a config
+        # compared against itself shows per-element grad diffs ~= the max grad
+        # magnitude), so an element-wise allclose is unachievable. Instead
+        # compare *direction* via a global (flattened) cosine similarity:
+        # padded-vs-baseline measures ~0.997 while the same-config noise floor
+        # is ~0.9995, so >0.99 robustly confirms the masking preserves the
+        # real-token gradients while still catching a genuinely corrupted mask.
+        # Per-row cosine is unusable here: causal-masked early rows have
+        # all-zero grads (cosine vs a zero vector is 0).
+        def _grad_cos_sim(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.flatten().float(), b.flatten().float(), dim=0
+            )
+
+        cos_q = _grad_cos_sim(padded['q_indexer'].grad[real_positions], grad_q_real)
+        assert cos_q > 0.99, (
+            f"q_indexer grad at real positions should align with unpadded "
+            f"baseline, cosine similarity = {cos_q.item():.6f}"
+        )
+        cos_w = _grad_cos_sim(padded['weights'].grad[real_positions], grad_w_real)
+        assert cos_w > 0.99, (
+            f"weights grad at real positions should align with unpadded "
+            f"baseline, cosine similarity = {cos_w.item():.6f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Real-kernel dense-indexer backward parity (kernel vs autograd)
 # ---------------------------------------------------------------------------
 

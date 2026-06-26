@@ -477,9 +477,7 @@ def _apply_rope(
     else:
         max_total = None
 
-    # Fused path applies to THD unconditionally and to SBHD only for
-    # non-"rope" types (plain "rope" always goes through the unfused path).
-    use_fused = config.apply_rope_fusion and (packed_seq or config.rope_type != "rope")
+    use_fused = config.apply_rope_fusion
 
     if use_fused:
         # ``mscale=1.0`` keeps the cached cos/sin free of yarn's

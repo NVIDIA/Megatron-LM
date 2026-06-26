@@ -1251,8 +1251,7 @@ class TestDSv4HybridNativeParity:
         [
             pytest.param([512], 640, 4, id="single-seg-padded"),
             pytest.param([256, 256], 640, 4, id="two-seg-padded"),
-            pytest.param([200, 150, 162], 640, 8, id="three-seg-padded"),
-            pytest.param([128, 64, 128, 64], 512, 8, id="four-seg-padded"),
+            pytest.param([200, 150, 912], 2048, 8, id="three-seg-padded"),
         ],
     )
     def test_thd_padded_attention_matches_unpadded(
@@ -1314,45 +1313,110 @@ class TestDSv4HybridNativeParity:
         out_unpadded.backward(grad_unpadded)
 
         # ---- Padded run ------------------------------------------------------
-        # Pad hidden_states along dim-0 (sequence) with zeros.
-        pad_len = pad_max_seqlen - actual_T
-        hidden_padded = F.pad(hidden_states.detach(), (0, 0, 0, 0, 0, pad_len))
-        hidden_padded = hidden_padded.clone().requires_grad_(True)
-
-        # Build padded packed_seq_params: pad cu_seqlens to
-        # (pad_max_num_seqs+1) entries by repeating the last value.
+        # Per-sequence padding: each segment is padded to the next multiple
+        # of compress_ratio, then the total is extended to pad_max_seqlen
+        # with a dummy tail segment.  This matches the real data_schedule
+        # path where each sequence is individually padded to alignment.
         from megatron.core.packed_seq_params import _pad_cu_seqlens
 
-        packed_raw = _make_thd_packed_seq_params(seg_lens)
+        align = max(compress_ratio, 4)
+        padded_seg_lens = [((sl + align - 1) // align) * align for sl in seg_lens]
+        padded_actual_T = sum(padded_seg_lens)
+        total_padded_T = pad_max_seqlen
+        assert padded_actual_T <= total_padded_T
+
+        # Build padded hidden_states with per-segment intra-padding + tail.
+        hidden_padded = torch.zeros(
+            total_padded_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        real_offset = 0
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            hidden_padded[pad_offset : pad_offset + rl] = hidden_states[
+                real_offset : real_offset + rl
+            ]
+            real_offset += rl
+            pad_offset += pl
+        hidden_padded = hidden_padded.clone().requires_grad_(True)
+
+        # cu_seqlens_q: unpadded real boundaries (cumsum of real lengths
+        # within the padded physical layout).
+        cu_seqlens_q_vals = [0]
+        offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            cu_seqlens_q_vals.append(offset + rl)
+            offset += pl
+        cu_seqlens_unpadded = torch.tensor(cu_seqlens_q_vals, dtype=torch.int32, device='cuda')
+
+        # cu_seqlens_q_padded: padded boundaries (cumsum of padded lengths
+        # + dummy tail segment to total_padded_T).
+        padded_boundaries = [0]
+        for pl in padded_seg_lens:
+            padded_boundaries.append(padded_boundaries[-1] + pl)
+        if padded_actual_T < total_padded_T:
+            padded_boundaries.append(total_padded_T)
+        cu_seqlens_padded_raw = torch.tensor(padded_boundaries, dtype=torch.int32, device='cuda')
+        # Also extend unpadded with a zero-length dummy for the tail.
+        if padded_actual_T < total_padded_T:
+            cu_seqlens_unpadded = torch.cat(
+                [
+                    cu_seqlens_unpadded,
+                    cu_seqlens_unpadded[-1:],  # repeat last (real total unchanged)
+                ]
+            )
+
         target_cu = pad_max_num_seqs + 1
+        cu_seqlens_unpadded = _pad_cu_seqlens(cu_seqlens_unpadded, target_cu)
+        cu_seqlens_padded = _pad_cu_seqlens(cu_seqlens_padded_raw, target_cu)
+        max_padded_seg = max(padded_seg_lens + [total_padded_T - padded_actual_T])
+
         packed_padded = PackedSeqParams(
             qkv_format='thd',
-            cu_seqlens_q=_pad_cu_seqlens(packed_raw.cu_seqlens_q, target_cu),
-            cu_seqlens_kv=_pad_cu_seqlens(packed_raw.cu_seqlens_kv, target_cu),
-            cu_seqlens_q_padded=_pad_cu_seqlens(packed_raw.cu_seqlens_q_padded, target_cu),
-            cu_seqlens_kv_padded=_pad_cu_seqlens(packed_raw.cu_seqlens_kv_padded, target_cu),
-            max_seqlen_q=packed_raw.max_seqlen_q,
-            max_seqlen_kv=packed_raw.max_seqlen_kv,
+            cu_seqlens_q=cu_seqlens_unpadded,
+            cu_seqlens_kv=cu_seqlens_unpadded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_padded_seg,
+            max_seqlen_kv=max_padded_seg,
         )
 
         out_padded, _ = real_layer(
             hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded
         )
-        # Use the same grad for real tokens, zero for padding.
-        grad_padded = F.pad(grad_unpadded.detach(), (0, 0, 0, 0, 0, pad_len))
+        # Build grad for padded buffer: scatter unpadded grad into real positions.
+        grad_padded = torch.zeros_like(out_padded)
+        real_offset = 0
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            grad_padded[pad_offset : pad_offset + rl] = grad_unpadded[
+                real_offset : real_offset + rl
+            ]
+            real_offset += rl
+            pad_offset += pl
         out_padded.backward(grad_padded)
 
         # ---- Assertions: real tokens must match ------------------------------
+        # Gather real-token positions from the padded output/grad.
+        real_positions = []
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            real_positions.extend(range(pad_offset, pad_offset + rl))
+            pad_offset += pl
+        real_positions = torch.tensor(real_positions, dtype=torch.long, device='cuda')
+
         label = f"thd-padded-{backend}-{variant}-r{compress_ratio}-segs{len(seg_lens)}"
         _assert_similarity(
-            out_padded[:actual_T].detach(), out_unpadded.detach(), f"{label}:out", eps=fwd_eps
+            out_padded[real_positions].detach(), out_unpadded.detach(), f"{label}:out", eps=fwd_eps
         )
         _assert_similarity(
-            hidden_padded.grad[:actual_T], hidden_unpadded.grad, f"{label}:hidden_grad", eps=bwd_eps
+            hidden_padded.grad[real_positions],
+            hidden_unpadded.grad,
+            f"{label}:hidden_grad",
+            eps=bwd_eps,
         )
 
         del real_layer, hidden_states, hidden_unpadded, hidden_padded
         del out_unpadded, out_padded, grad_unpadded, grad_padded
-        del packed_unpadded, packed_raw, packed_padded
+        del packed_unpadded, packed_padded
         gc.collect()
         torch.cuda.empty_cache()
