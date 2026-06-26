@@ -991,9 +991,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:
-            raise ValueError(
-                "Async scheduling requires materialize_only_last_token_logits=True."
-            )
+            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
         if model_config.expert_model_parallel_size > 1:
             raise ValueError("Async scheduling does not support expert parallelism.")
         if model_config.num_moe_experts is not None:

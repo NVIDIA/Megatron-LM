@@ -3395,15 +3395,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_new_blocks > 0:
             active_block_count_avail = self.kv_block_allocator.get_active_avail()
             if num_new_blocks > active_block_count_avail:
-                raise RuntimeError(
-                    "Async scheduling cannot pause requests to allocate new blocks."
-                )
+                raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
 
             block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
             if block_ids is None:
-                raise RuntimeError(
-                    "Async scheduling cannot evict requests to allocate new blocks."
-                )
+                raise RuntimeError("Async scheduling cannot evict requests to allocate new blocks.")
 
             row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
             col_idx = self.request_kv_block_counts[row_idx]

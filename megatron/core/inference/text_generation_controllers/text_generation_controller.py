@@ -266,9 +266,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         if not context.config.materialize_only_last_token_logits:
-            raise RuntimeError(
-                "Async scheduling requires materialize_only_last_token_logits=True."
-            )
+            raise RuntimeError("Async scheduling requires materialize_only_last_token_logits=True.")
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
         if context.is_hybrid_model:
@@ -292,13 +290,11 @@ class TextGenerationController:
             return
         if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
             raise RuntimeError(
-                "Async scheduling only supports greedy sampling "
-                "(SamplingParams.top_k == 1)."
+                "Async scheduling only supports greedy sampling " "(SamplingParams.top_k == 1)."
             )
         if not torch.all(context.request_metadata["top_p"][active_slice] == 0.0):
             raise RuntimeError(
-                "Async scheduling only supports greedy sampling "
-                "(SamplingParams.top_p == 0.0)."
+                "Async scheduling only supports greedy sampling " "(SamplingParams.top_p == 0.0)."
             )
         if torch.any(context.request_metadata["return_log_probs"][active_slice]):
             raise RuntimeError("Async scheduling does not support log probabilities.")
