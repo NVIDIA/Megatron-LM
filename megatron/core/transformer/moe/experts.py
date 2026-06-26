@@ -250,6 +250,11 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
+        self.offload_fused_group_mlp = (
+            self.config.fine_grained_activation_offloading
+            and "fused_group_mlp" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -655,14 +660,28 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             stash_context = nullcontext()
-        with stash_context:
-            # Call fused impl
-            output = ops(
-                permuted_local_hidden_states,
-                tokens_per_expert,  # FC1
-                permuted_probs,  # Scaled SwiGLU
-                tokens_per_expert,  # FC2
+        fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
+        offload_name = "fused_group_mlp"
+        fused_group_mlp_manager = off_interface(
+            fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
+        )
+        with fused_group_mlp_manager as permuted_local_hidden_states:
+            forced_released_tensors = (
+                [permuted_local_hidden_states] if fine_grained_activation_offloading else []
             )
+            with stash_context:
+                # Call fused impl
+                output = ops(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,  # FC1
+                    permuted_probs,  # Scaled activation
+                    tokens_per_expert,  # FC2
+                )
+        output = fused_group_mlp_manager.group_offload(
+            output,
+            forced_released_tensors=forced_released_tensors,
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
