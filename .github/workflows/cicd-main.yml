@@ -34,7 +34,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-  container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
+  container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
 
 jobs:
   is-not-external-contributor:
@@ -44,7 +44,7 @@ jobs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nemo-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
@@ -516,21 +516,21 @@ jobs:
         id: compute
         env:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
-          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-          SELECTED_RUNNER_GB200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+          SELECTED_RUNNER_GB_GPU: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
           REGISTRY_AWS: ${{ env.container-registry }}
-          REGISTRY_GCP: ${{ env.container-registry-gb200 }}
+          REGISTRY_GB_GPU: ${{ env.container-registry-gb200 }}
         run: |
-          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
-            '{"cloud": "aws", "registry": $registry, "runner": $runner}')
-          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "$SELECTED_RUNNER_GB200" \
-              '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
-            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
-              '{"include": [$aws, $gcp]}')
+          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB_TESTING" == "true" ]; then
+            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
+              '{"include": [$aws, $gb_gpu]}')
           else
-            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" '{"include": [$aws]}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" '{"include": [$aws]}')
           fi
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
 
