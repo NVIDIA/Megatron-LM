@@ -111,7 +111,6 @@ class SafeUnpickler(pickle.Unpickler):
     )
 
     def find_class(self, module: str, name: str):
-        print("YES YOU ARE HERE 2")
         if (module, name) not in self._SAFE_CLASSES:
             raise pickle.UnpicklingError(
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
