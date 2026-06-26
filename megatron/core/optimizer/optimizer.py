@@ -801,14 +801,17 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
-    # Checkpoint compatibility point: source the groups from parallel_state, mirroring the
-    # make_*_for_checkpoint helpers (which fall back to these same globals).
-    tp_group = parallel_state.get_tensor_model_parallel_group()
-    dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    # Groups sourced lazily (below) only when a GTP param is found, so GTP-free models on
+    # explicit grids (e.g. MiMo) never require the global MPU groups to be initialized.
+    tp_group = None
+    dp_cp_group = None
     for param_id, p in enumerate(chain.from_iterable(float16_groups)):
         # Skip params that already matched, and any non-GTP param (those always match).
         if param_id in id_to_sharded_param_map or not isinstance(p, GTPShardedParam):
             continue
+        if tp_group is None:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
