@@ -61,7 +61,6 @@ def safe_load_from_bytes(b):
 
 def _safe_pickle_load(file, **kwargs):
     """Safe version of `pickle.load`."""
-    print("YES YOU ARE HERE 3")
     return SafeUnpickler(file).load(**kwargs)
 
 

@@ -97,7 +97,6 @@ class BlendedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         if self.dataset_index is None:
-            print("YOUARE INSIDE BLENDED 1")
             self.dataset_index = safe_numpy_load(
                 self.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
             )
