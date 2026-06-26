@@ -226,6 +226,48 @@ class TransformerLayerSchedulePlan:
             else nullcontext()
         )
 
+    def _uses_te_cuda_graph_replay(self):
+        """Return whether this layer uses TE CUDA graph replay for its forward path."""
+        return bool(getattr(self.layer, 'cuda_graphs', None))
+
+    def run_forward_pre_hooks(self, input_tensor):
+        """Manually run layer forward pre-hooks that fine-grained direct calls bypass."""
+        if self._uses_te_cuda_graph_replay():
+            return input_tensor
+
+        args = (input_tensor,)
+        kwargs = {}
+        hooks_with_kwargs = getattr(self.layer, '_forward_pre_hooks_with_kwargs', set())
+        for hook_id, hook in getattr(self.layer, '_forward_pre_hooks', {}).items():
+            if hook_id in hooks_with_kwargs:
+                result = hook(self.layer, args, kwargs)
+                if result is not None:
+                    args, kwargs = result
+            else:
+                result = hook(self.layer, args)
+                if result is not None:
+                    args = result if isinstance(result, tuple) else (result,)
+
+        assert not kwargs, "Fine-grained layer forward pre-hooks must not add kwargs."
+        assert len(args) == 1, "Fine-grained layer forward pre-hooks must preserve one input."
+        return args[0]
+
+    def run_forward_hooks(self, input_tensor, output_tensor):
+        """Manually run layer forward hooks that fine-grained direct calls bypass."""
+        if self._uses_te_cuda_graph_replay():
+            return output_tensor
+
+        args = (input_tensor,)
+        hooks_with_kwargs = getattr(self.layer, '_forward_hooks_with_kwargs', set())
+        for hook_id, hook in getattr(self.layer, '_forward_hooks', {}).items():
+            if hook_id in hooks_with_kwargs:
+                result = hook(self.layer, args, {}, output_tensor)
+            else:
+                result = hook(self.layer, args, output_tensor)
+            if result is not None:
+                output_tensor = result
+        return output_tensor
+
     @staticmethod
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
         """Schedule one-forward-one-backward operations for a single transformer layer.
@@ -257,6 +299,8 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
+            f_input = f_layer.run_forward_pre_hooks(f_input)
+            f_layer_input = f_input
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
 
@@ -288,6 +332,7 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
+            f_input = f_layer.run_forward_hooks(f_layer_input, f_input)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm

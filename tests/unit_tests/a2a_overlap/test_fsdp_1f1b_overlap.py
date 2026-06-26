@@ -81,6 +81,15 @@ class TestFSDP1F1BOverlap:
             offload_modules=offload_modules,
         )
 
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    def test_fsdp_1f1b_training_step_with_double_buffer(self):
+        self._run_test_helper(
+            dispatcher_type="alltoall",
+            sharding_strategy="optim_grads_params",
+            fsdp_double_buffer=True,
+            fsdp_db_use_persist_buf_on_alloc_fail=True,
+        )
+
     def _run_test_helper(
         self,
         dispatcher_type="alltoall",
@@ -89,6 +98,8 @@ class TestFSDP1F1BOverlap:
         shared_expert_intermediate_size=None,
         recompute_modules=None,
         offload_modules=None,
+        fsdp_double_buffer=False,
+        fsdp_db_use_persist_buf_on_alloc_fail=False,
         **kwargs,
     ):
         """Verify multi-step FSDP training with overlap produces identical
@@ -122,6 +133,8 @@ class TestFSDP1F1BOverlap:
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 megatron_fsdp_main_params_dtype=None,
+                fsdp_double_buffer=fsdp_double_buffer,
+                fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
             )
 
         with deterministic_mode():

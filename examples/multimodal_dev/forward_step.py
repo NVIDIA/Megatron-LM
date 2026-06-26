@@ -385,13 +385,29 @@ def loss_func(loss_mask, output_tensor):
     return (total_loss, total_tokens, {"lm loss": reporting_loss})
 
 
+def _loss_mask_for_model_output(batch):
+    """Return the loss mask sliced the same way as model outputs."""
+    loss_mask = batch.get("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+
+    from examples.multimodal_dev.models.base import MultimodalModel
+
+    return MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
+
+
 # -------------------------------------------------------------------
 # Forward step
 # -------------------------------------------------------------------
 
 
-def forward_step(data_iterator, model):
-    """Forward step for multimodal_dev training."""
+def forward_step(data_iterator, model, return_schedule_plan: bool = False):
+    """Forward step for multimodal_dev training.
+
+    When EP A2A overlap asks for a schedule plan, build the multimodal
+    embeddings eagerly and delegate decoder scheduling to the model instead
+    of running the full forward immediately.
+    """
     batch = get_batch(data_iterator)
 
     if batch is None:
@@ -404,6 +420,25 @@ def forward_step(data_iterator, model):
         and pixel_values.dtype == torch.float32
     ):
         pixel_values = pixel_values.bfloat16()
+
+    if return_schedule_plan:
+        args = get_args()
+        assert args.overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+        )
+        schedule_plan = model.build_schedule_plan(
+            input_ids=batch["input_ids"],
+            position_ids=batch.get("position_ids"),
+            attention_mask=batch.get("attention_mask", None),
+            labels=batch.get("labels", None),
+            loss_mask=batch.get("loss_mask", None),
+            padding_mask=batch.get("padding_mask", None),
+            pixel_values=pixel_values,
+            image_grid_thw=batch.get("image_grid_thw", None),
+            packed_seq_params=batch.get("packed_seq_params", None),
+        )
+
+        return schedule_plan, partial(loss_func, _loss_mask_for_model_output(batch))
 
     # We don't provide position_ids, now. Let model handle it itself.
     output_tensor = model(
@@ -418,15 +453,4 @@ def forward_step(data_iterator, model):
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 
-    loss_mask = batch.get("loss_mask", None)
-    if loss_mask is None:
-        loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
-
-    # Slice loss_mask the same way the model sliced its inputs, so the
-    # mask aligns with the CP-shard output.  Delegated to MultimodalModel
-    # so the slicing rule lives in one place.
-    from examples.multimodal_dev.models.base import MultimodalModel
-
-    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
-
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, _loss_mask_for_model_output(batch))

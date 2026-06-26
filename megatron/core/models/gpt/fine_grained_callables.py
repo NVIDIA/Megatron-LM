@@ -434,15 +434,17 @@ class _BackwardDWWrapper:
         else:
             self.shared_expert_dw_callable = None
         self.cuda_graph_modules = layer.config.cuda_graph_modules
+        self.attn_in_cuda_graph = layer._cuda_graph_captures_attention()
+        self.moe_router_in_cuda_graph = layer._cuda_graph_captures_moe_router()
 
     def backward_dw(self):
         """Execute weight gradients, skipping CUDA graphed components during replay."""
         is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
         if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
+            not is_replay or not self.moe_router_in_cuda_graph
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
+        if not is_replay or not self.attn_in_cuda_graph:
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()

@@ -3876,7 +3876,7 @@ def train(
             cuda_graph_helper.create_cudagraphs()
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
-                cuda_graph_helper.cuda_graph_set_manual_hooks()
+            cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:

@@ -34,6 +34,12 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CUDA_GRAPH_BACKWARD_HANDLER_ATTR,
+    _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR,
+    _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR,
+    _CUDA_GRAPH_FSDP_RELEASE_ATTR,
+    _apply_fsdp_hook_transforms,
+    _CUDA_GRAPH_FORWARD_RELEASE_ATTR,
     _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
@@ -95,6 +101,79 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_fsdp_forward_release_hook_is_withheld_from_te_capture(self):
+        def normal_hook(*args):
+            pass
+
+        def release_hook(*args):
+            pass
+
+        setattr(release_hook, _CUDA_GRAPH_FORWARD_RELEASE_ATTR, object())
+        hooks = {
+            'forward_hooks': {1: normal_hook, 2: release_hook},
+            'forward_hooks_restore': {1: normal_hook, 2: release_hook},
+        }
+
+        _apply_fsdp_hook_transforms(hooks)
+
+        assert hooks['forward_hooks'] == {1: normal_hook}
+        assert hooks['forward_hooks_restore'] == {1: normal_hook, 2: release_hook}
+
+    def test_fsdp_unshard_and_backward_release_hooks_are_withheld_from_te_capture(self):
+        def normal_pre_hook(*args):
+            pass
+
+        def normal_forward_hook(*args):
+            pass
+
+        def fwd_unshard_hook(*args):
+            pass
+
+        def bwd_unshard_handler(*args):
+            pass
+
+        def bwd_unshard_wrapper(*args):
+            pass
+
+        def bwd_release_handler(*args):
+            pass
+
+        def bwd_release_wrapper(*args):
+            pass
+
+        setattr(fwd_unshard_hook, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, True)
+        setattr(bwd_unshard_handler, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, True)
+        setattr(bwd_unshard_wrapper, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, bwd_unshard_handler)
+        setattr(bwd_release_handler, _CUDA_GRAPH_FSDP_RELEASE_ATTR, True)
+        setattr(bwd_release_wrapper, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, bwd_release_handler)
+        hooks = {
+            'forward_pre_hooks': {
+                1: fwd_unshard_hook,
+                2: bwd_release_wrapper,
+                3: normal_pre_hook,
+            },
+            'forward_hooks': {4: bwd_unshard_wrapper, 5: normal_forward_hook},
+            'forward_pre_hooks_restore': {
+                1: fwd_unshard_hook,
+                2: bwd_release_wrapper,
+                3: normal_pre_hook,
+            },
+            'forward_hooks_restore': {4: bwd_unshard_wrapper, 5: normal_forward_hook},
+        }
+
+        _apply_fsdp_hook_transforms(hooks)
+
+        assert hooks['forward_pre_hooks'] == {3: normal_pre_hook}
+        assert hooks['forward_hooks'] == {5: normal_forward_hook}
+        assert 'backward_pre_hooks' not in hooks
+        assert 'backward_hooks' not in hooks
+        assert hooks['forward_pre_hooks_restore'] == {
+            1: fwd_unshard_hook,
+            2: bwd_release_wrapper,
+            3: normal_pre_hook,
+        }
+        assert hooks['forward_hooks_restore'] == {4: bwd_unshard_wrapper, 5: normal_forward_hook}
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
