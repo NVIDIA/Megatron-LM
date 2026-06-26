@@ -9,14 +9,14 @@ refs/full_e4b.pt.
 Run with the CONTAINER python (mlm_env first). Requires refs/full_e4b.pt
 (produced by ib_dump_hf_refs.py --full in the gemma4_venv).
 """
-import gemma4_common  # noqa: F401  MUST be first
+import mlm_env  # noqa: F401  MUST be first
 
 import os
 
 import torch
 
-from gemma4_common import _build_model, _init_distributed, _make_config
-from hf_to_mlm_convert import HFStore, HF_WEIGHTS, build_state_dict
+from ic_tests import _build_model, _init_distributed, _make_config
+from id_convert import HFStore, HF_WEIGHTS, build_state_dict
 
 IMPL = (
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
