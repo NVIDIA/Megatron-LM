@@ -64,7 +64,7 @@ def safe_load_from_bytes(b):
 
 def _safe_pickle_load(file, **kwargs):
     """Safe version of `pickle.load`."""
-    return SafeUnpickler(file).load(**kwargs)
+    return SafeUnpickler(file, **kwargs).load()
 
 
 def safe_numpy_load(path, **kwargs):
