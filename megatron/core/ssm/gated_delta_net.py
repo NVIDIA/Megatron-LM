@@ -83,6 +83,9 @@ class GatedDeltaNet(MegatronModule):
     and returns output of the same size.
     """
 
+    # The FLA GDN kernels currently replay different values under TE partial CUDA graphs.
+    supports_te_cuda_graph = False
+
     def __init__(
         self,
         config: TransformerConfig,

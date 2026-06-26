@@ -575,6 +575,51 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def _attention_modules_under_cuda_graph(self):
+        """Return non-identity attention modules that gate TE CUDA graph support."""
+        return [
+            module
+            for module in (self.self_attention, self.cross_attention)
+            if not isinstance(module, IdentityOp)
+        ]
+
+    def _attention_modules_support_te_cuda_graph(self) -> bool:
+        """Return whether this layer's attention modules are safe with TE CUDA graph."""
+        attention_modules = self._attention_modules_under_cuda_graph()
+        return all(getattr(module, "supports_te_cuda_graph", True) for module in attention_modules)
+
+    def _cuda_graph_captures_attention(self) -> bool:
+        """Return whether this layer's attention block is inside the CUDA graph."""
+        attention_modules = self._attention_modules_under_cuda_graph()
+        if not attention_modules:
+            return False
+        if (
+            self.config.cuda_graph_modules
+            and CudaGraphModule.attn not in self.config.cuda_graph_modules
+        ):
+            return False
+        return self._attention_modules_support_te_cuda_graph()
+
+    def _cuda_graph_captures_moe_router(self) -> bool:
+        """Return whether this layer's MoE router/preprocess is inside the CUDA graph."""
+        if not self.is_moe_layer:
+            return False
+        if self.config.cuda_graph_modules and not (
+            CudaGraphModule.moe in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
+        ):
+            return False
+        if (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+        ):
+            return False
+        # The MoE router graph consumes the attention output as its graph input. If the
+        # attention implementation is marked unsafe for TE CUDA graph replay (for example
+        # current GDN/FLA kernels), keep the whole layer's partial graph eager as well.
+        return self._attention_modules_support_te_cuda_graph()
+
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
         """
@@ -1026,7 +1071,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and self.config.cuda_graph_impl == "transformer_engine"
             and self.training
             and is_graph_capturing()
-            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            and self._cuda_graph_captures_moe_router()
         ):
             if self.recompute_pre_mlp_layernorm:
                 # Register the recompute hooks to all the cudagraph output tensors, because some
@@ -1197,10 +1242,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Captured forward needs attention-side static input only when this
         # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        )
+        attn_in_graph = self._cuda_graph_captures_attention()
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1270,7 +1312,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return super()._get_submodules_under_cudagraphs()
 
         submodules = []
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
+        if (
+            CudaGraphModule.attn in self.config.cuda_graph_modules
+            and self._cuda_graph_captures_attention()
+        ):
             submodules += [
                 self.input_layernorm,
                 self.self_attention,
@@ -1281,7 +1326,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules
         ):
             submodules += [self.pre_mlp_layernorm, self.mlp]
-        elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
+        elif self._cuda_graph_captures_moe_router():
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
@@ -1355,10 +1400,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
         context = None
-        if (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        ):
+        if self._cuda_graph_captures_attention():
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
             if len(args) > 0:
@@ -1369,13 +1411,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if (
             not self.config.cuda_graph_modules
             or (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules)
-            or (
-                self.is_moe_layer
-                and (
-                    CudaGraphModule.moe in self.config.cuda_graph_modules
-                    or CudaGraphModule.moe_router in self.config.cuda_graph_modules
-                )
-            )
+            or (self.is_moe_layer and self._cuda_graph_captures_moe_router())
         ):
             hidden_states = self._forward_mlp(
                 hidden_states,
@@ -1406,10 +1442,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         context = None
         padding_mask = kwargs.get("padding_mask", None)
-        if (
-            self.config.cuda_graph_modules
-            and CudaGraphModule.attn not in self.config.cuda_graph_modules
-        ):
+        if not self._cuda_graph_captures_attention():
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
@@ -1512,7 +1545,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 not self.config.overlap_moe_expert_parallel_comm
             ), "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
-        elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
+        elif self._cuda_graph_captures_moe_router():
             # CUDA Graph partially captures the MoE.
             # The rest of the layer should go to the normal pass.
             shared_expert_output, routing_map = None, None
@@ -1787,7 +1820,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
+        if (
+            CudaGraphModule.attn in self.config.cuda_graph_modules
+            and self._cuda_graph_captures_attention()
+        ):
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
         if not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules:
@@ -1921,14 +1957,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if not self.config.cuda_graph_modules:
             return submodules
 
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
+        if (
+            CudaGraphModule.attn in self.config.cuda_graph_modules
+            and self._cuda_graph_captures_attention()
+        ):
             submodules.append(self.self_attention_hyper_connection)
         if (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules) or (
-            self.is_moe_layer
-            and (
-                CudaGraphModule.moe in self.config.cuda_graph_modules
-                or CudaGraphModule.moe_router in self.config.cuda_graph_modules
-            )
+            self.is_moe_layer and self._cuda_graph_captures_moe_router()
         ):
             submodules.append(self.mlp_hyper_connection)
         return submodules
@@ -2155,7 +2190,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             and self.config.cuda_graph_impl == "transformer_engine"
             and self.training
             and is_graph_capturing()
-            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            and self._cuda_graph_captures_moe_router()
         ):
             if self.recompute_pre_mlp_layernorm or (
                 mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
@@ -2253,7 +2288,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 not self.config.overlap_moe_expert_parallel_comm
             ), "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
-        elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
+        elif self._cuda_graph_captures_moe_router():
             # Pop HC state (appended during capture in _forward_mlp).
             residual = cuda_graph_output.pop()
             mlp_h_res = cuda_graph_output.pop()

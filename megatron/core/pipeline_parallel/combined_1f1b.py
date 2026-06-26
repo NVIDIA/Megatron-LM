@@ -383,9 +383,13 @@ def combined_forward_backward_step(
             )
             from megatron.core.models.gpt.gpt_model import GPTModel
 
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
+            supports_ep_a2a_overlap_schedule = isinstance(unwrapped_model, GPTModel) or getattr(
+                unwrapped_model, "supports_ep_a2a_overlap_schedule", False
+            )
+            assert supports_ep_a2a_overlap_schedule, (
+                "The final unwrapped model must be a GPTModel or explicitly set "
+                "`supports_ep_a2a_overlap_schedule=True`. "
+                f"Got {type(unwrapped_model).__name__}."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True

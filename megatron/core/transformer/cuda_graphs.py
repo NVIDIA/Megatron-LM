@@ -6,6 +6,7 @@ import inspect
 import logging
 import math
 import os
+import random
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
@@ -68,6 +70,39 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+
+def _clone_rng_state(state):
+    """Clone a Tensor or graph-safe CUDA Generator state for later restoration."""
+    if hasattr(state, "clone_state"):
+        return state.clone_state()
+    if torch.is_tensor(state):
+        return state.clone()
+    return deepcopy(state)
+
+
+def _snapshot_training_rng_state():
+    """Capture RNG states that CUDA graph warmup must not expose to training."""
+    tracker = get_cuda_rng_tracker()
+    tracker_states = {}
+    for name, state in tracker.get_states().items():
+        tracker_states[name] = _clone_rng_state(state)
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": [state.clone() for state in torch.cuda.get_rng_state_all()],
+        "tracker": tracker_states,
+    }
+
+
+def _restore_training_rng_state(snapshot):
+    """Restore RNG states after CUDA graph capture/warmup."""
+    random.setstate(snapshot["python"])
+    np.random.set_state(snapshot["numpy"])
+    torch.set_rng_state(snapshot["torch_cpu"])
+    torch.cuda.set_rng_state_all(snapshot["torch_cuda"])
+    get_cuda_rng_tracker().set_states(snapshot["tracker"])
 
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
@@ -1435,6 +1470,94 @@ class _CudaGraphRunner(torch.nn.Module):
         return [x] if torch.is_tensor(x) else list(x)
 
 
+# Keys used to split per-module hooks_dict into TE-facing vs restore-only dicts.
+_TE_HOOK_KEYS = frozenset(
+    {
+        'forward_pre_hooks',
+        'forward_pre_hooks_with_kwargs',
+        'forward_hooks',
+        'forward_hooks_with_kwargs',
+        'backward_pre_hooks',
+        'backward_hooks',
+    }
+)
+_RESTORE_KEYS = frozenset(
+    {
+        'forward_pre_hooks_restore',
+        'forward_hooks_restore',
+        'backward_pre_hooks_restore',
+        'backward_hooks_restore',
+    }
+)
+
+# Sentinel attribute names set by megatron_fsdp.py on forward hooks that wrap backward handlers.
+# cuda_graphs.py reads these to detect which hooks to withhold from TE and how to reroute them.
+# The attribute value is the inner backward handler to extract.
+# Must match the attribute names used in megatron_fsdp.py.
+#
+# Set on a forward_pre hook: inner handler goes to backward_hooks (post-backward).
+_CUDA_GRAPH_BACKWARD_HANDLER_ATTR = '_cuda_graph_backward_handler'
+# Set on a forward hook: inner handler goes to backward_pre_hooks (pre-backward).
+_CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR = '_cuda_graph_backward_pre_handler'
+# Set on a forward hook: hook is restored after capture, but withheld from TE capture.
+_CUDA_GRAPH_FORWARD_RELEASE_ATTR = '_cuda_graph_forward_release_handler'
+# Set on FSDP parameter unshard hooks that are driven outside TE capture.
+_CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR = '_cuda_graph_fsdp_param_unshard_handler'
+# Set on FSDP parameter release hooks that are driven outside TE capture.
+_CUDA_GRAPH_FSDP_RELEASE_ATTR = '_cuda_graph_fsdp_release_handler'
+
+
+def _apply_fsdp_hook_transforms(hooks_dict):
+    """Reroute or withhold tagged FSDP wrapper hooks before TE capture."""
+    fph = hooks_dict.get('forward_pre_hooks')
+    if fph:
+        to_remove = []
+        new_bh = {}
+        for hook_id, hook_fn in fph.items():
+            if getattr(hook_fn, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, None) is not None:
+                to_remove.append(hook_id)
+                continue
+            handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None)
+            if handler is not None:
+                if getattr(handler, _CUDA_GRAPH_FSDP_RELEASE_ATTR, None) is not None:
+                    to_remove.append(hook_id)
+                    continue
+                new_bh[hook_id] = handler
+                to_remove.append(hook_id)
+        for hook_id in to_remove:
+            del fph[hook_id]
+            hooks_dict.get('forward_pre_hooks_with_kwargs', {}).pop(hook_id, None)
+        if new_bh:
+            hooks_dict.setdefault('backward_hooks', {}).update(new_bh)
+        if not fph:
+            del hooks_dict['forward_pre_hooks']
+            hooks_dict.pop('forward_pre_hooks_with_kwargs', None)
+
+    fh = hooks_dict.get('forward_hooks')
+    if fh:
+        to_remove = []
+        new_bph = {}
+        for hook_id, hook_fn in fh.items():
+            if getattr(hook_fn, _CUDA_GRAPH_FORWARD_RELEASE_ATTR, None) is not None:
+                to_remove.append(hook_id)
+                continue
+            handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None)
+            if handler is not None:
+                if getattr(handler, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, None) is not None:
+                    to_remove.append(hook_id)
+                    continue
+                new_bph[hook_id] = handler
+                to_remove.append(hook_id)
+        for hook_id in to_remove:
+            del fh[hook_id]
+            hooks_dict.get('forward_hooks_with_kwargs', {}).pop(hook_id, None)
+        if new_bph:
+            hooks_dict.setdefault('backward_pre_hooks', {}).update(new_bph)
+        if not fh:
+            del hooks_dict['forward_hooks']
+            hooks_dict.pop('forward_hooks_with_kwargs', None)
+
+
 class CudaGraphManager(torch.nn.Module):
     """Creates and runs cudagraphs for a megatron module"""
 
@@ -1731,7 +1854,6 @@ def _layer_is_graphable(layer, config):
     # import modules here to avoid a circular import
     from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
     from megatron.core.ssm.mamba_layer import MambaLayer
-    from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -1748,18 +1870,14 @@ def _layer_is_graphable(layer, config):
         if isinstance(inner, TransformerLayer):
             if isinstance(inner.mlp, MoELayer):
                 # MoE inner: graphable via partial (router/preprocess) capture.
-                if (
-                    CudaGraphModule.moe in config.cuda_graph_modules
-                    or CudaGraphModule.moe_router in config.cuda_graph_modules
-                    or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
-                ):
+                if inner._cuda_graph_captures_moe_router():
                     return True
                 # attn-only scope on an MoE inner: the (identity) attention prefix has
                 # nothing graph-worthy, so leave eager.
                 return False
-            if CudaGraphModule.attn in config.cuda_graph_modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
+            if (
+                CudaGraphModule.attn in config.cuda_graph_modules
+                and inner._cuda_graph_captures_attention()
             ):
                 return True
             if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
@@ -1770,17 +1888,21 @@ def _layer_is_graphable(layer, config):
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
+        if (
+            CudaGraphModule.attn in config.cuda_graph_modules
+            and layer._cuda_graph_captures_attention()
         ):
             # attn layer.
             return True
         if (
-            CudaGraphModule.moe in config.cuda_graph_modules
-            or CudaGraphModule.moe_router in config.cuda_graph_modules
-            or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
-        ) and isinstance(layer.mlp, MoELayer):
+            (
+                CudaGraphModule.moe in config.cuda_graph_modules
+                or CudaGraphModule.moe_router in config.cuda_graph_modules
+                or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+            )
+            and isinstance(layer.mlp, MoELayer)
+            and layer._cuda_graph_captures_moe_router()
+        ):
             # moe layer.
             return True
         if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(layer.mlp, MLP):
@@ -1848,6 +1970,7 @@ class TECudaGraphHelper:
         #   layers found)
         self._capture_finished = False
         self._graphs_created = False
+        self._fsdp_capture_param_states = []
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -2088,6 +2211,7 @@ class TECudaGraphHelper:
         fwd_sample_queues = {}
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
+        reuse_static_inputs = not self.config.overlap_moe_expert_parallel_comm
         fwd_idx = [0] * self.num_model_chunks
         for idx, chunk_id in enumerate(order):
             model_chunk_idx = abs(ceil(chunk_id)) - 1
@@ -2133,7 +2257,11 @@ class TECudaGraphHelper:
                             (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
                         )
                         sample_kwargs_keys = tuple(
-                            (k, v.shape, v.dtype, v.layout)
+                            (
+                                (k, v.shape, v.dtype, v.layout)
+                                if torch.is_tensor(v)
+                                else (k, type(v), v)
+                            )
                             for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
                         )
                         sample_keys = sample_args_keys + sample_kwargs_keys
@@ -2145,7 +2273,7 @@ class TECudaGraphHelper:
                         sample_keys = layer_sample_keys_cache[id(layer)]
                     model_chunk_idx = abs(chunk_id) - 1
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
-                    if consumed_sample_queue.get(sample_keys, []):
+                    if reuse_static_inputs and consumed_sample_queue.get(sample_keys, []):
                         # We can reuse the static inputs of a previous forward pass for this
                         # forward pass, because they are of the same input signature and the
                         # backward pass of the previous forward pass has completed.
@@ -2506,6 +2634,65 @@ class TECudaGraphHelper:
         # Generate sample arguments and keyword arguments for capturing.
         sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
 
+        # Extract hooks from callables for manual invocation during CUDA Graph capture/replay.
+        # Two-phase approach:
+        #   Phase 1 (_extract_module_hooks): general - copies ALL 4 hook dicts
+        #     uniformly, clears them.
+        #   Phase 2 (_apply_fsdp_hook_transforms): FSDP-specific - reroutes FSDP wrappers so their
+        #     inner backward handlers land in the right TE-facing key while the wrappers themselves
+        #     are withheld from TE. *_restore keys are never modified in Phase 2.
+        def _extract_module_hooks(module):
+            """Phase 1: copy all PyTorch hook dicts and clear them from module."""
+            hooks_dict = {}
+
+            if getattr(module, '_forward_pre_hooks', None):
+                with_kw = getattr(module, '_forward_pre_hooks_with_kwargs', set())
+                fph = dict(module._forward_pre_hooks)
+                hooks_dict['forward_pre_hooks'] = fph
+                hooks_dict['forward_pre_hooks_restore'] = dict(fph)
+                fph_kw = {hid: True for hid in fph if hid in with_kw}
+                if fph_kw:
+                    hooks_dict['forward_pre_hooks_with_kwargs'] = fph_kw
+                module._forward_pre_hooks.clear()
+
+            if getattr(module, '_forward_hooks', None):
+                with_kw = getattr(module, '_forward_hooks_with_kwargs', set())
+                fh = dict(module._forward_hooks)
+                hooks_dict['forward_hooks'] = fh
+                hooks_dict['forward_hooks_restore'] = dict(fh)
+                fh_kw = {hid: True for hid in fh if hid in with_kw}
+                if fh_kw:
+                    hooks_dict['forward_hooks_with_kwargs'] = fh_kw
+                module._forward_hooks.clear()
+
+            if getattr(module, '_backward_pre_hooks', None):
+                bph = dict(module._backward_pre_hooks)
+                hooks_dict['backward_pre_hooks'] = bph
+                hooks_dict['backward_pre_hooks_restore'] = dict(bph)
+                module._backward_pre_hooks.clear()
+
+            if getattr(module, '_backward_hooks', None):
+                bh = dict(module._backward_hooks)
+                hooks_dict['backward_hooks'] = bh
+                hooks_dict['backward_hooks_restore'] = dict(bh)
+                module._backward_hooks.clear()
+
+            return hooks_dict
+
+        extracted_hooks = []
+        restore_hooks = []
+        for callable_module in self.flattened_callables:
+            if isinstance(callable_module, torch.nn.Module):
+                hooks_dict = _extract_module_hooks(callable_module)
+                _apply_fsdp_hook_transforms(hooks_dict)
+                te_hooks = {k: v for k, v in hooks_dict.items() if k in _TE_HOOK_KEYS}
+                restore = {k: v for k, v in hooks_dict.items() if k in _RESTORE_KEYS}
+                extracted_hooks.append(te_hooks if te_hooks else None)
+                restore_hooks.append(restore if restore else None)
+            else:
+                extracted_hooks.append(None)
+                restore_hooks.append(None)
+
         def get_make_graphed_callables_kwargs():
             kwargs = {
                 'allow_unused_input': True,
@@ -2590,7 +2777,119 @@ class TECudaGraphHelper:
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
-        return sample_args, kwargs
+        if extracted_hooks and any(h for h in extracted_hooks):
+            # TE's make_graphed_callables asserts that all capture_time_hooks return None.
+            def _wrap_none(fn):
+                def wrapper(*args, **kwargs):
+                    fn(*args, **kwargs)
+
+                return wrapper
+
+            def _wrap_hooks_dict(hooks):
+                if hooks is None:
+                    return None
+                wrapped = {}
+                for key, id_to_fn in hooks.items():
+                    if key in ('forward_pre_hooks_with_kwargs', 'forward_hooks_with_kwargs'):
+                        wrapped[key] = id_to_fn
+                    else:
+                        wrapped[key] = {hid: _wrap_none(fn) for hid, fn in id_to_fn.items()}
+                return wrapped
+
+            kwargs['capture_time_hooks'] = [_wrap_hooks_dict(h) for h in extracted_hooks]
+
+        return sample_args, kwargs, restore_hooks
+
+    def _get_megatron_fsdp_instances(self):
+        """Find Megatron-FSDP instances from possibly wrapped model chunks."""
+        fsdp_instances = []
+        for model_chunk in self.model:
+            try:
+                obj = get_attr_wrapped_model(
+                    model_chunk, '_replace_param_with_raw_if_needed', return_model_obj=True
+                )
+            except RuntimeError:
+                continue
+            if hasattr(obj, '_replace_param_with_distributed_if_needed'):
+                fsdp_instances.append(obj)
+        return fsdp_instances
+
+    def _prepare_fsdp_params_for_capture(self):
+        """
+        Switch Megatron-FSDP modules to raw parameters before TE capture.
+
+        TE captures graphable submodules directly, so it may not enter
+        MegatronFSDP.forward(), which normally switches module parameters from
+        optimizer DTensors back to raw parameters before all-gather hooks run.
+        """
+        self._fsdp_capture_param_states = []
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            was_distributed = getattr(fsdp_module, 'is_param_fsdp_distributed', False)
+            self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
+            fsdp_module._replace_param_with_raw_if_needed()
+        self._all_gather_graph_fsdp_buckets_for_capture()
+
+    def _get_graph_fsdp_bucket_keys(self, fsdp_module):
+        """Return FSDP all-gather bucket keys whose storage is captured by TE graphs."""
+        graph_bucket_keys = set()
+        param_to_group = fsdp_module.param_and_grad_buffer.param_to_param_group
+        ag_pipeline = fsdp_module.all_gather_pipeline
+        for callable_module in self.flattened_callables:
+            if not isinstance(callable_module, torch.nn.Module):
+                continue
+            graph_submodules = [callable_module]
+            if hasattr(callable_module, '_get_submodules_under_cudagraphs'):
+                graph_submodules.extend(callable_module._get_submodules_under_cudagraphs())
+            for submodule in graph_submodules:
+                if submodule is None:
+                    continue
+                for param in submodule.parameters():
+                    orig_param = getattr(param, "orig_param", param)
+                    group_id = param_to_group.get(orig_param)
+                    if group_id is None:
+                        continue
+                    graph_bucket_keys.add(ag_pipeline.get_bucket_key(group_id, bwd=False))
+                    graph_bucket_keys.add(ag_pipeline.get_bucket_key(group_id, bwd=True))
+        return graph_bucket_keys
+
+    def _all_gather_graph_fsdp_buckets_for_capture(self):
+        """Make graph-covered FSDP buckets ready before TE invokes capture hooks."""
+        if not self.config.overlap_moe_expert_parallel_comm:
+            return
+        for fsdp_module, _ in self._fsdp_capture_param_states:
+            pgb = fsdp_module.param_and_grad_buffer
+            for bucket_id, bwd in sorted(self._get_graph_fsdp_bucket_keys(fsdp_module)):
+                param_group = pgb.parameter_groups[bucket_id]
+                fsdp_module.all_gather_and_wait_parameters_ready(
+                    param_group.params,
+                    prefetch=False,
+                    bwd=bwd,
+                )
+
+    def _release_non_graph_fsdp_buckets_after_capture(self):
+        """Drop capture-time FSDP buckets that are not needed by TE graph replay."""
+        if not self.config.overlap_moe_expert_parallel_comm:
+            return
+        for fsdp_module, _ in self._fsdp_capture_param_states:
+            graph_bucket_keys = self._get_graph_fsdp_bucket_keys(fsdp_module)
+            ag_pipeline = fsdp_module.all_gather_pipeline
+            for bucket_key, status in list(ag_pipeline.bucket_status.items()):
+                if bucket_key in graph_bucket_keys:
+                    ag_pipeline.bucket_can_be_released[bucket_key] = False
+                    continue
+                if getattr(status, "name", None) != "EMPTY":
+                    bucket_id, bwd = bucket_key
+                    ag_pipeline.release_bucket(bucket_id, bwd)
+                ag_pipeline.bucket_can_be_released[bucket_key] = False
+
+    def _restore_fsdp_params_after_capture(self):
+        """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
+        for fsdp_module, was_distributed in reversed(self._fsdp_capture_param_states):
+            if was_distributed:
+                fsdp_module._replace_param_with_distributed_if_needed()
+            else:
+                fsdp_module._replace_param_with_raw_if_needed()
+        self._fsdp_capture_param_states = []
 
     def _start_capturing(self):
         """
@@ -2604,6 +2903,7 @@ class TECudaGraphHelper:
         if FREEZE_GC:
             gc.freeze()
 
+        self._prepare_fsdp_params_for_capture()
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
@@ -2654,6 +2954,8 @@ class TECudaGraphHelper:
 
         torch.cuda.synchronize()
         self._reset_after_capture()
+        self._release_non_graph_fsdp_buckets_after_capture()
+        self._restore_fsdp_params_after_capture()
 
         if FREEZE_GC:
             gc.unfreeze()
@@ -2676,15 +2978,35 @@ class TECudaGraphHelper:
             )
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
+            sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
-                )
+            rng_snapshot = _snapshot_training_rng_state()
+            try:
+                with rng_context:
+                    graphs = make_graphed_callables(
+                        tuple(self.flattened_callables), sample_args, **kwargs
+                    )
+            finally:
+                _restore_training_rng_state(rng_snapshot)
+
+            if restore_hooks and any(h for h in restore_hooks):
+                for callable_module, restore in zip(self.flattened_callables, restore_hooks):
+                    if isinstance(callable_module, torch.nn.Module) and restore:
+                        if 'forward_pre_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['forward_pre_hooks_restore'].items():
+                                callable_module._forward_pre_hooks[hook_id] = hook_fn
+                        if 'forward_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['forward_hooks_restore'].items():
+                                callable_module._forward_hooks[hook_id] = hook_fn
+                        if 'backward_pre_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['backward_pre_hooks_restore'].items():
+                                callable_module._backward_pre_hooks[hook_id] = hook_fn
+                        if 'backward_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['backward_hooks_restore'].items():
+                                callable_module._backward_hooks[hook_id] = hook_fn
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0
@@ -2714,10 +3036,62 @@ class TECudaGraphHelper:
         Set CUDA Graph manual hooks for the modules that contain direct parameters and
         are covered by cudagraphs.
         """
+
+        def _setup_module_forward_pre_hooks(layer):
+            """Manually replay module forward-pre hooks that CUDA graph bypasses."""
+            layer.cuda_graph_manual_hooks = []
+            hook_modules = {}
+
+            def _has_replayable_forward_pre_hook(module):
+                for _, hook in getattr(module, '_forward_pre_hooks', {}).items():
+                    if getattr(hook, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None) is None:
+                        return True
+                return False
+
+            def _maybe_add_hook_module(module):
+                if _has_replayable_forward_pre_hook(module):
+                    hook_modules[id(module)] = module
+
+            # Megatron-FSDP registers the parameter all-gather hook on the FSDP unit
+            # module itself (for this config, TransformerLayer), even if the layer
+            # normally has no direct parameters. Replay that hook before child hooks.
+            _maybe_add_hook_module(layer)
+            for submodule in layer._get_submodules_under_cudagraphs():
+                _maybe_add_hook_module(submodule)
+                for module in submodule.modules():
+                    if next(module.parameters(recurse=False), None) is not None:
+                        _maybe_add_hook_module(module)
+
+            def _make_hook_runner(module):
+                hooks = tuple(getattr(module, '_forward_pre_hooks', {}).items())
+                hooks_with_kwargs = getattr(module, '_forward_pre_hooks_with_kwargs', set())
+
+                def _run_hooks():
+                    for hook_id, hook in hooks:
+                        if getattr(hook, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None) is not None:
+                            continue
+                        if hook_id in hooks_with_kwargs:
+                            result = hook(module, (), {})
+                        else:
+                            result = hook(module, ())
+                        if result is not None:
+                            raise RuntimeError(
+                                "CUDA graph manual forward_pre hooks must not modify inputs."
+                            )
+
+                return _run_hooks
+
+            for module in hook_modules.values():
+                layer.cuda_graph_manual_hooks.append((_make_hook_runner(module), ()))
+
+        has_megatron_fsdp = bool(self._get_megatron_fsdp_instances())
         for chunk_number, layers in enumerate(self.callables_per_chunk):
             model_chunk = self.model[chunk_number]
             for layer in layers:
-                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+                if hasattr(model_chunk, '_make_forward_pre_hook'):
+                    layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+                elif has_megatron_fsdp:
+                    _setup_module_forward_pre_hooks(layer)
 
     def delete_cuda_graphs(self):
         """

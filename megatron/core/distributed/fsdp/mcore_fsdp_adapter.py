@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -57,6 +58,28 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_ep_overlap_cuda_graph_compat(config: TransformerConfig) -> None:
+    if not config.overlap_moe_expert_parallel_comm:
+        return
+
+    if config.cuda_graph_impl == "transformer_engine":
+        unsupported_modules = {
+            CudaGraphModule.moe,
+            CudaGraphModule.mlp,
+        }.intersection(config.cuda_graph_modules or [])
+        assert not unsupported_modules, (
+            "1F1B overlap with FSDP does not support TE partial CUDA graph "
+            f"modules {sorted(module.value for module in unsupported_modules)}."
+        )
+        return
+
+    assert config.cuda_graph_impl in ("none", "full_iteration"), (
+        "1F1B overlap with FSDP supports cuda_graph_impl='none', "
+        "'full_iteration', or 'transformer_engine'; got "
+        f"{config.cuda_graph_impl!r}."
+    )
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -158,17 +181,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._annotate_tensor_parallelism(module)
 
-        if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
-            assert config.cuda_graph_impl in ("none", "full_iteration"), (
-                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
-                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
-                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
-                "(cuda_graph_impl='none')."
-            )
+        _validate_ep_overlap_cuda_graph_compat(config)
 
         if (
             config.overlap_moe_expert_parallel_comm

@@ -1303,6 +1303,9 @@ def validate_args(args, defaults={}):
         assert not args.megatron_fsdp_cache_param_bucket_views, (
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
+        assert not args.fsdp_db_use_persist_buf_on_alloc_fail, (
+            "--fsdp-db-use-persist-buf-on-alloc-fail requires " "--use-megatron-fsdp."
+        )
 
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
@@ -4151,6 +4154,13 @@ def _add_distributed_args(parser):
         "Double-buffering the communication memory improves memory management efficiency by "
         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-db-use-persist-buf-on-alloc-fail',
+        action='store_true',
+        help="Fall back to the persistent Megatron-FSDP communication buffer when a bucket "
+        "does not fit in the fixed double-buffer pool. This preserves NCCL user-buffer "
+        "registration for the outlier bucket at the cost of additional persistent memory.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
