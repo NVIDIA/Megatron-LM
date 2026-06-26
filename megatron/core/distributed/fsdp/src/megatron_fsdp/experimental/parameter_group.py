@@ -232,12 +232,9 @@ class FsdpParameterGroup:
     def reshard_parameters(self) -> None:
         """Install sharded DTensor parameters on the owning modules."""
         self._switch_to_sharded_parameters()
-        # At post-backward time, replacing unsharded parameter .data with size-0
-        # empty tensors would also be safe: autograd has consumed the saved
-        # forward views. That alternative is not much cleaner than releasing
-        # this storage, and splitting post-forward and post-backward reshard
-        # behavior would make the caller code less clean, so keep the shared
-        # storage-release path.
+
+    def release_unsharded_storage(self) -> None:
+        """Release this group's full-parameter storage."""
         self._unsharded_model_weight.release_storage()
 
     def reduce_gradients(self) -> None:
