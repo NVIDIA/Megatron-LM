@@ -610,7 +610,7 @@ jobs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "type=registry,ref=${{ matrix.registry }}/megatron-lm:$number-buildcache,mode=max"
+              echo "type=registry,ref=${{ matrix.registry }}/megatron-lm:$number-buildcache-${{ matrix.cloud }},mode=max"
             done)
 
           echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -649,15 +649,15 @@ jobs:
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
           cache-from: |
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:main-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache-${{ matrix.cloud }},mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:main-buildcache-${{ matrix.cloud }},mode=max
             ${{ steps.cache_from.outputs.LAST_PRS }}
           cache-to: |
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
-            ${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+            ${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-${{ matrix.cloud }}
+            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-${{ matrix.cloud }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
@@ -741,7 +741,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-unit-tests-gb200:
@@ -829,7 +829,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
 
@@ -986,7 +986,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
@@ -1087,7 +1087,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
