@@ -1986,7 +1986,7 @@ def _add_inference_args(parser):
                        help='Async scheduling mode for dynamic batching. '
                             '"legacy" (default) preserves the existing resolve-before-prepare '
                             'path. "serial" speculatively prepares and forwards decode-only '
-                            'greedy GPT steps before resolving finished requests.')
+                            'steps before resolving finished requests.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

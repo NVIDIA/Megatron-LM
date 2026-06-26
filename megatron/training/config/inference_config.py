@@ -139,7 +139,7 @@ class InferenceSetupConfig:
     inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
     existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    greedy GPT steps before resolving finished requests."""
+    steps before resolving finished requests."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
