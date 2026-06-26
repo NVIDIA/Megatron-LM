@@ -97,16 +97,14 @@ _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
 
-_GTP_PHASE2_COMPLETION_EVENTS: List[torch.cuda.Event] = []
+_GTP_RUNNER_STREAMS: List[torch.cuda.Stream] = []
 
 
-def get_gtp_phase2_completion_events() -> List[torch.cuda.Event]:
-    """Return all GTP bwd Phase 2 completion events from CG runners.
-
-    finalize_model_grads waits on these before reading main_grad,
-    ensuring captured main_grad.add_ on runner.stream has completed.
+def get_gtp_runner_streams() -> List[torch.cuda.Stream]:
+    """Replay streams of all GTP CG runners; finalize_model_grads waits on these
+    (tail = captured Phase 2 main_grad.add_) before reading main_grad.
     """
-    return _GTP_PHASE2_COMPLETION_EVENTS
+    return _GTP_RUNNER_STREAMS
 
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
@@ -610,7 +608,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
-    _GTP_PHASE2_COMPLETION_EVENTS.clear()
+    _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -661,29 +659,6 @@ class _CudagraphRecordNode(torch.autograd.Function):
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
-
-    # pylint: disable=line-too-long
-    ## Capture-time sync schemes (wait_async_comms is called INSIDE the captured
-    #  graph so the drain ops are embedded in the graph itself, not before replay).
-    #
-    #  Fwd — single-phase drain (full join before completion_event):
-    #    runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──fwd_completion_event.record
-    #    ag_stream:        AG ──────────────────────▶ ag_event.record
-    #    main_stream:                                                       fwd_completion_event.wait ▶ [next runner]
-    #    main_stream unblocks after ag/rs streams are fully drained, so eager
-    #    ops that follow see completed data.
-    #
-    #  Bwd — phased drain (cross-graph RS overlap, see _CudaGraphRunner.backward):
-    #    runner_N.stream:  GEMM ─▶ Phase 1 (drain AG) ─▶ fence ─▶ bwd_completion_event.record ─▶ Phase 2 (wait_side_streams) ─▶ phase2_event
-    #    ag_stream:        AG ──────────────────▶ ag_event.record ▶ fence_event.record
-    #    rs_stream:        RS_issue ──▶ handle.wait ▶ rs_event.record ▶ main_grad.add_ ─────────────────────────────────────────────────────┐
-    #    main_stream:                                              bwd_completion_event.wait ▶ [next runner]                                  │
-    #                                                                                                              phase2_event.wait (in finalize_model_grads) ◀─┘
-    #    main_grad.add_ runs on rs_stream right after NCCL RS — concurrent with
-    #    Phase 1 AG drain. By the time bwd_completion_event fires and the next
-    #    runner launches, the add_ is done (no SM saturation blocking overlap).
-    #    finalize_model_grads waits phase2_completion_event before DP grad sync.
-    # pylint: enable=line-too-long
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -797,13 +772,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
-        # DDP's grad-ready hook is silenced during capture and not re-fired at replay, so fire it
-        # here to let DDP RS overlap backward. Fire on each param's rs_stream (the one that ran its
-        # captured main_grad.add_) so FIFO orders DDP-RS after that write; wait_event guards
-        # cross-substream Phase 2. Plan precomputed in create_bwd_graph; main_stream stays free.
+        # DDP grad-ready hook is silenced at capture/replay, so fire it here (on each param's
+        # rs_stream, after wait_stream(runner.stream) fences Phase 2) to let DDP RS overlap bwd.
         if runner.gtp_remat:
             for gtp_rs_stream, params in runner._gtp_finalize_hook_plan:
-                gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
+                gtp_rs_stream.wait_stream(runner.stream)
                 with torch.cuda.stream(gtp_rs_stream):
                     for param in params:
                         hook = getattr(param, '_grad_accum_hook', None)
@@ -924,13 +897,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 # NCCL into runner_stream before bwd_completion_event fires.
                 if get_expert_gtp_weight_remat_world_size() > 1:
                     self._register_gtp_side_streams(get_expert_gtp_weight_remat_group())
-                # Records after Phase 2 (RS drain + main_grad.add_) completes
-                # on runner.stream. finalize_model_grads waits on this before
-                # reading main_grad for the DP gradient sync.
-                self.bwd_phase2_completion_event = torch.cuda.Event(
-                    external=True, interprocess=True
-                )
-                _GTP_PHASE2_COMPLETION_EVENTS.append(self.bwd_phase2_completion_event)
+                # Registered for finalize_model_grads to wait on (Phase 2 fence).
+                _GTP_RUNNER_STREAMS.append(self.stream)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -1379,11 +1347,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
-
-            if self.gtp_remat:
-                # Phase 2 + side-stream join done — record so
-                # finalize_model_grads can wait for main_grad.add_ completion.
-                self.bwd_phase2_completion_event.record()
 
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.

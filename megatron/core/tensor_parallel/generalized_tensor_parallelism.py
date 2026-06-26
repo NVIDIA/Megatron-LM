@@ -258,9 +258,8 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
-    Drains in-flight AG/RS on the side streams (eager expert backward may still be writing
-    main_grad) and waits on each CUDA-graph runner's captured dense-GTP bwd Phase 2
-    (main_grad.add_) completion event. No-op when GTP is inactive (empty streams / events).
+    Drains the eager AG/RS side streams, then waits on each CG runner's replay stream
+    (its tail = captured Phase 2 main_grad.add_). No-op when GTP is inactive.
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
@@ -269,10 +268,10 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
-    from megatron.core.transformer.cuda_graphs import get_gtp_phase2_completion_events
+    from megatron.core.transformer.cuda_graphs import get_gtp_runner_streams
 
-    for evt in get_gtp_phase2_completion_events():
-        cur.wait_event(evt)
+    for s in get_gtp_runner_streams():
+        cur.wait_stream(s)
 
 
 @dataclass
