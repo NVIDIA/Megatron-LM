@@ -3387,7 +3387,10 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    # Preserve a caller-installed finalize hook (e.g. heterogeneous MIMO grad sync);
+    # only default to the stock implementation when none was set.
+    if getattr(config, 'finalize_model_grads_func', None) is None:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
