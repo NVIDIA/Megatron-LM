@@ -832,12 +832,21 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
-                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
-                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
+                # Resolve TP/PP rank+size from the threaded groups (MIMO has no global mpu).
+                _tp_r = tensor_rank if tensor_rank is not None else (
+                    get_pg_rank(tp_group) if tp_group is not None
+                    else mpu.get_tensor_model_parallel_rank())
+                _pp_r = pipeline_rank if pipeline_rank is not None else (
+                    get_pg_rank(pp_group) if pp_group is not None
+                    else mpu.get_pipeline_model_parallel_rank())
+                _tp_w = get_pg_size(tp_group) if tp_group is not None \
+                    else mpu.get_tensor_model_parallel_world_size()
+                _pp_w = get_pg_size(pp_group) if pp_group is not None \
+                    else mpu.get_pipeline_model_parallel_world_size()
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
-                             f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
-                             f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
+                             f"[ t {_tp_r + 1}/{_tp_w}, "
+                             f"p {_pp_r + 1}/{_pp_w} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
