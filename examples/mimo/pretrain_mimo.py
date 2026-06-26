@@ -133,6 +133,7 @@ class MimoSetup:
                 tp_group=runtime.pg_collection.tp,
                 pp_group=runtime.pg_collection.pp,
                 dp_cp_group=runtime.pg_collection.dp_cp,
+                dp_group=runtime.pg_collection.dp,
                 rng_state_key_prefix=runtime.model[0].rng_state_key_prefix,
             )
         else:
