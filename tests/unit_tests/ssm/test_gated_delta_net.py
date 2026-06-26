@@ -19,6 +19,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm import gated_delta_net as gdn_module
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     _build_head_perm_for_split_sections,
@@ -145,6 +146,106 @@ def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
             linear_cp_mode="headwise",
             linear_num_key_heads=4,
             linear_num_value_heads=8,
+        )
+
+
+@pytest.mark.parametrize("gated_delta_rule_backend", ["fla", "flash_qla", "torch"])
+def test_gated_delta_rule_backend_accepts_gdn_modes(gated_delta_rule_backend):
+    config = _make_gdn_config(gated_delta_rule_backend=gated_delta_rule_backend)
+    assert config.gated_delta_rule_backend == gated_delta_rule_backend
+
+
+def test_gated_delta_rule_backend_rejects_invalid_value():
+    with pytest.raises(ValueError, match="gated_delta_rule_backend must be one of"):
+        _make_gdn_config(gated_delta_rule_backend="flashinfer")
+
+
+def test_gated_delta_rule_backend_requires_gdn_variant_for_non_default():
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            gated_delta_rule_backend="torch",
+        )
+
+
+@pytest.mark.parametrize("gated_delta_rule_backend", ["fla", "flash_qla"])
+def test_gated_delta_rule_backend_rejects_uncertified_deterministic_mode(
+    gated_delta_rule_backend,
+):
+    with pytest.raises(ValueError, match="deterministic_mode=True"):
+        _make_gdn_config(
+            deterministic_mode=True,
+            gated_delta_rule_backend=gated_delta_rule_backend,
+        )
+
+
+def test_gated_delta_rule_backend_allows_torch_deterministic_mode():
+    config = _make_gdn_config(
+        deterministic_mode=True,
+        gated_delta_rule_backend="torch",
+    )
+    assert config.gated_delta_rule_backend == "torch"
+
+
+def test_torch_gated_delta_rule_backend_selector():
+    backend = gdn_module._select_gated_delta_rule_backend(
+        "torch",
+        deterministic_mode=True,
+        cp_size=1,
+        key_head_dim=128,
+        value_head_dim=128,
+    )
+    assert backend is gdn_module.torch_chunk_gated_delta_rule
+
+
+def test_flash_qla_gated_delta_rule_backend_rejects_chunkwise_cp():
+    with pytest.raises(ValueError, match="chunkwise CP"):
+        gdn_module._select_gated_delta_rule_backend(
+            "flash_qla",
+            deterministic_mode=False,
+            cp_size=2,
+            key_head_dim=128,
+            value_head_dim=128,
+            linear_cp_mode="chunkwise",
+        )
+
+
+def test_flash_qla_gated_delta_rule_backend_allows_headwise_cp(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(gdn_module, "_current_cuda_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(gdn_module, "_load_flash_qla_chunk_gated_delta_rule", lambda: sentinel)
+    backend = gdn_module._select_gated_delta_rule_backend(
+        "flash_qla",
+        deterministic_mode=False,
+        cp_size=2,
+        key_head_dim=128,
+        value_head_dim=128,
+        linear_cp_mode="headwise",
+    )
+    assert backend is sentinel
+
+
+def test_flash_qla_gated_delta_rule_backend_rejects_non_128_head_dim():
+    with pytest.raises(ValueError, match="linear_key_head_dim=128"):
+        gdn_module._select_gated_delta_rule_backend(
+            "flash_qla",
+            deterministic_mode=False,
+            cp_size=1,
+            key_head_dim=64,
+            value_head_dim=128,
+        )
+
+
+def test_flash_qla_gated_delta_rule_backend_rejects_unsupported_gpu(monkeypatch):
+    monkeypatch.setattr(gdn_module, "_current_cuda_device_capability", lambda: (8, 0))
+    with pytest.raises(ValueError, match="SM90/SM100/SM120"):
+        gdn_module._select_gated_delta_rule_backend(
+            "flash_qla",
+            deterministic_mode=False,
+            cp_size=1,
+            key_head_dim=128,
+            value_head_dim=128,
         )
 
 
@@ -602,6 +703,7 @@ class TestFusedPreGatedDeltaRule:
             transformer_impl="transformer_engine",
             deterministic_mode=deterministic_mode,
             gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
+            gated_delta_rule_backend="torch" if deterministic_mode else "fla",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
             config=transformer_config
