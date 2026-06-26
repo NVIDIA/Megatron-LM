@@ -61,12 +61,13 @@ def safe_load_from_bytes(b):
 
 def _safe_pickle_load(file, **kwargs):
     """Safe version of `pickle.load`."""
-    return SafeUnpickler(file).load()
+    print("YES YOU ARE HERE 3")
+    return SafeUnpickler(file).load(**kwargs)
 
 
 def safe_numpy_load(path, **kwargs):
     """Safe version of `numpy.load` which calls `pickle.load`."""
-    with patch('numpy.lib.npyio.pickle.load', _safe_pickle_load):
+    with patch('pickle.load', _safe_pickle_load):
         return numpy.load(path, **kwargs)
 
 
@@ -111,6 +112,7 @@ class SafeUnpickler(pickle.Unpickler):
     )
 
     def find_class(self, module: str, name: str):
+        print("YES YOU ARE HERE 2")
         if (module, name) not in self._SAFE_CLASSES:
             raise pickle.UnpicklingError(
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
