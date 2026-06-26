@@ -480,7 +480,9 @@ class TestFusedPreGatedDeltaRule:
         self.pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
         self.unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
-        self.fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        self.fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False
+        )
         self.fused_gdn.load_state_dict(self.unfused_gdn.state_dict())
 
     def teardown_method(self):
