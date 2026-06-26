@@ -53,7 +53,7 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
-from utils import get_hf_tokenizer
+from utils import build_lm_batch_from_input_ids, get_hf_tokenizer
 
 from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
@@ -423,6 +423,21 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     def forward_step(model, batch):
         return megatron_prefill(model, batch["input_ids"])
 
+    def forward_backward_step(model, batch):
+        lm_batch = build_lm_batch_from_input_ids(
+            batch,
+            cp_group=get_context_parallel_group(),
+        )
+        loss = model.forward(
+            input_ids=lm_batch["tokens"],
+            position_ids=lm_batch["position_ids"],
+            attention_mask=lm_batch["attention_mask"],
+            labels=lm_batch["labels"],
+            loss_mask=lm_batch["loss_mask"],
+            runtime_gather_output=True,
+        )
+        loss.mean().backward()
+
     quantization_formats = [QUANT_CFG_CHOICES[fmt] for fmt in args.auto_quantize_formats]
     disabled_layers = [
         entry["quantizer_name"]
@@ -451,7 +466,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         data_loader=calib_dataloader,
         forward_step=forward_step,
         loss_func=None,
-        forward_backward_step=None,
+        forward_backward_step=forward_backward_step,
         disabled_layers=disabled_layers,
         num_calib_steps=num_calib_steps,
         num_score_steps=num_score_steps,
