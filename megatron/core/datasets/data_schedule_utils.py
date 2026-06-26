@@ -619,7 +619,11 @@ def next_hdp_group_packing_aware(
                 if projected_max <= cap and (best is None or projected_max < best[0]):
                     best = (projected_max, cp_size, "add", group_id, None)
 
-            free_ranks = [rank for rank, group_id in enumerate(gpu_group_id) if group_id is None]
+            free_ranks = [
+                rank
+                for rank, assigned_group_id in enumerate(gpu_group_id)
+                if assigned_group_id is None
+            ]
             if len(free_ranks) >= cp_size:
                 chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
                 chosen_set = set(chosen_members)
@@ -663,6 +667,9 @@ def next_hdp_group_packing_aware(
         empty_ranks = [rank for rank, micro_batch in enumerate(micro_batches) if not micro_batch]
         if not empty_ranks:
             return False
+        assert all(
+            not micro_batches[rank] for rank in range(empty_ranks[0], total_gpus)
+        ), "fill_empty_gpus_once assumes empty ranks are contiguous at the tail"
 
         existing_group_sizes = set(group_size.values())
         if not existing_group_sizes:
@@ -696,11 +703,11 @@ def next_hdp_group_packing_aware(
                 new_sample_ids_per_gpu[rank] = sample_ids_per_gpu[rank]
 
             for rank in range(group_start_rank, group_end_rank + needed_count + 1):
-                new_micro_batches[rank] = micro_batches[group_end_rank]
+                new_micro_batches[rank] = list(micro_batches[group_end_rank])
                 new_exec_times[rank] = sum(
                     workload(length, next_power) for length in micro_batches[group_end_rank]
                 )
-                new_sample_ids_per_gpu[rank] = sample_ids_per_gpu[group_end_rank]
+                new_sample_ids_per_gpu[rank] = list(sample_ids_per_gpu[group_end_rank])
 
             for idx, work in enumerate(work_to_push):
                 target_rank = group_end_rank + needed_count + 1 + idx
