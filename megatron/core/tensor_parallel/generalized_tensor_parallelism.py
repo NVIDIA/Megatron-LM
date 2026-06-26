@@ -7,8 +7,11 @@ and materializes them on-demand via async all-gather, with a per-weight
 prefetch chain + ticket-based buffer cache co-designed for CUDA graph
 capture/replay.  Quantized AG (FP8 / MXFP8 / NVFP4) composes with the
 sharding for compounding bandwidth reduction.
+
+See ``docs/api-guide/core/generalized_tensor_parallel.md`` for design and usage.
 """
 
+import logging
 import math
 import os
 import re
@@ -22,6 +25,10 @@ from typing import Dict, List, Optional
 import torch
 from packaging.version import Version
 
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
+
 _GTP_TE_MIN_VERSION = Version("2.17")
 
 try:
@@ -30,9 +37,9 @@ try:
     _te_version = Version(te.__version__)
     if _te_version < _GTP_TE_MIN_VERSION and not os.environ.get("MEGATRON_GTP_FORCE_ENABLE"):
         raise ImportError(
-            f"megatron.core.tensor_parallel.gtp requires TransformerEngine >= {_GTP_TE_MIN_VERSION} "
-            f"(found {_te_version}). Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass this check "
-            "when using a custom TE build that includes the GTP hook registry."
+            f"megatron.core.tensor_parallel.gtp requires TransformerEngine "
+            f">= {_GTP_TE_MIN_VERSION} (found {_te_version}). Set MEGATRON_GTP_FORCE_ENABLE=1 "
+            "to bypass this check when using a custom TE build with the GTP hook registry."
         )
 
     import transformer_engine_torch as tex
@@ -147,10 +154,9 @@ def _classify_param_chain(param_name: str) -> "GTPChain":
 def classify_gtp_chains(model) -> None:
     """Walk model.named_parameters() and set chain_id on every GTPShardedParam.
 
-    Call once at init, AFTER set_cuda_graph_modules() and BEFORE the first fwd
-    of any graphed param. Raises if an already chain-initialized param would
-    be reclassified into a different chain (its prev/next links are already
-    wired into the wrong list).
+    Call once at init, AFTER set_cuda_graph_modules() and BEFORE the first fwd of any
+    graphed param. Raises if an already-initialized param would be reclassified into a
+    different chain (its prev/next links are already wired into the wrong list).
     """
     conflicts = []
     for name, param in model.named_parameters():
@@ -162,9 +168,8 @@ def classify_gtp_chains(model) -> None:
             continue
         param.chain_id = target
 
-        # Bwd-prefetch opt-out: embedding.word_embeddings.weight does not need
-        # an AG in the bwd pass (its wgrad is a scatter-add on sharded rows
-        # and its input has no dgrad). Skipping its bwd AG saves one collective.
+        # Bwd-prefetch opt-out: embedding weight needs no bwd AG (wgrad is a
+        # scatter-add on sharded rows, input has no dgrad) — saves one collective.
         if "embedding" in name:
             param._need_weight_prefetch_bwd = False
     if conflicts:
@@ -202,10 +207,8 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 
 
 def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
-    """Get a pool buffer or allocate fresh. Tagged so _wgrad_pool_put accepts
-    only pool-owned buffers — callers that don't use _wgrad_pool_get (e.g.
-    Megatron layers.py wgrad GEMM, aten F.embedding bwd) fall through to the
-    caching allocator on release."""
+    """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
+    pool-owned buffers (other callers fall through to the caching allocator on release)."""
     key = (shape, dtype)
     pool = _wgrad_buf_pool.get(key)
     if pool:
@@ -230,11 +233,8 @@ def _wgrad_pool_put(buf: torch.Tensor):
 def _stream_key(chain_id: str, group) -> tuple:
     """Key for the per-(chain, group) AG/RS stream dicts.
 
-    Two partitioning axes:
-      - chain_id: captured (GRAPHED) vs eager (UNGRAPHED) ops must not share
-        a stream (eager ops would contaminate capture/replay state).
-      - group: independent NCCL communicators (e.g. GTP vs EGTP) get their
-        own user-level stream to avoid cross-group serialization.
+    Partitioned on two axes: chain_id (captured GRAPHED vs eager UNGRAPHED ops must not
+    share a stream) and group (independent NCCL comms, e.g. GTP vs EGTP, avoid serialization).
     """
     return (chain_id, id(group) if group is not None else 0)
 
@@ -281,15 +281,12 @@ class GTPConfig:
     pad_for_alignment: int = 16
     check_param_states: bool = False
     weight_prefetch: bool = True
-    # When True (default), wgrad reduce-scatter for non-chain-head GTP
-    # params uses async_op=True; finalize (handle.wait + main_grad.add_)
-    # runs in the cascade walk of a later bwd call, allowing RS-compute
-    # overlap. When False, every wgrad RS is synchronous and finalizes
-    # inline, at the cost of that overlap.
+    # True (default): non-chain-head wgrad RS is async_op=True and finalizes
+    # (handle.wait + main_grad.add_) in a later bwd's cascade walk, overlapping RS with
+    # compute. False: every wgrad RS is synchronous + inline (no overlap).
     async_reduction: bool = True
-    # GTP companion to Megatron --fp8-param-gather: optimizer casts FP32 master
-    # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
-    # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
+    # GTP companion to --fp8-param-gather: optimizer casts FP32 master directly into
+    # GTPShardedParam.quantized; forward reuses the cached FP8 (BF16->FP8 off critical path).
     fp8_param_gather: bool = False
 
 
@@ -318,9 +315,8 @@ def tag_gtp_params_with_names(model):
 def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
     """Pad + slice a full-size BF16 weight to this rank's GTP shard.
 
-    Caller attaches GTP attrs (see _gtp_attach_attrs). When called from the
-    legacy post-init path under fp8_model_init, tensor may be a
-    QuantizedTensor — F.pad dequantizes it before slicing.
+    Caller attaches GTP attrs (see _gtp_attach_attrs). On the legacy post-init path under
+    fp8_model_init, tensor may be a QuantizedTensor — F.pad dequantizes it before slicing.
     """
     gtp_size = gtp_group.size()
     gtp_rank = gtp_group.rank()
@@ -348,9 +344,8 @@ def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
-    # Preserve the source weight's tensor-model-parallel attributes (dropped when wrapping
-    # into GTPShardedParam). GTP only shards TP-parallel linears, so this keeps the param
-    # correctly classified by param_is_not_tensor_parallel_duplicate without GTP-specific code.
+    # Preserve the source weight's TP attributes (dropped when wrapping into GTPShardedParam),
+    # so param_is_not_tensor_parallel_duplicate still classifies it without GTP-specific code.
     from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
 
     copy_tensor_model_parallel_attributes(gtp_shard, param)
@@ -360,8 +355,8 @@ def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
 def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
     """Attach group / gtp_size / routed-expert tags and register in _GTP_PARAMS.
 
-    Kept separate from _gtp_slice_one_param so attrs land on the post-quantize
-    param (when quantize fires between slice and attach).
+    Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
+    quantize fires between slice and attach).
     """
     if is_grouped:
         gtp_shard.expert_idx = expert_idx
@@ -378,11 +373,9 @@ def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
 def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
     """Shard and re-register module params as GTPShardedParam.
 
-    Two call paths:
-    1. Megatron-style modules (ColumnParallelLinear, etc.): full post-init slice.
-    2. TE modules: per-param body no-ops because the reset_parameters hook
-       already produced GTPShardedParam instances.
-
+    Two call paths: (1) Megatron-style modules (ColumnParallelLinear, etc.) — full post-init
+    slice; (2) TE modules — per-param body no-ops, since the reset_parameters hook already
+    produced GTPShardedParam instances.
     """
     if gtp_group.size() == 1:
         return
@@ -410,13 +403,11 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
 
 
 def gtp_slice_in_reset_parameters(module, name, param, expert_idx=0):
-    """Slice + attach attrs for one param. Called between init_fn(param) and
-    the optional quantizer(param) in TransformerEngineBaseModule.reset_parameters.
+    """Slice + attach attrs for one param, between init_fn(param) and the optional
+    quantizer(param) in TransformerEngineBaseModule.reset_parameters.
 
-    Only fires for params in module.weight_names (the GEMM weights);
-    layer-norm gammas, biases, etc. are left full-size.
-
-    Returns the new GTPShardedParam or None (GTP not active for this param).
+    Only fires for params in module.weight_names (GEMM weights); layer-norm gammas, biases,
+    etc. stay full-size. Returns the new GTPShardedParam, or None (GTP not active here).
     """
     gtp_group = getattr(module, "_gtp_group", None)
     if gtp_group is None or gtp_group.size() == 1:
@@ -431,9 +422,8 @@ def gtp_slice_in_reset_parameters(module, name, param, expert_idx=0):
 
 
 def gtp_finalize_module_in_reset_parameters(module, weight_names):
-    """GroupedLinear-only: attach weight_list to expert 0's shard for batched
-    all-gather. No-op when module._gtp_is_grouped is False.
-    """
+    """GroupedLinear-only: attach weight_list to expert 0's shard for batched all-gather
+    (no-op when module._gtp_is_grouped is False)."""
     if not getattr(module, "_gtp_is_grouped", False):
         return
     gtp_group = getattr(module, "_gtp_group", None)
@@ -447,9 +437,8 @@ def gtp_finalize_module_in_reset_parameters(module, weight_names):
 class GTPShardHandle:
     """Wrapper around a ``dist`` async-work handle for a GTP AG / RS.
 
-    Tracks the participating shards so the wait-site can transition their
-    ``GTPWeightState`` and so the GTP module can prune the param from
-    ``_inflight_comm_params`` when the collective completes.
+    Tracks the participating shards so the wait-site can transition their GTPWeightState
+    and prune the param from _inflight_comm_params when the collective completes.
     """
 
     def __init__(self, handle, gtp_shards, reduce_scatter=False):
@@ -476,15 +465,13 @@ class GTPShardHandle:
 class GTPShardedParam(torch.nn.Parameter):
     """A weight parameter sharded 1/N across a GTP process group.
 
-    Materialized on-demand via async all-gather and gradient-reduced via
-    reduce-scatter.  Carries its own prefetch-chain wiring (``prev_w`` /
-    ``next_w``), per-chain state, AG/RS cache tickets, and the metadata the
-    integrator needs to drive overlap with captured compute.
+    Materialized on-demand via async all-gather and gradient-reduced via reduce-scatter.
+    Carries its own prefetch-chain wiring (prev_w/next_w), per-chain state, AG/RS cache
+    tickets, and the metadata the integrator needs to overlap with captured compute.
     """
 
-    # Per-chain linked-list state, keyed by chain_id (GTPChain.GRAPHED/UNGRAPHED); chains
-    # never cross-link (prev_w/next_w join only same-chain_id params). Call reset_gtp_state()
-    # before rebuilding a GTP model in the same process.
+    # Per-chain linked-list state, keyed by chain_id; chains never cross-link (prev_w/next_w join
+    # only same-chain params). Call reset_gtp_state() before rebuilding a GTP model in-process.
     _chain_state: Dict[str, dict] = {}
 
     # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
@@ -511,7 +498,7 @@ class GTPShardedParam(torch.nn.Parameter):
     def _buffer_link_table_row(
         cls, prev: "GTPShardedParam", curr: "GTPShardedParam", chain: dict
     ) -> None:
-        """Buffer one row of the prefetch-link table (flushed atomically on the second forward pass)."""
+        """Buffer one prefetch-link row (flushed atomically on the second forward pass)."""
         _W = 70
 
         def _layer_id(name: str) -> str:
@@ -555,10 +542,9 @@ class GTPShardedParam(torch.nn.Parameter):
         self._ag_ticket_bwd = None
         self._prefetch_handle = None
         self._need_weight_prefetch = True
-        # Per-direction prefetch opt-outs. Default True. The embedding weight
-        # never needs an AG during bwd (its wgrad is a scatter-add indexed by
-        # token ids, and its input is non-differentiable, so no dgrad either).
-        # classify_gtp_chains() sets this to False for embedding.word_embeddings.weight.
+        # Per-direction prefetch opt-outs (default True). The embedding weight needs no bwd AG
+        # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
+        # sets this False for embedding.word_embeddings.weight.
         self._need_weight_prefetch_bwd = True
         self.ag_event = torch.cuda.Event(external=True)
         # DDP backward hook (set by register_grad_accum_hook); invoked after
@@ -572,22 +558,19 @@ class GTPShardedParam(torch.nn.Parameter):
         self.prefetch_initialized = False
         self.next_w = None
         self.prev_w = None
-        # Recompute-forward prefetch chain: a SEPARATE chain (own slot) linking
-        # the weights re-gathered rowwise during an activation-recompute forward
-        # in backward. Kept distinct from state/_prefetch_handle/ag_event above so
-        # it never clobbers the concurrent columnwise dgrad lifecycle of the same
-        # weight. Self-populates lazily from the first backward's recompute-fwd
-        # gathers (see all_gather_and_prefetch).
+        # Recompute-forward prefetch chain: a SEPARATE chain (own slot) for weights re-gathered
+        # rowwise during an activation-recompute forward in backward. Distinct from the
+        # state/_prefetch_handle/ag_event above so it never clobbers the concurrent columnwise
+        # dgrad lifecycle. Self-populates from the first backward's recompute gathers.
         self._recompute_initialized = False
         self._recompute_next = None
         self._recompute_prev = None
         self._recompute_prefetch_handle = None
         self._recompute_ag_event = torch.cuda.Event(external=True)
         self._recompute_already_drained = False
-        # Chain identity (GTPChain.GRAPHED / GTPChain.UNGRAPHED). Defaults to
-        # UNGRAPHED as a safe fallback; classify_gtp_chains(model) walks the
-        # model at init time (after set_cuda_graph_modules) and reclassifies
-        # based on param name + active cuda_graph_modules.
+        # Chain identity (GRAPHED/UNGRAPHED). Defaults to UNGRAPHED; classify_gtp_chains(model)
+        # walks the model at init (after set_cuda_graph_modules) and reclassifies on param name +
+        # active cuda_graph_modules.
         self.chain_id = GTPChain.UNGRAPHED.value
         # Grouped gemm
         self.is_routed_expert = False
@@ -622,10 +605,9 @@ class GTPShardedParam(torch.nn.Parameter):
                     q.with_amax_reduction = True
                     q.amax_reduction_group = group
                 q.internal = False
-                # MXFP8 scales must stay in compact (unswizzled) layout so that
-                # per-shard scale_inv can be all-gathered via byte concatenation.
-                # GEMM-swizzled scales from independent shards don't compose into
-                # a valid swizzled layout for the full tensor after AG.
+                # MXFP8 scales must stay compact (unswizzled) so per-shard scale_inv can be
+                # all-gathered by byte concatenation. GEMM-swizzled scales from independent
+                # shards don't compose into a valid swizzled layout for the full tensor.
                 q.optimize_for_gemm = not isinstance(q, MXFP8Quantizer)
                 return q
 
@@ -644,16 +626,15 @@ class GTPShardedParam(torch.nn.Parameter):
                 with _graphed_alloc(getattr(weight, "chain_id", GTPChain.UNGRAPHED.value)):
                     weight.quantized = weight._quantizer.quantize(weight.get_padded_shard())
                 weight.quantized.is_routed_expert = getattr(weight, "is_routed_expert", False)
-                # fp8_param_gather: the init quantize above already produced a
-                # valid FP8 cache from the BF16 shard; flag did_cast so iter-0's
-                # forward _quantize_if_needed short-circuits and the redundant
-                # BF16->FP8 cast on iter 0 is skipped.
+                # fp8_param_gather: the init quantize already produced a valid FP8 cache from
+                # the BF16 shard; flag did_cast so iter-0 forward short-circuits and skips the
+                # redundant BF16->FP8 cast.
                 if GTP_CONFIG.fp8_param_gather:
                     weight.did_cast_to_low_precision = True
 
     @property
     def _weights(self):
-        """Return the list of individual weight shards (self for non-routed, weight_list for routed)."""
+        """Individual weight shards (self for non-routed, weight_list for routed)."""
         weights = self.weight_list if self.is_routed_expert else [self]
         # Only meaningful when _set_state is actively tracking transitions.
         if GTP_CONFIG.check_param_states:
@@ -697,11 +678,10 @@ class GTPShardedParam(torch.nn.Parameter):
         self.rs_state = new_state
 
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
-        """Build cache key using output shape + dtype.
+        """Build cache key from output shape + dtype.
 
-        Weights with matching gathered shape and dtype share a buffer.
-        For expert weights gathered in parallel, self.expert_idx distinguishes them so
-        each gets a distinct buffer, while same-indexed experts across layers share.
+        Weights with matching gathered shape and dtype share a buffer. For experts gathered
+        in parallel, self.expert_idx keeps each distinct; same-indexed experts across layers share.
         """
 
         if not isinstance(dtype, torch.dtype):
@@ -801,10 +781,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
         weights = self._weights
 
-        # 1. Transition state for async gathers. Skip during a recompute-forward:
-        #    it gathers this weight rowwise (into _ag_ticket_fwd) while a bwd-chain
-        #    prefetch may hold an in-flight columnwise AG state on the same weight
-        #    (separate _ag_ticket_bwd) — clobbering it would break the dgrad consume.
+        # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
+        #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
+        #    AG state (_ag_ticket_bwd) on the same weight — clobbering breaks the dgrad consume.
         if GTP_CONFIG.check_param_states and not in_fp8_activation_recompute_phase():
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
@@ -822,9 +801,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 w._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
 
         # 3. Build gather inputs.
-        # quantizers / dtypes / gtp_group are stable after model construction —
-        # cache on the anchor (self == weights[0]) to avoid rebuilding lists
-        # every call.  w.quantized is NOT cached because it can rebind.
+        # quantizers / dtypes / gtp_group are stable post-construction — cache on the anchor
+        # (self == weights[0]) to avoid rebuilding lists each call. w.quantized is NOT cached
+        # (it can rebind).
         quantizers = self._cached_quantizers
         if quantizers is None:
             quantizers = [w._quantizer for w in weights]
@@ -865,12 +844,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 out_buffers
             ), "Duplicate output buffers in batched all-gather — experts need distinct cache keys"
 
-        # ASYNC AG: wrap issue on ag_stream — ag_stream's tail then reflects
-        # the collective's full lifecycle (what external wait_stream(ag_stream)
-        # drains depend on). The explicit outer→ag_stream sync event preserves
-        # the upstream quantize writer edge that the bare stream context would
-        # drop; held on self so PyTorch's event pool can't recycle the handle
-        # between capture and replay.
+        # ASYNC AG: issue on ag_stream so its tail reflects the collective's full lifecycle
+        # (what external wait_stream(ag_stream) drains depend on). The explicit outer→ag_stream
+        # sync event preserves the upstream quantize-writer edge the bare stream context drops;
+        # held on self so the event pool can't recycle it between capture and replay.
         # SYNC AG: stay on caller — output ready on return.
         if async_op:
             outer_stream = torch.cuda.current_stream()
@@ -964,9 +941,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
         _was_drained = getattr(self, "_already_ag_drained", False)
         if _was_drained:
-            # Producer already drained via wait_async_comms; skip the captured
-            # cross-graph wait (CUDA no-op anyway). Correctness is provided by
-            # the eager main_stream sync chain in the surrounding training loop.
+            # Producer already drained via wait_async_comms; skip the captured cross-graph
+            # wait (a CUDA no-op anyway). Correctness comes from the eager main_stream sync.
             self._already_ag_drained = False
         else:
             # Intra-graph or eager consume: drain inline.
@@ -998,9 +974,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._recompute_ag_event.record()
 
     def _recompute_prefetch_next(self, target, nvtx_label=None):
-        # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight
-        # skips the AG-state transition under recompute, so the dgrad `state` of
-        # target is untouched; result lands in target._ag_ticket_fwd.
+        # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight skips the
+        # AG-state transition under recompute, so target's dgrad state is untouched; result lands
+        # in target._ag_ticket_fwd.
         _, handle = target._all_gather_weight(
             async_op=True,
             skip_weight_cast=True,
@@ -1030,14 +1006,12 @@ class GTPShardedParam(torch.nn.Parameter):
         return result if self.is_routed_expert else result[0]
 
     def all_gather_and_prefetch_bwd(self, nvtx_label=None):
-        """
-        Backward variant: get current weight (from cache if prefetched, else
-        sync gather) and async-prefetch prev_w.
+        """Backward variant: get the current weight (cached if prefetched, else sync gather)
+        and async-prefetch prev_w.
 
-        Safe thanks to the coat-check cache: get() returns the current buffer
-        to the pool, and the prefetch's checkout() will allocate a separate
-        buffer if the pool is empty (i.e. the current buffer is still live
-        via the caller's tensor reference).
+        Safe via the coat-check cache: get() returns the current buffer to the pool, and the
+        prefetch's checkout allocates a separate buffer if the pool is empty (current buffer
+        still live via the caller's reference).
 
         Returns:
             weight_total
@@ -1054,9 +1028,8 @@ class GTPShardedParam(torch.nn.Parameter):
             and self.prev_w._need_weight_prefetch
             and self.prev_w._need_weight_prefetch_bwd
         ):
-            # Pre-AG work (quantize, ticket lookup) runs on caller's stream;
-            # the NCCL collective itself is wrapped on ag_stream inside
-            # _all_gather_weight (see the async/sync gate there for rationale).
+            # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
+            # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
             _, handle = self.prev_w._all_gather_weight(
                 async_op=True,
                 skip_weight_cast=True,
@@ -1090,8 +1063,7 @@ class GTPShardedParam(torch.nn.Parameter):
         cast_noop_flag: torch.Tensor = None,
         nvtx_label: str = None,
     ):
-        """
-        All-gather current weight and async-prefetch the next weight.
+        """All-gather the current weight and async-prefetch the next.
 
         Returns:
             weight_total
@@ -1135,18 +1107,17 @@ class GTPShardedParam(torch.nn.Parameter):
             )
             self.next_w._prefetch_handle = handle
 
-        # The unsharded tensor has been returned, no pending work so reset state to NONE.
-        # Skip during recompute: a bwd-chain prefetch may hold an in-flight AG state on
-        # this weight that its later dgrad consume still needs.
+        # Unsharded tensor returned, no pending work → reset state to NONE. Skip during recompute:
+        # a bwd-chain prefetch may hold an in-flight AG state this weight's later dgrad needs.
         if GTP_CONFIG.check_param_states and not in_recompute:
             for w in self._weights:
                 w._set_state(GTPWeightState.NONE)
 
         cls = type(self)
 
-        # Lazy-build the recompute-forward prefetch chain (first backward, in
-        # recompute order). Consume/prefetch above used the prior iteration's links,
-        # so the first backward runs on-demand while these links are established.
+        # Lazy-build the recompute-forward prefetch chain (first backward, in recompute order).
+        # Consume/prefetch above used the prior iter's links, so the first backward runs on-demand
+        # while these are established.
         if in_recompute and not self._recompute_initialized:
             rchain = cls._get_recompute_chain_state(self.chain_id)
             last_r = rchain["last_weight"]
@@ -1183,12 +1154,12 @@ class GTPShardedParam(torch.nn.Parameter):
         elif not chain["link_table_flushed"] and chain["link_table_buffer"]:
             # Second forward pass: flush the complete table atomically to avoid interleaving
             chain["link_table_flushed"] = True
-            print_rank_0("\n".join(chain["link_table_buffer"]) + "\n")
+            log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
 
         return result
 
     def batched_all_gather_and_prefetch(self, **kwargs):
-        """Batched all-gather + prefetch for expert weights. Wrapper around all_gather_and_prefetch."""
+        """Batched all-gather + prefetch for expert weights (wraps all_gather_and_prefetch)."""
         assert self.is_routed_expert and self.weight_list is not None
         return self.all_gather_and_prefetch(**kwargs)
 
@@ -1197,27 +1168,23 @@ class GTPShardedParam(torch.nn.Parameter):
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_grad_accum_hook(self, grad_accum_node, hook):
-        """Register a DDP backward hook to be called after the wgrad RS finalize.
+        """Register a DDP backward hook to call after the wgrad RS finalize.
 
-        For GTP params, autograd may receive None (async RS) so the normal grad
-        accumulator hook never fires. Instead, the integrator (Graphed.backward
-        for captured chains, or the eager chain-tail cascade) calls this hook
-        explicitly after RS wait + gradient accumulation, ensuring DDP's
-        register_grad_ready fires at exactly the right time.
-
-        ``grad_accum_node`` is accepted for caller-API compatibility but the
-        node itself is not retained — only the hook callable.
+        For GTP params autograd may receive None (async RS), so the normal grad-accumulator
+        hook never fires; the integrator (Graphed.backward for captured chains, or the eager
+        chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
+        register_grad_ready fires at the right time. grad_accum_node is accepted for API
+        compatibility but not retained — only the hook callable.
         """
         del grad_accum_node
         self._grad_accum_hook = hook
 
     @staticmethod
     def _handle_megatron_grad_accum(param):
-        """Handle megatron DDP and gradient accumulation fusion.
+        """Handle megatron DDP and gradient-accumulation fusion.
 
-        Do NOT set param.grad before calling the hook — the hook checks
-        param.grad and would accumulate it into main_grad if zero_out_wgrad
-        is True, corrupting the gradient with a non-zero dummy.
+        Do NOT set param.grad before calling the hook — the hook checks param.grad and would
+        accumulate it into main_grad if zero_out_wgrad is True, corrupting it with a dummy.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
@@ -1229,11 +1196,10 @@ class GTPShardedParam(torch.nn.Parameter):
         return dummy_grad
 
     def _wait_reduce_scatter(self, finalize_grad=False):
-        # Enter rs_stream context so handle.wait() + rs_event.record() land
-        # on rs_stream — mirrors _wait_param_gather for the RS path.
-        # When finalize_grad=True, main_grad.add_ also runs on rs_stream
-        # (right after NCCL RS), so it starts during AG drain rather than
-        # after it — avoids SM-saturation blocking cross-graph overlap.
+        # Enter rs_stream context so handle.wait() + rs_event.record() land on rs_stream
+        # (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
+        # rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
+        # SM-saturation that blocks cross-graph overlap.
         rs_stream = self._cached_rs_stream
         if rs_stream is None:
             rs_stream = get_rs_stream(self.chain_id, self.group)
@@ -1265,11 +1231,8 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wgrad_input_bufs = None
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
-        """Reduce-scatter one or more wgrads. Returns (outputs, handle).
-
-        Single tensor: plain reduce-scatter (no coalescing).
-        Multiple tensors: coalesced reduce-scatter.
-        """
+        """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
+        multiple: coalesced RS."""
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
@@ -1292,12 +1255,10 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             out_buffers = [None] * len(wgrads)
 
-        # ASYNC RS: wrap issue on rs_stream — rs_stream's tail then reflects
-        # the collective's full lifecycle (what external wait_stream(rs_stream)
-        # drains depend on). The explicit outer→rs_stream sync event preserves
-        # the wgrad-GEMM writer edge that the bare stream context would drop;
-        # held on self so PyTorch's event pool can't recycle the handle
-        # between capture and replay. Mirrors AG path.
+        # ASYNC RS: issue on rs_stream so its tail reflects the collective's full lifecycle
+        # (what external wait_stream(rs_stream) drains depend on). The explicit outer→rs_stream
+        # sync event preserves the wgrad-GEMM writer edge the bare stream context drops; held on
+        # self so the event pool can't recycle it between capture and replay. Mirrors the AG path.
         # SYNC RS: stay on caller — output ready on return.
         if async_op:
             outer_stream = torch.cuda.current_stream()
@@ -1333,27 +1294,24 @@ class GTPShardedParam(torch.nn.Parameter):
             return outputs, cm if async_op else None
 
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
-        """Reduce-scatter wgrad(s). Sync for last weight, async+deferred for others.
-
-        Accepts a single tensor (non-routed) or list of tensors (routed experts).
+        """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
+        Accepts a single tensor (non-routed) or a list (routed experts).
 
         Returns:
-            Single tensor or list for sync (last weight) — backward should return this.
-            None or tuple of Nones for async — backward should return this.
+            Single tensor or list for sync (last weight) — backward returns this.
+            None or tuple of Nones for async — backward returns this.
         """
         batched = isinstance(wgrad, (list, tuple))
         wgrads = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
-        # UNGRAPHED-chain wgrads are recycled via the standalone pool (_wgrad_pool_put).
-        # GRAPHED-chain wgrads cannot pool-recycle because CUDA graphs require
-        # stable buffer addresses across replay.
+        # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
+        # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = self.chain_id == GTPChain.UNGRAPHED.value
 
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
-            # Async reduce-scatter (not last weight — deferred finish). Pre-RS
-            # work on caller; NCCL wrap lives at the collective site inside
-            # _reduce_scatter (mirrors the AG prefetch sites).
+            # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
+            # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
             self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
             # Stash wgrad input buffers — cannot recycle yet because the async RS
@@ -1409,9 +1367,8 @@ class GTPShardedParam(torch.nn.Parameter):
     def get_data_tensors(self):
         """Expose self as the lone data tensor for TE's offload-marking interface.
 
-        TE's ``mark_activation_offload`` treats any non-plain tensor as a storage
-        wrapper and calls ``get_data_tensors()`` on it; a sharded param has no inner
-        buffers, so it is its own data tensor.
+        TE's mark_activation_offload treats any non-plain tensor as a storage wrapper and calls
+        get_data_tensors() on it; a sharded param has no inner buffers, so it is its own.
         """
         return (self,)
 
@@ -1433,18 +1390,6 @@ class GTPShardedParam(torch.nn.Parameter):
             return func(*args, **kwargs)
 
 
-def print_rank_0(message, rank=None):
-    """If distributed is initialized or rank is specified, print only on rank 0."""
-    if rank is not None:
-        if rank == 0:
-            print(message, flush=True)
-    elif torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            print(message, flush=True)
-    else:
-        print(message, flush=True)
-
-
 @dataclass
 class _TicketSlot:
     """Internal slot backing a persistent ticket in the GTP buffer cache."""
@@ -1458,11 +1403,10 @@ class _TicketSlot:
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
 
 
-# CUDA-graph memory pool for routing GRAPHED-chain allocations (AG/RS buffers and
-# quantized weight storage) into the capture pool *at creation time*, so no post-hoc
-# reallocation is needed. Registered by the integrator (set_cuda_graph_mempool) after
-# the pool is created and before the first graphed forward; stays None when CG is off,
-# in which case _graphed_alloc is a no-op and allocations use regular memory.
+# CUDA-graph memory pool: routes GRAPHED-chain allocations (AG/RS buffers, quantized weight
+# storage) into the capture pool at creation time, avoiding post-hoc reallocation. Registered
+# via set_cuda_graph_mempool before the first graphed forward; stays None when CG is off, where
+# _graphed_alloc is a no-op (regular allocator).
 _CG_MEMPOOL_DEVICE = None
 _CG_MEMPOOL = None
 
@@ -1489,25 +1433,17 @@ def _graphed_alloc(chain_id):
 
 
 class GTPWeightCache:
-    """
-    Ticket-based buffer pool for GTP all-gather / reduce-scatter buffers.
+    """Ticket-based buffer pool for GTP all-gather / reduce-scatter buffers.
 
-    - ``reserve(param, dtype, fwd)`` → ``ticket``
-      Assigns a persistent ticket (no buffer allocated yet).
-    - ``get(ticket)`` → ``buffer``
-      Returns the buffer, lazily allocating from pool or fresh if needed.
-    - ``release(ticket)``
-      Returns the buffer to the pool.  Ticket remains valid; next ``get()``
-      will re-allocate from the pool.
-    - ``clear()``
-      Drops all buffers and pools.  Tickets remain valid; next ``get()``
-      lazily allocates fresh buffers.
+    - reserve(param, dtype, fwd) → ticket: assign a persistent ticket (no buffer yet).
+    - get(ticket) → buffer: return the buffer, lazily (re)allocating from pool or fresh.
+    - release(ticket): return the buffer to the pool; ticket stays valid.
+    - clear(): drop all buffers/pools; tickets stay valid, next get() allocates fresh.
     """
 
-    # Bytes per element for known dtypes (used for logging).  Add new entries
-    # here when GTP starts caching buffers of additional quantized dtypes.
-    # Only DType values guaranteed exposed by the TE pybind bindings — verify
-    # via ``hasattr(tex.DType, ...)`` before adding speculative entries.
+    # Bytes per element for known dtypes (for logging). Add entries when GTP caches buffers of
+    # new quantized dtypes — only DType values the TE pybind bindings expose (verify via
+    # hasattr(tex.DType, ...) before adding speculative entries).
     _BYTES_PER_ELEMENT = {
         torch.bfloat16: 2,
         torch.float16: 2,
@@ -1568,9 +1504,11 @@ class GTPWeightCache:
         dtype_str = (
             str(dtype) if isinstance(dtype, torch.dtype) else getattr(dtype, "name", str(dtype))
         )
-        print_rank_0(
+        log_single_rank(
+            logger,
+            logging.INFO,
             f"[GTP Cache] +{buf_bytes / 1024**2:.1f} MB  (shape={out_shape}, dtype={dtype_str})  "
-            f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} fwd: {fwd}"
+            f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} fwd: {fwd}",
         )
         return buf
 
@@ -1612,10 +1550,10 @@ class GTPWeightCache:
         return slot.buf
 
     def release(self, ticket: int):
-        """Return the buffer to the pool.  Ticket remains valid.
+        """Return the buffer to the pool (ticket stays valid).
 
-        slot.buf is intentionally NOT cleared: get() must stay idempotent so that
-        CUDA-graph-captured buffers keep their fixed address across replays.
+        slot.buf is intentionally NOT cleared: get() must stay idempotent so CUDA-graph-captured
+        buffers keep their fixed address across replays.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
@@ -1646,12 +1584,10 @@ def wait_async_comms(
 ):
     """Drain in-flight GTP async AG / RS handles.
 
-    When called inside CUDA graph capture, the drains are captured into that
-    graph. This is the producer-side hook for cross-graph AG/RS overlap:
-    captured cudaStreamWaitEvent on an event recorded in a different capture
-    session is a CUDA no-op, so consumer graphs can't safely wait on
-    cross-graph events. Instead, the producer drains here and flags the
-    param; the consumer reads the flag and skips its captured wait.
+    Inside CUDA graph capture the drains are captured into the graph — the producer-side hook
+    for cross-graph overlap. A captured cudaStreamWaitEvent on another capture session's event is
+    a CUDA no-op, so consumers can't wait cross-graph; instead the producer drains here and flags
+    the param, and the consumer skips its captured wait.
 
     Args:
         chain_id: If specified, only drain params on this chain.
@@ -1683,10 +1619,9 @@ def wait_async_comms(
             param._recompute_already_drained = True
         if not skip_rs:
             param._wait_reduce_scatter(finalize_grad=finalize_after_drain)
-            # Fallback inline-accumulation: only when finalize is requested,
-            # _wait_reduce_scatter didn't already finalize, and an RS actually
-            # ran for this param (rs_ticket set).  Skips pure-AG prefetches in
-            # _inflight_comm_params (no wgrad to accumulate).
+            # Fallback inline-accumulation: only when finalize is requested, _wait_reduce_scatter
+            # didn't already finalize, and an RS actually ran (rs_ticket set). Skips pure-AG
+            # prefetches in _inflight_comm_params (no wgrad).
             need_fallback_accumulation = (
                 finalize_after_drain
                 and not getattr(param, "_already_finalized", False)
@@ -1738,11 +1673,8 @@ def grouped_gather_along_first_dim(
     quantizers: list = None,
     output_tensors: list = None,
 ):
-    """
-    All-gather multiple weights in a single coalesced operation.
-
-    Handles NVFP4 post-processing for both sync and async paths.
-    """
+    """All-gather multiple weights in one coalesced op; handles NVFP4 post-processing for both
+    sync and async paths."""
     # Determine device from first weight.
     inp = weights[0]
     if isinstance(inp, NVFP4TensorStorage):
@@ -1785,33 +1717,33 @@ def grouped_gather_along_first_dim(
 
 
 class GTPEmbeddingWeight(torch.autograd.Function):
-    """All-gather the embedding weight across the GTP group in forward, and
-    reduce-scatter its gradient back in backward.
+    """All-gather the embedding weight across the GTP group in forward, reduce-scatter its
+    gradient in backward.
 
-    The embedding weight is stored sharded along the vocab dimension across
-    the GTP group; this autograd function materializes the full weight for
-    the embedding lookup and distributes the gradient back to the shard.
+    The weight is stored sharded along the vocab dimension; this materializes the full weight
+    for the lookup and distributes the gradient back to the shard.
     """
 
     @staticmethod
     def forward(ctx, weight):
+        """All-gather the full embedding weight across the GTP group for the lookup."""
         ctx.save_for_backward(weight)
         return weight.all_gather_and_prefetch(fwd=True)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
         return weight.wgrad_reduce_scatter(grad_output)
 
 
 def reset_gtp_state():
-    """Clear the process-global GTP prefetch-chain state (``GTPShardedParam._chain_state`` /
-    ``._recompute_chain_state``).
+    """Clear the process-global GTP prefetch-chain state (GTPShardedParam._chain_state /
+    ._recompute_chain_state).
 
-    These class-level dicts survive model teardown, so a GTP model rebuilt in the same process
-    would otherwise inherit the prior model's stale ``last_weight`` pointers / flushed link
-    tables. Call once before the per-chunk ``classify_gtp_chains`` loop (never inside it — chains
-    span chunks). No-op on a fresh process.
+    These class-level dicts survive model teardown, so a GTP model rebuilt in-process would
+    inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
+    classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
     """
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
@@ -1820,10 +1752,9 @@ def reset_gtp_state():
 def reset_gtp_quantize_cache(model):
     """Invalidate the per-shard low-precision cache after a checkpoint load.
 
-    DCP load copies new data into ``GTPShardedParam.data`` in-place, leaving
-    the stale FP8 / MXFP8 / NVFP4 buffer in ``self.quantized`` behind. Call
-    this once after ``load_state_dict`` / ``dist_checkpointing.load`` so the
-    next forward re-quantizes from the freshly-loaded high-precision weight.
+    DCP load copies new data into GTPShardedParam.data in-place, leaving a stale FP8/MXFP8/NVFP4
+    buffer in self.quantized. Call once after load so the next forward re-quantizes from the
+    freshly-loaded weight.
     """
     for param in model.parameters():
         if isinstance(param, GTPShardedParam):
@@ -1833,16 +1764,9 @@ def reset_gtp_quantize_cache(model):
 # ------------------------------------------------------------------------
 # Distributed-checkpointing helpers
 # ------------------------------------------------------------------------
-#
-# GTP shards weights further along axis 0 on top of TP. The vanilla helpers
-# in ``megatron.core.transformer.utils`` only know about TP, so the
-# ShardedTensor offsets they emit don't reflect the GTP slice the local
-# rank actually owns. The helper below detects GTPShardedParam per-tensor
-# and either composes TP × GTP into a single axis-0 offset (when TP is
-# also on axis 0) or emits two offsets (TP on its axis, GTP on axis 0).
-# ``replica_id`` uses the DP-with-GTP-with-CP rank — the set of ranks that
-# actually hold identical copies of this chunk.
-#
+# GTP shards axis 0 on top of TP, but the vanilla utils helpers only know TP, so their offsets
+# miss the GTP slice. The helper below detects GTPShardedParam per-tensor and composes TP × GTP
+# into one axis-0 offset (or two offsets), with replica_id = the DP-with-GTP-with-CP rank.
 
 
 def make_sharded_tensors_for_checkpoint_with_gtp(
@@ -1856,15 +1780,12 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
     dp_cp_group,
     intra_dp_cp_no_gtp_group=None,
 ):
-    """GTP-aware analogue of ``make_sharded_tensors_for_checkpoint``.
+    """GTP-aware analogue of make_sharded_tensors_for_checkpoint.
 
-    Detects GTP sharding per-tensor (via ``isinstance(tensor, GTPShardedParam)``).
-    Non-GTP tensors keep the vanilla offsets exactly; GTP tensors layer the
-    GTP axis-0 split on top.
-
-    No-op (delegates to the vanilla helper) when no tensor in ``state_dict``
-    is a ``GTPShardedParam``, so plumbing this helper through has zero cost
-    when GTP is inactive.
+    Detects GTP sharding per-tensor (isinstance(tensor, GTPShardedParam)). Non-GTP tensors keep
+    the vanilla offsets exactly; GTP tensors layer the GTP axis-0 split on top. No-op (delegates
+    to the vanilla helper) when no tensor is a GTPShardedParam, so this is zero-cost when GTP is
+    inactive.
     """
     from megatron.core.transformer.utils import (  # noqa: E402
         make_sharded_object_for_checkpoint,
@@ -1926,10 +1847,9 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
             continue
 
         if not is_gtp:
-            # Non-GTPShardedParam under a GTP-active module (e.g. bias). The tensor is
-            # GTP-replicated, so different GTP ranks would collide on the same replica_id
-            # without intervention. Inject gtp_rank into position 1 of the replica_id, the same
-            # way the GTP-sharded branch below does.
+            # Non-GTPShardedParam under a GTP-active module (e.g. bias): GTP-replicated, so GTP
+            # ranks would collide on the same replica_id. Inject gtp_rank into replica_id
+            # position 1 (same as the GTP-sharded branch below).
             if layer_name in tensor_parallel_layers_axis_map:
                 replica_id = (0, gtp_rank, dp_no_gtp_rank)
                 sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
@@ -1953,10 +1873,9 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
                 )
             continue
 
-        # GTP-sharded tensor: delegate to the (GTP-aware) single-tensor helper, the one place
-        # that knows how to layer the axis-0 GTP split onto TP, elect the writer over the
-        # gtp-excluded DP group, and set allow_shape_mismatch for GTP alignment padding.
-        # (tp_axis None → 0: GTP always shards axis 0; tp_size is 1 when this param has no TP.)
+        # GTP-sharded tensor: delegate to the GTP-aware single-tensor helper — it layers the
+        # axis-0 GTP split onto TP, elects the writer over the gtp-excluded DP group, and sets
+        # allow_shape_mismatch for alignment padding. (tp_axis None → 0; tp_size 1 when no TP.)
         tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
         sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
             tensor,
@@ -1970,10 +1889,9 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
     return sharded_state_dict
 
 
-# Wire GTP into TE's hook registry. Done at module import time so any later
-# ``te.Linear(gtp_group=...)`` call routes through the hooks below. The
-# warning fires if TE is too old to expose ``register_gtp_hooks`` — in that
-# case GTP silently no-ops, which is the failure mode we want to surface.
+# Wire GTP into TE's hook registry at import time, so any later
+# ``te.Linear(gtp_group=...)`` routes through the hooks below. If TE is too old to
+# expose ``register_gtp_hooks``, GTP silently no-ops (the warning surfaces that).
 try:
     from transformer_engine.pytorch.module.base import (  # noqa: E402
         register_gtp_hooks as _te_register_gtp_hooks,
