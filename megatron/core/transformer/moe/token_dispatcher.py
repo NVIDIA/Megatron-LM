@@ -1451,7 +1451,11 @@ class _NCCLEPManager(_DispatchManager):
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
-        self.use_symm_mem = config.moe_ncclep_use_symm_mem
+        if config.moe_ncclep_use_symm_mem:
+            raise NotImplementedError(
+                "moe_ncclep_use_symm_mem (symm-mem / zero-copy EP payload buffers) is not "
+                "supported yet."
+            )
         if self.static_shape:
             if torch.cuda.get_device_capability()[0] < 10:
                 raise ValueError(
@@ -1508,7 +1512,7 @@ class _NCCLEPManager(_DispatchManager):
         if self._pool is not None:
             return
         # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
-        # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage". 
+        # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage".
         # (nccl_ep device/hybridep_adapter.cu).
         _HT_TOKENS_PER_CHUNK = 64
         max_tokens_per_rank = (
@@ -1531,7 +1535,7 @@ class _NCCLEPManager(_DispatchManager):
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
             num_sms=self.config.moe_ncclep_num_sms,
-            zero_copy=self.use_symm_mem,
+            zero_copy=False,
         )
 
         def _context_factory() -> NcclEpContext:
@@ -1542,8 +1546,6 @@ class _NCCLEPManager(_DispatchManager):
                 hidden_dim=self.hidden_dim,
                 num_local_experts=self.num_local_experts,
                 alignment=self.alignment,
-                use_symm_mem=self.use_symm_mem,
-                ep_group=self.group,
             )
 
         self._pool = NcclEpContextPool(

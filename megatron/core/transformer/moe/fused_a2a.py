@@ -616,7 +616,12 @@ _TE_EP_MISSING_MSG = (
 
 
 def ensure_nccl_ep_bootstrapped(
-    ep_group, num_experts, max_tokens_per_rank, recv_capacity_per_rank, hidden_dim, num_sms=0,
+    ep_group,
+    num_experts,
+    max_tokens_per_rank,
+    recv_capacity_per_rank,
+    hidden_dim,
+    num_sms=0,
     zero_copy=False,
 ):
     """Initialize the process-wide NCCL EP context once. Idempotent.
@@ -678,10 +683,6 @@ class NcclEpContext:
         num_local_experts (int): Experts owned by this rank (``num_experts // ep_size``).
         alignment (int): Per-expert packing alignment for ``recv_tokens`` (grouped-GEMM
             tile; 0 = packed contiguously by actual count).
-        ep_group (torch.distributed.ProcessGroup): Required when ``use_symm_mem=True``
-            (symm-mem rendezvous is collective).
-        use_symm_mem (bool): Use NCCL symmetric-memory payload buffers (zero-copy) vs. the
-            HBM staged-copy path. Defaults to the HBM staged-copy path.
         payload_dtype (torch.dtype): Token dtype carried through dispatch/combine.
     """
 
@@ -693,14 +694,10 @@ class NcclEpContext:
         hidden_dim,
         num_local_experts,
         alignment=0,
-        ep_group=None,
-        use_symm_mem=False,
         payload_dtype=torch.bfloat16,
     ):
         if not HAVE_TE_EP:
             raise RuntimeError(_TE_EP_MISSING_MSG)
-        if use_symm_mem and ep_group is None:
-            raise ValueError("NcclEpContext(use_symm_mem=True) requires ep_group.")
         self.buffer = te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -799,10 +796,11 @@ class NcclEpContextPool:
         if lease.released:
             return
         ctx = lease.ctx
-        # Loud tripwire: in correct operation a context is not re-leased until after this
-        # lease's backward has run, so its generation is unchanged here. A mismatch means the
-        # context was leased again (its buffer overwritten) before this execution's backward
+        # Loud tripwire: A mismatch means the ctx is incorrectly returned to _free early
+        # and used by a different lease, i.e. context was leased
+        # again (its buffer overwritten) before this execution's backward
         # consumed it -- concurrent in-flight microbatches exceeded safe reuse.
+        # Basically: the same ctx cannot be shared by 2 different leases.
         if ctx.generation != lease.generation:
             raise RuntimeError(
                 f"ncclep[{self._layer_name}]: EP context for dispatch #{lease.dispatch_id} "
@@ -827,10 +825,6 @@ class NcclEpContextPool:
         return ctx
 
     def _retire(self, ctx: "NcclEpContext") -> None:
-        # TODO(ncclep, comm-overlap): when dispatch/combine run on a comm stream separate from
-        # the expert-compute stream, record an event on the consuming (backward) stream here and
-        # have lease() make the dispatch stream wait on it before overwriting the buffer, to
-        # order cross-stream reuse. Single-stream training is ordered implicitly and needs none.
         self._free.append(ctx)
 
 
@@ -880,9 +874,7 @@ if HAVE_TE_EP:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
-        return te_ep.ep_combine(
-            context.buffer, expert_out, num_local_tokens=num_local_tokens
-        )
+        return te_ep.ep_combine(context.buffer, expert_out, num_local_tokens=num_local_tokens)
 
 else:
     nccl_ep_dispatch = None

@@ -891,9 +891,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_ncclep_use_symm_mem: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
-    staged-copy path. Peers read combine inputs directly via symm-mem, avoiding the combine-side
-    staging copy. Requires the EP group to support symm-mem (intra-node NVLink domain). Defaults to
-    False."""
+    staged-copy path. NOT SUPPORTED YET -- the dispatcher rejects this if set; the cross-stream
+    reuse ordering for the persistent symm-mem buffer is not implemented. Leave False."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -2528,11 +2527,6 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_token_dispatcher_type == 'flex'
                 and self.moe_flex_dispatcher_backend == 'ncclep'
             ):
-                assert not self.moe_ncclep_use_symm_mem, (
-                    'overlap_moe_expert_parallel_comm with ncclep does not yet support '
-                    'moe_ncclep_use_symm_mem: zero-copy reuses a persistent symm-mem buffer across '
-                    'microbatches, which needs cross-stream reuse ordering that is not implemented.'
-                )
                 if not self.moe_ncclep_static_shape:
                     warnings.warn(
                         'overlap_moe_expert_parallel_comm with ncclep and moe_ncclep_static_shape=False: '
