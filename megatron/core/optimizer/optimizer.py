@@ -170,6 +170,10 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage optimizer-owned model params before an explicit DDP param sync."""
+        return
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -1391,6 +1395,43 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
         self._synchronize_steps()
+
+    @override
+    @torch.no_grad()
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage params once per DDP model chunk before explicit param sync."""
+        use_reused_grad_buffer = (
+            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
+        )
+        if not use_reused_grad_buffer:
+            for optimizer in self.chained_optimizers:
+                optimizer.prepare_model_params_for_param_sync()
+            return
+
+        from .distrib_optimizer import DistributedOptimizer
+
+        model_chunks = []
+        model_chunk_ids = set()
+        dist_optimizers = []
+
+        for optimizer in self.chained_optimizers:
+            if isinstance(optimizer, DistributedOptimizer):
+                dist_optimizers.append(optimizer)
+                if getattr(optimizer, 'is_stub_optimizer', False):
+                    continue
+                for model_chunk in optimizer.model_chunks:
+                    model_chunk_id = id(model_chunk)
+                    if model_chunk_id not in model_chunk_ids:
+                        model_chunk_ids.add(model_chunk_id)
+                        model_chunks.append(model_chunk)
+            else:
+                optimizer.prepare_model_params_for_param_sync()
+
+        for model_chunk in model_chunks:
+            model_chunk.zero_grad_buffer()
+        for optimizer in dist_optimizers:
+            if not getattr(optimizer, 'is_stub_optimizer', False):
+                optimizer._copy_main_params_to_param_buffer()
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
