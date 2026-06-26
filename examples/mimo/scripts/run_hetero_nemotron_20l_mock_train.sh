@@ -98,6 +98,5 @@ fi
   --adam-beta2 0.95 \
   --clip-grad 1.0 \
   --ddp-bucket-size 0 \
-  --no-ckpt-fully-parallel-save \
   --train-iters "${TRAIN_ITERS}" \
   "$@"
