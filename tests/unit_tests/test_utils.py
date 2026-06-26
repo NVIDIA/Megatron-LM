@@ -52,6 +52,24 @@ def test_divide_improperly():
         util.divide(4, 5)
 
 
+@pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
+@pytest.mark.parametrize("check_equality", [True, False])
+def test_is_flashinfer_min_version(check_equality):
+    from packaging.version import Version as PkgVersion
+
+    with patch.object(util, "get_flashinfer_version", return_value=PkgVersion("0.6.5")):
+        # check_equality=False exercised the path that used to reference an
+        # undefined name and raise NameError instead of returning a bool.
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is True
+        assert util.is_flashinfer_min_version("0.7.0", check_equality=check_equality) is False
+        assert (
+            util.is_flashinfer_min_version("0.6.5", check_equality=check_equality) is check_equality
+        )
+
+    with patch.object(util, "get_flashinfer_version", return_value=None):
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is False
+
+
 def test_experimental_cls_init():
     with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
         # Check that initialization works
