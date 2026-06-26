@@ -637,13 +637,9 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-            if (
-                self.config.sequence_parallel
-                and padding_mask.shape[0] != hidden_states.shape[0]
-            ):
+            if self.config.sequence_parallel and padding_mask.shape[0] != hidden_states.shape[0]:
                 padding_mask = tensor_parallel.scatter_to_sequence_parallel_region(
-                    padding_mask,
-                    group=self.tp_group,
+                    padding_mask, group=self.tp_group
                 )
             if padding_mask.shape[:2] != hidden_states.shape[:2]:
                 raise RuntimeError(
