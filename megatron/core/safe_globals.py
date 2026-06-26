@@ -111,7 +111,7 @@ class SafeUnpickler(pickle.Unpickler):
             ("transformer_engine.common.recipe", "QParams"),
             ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
             ("megatron.core.safe_globals", "safe_load_from_bytes"),
-            ("numpy.core.multiarray", "_reconstruct"),
+            ("numpy._core.multiarray", "_reconstruct"),
             ("numpy", "ndarray"),
             ("numpy", "dtype"),
         }
@@ -121,6 +121,5 @@ class SafeUnpickler(pickle.Unpickler):
         if (module, name) not in self._SAFE_CLASSES:
             raise pickle.UnpicklingError(
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
-                "in FP8 extra-state checkpoint."
             )
         return super().find_class(module, name)
