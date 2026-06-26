@@ -33,6 +33,8 @@ fi
   examples/mimo/pretrain_mimo.py \
   --model-provider nemotron-moe-vlm \
   --dynamic-resolution \
+  --pixel-shuffle \
+  --disable-vision-class-token \
   --num-layers 20 \
   --hybrid-layer-pattern "MEMEM*EMEMEM*EMEMEM*" \
   --hidden-size 2688 \
