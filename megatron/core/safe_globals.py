@@ -2,6 +2,7 @@
 
 import io
 import pickle
+import threading
 from argparse import Namespace
 from io import BytesIO
 from pathlib import PosixPath
@@ -47,6 +48,8 @@ SAFE_GLOBALS = [
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
 
+_pickle_patch_lock = threading.Lock()
+
 
 def register_safe_globals():
     """Register megatron-core safe classes with torch serialization."""
@@ -66,8 +69,9 @@ def _safe_pickle_load(file, **kwargs):
 
 def safe_numpy_load(path, **kwargs):
     """Safe version of `numpy.load` which calls `pickle.load`."""
-    with patch('pickle.load', _safe_pickle_load):
-        return numpy.load(path, **kwargs)
+    with _pickle_patch_lock:
+        with patch('pickle.load', _safe_pickle_load):
+            return numpy.load(path, **kwargs)
 
 
 class SafeUnpickler(pickle.Unpickler):
