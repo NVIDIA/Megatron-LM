@@ -135,10 +135,10 @@ def make_sharded_tensors_for_checkpoint(
     # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
     # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
     # gate on HAVE_GTP and the presence of a GTPShardedParam before delegating.
-    from megatron.experimental.gtp import HAVE_GTP
+    from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     if HAVE_GTP:
-        from megatron.experimental.gtp import (
+        from megatron.core.tensor_parallel.gtp import (
             GTPShardedParam,
             make_sharded_tensors_for_checkpoint_with_gtp,
         )

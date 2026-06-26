@@ -388,7 +388,7 @@ def _maybe_setup_gtp(module, gtp_group, extra_kwargs):
     """
     if gtp_group is None or gtp_group.size() <= 1:
         return
-    from megatron.experimental.gtp import HAVE_GTP
+    from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     assert HAVE_GTP, (
         "GTP requires TransformerEngine >= 2.17. "

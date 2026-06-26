@@ -114,6 +114,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -133,7 +134,6 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
-from megatron.experimental.gtp import HAVE_GTP
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -307,7 +307,7 @@ def reset_gtp_quantize_cache_after_load(model):
     """
     if not HAVE_GTP:
         return
-    from megatron.experimental.gtp import reset_gtp_quantize_cache
+    from megatron.core.tensor_parallel.gtp import reset_gtp_quantize_cache
 
     for m in model:
         reset_gtp_quantize_cache(m)
@@ -1722,7 +1722,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         getattr(args, 'gtp_weight_remat_size', 1) > 1
         or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
     ):
-        from megatron.experimental.gtp import update_gtp_config
+        from megatron.core.tensor_parallel.gtp import update_gtp_config
 
         if getattr(args, 'fp4', None) is not None:
             update_gtp_config(pad_for_alignment=16)
@@ -1786,7 +1786,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         getattr(args, 'gtp_weight_remat_size', 1) > 1
         or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
     ):
-        from megatron.experimental.gtp import (
+        from megatron.core.tensor_parallel.gtp import (
             GTP_CONFIG,
             classify_gtp_chains,
             reset_gtp_state,

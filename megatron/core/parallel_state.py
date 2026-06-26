@@ -1414,7 +1414,8 @@ def initialize_model_parallel(
     # Expert+tensor+pipeline group merged across EGTP peers — expert analog of the dense
     # _MODEL_PARALLEL_GROUP merge (above). The 'tp-ep-gtp-pp' token spans the egtp axis; with
     # expert_gtp_remat_size=1 it reduces to the plain tp-ep-pp groups. Merging gives EGTP peers
-    # distinct ranks; see gtp/README.md §3.3 (Optimizer state) for the DCP-collision rationale.
+    # distinct ranks; see docs/api-guide/core/generalized_tensor_parallel.md §3.3
+    # (Optimizer state) for the DCP-collision rationale.
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
     for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-gtp-pp'):
         group = create_group(

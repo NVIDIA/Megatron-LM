@@ -30,7 +30,7 @@ try:
     _te_version = Version(te.__version__)
     if _te_version < _GTP_TE_MIN_VERSION and not os.environ.get("MEGATRON_GTP_FORCE_ENABLE"):
         raise ImportError(
-            f"megatron.experimental.gtp requires TransformerEngine >= {_GTP_TE_MIN_VERSION} "
+            f"megatron.core.tensor_parallel.gtp requires TransformerEngine >= {_GTP_TE_MIN_VERSION} "
             f"(found {_te_version}). Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass this check "
             "when using a custom TE build that includes the GTP hook registry."
         )
@@ -57,7 +57,7 @@ try:
     )
 except (ImportError, ModuleNotFoundError) as _gtp_te_import_err:
     raise ImportError(
-        "megatron.experimental.gtp requires TransformerEngine with FP8 / MXFP8 / "
+        "megatron.core.tensor_parallel.gtp requires TransformerEngine with FP8 / MXFP8 / "
         "NVFP4 tensor primitives. Original error: " + str(_gtp_te_import_err)
     ) from _gtp_te_import_err
 
@@ -1987,7 +1987,7 @@ try:
     )
 except ImportError:
     warnings.warn(
-        "megatron.experimental.gtp: TransformerEngine does not expose register_gtp_hooks; "
+        "megatron.core.tensor_parallel.gtp: TransformerEngine does not expose register_gtp_hooks; "
         "GTP will be a no-op for te.Linear / te.LayerNormLinear / te.GroupedLinear. "
         "GTP requires TransformerEngine >= 2.17 (planned release). "
         "Upgrade TransformerEngine to a build that includes the GTP hook registry.",

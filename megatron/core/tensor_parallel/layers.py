@@ -309,7 +309,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
-            from megatron.experimental.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()
@@ -335,7 +335,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         weight = self.weight
         if self.gtp_size > 1:
-            from megatron.experimental.gtp import GTPEmbeddingWeight
+            from megatron.core.tensor_parallel.gtp import GTPEmbeddingWeight
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
@@ -1008,7 +1008,7 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
-            from megatron.experimental.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()
@@ -1365,7 +1365,7 @@ class RowParallelLinear(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
-            from megatron.experimental.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()

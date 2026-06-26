@@ -794,7 +794,7 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
     """
     try:
         from megatron.core import parallel_state
-        from megatron.experimental.gtp import (
+        from megatron.core.tensor_parallel.gtp import (
             GTPShardedParam,
             make_sharded_tensors_for_checkpoint_with_gtp,
         )

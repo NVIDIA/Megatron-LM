@@ -1472,7 +1472,7 @@ def validate_args(args, defaults={}):
         # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
         # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
         if getattr(args, 'fp8_param_gather', False):
-            from megatron.experimental.gtp import update_gtp_config
+            from megatron.core.tensor_parallel.gtp import update_gtp_config
 
             update_gtp_config(fp8_param_gather=True)
             warn_rank_0(

@@ -105,7 +105,7 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     """
     gtp_fold: Dict[str, Tuple[int, int]] = {}
     try:
-        from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
+        from megatron.core.tensor_parallel.gtp import HAVE_GTP, GTPShardedParam
     except ImportError:
         return gtp_fold
     if not HAVE_GTP:

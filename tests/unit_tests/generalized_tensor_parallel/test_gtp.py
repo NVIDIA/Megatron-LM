@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.experimental.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
@@ -48,9 +48,12 @@ from transformer_engine.common.recipe import NVFP4BlockScaling
 from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
-import megatron.experimental.gtp.generalized_tensor_parallelism as gtp_module
-from megatron.experimental.gtp import GTPShardedParam, wrap_module_params_gtp
-from megatron.experimental.gtp.generalized_tensor_parallelism import GTPWeightCache, GTPWeightState
+import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    GTPWeightCache,
+    GTPWeightState,
+)
+from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_grouped_linear,
     _make_gtp_linear,

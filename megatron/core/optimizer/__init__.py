@@ -1204,8 +1204,9 @@ def get_megatron_optimizer(
             param_group_id += 1
     if len(moe_param_groups) > 0:
         # Expert analog of the dense ``model_parallel_rank`` above: the EGTP-merged group gives
-        # each EGTP peer a distinct distopt ShardedObject key. See gtp/README.md §3.3 (Optimizer
-        # state) for why the non-merged ``expt_tp_pp_group`` would cause a DCP "duplicate" error.
+        # each EGTP peer a distinct distopt ShardedObject key. See
+        # docs/api-guide/core/generalized_tensor_parallel.md §3.3 (Optimizer state) for why
+        # the non-merged ``expt_tp_pp_group`` would cause a DCP "duplicate" error.
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_group)
         # Gloo expert-DP group for the optimizer, only when (E)GTP is inactive. When active the
         # optimizer shards over the egtp-EXCLUDED (no_egtp) replicate group, which has no Gloo

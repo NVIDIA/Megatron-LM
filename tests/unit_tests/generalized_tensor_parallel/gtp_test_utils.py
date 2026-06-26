@@ -9,7 +9,7 @@ import transformer_engine.pytorch as te
 from transformer_engine.pytorch import is_mxfp8_available, is_nvfp4_available
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-from megatron.experimental.gtp import GTPShardedParam
+from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from tests.unit_tests.test_utilities import Utils
 
 # ---------------------------------------------------------------------------

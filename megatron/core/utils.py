@@ -969,10 +969,10 @@ def make_tp_sharded_tensor_for_checkpoint(
     # split onto the TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
     # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
-    from megatron.experimental.gtp import HAVE_GTP
+    from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     if HAVE_GTP:
-        from megatron.experimental.gtp import GTPShardedParam
+        from megatron.core.tensor_parallel.gtp import GTPShardedParam
 
         if isinstance(tensor, GTPShardedParam):
             gtp_rank = get_pg_rank(tensor.group)
@@ -1026,10 +1026,10 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
               (default: None, falls back to parallel_state)
     """
     # Sanity guard.
-    from megatron.experimental.gtp import HAVE_GTP
+    from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     if HAVE_GTP:
-        from megatron.experimental.gtp import GTPShardedParam
+        from megatron.core.tensor_parallel.gtp import GTPShardedParam
 
         assert not isinstance(tensor, GTPShardedParam), (
             f"GTPShardedParam '{key}' reached make_sharded_tensor_for_checkpoint (the replicated "

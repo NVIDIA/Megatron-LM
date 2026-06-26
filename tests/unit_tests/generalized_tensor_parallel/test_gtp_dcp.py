@@ -14,12 +14,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.experimental.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
 
-from megatron.experimental.gtp import (  # noqa: E402
+from megatron.core.tensor_parallel.gtp import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp,
@@ -654,13 +654,13 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
     from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.experimental.gtp import (
+    from megatron.core.tensor_parallel.gtp import (
         make_sharded_tensors_for_checkpoint_with_gtp,
         tag_gtp_params_with_names,
     )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(

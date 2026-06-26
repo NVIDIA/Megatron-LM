@@ -16,11 +16,11 @@ and their cross-graph ``next_w`` must survive a simulated warmup clobber.
 import pytest
 import torch
 
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import (
     _backup_grads_before_capture,
     _restore_grads_after_capture,
 )
-from megatron.experimental.gtp import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TE with hook registry", allow_module_level=True)

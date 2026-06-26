@@ -30,6 +30,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -47,10 +48,9 @@ from megatron.core.utils import (
     log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
 )
-from megatron.experimental.gtp import HAVE_GTP
 
 if HAVE_GTP:
-    from megatron.experimental.gtp import GTPShardedParam
+    from megatron.core.tensor_parallel.gtp import GTPShardedParam
 else:
     GTPShardedParam = None
 
@@ -1415,7 +1415,8 @@ class MambaMixer(MegatronModule):
             0,
         )
 
-        # GTP load-side inverse of the save-time all-gather (see gtp/README.md §3.3, in_proj
+        # GTP load-side inverse of the save-time all-gather (see
+        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj
         # note): the checkpoint stores the FULL TP-local in_proj.weight (pad stripped) under the
         # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
         # rows with no padding. To reload into the live GTPShardedParam we must mirror init

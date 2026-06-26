@@ -95,8 +95,8 @@ class DistributedDataParallel(_BaseDataParallel):
         # (GTP-excluded group). Data-parallel gradient reductions over the GTP group are completed
         # separately in the model backward pass.
         #
-        # See Section 3.2 in `gtp/README.md` for more details (including why
-        # average_in_collective=False).
+        # See Section 3.2 in `docs/api-guide/core/generalized_tensor_parallel.md`
+        # for more details (including why average_in_collective=False).
         #
         # When GTP is disabled, the *_no_gtp groups alias the regular DP groups.
         self.intra_dp_cp_group = process_group_dict.get(
