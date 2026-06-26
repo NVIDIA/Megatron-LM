@@ -172,16 +172,8 @@ if _CUTE_AVAILABLE:
                 copy_vecs_per_head = nope_dim // 8
                 copy_use_u256 = True
             elif cutlass.const_expr(
-                (
-                    x.element_type.width == 16
-                    and nope_dim % 4 == 0
-                    and head_dim % 4 == 0
-                )
-                or (
-                    x.element_type.width == 32
-                    and nope_dim % 2 == 0
-                    and head_dim % 2 == 0
-                )
+                (x.element_type.width == 16 and nope_dim % 4 == 0 and head_dim % 4 == 0)
+                or (x.element_type.width == 32 and nope_dim % 2 == 0 and head_dim % 2 == 0)
             ):
                 copy_use_u256 = False
                 if cutlass.const_expr(x.element_type.width == 16):
@@ -201,16 +193,8 @@ if _CUTE_AVAILABLE:
                 head = copy_work // copy_vecs_per_head
                 offset = row * row_width + head * head_dim + unit * copy_vec_elems
                 if cutlass.const_expr(
-                    (
-                        x.element_type.width == 16
-                        and nope_dim % 4 == 0
-                        and head_dim % 4 == 0
-                    )
-                    or (
-                        x.element_type.width == 32
-                        and nope_dim % 2 == 0
-                        and head_dim % 2 == 0
-                    )
+                    (x.element_type.width == 16 and nope_dim % 4 == 0 and head_dim % 4 == 0)
+                    or (x.element_type.width == 32 and nope_dim % 2 == 0 and head_dim % 2 == 0)
                 ):
                     if cutlass.const_expr(copy_use_u256):
                         src_ptr = _ptr_as_i64(x, offset)
@@ -226,9 +210,7 @@ if _CUTE_AVAILABLE:
                             level1_eviction_priority="evict_no_allocate",
                         )
                         cute.arch.store(
-                            dst_ptr.llvm_ptr,
-                            value,
-                            level1_eviction_priority="evict_first",
+                            dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                         )
                 else:
                     col = head * head_dim + unit
@@ -286,12 +268,8 @@ if _CUTE_AVAILABLE:
                         value_left = x1_cos_left - x2_sin_left
                         value_right = x2_cos_right + x1_sin_right
                         if adjoint != 0:
-                            x2_sin_right = (x2 * sin_right).to(out.element_type).to(
-                                cutlass.Float32
-                            )
-                            x1_sin_left = (x1 * sin_left).to(out.element_type).to(
-                                cutlass.Float32
-                            )
+                            x2_sin_right = (x2 * sin_right).to(out.element_type).to(cutlass.Float32)
+                            x1_sin_left = (x1 * sin_left).to(out.element_type).to(cutlass.Float32)
                             value_left = x1_cos_left + x2_sin_right
                             value_right = cutlass.Float32(0.0) - x1_sin_left + x2_cos_right
                         out[row, col] = value_left.to(out.element_type)
@@ -577,11 +555,7 @@ if _CUTE_AVAILABLE:
                                 cutlass.Int64,
                                 level1_eviction_priority="evict_no_allocate",
                             )
-                    cute.arch.store(
-                        dst_ptr.llvm_ptr,
-                        value,
-                        level1_eviction_priority="evict_first",
-                    )
+                    cute.arch.store(dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first")
                 else:
                     value = cutlass.Float32(0.0).to(hidden_compact.element_type)
                     if src_global >= 0:
@@ -743,9 +717,7 @@ if _CUTE_AVAILABLE:
         bidx, _, _ = cute.arch.block_idx()
         out_row = bidx
 
-        if cutlass.const_expr(
-            grad_hidden_compact.element_type.width == 16 and row_width % 4 == 0
-        ):
+        if cutlass.const_expr(grad_hidden_compact.element_type.width == 16 and row_width % 4 == 0):
             vec_elems = cutlass.Int32(4)
             vec_cols = row_width // 4
         else:
@@ -824,22 +796,17 @@ if _CUTE_AVAILABLE:
                         )
                     if out_row < d_window:
                         dst_ptr = cute.recast_ptr(
-                            grad_boundary_hidden.iterator + dst_offset,
-                            dtype=cutlass.Int64,
+                            grad_boundary_hidden.iterator + dst_offset, dtype=cutlass.Int64
                         )
                         cute.arch.store(
-                            dst_ptr.llvm_ptr,
-                            value,
-                            level1_eviction_priority="evict_first",
+                            dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                         )
                     else:
                         dst_ptr = cute.recast_ptr(
                             grad_hidden_local.iterator + dst_offset, dtype=cutlass.Int64
                         )
                         cute.arch.store(
-                            dst_ptr.llvm_ptr,
-                            value,
-                            level1_eviction_priority="evict_first",
+                            dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                         )
                 else:
                     value = cutlass.Float32(0.0).to(grad_hidden_compact.element_type)
@@ -1086,19 +1053,18 @@ if _CUTE_AVAILABLE:
                         elif source_kind == 2:
                             src_offset = source_index * row_width + vec_col * vec_elems
                             src_ptr = cute.recast_ptr(
-                                compressed_rank_major.iterator + src_offset,
-                                dtype=cutlass.Int64,
+                                compressed_rank_major.iterator + src_offset, dtype=cutlass.Int64
                             )
                             value = cute.arch.load(
                                 src_ptr.llvm_ptr,
                                 cutlass.Int64,
                                 level1_eviction_priority="evict_no_allocate",
                             )
-                        dst_ptr = cute.recast_ptr(kv_full.iterator + dst_offset, dtype=cutlass.Int64)
+                        dst_ptr = cute.recast_ptr(
+                            kv_full.iterator + dst_offset, dtype=cutlass.Int64
+                        )
                         cute.arch.store(
-                            dst_ptr.llvm_ptr,
-                            value,
-                            level1_eviction_priority="evict_first",
+                            dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                         )
                     else:
                         value = cutlass.Float32(0.0).to(kv_full.element_type)
@@ -1112,7 +1078,9 @@ if _CUTE_AVAILABLE:
                 else:
                     if cutlass.const_expr(kv_full.element_type.width == 16 and row_width % 4 == 0):
                         src_offset = out_row * row_width + vec_col * vec_elems
-                        src_ptr = cute.recast_ptr(kv_full.iterator + src_offset, dtype=cutlass.Int64)
+                        src_ptr = cute.recast_ptr(
+                            kv_full.iterator + src_offset, dtype=cutlass.Int64
+                        )
                         value = cute.arch.load(
                             src_ptr.llvm_ptr,
                             cutlass.Int64,
@@ -1124,9 +1092,7 @@ if _CUTE_AVAILABLE:
                                 kv_local.iterator + dst_offset, dtype=cutlass.Int64
                             )
                             cute.arch.store(
-                                dst_ptr.llvm_ptr,
-                                value,
-                                level1_eviction_priority="evict_first",
+                                dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                             )
                         elif source_kind == 1:
                             dst_offset = source_index * row_width + vec_col * vec_elems
@@ -1134,20 +1100,15 @@ if _CUTE_AVAILABLE:
                                 boundary_kv.iterator + dst_offset, dtype=cutlass.Int64
                             )
                             cute.arch.store(
-                                dst_ptr.llvm_ptr,
-                                value,
-                                level1_eviction_priority="evict_first",
+                                dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                             )
                         elif source_kind == 2:
                             dst_offset = source_index * row_width + vec_col * vec_elems
                             dst_ptr = cute.recast_ptr(
-                                compressed_rank_major.iterator + dst_offset,
-                                dtype=cutlass.Int64,
+                                compressed_rank_major.iterator + dst_offset, dtype=cutlass.Int64
                             )
                             cute.arch.store(
-                                dst_ptr.llvm_ptr,
-                                value,
-                                level1_eviction_priority="evict_first",
+                                dst_ptr.llvm_ptr, value, level1_eviction_priority="evict_first"
                             )
                     else:
                         if source_kind == 0:

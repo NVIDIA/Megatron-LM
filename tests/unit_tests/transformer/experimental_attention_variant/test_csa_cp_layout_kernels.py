@@ -32,7 +32,9 @@ def _make_e2e_like_cu_seqlens(device: str = "cuda", *, padded: bool = True) -> t
     full e2e hidden sizes in these focused kernel tests.
     """
     lengths = _E2E_RAGGED_PADDED_SEG_LENS if padded else _E2E_RAGGED_SEG_LENS
-    return torch.tensor([0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32, device=device)
+    return torch.tensor(
+        [0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32, device=device
+    )
 
 
 def _compressed_cu_seqlens(cu_seqlens: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -804,9 +806,9 @@ def test_thd_full_kv_pack_matches_native_forward_backward_and_reports_bandwidth(
     seq_ids, comp_ids, valid = _native_build_compressed_row_metadata(
         cu, _E2E_CP_SIZE, l_local, ratio, d_comp, c_cap, c_cap, False
     )
-    compressed = torch.randn(seq_ids.shape[0], 4, dtype=torch.bfloat16, device="cuda").requires_grad_(
-        True
-    )
+    compressed = torch.randn(
+        seq_ids.shape[0], 4, dtype=torch.bfloat16, device="cuda"
+    ).requires_grad_(True)
     dummy = torch.empty((1,), dtype=torch.int32, device="cuda")
     capacity = l_local + d_window * (cu.shape[0] - 1) + compressed.shape[0]
 
@@ -1153,7 +1155,9 @@ def test_build_indexer_loss_indices_matches_native_and_reports_bandwidth():
     window = 16
     compressed_width = 8
     logical_ids = (
-        torch.arange(compressed_width, dtype=torch.int32, device="cuda").unsqueeze(0).repeat(l_local, 1)
+        torch.arange(compressed_width, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .repeat(l_local, 1)
     )
     logical_ids[1::5, -1] = -1
     rank_by_seq = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda")
@@ -1161,15 +1165,7 @@ def test_build_indexer_loss_indices_matches_native_and_reports_bandwidth():
         cu, cu_comp, global_start, l_local, d_window, window, ratio, logical_ids, rank_by_seq
     )
     expected = _native_indexer_loss_indices(
-        cu,
-        cu_comp,
-        global_start,
-        l_local,
-        d_window,
-        window,
-        ratio,
-        logical_ids,
-        rank_by_seq,
+        cu, cu_comp, global_start, l_local, d_window, window, ratio, logical_ids, rank_by_seq
     )
     assert torch.equal(fused[0], expected[0])
     assert torch.equal(fused[1], expected[1])

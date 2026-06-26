@@ -1581,11 +1581,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         )
 
         raw_local_loss = _kl_loss_from_target_predict(
-            target,
-            predict,
-            indexer_topk_idxs_for_loss,
-            loss_coeff,
-            calculate_per_token_loss=True,
+            target, predict, indexer_topk_idxs_for_loss, loss_coeff, calculate_per_token_loss=True
         )
         if calculate_per_token_loss:
             indexer_loss = raw_local_loss

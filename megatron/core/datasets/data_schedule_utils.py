@@ -30,8 +30,8 @@ def get_cp_slice_for_thd(
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
         csa_cp_partition_mode: Optional CSA CP partition mode for DSv4 hybrid attention.
         partition_total_tokens: Optional padded total used only for choosing CP row indices.
-            When set, tensors selected by ``keys`` are tail-padded to this length before slicing. Existing
-            cu_seqlens metadata is left unchanged.
+            When set, tensors selected by ``keys`` are tail-padded to this length before
+            slicing. Existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:

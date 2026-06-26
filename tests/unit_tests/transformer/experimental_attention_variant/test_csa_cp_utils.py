@@ -291,9 +291,7 @@ def test_apply_thd_cp_local_rope_fused_dispatches_equal_and_ragged_chunks(monkey
     cu = torch.tensor([0, 8], dtype=torch.int32)
 
     equal = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    out = apply_thd_cp_local_rope_fused(
-        equal, cos, sin, 1, 1, cu, ((2, 4), (10, 12)), inverse=True
-    )
+    out = apply_thd_cp_local_rope_fused(equal, cos, sin, 1, 1, cu, ((2, 4), (10, 12)), inverse=True)
     assert torch.equal(out, equal + 10)
     assert calls[-1] == ((4, 2), 2, 2, 1, 1, 10, True, False)
 
@@ -374,16 +372,15 @@ def test_rank_major_compressed_metadata_wrapper_computes_capacities(monkeypatch)
             torch.zeros((rows,), dtype=torch.bool),
         )
 
-    monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels, "build_compressed_row_metadata", fake_build)
+    monkeypatch.setattr(
+        csa_cp_utils.csa_cp_layout_kernels, "build_compressed_row_metadata", fake_build
+    )
     cu = torch.tensor([0, 32, 64], dtype=torch.int32)
 
     build_cp_rank_major_compressed_metadata_fused(cu, ((16, 32),), 4, 4, 8)
     build_cp_rank_major_compressed_metadata_fused(cu, ((0, 4), (28, 32)), 4, 4, 8)
 
-    assert calls == [
-        (4, 16, 4, 8, 8, None, False),
-        (4, 4, 4, 8, 3, 8, True),
-    ]
+    assert calls == [(4, 16, 4, 8, 8, None, False), (4, 4, 4, 8, 3, 8, True)]
 
 
 def test_compressor_prep_compact_wrapper_merges_two_chunk_outputs(monkeypatch):
@@ -453,7 +450,9 @@ def test_pack_cp_kv_full_fused_wrapper_selects_contiguous_and_two_chunk_layouts(
         capacity = int(args[13])
         return kv_local.new_full((capacity,) + tuple(kv_local.shape[1:]), len(calls))
 
-    monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels.ThdFullKvPack, "apply", staticmethod(fake_apply))
+    monkeypatch.setattr(
+        csa_cp_utils.csa_cp_layout_kernels.ThdFullKvPack, "apply", staticmethod(fake_apply)
+    )
     kv_local = torch.ones(4, 2)
     boundary = torch.ones(2, 2)
     compressed = torch.ones(6, 2)
@@ -510,7 +509,9 @@ def test_repack_rank_major_compressed_to_seq_major_fused_forwards_arguments(monk
         captured.update(rows=int(rows), rank_major=rank_major, seq_ids=seq_ids)
         return rank_major[:rows].clone(), torch.arange(rows, dtype=torch.int32)
 
-    monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels, "repack_compressed_kv_to_seq_major", fake_repack)
+    monkeypatch.setattr(
+        csa_cp_utils.csa_cp_layout_kernels, "repack_compressed_kv_to_seq_major", fake_repack
+    )
     rank_major = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     seq_ids = torch.zeros(6, dtype=torch.int32)
     comp_ids = torch.arange(6, dtype=torch.int32)
@@ -577,7 +578,9 @@ def test_compute_cp_indexer_topk_logical_fused_splits_chunks_and_passes_visible_
         )
         return torch.full((q.shape[0], int(topk)), len(topk_calls), dtype=torch.int32), None
 
-    monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels, "build_indexer_topk_metadata", fake_metadata)
+    monkeypatch.setattr(
+        csa_cp_utils.csa_cp_layout_kernels, "build_indexer_topk_metadata", fake_metadata
+    )
     monkeypatch.setattr(csa_cp_utils, "indexer_topk", fake_indexer_topk)
 
     q = torch.randn(5, 2)
@@ -604,9 +607,12 @@ def test_compute_cp_indexer_topk_logical_fused_splits_chunks_and_passes_visible_
     assert torch.equal(out, torch.tensor([[1, 1], [1, 1], [2, 2], [2, 2], [2, 2]]))
     assert torch.equal(topk_calls[0][-1], torch.ones(2, dtype=torch.int32))
     assert torch.equal(topk_calls[1][-1], torch.full((3,), 2, dtype=torch.int32))
-    assert compute_cp_indexer_topk_logical_fused(
-        q, weights, k_seq[:0], cu_q, cu_comp, ((2, 4),), 4, 2, 1.0, 10, 3
-    ) is None
+    assert (
+        compute_cp_indexer_topk_logical_fused(
+            q, weights, k_seq[:0], cu_q, cu_comp, ((2, 4),), 4, 2, 1.0, 10, 3
+        )
+        is None
+    )
 
 
 def test_final_index_wrappers_lower_two_chunk_arguments(monkeypatch):
@@ -622,7 +628,9 @@ def test_final_index_wrappers_lower_two_chunk_arguments(monkeypatch):
         captured["attention"] = (args, kwargs)
         l_local = int(args[2])
         width = int(args[6])
-        return torch.zeros(l_local, width, dtype=torch.int32), torch.zeros(l_local, dtype=torch.int32)
+        return torch.zeros(l_local, width, dtype=torch.int32), torch.zeros(
+            l_local, dtype=torch.int32
+        )
 
     def fake_loss(*args, **kwargs):
         captured["loss"] = (args, kwargs)
@@ -630,7 +638,9 @@ def test_final_index_wrappers_lower_two_chunk_arguments(monkeypatch):
         width = args[7].shape[1] + int(args[5])
         return torch.zeros(l_local, width, dtype=torch.int32), torch.zeros_like(args[7])
 
-    monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels, "build_attention_indices", fake_attention)
+    monkeypatch.setattr(
+        csa_cp_utils.csa_cp_layout_kernels, "build_attention_indices", fake_attention
+    )
     monkeypatch.setattr(csa_cp_utils.csa_cp_layout_kernels, "build_indexer_loss_indices", fake_loss)
 
     cu = torch.tensor([0, 16], dtype=torch.int32)

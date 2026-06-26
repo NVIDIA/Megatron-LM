@@ -168,10 +168,7 @@ def build_thd_cp_local_padding_row_mask(
     chunk_ranges, _, _ = _normalize_row_ranges(chunk_ranges, "DSv4 CP padding-row mask")
     device = cu_seqlens_padded.device
     global_rows = torch.cat(
-        [
-            torch.arange(start, end, device=device, dtype=torch.int64)
-            for start, end in chunk_ranges
-        ],
+        [torch.arange(start, end, device=device, dtype=torch.int64) for start, end in chunk_ranges],
         dim=0,
     )
 
@@ -596,11 +593,7 @@ def build_cp_compressor_prep_compact_fused(
             torch.cumsum(cu_deltas, dim=0),
         )
     )
-    return (
-        torch.cat(hidden_parts, dim=0),
-        cu_compact,
-        torch.cat(comp_parts, dim=0),
-    )
+    return (torch.cat(hidden_parts, dim=0), cu_compact, torch.cat(comp_parts, dim=0))
 
 
 # =============================================================================
