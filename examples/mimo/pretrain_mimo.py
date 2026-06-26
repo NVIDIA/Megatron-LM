@@ -21,9 +21,9 @@ if _REPO_ROOT not in sys.path:
 
 from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import add_hetero_grid_args, validate_hetero_grid_args
-from examples.mimo.training.bootstrap import MimoRuntime, build_mimo_runtime, mimo_model_provider
 from examples.mimo.training.data import add_data_args
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
+from examples.mimo.training.runtime import MimoRuntime, build_mimo_runtime, mimo_model_provider
 from examples.mimo.training.step import mimo_forward_step
 from megatron.core.config import set_experimental_flag
 from megatron.core.enums import ModelType
