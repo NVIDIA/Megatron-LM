@@ -11,6 +11,8 @@ sharding for compounding bandwidth reduction.
 See ``docs/api-guide/core/generalized_tensor_parallel.md`` for design and usage.
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import os
@@ -62,11 +64,26 @@ try:
         nvtx_range_push,
         round_up_to_nearest_multiple,
     )
-except (ImportError, ModuleNotFoundError) as _gtp_te_import_err:
-    raise ImportError(
-        "megatron.core.tensor_parallel.gtp requires TransformerEngine with FP8 / MXFP8 / "
-        "NVFP4 tensor primitives. Original error: " + str(_gtp_te_import_err)
-    ) from _gtp_te_import_err
+
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):
+    # TE unavailable/too old -> stub the TE-backed names so this module still imports,
+    # and flag GTP unusable via HAVE_TE (gtp.py surfaces this as HAVE_GTP=False). No
+    # GTP path runs without TE. The `annotations` future-import keeps the lone
+    # module-level TE reference (a dataclass field annotation) from being evaluated.
+    from unittest.mock import MagicMock
+
+    te = tex = MagicMock()
+    MXFP8_BLOCK_SCALING_SIZE = NVFP4_BLOCK_SCALING_SIZE = None
+    _NVFP4AllGatherAsyncHandle = MagicMock()
+    gather_along_first_dim = reduce_scatter_along_first_dim = MagicMock()
+    in_fp8_activation_recompute_phase = MagicMock()
+    get_dummy_wgrad = MagicMock()
+    QuantizedTensor = MagicMock()
+    MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
+    MXFP8Quantizer = MagicMock()
+    nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
+    HAVE_TE = False
 
 
 class GTPChain(str, Enum):

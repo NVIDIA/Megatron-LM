@@ -7,14 +7,16 @@ and materializes them on-demand via async all-gather. The implementation lives
 in ``megatron.core.tensor_parallel.generalized_tensor_parallelism`` and depends
 on TransformerEngine's FP8 / MXFP8 / NVFP4 primitives.
 
-If TransformerEngine is missing or too old, the inner import fails and the
-module exposes only ``HAVE_GTP = False``. No core module imports GTP symbols
-unconditionally at module load time.
+If TransformerEngine is missing or too old, the inner module imports cleanly
+but stubs its TE-backed symbols and reports ``HAVE_TE = False``; this module
+mirrors that as ``HAVE_GTP = False``. Consumers gate every GTP code path behind
+``if HAVE_GTP:``, so no core module uses GTP symbols without TE.
 """
 
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         GTP_CONFIG,
+        HAVE_TE,
         GTPChain,
         GTPEmbeddingWeight,
         GTPShardedParam,
@@ -33,11 +35,10 @@ try:
         wrap_module_params_gtp,
     )
 
-    HAVE_GTP = True
+    HAVE_GTP = HAVE_TE
 except ImportError:
-    # GTP requires TransformerEngine with the GTP hook registry; when it's
-    # unavailable only ``HAVE_GTP`` is exposed. Consumers import the other
-    # symbols lazily under an ``if HAVE_GTP:`` guard, so no fallbacks are needed.
+    # Defensive fallback for any unexpected inner-import failure; consumers import
+    # the other symbols lazily under an ``if HAVE_GTP:`` guard, so no stubs needed.
     HAVE_GTP = False
 
 

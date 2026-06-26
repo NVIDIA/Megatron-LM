@@ -1387,6 +1387,14 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.cp = parallel_state.get_context_parallel_group()
     pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
     pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    # EGTP-excluded expert-DP groups used to stamp expert-weight replica_ids. Must not be
+    # left None (get_pg_rank(None)==0 -> duplicate-writer collision at checkpoint save).
+    pg_collection.expt_dp_no_egtp = parallel_state.get_expert_data_parallel_group(
+        no_gtp=True, check_initialized=False
+    )
+    pg_collection.intra_expt_dp_no_egtp = parallel_state.get_expert_data_parallel_group(
+        no_gtp=True, partial_expert_data_parallel=True, check_initialized=False
+    )
     pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
     pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
