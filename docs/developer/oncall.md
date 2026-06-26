@@ -75,9 +75,6 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
   - If it's a severe blocker, revert and inform author
   - If not, we reach out to the author
 
-In such cases, you will receive a Slack notification and you are expected to work with the CI team 
-to find the regression.
-
 ### Tips
 
 - Leverage the [CI Dashboard](https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci?orgId=43)
