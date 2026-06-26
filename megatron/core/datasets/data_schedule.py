@@ -613,6 +613,15 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
+    static_cp_target_len = None
+    if (
+        config is not None
+        and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
+        and cp_group.size() > 1
+        and getattr(config, 'pad_packed_seq_alignment', None) == "max"
+        and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
+    ):
+        static_cp_target_len = int(config.max_seqlen_per_dp_cp_rank)
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
@@ -658,7 +667,22 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_slice_keys = ['padding_mask']
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-        get_cp_slice_for_thd(batch, cp_group, keys=cp_slice_keys)
+        csa_cp_partition_mode = None
+        if (
+            config is not None
+            and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
+        ):
+            csa_cp_partition_mode = config.csa_cp_partition_mode
+        partition_total_tokens = (
+            static_cp_target_len * cp_group.size() if static_cp_target_len is not None else None
+        )
+        get_cp_slice_for_thd(
+            batch,
+            cp_group,
+            keys=cp_slice_keys,
+            csa_cp_partition_mode=csa_cp_partition_mode,
+            partition_total_tokens=partition_total_tokens,
+        )
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
     # cu_seqlens_padded for non TP 0 ranks.
@@ -672,12 +696,15 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Broadcast total_tokens because padding_mask is prepared on every PP stage.
     # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
     if is_tp_rank_0:
-        # Under VPP, the last PP stage has labels but no tokens, so derive
-        # total_tokens from cu_seqlens_padded, which is present on every
-        # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
-        # by cp_size to match the already CP-sliced sequence tensors.
-        cp_world = cp_group.size()
-        total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
+        if static_cp_target_len is not None:
+            total_tokens = torch.tensor([static_cp_target_len], dtype=torch.int32, device=dev)
+        else:
+            # Under VPP, the last PP stage has labels but no tokens, so derive
+            # total_tokens from cu_seqlens_padded, which is present on every
+            # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
+            # by cp_size to match the already CP-sliced sequence tensors.
+            cp_world = cp_group.size()
+            total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
     else:
         total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
     broadcast_tensor(total_tokens, tp_src_rank, tp_group)

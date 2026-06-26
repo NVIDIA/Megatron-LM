@@ -479,6 +479,7 @@ def _indexer_topk_core(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    visible_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
@@ -544,19 +545,36 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        # Per-row valid KV length: for token ``i`` in batch ``b``,
-        #   pos_in_seq = i - cu_seqlens_q[b]
-        #   valid = min((pos_in_seq + 1) // ratio, seqlen_kv[b])
-        row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
-        row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
-        row_valid = row_idx < cu_seqlens_q[-1]
-        pos_in_seq = row_idx - cu_seqlens_q[row_batch_ids]
-        pos_in_seq = torch.where(row_valid, pos_in_seq, torch.zeros_like(pos_in_seq))
-        seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
-        seq_lens = (
-            ((pos_in_seq + 1) // ratio).clamp(max=seqlen_kv_per_row).to(torch.int32).contiguous()
-        )
-        seq_lens = torch.where(row_valid, seq_lens, torch.zeros_like(seq_lens))
+        if visible_k_lengths is not None:
+            if visible_k_lengths.shape[0] != total_q:
+                raise ValueError(
+                    "visible_k_lengths must have one entry per THD query row: "
+                    f"got={visible_k_lengths.shape[0]}, expected={total_q}."
+                )
+            if visible_k_lengths.dtype != torch.int32:
+                raise ValueError(f"visible_k_lengths must be int32, got {visible_k_lengths.dtype}.")
+            if visible_k_lengths.device != device:
+                raise ValueError("visible_k_lengths must be on the same device as q_indexer.")
+            seq_lens = visible_k_lengths
+        else:
+            # Per-row valid KV length: for token ``i`` in batch ``b``,
+            #   pos_in_seq = i - cu_seqlens_q[b]
+            #   valid = min((pos_in_seq + 1) // ratio, seqlen_kv[b])
+            # CP callers with a trapezoid mask pass ``visible_k_lengths``
+            # directly because q/k local ranges can differ from this formula.
+            row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
+            row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+            row_valid = row_idx < cu_seqlens_q[-1]
+            pos_in_seq = row_idx - cu_seqlens_q[row_batch_ids]
+            pos_in_seq = torch.where(row_valid, pos_in_seq, torch.zeros_like(pos_in_seq))
+            seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
+            seq_lens = (
+                ((pos_in_seq + 1) // ratio)
+                .clamp(max=seqlen_kv_per_row)
+                .to(torch.int32)
+                .contiguous()
+            )
+            seq_lens = torch.where(row_valid, seq_lens, torch.zeros_like(seq_lens))
     else:
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
@@ -584,7 +602,17 @@ def _indexer_topk_core(
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
-    topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
+    row_valid = (topk_indices >= 0) & (topk_indices < seq_lens.unsqueeze(1))
+    topk_indices = topk_indices.masked_fill(~row_valid, -1)
+
+    if is_thd:
+        safe_topk = topk_indices.clamp(min=0, max=max(sk - 1, 0)).to(torch.long)
+        selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
+        selected_valid = (topk_indices >= 0) & (topk_indices < sk) & torch.isfinite(selected_scores)
+        topk_indices = topk_indices.masked_fill(~selected_valid, -1)
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()
+    else:
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
     # ---------------- Layout-specific output reshape --------------------
     if is_thd:
@@ -604,6 +632,7 @@ def indexer_topk(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    visible_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -625,6 +654,10 @@ def indexer_topk(
         cu_seqlens_kv: THD only — ``(B+1,)`` int32 CUDA cumulative KV lens.
         max_seqlen_q: THD only — per-batch max Q length.
         max_seqlen_kv: THD only — per-batch max KV length.
+        visible_k_lengths: THD only — optional ``(total_q,)`` int32 CUDA
+            tensor with the per-row visible K length for the radix top-K wrapper.
+            Callers pass this from a layout kernel to avoid rebuilding the
+            same metadata with generic PyTorch indexing during CUDA graph replay.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -638,6 +671,8 @@ def indexer_topk(
             "indexer_topk THD mode requires cu_seqlens_q, cu_seqlens_kv, "
             "max_seqlen_q, and max_seqlen_kv to all be supplied."
         )
+    if not is_thd and visible_k_lengths is not None:
+        raise ValueError("visible_k_lengths is only supported in THD mode.")
 
     # ``indexer_softmax_scale`` is applied via the
     # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
@@ -665,6 +700,7 @@ def indexer_topk(
         cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
+        visible_k_lengths=visible_k_lengths,
     )
     return topk_indices, topk_length
 
@@ -1448,6 +1484,193 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
+    """Sparse attention with caller-supplied indexer top-k.
+
+    The caller owns top-k selection. Sparse attention and indexer-loss
+    backward still use FlashMLA / cuDNN DSA wrappers.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        topk_idxs: Tensor,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        indexer_topk_idxs: Tensor,
+        compressed_kv: Tensor,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        calculate_per_token_loss: bool,
+        global_query_rows: int,
+        q_padding_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Run fused sparse attention using caller-supplied top-k indices."""
+        _ensure_dsa_namespace()
+
+        total_q, np_ = query.shape[:2]
+        idx_nh, idx_hd = q_indexer.shape[1], q_indexer.shape[2]
+        total_comp = k_indexer.shape[0]
+        indexer_topk = indexer_topk_idxs.shape[-1]
+
+        indexer_topk_idxs_for_loss = indexer_topk_idxs
+        if q_padding_mask is not None:
+            if q_padding_mask.shape != (total_q,):
+                raise RuntimeError(
+                    "q_padding_mask must have shape "
+                    f"({total_q},), got {tuple(q_padding_mask.shape)}."
+                )
+            if q_padding_mask.dtype != torch.bool:
+                raise RuntimeError(f"q_padding_mask must be bool, got {q_padding_mask.dtype}.")
+            if q_padding_mask.device != query.device:
+                raise RuntimeError(
+                    f"q_padding_mask must be on {query.device}, got {q_padding_mask.device}."
+                )
+            indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
+                q_padding_mask.unsqueeze(-1), -1
+            )
+
+        out_flat, lse, lse_indexer = _dsa_fwd_flash_mla(
+            query,
+            kv_full,
+            topk_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=None,
+            indexer_topk=indexer_topk,
+        )
+        if lse_indexer is None:
+            raise RuntimeError("Indexer sparse attention from top-k requires lse_indexer.")
+
+        if indexer_softmax_scale != 1.0:
+            weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
+        else:
+            weights_scaled = weights
+        predict = _compute_indexer_predict(
+            q_indexer,
+            k_indexer,
+            weights_scaled,
+            indexer_topk_idxs_for_loss,
+            qhead_per_kv_head=idx_nh,
+            topk_indices_global=True,
+        )
+        target = _compute_attn_target(
+            query.detach(),
+            compressed_kv.detach(),
+            lse_indexer.detach(),
+            indexer_topk_idxs_for_loss,
+            softmax_scale,
+            qhead_per_kv_head=np_,
+            topk_indices_global=True,
+        )
+
+        raw_local_loss = _kl_loss_from_target_predict(
+            target,
+            predict,
+            indexer_topk_idxs_for_loss,
+            loss_coeff,
+            calculate_per_token_loss=True,
+        )
+        if calculate_per_token_loss:
+            indexer_loss = raw_local_loss
+            bwd_loss_coeff = loss_coeff * total_q
+        else:
+            if global_query_rows <= 0:
+                raise RuntimeError(f"global_query_rows must be positive, got {global_query_rows}.")
+            indexer_loss = raw_local_loss / float(global_query_rows)
+            bwd_loss_coeff = loss_coeff * float(total_q) / float(global_query_rows)
+
+        if loss_coeff > 0:
+            ig = _DSA.indexer_backward_wrapper(
+                q_indexer.view(1, total_q, idx_nh, idx_hd),
+                weights.view(1, total_q, idx_nh),
+                k_indexer.view(1, total_comp, idx_hd),
+                target.view(1, total_q, indexer_topk),
+                predict.view(1, total_q, indexer_topk),
+                indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
+                sm_scale=indexer_softmax_scale,
+                loss_coeff=bwd_loss_coeff,
+                grad_loss=torch.ones((), device=query.device, dtype=torch.float32),
+                block_I=128,
+            )
+            saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
+            saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd)
+            saved_grad_weights = ig["d_weights"].view(total_q, idx_nh)
+            if q_padding_mask is not None:
+                saved_grad_q_indexer[q_padding_mask] = 0
+                saved_grad_weights[q_padding_mask] = 0
+        else:
+            saved_grad_q_indexer = torch.zeros_like(q_indexer)
+            saved_grad_k_indexer = torch.zeros_like(k_indexer)
+            saved_grad_weights = torch.zeros_like(weights)
+
+        ctx.save_for_backward(
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+            out_flat,
+            lse,
+            saved_grad_q_indexer,
+            saved_grad_k_indexer,
+            saved_grad_weights,
+        )
+        ctx.softmax_scale = softmax_scale
+
+        return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        """Run sparse-attention and indexer-loss backward kernels."""
+        _ensure_dsa_namespace()
+        (
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+            out_flat,
+            lse,
+            saved_grad_q_indexer,
+            saved_grad_k_indexer,
+            saved_grad_weights,
+        ) = ctx.saved_tensors
+
+        dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
+        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+            query,
+            kv_full,
+            out_flat,
+            dO_flat,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=None,
+        )
+        return (
+            attn_bwd["dq"],
+            attn_bwd["dkv"],
+            attn_bwd["d_sink"],
+            None,
+            saved_grad_q_indexer * grad_loss,
+            saved_grad_k_indexer * grad_loss,
+            saved_grad_weights * grad_loss,
             None,
             None,
             None,

@@ -11,16 +11,27 @@ from megatron.core.extensions.transformer_engine import get_thd_partitioned_indi
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
-def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
+def get_cp_slice_for_thd(
+    batch,
+    cp_group,
+    keys: Optional[Sequence[str]] = None,
+    csa_cp_partition_mode: Optional[str] = None,
+    partition_total_tokens: Optional[int] = None,
+):
     """Partition sequence data for context parallelism in THD format.
 
-    Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
-    Only keys present in the batch are sliced.
+    Uses TE's THD partitioned indices by default. When ``csa_cp_partition_mode``
+    is provided, uses the CSA partition helper so data row order matches the
+    DSv4 attention layer's CP row order. Only keys present in the batch are sliced.
 
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
+        csa_cp_partition_mode: Optional CSA CP partition mode for DSv4 hybrid attention.
+        partition_total_tokens: Optional padded total used only for choosing CP row indices.
+            When set, tensors selected by ``keys`` are tail-padded to this length before slicing. Existing
+            cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:
@@ -32,10 +43,36 @@ def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
     # Use cu_seqlens_padded[-1] for total_tokens instead of batch['tokens'].size(0):
     # under VPP, the last PP stage has labels/loss_mask but no tokens, so
     # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
-    total_tokens = int(cu_seqlens[-1].item())
-    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    total_tokens = (
+        int(cu_seqlens[-1].item())
+        if partition_total_tokens is None
+        else int(partition_total_tokens)
+    )
     if keys is None:
         keys = ('tokens', 'position_ids', 'labels', 'loss_mask')
+    if partition_total_tokens is not None:
+        for key in keys:
+            if key not in batch or batch[key] is None:
+                continue
+            pad_len = total_tokens - batch[key].numel()
+            if pad_len < 0:
+                raise RuntimeError(
+                    f"partition_total_tokens={total_tokens} is smaller than {key} length "
+                    f"{batch[key].numel()}."
+                )
+            if pad_len > 0:
+                pad_value = True if key == 'padding_mask' else 0
+                batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    if csa_cp_partition_mode is None:
+        index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    else:
+        from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+            thd_cp_local_row_indices,
+        )
+
+        index = thd_cp_local_row_indices(
+            csa_cp_partition_mode, total_tokens, cp_size, cp_rank, cu_seqlens.device
+        )
     for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
