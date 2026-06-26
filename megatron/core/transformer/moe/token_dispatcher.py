@@ -1400,6 +1400,30 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _NcclEpLeaseRelease(torch.autograd.Function):
+    """A dedicated autograd node to release the NCCL EP context lease after the dispatch backward.
+
+    The EP context's receive buffer is reused by the dispatch backward, so the lease must
+    be held until that backward completes. We cannot return it via
+    ``dispatch_input.register_hook`` because, under partial CUDA graphs, the dispatch input
+    is the router graph's replayed output (``grad_fn`` is ``_CudagraphReplayNodeBackward``)
+    and per-tensor pre-hooks on a replayed-graph output are not invoked on graph replay
+    """
+
+    @staticmethod
+    def forward(ctx, x, pool, lease):
+        """Identity passthrough; remembers the pool/lease to release in backward."""
+        ctx.pool = pool
+        ctx.lease = lease
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        """Release the lease (dispatch backward is done with the buffer), pass grad through."""
+        ctx.pool.release(ctx.lease)
+        return grad, None, None
+
+
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
     Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
@@ -1580,28 +1604,17 @@ class _NCCLEPManager(_DispatchManager):
         # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_capacity_per_rank, H]
         #   tokens_per_expert: [num_local_experts]
         #   dispatched_probs: [recv_capacity_per_rank]
-        recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
-            lease.ctx, hidden_states, topk_idx, topk_weights
-        )
         if torch.is_grad_enabled() and hidden_states.requires_grad:
-            self._arm_release_on_backward(lease, hidden_states)
+            hidden_states = _NcclEpLeaseRelease.apply(hidden_states, self._pool, lease)
         else:
             # we are inside of activation checkpointing, do not need to save for backward
             lease.release_at_combine = True
+        recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
+            lease.ctx, hidden_states, topk_idx, topk_weights
+        )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         self.dispatched_probs = dispatched_probs
         return recv_tokens
-
-    def _arm_release_on_backward(self, lease: _EpLease, dispatch_input: torch.Tensor):
-        """
-        Return ``lease``'s context to the pool when this execution's backward consumes it.
-        """
-        pool = self._pool
-
-        def _release_hook(grad):
-            pool.release(lease)
-
-        dispatch_input.register_hook(_release_hook)
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.static_shape:
