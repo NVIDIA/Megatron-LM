@@ -61,6 +61,8 @@ please merge the PR! Community contributors are unable to do so.
 
 ## CI Regressions
 
+**Goal: resolve nightly and weekly CI errors.**
+
 Nightly and weekly CI tests do occasionally fail, typically due to a large divergence in loss, 
 iteration time, or memory usage. Even improvements will cause CI to fail!
 
