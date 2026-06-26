@@ -120,6 +120,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import (
     StragglerDetector,

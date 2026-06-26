@@ -365,9 +365,7 @@ class RouterTracer:
         top_indices_cpu = top_indices.detach().to("cpu", torch.int32, non_blocking=True)
         num_tokens = int(top_indices_cpu.shape[0])
 
-        record: dict = {
-            **self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
-        }
+        record = self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
 
         if self.capture_hidden_states:
             hs = self._extract_hidden_state(inputs, num_tokens)

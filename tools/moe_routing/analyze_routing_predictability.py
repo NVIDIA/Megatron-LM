@@ -177,6 +177,12 @@ def main():
         raise SystemExit("Need >=2 MoE layers with both router state and trace records.")
 
     top_k = args.top_k or inferred_topk
+    if top_k is None:
+        raise SystemExit(
+            "Could not determine router top-K from traces. "
+            "Pass --top-k or collect traces with a version of the tracer "
+            "(which records the 'topk' field in each JSONL record)."
+        )
     E = router_state[common[0]]["weight"].shape[0]
     if args.num_experts != E:
         print(f"WARNING: --num-experts {args.num_experts} != router weight dim {E}. Using {E}.")

@@ -101,14 +101,16 @@ def main():
 
     n_values = sorted({int(x) for x in args.n_values.split(",")})
 
-    # First pass: detect which steps are full forward passes (have many layers)
-    # so we can filter to decode-only if requested.
-    step_layer_count = defaultdict(lambda: defaultdict(set))  # rank -> step -> {layer_keys}
-    step_token_count = defaultdict(lambda: defaultdict(int))  # rank -> step -> num_tokens
+    # Buffer records by (rank, step), then apply the full/decode filter once all records are known.
+    step_layer_count = defaultdict(lambda: defaultdict(set))   # rank -> step -> {layer_keys}
+    step_token_count = defaultdict(lambda: defaultdict(int))   # rank -> step -> num_tokens
+    step_records: dict = defaultdict(list)                     # (rank, step) -> [(layer_key, ntok, top_indices)]
     per_layer_topk: dict = {}  # layer_key -> topk (auto-detected from first record)
-    for rank, step, layer_key, topk, ntok, _ in load_traces(args.trace_dir):
+
+    for rank, step, layer_key, topk, ntok, top_indices in load_traces(args.trace_dir):
         step_layer_count[rank][step].add(layer_key)
         step_token_count[rank][step] = ntok
+        step_records[(rank, step)].append((layer_key, ntok, top_indices))
         if topk is not None and layer_key not in per_layer_topk:
             per_layer_topk[layer_key] = topk
 
@@ -121,7 +123,7 @@ def main():
     def step_is_decode(rank, step):
         return step_is_full(rank, step) and step_token_count[rank][step] <= 64
 
-    # Second pass: accumulate per-layer expert activation counts.
+    # Accumulate per-layer expert activation counts from the buffered records.
     # Key: (block, mtp_idx, layer) -> Counter(expert_id -> count)
     per_layer_freq: dict = defaultdict(Counter)
     per_layer_tokens: Counter = Counter()  # how many tokens contributed to each layer_key
@@ -129,15 +131,16 @@ def main():
     filter_fn = step_is_decode if args.decode_only else step_is_full
     skipped_steps = 0
     accepted_records = 0
-    for rank, step, layer_key, topk, ntok, top_indices in load_traces(args.trace_dir):
+    for (rank, step), records in step_records.items():
         if not filter_fn(rank, step):
-            skipped_steps += 1
+            skipped_steps += len(records)
             continue
-        accepted_records += 1
-        for token_top in top_indices:
-            for e in token_top:
-                per_layer_freq[layer_key][e] += 1
-        per_layer_tokens[layer_key] += len(top_indices)
+        for layer_key, ntok, top_indices in records:
+            accepted_records += 1
+            for token_top in top_indices:
+                for e in token_top:
+                    per_layer_freq[layer_key][e] += 1
+            per_layer_tokens[layer_key] += len(top_indices)
 
     layer_keys = sorted(per_layer_freq.keys())
     if not layer_keys:

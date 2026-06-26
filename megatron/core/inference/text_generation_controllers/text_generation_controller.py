@@ -1756,7 +1756,12 @@ class TextGenerationController:
             # Save routing indices.
             tracer = get_moe_router_tracer()
             if tracer is not None and routing_indices is not None:
-                tracer.record_indices(torch.from_numpy(routing_indices))
+                layer_ids = [
+                    r.layer_number
+                    for r in RouterReplay.global_router_replay_instances
+                    if r.layer_number is not None
+                ] or None
+                tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
                 tracer.advance_step()
             range_pop()
 
