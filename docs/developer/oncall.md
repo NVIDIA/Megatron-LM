@@ -9,7 +9,10 @@
 
 # Oncall Overview
 
-The oncall's primary responsibility is helping community contributors and users.
+The oncall's primary responsibility is:
+
+1. Helping community contributors and users
+2. Helping the CI team resolve regressions from nightly or weekly runs
 
 ## Community Issues
 
@@ -48,10 +51,32 @@ We have a useful Claude tool that will send a Slack DM with context to the assig
 
 ### Launch CI
 
-Community contributors are unable to launch CI. If there is a basic merge conflict or lint errror,
+Community contributors are unable to launch CI. If there is a basic merge conflict or lint errror, 
 it is acceptable to fix it and re-launch CI (to reduce iteration time).
 
 ### Approvals and Merging
 
-You may have to reach out to reviewers to help get approvals. Once the PR is fully-approved, please
-merge the PR! Community contributors are unable to do so.
+You may have to reach out to reviewers to help get approvals. Once the PR is fully-approved, 
+please merge the PR! Community contributors are unable to do so.
+
+## CI Regressions
+
+Nightly and weekly CI tests do occasionally fail, typically due to a large divergence in loss, 
+iteration time, or memory usage. Even improvements will cause CI to fail!
+
+### Steps
+
+1. Receive notification via Slack
+2. Work with CI to find root cause
+3. Resolve
+  - If it's a low-hanging fruit, try to fix immediately
+  - If it's a severe blocker, revert and inform author
+  - If not, we reach out to the author
+
+In such cases, you will receive a Slack notification and you are expected to work with the CI team 
+to find the regression.
+
+### Tips
+
+- Leverage the [CI Dashboard](https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci?orgId=43)
+- Setup the GitLab MCP server with Codex
