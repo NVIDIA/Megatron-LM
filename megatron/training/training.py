@@ -1006,7 +1006,6 @@ def pretrain(
     train_valid_test_dataset_provider,
     model_type,
     forward_step_func,
-    model_provider=None,
     process_non_loss_data_func=None,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
