@@ -29,9 +29,15 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
     temporary gradient casting around optimizer steps for FSDP sharded
     parameters whose data dtype differs from their grad dtype.
 
+    Alternatives considered:
+        - Monkey-patching optimizer methods directly on the instance. This is
+          more invasive and harder to compose than hooks.
+        - Generating an FSDP-specific subclass per ``torch.optim.Optimizer``.
+          This adds extra class-generation machinery, but would let us
+          instrument ``zero_grad`` and ``__init__`` as well as ``step`` if needed.
+
     Args:
         optimizer: Optimizer instance to adapt in place.
-
     """
     class CastedGrad(NamedTuple):
         parameter: nn.Parameter
