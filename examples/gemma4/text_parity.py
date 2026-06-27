@@ -15,6 +15,7 @@ HF is loaded first and freed before MLM is built, so peak GPU memory is ~one mod
 import argparse
 import os
 import sys
+import torch
 
 HF_WEIGHTS = (
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
@@ -30,6 +31,7 @@ MLM_CKPT = (
 )
 DEFAULT_TEXT = "What is the capital of France? Answer in one word."
 
+GELU_TANH = functools.partial(torch.nn.functional.gelu, approximate="tanh")
 
 class _RawDecoder:
     """Minimal decode shim wrapping a tokenizers.Tokenizer (for the report)."""
