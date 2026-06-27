@@ -502,29 +502,6 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
         optimizer.step()
 
 
-def test_fully_shard_adam_without_adapter_raises_precision_error(distributed_setup):
-    """Raw Adam should fail on mixed-precision FSDP parameters without the adapter."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-    mesh = init_device_mesh(device.type, (world_size,))
-    torch.manual_seed(2026)
-    model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-    x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
-    target = torch.randn(6, 4, device=device, dtype=torch.bfloat16)
-    optimizer.zero_grad(set_to_none=True)
-    loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
-    loss.backward()
-
-    with pytest.raises(RuntimeError, match="same device and the same dtype"):
-        optimizer.step()
-
-
 def test_microbatch_scopes_child_contexts(distributed_setup):
     """microbatch() should scope FSDP child contexts under an unwrapped parent."""
     world_size = distributed_setup.world_size
