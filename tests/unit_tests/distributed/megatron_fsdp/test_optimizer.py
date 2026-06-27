@@ -32,7 +32,7 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def test_fully_shard_adam_without_adapter_raises_precision_error(distributed_setup):
+def test_adam_without_adapter_raises_precision_error(distributed_setup):
     """Raw Adam should fail on mixed-precision FSDP parameters without the adapter."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
