@@ -152,6 +152,8 @@ class TestMoESingleGroupedWeightNumerics:
         single_weight: bool,
         gradient_accumulation_fusion: bool,
         use_transformer_engine_op_fuser: bool,
+        overlap_param_gather: bool = False,
+        overlap_grad_reduce: bool = False,
     ):
         self._cleanup()
 
@@ -180,8 +182,8 @@ class TestMoESingleGroupedWeightNumerics:
         args.gradient_accumulation_fusion = gradient_accumulation_fusion
         args.use_distributed_optimizer = True
         args.use_transformer_engine_op_fuser = use_transformer_engine_op_fuser
-        args.overlap_param_gather = False
-        args.overlap_grad_reduce = False
+        args.overlap_param_gather = overlap_param_gather
+        args.overlap_grad_reduce = overlap_grad_reduce
         args.ddp_bucket_size = 40960
 
         args.num_experts = 2
@@ -322,6 +324,34 @@ class TestMoESingleGroupedWeightNumerics:
         )
         return torch.stack(losses)
 
+    def run_forced_param_sync_case(self) -> None:
+        args = self.create_test_args(
+            precision="mxfp8",
+            primary_param_gather=True,
+            single_weight=True,
+            gradient_accumulation_fusion=True,
+            use_transformer_engine_op_fuser=True,
+            overlap_param_gather=True,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
+        )
+
+        model, optimizer, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+        assert len(model) == 1
+        self.assert_storage_path_is_exercised(model[0], "mxfp8", True, True)
+        self.assert_execution_path_is_exercised(model[0], True)
+
+        # Bridge evaluation/checkpointing stages MXFP8 master params, then disables
+        # pre-hooks with param_sync=True. This used to mix no_grad-created views with
+        # grad-enabled param-buffer mutation for single grouped MXFP8 weights.
+        optimizer.prepare_model_params_for_param_sync()
+        model[0].disable_forward_pre_hook(param_sync=True)
+
     @staticmethod
     def assert_loss_parity(precision: str, single_weight_losses, discrete_weight_losses):
         if precision == "bf16":
@@ -376,6 +406,19 @@ class TestMoESingleGroupedWeightNumerics:
                 use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
             )
             self.assert_loss_parity(precision, single_losses, discrete_losses)
+        except Exception:
+            local_passed = False
+            local_error = traceback.format_exc()
+
+        self.assert_all_ranks_passed(local_passed, local_error)
+
+    def test_single_grouped_mxfp8_forced_param_sync_after_staging(self):
+        """Exercise eval-style forced param sync after MXFP8 param-buffer staging."""
+        _skip_if_unsupported("mxfp8")
+        local_passed = True
+        local_error = ""
+        try:
+            self.run_forced_param_sync_case()
         except Exception:
             local_passed = False
             local_error = traceback.format_exc()
