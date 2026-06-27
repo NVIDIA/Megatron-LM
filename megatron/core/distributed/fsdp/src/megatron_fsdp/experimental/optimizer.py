@@ -14,18 +14,15 @@
 
 """Optimizer adapter for the minimal Megatron-FSDP path."""
 
-from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
 
 from .parameter_group import contained_in_parameter_group
 
-_OptimizerT = TypeVar("_OptimizerT", bound=torch.optim.Optimizer)
 
-
-def fully_shard_optimizer(optimizer: _OptimizerT) -> None:
+def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
     """Attach FSDP-aware step hooks to an optimizer instance.
 
     The adapted optimizer preserves its existing parameter groups and only adds
@@ -36,16 +33,18 @@ def fully_shard_optimizer(optimizer: _OptimizerT) -> None:
         optimizer: Optimizer instance to adapt in place.
 
     """
-    if not isinstance(optimizer, torch.optim.Optimizer):
-        raise TypeError(
-            "fully_shard_optimizer expected a torch.optim.Optimizer instance, "
-            f"got {optimizer!r}."
-        )
-
-    @dataclass
-    class CastedGrad:
+    class CastedGrad(NamedTuple):
         parameter: nn.Parameter
         original_grad: torch.Tensor
+
+    def set_grad(parameter: nn.Parameter, grad: torch.Tensor) -> None:
+        """Install a grad with matching grad_dtype on a sharded parameter."""
+        # Clear the existing grad before switching grad_dtype; the sharded
+        # parameter cannot advertise a new grad dtype while the old grad
+        # object with the previous dtype is still attached.
+        parameter.grad = None
+        parameter.grad_dtype = grad.dtype
+        parameter.grad = grad
 
     casted_grads: list[CastedGrad] = []
 
@@ -79,15 +78,8 @@ def fully_shard_optimizer(optimizer: _OptimizerT) -> None:
                 if parameter.grad.dtype == parameter.dtype:
                     continue
 
-                original_grad = parameter.grad
-                casted_grads.append(CastedGrad(parameter, original_grad))
-
-                # Clear the existing grad before switching grad_dtype; the sharded
-                # parameter cannot advertise a new grad dtype while the old grad
-                # object with the previous dtype is still attached.
-                parameter.grad = None
-                parameter.grad_dtype = parameter.dtype
-                parameter.grad = original_grad.to(dtype=parameter.dtype)
+                casted_grads.append(CastedGrad(parameter, parameter.grad))
+                set_grad(parameter, parameter.grad.to(dtype=parameter.dtype))
 
     def step_post_hook(
         hooked_optimizer: torch.optim.Optimizer,
@@ -95,12 +87,8 @@ def fully_shard_optimizer(optimizer: _OptimizerT) -> None:
         kwargs: dict[str, Any],
     ) -> None:
         del hooked_optimizer, args, kwargs
-        for casted_grad in casted_grads:
-            parameter = casted_grad.parameter
-            original_grad = casted_grad.original_grad
-            parameter.grad = None
-            parameter.grad_dtype = original_grad.dtype
-            parameter.grad = original_grad
+        for parameter, original_grad in casted_grads:
+            set_grad(parameter, original_grad)
         casted_grads.clear()
 
     optimizer.register_step_pre_hook(step_pre_hook)
