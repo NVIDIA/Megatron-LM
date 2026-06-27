@@ -40,6 +40,54 @@ class _RawDecoder:
     def decode(self, ids):
         return self._t.decode(list(ids))
 
+def _build_model(spec_fn, config, vocab=262144):
+    from megatron.core.models.gemma4.gemma4_model import Gemma4Model
+
+    spec = spec_fn(config)
+    model = Gemma4Model(
+        config=config,
+        transformer_layer_spec=spec,
+        vocab_size=vocab,
+        max_sequence_length=512,
+    )
+    return model.bfloat16().cuda()
+
+def _init_distributed():
+    import megatron.core.parallel_state as ps
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "12399")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        torch.distributed.init_process_group(backend="nccl", world_size=1, rank=0)
+    ps.initialize_model_parallel(1, 1)
+    # Required before building VocabParallelEmbedding / parallel linears (adds the
+    # 'model-parallel-rng' cuda rng state used by _initialize_affine_weight_gpu).
+    model_parallel_cuda_manual_seed(123)
+
+def _make_config(num_layers=42, hidden=2560, ffn=10240):
+    from megatron.core.transformer.gemma4_config import Gemma4TransformerConfig
+
+    return Gemma4TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden,
+        ffn_hidden_size=ffn,
+        num_attention_heads=8,
+        num_query_groups=2,
+        layernorm_epsilon=1e-6,
+        gated_linear_unit=True,
+        activation_func=GELU_TANH,
+        add_bias_linear=False,
+        qk_layernorm=True,
+        bias_activation_fusion=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_softmax_in_fp32=True,
+        masked_softmax_fusion=False,
+        pipeline_dtype=torch.bfloat16,
+    )
 
 def _tokenize(text):
     """Chat-template tokenize with the E4B tokenizer -> (decoder, ids[1, S]).
