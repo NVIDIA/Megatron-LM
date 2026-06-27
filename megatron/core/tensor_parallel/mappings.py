@@ -28,8 +28,8 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    # Note: If input_ is contiguous, it is mutated in-place.  
-    # If not, a new contiguous tensor is created and returned;  
+    # Note: If input_ is contiguous, it is mutated in-place.
+    # If not, a new contiguous tensor is created and returned;
     # callers must use the returned value to ensure the reduced result is captured.
     input_ = input_.contiguous()
     torch.distributed.all_reduce(input_, group=group)
