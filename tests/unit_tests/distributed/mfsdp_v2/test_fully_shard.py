@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -464,6 +465,119 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
+
+def test_fully_shard_optimizer_keeps_optimizer_instance_and_sharded_params(distributed_setup):
+    """The adapter should reuse the optimizer instance and keep sharded parameters."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = TinyModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    fsdp_parameters = tuple(
+        parameter
+        for parameter_group in (*model.fc1.parameter_groups(), *model.fc2.parameter_groups())
+        for parameter in parameter_group.sharded_parameters
+    )
+
+    adam = torch.optim.Adam(model.parameters(), lr=0.01)
+    result = fully_shard_optimizer(adam)
+
+    assert result is None
+    assert isinstance(adam, torch.optim.Adam)
+
+    optimizer_parameters = tuple(adam.param_groups[0]["params"])
+    assert len(optimizer_parameters) == len(fsdp_parameters)
+    for optimizer_parameter, fsdp_parameter in zip(
+        optimizer_parameters, fsdp_parameters, strict=True
+    ):
+        assert optimizer_parameter is fsdp_parameter
+
+
+@pytest.mark.parametrize("optimizer_cls", [torch.optim.Adam, torch.optim.AdamW])
+def test_fully_shard_optimizer_adam_casts_mixed_precision_grads(
+    distributed_setup, optimizer_cls
+):
+    """Adam optimizers should step on default mixed-precision FSDP parameters."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    if device.type != "cuda":
+        pytest.skip("Adam mixed-precision optimizer coverage requires CUDA.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(2026)
+    model = TinyModel().to(device=device, dtype=torch.bfloat16)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+
+    fsdp_parameter_groups = (*model.fc1.parameter_groups(), *model.fc2.parameter_groups())
+    fsdp_parameters = tuple(
+        parameter
+        for parameter_group in fsdp_parameter_groups
+        for parameter in parameter_group.sharded_parameters
+    )
+    for parameter_group in fsdp_parameter_groups:
+        assert parameter_group.main_grad is not None
+        assert parameter_group.main_grad.dtype == torch.bfloat16
+    for parameter in fsdp_parameters:
+        assert parameter.dtype == torch.float32
+
+    extra_parameter = nn.Parameter(torch.ones((), device=device))
+    optimizer = optimizer_cls([{"params": model.parameters()}, {"params": [extra_parameter]}], lr=0.01)
+    fully_shard_optimizer(optimizer)
+
+    optimizer_fsdp_parameters = tuple(optimizer.param_groups[0]["params"])
+    assert len(optimizer_fsdp_parameters) == len(fsdp_parameters)
+    for optimizer_parameter, fsdp_parameter in zip(
+        optimizer_fsdp_parameters, fsdp_parameters, strict=True
+    ):
+        assert optimizer_parameter is fsdp_parameter
+
+    x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
+    target = torch.randn(6, 4, device=device, dtype=torch.bfloat16)
+    losses = []
+    optimizer.zero_grad(set_to_none=True)
+
+    for _ in range(3):
+        loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+        losses.append(loss.detach())
+        loss.backward()
+
+        for parameter in fsdp_parameters:
+            assert parameter.grad is not None
+            assert parameter.grad.dtype == torch.bfloat16
+            assert parameter.grad.dtype != parameter.dtype
+            assert parameter.grad_dtype == torch.bfloat16
+
+        optimizer.step()
+
+        for parameter in fsdp_parameters:
+            assert parameter.grad is not None
+            assert parameter.grad.dtype == torch.bfloat16
+            assert parameter.grad_dtype == torch.bfloat16
+        for parameter_group in fsdp_parameter_groups:
+            assert parameter_group.main_grad is not None
+            assert parameter_group.main_grad.dtype == torch.bfloat16
+
+        extra_parameter.grad = torch.ones_like(extra_parameter)
+        optimizer.zero_grad(set_to_none=False)
+
+        for parameter in fsdp_parameters:
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad.to_local(), torch.zeros_like(parameter.grad.to_local())
+            )
+            assert parameter.grad_dtype == torch.bfloat16
+        assert extra_parameter.grad is not None
+        torch.testing.assert_close(extra_parameter.grad, torch.zeros_like(extra_parameter))
+
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(losses[-1], losses[0])
 
 
 def test_microbatch_scopes_child_contexts(distributed_setup):
