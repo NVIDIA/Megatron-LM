@@ -647,6 +647,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     use_dsv4_cp_slice = (
         config is not None
         and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
+        and cp_group.size() > 1
     )
     dsv4_cp_local_target_len = None
     pad_alignment = (

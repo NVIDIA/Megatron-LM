@@ -209,7 +209,7 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
 
 @pytest.mark.parametrize(
     ("alignment", "cuda_graph_impl", "local_cp_size", "total_tokens", "local_target"),
-    [("max", "none", 1, 6, 8), (4, "none", 2, 10, 8), (8, "transformer_engine", 2, 10, 8)],
+    [(4, "none", 2, 10, 8), (8, "transformer_engine", 2, 10, 8)],
 )
 def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     monkeypatch, alignment, cuda_graph_impl, local_cp_size, total_tokens, local_target

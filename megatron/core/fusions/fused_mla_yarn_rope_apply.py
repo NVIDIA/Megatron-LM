@@ -369,7 +369,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             total_seqlen = grad.shape[0]
         else:
             seq_num = len(ctx.cu_seqlens_q) - 1
-            grad = grad.contiguous()
+            if ctx.has_position_ids:
+                grad = grad.contiguous()
             total_seqlen, nheads, headdim = grad.shape
         assert grad.stride(-1) == 1
 

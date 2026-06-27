@@ -717,6 +717,63 @@ def _thd_to_fake_bshd(*tensors: Tensor) -> Tuple[Tensor, ...]:
     return tuple(t.unsqueeze(0) for t in tensors)
 
 
+def _compute_indexer_predict(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    qhead_per_kv_head: int,
+    *,
+    topk_indices_global: bool = False,
+) -> Tensor:
+    """Compute ``predict`` distribution (softmax over top-K of indexer scores).
+
+    Wraps `cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
+    This function is not used now, but it is kept for potential future use.
+
+    Two layouts:
+
+    * **BSHD** (default; 4-D q): ``q (B, S_q, H, D)``, ``k (B, S_k, D)``,
+      ``w (B, S_q, H)``, ``topk (B, S_q, topk)``.
+    * **THD packed** (3-D q): ``q (total_q, H, D)``, ``k (total_k, D)``,
+      ``w (total_q, H)``, ``topk (total_q, topk)``. Internally
+      fake-BSHD'd with ``B=1`` so the wrapper's 4-D-Q shape check
+      passes; ``topk_indices_global=True`` is required (and enforced) so
+      the kernel decodes the flat ids directly as positions into the
+      ``(1*total_k, D)`` view.
+
+    Output shape matches the layout: BSHD ``(B, S_q, topk)`` or
+    THD ``(total_q, topk)``, fp32 softmax over the top-K axis.
+    """
+    _ensure_dsa_namespace()
+    is_thd = q_indexer.ndim == 3
+    if is_thd:
+        if not topk_indices_global:
+            raise ValueError(
+                "THD ``_compute_indexer_predict`` requires "
+                "``topk_indices_global=True`` so the kernel addresses K "
+                "by flat ids over the packed ``(total_k, D)`` buffer."
+            )
+        q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+            q_indexer, k_indexer, weights, topk_indices
+        )
+    else:
+        q_bshd, k_bsd, w_bsh, topk_bst = q_indexer, k_indexer, weights, topk_indices
+
+    result = _DSA.sparse_indexer_score_recompute_wrapper(
+        q_bshd,
+        k_bsd,
+        w_bsh,
+        topk_bst,
+        qhead_per_kv_head=qhead_per_kv_head,
+        topk_indices_global=topk_indices_global,
+    )
+    predict = result["predict"]
+    if is_thd:
+        predict = predict.squeeze(0)
+    return predict
+
+
 def _compute_attn_target(
     q_attn: Tensor,
     k_attn: Tensor,
@@ -729,9 +786,10 @@ def _compute_attn_target(
 ) -> Tensor:
     """Compute ``target`` distribution (L1-normalised head-sum softmax).
 
-    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. A 4-D q
-    is BSHD; a 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
-    wrapper call so the 4-D-Q shape check passes.
+    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. Same
+    layout convention as :func:`_compute_indexer_predict`: 4-D q is
+    BSHD; 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
+    wrapper call (so the 4-D-Q shape check passes).
     """
     _ensure_dsa_namespace()
     is_thd = q_attn.ndim == 3
@@ -1010,6 +1068,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # THD: skip the permute; tensors are already flat.
         if is_thd:
             total_q = q_indexer.shape[0]
+            idx_nh = q_indexer.shape[1]
             np_, d = query.shape[1], query.shape[2]
 
             q_indexer_flat = q_indexer
@@ -1018,6 +1077,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         else:
             sq, b, np_, d = query.shape
             skv = kv_full.shape[0]
+            idx_nh = q_indexer.shape[2]
 
             q_indexer_flat = q_indexer.permute(1, 0, 2, 3).contiguous()
             k_indexer_flat = k_indexer.permute(1, 0, 2).contiguous()

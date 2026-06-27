@@ -45,22 +45,6 @@ def _sequence_positions(cu_seqlens, rows, clamp=False):
     return rows - cu_seqlens[seq_ids]
 
 
-def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
-    """Validate the no-CP boundary exchange contract.
-
-    Expected: with cp_group=None, the fixed left boundary is zero-filled and its
-    backward path contributes no gradient to the local tensor. A failure here
-    means the CP path could invent boundary tokens or bogus local gradients.
-    """
-    local = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_(True)
-
-    boundary = exchange_cp_boundary_hidden(local, 0, 2, None)
-
-    assert torch.equal(boundary, torch.zeros(2, 3))
-    boundary.sum().backward()
-    assert torch.equal(local.grad, torch.zeros_like(local))
-
-
 def test_thd_cp_left_boundary_exchange_forward_backward():
     """Validate distributed CP boundary exchange forward/backward.
 

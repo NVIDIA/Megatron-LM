@@ -84,8 +84,8 @@ class _LeftBoundaryExchange(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, d_window: int, cp_group: torch.distributed.ProcessGroup):
         """Receive fixed left-boundary hidden rows needed by this CP rank."""
-        cp_size = 1 if cp_group is None else cp_group.size()
-        cp_rank = 0 if cp_group is None else cp_group.rank()
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
         ctx.cp_group = cp_group
         ctx.d_window = d_window
         ctx.input_shape = tensor.shape
@@ -95,8 +95,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                 f"local_rows={tensor.shape[0]}, D_window={d_window}."
             )
         boundary = tensor.new_zeros((d_window,) + tuple(tensor.shape[1:]))
-        if cp_size <= 1:
-            return boundary
 
         ops = []
         if cp_rank > 0:
@@ -120,12 +118,10 @@ class _LeftBoundaryExchange(torch.autograd.Function):
     def backward(ctx, grad_boundary: torch.Tensor):
         """Send boundary gradients back to ranks that own those hidden rows."""
         cp_group = ctx.cp_group
-        cp_size = 1 if cp_group is None else cp_group.size()
-        cp_rank = 0 if cp_group is None else cp_group.rank()
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
         d_window = ctx.d_window
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
-        if cp_size <= 1:
-            return grad_input, None, None
 
         ops = []
         if cp_rank > 0:
