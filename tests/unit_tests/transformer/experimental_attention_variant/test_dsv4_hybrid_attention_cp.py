@@ -74,6 +74,29 @@ _DSV4_CP_RAGGED_PADDED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95,
 _DSV4_CP_REPLAY_PADDED_SEG_LENS = (8, 128, 1000, 32, 132, 904, 64, 260, 804, 96, 512, 156)
 
 
+def _dsv4_cp_fused_kernels_available():
+    """Return whether this host can run the fused DSv4 THD CP test path."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        sm_major = torch.cuda.get_device_capability()[0]
+    except RuntimeError:
+        return False
+    if sm_major < 10:
+        return False
+    try:
+        from cudnn import DSA  # noqa: F401
+        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON = (
+    "DSv4 fused DSA cases require SM100+, flash_mla, and cudnn.DSA"
+)
+
+
 class _ReferenceCPGroup:
     def rank(self):
         """Return the CP rank used by the CP1 reference path."""
@@ -462,6 +485,7 @@ class TestDSv4HybridAttentionTHDCP:
         model_parallel_cuda_manual_seed(_SEED)
 
         cls = request.cls
+        cls.fused_kernels_available = _dsv4_cp_fused_kernels_available()
         cls.cp_size = cp_size
         cls.cp_rank = parallel_state.get_context_parallel_rank()
         cls.pg = ProcessGroupCollection.use_mpu_process_groups()
@@ -564,6 +588,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
+            apply_dsa_kernel_fusion=self.fused_kernels_available,
             apply_rope_fusion=True,
             csa_cp_partition_mode=partition_mode,
         )
@@ -573,6 +598,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             # Numerical parity uses the unfused CP1 reference so failures point
             # at the CP path instead of non-CP fused RoPE behavior.
+            apply_dsa_kernel_fusion=self.fused_kernels_available,
             apply_rope_fusion=False,
         )
         cp_attn = _build_attention(
@@ -649,6 +675,9 @@ class TestDSv4HybridAttentionTHDCP:
         plus elementwise ``assert_close`` gates because they may be
         nondeterministic against eager execution.
         """
+        if fused and not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
         context = nullcontext() if fused else _deterministic_torch_algorithms()
         mode = "fused" if fused else "unfused"
         with context:
@@ -753,6 +782,9 @@ class TestDSv4HybridAttentionTHDCP:
         failure means the CP path baked capture-time padded boundaries or a
         host-derived dynamic shape into the graph.
         """
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
         capture_packed = _make_thd_packed_seq_params(
             _DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_RAGGED_PADDED_SEG_LENS
         )
@@ -871,6 +903,9 @@ class TestDSv4HybridAttentionTHDCP:
         accidentally gather full hidden states or otherwise allocate global
         activation-sized buffers before the layer work.
         """
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
         packed, padded_tokens, local_idx = _make_ragged_cp_case(
             partition_mode, self.cp_size, self.cp_rank
         )
@@ -934,6 +969,9 @@ class TestDSv4HybridAttentionTHDCP:
         are not enough if the implementation falls back to slow dynamic PyTorch
         work in the production graph path.
         """
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
         packed, padded_tokens, local_idx = _make_ragged_cp_case(
             partition_mode, self.cp_size, self.cp_rank
         )
