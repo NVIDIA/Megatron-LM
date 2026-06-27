@@ -39,7 +39,10 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
     Args:
         optimizer: Optimizer instance to adapt in place.
     """
+
     class CastedGrad(NamedTuple):
+        """Original grad tensor temporarily replaced during an optimizer step."""
+
         parameter: nn.Parameter
         original_grad: torch.Tensor
 
@@ -55,9 +58,7 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
     casted_grads: list[CastedGrad] = []
 
     def step_pre_hook(
-        hooked_optimizer: torch.optim.Optimizer,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
+        hooked_optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
         closure = kwargs.get("closure")
         if closure is None and len(args) > 1:
@@ -88,9 +89,7 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
                 set_grad(parameter, parameter.grad.to(dtype=parameter.dtype))
 
     def step_post_hook(
-        hooked_optimizer: torch.optim.Optimizer,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
+        hooked_optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
         del hooked_optimizer, args, kwargs
         for parameter, original_grad in casted_grads:

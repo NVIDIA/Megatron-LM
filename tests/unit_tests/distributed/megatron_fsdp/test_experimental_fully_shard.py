@@ -245,6 +245,7 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
 
+
 def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
     """Mixed-precision FSDP Adam should track an unsharded Adam baseline."""
     world_size = distributed_setup.world_size
@@ -299,11 +300,9 @@ def test_fully_shard_adam_without_adapter_raises_precision_error(distributed_set
     loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
     loss.backward()
 
-    with pytest.raises(
-        RuntimeError,
-        match="same device and the same dtype",
-    ):
+    with pytest.raises(RuntimeError, match="same device and the same dtype"):
         optimizer.step()
+
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     """CPU-initialized parameters should be sharded with their real values."""
