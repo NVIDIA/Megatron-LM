@@ -1223,7 +1223,6 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
         model_type,
         checkpointing_context=checkpointing_context,
         cfg_container=cfg_container,
@@ -1995,7 +1994,6 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
     checkpointing_context=None,
     *,

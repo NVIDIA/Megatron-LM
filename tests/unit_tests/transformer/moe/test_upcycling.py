@@ -192,10 +192,7 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider,
-            ModelType.encoder_or_decoder,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            ModelType.encoder_or_decoder, cfg_container=cfg_container, pg_collection=pg_collection
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -282,10 +279,7 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider,
-            ModelType.encoder_or_decoder,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            ModelType.encoder_or_decoder, cfg_container=cfg_container, pg_collection=pg_collection
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()

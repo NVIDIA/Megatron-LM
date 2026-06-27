@@ -801,10 +801,7 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider,
-            ModelType.encoder_or_decoder,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            ModelType.encoder_or_decoder, cfg_container=cfg_container, pg_collection=pg_collection
         )
 
         # Forward pass with packed sequences
@@ -869,10 +866,7 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider,
-            ModelType.encoder_or_decoder,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            ModelType.encoder_or_decoder, cfg_container=cfg_container, pg_collection=pg_collection
         )
 
         output = gpt_model[0].forward(
@@ -1414,10 +1408,7 @@ class TestMultiTokenPredictionHybrid:
         cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider,
-            ModelType.encoder_or_decoder,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            ModelType.encoder_or_decoder, cfg_container=cfg_container, pg_collection=pg_collection
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1464,7 +1455,6 @@ class TestMultiTokenPredictionHybrid:
             cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider,
                 ModelType.encoder_or_decoder,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
