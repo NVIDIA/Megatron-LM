@@ -7,7 +7,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from hybrid_builders import hybrid_builder
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -98,7 +97,6 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
-        model_provider_func=partial(model_provider, hybrid_builder),
         model_type=ModelType.encoder_or_decoder,
         cfg_container=cfg_container,
         pg_collection=pg_collection,
