@@ -35,6 +35,14 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
         - Generating an FSDP-specific subclass per ``torch.optim.Optimizer``.
           This adds extra class-generation machinery, but would let us
           instrument ``zero_grad`` and ``__init__`` as well as ``step`` if needed.
+        - Casting from ``main_grad.dtype`` to ``main_weight.dtype`` after the
+          last microbatch and casting back before the first microbatch. This
+          should be done from a root post-backward callback if needed later, so
+          users do not need to call ``fully_shard_optimizer`` on an existing
+          ``torch.optim.Optimizer``.
+        - Letting the user set ``main_weight`` and ``main_grad`` to the same
+          dtype. This is enough for an FSDP2 drop-in replacement path and lets
+          optimizers stay unaware of FSDP precision handling.
 
     Args:
         optimizer: Optimizer instance to adapt in place.
