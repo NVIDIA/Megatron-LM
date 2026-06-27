@@ -35,7 +35,15 @@ class VocabParallelCrossEntropy:
         logits_max: torch.Tensor,
         vocab_start_index: int,
         vocab_end_index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        calculate_sum_logits: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         """Calculates predicted logits."""
 
         # In-place subtraction reduces memory pressure.
@@ -58,11 +66,19 @@ class VocabParallelCrossEntropy:
         predicted_logits = predicted_logits_1d.view_as(target)
         predicted_logits[target_mask] = 0.0
 
+        sum_logits = vocab_parallel_logits.sum(dim=-1) if calculate_sum_logits else None
         exp_logits = vocab_parallel_logits
         torch.exp(vocab_parallel_logits, out=exp_logits)
         sum_exp_logits = exp_logits.sum(dim=-1)
 
-        return target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits
+        return (
+            target_mask,
+            masked_target_1d,
+            predicted_logits,
+            sum_exp_logits,
+            exp_logits,
+            sum_logits,
+        )
 
     @staticmethod
     def calculate_cross_entropy_loss(
@@ -136,10 +152,20 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
-        (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
-            VocabParallelCrossEntropy.calculate_predicted_logits(
-                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
-            )
+        (
+            target_mask,
+            masked_target_1d,
+            predicted_logits,
+            sum_exp_logits,
+            exp_logits,
+            sum_logits,
+        ) = VocabParallelCrossEntropy.calculate_predicted_logits(
+            vocab_parallel_logits,
+            target,
+            logits_max,
+            vocab_start_index,
+            vocab_end_index,
+            calculate_sum_logits=label_smoothing > 0,
         )
 
         # All reduce is needed to get the chunks from other GPUs.
@@ -155,7 +181,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             exp_logits, predicted_logits, sum_exp_logits
         )
 
-        vocab_size = exp_logits.size(-1)
+        vocab_size = partition_vocab_size * world_size
         if label_smoothing > 0:
             r"""
             We'd like to assign 1 / (K - 1) probability mass to every index that is not the ground truth.
@@ -169,10 +195,11 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             assert 1.0 > label_smoothing > 0.0
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
 
-            # Exp logits at this point are normalized probabilities.
-            # So we can just take the log to get log-probs.
-            log_probs = torch.log(exp_logits)
-            mean_log_probs = log_probs.mean(dim=-1)
+            assert sum_logits is not None
+            torch.distributed.all_reduce(
+                sum_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            mean_log_probs = sum_logits / vocab_size - torch.log(sum_exp_logits)
             loss = (1.0 - smoothing) * loss - smoothing * mean_log_probs
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size

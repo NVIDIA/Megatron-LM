@@ -47,6 +47,69 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
 
 
+def test_vocab_parallel_cross_entropy_label_smoothing():
+    """Label smoothing should match dense cross entropy across TP ranks."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        tp_group = cross_entropy_module.get_tensor_model_parallel_group()
+        tp_rank = tp_group.rank()
+        tp_size = tp_group.size()
+        assert tp_size == 2
+
+        full_logits = torch.tensor(
+            [
+                [3.0, -1.0, 0.5, 2.0, -4.0, 1.5, 0.0, 4.0],
+                [-2.0, 0.25, 5.0, -1.5, 3.5, -0.5, 1.0, 2.5],
+                [1.25, -3.0, 2.75, 0.5, -1.0, 0.75, 4.25, -2.5],
+                [120.0, -120.0, 80.0, -80.0, 60.0, -60.0, 40.0, -40.0],
+            ],
+            device='cuda',
+        )
+        target = torch.tensor([0, 5, 7, 6], device='cuda')
+        label_smoothing = 0.2
+
+        global_vocab_size = full_logits.size(-1)
+        partition_vocab_size = global_vocab_size // tp_size
+        partition_start = tp_rank * partition_vocab_size
+        partition_end = partition_start + partition_vocab_size
+
+        # Pass a non-leaf tensor because the implementation normalizes logits in-place.
+        local_logits_leaf = (
+            full_logits[:, partition_start:partition_end].clone().detach().requires_grad_(True)
+        )
+        actual_loss = vocab_parallel_cross_entropy(
+            local_logits_leaf + 0.0,
+            target,
+            label_smoothing=label_smoothing,
+            tp_group=tp_group,
+        )
+
+        # This API assigns alpha mass only to non-target classes, rather than
+        # using PyTorch's uniform-mixture interpretation of label_smoothing.
+        reference_logits = full_logits.clone().detach().requires_grad_(True)
+        target_distribution = torch.full_like(
+            reference_logits, label_smoothing / (global_vocab_size - 1)
+        )
+        target_distribution.scatter_(-1, target.unsqueeze(-1), 1.0 - label_smoothing)
+        reference_loss = -(
+            target_distribution * torch.log_softmax(reference_logits, dim=-1)
+        ).sum(dim=-1)
+
+        assert torch.isfinite(actual_loss).all()
+        actual_loss.sum().backward()
+        reference_loss.sum().backward()
+
+        torch.testing.assert_close(actual_loss, reference_loss, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            local_logits_leaf.grad,
+            reference_logits.grad[:, partition_start:partition_end],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_language_module_unfused_loss_passes_tp_group(monkeypatch):
     tp_group = _FakeTPGroup()
     captured = {}
