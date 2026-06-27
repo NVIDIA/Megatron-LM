@@ -347,9 +347,17 @@ class TestMoESingleGroupedWeightNumerics:
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, True)
         self.assert_execution_path_is_exercised(model[0], True)
 
+        # Seed cached DDP param-buffer shard views under no_grad, as explicit
+        # sync paths can do outside differentiable forward compute. The later
+        # hook-disable forced sync must not reuse those views in grad mode.
+        optimizer.prepare_model_params_for_param_sync()
+        with torch.no_grad():
+            model[0].start_param_sync(force_sync=True)
+
         # Bridge evaluation/checkpointing stages MXFP8 master params, then disables
-        # pre-hooks with param_sync=True. This used to mix no_grad-created views with
-        # grad-enabled param-buffer mutation for single grouped MXFP8 weights.
+        # pre-hooks with param_sync=True. Without the DDP no_grad boundary, this forced
+        # sync reuses no_grad-created cached shard views and mutates the same param buffer
+        # with grad mode enabled.
         optimizer.prepare_model_params_for_param_sync()
         model[0].disable_forward_pre_hook(param_sync=True)
 
