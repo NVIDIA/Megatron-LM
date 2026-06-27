@@ -332,6 +332,7 @@ class TestMoESingleGroupedWeightNumerics:
             gradient_accumulation_fusion=True,
             use_transformer_engine_op_fuser=True,
             overlap_param_gather=True,
+            overlap_grad_reduce=True,
         )
         set_args(args)
         torch.manual_seed(_SEED)
