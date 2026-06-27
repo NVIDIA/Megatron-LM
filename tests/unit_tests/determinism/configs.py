@@ -91,6 +91,79 @@ def moe_overrides(tp: int = 1, ep: int = 1) -> dict:
     return overrides
 
 
+# DeepSeek-V3-style proxy base. Built on ``MLATransformerConfig`` by the test
+# factory so YaRN-RoPE / mscale defaults match the real model. Scaled to toy
+# sizes but keeps every determinism-relevant code path the real DSV3 recipe
+# exercises: Multi-Latent Attention (low-rank q/kv projections), sigmoid routing
+# + expert bias, group-limited (node-limited) top-k — the ``group_limited_topk``
+# scatter path flagged in docs/developer/determinism/op-catalog.md — seq-aux-loss
+# balancing, and grouped-GEMM experts. MoE is baked in (DSV3 is always MoE), so
+# unlike the dense GPT preset it does not rely on EP>1 to enable experts.
+#
+# MLA head dims intentionally exceed ``hidden_size`` (mirrors
+# tests/unit_tests/transformer/test_multi_latent_attention.py): MLA projects
+# through low-rank latents so the per-head dim is independent of hidden_size.
+def deepseek_base() -> dict:
+    return dict(
+        num_layers=2,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=8,
+        # Multi-Latent Attention (proven dims from the MLA unit test).
+        multi_latent_attention=True,
+        q_lora_rank=32,
+        kv_lora_rank=32,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+        v_head_dim=128,
+        qk_layernorm=True,
+        rope_type="yarn",
+        rotary_base=10000,
+        original_max_position_embeddings=32,
+        normalization="RMSNorm",
+        gated_linear_unit=True,  # SwiGLU, as in DSV3.
+        # Fine-grained MoE with DSV3 group-limited routing.
+        num_moe_experts=8,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_router_score_function="sigmoid",
+        moe_router_enable_expert_bias=True,
+        moe_router_load_balancing_type="seq_aux_loss",
+        moe_router_num_groups=2,
+        moe_router_group_topk=1,
+        moe_router_dtype="fp32",
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        sequence_parallel=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        deterministic_mode=True,
+    )
+
+
+# Nemotron-3-Ultra-style proxy base: hybrid Mamba + attention + MoE. The real
+# recipe interleaves Mamba (``M``), attention (``*``) and MoE (``E``) layers
+# (pattern ``MEMEMEM*...``) with sigmoid + expert-bias routing. This adds MoE +
+# DSV3-style routing to the dense hybrid base so the ``E`` slot in the layer
+# pattern builds real MoE layers, exercising MoE-in-hybrid (grouped GEMM inside a
+# hybrid stack) which the dense hybrid determinism test deliberately omits.
+def nemotron_hybrid_base() -> dict:
+    return dict(
+        hybrid_base(),
+        num_moe_experts=8,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_router_score_function="sigmoid",
+        moe_router_enable_expert_bias=True,
+        moe_router_load_balancing_type="seq_aux_loss",
+        moe_router_dtype="fp32",
+        add_bias_linear=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Model presets — fed to @pytest.mark.parametrize. Each pytest.param's first
 # arg is a dict of TransformerConfig overrides; the `id=` controls the test
@@ -122,6 +195,17 @@ HYBRID_CONFIGS = [
     # dropped (Mamba path alone is already exercised here).
     pytest.param("M*-", {}, id="mamba-attn-mlp")
 ]
+
+
+# DeepSeek-V3 proxy presets. MLA + MoE config lives in ``deepseek_base()``;
+# overrides here only carry per-cell variations (none yet — one canonical cell).
+DEEPSEEK_CONFIGS = [pytest.param({}, id="dsv3-like")]
+
+
+# Nemotron-3-Ultra proxy presets. The first arg is the hybrid layer pattern.
+# ``M*E`` = Mamba + attention + MoE — the three layer types that define the
+# Nemotron-3-Ultra stack. MoE config lives in ``nemotron_hybrid_base()``.
+NEMOTRON_CONFIGS = [pytest.param("M*E", {}, id="mamba-attn-moe")]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +259,36 @@ def parallelism_configs(*, exclude: tuple[str, ...] = ()) -> list:
     """
     excluded = set(exclude)
     return [p for p in PARALLELISM_CONFIGS if p.id not in excluded]
+
+
+# DeepSeek-V3 proxy parallelism matrix. MoE is always on (baked into
+# ``deepseek_base``). Cells are chosen so MoE is valid without extra wiring:
+# either EP>1 (the runner merges ``moe_overrides`` → sets SP + TP/EP propagation)
+# or TP==1 (no MoE+TP sequence-parallel requirement). EP is DSV3's signature
+# parallelism; FSDP/PP cells exercise MLA + dense-EP determinism.
+DEEPSEEK_PARALLELISM_CONFIGS = [
+    pytest.param({"EP": 2}, id="ep2"),
+    pytest.param({"TP": 2, "EP": 2}, id="tp2-ep2"),
+    pytest.param({"TP": 2, "EP": 4}, id="tp2-ep4"),
+    pytest.param({"FSDP": 8, "EP": 4}, id="fsdp8-ep4"),
+    pytest.param({"FSDP": 8}, id="fsdp8"),
+    pytest.param({"PP": 2}, id="pp2"),
+    pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+]
+
+
+# Nemotron-3-Ultra proxy parallelism matrix. Adds the EP cells the dense hybrid
+# determinism test omits (MoE-in-hybrid grouped GEMM) while keeping the cheap
+# PP/FSDP hybrid cells. Same TP==1-or-EP>1 rule as above so MoE+TP never needs
+# manual SP wiring. TP=4/8 are skipped (Mamba shard re-JIT cost, per the dense
+# hybrid test rationale).
+NEMOTRON_PARALLELISM_CONFIGS = [
+    pytest.param({"EP": 2}, id="ep2"),
+    pytest.param({"TP": 2, "EP": 2}, id="tp2-ep2"),
+    pytest.param({"PP": 2}, id="pp2"),
+    pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+    pytest.param({"FSDP": 8}, id="fsdp8"),
+]
 
 
 _SHORTNAME_TO_INIT_KWARG = {
