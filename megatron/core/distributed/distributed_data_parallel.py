@@ -408,7 +408,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Force synchronize parameters.
         if param_sync:
-            self.start_param_sync(force_sync=True)
+            # Hook-disable paths (eval/checkpointing/shutdown) synchronize params as an
+            # explicit state update, not as differentiable forward compute.
+            with torch.no_grad():
+                self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
