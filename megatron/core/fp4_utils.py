@@ -7,12 +7,7 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
-from megatron.core.fp8_utils import (
-    _get_custom_recipe,
-    _get_grouped_quantized_recipe,
-    get_grouped_quantized_members,
-    is_grouped_tensor_with_quantized_storage,
-)
+from megatron.core.fp8_utils import _get_custom_recipe, _get_grouped_quantized_recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
