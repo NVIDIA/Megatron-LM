@@ -88,13 +88,15 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
                 x, _ = layer(x, attention_mask=None)
         return x.mean()
 
-    # ---- Phase 1: Baseline — GTP=1 (DP=4) ----
+    # ---- Phase 1: Baseline — GTP_remat=1 (DP=4) ----
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
     )
     model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat']
+    )
     config = make_config()
     layers = make_transformer_stack(config, pg_collection)
     for layer in layers:
@@ -122,23 +124,25 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     GTPShardedParam._chain_state = {}
     FP8GlobalStateManager.reset()
 
-    # ---- Phase 2: GTP=4 (world = TP1 * GTP4 * CP1 * DP1) ----
+    # ---- Phase 2: GTP_remat=4 (world = TP1 * GTP4 * CP1 * DP1) ----
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        gtp_remat_size=4,  # standalone-axis GTP under test
+        gtp_remat_size=4,  # standalone-axis GTP_remat under test
     )
     model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat']
+    )
     config = make_config()
     layers_gtp = make_transformer_stack(config, pg_collection)
     for layer in layers_gtp:
         layer.cuda()
 
-    gtp_group = ps.get_gtp_weight_remat_group()
-    gtp_size = gtp_group.size()
-    gtp_rank = gtp_group.rank()
-    assert gtp_size == 4, f"GTP shard group size should be 4, got {gtp_size}"
+    gtp_remat_group = ps.get_gtp_weight_remat_group()
+    gtp_remat_size = gtp_remat_group.size()
+    gtp_rank = gtp_remat_group.rank()
+    assert gtp_remat_size == 4, f"GTP shard group size should be 4, got {gtp_remat_size}"
 
     gtp_params = [p for p in layers_gtp.parameters() if isinstance(p, GTPShardedParam)]
     assert len(gtp_params) > 0, "GTP not active: no GTPShardedParam found"
@@ -170,7 +174,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
         with torch.no_grad():
             for p in layers_gtp.parameters():
                 if isinstance(p, GTPShardedParam):
-                    p.data.sub_((LR / gtp_size) * p.main_grad)
+                    p.data.sub_((LR / gtp_remat_size) * p.main_grad)
                 elif p.grad is not None:
                     p.data.sub_(LR * p.grad)
                     p.grad.zero_()

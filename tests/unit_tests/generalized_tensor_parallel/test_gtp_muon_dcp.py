@@ -72,10 +72,10 @@ class TestGTPMuonDCP:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
         )
         model_parallel_cuda_manual_seed(2)
-        # Disable GTP alignment padding so the tiny test dims slice cleanly by gtp_size.
+        # Disable GTP_remat alignment padding so the tiny test dims slice cleanly by gtp_remat_size.
         _orig_pad = GTP_CONFIG.pad_for_alignment
         update_gtp_config(pad_for_alignment=0)
-        # GTP-friendly dims (divisible by gtp_size=2); GPU init (CPU affine init is not GTP-aware
+        # GTP_remat dims (divisible by gtp_remat_size=2); GPU init (CPU affine not GTP_remat-aware
         # for the strided QKV weight).
         moe_cfg = dict(
             hidden_size=64,

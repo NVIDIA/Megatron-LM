@@ -74,7 +74,7 @@ def _requires_nvfp4():
         pytest.skip("NVFP4 not available (requires compute capability >= 10.0)")
 
 
-def _make_gtp_linear(in_f, out_f, gtp_group, dtype=torch.bfloat16, **kwargs):
+def _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype=torch.bfloat16, **kwargs):
     """Construct a bias-free GTP-sharded te.Linear on CUDA."""
     return te.Linear(
         in_features=in_f,
@@ -82,12 +82,14 @@ def _make_gtp_linear(in_f, out_f, gtp_group, dtype=torch.bfloat16, **kwargs):
         bias=False,
         params_dtype=dtype,
         device="cuda",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         **kwargs,
     )
 
 
-def _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype=torch.bfloat16, **kwargs):
+def _make_gtp_remat_grouped_linear(
+    num_gemms, in_f, out_f, gtp_remat_group, dtype=torch.bfloat16, **kwargs
+):
     """Construct a bias-free GTP-sharded te.GroupedLinear on CUDA."""
     return te.GroupedLinear(
         num_gemms=num_gemms,
@@ -96,6 +98,6 @@ def _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype=torch.bflo
         bias=False,
         params_dtype=dtype,
         device="cuda",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         **kwargs,
     )

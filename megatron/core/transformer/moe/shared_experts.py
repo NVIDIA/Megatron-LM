@@ -125,7 +125,7 @@ class SharedExpertMLP(MLP):
             submodules=submodules,
             tp_group=pg_collection.tp,
             name=name,
-            gtp_group=pg_collection.gtp,
+            gtp_remat_group=pg_collection.gtp_remat,
         )
 
         self.use_shared_expert_gate = gate

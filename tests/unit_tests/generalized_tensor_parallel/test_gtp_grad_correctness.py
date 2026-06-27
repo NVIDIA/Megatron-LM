@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Numeric repro: GTP gradient correctness through the REAL
+"""Numeric repro: GTP_remat gradient correctness through the REAL
 DDP + distributed-optimizer + finalize path, with replicate (DP) > 1.
 
 The validated loss-trajectory test uses DP=1 (replicate=1) and manual
@@ -8,7 +8,7 @@ SGD on main_grad, so it cannot catch a gradient-reduction error that only shows
 up when the dist-opt shards over a replicate group of size > 1 (the new-at-64-GPU
 condition: DP2 x GTP16). This test reproduces that condition at small scale
 (world=4 = GTP2 x DP2) and checks the gradient end-to-end against a trusted
-no-GTP DP=4 baseline.
+no-GTP_remat DP=4 baseline.
 
 Decisive choices:
   * SGD lr=1.0 (NOT Adam): the step is scale-SENSITIVE, so a gtp x gradient
@@ -16,7 +16,7 @@ Decisive choices:
     normalize a uniform scale error away and mask the bug.
   * Distinct input per rank (seed=rank): each data-parallel position sees a
     different batch (the HSDP guarantee), so the correct reduced grad is the
-    MEAN over all 4 positions. Baseline (DP4) and GTP (GTP2xDP2) both
+    MEAN over all 4 positions. Baseline (DP4) and GTP_remat (GTP2xDP2) both
     span the same 4 positions, so their reduced grads -- and thus post-step
     weights and grad-norm -- must match.
 """
@@ -109,10 +109,10 @@ def _run_one_backward(ddp_model, rank):
     # reduces, which is idempotent at full-DP size but halves at replicate size.
     ddp_model.finish_grad_sync()
     from megatron.core.distributed.finalize_model_grads import (
-        _allreduce_replicated_grads_over_gtp_group,
+        _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
-    _allreduce_replicated_grads_over_gtp_group([ddp_model])
+    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model])
     return float(loss.item())
 
 
@@ -120,7 +120,7 @@ def _full_main_grads(stack):
     """Reconstruct full (unsharded) reduced gradients keyed by param name.
 
     GTPShardedParam.main_grad is the local gtp shard -> all-gather over the gtp
-    group. Non-GTP params are replicated -> take the local (already gtp-summed) copy.
+    group. Non-GTP_remat params are replicated -> take the local (already gtp-summed) copy.
     """
     from megatron.core import parallel_state as ps
 
@@ -144,13 +144,13 @@ def _worker(rank, world_size, port):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-    # ---------- Phase A: baseline, GTP=1 DP=4 (trusted standard path) ----------
+    # ---------- Phase A: baseline, GTP_remat=1 DP=4 (trusted standard path) ----------
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
     )
     model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     base_stack = _make_stack(_make_config(), pgc)
     for layer in base_stack:
         layer.cuda()
@@ -165,12 +165,12 @@ def _worker(rank, world_size, port):
     ps.destroy_model_parallel()
     GTPShardedParam._chain_state = {}
 
-    # ---------- Phase B: GTP=2 DP=2 (replicate>1!) ----------
+    # ---------- Phase B: GTP_remat=2 DP=2 (replicate>1!) ----------
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
     model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     gtp_stack = _make_stack(_make_config(), pgc)
     for layer in gtp_stack:
         layer.cuda()
@@ -179,7 +179,7 @@ def _worker(rank, world_size, port):
     gtp_rank = g.rank()
     assert g.size() == 2, f"expected gtp shard group size 2, got {g.size()}"
 
-    # Load the SAME init weights as baseline: GTP params get their gtp shard.
+    # Load the SAME init weights as baseline: GTP_remat params get their gtp shard.
     for name, p in gtp_stack.named_parameters():
         full = saved[name]
         if isinstance(p, GTPShardedParam):
@@ -213,12 +213,12 @@ def _worker(rank, world_size, port):
             if rel > max_err:
                 max_err, worst = rel, name
         print(
-            f"[summary] max relative grad error GTP-vs-DP4-baseline = {max_err:.3e} "
+            f"[summary] max relative grad error GTP_remat-vs-DP4-baseline = {max_err:.3e} "
             f"(worst: {worst})",
             flush=True,
         )
         assert max_err < 2e-2, (
-            f"GTP2xDP2 reduced gradient does not match the no-GTP DP4 baseline "
+            f"GTP2xDP2 reduced gradient does not match the no-GTP_remat DP4 baseline "
             f"(max rel err {max_err:.3e} on {worst}) -> gtp-axis grad reduction/scaling error."
         )
 
@@ -272,10 +272,10 @@ def _run_step_distopt(ddp_model, optim, rank):
     # Production order (finalize_model_grads): reduce across DP first, THEN the gtp finalize.
     ddp_model.finish_grad_sync()
     from megatron.core.distributed.finalize_model_grads import (
-        _allreduce_replicated_grads_over_gtp_group,
+        _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
-    _allreduce_replicated_grads_over_gtp_group([ddp_model])
+    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model])
     _, grad_norm, _ = optim.step()
     return float(grad_norm)
 
@@ -285,13 +285,13 @@ def _worker_distopt(rank, world_size, port):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-    # ---------- Phase A: baseline, GTP=1 DP=4, dist-opt + Adam ----------
+    # ---------- Phase A: baseline, GTP_remat=1 DP=4, dist-opt + Adam ----------
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=1
     )
     model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     base_stack = _make_stack(_make_config(), pgc)
     for layer in base_stack:
         layer.cuda()
@@ -304,12 +304,12 @@ def _worker_distopt(rank, world_size, port):
     ps.destroy_model_parallel()
     GTPShardedParam._chain_state = {}
 
-    # ---------- Phase B: GTP=2 DP=2, dist-opt + Adam ----------
+    # ---------- Phase B: GTP_remat=2 DP=2, dist-opt + Adam ----------
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
     model_parallel_cuda_manual_seed(42)
-    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     gtp_stack = _make_stack(_make_config(), pgc)
     for layer in gtp_stack:
         layer.cuda()
@@ -331,7 +331,7 @@ def _worker_distopt(rank, world_size, port):
     if rank == 0:
         ratio = gtp_gn / max(base_gn, 1e-12)
         print(
-            f"\n[distopt grad-norm] baseline={base_gn:.6f}  GTP={gtp_gn:.6f}  "
+            f"\n[distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={gtp_gn:.6f}  "
             f"ratio={ratio:.4f}",
             flush=True,
         )
@@ -340,7 +340,7 @@ def _worker_distopt(rank, world_size, port):
 
 
 # ---------------------------------------------------------------------------
-# MoE + EGTP dist-opt grad-norm path (a55b has experts; EGTP shards expert weights)
+# MoE + EGTP_remat dist-opt grad-norm path (a55b has experts; EGTP_remat shards expert weights)
 # ---------------------------------------------------------------------------
 
 NUM_EXPERTS = 4
@@ -394,7 +394,7 @@ def _worker_moe_distopt(rank, world_size, port):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-    pgs = ['tp', 'cp', 'gtp', 'ep']
+    pgs = ['tp', 'cp', 'gtp_remat', 'ep']
 
     # ---------- Phase A: baseline GTP1/EGTP1, EP2 (DP2 dense / expert_dp2) ----------
     ps.destroy_model_parallel()
@@ -411,7 +411,7 @@ def _worker_moe_distopt(rank, world_size, port):
     for layer in base_stack:
         layer.cuda()
     # Broadcast only NON-expert (dense) params; expert weights are EP-local and must
-    # stay rank-distinct. Save all params per-rank for the GTP phase to mirror.
+    # stay rank-distinct. Save all params per-rank for the GTP_remat phase to mirror.
     for name, p in base_stack.named_parameters():
         if not _is_expert_param(name, p):
             dist.broadcast(p.data, src=0)
@@ -422,7 +422,7 @@ def _worker_moe_distopt(rank, world_size, port):
     ps.destroy_model_parallel()
     GTPShardedParam._chain_state = {}
 
-    # ---------- Phase B: GTP2/EGTP2, EP2 (EGTP actually shards experts) ----------
+    # ---------- Phase B: GTP2/EGTP2, EP2 (EGTP_remat actually shards experts) ----------
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
@@ -442,7 +442,7 @@ def _worker_moe_distopt(rank, world_size, port):
     for name, p in moe_stack.named_parameters():
         full = saved[name]  # EP2 layout identical to baseline -> rank-local match
         if isinstance(p, GTPShardedParam):
-            # dense GTP shards over the gtp group; expert (EGTP) shards over the egtp group.
+            # dense GTP_remat shards over gtp group; expert (EGTP_remat) over egtp group.
             is_expert = _is_expert_param(name, p)
             r = egtp_rank if is_expert else gtp_rank
             ss = p.shape[0]
@@ -454,7 +454,7 @@ def _worker_moe_distopt(rank, world_size, port):
     if rank == 0:
         print(
             f"[moe-egtp] egtp-sharded expert params = {n_egtp_sharded} (must be >0 to be a "
-            f"faithful EGTP test)",
+            f"faithful EGTP_remat test)",
             flush=True,
         )
     moe_ddp, moe_optim = _build_ddp_distopt_and_optim(moe_stack)
@@ -466,7 +466,7 @@ def _worker_moe_distopt(rank, world_size, port):
     if rank == 0:
         ratio = moe_gn / max(base_gn, 1e-12)
         print(
-            f"\n[moe distopt grad-norm] baseline={base_gn:.6f}  GTP={moe_gn:.6f}  "
+            f"\n[moe distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={moe_gn:.6f}  "
             f"ratio={ratio:.4f}",
             flush=True,
         )
@@ -517,21 +517,21 @@ class TestGTPGradCorrectness:
         _run_distributed(_worker_idog_span, 4)
 
     def test_gtp2_dp2_grad_matches_dp4_baseline(self):
-        """GTP2xDP2 reduced grad must match no-GTP DP4 (non-dist-opt main_grad)."""
+        """GTP2xDP2 reduced grad must match no-GTP_remat DP4 (non-dist-opt main_grad)."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker, 4)
 
     def test_gtp2_dp2_distopt_grad_norm_matches_dp4_baseline(self):
-        """GTP2xDP2 dist-opt grad-norm must match no-GTP DP4 (the 64-GPU path)."""
+        """GTP2xDP2 dist-opt grad-norm must match no-GTP_remat DP4 (the 64-GPU path)."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_distopt, 4)
 
     @pytest.mark.skip(
-        reason="EP=2 (engages EGTP) but the minimal test dims (SEQ16 BATCH1 hidden256) hit a "
+        reason="EP=2 (engages EGTP_remat) but the minimal test dims (SEQ16 BATCH1 hidden256) hit a "
         "token-dispatcher shape error in the alltoall path (RuntimeError shape [2,1,4]). Needs a "
-        "larger MoE config to run; left as a stub. The real EGTP path is validated by the a55b "
+        "larger MoE config to run; left as a stub. The real EGTP_remat path validated by a55b "
         "re-run (loss matches the GTP1/EGTP1 baseline after the is_gtp/allreduce master-param fix)."
     )
     def test_moe_egtp_distopt_grad_norm_matches_baseline(self):

@@ -2,11 +2,22 @@
 
 """Generalized Tensor Parallelism (GTP).
 
-Shards weight tensors 1/N across a GTP process group along ``out_features``
-and materializes them on-demand via async all-gather, with a per-weight
-prefetch chain + ticket-based buffer cache co-designed for CUDA graph
-capture/replay.  Quantized AG (FP8 / MXFP8 / NVFP4) composes with the
-sharding for compounding bandwidth reduction.
+GTP factors the weight-parallel domain into ``TP x GTP_remat`` (two orthogonal
+sub-axes). A weight is sharded ``1/(TP * GTP_remat)`` along its partition dim:
+
+* The ``TP`` slice stays sharded through the GEMM — ordinary tensor parallelism;
+  the output is TP-sharded and reduced/gathered as usual.
+* The ``GTP_remat`` slice is *rematerialized* just before the GEMM: only the
+  ``gtp_remat`` sub-group async all-gathers its part, so each rank's GEMM sees
+  the full TP slice. This trades extra all-gather traffic for ``1/GTP_remat``
+  lower weight (and optimizer/grad) memory — ZeRO-3-on-the-weight on top of TP.
+
+``GTP_remat`` (the rematerialization sub-axis) has degree ``gtp_weight_remat_size``,
+derived from ``--tensor-parallel-num-weight-shards``.
+
+Materialization uses a per-weight prefetch chain + ticket-based buffer cache
+co-designed for CUDA graph capture/replay. Quantized AG (FP8 / MXFP8 / NVFP4)
+composes with the sharding for compounding bandwidth reduction.
 
 See ``docs/api-guide/core/generalized_tensor_parallel.md`` for design and usage.
 """
@@ -251,7 +262,7 @@ def _stream_key(chain_id: str, group) -> tuple:
     """Key for the per-(chain, group) AG/RS stream dicts.
 
     Partitioned on two axes: chain_id (captured GRAPHED vs eager UNGRAPHED ops must not
-    share a stream) and group (independent NCCL comms, e.g. GTP vs EGTP, avoid serialization).
+    share a stream) and group (independent NCCL, e.g. GTP_remat vs EGTP_remat, no serialization).
     """
     return (chain_id, id(group) if group is not None else 0)
 
@@ -329,35 +340,35 @@ def tag_gtp_params_with_names(model):
             param._debug_name = name
 
 
-def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
+def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     """Pad + slice a full-size BF16 weight to this rank's GTP shard.
 
     Caller attaches GTP attrs (see _gtp_attach_attrs). On the legacy post-init path under
     fp8_model_init, tensor may be a QuantizedTensor — F.pad dequantizes it before slicing.
     """
-    gtp_size = gtp_group.size()
-    gtp_rank = gtp_group.rank()
+    gtp_remat_size = gtp_remat_group.size()
+    gtp_rank = gtp_remat_group.rank()
     tensor = param.data
 
     if GTP_CONFIG.pad_for_alignment > 0:
         # Pad before slicing so shards stay alignment-divisible and padding
         # ends up contiguous at the tail of the gathered result.
-        alignment = GTP_CONFIG.pad_for_alignment * gtp_size
+        alignment = GTP_CONFIG.pad_for_alignment * gtp_remat_size
         dim0 = tensor.shape[0]
         pad_length = (alignment - dim0 % alignment) % alignment
         if pad_length > 0:
             tensor = torch.nn.functional.pad(tensor, (0, 0, 0, pad_length))
     else:
-        # No-pad mode: dim-0 must divide gtp_size or AG output loses tail rows.
-        assert tensor.shape[0] % gtp_size == 0, (
+        # No-pad mode: dim-0 must divide gtp_remat_size or AG output loses tail rows.
+        assert tensor.shape[0] % gtp_remat_size == 0, (
             f"_gtp_slice_one_param: {name}.shape[0]={tensor.shape[0]} is not "
-            f"divisible by gtp_size={gtp_size}. Either enable padding by "
+            f"divisible by gtp_remat_size={gtp_remat_size}. Either enable padding by "
             "setting GTP_CONFIG.pad_for_alignment > 0, or ensure the weight's "
             "dim-0 is a multiple of the GTP group size."
         )
         pad_length = 0
 
-    shard_size = tensor.shape[0] // gtp_size
+    shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
@@ -369,8 +380,8 @@ def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
     return gtp_shard
 
 
-def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
-    """Attach group / gtp_size / routed-expert tags and register in _GTP_PARAMS.
+def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0):
+    """Attach group / gtp_remat_size / routed-expert tags and register in _GTP_PARAMS.
 
     Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
     quantize fires between slice and attach).
@@ -381,20 +392,20 @@ def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
         # Default to UNGRAPHED; classify_gtp_chains() reclassifies based on the
         # cuda_graph_modules at init time.
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
-    gtp_shard.group = gtp_group
-    gtp_shard.gtp_size = gtp_group.size()
+    gtp_shard.group = gtp_remat_group
+    gtp_shard.gtp_remat_size = gtp_remat_group.size()
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 
 
-def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
+def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):
     """Shard and re-register module params as GTPShardedParam.
 
     Two call paths: (1) Megatron-style modules (ColumnParallelLinear, etc.) — full post-init
     slice; (2) TE modules — per-param body no-ops, since the reset_parameters hook already
     produced GTPShardedParam instances.
     """
-    if gtp_group.size() == 1:
+    if gtp_remat_group.size() == 1:
         return
 
     for idx, name in enumerate(weight_names):
@@ -408,9 +419,9 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
 
         # delete the original parameter, which will be replaced by an GTP sharded one
         delattr(module, name)
-        gtp_shard = _gtp_slice_one_param(param, gtp_group, name=name)
+        gtp_shard = _gtp_slice_one_param(param, gtp_remat_group, name=name)
         del param
-        _gtp_attach_attrs(gtp_shard, gtp_group, is_grouped=bool(is_grouped), expert_idx=idx)
+        _gtp_attach_attrs(gtp_shard, gtp_remat_group, is_grouped=bool(is_grouped), expert_idx=idx)
         # register the newly sharded param back to the module
         module._parameters[name] = gtp_shard
 
@@ -426,15 +437,15 @@ def gtp_slice_in_reset_parameters(module, name, param, expert_idx=0):
     Only fires for params in module.weight_names (GEMM weights); layer-norm gammas, biases,
     etc. stay full-size. Returns the new GTPShardedParam, or None (GTP not active here).
     """
-    gtp_group = getattr(module, "_gtp_group", None)
-    if gtp_group is None or gtp_group.size() == 1:
+    gtp_remat_group = getattr(module, "_gtp_remat_group", None)
+    if gtp_remat_group is None or gtp_remat_group.size() == 1:
         return None
     weight_names = getattr(module, "weight_names", None)
     if weight_names is None or name not in weight_names:
         return None
     is_grouped = bool(getattr(module, "_gtp_is_grouped", False))
-    gtp_shard = _gtp_slice_one_param(param, gtp_group, name=name)
-    _gtp_attach_attrs(gtp_shard, gtp_group, is_grouped=is_grouped, expert_idx=expert_idx)
+    gtp_shard = _gtp_slice_one_param(param, gtp_remat_group, name=name)
+    _gtp_attach_attrs(gtp_shard, gtp_remat_group, is_grouped=is_grouped, expert_idx=expert_idx)
     return gtp_shard
 
 
@@ -443,8 +454,8 @@ def gtp_finalize_module_in_reset_parameters(module, weight_names):
     (no-op when module._gtp_is_grouped is False)."""
     if not getattr(module, "_gtp_is_grouped", False):
         return
-    gtp_group = getattr(module, "_gtp_group", None)
-    if gtp_group is None or gtp_group.size() == 1:
+    gtp_remat_group = getattr(module, "_gtp_remat_group", None)
+    if gtp_remat_group is None or gtp_remat_group.size() == 1:
         return
     allweights = [getattr(module, n) for n in weight_names]
     if allweights:
@@ -609,7 +620,7 @@ class GTPShardedParam(torch.nn.Parameter):
         self._cached_rs_stream = None
         self._cached_quantizers = None
         self._cached_dtypes = None
-        self._cached_gtp_group = None
+        self._cached_gtp_remat_group = None
 
     def setup(self, weight_quantizer=None):
         """Set quantizer and create quantized shard."""
@@ -818,7 +829,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 w._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
 
         # 3. Build gather inputs.
-        # quantizers / dtypes / gtp_group are stable post-construction — cache on the anchor
+        # quantizers / dtypes / gtp_remat_group are stable post-construction — cache on the anchor
         # (self == weights[0]) to avoid rebuilding lists each call. w.quantized is NOT cached
         # (it can rebind).
         quantizers = self._cached_quantizers
@@ -851,10 +862,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 out_buffers.append(cache.get(p._ag_ticket_bwd))
 
         # 5. Communicate.
-        gtp_group = self._cached_gtp_group
-        if gtp_group is None:
-            gtp_group = weights[0].group
-            self._cached_gtp_group = gtp_group
+        gtp_remat_group = self._cached_gtp_remat_group
+        if gtp_remat_group is None:
+            gtp_remat_group = weights[0].group
+            self._cached_gtp_remat_group = gtp_remat_group
         if GTP_CONFIG.check_param_states and len(gather_weights) > 1:
             # Debug invariant: batched AG needs distinct output buffers per expert.
             assert len(set(id(b) for b in out_buffers)) == len(
@@ -868,7 +879,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # SYNC AG: stay on caller — output ready on return.
         if async_op:
             outer_stream = torch.cuda.current_stream()
-            ag_stream = get_ag_stream(self.chain_id, gtp_group)
+            ag_stream = get_ag_stream(self.chain_id, gtp_remat_group)
             if getattr(self, "_ag_outer_sync_event", None) is None:
                 self._ag_outer_sync_event = torch.cuda.Event()
             outer_sync_event = self._ag_outer_sync_event
@@ -883,7 +894,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_push(f"{nvtx_label}.batched_gtp_ag")
                 results, handle = grouped_gather_along_first_dim(
                     gather_weights,
-                    gtp_group,
+                    gtp_remat_group,
                     async_op=async_op,
                     quantizers=quantizers,
                     output_tensors=out_buffers,
@@ -893,7 +904,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_push(f"{nvtx_label}.gtp_ag")
                 weight_total, handle = gather_along_first_dim(
                     gather_weights[0],
-                    gtp_group,
+                    gtp_remat_group,
                     quantizer=quantizers[0],
                     async_op=async_op,
                     output_tensor=out_buffers[0] if out_buffers is not None else None,
@@ -1786,7 +1797,7 @@ def reset_gtp_quantize_cache(model):
 # into one axis-0 offset (or two offsets), with replica_id = the DP-with-GTP-with-CP rank.
 
 
-def make_sharded_tensors_for_checkpoint_with_gtp(
+def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     state_dict,
     prefix,
     tensor_parallel_layers_axis_map=None,
@@ -1795,7 +1806,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
     *,
     tp_group,
     dp_cp_group,
-    intra_dp_cp_no_gtp_group=None,
+    intra_dp_cp_no_gtp_remat_group=None,
 ):
     """GTP-aware analogue of make_sharded_tensors_for_checkpoint.
 
@@ -1832,20 +1843,20 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
 
     tp_rank = get_pg_rank(tp_group)
     tp_size = get_pg_size(tp_group)
-    # All GTP params in this state_dict share the same gtp_group (set by the
+    # All GTP params in this state_dict share the same gtp_remat_group (set by the
     # wrap hook at module init), so pick it off the first GTP shard.
-    gtp_group = next(t.group for t in state_dict.values() if isinstance(t, GTPShardedParam))
-    gtp_rank = get_pg_rank(gtp_group)
-    gtp_size = get_pg_size(gtp_group)
+    gtp_remat_group = next(t.group for t in state_dict.values() if isinstance(t, GTPShardedParam))
+    gtp_rank = get_pg_rank(gtp_remat_group)
+    gtp_remat_size = get_pg_size(gtp_remat_group)
 
     # DP-with-GTP-with-CP rank — replicas of a given GTP chunk live here.
-    if intra_dp_cp_no_gtp_group is not None:
-        dp_no_gtp_rank = get_pg_rank(intra_dp_cp_no_gtp_group)
+    if intra_dp_cp_no_gtp_remat_group is not None:
+        dp_no_gtp_remat_rank = get_pg_rank(intra_dp_cp_no_gtp_remat_group)
     else:
         from megatron.core import parallel_state  # noqa: E402
 
-        dp_no_gtp_rank = parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, no_gtp=True
+        dp_no_gtp_remat_rank = parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, no_gtp_remat=True
         )
 
     sharded_state_dict = {}
@@ -1857,7 +1868,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
             # ShardedObject (extra_state metadata): GTP-REPLICATED across the GTP group. Fold
             # gtp_rank into position 1 of the replica_id (PP, TP-replica-coord, DP) tuple so
             # GTP-peer ranks within the same TP slice get unique replica_ids.
-            replica_id = (0, tp_rank * gtp_size + gtp_rank, dp_no_gtp_rank)
+            replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_no_gtp_remat_rank)
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
                 tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
@@ -1868,7 +1879,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
             # ranks would collide on the same replica_id. Inject gtp_rank into replica_id
             # position 1 (same as the GTP-sharded branch below).
             if layer_name in tensor_parallel_layers_axis_map:
-                replica_id = (0, gtp_rank, dp_no_gtp_rank)
+                replica_id = (0, gtp_rank, dp_no_gtp_remat_rank)
                 sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,
@@ -1879,7 +1890,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
                     dp_cp_group=dp_cp_group,
                 )
             else:
-                replica_id = (0, tp_rank * gtp_size + gtp_rank, dp_no_gtp_rank)
+                replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_no_gtp_remat_rank)
                 sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,
@@ -1907,7 +1918,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp(
 
 
 # Wire GTP into TE's hook registry at import time, so any later
-# ``te.Linear(gtp_group=...)`` routes through the hooks below. If TE is too old to
+# ``te.Linear(gtp_remat_group=...)`` routes through the hooks below. If TE is too old to
 # expose ``register_gtp_hooks``, GTP silently no-ops (the warning surfaces that).
 try:
     from transformer_engine.pytorch.module.base import (  # noqa: E402

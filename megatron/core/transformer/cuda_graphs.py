@@ -893,7 +893,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
 
                 self._register_gtp_side_streams(get_gtp_weight_remat_group())
-                # EGTP streams: required so _wait/_sync_side_streams drain EGTP
+                # EGTP_remat streams: required so _wait/_sync_side_streams drain EGTP_remat
                 # NCCL into runner_stream before bwd_completion_event fires.
                 if get_expert_gtp_weight_remat_world_size() > 1:
                     self._register_gtp_side_streams(get_expert_gtp_weight_remat_group())
@@ -1329,12 +1329,12 @@ class _CudaGraphRunner(torch.nn.Module):
                     get_gtp_weight_remat_group,
                 )
 
-                gtp_group = get_gtp_weight_remat_group()
-                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
+                gtp_remat_group = get_gtp_weight_remat_group()
+                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_remat_group)
                 torch.cuda.current_stream().wait_stream(graphed_ag)
                 if get_expert_gtp_weight_remat_world_size() > 1:
-                    egtp_group = get_expert_gtp_weight_remat_group()
-                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
+                    egtp_remat_group = get_expert_gtp_weight_remat_group()
+                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_remat_group)
                     torch.cuda.current_stream().wait_stream(egtp_graphed_ag)
 
                 # Record completion AFTER AG drain + fence but BEFORE RS drain,

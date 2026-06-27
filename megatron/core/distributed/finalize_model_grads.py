@@ -446,15 +446,15 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
-def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
+def _allreduce_replicated_grads_over_gtp_remat_group(model: List[torch.nn.Module]):
     """Sum wgrads for replicated parameters over the gtp / egtp group.
 
     The data-parallel collective already reduced wgrads over the GTP-excluded process groups with
     1/full scaling, so the gtp-axis terms are still missing. A plain SUM (not AVG) over the gtp/egtp
     group adds them and yields the exact full mean. No-op when GTP is inactive (group size <= 1).
     """
-    gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-    egtp_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+    gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
 
     dense_params, dense_grads = [], []
     expert_params, expert_grads = [], []
@@ -475,8 +475,8 @@ def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
                 expert_grads.append(grad.data)
 
     for params, grads, group in (
-        (dense_params, dense_grads, gtp_group),
-        (expert_params, expert_grads, egtp_group),
+        (dense_params, dense_grads, gtp_remat_group),
+        (expert_params, expert_grads, egtp_remat_group),
     ):
         if not grads or group is None or group.size() <= 1:
             continue
@@ -571,7 +571,7 @@ def finalize_model_grads(
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
     # Complete the gtp-axis reduction for replicated (non-GTP) params (no-op when GTP inactive).
-    _allreduce_replicated_grads_over_gtp_group(model)
+    _allreduce_replicated_grads_over_gtp_remat_group(model)
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 

@@ -140,11 +140,11 @@ def make_sharded_tensors_for_checkpoint(
     if HAVE_GTP:
         from megatron.core.tensor_parallel.gtp import (
             GTPShardedParam,
-            make_sharded_tensors_for_checkpoint_with_gtp,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
 
         if any(isinstance(t, GTPShardedParam) for t in state_dict.values()):
-            return make_sharded_tensors_for_checkpoint_with_gtp(
+            return make_sharded_tensors_for_checkpoint_with_gtp_remat(
                 state_dict,
                 prefix,
                 tensor_parallel_layers_axis_map,

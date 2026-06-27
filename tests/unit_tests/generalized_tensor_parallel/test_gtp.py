@@ -21,7 +21,7 @@ Test groups
 15. TestGTPShardedParamProperties - shape computations, get_padded_shard, _strip_padding (single-process)
 16. TestGTPCacheKey              - _get_cache_key: expert vs non-expert, fwd vs bwd (single-process)
 17. TestTagGTPParamsWithNames    - _debug_name population on GTPShardedParam (single-process)
-18. TestGTPGroupSizeOne          - wrap_module_params_gtp no-op when gtp_group.size()==1 (single-process)
+18. TestGTPGroupSizeOne          - wrap_module_params_gtp no-op when gtp_remat_group.size()==1 (single-process)
 19. TestGTPPrefetchDisabled      - weight_prefetch=False: single-pass forward still works (multi-GPU)
 20. TestFuseWgradAccumulation    - fuse_wgrad_accumulation=True: wgrad→main_grad (multi-GPU)
 21. TestGTPGradAccumHook         - main_grad updated after reduce-scatter backward (multi-GPU)
@@ -55,8 +55,8 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
 )
 from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
-    _make_gtp_grouped_linear,
     _make_gtp_linear,
+    _make_gtp_remat_grouped_linear,
     _requires_multi_gpu,
     _requires_mxfp8,
     _requires_nvfp4,
@@ -124,9 +124,9 @@ class TestGTPWeightState:
 
 class TestGTPWeightCache:
 
-    def _param(self, shape=(8, 4), gtp_size=2):
+    def _param(self, shape=(8, 4), gtp_remat_size=2):
         p = GTPShardedParam(torch.zeros(*shape))
-        p.group = _FakeGroup(size=gtp_size)
+        p.group = _FakeGroup(size=gtp_remat_size)
         p.expert_idx = None
         p.pad_length = 0
         p._quantizer = None
@@ -220,7 +220,7 @@ class TestGTPWeightCache:
 
 
 # ---------------------------------------------------------------------------
-# 3. GTP weight sharding: shard content and alignment padding
+# 3. GTP_remat weight sharding: shard content and alignment padding
 # ---------------------------------------------------------------------------
 
 
@@ -229,10 +229,10 @@ def _worker_sharding_aligned(rank, world_size, port):
     full_weight = torch.arange(K * M, dtype=torch.float32).reshape(K, M).cuda()
     dist.broadcast(full_weight, src=0)
 
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
     mod = nn.Module()
     mod.weight = nn.Parameter(full_weight.clone(), requires_grad=False)
-    wrap_module_params_gtp(mod, ["weight"], gtp_group)
+    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
     shard = mod.weight
 
     rows_per_rank = K // world_size
@@ -249,10 +249,10 @@ def _worker_sharding_padding(rank, world_size, port):
     full_weight = torch.ones(K, M, dtype=torch.float32).cuda()
     dist.broadcast(full_weight, src=0)
 
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
     mod = nn.Module()
     mod.weight = nn.Parameter(full_weight.clone(), requires_grad=False)
-    wrap_module_params_gtp(mod, ["weight"], gtp_group)
+    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
     shard = mod.weight
 
     padded_K = alignment
@@ -293,18 +293,18 @@ class TestGTPSharding:
 
 def _worker_linear_param_replaced(rank, world_size, port):
     in_f, out_f = 64, 128
-    gtp_group = dist.new_group(list(range(world_size)))
-    layer = _make_gtp_linear(in_f, out_f, gtp_group)
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group)
     w = layer.weight
     assert isinstance(w, GTPShardedParam), "weight must be GTPShardedParam"
     assert w.shape == (out_f // world_size, in_f), f"unexpected shard shape {w.shape}"
-    assert w.group is gtp_group
+    assert w.group is gtp_remat_group
 
 
 def _worker_grouped_weight_list(rank, world_size, port):
     num_gemms, in_f, out_f = 3, 32, 64
-    gtp_group = dist.new_group(list(range(world_size)))
-    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group)
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    layer = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group)
     w0 = layer.weight0
     assert isinstance(w0, GTPShardedParam)
     assert w0.weight_list is not None
@@ -332,14 +332,14 @@ def _worker_linear_correctness(rank, world_size, port):
     torch.manual_seed(0)
     batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     # Reconstruct full weight from shards (all-gather)
     shard = layer.weight.data.clone()
     all_shards = [torch.zeros_like(shard) for _ in range(world_size)]
-    dist.all_gather(all_shards, shard, group=gtp_group)
+    dist.all_gather(all_shards, shard, group=gtp_remat_group)
     full_weight = torch.cat(all_shards, dim=0).float()[:out_f]  # strip any padding
 
     # Shared input across ranks
@@ -349,7 +349,7 @@ def _worker_linear_correctness(rank, world_size, port):
     inp_gtp = inp.clone().requires_grad_(True)
     inp_ref = inp.clone().requires_grad_(True)
 
-    # GTP forward
+    # GTP_remat forward
     out_gtp = layer(inp_gtp, is_first_microbatch=True)
 
     # Reference forward
@@ -391,7 +391,7 @@ def _worker_layernorm_linear(rank, world_size, port):
     torch.manual_seed(0)
     seq, batch, in_f, out_f = 4, 2, 64, 128
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
     layer = te.LayerNormLinear(
         in_features=in_f,
@@ -399,7 +399,7 @@ def _worker_layernorm_linear(rank, world_size, port):
         bias=False,
         params_dtype=dtype,
         device="cuda",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
     )
     assert isinstance(layer.weight, GTPShardedParam)
 
@@ -429,9 +429,9 @@ def _worker_grouped_linear(rank, world_size, port, num_gemms):
     torch.manual_seed(0)
     in_f, out_f, total_tokens = 32, 64, num_gemms * 4
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
     assert isinstance(layer.weight0, GTPShardedParam)
 
     m_splits = [total_tokens // num_gemms] * num_gemms
@@ -466,10 +466,10 @@ def _worker_chain_wired(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
-    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
@@ -490,10 +490,10 @@ def _worker_chain_async_prefetch(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
-    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
@@ -524,9 +524,9 @@ def _worker_wgrad_shape(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, fuse_wgrad_accumulation=False)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype, fuse_wgrad_accumulation=False)
     inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -543,10 +543,10 @@ def _worker_multilayer_deferred_rs(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
-    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
@@ -583,9 +583,9 @@ def _worker_microbatches(rank, world_size, port):
     torch.manual_seed(0)
     batch, in_f, out_f = 8, 64, 128
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
 
@@ -607,7 +607,7 @@ class TestGTPMicrobatches:
 
 
 # ---------------------------------------------------------------------------
-# 11. NVFP4 + GTP: Linear forward/backward, quantized shard setup
+# 11. NVFP4 + GTP_remat: Linear forward/backward, quantized shard setup
 # ---------------------------------------------------------------------------
 
 
@@ -617,9 +617,9 @@ def _worker_nvfp4_linear(rank, world_size, port):
     # batch=32: NVFP4 wgrad GEMM (K=batch) requires K divisible by 32
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -655,15 +655,15 @@ def _worker_nvfp4_linear_unaligned(rank, world_size, port):
     """
     torch.manual_seed(0)
     alignment = 16 * world_size  # 64 for world_size=4
-    # Choose out_f divisible by 8 (NVFP4 GEMM constraint) but not by 64 (GTP alignment).
+    # Choose out_f divisible by 8 (NVFP4 GEMM constraint) but not by 64 (GTP_remat alignment).
     # With out_f=56: pad_length=8, shard_size=16, last rank gets 8 rows padded to 16.
     out_f = alignment - 8  # 56 for world_size=4
     in_f = 64
     batch = 32
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -688,7 +688,7 @@ class TestNVFP4LinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 12. NVFP4 + GTP: GroupedLinear forward/backward (coalesced batched all-gather)
+# 12. NVFP4 + GTP_remat: GroupedLinear forward/backward (coalesced batched all-gather)
 # ---------------------------------------------------------------------------
 
 
@@ -699,9 +699,9 @@ def _worker_nvfp4_grouped_linear(rank, world_size, port, num_gemms):
     # (Hadamard transform requirement), and K=tokens_per_expert % 32 == 0 for wgrad.
     in_f, out_f, total_tokens = 128, 256, num_gemms * 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
     assert isinstance(layer.weight0, GTPShardedParam)
 
     m_splits = [total_tokens // num_gemms] * num_gemms
@@ -742,7 +742,7 @@ class TestNVFP4GroupedLinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 13. MXFP8 + GTP: Linear forward/backward, quantized shard setup
+# 13. MXFP8 + GTP_remat: Linear forward/backward, quantized shard setup
 # ---------------------------------------------------------------------------
 
 
@@ -754,9 +754,9 @@ def _worker_mxfp8_linear(rank, world_size, port):
     # batch=32: MXFP8 wgrad GEMM (K=batch) requires K divisible by MXFP8_BLOCK_SCALING_SIZE=32
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -800,14 +800,14 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
 
     torch.manual_seed(0)
     # out_f=120: M_padded=128, shard_size=32, last rank has 24 rows padded to 32.
-    # 120 is divisible by 8 (GEMM constraint), not by 64 (GTP alignment → padding needed).
+    # 120 is divisible by 8 (GEMM constraint), not by 64 (GTP_remat alignment → padding needed).
     out_f = 120
     in_f = 64
     batch = 32
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -1042,20 +1042,20 @@ class TestTagGTPParamsWithNames:
 
 
 # ---------------------------------------------------------------------------
-# 18. wrap_module_params_gtp is a no-op when gtp_group.size() == 1
+# 18. wrap_module_params_gtp is a no-op when gtp_remat_group.size() == 1
 # ---------------------------------------------------------------------------
 
 
 class TestGTPGroupSizeOne:
 
-    def test_no_sharding_when_gtp_size_one(self):
+    def test_no_sharding_when_gtp_remat_size_one(self):
         """wrap_module_params_gtp must be a no-op for a singleton GTP group."""
         mod = nn.Linear(32, 64, bias=False)
         original_weight = mod.weight
         wrap_module_params_gtp(mod, ["weight"], _FakeGroup())
         assert (
             mod.weight is original_weight
-        ), "gtp_group.size()==1 should leave parameters unchanged"
+        ), "gtp_remat_group.size()==1 should leave parameters unchanged"
         assert not isinstance(mod.weight, GTPShardedParam)
 
 
@@ -1068,12 +1068,12 @@ def _worker_prefetch_disabled(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
     gtp_module.update_gtp_config(weight_prefetch=False)
     try:
-        l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
-        l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+        l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
         inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
         dist.broadcast(inp, src=0)
@@ -1103,9 +1103,9 @@ def _worker_fuse_wgrad(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 128  # out_f % (16*world_size)==0, no padding
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, fuse_wgrad_accumulation=True)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype, fuse_wgrad_accumulation=True)
 
     # Allocate main_grad on the local shard shape
     w = layer.weight
@@ -1138,9 +1138,9 @@ def _worker_main_grad_updated_after_bwd(rank, world_size, port):
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     # wgrad RS path always accumulates into main_grad; allocate before backward.
     layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
@@ -1292,7 +1292,7 @@ class TestWaitAsyncCommsFallback:
 
 
 # ---------------------------------------------------------------------------
-# 23. GTP DDP bucket alignment: distributed optimizer bucket-end assertion
+# 23. GTP_remat DDP bucket alignment: distributed optimizer bucket-end assertion
 # ---------------------------------------------------------------------------
 
 
@@ -1302,10 +1302,10 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     Bug: DDP used param_layout=None for GTP buffers, falling through to
     _compute_default_per_buffer_param_layout, which packs params without padding bucket ends.
     The distributed optimizer requires every bucket end to be divisible by
-    intra_dp_cp_no_gtp_group.size() (asserted at param_and_grad_buffer.py:1427).
+    intra_dp_cp_no_gtp_remat_group.size() (asserted at param_and_grad_buffer.py:1427).
 
     Trigger:
-      GTP=2, DP=4  →  intra_dp_cp_no_gtp_group.size()=2
+      GTP=2, DP=4  →  intra_dp_cp_no_gtp_remat_group.size()=2
       pad_for_alignment=0, weight [out=2,in=3]  →  GTP shard=[1,3]=3 elements (odd)
       Two GTP params: total=6, 6%2==0 (total check passes); bucket_size=3 forces
       bucket-0 to contain only the first param, end=3, 3%2≠0  →  AssertionError
@@ -1314,7 +1314,7 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    # The module fixture initialized model_parallel without GTP; re-init with GTP=2.
+    # The module fixture initialized model_parallel without GTP_remat; re-init with GTP_remat=2.
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
@@ -1323,7 +1323,7 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
     gtp_module.GTP_CONFIG.pad_for_alignment = 0
     try:
-        gtp_group = ps.get_gtp_weight_remat_group()
+        gtp_remat_group = ps.get_gtp_weight_remat_group()
 
         class _TwoLayerModel(torch.nn.Module):
             def __init__(self):
@@ -1332,8 +1332,8 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
                 self.fc1 = te.Linear(3, 2, bias=False, device="cuda")
 
         model = _TwoLayerModel()
-        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
-        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_remat_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_remat_group)
 
         config = TransformerConfig(
             num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
@@ -1378,7 +1378,7 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
     orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
     gtp_module.GTP_CONFIG.pad_for_alignment = 0
     try:
-        gtp_group = ps.get_gtp_weight_remat_group()
+        gtp_remat_group = ps.get_gtp_weight_remat_group()
 
         class _TwoLayerModelWithBias(torch.nn.Module):
             def __init__(self):
@@ -1388,8 +1388,8 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
                 self.fc1 = te.Linear(3, 2, bias=True, device="cuda")
 
         model = _TwoLayerModelWithBias()
-        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
-        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_remat_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_remat_group)
 
         config = TransformerConfig(
             num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
@@ -1410,7 +1410,7 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
 
 class TestGTPDDPBucketAlignment:
     def test_gtp_buffers_use_padded_layout_with_distributed_optimizer(self):
-        """GTP buffer bucket ends must be padded to intra_dp_cp_no_gtp_group.size()."""
+        """GTP buffer bucket ends must be padded to intra_dp_cp_no_gtp_remat_group.size()."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_gtp_ddp_bucket_alignment, 4)
 
@@ -1421,7 +1421,7 @@ class TestGTPDDPBucketAlignment:
 
 
 # ---------------------------------------------------------------------------
-# 24. GTP DDP grad-ready wiring: register_grad_ready must fire AFTER the wgrad add
+# 24. GTP_remat DDP grad-ready wiring: register_grad_ready must fire AFTER the wgrad add
 # ---------------------------------------------------------------------------
 
 
@@ -1438,24 +1438,24 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    # The module fixture initialized model_parallel without GTP; re-init with GTP=2.
+    # The module fixture initialized model_parallel without GTP_remat; re-init with GTP_remat=2.
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
     try:
-        gtp_group = ps.get_gtp_weight_remat_group()
+        gtp_remat_group = ps.get_gtp_weight_remat_group()
 
         class _TwoLayerModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                # bias=False -> all params are GTP weights, so grad_accs must end up empty.
+                # bias=False -> all params are GTP_remat weights, so grad_accs must end up empty.
                 self.fc0 = te.Linear(64, 128, bias=False, device="cuda")
                 self.fc1 = te.Linear(64, 128, bias=False, device="cuda")
 
         model = _TwoLayerModel()
-        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
-        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_remat_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_remat_group)
 
         config = TransformerConfig(
             num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
@@ -1472,7 +1472,7 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
 
-        # bias=False -> all params are GTP -> none took the autograd path.
+        # bias=False -> all params are GTP_remat -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (
             "GTP params must not register an autograd AccumulateGrad hook "
             f"(grad_accs has {len(ddp_model.grad_accs)} entries)"

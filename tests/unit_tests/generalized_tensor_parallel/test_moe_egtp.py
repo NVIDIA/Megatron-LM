@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Integration tests for EGTP + MoE correctness.
+"""Integration tests for EGTP_remat + MoE correctness.
 
 Test groups
 -----------
-TestMoEEGTPCorrectness  - EGTP MoE loss trajectory matches baseline (no-EGTP) over 10
+TestMoEEGTPCorrectness  - EGTP_remat MoE loss trajectory matches baseline (no-EGTP_remat) over 10
                           training steps using MXFP8 and Nemotron3-Super MoE hyperparameters.
 """
 
@@ -30,37 +30,37 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 )
 
 # ---------------------------------------------------------------------------
-# MoE EGTP correctness: per-step loss trajectory EP=4 baseline vs EP=2+EGTP=2
+# MoE EGTP_remat correctness: per-step loss trajectory EP=4 baseline vs EP=2+EGTP_remat=2
 # ---------------------------------------------------------------------------
 
 
 def _worker_moe_egtp_correctness(rank, world_size, port):
-    """Verify EP=2+EGTP=2 MoE produces the same per-step loss as an EP=4 no-EGTP baseline.
+    """Verify EP=2+EGTP_remat=2 MoE matches per-step loss of EP=4 no-EGTP_remat baseline.
 
-    Phase 1 — EP=4, EGTP=1:
+    Phase 1 — EP=4, EGTP_remat=1:
         All 4 ranks form one EP group; each rank holds 2 full expert weights (8 total).
         All ranks receive the same MoE-layer input; alltoall dispatch routes each token
         to its assigned expert rank, so each rank computes a different token subset.
         Gradients are local to each expert's rank.  Weight update:
             param.data -= lr * param.grad
 
-    Phase 2 — EP=2, EGTP=2:
-        Two EP groups of 2 ranks, each EGTP-sharded over 2 ranks.  Expert weights
-        are sharded along dim 0 within each EGTP group (shard = full_dim0 / egtp_size).
+    Phase 2 — EP=2, EGTP_remat=2:
+        Two EP groups of 2 ranks, each EGTP_remat-sharded over 2 ranks.  Expert weights
+        are sharded along dim 0 within each EGTP_remat group (shard = full_dim0 / egtp_remat_size).
         After backward, wgrad reduce-scatter sums each shard's identical wgrad:
-            main_grad[rank_i] = egtp_size * dW[shard_i]
-        The optimizer divides by egtp_size:
-            param.data -= (lr / egtp_size) * param.main_grad
+            main_grad[rank_i] = egtp_remat_size * dW[shard_i]
+        The optimizer divides by egtp_remat_size:
+            param.data -= (lr / egtp_remat_size) * param.main_grad
 
     Weight sharing (test-only):
         To ensure both phases start from identical expert weights, an all-gather
         collects the full 8-expert table from the EP=4 group (where each rank holds
         only 2 experts) onto every rank.  Phase 2 then slices each rank's local
-        experts and EGTP shard from that global table.
+        experts and EGTP_remat shard from that global table.
 
     Nemotron3-Super Proxy MoE hyperparameters (scaled for unit-test speed):
         hidden=4096, ffn_hidden_size=2688, num_experts=8, topk=2
-    MXFP8 alignment with EGTP=2:
+    MXFP8 alignment with EGTP_remat=2:
         2688/2=1344, 1344%16=0 (fc1 shard); 4096/2=2048, 2048%16=0 (fc2 shard)
     """
     from transformer_engine.common.recipe import MXFP8BlockScaling
@@ -114,7 +114,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
         return output.mean()
 
     # -------------------------------------------------------------------------
-    # Phase 1: Baseline — EP=4, EGTP=1 (DP=1)
+    # Phase 1: Baseline — EP=4, EGTP_remat=1 (DP=1)
     # -------------------------------------------------------------------------
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -133,10 +133,10 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     layer = make_moe_layer(config, None)  # MoELayer uses get_default_pg_collection()
     layer.cuda()
 
-    # Verify baseline has no GTP sharding (EGTP=1 should leave plain parameters).
+    # Verify baseline has no GTP_remat sharding (EGTP_remat=1 should leave plain parameters).
     assert not any(
         isinstance(p, GTPShardedParam) for p in layer.parameters()
-    ), "Baseline EP=4 layer should have no GTPShardedParam (EGTP=1)"
+    ), "Baseline EP=4 layer should have no GTPShardedParam (EGTP_remat=1)"
 
     # Synchronize non-expert weights from rank 0; expert weights are rank-local.
     for name, p in layer.named_parameters():
@@ -191,7 +191,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------
-    # Phase 2: EP=2, EGTP=2 (DP=1 effective)
+    # Phase 2: EP=2, EGTP_remat=2 (DP=1 effective)
     # -------------------------------------------------------------------------
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -201,28 +201,28 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['expt_gtp'])
-    egtp_group = pg_collection.expt_gtp
-    egtp_size = egtp_group.size()
-    egtp_rank = egtp_group.rank()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['expt_gtp_remat'])
+    egtp_remat_group = pg_collection.expt_gtp_remat
+    egtp_remat_size = egtp_remat_group.size()
+    egtp_rank = egtp_remat_group.rank()
     ep_rank_egtp = dist.get_rank(ps.get_expert_model_parallel_group())
     num_local_experts_egtp = NUM_EXPERTS // 2  # = 4
 
     config = make_config()
-    # Build full pg_collection for MoELayer: default groups + expt_gtp for EGTP sharding.
+    # Build full pg_collection for MoELayer: default groups + expt_gtp for EGTP_remat sharding.
     moe_pg = get_default_pg_collection()
-    moe_pg.expt_gtp = egtp_group
+    moe_pg.expt_gtp_remat = egtp_remat_group
     layer_egtp = make_moe_layer(config, moe_pg)
     layer_egtp.cuda()
 
-    # Verify EGTP is truly active: expert weight params must be GTPShardedParam instances.
+    # Verify EGTP_remat is truly active: expert weight params must be GTPShardedParam instances.
     egtp_params = [p for p in layer_egtp.parameters() if isinstance(p, GTPShardedParam)]
-    assert len(egtp_params) > 0, "EGTP is not active: no GTPShardedParam found in EP=2+EGTP=2 layer"
+    assert len(egtp_params) > 0, "EGTP_remat inactive: no GTPShardedParam in EP=2+EGTP_remat=2"
 
     # Restore weights from saved global tables.
     # Expert local index j → global expert id = ep_rank_egtp * num_local_experts_egtp + j.
-    fc1_shard = FFN_HIDDEN // egtp_size  # 2688/2 = 1344
-    fc2_shard = HIDDEN // egtp_size  # 4096/2 = 2048
+    fc1_shard = FFN_HIDDEN // egtp_remat_size  # 2688/2 = 1344
+    fc2_shard = HIDDEN // egtp_remat_size  # 4096/2 = 2048
     for name, p in layer_egtp.named_parameters():
         if 'linear_fc1.weight' in name:
             j = int(name.rsplit('weight', 1)[1])
@@ -235,7 +235,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
         elif name in non_expert_weights:
             p.data.copy_(non_expert_weights[name])
 
-    # Pre-allocate main_grad for EGTP params (required before the first backward).
+    # Pre-allocate main_grad for EGTP_remat params (required before the first backward).
     for p in layer_egtp.parameters():
         if isinstance(p, GTPShardedParam):
             p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
@@ -256,11 +256,11 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
 
         loss.backward()
 
-        # After RS, main_grad = egtp_size * dW_shard.  Divide by egtp_size to match baseline.
+        # After RS, main_grad = egtp_remat_size * dW_shard. Divide by egtp_remat_size for baseline.
         with torch.no_grad():
             for p in layer_egtp.parameters():
                 if isinstance(p, GTPShardedParam):
-                    p.data.sub_((LR / egtp_size) * p.main_grad)
+                    p.data.sub_((LR / egtp_remat_size) * p.main_grad)
                 elif p.grad is not None:
                     p.data.sub_(LR * p.grad)
                     p.grad.zero_()
@@ -284,7 +284,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
 
 class TestMoEEGTPCorrectness:
     def test_moe_egtp_loss_trajectory_matches_baseline(self):
-        """EP=2+EGTP=2 MoE per-step losses must match EP=4 baseline: atol=1e-5, rtol=1e-5; MXFP8"""
+        """EP=2+EGTP_remat=2 MoE per-step losses match EP=4 baseline: atol=rtol=1e-5; MXFP8"""
         _requires_mxfp8()
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")

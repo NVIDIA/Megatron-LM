@@ -908,14 +908,14 @@ def _get_megatron_emerging_optimizer(
                     )
                 fallback_config.use_distributed_optimizer = True
                 # Shard optimizer state over the gtp-EXCLUDED replicate group
-                # (intra_dp_cp_no_gtp_group), matching how the DDP grad buffer is partitioned.
+                # (intra_dp_cp_no_gtp_remat_group), matching how the DDP grad buffer is partitioned.
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_no_gtp_group'],
+                    data_parallel_group=distopt_process_groups['intra_dp_cp_no_gtp_remat_group'],
                     data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
@@ -1049,19 +1049,19 @@ def get_megatron_optimizer(
 
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
-    intra_dp_cp_no_gtp_group = process_groups_dict['intra_dp_cp_no_gtp_group']
-    intra_expt_dp_no_egtp_group = process_groups_dict['intra_expt_dp_no_egtp_group']
+    intra_dp_cp_no_gtp_remat_group = process_groups_dict['intra_dp_cp_no_gtp_remat_group']
+    intra_expt_dp_no_egtp_remat_group = process_groups_dict['intra_expt_dp_no_egtp_remat_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
-    expt_tp_pp_with_egtp_group = process_groups_dict['expt_tp_pp_with_egtp_group']
+    expt_tp_pp_with_egtp_remat_group = process_groups_dict['expt_tp_pp_with_egtp_remat_group']
     expt_dp_group = process_groups_dict['expt_dp_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
-    # Drives no-Gloo state path + sharding over the *_no_gtp replicate group below.
+    # Drives no-Gloo state path + sharding over the *_no_gtp_remat replicate group below.
     gtp_active = ProcessGroupCollection.is_gtp_active(process_groups_dict)
-    optim_dp_group = intra_dp_cp_no_gtp_group
+    optim_dp_group = intra_dp_cp_no_gtp_remat_group
     # The gtp-excluded replicate group has no Gloo variant by design (parallel_state asserts it),
     # so None is correct under GTP. Warn if a Gloo group was requested so the drop is not silent.
     if gtp_active and intra_dp_cp_group_gloo is not None:
@@ -1073,7 +1073,7 @@ def get_megatron_optimizer(
             "checkpointing; the legacy Gloo CPU scatter path is unavailable under GTP.",
         )
     optim_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo
-    optim_expt_dp_group = intra_expt_dp_no_egtp_group
+    optim_expt_dp_group = intra_expt_dp_no_egtp_remat_group
 
     # ``mp_group`` spans TP×GTP×PP (GTP-merged).
     model_parallel_rank = get_pg_rank(mp_group)
@@ -1185,8 +1185,8 @@ def get_megatron_optimizer(
         )
         model_chunk_offset += 1
 
-    # Expert params (incl. EGTP shards): reduce over the egtp-EXCLUDED replicate group
-    # (intra_expt_dp_no_egtp_group, which aliases the full expert-DP group when EGTP is
+    # Expert params (incl. EGTP_remat shards): reduce over the egtp-EXCLUDED replicate group
+    # (intra_expt_dp_no_egtp_remat_group, which aliases the full expert-DP group when EGTP_remat is
     # inactive). Backed by expert_parallel_buffers in DDP.
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,
@@ -1203,13 +1203,13 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
-        # Expert analog of the dense ``model_parallel_rank`` above: the EGTP-merged group gives
-        # each EGTP peer a distinct distopt ShardedObject key. See
+        # Expert analog of dense ``model_parallel_rank``: the EGTP_remat-merged group gives
+        # each EGTP_remat peer a distinct distopt ShardedObject key. See
         # docs/api-guide/core/generalized_tensor_parallel.md §3.3 (Optimizer state) for why
         # the non-merged ``expt_tp_pp_group`` would cause a DCP "duplicate" error.
-        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_group)
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
         # Gloo expert-DP group for the optimizer, only when (E)GTP is inactive. When active the
-        # optimizer shards over the egtp-EXCLUDED (no_egtp) replicate group, which has no Gloo
+        # optimizer shards over egtp_remat-EXCLUDED (no_egtp_remat) replicate group; no Gloo
         # variant yet, so pass None (mirrors the dense optim_dp_group_gloo above).
         if use_gloo_process_groups and not gtp_active:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
@@ -1221,7 +1221,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=expt_tp_pp_with_egtp_group,
+                model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=optim_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,

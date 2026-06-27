@@ -381,12 +381,12 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
-def _maybe_setup_gtp(module, gtp_group, extra_kwargs):
-    """Wire an active GTP group (size > 1) into TE's extra_kwargs and set module.gtp_size.
+def _maybe_setup_gtp(module, gtp_remat_group, extra_kwargs):
+    """Wire an active GTP group (size > 1) into TE's extra_kwargs and set module.gtp_remat_size.
 
-    No-op when GTP is inactive (gtp_group is None or size 1), so module.gtp_size stays unset.
+    No-op when GTP is inactive (gtp_remat_group None/size 1); module.gtp_remat_size unset.
     """
-    if gtp_group is None or gtp_group.size() <= 1:
+    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         return
     from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
@@ -394,8 +394,10 @@ def _maybe_setup_gtp(module, gtp_group, extra_kwargs):
         "GTP requires TransformerEngine >= 2.17. "
         "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
     )
-    module.gtp_size = get_pg_size(gtp_group)
-    extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
+    module.gtp_remat_size = get_pg_size(gtp_remat_group)
+    extra_kwargs["gtp_remat_group"] = (
+        gtp_remat_group if torch.distributed.is_initialized() else None
+    )
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -779,7 +781,7 @@ class TELinear(te.pytorch.Linear):
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
-        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -913,7 +915,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
+        _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
         with init_quant_context:
             super().__init__(
                 in_features=input_size,
@@ -1023,7 +1025,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1121,7 +1123,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
+        _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1237,7 +1239,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1264,7 +1267,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1304,7 +1307,7 @@ class TEColumnParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
-            gtp_group=gtp_group,
+            gtp_remat_group=gtp_remat_group,
         )
 
         # Set proper partition_stride
@@ -1355,7 +1358,8 @@ class TEColumnParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1511,7 +1515,7 @@ class TERowParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
-        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -1549,7 +1553,7 @@ class TERowParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
-            gtp_group=gtp_group,
+            gtp_remat_group=gtp_remat_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1596,7 +1600,8 @@ class TERowParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -2006,7 +2011,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
-            gtp_group = pg_collection.expt_gtp
+            gtp_remat_group = pg_collection.expt_gtp_remat
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -2026,7 +2031,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
-            _maybe_setup_gtp(self, gtp_group, extra_kwargs)
+            _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False
@@ -2405,14 +2410,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
                 if self.use_bias:
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
-            # Set the expert-DP replica_id, picking the group by what EGTP does to each entry:
-            #   - weight ShardedTensor: SHARDED across EGTP (distinct chunks) → not replicas →
-            #     use ``intra_expt_dp_no_egtp``.
-            #   - _extra_state ShardedObject: REPLICATED across EGTP → need distinct replica_ids
+            # Set the expert-DP replica_id, picking the group by what EGTP_remat does to each entry:
+            #   - weight ShardedTensor: SHARDED across EGTP_remat (distinct) → not replicas →
+            #     use ``intra_expt_dp_no_egtp_remat``.
+            #   - _extra_state ShardedObject: REPLICATED across EGTP_remat → need distinct ids
             #     to avoid duplicate-writer collisions → use full ``expt_dp``.
-            # EGTP=1: the two groups coincide, so this is a no-op.
+            # EGTP_remat=1: the two groups coincide, so this is a no-op.
             expt_dp_full = self._pg_collection.expt_dp
-            expt_dp_intra = self._pg_collection.intra_expt_dp_no_egtp
+            expt_dp_intra = self._pg_collection.intra_expt_dp_no_egtp_remat
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (
@@ -2436,7 +2441,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 super().backward_dw()
 
         def __repr__(self):
-            gtp_str = f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else ""
+            gtp_str = f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
             return (
                 f"{type(self).__name__}(per expert(["
                 f"in={self.in_features}, out={self.out_features}]) "

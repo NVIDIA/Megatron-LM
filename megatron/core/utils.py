@@ -875,8 +875,8 @@ def check_param_hashes_across_dp_replicas(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
         [
-            parallel_state.get_data_parallel_group(no_gtp=True),
-            parallel_state.get_expert_data_parallel_group(no_gtp=True),
+            parallel_state.get_data_parallel_group(no_gtp_remat=True),
+            parallel_state.get_expert_data_parallel_group(no_gtp_remat=True),
         ],
     ):
         # Collect per-parameter hashes across all ranks in group.
@@ -966,7 +966,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     # GTP: a GTPShardedParam additionally shards out_features (axis 0) by 1/gtp. Layer that
-    # split onto the TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp so direct
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
     # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
     from megatron.core.tensor_parallel.gtp import HAVE_GTP
@@ -976,21 +976,21 @@ def make_tp_sharded_tensor_for_checkpoint(
 
         if isinstance(tensor, GTPShardedParam):
             gtp_rank = get_pg_rank(tensor.group)
-            gtp_size = get_pg_size(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
             if tp_axis == 0:
                 # same axis as TP → one composite axis-0 offset
                 new_offsets[0] = (
                     prepend_axis_num,
-                    tp_rank * gtp_size + gtp_rank,
-                    tp_size * gtp_size,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
                 )
             else:
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
-                new_offsets.append((prepend_axis_num, gtp_rank, gtp_size))
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
             # GTP peers hold distinct shards (disambiguated by the offset above); the true
             # replicas are the gtp-EXCLUDED DP group, so elect the writer over that group.
             dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, no_gtp=True
+                with_context_parallel=True, no_gtp_remat=True
             )
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):

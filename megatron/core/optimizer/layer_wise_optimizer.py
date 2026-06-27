@@ -88,18 +88,18 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
 
 
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
-    """Map each (E)GTP-REPLICATED param's name to ``(gtp_rank, gtp_size)`` for replica_id folding.
+    """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
 
-    PROBLEM: LayerWise keeps (E)GTP-replicated params (identical on every (e)gtp peer) WHOLE, so
+    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per (e)gtp peer) WHOLE, so
     their optimizer-state ShardedTensors share one key+offset across those peers. The DP-coord reset
     in ``sharded_state_dict`` would then mark all peers the all-zero "main replica" -> DCP sees N
     writers for one shard and rejects the save.
 
-    FIX: fold the (e)gtp rank into ``replica_id[1]`` so exactly one peer writes. (E)GTP-SHARDED
+    FIX: fold the (e)gtp rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
     params (``GTPShardedParam``) are offset-sharded and excluded -- each shard already has a
     distinct offset, hence a unique writer.
 
-    Returns: ``{param_name: (gtp_rank, gtp_size)}``, empty (no folding) when GTP is unavailable or
+    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
     no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
     collapsed) to match the optimizer-state checkpoint key suffix.
     """
@@ -115,18 +115,18 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
 
     # Source the (e)gtp groups from pg_collection if populated, else from parallel_state
     # (the default pg_collection leaves gtp/expt_gtp unset). Compatibility point.
-    gtp_group = getattr(pg_collection, 'gtp', None) if pg_collection else None
-    if gtp_group is None:
-        gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-    egtp_group = getattr(pg_collection, 'expt_gtp', None) if pg_collection else None
-    if egtp_group is None:
-        egtp_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    if gtp_remat_group is None:
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
+    if egtp_remat_group is None:
+        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
 
     for model_chunk in model_chunks:
         for name, p in model_chunk.named_parameters():
             if isinstance(p, GTPShardedParam):
                 continue
-            grp = egtp_group if getattr(p, 'is_expert_parallel', False) else gtp_group
+            grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
             if grp is None or grp.size() <= 1:
                 continue
             # Normalize the param name so it matches the optimizer-state checkpoint key suffix,
@@ -149,8 +149,8 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
     Base reset: keep (PP, TP), zero DP -- every DP rank holds the same shard, so one writer
     remains. Correct for normal params.
 
-    For an (e)gtp-replicated param (one in ``gtp_fold``), the reset leaves ``gtp_size`` writers, so
-    fold the peer's gtp rank into the TP slot to re-spread them: ``new_tp = old_tp * gtp_size +
+    For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
+    fold the peer gtp rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
     gtp_rank`` (rank 0 stays the writer, the others move off the all-zero main replica) -> one
     writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
     layer index too, so it matches per-layer and already-collapsed keys.
@@ -159,9 +159,9 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
     if not gtp_fold:
         return rid
     key = re.sub(r'\.layers\.\d+\.', '.layers.', key or '')
-    for nm, (gtp_rank, gtp_size) in gtp_fold.items():
+    for nm, (gtp_rank, gtp_remat_size) in gtp_fold.items():
         if key.endswith(nm):
-            return (rid[0], rid[1] * gtp_size + gtp_rank, rid[2])
+            return (rid[0], rid[1] * gtp_remat_size + gtp_rank, rid[2])
     return rid
 
 
@@ -446,12 +446,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
 
-        # Use GTP/EGTP-excluded DP groups for layer-wise sharding and all-gather so that
-        # only true weight replicas are sharded across; GTP's own all-gather / reduce-scatter
-        # handles the GTP axis separately. Falls back to the full groups when GTP is inactive.
+        # Use GTP_remat/EGTP_remat-excluded DP groups for layer-wise sharding and all-gather so that
+        # only true weight replicas are sharded across; GTP_remat's own all-gather / reduce-scatter
+        # handles the GTP_remat axis separately. Falls back to full groups when GTP_remat inactive.
         if pg_collection is not None:
-            self.dp_cp_group = pg_collection.dp_cp_no_gtp or pg_collection.dp_cp
-            self.expt_dp_group = pg_collection.expt_dp_no_egtp or pg_collection.expt_dp
+            self.dp_cp_group = pg_collection.dp_cp_no_gtp_remat or pg_collection.dp_cp
+            self.expt_dp_group = pg_collection.expt_dp_no_egtp_remat or pg_collection.expt_dp
         else:
             self.dp_cp_group = None
             self.expt_dp_group = None
@@ -919,7 +919,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
-        # (E)GTP-replicated-param -> (gtp_rank, gtp_size), consumed by _fold_replica_id below.
+        # (E)GTP_remat-replicated -> (gtp_rank, gtp_remat_size), consumed by _fold_replica_id.
         gtp_fold = _build_gtp_replica_fold(self.pg_collection, self.model_chunks)
 
         # for fixed DP usage only

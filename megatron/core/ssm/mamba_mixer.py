@@ -287,7 +287,7 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
             name=(name + f".in_proj") if name is not None else None,
-            gtp_group=self.pg_collection.gtp,
+            gtp_remat_group=self.pg_collection.gtp_remat,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
         # component is independently TP-sharded but with different sizes.  When
@@ -439,7 +439,7 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
             name=(name + f".out_proj") if name is not None else None,
-            gtp_group=self.pg_collection.gtp,
+            gtp_remat_group=self.pg_collection.gtp_remat,
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
@@ -1372,17 +1372,21 @@ class MambaMixer(MegatronModule):
         # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
         # (strip the trailing pad rows from the gathered tail) and fall through to the same
         # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
-        in_proj_gtp_size = getattr(self.in_proj, "gtp_size", 1)
-        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
+        in_proj_gtp_remat_size = getattr(self.in_proj, "gtp_remat_size", 1)
+        if (
+            in_proj_gtp_remat_size > 1
+            and HAVE_GTP
+            and isinstance(self.in_proj.weight, GTPShardedParam)
+        ):
             gtp_shard = self.in_proj.weight
-            gtp_group = gtp_shard.group
+            gtp_remat_group = gtp_shard.group
             local = gtp_shard.data.contiguous()
             gathered = torch.empty(
-                (local.shape[0] * in_proj_gtp_size,) + local.shape[1:],
+                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
                 dtype=local.dtype,
                 device=local.device,
             )
-            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_group)
+            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
             if gathered.shape[0] != in_proj_dim:
                 gathered = gathered[:in_proj_dim].contiguous()
             # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
@@ -1421,8 +1425,12 @@ class MambaMixer(MegatronModule):
         # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
         # rows with no padding. To reload into the live GTPShardedParam we must mirror init
         # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
-        # ``gtp_local_size * gtp_size``, then slice by ``gtp_rank``. GTP=1 has no pad/slice.
-        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
+        # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP=1 has no pad/slice.
+        if (
+            in_proj_gtp_remat_size > 1
+            and HAVE_GTP
+            and isinstance(self.in_proj.weight, GTPShardedParam)
+        ):
             factory = sharded_state_dict[f"{prefix}in_proj.weight"]
             gtp_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
             gtp_local_size = self.in_proj.weight.data.size(0)
@@ -1434,10 +1442,10 @@ class MambaMixer(MegatronModule):
                 _orig=original_merge_fn,
                 _rank=gtp_local_rank,
                 _size=gtp_local_size,
-                _gtp_size=in_proj_gtp_size,
+                _gtp_remat_size=in_proj_gtp_remat_size,
             ):
                 full = _orig(sub_state_dict)
-                aligned_total = _size * _gtp_size
+                aligned_total = _size * _gtp_remat_size
                 pad_rows = aligned_total - full.shape[0]
                 if pad_rows > 0:
                     full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))

@@ -29,7 +29,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 )
 
 # ---------------------------------------------------------------------------
-# Mamba GTP correctness: per-step loss trajectory baseline vs GTP=4
+# Mamba GTP_remat correctness: per-step loss trajectory baseline vs GTP_remat=4
 # ---------------------------------------------------------------------------
 
 
@@ -44,9 +44,9 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     Phase 2 — GTP=4, DP=1:
         Weights sharded across 4 ranks.  After backward, wgrad reduce-scatter
         sums each shard's identical wgrad over all ranks, so:
-            main_grad[rank_i] = gtp_size * dW[shard_i]
-        The optimizer divides by gtp_size to recover the per-element gradient:
-            param.data -= (lr / gtp_size) * param.main_grad
+            main_grad[rank_i] = gtp_remat_size * dW[shard_i]
+        The optimizer divides by gtp_remat_size to recover the per-element gradient:
+            param.data -= (lr / gtp_remat_size) * param.main_grad
 
     Both phases use identical initial weights (synced from rank 0 in phase 1,
     restored as shards in phase 2) and identical step-by-step inputs.  The
@@ -124,7 +124,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         return x.mean()
 
     # -------------------------------------------------------------------------
-    # Phase 1: Baseline — GTP=1 (DP=4)
+    # Phase 1: Baseline — GTP_remat=1 (DP=4)
     # -------------------------------------------------------------------------
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -132,13 +132,15 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat']
+    )
     config = make_config()
     layers = make_mamba_stack(config, pg_collection)
     for layer in layers:
         layer.cuda()
 
-    # Verify baseline has no GTP sharding (gtp_remat_size=1 should leave plain parameters).
+    # Verify baseline has no GTP_remat sharding (gtp_remat_size=1 should leave plain parameters).
     assert not any(
         isinstance(p, GTPShardedParam) for p in layers.parameters()
     ), "Baseline GTP=1 stack should have no GTPShardedParam"
@@ -147,7 +149,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     for p in layers.parameters():
         dist.broadcast(p.data, src=0)
 
-    # Save initial weights; will be used to initialize the GTP model identically.
+    # Save initial weights; will be used to initialize the GTP_remat model identically.
     saved_weights = {n: p.data.clone() for n, p in layers.named_parameters()}
 
     baseline_losses = []
@@ -172,28 +174,30 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------
-    # Phase 2: GTP=4 (DP=1)
+    # Phase 2: GTP_remat=4 (DP=1)
     # -------------------------------------------------------------------------
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=4
     )
     model_parallel_cuda_manual_seed(42)
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat']
+    )
     config = make_config()
     layers_gtp = make_mamba_stack(config, pg_collection)
     for layer in layers_gtp:
         layer.cuda()
 
-    gtp_group = ps.get_gtp_weight_remat_group()
-    gtp_size = gtp_group.size()
-    gtp_rank = gtp_group.rank()
+    gtp_remat_group = ps.get_gtp_weight_remat_group()
+    gtp_remat_size = gtp_remat_group.size()
+    gtp_rank = gtp_remat_group.rank()
 
-    # Verify GTP is truly active: at least one param must be a GTPShardedParam.
+    # Verify GTP_remat is truly active: at least one param must be a GTPShardedParam.
     gtp_params = [p for p in layers_gtp.parameters() if isinstance(p, GTPShardedParam)]
     assert len(gtp_params) > 0, "GTP is not active: no GTPShardedParam found in GTP=4 Mamba stack"
 
-    # Restore initial weights: GTP params get the matching shard, others get the full tensor.
+    # Restore initial weights: GTP_remat params get the matching shard, others get the full tensor.
     for name, p in layers_gtp.named_parameters():
         full = saved_weights[name]
         if isinstance(p, GTPShardedParam):
@@ -202,7 +206,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         else:
             p.data.copy_(full)
 
-    # Pre-allocate main_grad for GTP params (required before the first backward).
+    # Pre-allocate main_grad for GTP_remat params (required before the first backward).
     for p in layers_gtp.parameters():
         if isinstance(p, GTPShardedParam):
             p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
@@ -223,13 +227,13 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
 
         loss.backward()
 
-        # After RS, main_grad = gtp_size * dW_shard (sum over ranks, all ranks hold the same
-        # full wgrad after all-gathering the weight in fwd).  Divide by gtp_size so the weight
+        # After RS, main_grad = gtp_remat_size * dW_shard (sum over ranks, all ranks hold the same
+        # full wgrad after all-gathering the weight in fwd).  Divide by gtp_remat_size so the weight
         # update is equivalent to the baseline.
         with torch.no_grad():
             for p in layers_gtp.parameters():
                 if isinstance(p, GTPShardedParam):
-                    p.data.sub_((LR / gtp_size) * p.main_grad)
+                    p.data.sub_((LR / gtp_remat_size) * p.main_grad)
                 elif p.grad is not None:
                     p.data.sub_(LR * p.grad)
                     p.grad.zero_()

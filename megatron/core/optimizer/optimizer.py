@@ -796,7 +796,7 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.gtp import (
             GTPShardedParam,
-            make_sharded_tensors_for_checkpoint_with_gtp,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
@@ -815,7 +815,7 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
-        entry = make_sharded_tensors_for_checkpoint_with_gtp(
+        entry = make_sharded_tensors_for_checkpoint_with_gtp_remat(
             {key: p},
             prefix='',
             tensor_parallel_layers_axis_map={key: 0},

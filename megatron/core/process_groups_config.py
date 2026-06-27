@@ -44,22 +44,22 @@ class ProcessGroupCollection:
         expt_tp: Expert tensor parallel group
         tp_ep: Tensor and expert parallel group
         tp_ep_pp: Tensor, expert, and pipeline parallel group
-        tp_ep_pp_with_egtp: tp_ep_pp merged across EGTP peers (analog of dense ``mp`` under GTP);
+        tp_ep_pp_with_egtp_remat: tp_ep_pp merged across EGTP peers (dense ``mp`` analog);
             identical to ``tp_ep_pp`` when EGTP=1
 
         # Data Parallelism Groups
         dp: Data parallel process group
         dp_cp: Data and context parallel group
-        dp_cp_no_gtp: Data and context parallel group excluding GTP peers
+        dp_cp_no_gtp_remat: Data and context parallel group excluding GTP peers
             (true dense-weight replicas); identical to dp_cp when GTP=1
         expt_dp: Expert data parallel group
-        expt_dp_no_egtp: Expert data parallel group excluding EGTP peers
+        expt_dp_no_egtp_remat: Expert data parallel group excluding EGTP peers
             (true expert-weight replicas); identical to expt_dp when EGTP=1
         intra_dp_cp: Intra partial data parallel group
-        intra_dp_cp_no_gtp: Intra partial data parallel group excluding GTP peers
+        intra_dp_cp_no_gtp_remat: Intra partial data parallel group excluding GTP peers
             (true dense-weight replicas); identical to intra_dp_cp when GTP=1
         intra_expt_dp: Intra partial expert data parallel group
-        intra_expt_dp_no_egtp: Intra expert data parallel group excluding EGTP peers
+        intra_expt_dp_no_egtp_remat: Intra expert data parallel group excluding EGTP peers
             (true expert-weight replicas); identical to intra_expt_dp when EGTP=1
         inter_dist_opt: Inter distributed optimizer instance group
 
@@ -117,7 +117,7 @@ class ProcessGroupCollection:
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP — expert "model parallel" group
     # merged across EGTP peers (analog of dense ``mp`` under GTP). Identical to ``tp_ep_pp``
     # when EGTP=1.
-    tp_ep_pp_with_egtp: torch.distributed.ProcessGroup = field(init=False)
+    tp_ep_pp_with_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     tp_dp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -131,16 +131,16 @@ class ProcessGroupCollection:
 
     # _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — DP+CP excluding GTP peers (true dense-weight
     # replicas). Identical to ``dp_cp`` when GTP=1.
-    dp_cp_no_gtp: torch.distributed.ProcessGroup = field(init=False)
+    dp_cp_no_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
     # _GTP_WEIGHT_REMAT_GROUP
-    gtp: torch.distributed.ProcessGroup = field(init=False)
+    gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
-    expt_gtp: torch.distributed.ProcessGroup = field(init=False)
+    expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
@@ -151,7 +151,7 @@ class ProcessGroupCollection:
 
     # _EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — expert DP excluding EGTP peers (true expert-weight
     # replicas). Identical to ``expt_dp`` when EGTP=1.
-    expt_dp_no_egtp: torch.distributed.ProcessGroup = field(init=False)
+    expt_dp_no_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_DATA_PARALLEL_GROUP_AG
     expt_dp_ag: torch.distributed.ProcessGroup = field(init=False)
@@ -161,14 +161,14 @@ class ProcessGroupCollection:
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — intra-instance DP+CP excluding GTP
     # peers (true dense-weight replicas). Identical to ``intra_dp_cp`` when GTP=1.
-    intra_dp_cp_no_gtp: torch.distributed.ProcessGroup = field(init=False)
+    intra_dp_cp_no_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — intra-instance expert DP excluding EGTP
     # peers (true expert-weight replicas). Identical to ``intra_expt_dp`` when EGTP=1.
-    intra_expt_dp_no_egtp: torch.distributed.ProcessGroup = field(init=False)
+    intra_expt_dp_no_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
@@ -257,10 +257,10 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_tensor_model_pipeline_parallel_group,
                 check_initialized=False,
             ),
-            'tp_ep_pp_with_egtp': partial(
+            'tp_ep_pp_with_egtp_remat': partial(
                 parallel_state.get_expert_tensor_model_pipeline_parallel_group,
                 check_initialized=False,
-                with_egtp=True,
+                with_egtp_remat=True,
             ),
             'embd': partial(parallel_state.get_embedding_group, check_initialized=False),
             'pos_embd': partial(
@@ -268,8 +268,10 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
-            'dp_cp_no_gtp': partial(
-                parallel_state.get_data_parallel_group, with_context_parallel=True, no_gtp=True
+            'dp_cp_no_gtp_remat': partial(
+                parallel_state.get_data_parallel_group,
+                with_context_parallel=True,
+                no_gtp_remat=True,
             ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
@@ -277,10 +279,10 @@ class ProcessGroupCollection:
                 with_context_parallel=True,
                 partial_data_parallel=True,
             ),
-            'intra_dp_cp_no_gtp': partial(
+            'intra_dp_cp_no_gtp_remat': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
-                no_gtp=True,
+                no_gtp_remat=True,
                 partial_data_parallel=True,
             ),
             'intra_expt_dp': partial(
@@ -288,10 +290,10 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 partial_expert_data_parallel=True,
             ),
-            'intra_expt_dp_no_egtp': partial(
+            'intra_expt_dp_no_egtp_remat': partial(
                 parallel_state.get_expert_data_parallel_group,
                 check_initialized=False,
-                no_gtp=True,
+                no_gtp_remat=True,
                 partial_expert_data_parallel=True,
             ),
             'inter_dist_opt': partial(
@@ -306,8 +308,10 @@ class ProcessGroupCollection:
             'expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
-            'expt_dp_no_egtp': partial(
-                parallel_state.get_expert_data_parallel_group, check_initialized=False, no_gtp=True
+            'expt_dp_no_egtp_remat': partial(
+                parallel_state.get_expert_data_parallel_group,
+                check_initialized=False,
+                no_gtp_remat=True,
             ),
             'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(
@@ -315,8 +319,10 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_context_parallel=True,
             ),
-            'gtp': partial(parallel_state.get_gtp_weight_remat_group, check_initialized=False),
-            'expt_gtp': partial(
+            'gtp_remat': partial(
+                parallel_state.get_gtp_weight_remat_group, check_initialized=False
+            ),
+            'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
             ),
         }
@@ -335,11 +341,11 @@ class ProcessGroupCollection:
     def is_gtp_active(process_group_dict: Dict) -> bool:
         """True iff GTP or EGTP is active (a weight-shard group spans >1 rank).
 
-        Reads the 'gtp_group'/'expt_gtp_group' entries produced by both setup_process_groups_for_*
+        Reads 'gtp_remat_group'/'expt_gtp_remat_group' from setup_process_groups_for_*
         builders; a None group means that axis is unused.
         """
-        gtp = process_group_dict.get('gtp_group')
-        expt_gtp = process_group_dict.get('expt_gtp_group')
+        gtp = process_group_dict.get('gtp_remat_group')
+        expt_gtp = process_group_dict.get('expt_gtp_remat_group')
         return (gtp is not None and gtp.size() > 1) or (
             expt_gtp is not None and expt_gtp.size() > 1
         )
@@ -364,12 +370,12 @@ class ProcessGroupCollection:
                 - dp_group: Data parallel group
                 - dp_cp_group: Data parallel with context parallel group
                 - intra_dp_cp_group: Intra data parallel with context parallel group
-                - intra_dp_cp_no_gtp_group: Intra data parallel with context parallel and
+                - intra_dp_cp_no_gtp_remat_group: Intra data parallel with context parallel and
                     generalized tensor parallel group (excludes GTP peers, i.e. only true dense
                     weight replicas)
                 - expt_dp_group: Expert data parallel group
                 - intra_expt_dp_group: Intra expert data parallel group
-                - intra_expt_dp_no_egtp_group: Intra expert data parallel group excluding
+                - intra_expt_dp_no_egtp_remat_group: Intra expert data parallel group excluding
                     EGTP peers (true expert-weight replicas); identical to expt_dp_group when
                     EGTP=1
                 - mp_group: Model parallel group
@@ -384,8 +390,8 @@ class ProcessGroupCollection:
 
         if pg_collection is None:
             # Use parallel_state groups
-            # Dense (non-GTP) params use no_gtp=False (full DP group) to maximize
-            # optimizer state sharding. GTP params use no_gtp=True (smaller group)
+            # Dense (non-GTP) params use no_gtp_remat=False (full DP group) to maximize
+            # optimizer state sharding. GTP params use no_gtp_remat=True (smaller group)
             # since GTP's reduce-scatter already handled the GTP dimension.
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
@@ -396,22 +402,24 @@ class ProcessGroupCollection:
             intra_dp_cp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, partial_data_parallel=True
             )
-            intra_dp_cp_no_gtp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, no_gtp=True, partial_data_parallel=True
+            intra_dp_cp_no_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, no_gtp_remat=True, partial_data_parallel=True
             )
-            dp_cp_no_gtp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, no_gtp=True
+            dp_cp_no_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, no_gtp_remat=True
             )
             expt_dp_group = parallel_state.get_expert_data_parallel_group()
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
                 partial_expert_data_parallel=True
             )
-            intra_expt_dp_no_egtp_group = parallel_state.get_expert_data_parallel_group(
-                no_gtp=True, partial_expert_data_parallel=True
+            intra_expt_dp_no_egtp_remat_group = parallel_state.get_expert_data_parallel_group(
+                no_gtp_remat=True, partial_expert_data_parallel=True
             )
-            expt_dp_no_egtp_group = parallel_state.get_expert_data_parallel_group(no_gtp=True)
-            gtp_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-            expt_gtp_group = parallel_state.get_expert_gtp_weight_remat_group(
+            expt_dp_no_egtp_remat_group = parallel_state.get_expert_data_parallel_group(
+                no_gtp_remat=True
+            )
+            gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+            expt_gtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(
                 check_initialized=False
             )
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
@@ -431,8 +439,8 @@ class ProcessGroupCollection:
             # Model communication groups
             mp_group = parallel_state.get_model_parallel_group()
             expt_tp_pp_group = parallel_state.get_expert_tensor_model_pipeline_parallel_group()
-            expt_tp_pp_with_egtp_group = (
-                parallel_state.get_expert_tensor_model_pipeline_parallel_group(with_egtp=True)
+            expt_tp_pp_with_egtp_remat_group = (
+                parallel_state.get_expert_tensor_model_pipeline_parallel_group(with_egtp_remat=True)
             )
 
             # Inter distributed optimizer group
@@ -542,38 +550,38 @@ class ProcessGroupCollection:
             # EGTP-MERGED variant of tp_ep_pp: includes the egtp axis, so each EGTP peer gets a
             # distinct rank — used for the distopt ShardedObject keys. Falls back to tp_ep_pp
             # when not provided.
-            if 'tp_ep_pp_with_egtp' in pg_set:
-                expt_tp_pp_with_egtp_group = pg_collection.tp_ep_pp_with_egtp
+            if 'tp_ep_pp_with_egtp_remat' in pg_set:
+                expt_tp_pp_with_egtp_remat_group = pg_collection.tp_ep_pp_with_egtp_remat
             else:
-                expt_tp_pp_with_egtp_group = expt_tp_pp_group
+                expt_tp_pp_with_egtp_remat_group = expt_tp_pp_group
 
-            # 6. no_gtp groups — the gtp-EXCLUDED replicate groups that DDP and the optimizer
+            # 6. no_gtp_remat groups — the gtp-EXCLUDED replicate groups that DDP and the optimizer
             #    shard over: intra (per-distopt-instance) and full (cross-instance). Fall back to
             #    the non-GTP variants when not provided.
-            if 'intra_dp_cp_no_gtp' in pg_set:
-                intra_dp_cp_no_gtp_group = pg_collection.intra_dp_cp_no_gtp
+            if 'intra_dp_cp_no_gtp_remat' in pg_set:
+                intra_dp_cp_no_gtp_remat_group = pg_collection.intra_dp_cp_no_gtp_remat
             else:
-                intra_dp_cp_no_gtp_group = intra_dp_cp_group
-            if 'dp_cp_no_gtp' in pg_set:
-                dp_cp_no_gtp_group = pg_collection.dp_cp_no_gtp
+                intra_dp_cp_no_gtp_remat_group = intra_dp_cp_group
+            if 'dp_cp_no_gtp_remat' in pg_set:
+                dp_cp_no_gtp_remat_group = pg_collection.dp_cp_no_gtp_remat
             else:
-                dp_cp_no_gtp_group = dp_cp_group
+                dp_cp_no_gtp_remat_group = dp_cp_group
 
-            # 7. no_egtp groups — the expert analog of §6: the egtp-EXCLUDED replicate groups,
+            # 7. no_egtp_remat groups — the expert analog of §6: the egtp-EXCLUDED replicate groups,
             #    intra (per-distopt-instance) and full (cross-instance). Fall back to the
             #    non-EGTP variants when not provided.
-            if 'intra_expt_dp_no_egtp' in pg_set:
-                intra_expt_dp_no_egtp_group = pg_collection.intra_expt_dp_no_egtp
+            if 'intra_expt_dp_no_egtp_remat' in pg_set:
+                intra_expt_dp_no_egtp_remat_group = pg_collection.intra_expt_dp_no_egtp_remat
             else:
-                intra_expt_dp_no_egtp_group = intra_expt_dp_group
-            if 'expt_dp_no_egtp' in pg_set:
-                expt_dp_no_egtp_group = pg_collection.expt_dp_no_egtp
+                intra_expt_dp_no_egtp_remat_group = intra_expt_dp_group
+            if 'expt_dp_no_egtp_remat' in pg_set:
+                expt_dp_no_egtp_remat_group = pg_collection.expt_dp_no_egtp_remat
             else:
-                expt_dp_no_egtp_group = expt_dp_group
+                expt_dp_no_egtp_remat_group = expt_dp_group
 
             # 8. GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            gtp_group = getattr(pg_collection, 'gtp', None)
-            expt_gtp_group = getattr(pg_collection, 'expt_gtp', None)
+            gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+            expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
 
             # Gloo groups - not supported when pg_collection is provided
             if use_gloo_process_groups:
@@ -587,18 +595,18 @@ class ProcessGroupCollection:
         return {
             'dp_group': dp_group,
             'dp_cp_group': dp_cp_group,
-            'dp_cp_no_gtp_group': dp_cp_no_gtp_group,
+            'dp_cp_no_gtp_remat_group': dp_cp_no_gtp_remat_group,
             'intra_dp_cp_group': intra_dp_cp_group,
-            'intra_dp_cp_no_gtp_group': intra_dp_cp_no_gtp_group,
+            'intra_dp_cp_no_gtp_remat_group': intra_dp_cp_no_gtp_remat_group,
             'expt_dp_group': expt_dp_group,
-            'expt_dp_no_egtp_group': expt_dp_no_egtp_group,
+            'expt_dp_no_egtp_remat_group': expt_dp_no_egtp_remat_group,
             'intra_expt_dp_group': intra_expt_dp_group,
-            'intra_expt_dp_no_egtp_group': intra_expt_dp_no_egtp_group,
-            'gtp_group': gtp_group,
-            'expt_gtp_group': expt_gtp_group,
+            'intra_expt_dp_no_egtp_remat_group': intra_expt_dp_no_egtp_remat_group,
+            'gtp_remat_group': gtp_remat_group,
+            'expt_gtp_remat_group': expt_gtp_remat_group,
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
-            'expt_tp_pp_with_egtp_group': expt_tp_pp_with_egtp_group,
+            'expt_tp_pp_with_egtp_remat_group': expt_tp_pp_with_egtp_remat_group,
             'inter_dist_opt_group': inter_dist_opt_group,
             'intra_dist_opt_group': intra_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
@@ -642,18 +650,22 @@ class ProcessGroupCollection:
                     with_context_parallel=True, partial_data_parallel=True
                 ),
                 'expt_dp_group': parallel_state.get_expert_data_parallel_group(),
-                'expt_dp_no_egtp_group': parallel_state.get_expert_data_parallel_group(no_gtp=True),
+                'expt_dp_no_egtp_remat_group': parallel_state.get_expert_data_parallel_group(
+                    no_gtp_remat=True
+                ),
                 'intra_expt_dp_group': parallel_state.get_expert_data_parallel_group(
                     partial_expert_data_parallel=True
                 ),
-                'intra_expt_dp_no_egtp_group': parallel_state.get_expert_data_parallel_group(
-                    no_gtp=True, partial_expert_data_parallel=True
+                'intra_expt_dp_no_egtp_remat_group': parallel_state.get_expert_data_parallel_group(
+                    no_gtp_remat=True, partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
-                'gtp_group': parallel_state.get_gtp_weight_remat_group(check_initialized=False),
+                'gtp_remat_group': parallel_state.get_gtp_weight_remat_group(
+                    check_initialized=False
+                ),
                 'pp_group': parallel_state.get_pipeline_model_parallel_group(),
                 'ep_group': parallel_state.get_expert_model_parallel_group(),
-                'expt_gtp_group': parallel_state.get_expert_gtp_weight_remat_group(
+                'expt_gtp_remat_group': parallel_state.get_expert_gtp_weight_remat_group(
                     check_initialized=False
                 ),
                 'inter_dist_opt_group': (
@@ -666,11 +678,11 @@ class ProcessGroupCollection:
                     if ddp_config.use_distributed_optimizer
                     else None
                 ),
-                'intra_dp_cp_no_gtp_group': parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, no_gtp=True, partial_data_parallel=True
+                'intra_dp_cp_no_gtp_remat_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, no_gtp_remat=True, partial_data_parallel=True
                 ),
-                'dp_cp_no_gtp_group': parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, no_gtp=True
+                'dp_cp_no_gtp_remat_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, no_gtp_remat=True
                 ),
             }
         else:
@@ -743,32 +755,34 @@ class ProcessGroupCollection:
             result['ep_group'] = pg_collection.ep
 
             # 6. GTP partial group (fallback to intra_dp_cp if not provided)
-            if 'intra_dp_cp_no_gtp' in pg_set:
-                result['intra_dp_cp_no_gtp_group'] = pg_collection.intra_dp_cp_no_gtp
+            if 'intra_dp_cp_no_gtp_remat' in pg_set:
+                result['intra_dp_cp_no_gtp_remat_group'] = pg_collection.intra_dp_cp_no_gtp_remat
             else:
-                result['intra_dp_cp_no_gtp_group'] = result['intra_dp_cp_group']
+                result['intra_dp_cp_no_gtp_remat_group'] = result['intra_dp_cp_group']
 
             # 7. EGTP partial group (fallback to intra_expt_dp if not provided)
-            if 'intra_expt_dp_no_egtp' in pg_set:
-                result['intra_expt_dp_no_egtp_group'] = pg_collection.intra_expt_dp_no_egtp
+            if 'intra_expt_dp_no_egtp_remat' in pg_set:
+                result['intra_expt_dp_no_egtp_remat_group'] = (
+                    pg_collection.intra_expt_dp_no_egtp_remat
+                )
             else:
-                result['intra_expt_dp_no_egtp_group'] = result['intra_expt_dp_group']
+                result['intra_expt_dp_no_egtp_remat_group'] = result['intra_expt_dp_group']
 
             # 8. Full (cross-instance) with-GTP-excluded variants for callers that need to
             # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
             # to the corresponding non-GTP-excluded full group when not provided.
-            if 'dp_cp_no_gtp' in pg_set:
-                result['dp_cp_no_gtp_group'] = pg_collection.dp_cp_no_gtp
+            if 'dp_cp_no_gtp_remat' in pg_set:
+                result['dp_cp_no_gtp_remat_group'] = pg_collection.dp_cp_no_gtp_remat
             else:
-                result['dp_cp_no_gtp_group'] = result['dp_cp_group']
-            if 'expt_dp_no_egtp' in pg_set:
-                result['expt_dp_no_egtp_group'] = pg_collection.expt_dp_no_egtp
+                result['dp_cp_no_gtp_remat_group'] = result['dp_cp_group']
+            if 'expt_dp_no_egtp_remat' in pg_set:
+                result['expt_dp_no_egtp_remat_group'] = pg_collection.expt_dp_no_egtp_remat
             else:
-                result['expt_dp_no_egtp_group'] = result['expt_dp_group']
+                result['expt_dp_no_egtp_remat_group'] = result['expt_dp_group']
 
             # 9. GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            result['gtp_group'] = getattr(pg_collection, 'gtp', None)
-            result['expt_gtp_group'] = getattr(pg_collection, 'expt_gtp', None)
+            result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
+            result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
 
             return result
 

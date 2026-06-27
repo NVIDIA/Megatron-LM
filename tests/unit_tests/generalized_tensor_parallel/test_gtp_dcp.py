@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for GTP + distributed checkpointing.
+"""Unit tests for GTP_remat + distributed checkpointing.
 
-Verifies that ``make_sharded_tensors_for_checkpoint_with_gtp`` emits
-ShardedTensor offsets that correctly encode TP × GTP sharding, and that
+Verifies that ``make_sharded_tensors_for_checkpoint_with_gtp_remat`` emits
+ShardedTensor offsets that correctly encode TP × GTP_remat sharding, and that
 the helper is a no-op (delegates to vanilla) when no ``GTPShardedParam``
 is present in the input state_dict.
 
@@ -22,7 +22,7 @@ if not HAVE_GTP:
 from megatron.core.tensor_parallel.gtp import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
-    make_sharded_tensors_for_checkpoint_with_gtp,
+    make_sharded_tensors_for_checkpoint_with_gtp_remat,
     reset_gtp_quantize_cache,
     update_gtp_config,
     wrap_module_params_gtp,
@@ -32,8 +32,8 @@ from tests.unit_tests.test_utilities import Utils  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _no_pad_alignment():
-    """Disable GTP padding for the duration of each test so local shard sizes
-    are exactly ``per_tp_out / gtp_size`` and the test math stays simple.
+    """Disable GTP_remat padding for the duration of each test so local shard sizes
+    are exactly ``per_tp_out / gtp_remat_size`` and the test math stays simple.
     DCP semantics with padding are exercised by the integration tests.
     """
     orig = GTP_CONFIG.pad_for_alignment
@@ -57,7 +57,7 @@ def _require_world_size(n):
         )
 
 
-def _make_gtp_shard(out_features, in_features, gtp_group, dtype=torch.bfloat16):
+def _make_gtp_shard(out_features, in_features, gtp_remat_group, dtype=torch.bfloat16):
     """Build a small GTPShardedParam by wrapping a one-param dummy module."""
 
     class _Dummy(torch.nn.Module):
@@ -70,34 +70,34 @@ def _make_gtp_shard(out_features, in_features, gtp_group, dtype=torch.bfloat16):
             )
 
     mod = _Dummy()
-    wrap_module_params_gtp(mod, ["weight"], gtp_group)
+    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
     return mod.weight  # now a GTPShardedParam
 
 
 def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
-    """TP=2, GTP=2 (4 ranks total). Weight is GTPShardedParam.
+    """TP=2, GTP_remat=2 (4 ranks total). Weight is GTPShardedParam.
 
     Production flow: Mcore TE constructs the Linear with already-TP-sliced
-    out_features (i.e. full / tp_size). GTP then slices that further by
-    gtp_size. We mimic that by starting with a per-TP-rank tensor of size
+    out_features (i.e. full / tp_size). GTP_remat then slices that further by
+    gtp_remat_size. We mimic that by starting with a per-TP-rank tensor of size
     ``full // tp_size`` and letting wrap_module_params_gtp slice it.
     """
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
     tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
 
     full_out_features = 8
-    tp_size, gtp_size = 2, 2
+    tp_size, gtp_remat_size = 2, 2
     per_tp_out = full_out_features // tp_size  # 4
-    per_shard_out = per_tp_out // gtp_size  # 2
+    per_shard_out = per_tp_out // gtp_remat_size  # 2
     in_features = 4
 
-    weight = _make_gtp_shard(per_tp_out, in_features, gtp_group)
+    weight = _make_gtp_shard(per_tp_out, in_features, gtp_remat_group)
     assert weight.shape == (per_shard_out, in_features), (
         f"rank={rank} local shard shape {tuple(weight.shape)} != "
         f"({per_shard_out}, {in_features})"
     )
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
@@ -108,11 +108,11 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
 
-    # Composite offset: (axis=0, tp_rank*gtp_size+gtp_rank, tp_size*gtp_size)
+    # Composite offset: (axis=0, tp_rank*gtp_remat_size+gtp_rank, tp_size*gtp_remat_size)
     # rank → (tp_rank, gtp_rank): 0→(0,0), 1→(0,1), 2→(1,0), 3→(1,1)
     tp_rank = rank // 2
     gtp_rank = rank % 2
-    expected_offset = (tp_rank * gtp_size + gtp_rank) * per_shard_out
+    expected_offset = (tp_rank * gtp_remat_size + gtp_rank) * per_shard_out
     assert (
         st.global_offset[0] == expected_offset
     ), f"rank={rank} expected axis-0 offset {expected_offset}, got {st.global_offset[0]}"
@@ -122,23 +122,23 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
 
 
 def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
-    """Row-parallel: TP=2 shards axis 1, GTP=2 shards axis 0.
+    """Row-parallel: TP=2 shards axis 1, GTP_remat=2 shards axis 0.
 
-    Per-TP-rank tensor: (full_out, full_in/tp_size). GTP further shards
-    axis 0 to (full_out/gtp_size, full_in/tp_size).
+    Per-TP-rank tensor: (full_out, full_in/tp_size). GTP_remat further shards
+    axis 0 to (full_out/gtp_remat_size, full_in/tp_size).
     """
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
     tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
 
     full_out, full_in = 8, 4
-    tp_size, gtp_size = 2, 2
+    tp_size, gtp_remat_size = 2, 2
     per_tp_in = full_in // tp_size  # 2
-    per_shard_out = full_out // gtp_size  # 4
+    per_shard_out = full_out // gtp_remat_size  # 4
 
-    weight = _make_gtp_shard(full_out, per_tp_in, gtp_group)
+    weight = _make_gtp_shard(full_out, per_tp_in, gtp_remat_group)
     assert weight.shape == (per_shard_out, per_tp_in)
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 1},  # row-parallel
@@ -161,7 +161,7 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
     ), f"rank={rank} global shape {st.global_shape} != ({full_out}, {full_in})"
 
 
-def _worker_helper_no_op_no_gtp(rank, world_size, port):
+def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
     """Helper must delegate to vanilla when state_dict has no GTPShardedParam.
 
     Per-TP-rank shape under column-parallel TP=2: (full_out//tp_size, in).
@@ -176,7 +176,7 @@ def _worker_helper_no_op_no_gtp(rank, world_size, port):
     )
     bias = torch.nn.Parameter(torch.zeros(per_tp_out, dtype=torch.bfloat16, device="cuda"))
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": plain, "bias": bias},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0, "bias": 0},
@@ -195,19 +195,19 @@ def _worker_helper_no_op_no_gtp(rank, world_size, port):
 
 def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
     """``in_proj.weight`` shape modeled after the production case (z|x|B|C|dt
-    concat along dim 0). With GTP=4 and these dim-0 sizes the alignment
-    constraint ``dim0 % (gtp_size * pad_for_alignment) == 0`` is satisfied —
+    concat along dim 0). With GTP_remat=4 and these dim-0 sizes the alignment
+    constraint ``dim0 % (gtp_remat_size * pad_for_alignment) == 0`` is satisfied —
     *no* padding fires. Verify the helper emits the expected offsets.
     """
     update_gtp_config(pad_for_alignment=16)
     # dim0 = 512+512+64+64+8 = 1160 → 1160 % (4*16=64) = 8 ⇒ NOT aligned.
     # Pick sizes that ARE aligned to 64 to exercise the no-pad path:
-    dim0 = 1152  # = 18 * 64; alignment-clean for gtp_size=4, pad=16
+    dim0 = 1152  # = 18 * 64; alignment-clean for gtp_remat_size=4, pad=16
     in_features = 4
 
-    # All 4 ranks form a single GTP group.
-    gtp_group = dist.new_group(list(range(world_size)))
-    weight = _make_gtp_shard(dim0, in_features, gtp_group)
+    # All 4 ranks form a single GTP_remat group.
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
 
     # No padding ⇒ local shape is exactly dim0 / 4 = 288
     expected_local = dim0 // 4
@@ -217,7 +217,7 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
     )
     assert getattr(weight, "pad_length", 0) == 0
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
@@ -233,41 +233,41 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
 
 
 def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
-    """Same in_proj layout but with a dim-0 size that requires GTP padding.
+    """Same in_proj layout but with a dim-0 size that requires GTP_remat padding.
 
-    z=512, x=512, B=64, C=64, dt=8 → dim0=1160. With gtp_size=4 and
+    z=512, x=512, B=64, C=64, dt=8 → dim0=1160. With gtp_remat_size=4 and
     pad_for_alignment=16, alignment block = 64; 1160 % 64 = 8 so 56 pad
     rows are appended. Padded dim0 = 1216, per-rank shard = 304 (uniform
     across all 4 ranks; the pad rows live at the tail of rank-3's slice).
 
     The helper today saves the *padded* global shape (1216) — round-trip is
-    correct under save_gtp_size == load_gtp_size. This test pins that
+    correct under save_gtp_remat_size == load_gtp_remat_size. This test pins that
     behaviour and serves as a regression for the future "unpadded global"
     fix.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160  # z(512) + x(512) + B(64) + C(64) + dt(8)
     in_features = 4
-    gtp_size = world_size
-    alignment_block = 16 * gtp_size  # = 64
+    gtp_remat_size = world_size
+    alignment_block = 16 * gtp_remat_size  # = 64
     pad = (alignment_block - dim0_unpadded % alignment_block) % alignment_block
     dim0_padded = dim0_unpadded + pad
-    per_shard = dim0_padded // gtp_size
+    per_shard = dim0_padded // gtp_remat_size
 
-    gtp_group = dist.new_group(list(range(world_size)))
-    weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_group)
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
 
     assert weight.shape == (
         per_shard,
         in_features,
     ), f"rank={rank}: post-pad shard shape {tuple(weight.shape)} != ({per_shard}, {in_features})"
-    # Only rank-3 (the last GTP rank) carries the trailing pad rows; all ranks
+    # Only rank-3 (the last GTP_remat rank) carries the trailing pad rows; all ranks
     # report the same pad_length (an invariant set by _gtp_slice_one_param).
     assert (
         getattr(weight, "pad_length", 0) == pad
     ), f"rank={rank}: pad_length {getattr(weight, 'pad_length', 0)} != {pad}"
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
@@ -277,15 +277,15 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     )
     st = sharded["weight"]
     # Helper saves the padded global. ``allow_shape_mismatch=True`` is what
-    # makes the saved tensor portable to a different load-time GTP topology
+    # makes the saved tensor portable to a different load-time GTP_remat topology
     # (different alignment choice yields a different padded size).
     assert (
         st.global_shape[0] == dim0_padded
     ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
     assert st.global_offset[0] == rank * per_shard
     assert st.allow_shape_mismatch is True, (
-        f"rank={rank} pad case: allow_shape_mismatch must be True when GTP padding fires; "
-        f"otherwise the ckpt cannot be loaded at a different GTP topology."
+        f"rank={rank} pad case: allow_shape_mismatch must be True when GTP_remat padding fires; "
+        f"otherwise the ckpt cannot be loaded at a different GTP_remat topology."
     )
 
 
@@ -301,17 +301,17 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160
     in_features = 4
-    gtp_size = world_size
-    alignment_block = 16 * gtp_size  # 64
+    gtp_remat_size = world_size
+    alignment_block = 16 * gtp_remat_size  # 64
     dim0_padded = (
         dim0_unpadded + (alignment_block - dim0_unpadded % alignment_block) % alignment_block
     )
-    per_shard = dim0_padded // gtp_size
+    per_shard = dim0_padded // gtp_remat_size
 
-    gtp_group = dist.new_group(list(range(world_size)))
-    weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_group)
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
@@ -344,11 +344,11 @@ def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
     update_gtp_config(pad_for_alignment=0)
     dim0 = 16
     in_features = 4
-    gtp_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = dist.new_group(list(range(world_size)))
 
     def _build(prefix):
-        weight = _make_gtp_shard(dim0, in_features, gtp_group)
-        return make_sharded_tensors_for_checkpoint_with_gtp(
+        weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
+        return make_sharded_tensors_for_checkpoint_with_gtp_remat(
             {"weight": weight},
             prefix=prefix,
             tensor_parallel_layers_axis_map={"weight": 0},
@@ -367,7 +367,7 @@ def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
 
 def _worker_reset_quantize_cache(rank, world_size, port):
     """`reset_gtp_quantize_cache` must flip did_cast_to_low_precision back to False."""
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
 
     class _Dummy(torch.nn.Module):
         def __init__(self):
@@ -375,7 +375,7 @@ def _worker_reset_quantize_cache(rank, world_size, port):
             self.weight = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16, device="cuda"))
 
     mod = _Dummy()
-    wrap_module_params_gtp(mod, ["weight"], gtp_group)
+    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
     p = mod.weight
     p.did_cast_to_low_precision = True
 
@@ -384,37 +384,37 @@ def _worker_reset_quantize_cache(rank, world_size, port):
 
 
 def _worker_helper_offsets_ep_egtp(rank, world_size, port):
-    """EP=2, EGTP=2 (4 ranks): routed-expert weight.
+    """EP=2, EGTP_remat=2 (4 ranks): routed-expert weight.
 
     Mirrors ``TEGroupedLinear.sharded_state_dict``: expert parallelism prepends a
-    global-expert axis through ``sharded_offsets``, and EGTP shards each expert's
-    ``out_features`` (axis 0). The GTP-aware checkpoint helper layers the EGTP
+    global-expert axis through ``sharded_offsets``, and EGTP_remat shards each expert's
+    ``out_features`` (axis 0). The GTP_remat-aware checkpoint helper layers the EGTP_remat
     axis-0 split on top of the prepended expert offset.
 
     rank → (ep_rank, egtp_rank): 0→(0,0) 1→(0,1) 2→(1,0) 3→(1,1).
     """
-    egtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    egtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
 
-    ep_size, egtp_size, num_gemms = 2, 2, 1
+    ep_size, egtp_remat_size, num_gemms = 2, 2, 1
     ep_rank = rank // 2
     egtp_rank = rank % 2
     per_expert_out = 4
-    per_shard_out = per_expert_out // egtp_size  # 2
+    per_shard_out = per_expert_out // egtp_remat_size  # 2
     in_features = 4
     num_global_experts = ep_size * num_gemms  # 2
     global_expert_idx = ep_rank * num_gemms  # + gemm_idx (0)
 
-    weight = _make_gtp_shard(per_expert_out, in_features, egtp_group)
+    weight = _make_gtp_shard(per_expert_out, in_features, egtp_remat_group)
     assert weight.shape == (
         per_shard_out,
         in_features,
-    ), f"rank={rank} EGTP shard shape {tuple(weight.shape)} != ({per_shard_out}, {in_features})"
+    ), f"rank={rank} EGTP_remat shape {tuple(weight.shape)} != ({per_shard_out}, {in_features})"
 
-    sharded = make_sharded_tensors_for_checkpoint_with_gtp(
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {"weight": weight},
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
-        # EP prepends the global-expert axis; EGTP shards out_features below it.
+        # EP prepends the global-expert axis; EGTP_remat shards out_features below it.
         sharded_offsets=((0, global_expert_idx, num_global_experts),),
         tp_group=dist.new_group([rank]),  # no TP in this case
         dp_cp_group=dist.new_group(list(range(world_size))),
@@ -430,30 +430,30 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     assert (
         st.global_offset[0] == global_expert_idx
     ), f"rank={rank} expert-axis offset {st.global_offset[0]} != {global_expert_idx}"
-    # EGTP axis (weight axis 0, shifted to global axis 1): offset == egtp_rank · per_shard.
+    # EGTP_remat axis (weight axis 0, shifted to global axis 1): offset == egtp_rank · per_shard.
     assert (
         st.global_offset[1] == egtp_rank * per_shard_out
-    ), f"rank={rank} EGTP axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
+    ), f"rank={rank} EGTP_remat axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
 
 
 def _worker_helper_embedding_offsets(rank, world_size, port):
     """Embedding / output_layer path: ``VocabParallelEmbedding.sharded_state_dict`` calls
     ``make_tp_sharded_tensor_for_checkpoint`` DIRECTLY (it needs allow_shape_mismatch for
-    vocab padding), bypassing the GTP-aware wrapper. So that helper itself must layer the
-    GTP axis-0 split. TP=2, GTP=2, tp_axis=0 (vocab) → composite axis-0 offset, same as the
+    vocab padding), bypassing the GTP_remat-aware wrapper. So that helper itself must layer the
+    GTP_remat axis-0 split. TP=2, GTP_remat=2, tp_axis=0 → composite axis-0 offset, same as the
     column-parallel case.
     """
     from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
     tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
 
     full_vocab, hidden = 8, 4
-    tp_size, gtp_size = 2, 2
+    tp_size, gtp_remat_size = 2, 2
     per_tp = full_vocab // tp_size  # 4
-    per_shard = per_tp // gtp_size  # 2
+    per_shard = per_tp // gtp_remat_size  # 2
 
-    weight = _make_gtp_shard(per_tp, hidden, gtp_group)
+    weight = _make_gtp_shard(per_tp, hidden, gtp_remat_group)
     assert weight.shape == (per_shard, hidden)
 
     st = make_tp_sharded_tensor_for_checkpoint(
@@ -468,7 +468,7 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
     tp_rank = rank // 2
     gtp_rank = rank % 2
-    expected_offset = (tp_rank * gtp_size + gtp_rank) * per_shard
+    expected_offset = (tp_rank * gtp_remat_size + gtp_rank) * per_shard
     assert (
         st.global_offset[0] == expected_offset
     ), f"rank={rank} embedding axis-0 offset {st.global_offset[0]} != {expected_offset}"
@@ -480,20 +480,20 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
 def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     """The public ``make_sharded_tensors_for_checkpoint`` (the entry point most layers call,
     e.g. ColumnParallelLinear / output_layer) must detect a GTPShardedParam and produce the
-    GTP-composite offset — i.e. it delegates to the GTP-aware path rather than the vanilla
-    TP-only one. TP=2, GTP=2, column-parallel (tp_axis=0).
+    GTP_remat-composite offset — i.e. it delegates to the GTP_remat-aware path not the vanilla
+    TP-only one. TP=2, GTP_remat=2, column-parallel (tp_axis=0).
     """
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
     tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
 
     full_out, in_features = 8, 4
-    tp_size, gtp_size = 2, 2
+    tp_size, gtp_remat_size = 2, 2
     per_tp_out = full_out // tp_size  # 4
-    per_shard_out = per_tp_out // gtp_size  # 2
+    per_shard_out = per_tp_out // gtp_remat_size  # 2
 
-    weight = _make_gtp_shard(per_tp_out, in_features, gtp_group)
+    weight = _make_gtp_shard(per_tp_out, in_features, gtp_remat_group)
 
     sharded = make_sharded_tensors_for_checkpoint(
         {"weight": weight},
@@ -507,10 +507,10 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
     tp_rank = rank // 2
     gtp_rank = rank % 2
-    expected_offset = (tp_rank * gtp_size + gtp_rank) * per_shard_out
+    expected_offset = (tp_rank * gtp_remat_size + gtp_rank) * per_shard_out
     assert st.global_offset[0] == expected_offset, (
-        f"rank={rank} public wrapper did not produce the GTP-composite offset: "
-        f"{st.global_offset[0]} != {expected_offset} (delegation to the GTP path failed?)"
+        f"rank={rank} public wrapper did not produce the GTP_remat-composite offset: "
+        f"{st.global_offset[0]} != {expected_offset} (delegation to the GTP_remat path failed?)"
     )
     assert (
         st.global_shape[0] == full_out
@@ -524,8 +524,8 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
     """
     from megatron.core.utils import make_sharded_tensor_for_checkpoint
 
-    gtp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-    weight = _make_gtp_shard(4, 4, gtp_group)
+    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    weight = _make_gtp_shard(4, 4, gtp_remat_group)
     with pytest.raises(AssertionError):
         make_sharded_tensor_for_checkpoint(
             weight,
@@ -536,7 +536,7 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
 
 
 def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
-    """End-to-end ``MambaMixer.sharded_state_dict`` under GTP: the GTP-REPLICATED
+    """End-to-end ``MambaMixer.sharded_state_dict`` under GTP_remat: the GTP_remat-REPLICATED
     directly-owned params (A_log / dt_bias / D / conv1d.*) must get conflict-free
     replica_ids — distinct across every rank holding the same chunk, with exactly
     one "main" (writer) replica — so DCP elects a single writer per chunk.
@@ -564,13 +564,13 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    GTP = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp peers and replicate DP)
+    GTP_remat = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp peers and replicate DP)
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP_remat
     )
     model_parallel_cuda_manual_seed(42)
-    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
 
     config = TransformerConfig(
         num_attention_heads=32,
@@ -599,7 +599,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     layer = MambaLayer(config, submodules, layer_number=1, pg_collection=pg).cuda()
     assert any(
         isinstance(p, GTPShardedParam) for p in layer.parameters()
-    ), "GTP not active: no GTPShardedParam in the GTP=2 Mamba layer"
+    ), "GTP_remat not active: no GTPShardedParam in the GTP_remat=2 Mamba layer"
 
     metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
     sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
@@ -624,7 +624,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
 
     if rank == 0:
         bases = set(gathered[0])
-        assert bases, "no GTP-replicated tiny params found in MambaMixer sharded_state_dict"
+        assert bases, "no GTP_remat-replicated tiny params found in MambaMixer sharded_state_dict"
         for base in sorted(bases):
             rids = [g[base] for g in gathered]
             assert (
@@ -635,7 +635,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
 
 
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
-    """GTP+Muon checkpoint fix: in_proj's gathered+split model entry does NOT object-id-match the
+    """GTP_remat+Muon ckpt fix: in_proj's gathered+split model entry does NOT id-match the
     per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
     Float16OptimizerWithFloat16Params.sharded_state_dict). Verify the per-shard fallback used by the
     fix restores a ShardedTensor with local_shape == the optimizer param shape, which
@@ -655,7 +655,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
     from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
     from megatron.core.tensor_parallel.gtp import (
-        make_sharded_tensors_for_checkpoint_with_gtp,
+        make_sharded_tensors_for_checkpoint_with_gtp_remat,
         tag_gtp_params_with_names,
     )
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -667,7 +667,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
     model_parallel_cuda_manual_seed(42)
-    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp'])
+    pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     config = TransformerConfig(
         num_attention_heads=32,
         num_layers=1,
@@ -696,7 +696,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     tag_gtp_params_with_names(layer)  # set _debug_name (mirrors production setup)
 
     in_proj_w = layer.mixer.in_proj.weight
-    assert isinstance(in_proj_w, GTPShardedParam), "in_proj.weight should be GTP-sharded"
+    assert isinstance(in_proj_w, GTPShardedParam), "in_proj.weight should be GTP_remat-sharded"
 
     metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
     model_sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
@@ -707,7 +707,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
 
     # The fix's per-shard fallback restores a matching entry.
     key = in_proj_w._debug_name or '_gtp_optim_param_0'
-    entry = make_sharded_tensors_for_checkpoint_with_gtp(
+    entry = make_sharded_tensors_for_checkpoint_with_gtp_remat(
         {key: in_proj_w},
         prefix='',
         tensor_parallel_layers_axis_map={key: 0},
@@ -767,9 +767,9 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_helper_replicated_sink_rejects_gtp(dist.get_rank(), 4, None)
 
-    def test_no_op_no_gtp(self):
+    def test_no_op_no_gtp_remat(self):
         _require_world_size(4)
-        _worker_helper_no_op_no_gtp(dist.get_rank(), 4, None)
+        _worker_helper_no_op_no_gtp_remat(dist.get_rank(), 4, None)
 
     def test_reset_quantize_cache(self):
         _require_world_size(4)

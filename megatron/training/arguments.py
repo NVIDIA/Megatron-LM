@@ -1429,12 +1429,15 @@ def validate_args(args, defaults={}):
             # architectures. Assigning high priority to communication streams ensures that
             # communication kernels are scheduled with higher priority, minimizing the exposed
             # communication when it is overlapped with other computation kernels.
-            if 'gtp' not in args.high_priority_stream_groups:
-                args.high_priority_stream_groups.append('gtp')
-                warn_rank_0("Setting 'gtp' group for high priority streams.")
-            if egtp_weight_remat_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
-                args.high_priority_stream_groups.append('expt_gtp')
-                warn_rank_0("Setting 'expt_gtp' group for high priority streams.")
+            if 'gtp_remat' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('gtp_remat')
+                warn_rank_0("Setting 'gtp_remat' group for high priority streams.")
+            if (
+                egtp_weight_remat_size > 1
+                and 'expt_gtp_remat' not in args.high_priority_stream_groups
+            ):
+                args.high_priority_stream_groups.append('expt_gtp_remat')
+                warn_rank_0("Setting 'expt_gtp_remat' group for high priority streams.")
 
             # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
             if args.cuda_graph_impl != "none":

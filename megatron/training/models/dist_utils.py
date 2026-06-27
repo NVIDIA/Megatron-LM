@@ -160,7 +160,7 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
         print(
             " > number of parameters on (tensor, gtp, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
-                pg_collection.gtp.rank(),
+                pg_collection.gtp_remat.rank(),
                 pg_collection.pp.rank(),
                 sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model]),
             ),

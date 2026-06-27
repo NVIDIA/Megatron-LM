@@ -1648,10 +1648,12 @@ def wrap_model_chunks_with_ddp(
                 "the distributed-optimizer parameter layout"
             )
             # Size the layout for the replicate (gtp/egtp-EXCLUDED) DP group the DDP buffer
-            # actually shards over, so DDP can use it directly without recomputing. no_gtp
+            # actually shards over, so DDP can use it directly without recomputing. no_gtp_remat
             # aliases the regular DP group when GTP is inactive.
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp_no_gtp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp_no_egtp", None))
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp_no_gtp_remat)
+            expert_data_parallel_world_size = get_pg_size(
+                getattr(layout_pgs, "expt_dp_no_egtp_remat", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1837,7 +1839,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ' > number of parameters on (tensor, gtp, pipeline) '
             'model parallel rank ({}, {}, {}): {}'.format(
                 get_pg_rank(pg_collection.tp),
-                get_pg_rank(pg_collection.gtp),
+                get_pg_rank(pg_collection.gtp_remat),
                 get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),

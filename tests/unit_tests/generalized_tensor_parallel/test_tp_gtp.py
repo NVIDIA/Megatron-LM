@@ -2,12 +2,12 @@
 
 """Unit tests for combined Tensor Parallelism + Generalized Tensor Parallelism (TP+GTP).
 
-Process group layout (world_size = tp_size x gtp_size):
+Process group layout (world_size = tp_size x gtp_remat_size):
 
     rank = gtp_rank x tp_size + tp_rank
 
     TP  group: all ranks that share the same gtp_rank  (size = tp_size)
-    GTP group: all ranks that share the same tp_rank   (size = gtp_size)
+    GTP group: all ranks that share the same tp_rank   (size = gtp_remat_size)
 
 Test groups
 -----------
@@ -16,10 +16,10 @@ Test groups
 3.  TestTPGTPRowParallelLinear    - row-parallel Linear: fwd/bwd smoke test + numerical correctness
 4.  TestTPGTPLayerNormLinear      - LayerNormLinear column-parallel smoke test
 
-Tests use (tp_size, gtp_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
+Tests use (tp_size, gtp_remat_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
 
 Multi-GPU tests skip automatically when ``torch.distributed.get_world_size()`` does not match
-the requested combination of tp_size x gtp_size.
+the requested combination of tp_size x gtp_remat_size.
 """
 
 import pytest
@@ -44,7 +44,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 )
 
 
-def _build_groups(rank: int, world_size: int, tp_size: int, gtp_size: int):
+def _build_groups(rank: int, world_size: int, tp_size: int, gtp_remat_size: int):
     """Create TP and GTP process groups for a 2D parallelism grid.
 
     Layout: rank = gtp_rank x tp_size + tp_rank
@@ -55,29 +55,29 @@ def _build_groups(rank: int, world_size: int, tp_size: int, gtp_size: int):
 
     Returns:
         tp_group:  this rank's TP process group
-        gtp_group: this rank's GTP process group
+        gtp_remat_group: this rank's GTP process group
         tp_rank:   this rank's index within its TP group
         gtp_rank:  this rank's index within its GTP group
     """
-    assert tp_size * gtp_size == world_size
+    assert tp_size * gtp_remat_size == world_size
     tp_rank = rank % tp_size
     gtp_rank = rank // tp_size
 
     tp_group = None
-    for er in range(gtp_size):
+    for er in range(gtp_remat_size):
         ranks = list(range(er * tp_size, (er + 1) * tp_size))
         grp = dist.new_group(ranks)
         if er == gtp_rank:
             tp_group = grp
 
-    gtp_group = None
+    gtp_remat_group = None
     for tr in range(tp_size):
         ranks = list(range(tr, world_size, tp_size))
         grp = dist.new_group(ranks)
         if tr == tp_rank:
-            gtp_group = grp
+            gtp_remat_group = grp
 
-    return tp_group, gtp_group, tp_rank, gtp_rank
+    return tp_group, gtp_remat_group, tp_rank, gtp_rank
 
 
 # ---------------------------------------------------------------------------
@@ -85,27 +85,29 @@ def _build_groups(rank: int, world_size: int, tp_size: int, gtp_size: int):
 # ---------------------------------------------------------------------------
 
 
-def _worker_groups(rank, world_size, port, tp_size, gtp_size):
-    tp_group, gtp_group, tp_rank, gtp_rank = _build_groups(rank, world_size, tp_size, gtp_size)
+def _worker_groups(rank, world_size, port, tp_size, gtp_remat_size):
+    tp_group, gtp_remat_group, tp_rank, gtp_rank = _build_groups(
+        rank, world_size, tp_size, gtp_remat_size
+    )
 
     assert tp_group.size() == tp_size, f"rank {rank}: TP group size {tp_group.size()} != {tp_size}"
     assert (
-        gtp_group.size() == gtp_size
-    ), f"rank {rank}: GTP group size {gtp_group.size()} != {gtp_size}"
+        gtp_remat_group.size() == gtp_remat_size
+    ), f"rank {rank}: GTP group size {gtp_remat_group.size()} != {gtp_remat_size}"
     assert (
         dist.get_rank(tp_group) == tp_rank
     ), f"rank {rank}: TP rank {dist.get_rank(tp_group)} != expected {tp_rank}"
     assert (
-        dist.get_rank(gtp_group) == gtp_rank
-    ), f"rank {rank}: GTP rank {dist.get_rank(gtp_group)} != expected {gtp_rank}"
+        dist.get_rank(gtp_remat_group) == gtp_rank
+    ), f"rank {rank}: GTP rank {dist.get_rank(gtp_remat_group)} != expected {gtp_rank}"
 
 
 class TestTPGTPProcessGroups:
-    @pytest.mark.parametrize("tp_size,gtp_size", [(2, 2)])
-    def test_group_sizes_and_ranks(self, tp_size, gtp_size):
-        world_size = tp_size * gtp_size
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_group_sizes_and_ranks(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_groups, world_size, tp_size, gtp_size)
+        _run_distributed(_worker_groups, world_size, tp_size, gtp_remat_size)
 
 
 # ---------------------------------------------------------------------------
@@ -113,23 +115,25 @@ class TestTPGTPProcessGroups:
 # ---------------------------------------------------------------------------
 
 
-def _worker_column_correctness(rank, world_size, port, tp_size, gtp_size):
+def _worker_column_correctness(rank, world_size, port, tp_size, gtp_remat_size):
     """Column-parallel output must equal inp @ (GTP-gathered TP-local weight)^T."""
     torch.manual_seed(0)
-    tp_group, gtp_group, tp_rank, gtp_rank = _build_groups(rank, world_size, tp_size, gtp_size)
+    tp_group, gtp_remat_group, tp_rank, gtp_rank = _build_groups(
+        rank, world_size, tp_size, gtp_remat_size
+    )
 
     batch, in_f = 16, 64
-    out_f = tp_size * gtp_size * 32  # per-rank shard = 32 rows
+    out_f = tp_size * gtp_remat_size * 32  # per-rank shard = 32 rows
     dtype = torch.bfloat16
 
     layer = _make_gtp_linear(
-        in_f, out_f, gtp_group, dtype, parallel_mode="column", tp_group=tp_group
+        in_f, out_f, gtp_remat_group, dtype, parallel_mode="column", tp_group=tp_group
     )
 
-    # All-gather GTP shards → TP-local full weight [out_f/tp_size, in_f]
+    # All-gather GTP_remat shards → TP-local full weight [out_f/tp_size, in_f]
     shard = layer.weight.data.clone()
-    all_gtp_shards = [torch.zeros_like(shard) for _ in range(gtp_size)]
-    dist.all_gather(all_gtp_shards, shard, group=gtp_group)
+    all_gtp_shards = [torch.zeros_like(shard) for _ in range(gtp_remat_size)]
+    dist.all_gather(all_gtp_shards, shard, group=gtp_remat_group)
     tp_local_weight = torch.cat(all_gtp_shards, dim=0).float()  # strip padding
     tp_local_weight = tp_local_weight[: out_f // tp_size]
 
@@ -138,7 +142,7 @@ def _worker_column_correctness(rank, world_size, port, tp_size, gtp_size):
     dist.broadcast(inp, src=0)
     inp_te = inp.clone().requires_grad_(True)
 
-    # TE forward: GTP all-gathers weight internally; no TP comm in column-parallel fwd
+    # TE forward: GTP_remat all-gathers weight internally; no TP comm in column-parallel fwd
     out = layer(inp_te, is_first_microbatch=True)
     assert out.shape == (
         batch,
@@ -163,11 +167,11 @@ def _worker_column_correctness(rank, world_size, port, tp_size, gtp_size):
 
 
 class TestTPGTPColumnParallelLinear:
-    @pytest.mark.parametrize("tp_size,gtp_size", [(2, 2)])
-    def test_forward_backward_correctness(self, tp_size, gtp_size):
-        world_size = tp_size * gtp_size
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_forward_backward_correctness(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_column_correctness, world_size, tp_size, gtp_size)
+        _run_distributed(_worker_column_correctness, world_size, tp_size, gtp_remat_size)
 
 
 # ---------------------------------------------------------------------------
@@ -175,19 +179,21 @@ class TestTPGTPColumnParallelLinear:
 # ---------------------------------------------------------------------------
 
 
-def _worker_row_forward_backward(rank, world_size, port, tp_size, gtp_size):
+def _worker_row_forward_backward(rank, world_size, port, tp_size, gtp_remat_size):
     """Row-parallel: weight shape verified; output is all-reduced [batch, out_f]; backward produces finite dX."""
     torch.manual_seed(0)
-    tp_group, gtp_group, tp_rank, _ = _build_groups(rank, world_size, tp_size, gtp_size)
+    tp_group, gtp_remat_group, tp_rank, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
 
     batch = 16
     in_f = tp_size * 64  # full in_features
-    out_f = gtp_size * 64  # full out_features
+    out_f = gtp_remat_size * 64  # full out_features
     dtype = torch.bfloat16
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, parallel_mode="row", tp_group=tp_group)
+    layer = _make_gtp_linear(
+        in_f, out_f, gtp_remat_group, dtype, parallel_mode="row", tp_group=tp_group
+    )
 
-    expected_shape = (out_f // gtp_size, in_f // tp_size)
+    expected_shape = (out_f // gtp_remat_size, in_f // tp_size)
     assert isinstance(
         layer.weight, GTPShardedParam
     ), f"rank {rank}: weight should be GTPShardedParam"
@@ -202,7 +208,7 @@ def _worker_row_forward_backward(rank, world_size, port, tp_size, gtp_size):
     inp = full_inp[:, tp_rank * local_in_f : (tp_rank + 1) * local_in_f]
     inp = inp.clone().requires_grad_(True)
 
-    # TE forward: GTP all-gathers weight, row-parallel all-reduces output across TP
+    # TE forward: GTP_remat all-gathers weight, row-parallel all-reduces output across TP
     out = layer(inp, is_first_microbatch=True)
     assert out.shape == (
         batch,
@@ -217,22 +223,24 @@ def _worker_row_forward_backward(rank, world_size, port, tp_size, gtp_size):
     assert torch.isfinite(inp.grad).all(), f"rank {rank}: non-finite dX"
 
 
-def _worker_row_correctness(rank, world_size, port, tp_size, gtp_size):
+def _worker_row_correctness(rank, world_size, port, tp_size, gtp_remat_size):
     """Row-parallel all-reduced output must equal inp_full @ full_weight^T."""
     torch.manual_seed(0)
-    tp_group, gtp_group, tp_rank, _ = _build_groups(rank, world_size, tp_size, gtp_size)
+    tp_group, gtp_remat_group, tp_rank, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
 
     batch = 16
     in_f = tp_size * 64
-    out_f = gtp_size * 64
+    out_f = gtp_remat_size * 64
     dtype = torch.bfloat16
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, parallel_mode="row", tp_group=tp_group)
+    layer = _make_gtp_linear(
+        in_f, out_f, gtp_remat_group, dtype, parallel_mode="row", tp_group=tp_group
+    )
 
-    # Reconstruct full weight: all-gather GTP shards → TP-local, then all-gather TP shards
+    # Reconstruct full weight: all-gather GTP_remat shards → TP-local, then all-gather TP shards
     shard = layer.weight.data.clone()
-    all_gtp_shards = [torch.zeros_like(shard) for _ in range(gtp_size)]
-    dist.all_gather(all_gtp_shards, shard, group=gtp_group)
+    all_gtp_shards = [torch.zeros_like(shard) for _ in range(gtp_remat_size)]
+    dist.all_gather(all_gtp_shards, shard, group=gtp_remat_group)
     tp_local_weight = torch.cat(all_gtp_shards, dim=0).float()  # [out_f, in_f/tp_size]
 
     all_tp_weights = [torch.zeros_like(tp_local_weight) for _ in range(tp_size)]
@@ -257,17 +265,17 @@ def _worker_row_correctness(rank, world_size, port, tp_size, gtp_size):
 
 
 class TestTPGTPRowParallelLinear:
-    @pytest.mark.parametrize("tp_size,gtp_size", [(2, 2)])
-    def test_forward_backward(self, tp_size, gtp_size):
-        world_size = tp_size * gtp_size
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_forward_backward(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_row_forward_backward, world_size, tp_size, gtp_size)
+        _run_distributed(_worker_row_forward_backward, world_size, tp_size, gtp_remat_size)
 
-    @pytest.mark.parametrize("tp_size,gtp_size", [(2, 2)])
-    def test_forward_correctness(self, tp_size, gtp_size):
-        world_size = tp_size * gtp_size
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_forward_correctness(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_row_correctness, world_size, tp_size, gtp_size)
+        _run_distributed(_worker_row_correctness, world_size, tp_size, gtp_remat_size)
 
 
 # ---------------------------------------------------------------------------
@@ -275,13 +283,13 @@ class TestTPGTPRowParallelLinear:
 # ---------------------------------------------------------------------------
 
 
-def _worker_layernorm_linear(rank, world_size, port, tp_size, gtp_size):
+def _worker_layernorm_linear(rank, world_size, port, tp_size, gtp_remat_size):
     torch.manual_seed(0)
-    tp_group, gtp_group, _, _ = _build_groups(rank, world_size, tp_size, gtp_size)
+    tp_group, gtp_remat_group, _, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
 
     seq, batch = 4, 2
     in_f = 64
-    out_f = tp_size * gtp_size * 32
+    out_f = tp_size * gtp_remat_size * 32
     dtype = torch.bfloat16
 
     layer = te.LayerNormLinear(
@@ -292,12 +300,12 @@ def _worker_layernorm_linear(rank, world_size, port, tp_size, gtp_size):
         parallel_mode="column",
         device="cuda",
         tp_group=tp_group,
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
     )
     assert isinstance(
         layer.weight, GTPShardedParam
     ), f"rank {rank}: LayerNormLinear.weight should be GTPShardedParam"
-    expected_rows = out_f // (tp_size * gtp_size)
+    expected_rows = out_f // (tp_size * gtp_remat_size)
     assert layer.weight.shape == (
         expected_rows,
         in_f,
@@ -318,8 +326,8 @@ def _worker_layernorm_linear(rank, world_size, port, tp_size, gtp_size):
 
 
 class TestTPGTPLayerNormLinear:
-    @pytest.mark.parametrize("tp_size,gtp_size", [(2, 2)])
-    def test_forward_backward(self, tp_size, gtp_size):
-        world_size = tp_size * gtp_size
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_forward_backward(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
-        _run_distributed(_worker_layernorm_linear, world_size, tp_size, gtp_size)
+        _run_distributed(_worker_layernorm_linear, world_size, tp_size, gtp_remat_size)

@@ -82,34 +82,36 @@ class DistributedDataParallel(_BaseDataParallel):
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
-        # Example process-group sizes (e.g., TP=2, GTP=64, world_size=1024 with PP=CP=EP=1 and
+        # Example process-group sizes (e.g., TP=2, GTP_remat=64, world_size=1024 with PP=CP=EP=1 and
         # single DistOpt instance):
-        #   model_size = TP x PP x CP x GTP = 2 x 64 = 128  ->  DP = 1024 / 128 = 8.
+        #   model_size = TP x PP x CP x GTP_remat = 2 x 64 = 128  ->  DP = 1024 / 128 = 8.
         #   The model weights are replicated DP (= 8) times.
-        #     dp_cp_group (degree of batch sharding, includes GTP) = GTP x DP = 64 * 8 = 512.
-        #     dp_cp_no_gtp_group (degree of weight replication, excludes GTP) = 8.
-        #     gtp_group = 64.
+        #     dp_cp_group (batch sharding, incl GTP_remat) = GTP_remat x DP = 64 * 8 = 512.
+        #     dp_cp_no_gtp_remat_group (degree of weight replication, excludes GTP_remat) = 8.
+        #     gtp_remat_group = 64.
         #     tp_group = 2.
         #
-        # Data-parallel gradient reductions for each bucket are performed over dp_cp_no_gtp_group
-        # (GTP-excluded group). Data-parallel gradient reductions over the GTP group are completed
+        # Per-bucket DP grad reductions run over dp_cp_no_gtp_remat_group
+        # (GTP_remat-excluded group). DP grad reductions over the GTP_remat group are completed
         # separately in the model backward pass.
         #
         # See Section 3.2 in `docs/api-guide/core/generalized_tensor_parallel.md`
         # for more details (including why average_in_collective=False).
         #
-        # When GTP is disabled, the *_no_gtp groups alias the regular DP groups.
+        # When GTP_remat is disabled, the *_no_gtp_remat groups alias the regular DP groups.
         self.intra_dp_cp_group = process_group_dict.get(
-            'intra_dp_cp_no_gtp_group', process_group_dict['intra_dp_cp_group']
+            'intra_dp_cp_no_gtp_remat_group', process_group_dict['intra_dp_cp_group']
         )
         self.intra_expt_dp_group = process_group_dict.get(
-            'intra_expt_dp_no_egtp_group', process_group_dict['intra_expt_dp_group']
+            'intra_expt_dp_no_egtp_remat_group', process_group_dict['intra_expt_dp_group']
         )
-        # Full cross-instance, GTP-peer-EXCLUDED groups for broadcast_params (init-time weight
-        # sync must reach all true replicas). Fall back to the full DP groups when GTP is off.
-        self.dp_cp_no_gtp_group = process_group_dict.get('dp_cp_no_gtp_group', self.dp_cp_group)
-        self.expt_dp_no_egtp_group = process_group_dict.get(
-            'expt_dp_no_egtp_group', self.expt_dp_group
+        # Full cross-instance, GTP_remat-peer-EXCLUDED groups for broadcast_params (init-time weight
+        # sync must reach all true replicas). Fall back to the full DP groups when GTP_remat is off.
+        self.dp_cp_no_gtp_remat_group = process_group_dict.get(
+            'dp_cp_no_gtp_remat_group', self.dp_cp_group
+        )
+        self.expt_dp_no_egtp_remat_group = process_group_dict.get(
+            'expt_dp_no_egtp_remat_group', self.expt_dp_group
         )
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
@@ -193,8 +195,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.full_param_layout = full_param_layout
 
-        # GTP needs average_in_collective=False: the per-bucket collective runs over the
-        # GTP-EXCLUDED group, so NCCL AVG would miss the 1/gtp factor. arguments.py guards the
+        # GTP_remat needs average_in_collective=False: the per-bucket collective runs over the
+        # GTP_remat-EXCLUDED group, so NCCL AVG would miss the 1/gtp factor. arguments.py guards the
         # training path; this assert covers direct megatron-core users.
         gtp_active = ProcessGroupCollection.is_gtp_active(process_group_dict)
         assert not (gtp_active and self.ddp_config.average_in_collective), (
@@ -401,12 +403,12 @@ class DistributedDataParallel(_BaseDataParallel):
                                     )
                                     break
                 elif getattr(param, 'is_gtp', False) and hasattr(param, 'register_grad_accum_hook'):
-                    # GTP: drive the post-hook from GTP's manual invocation, not autograd's
-                    # AccumulateGrad. GTP issues the wgrad RS async and defers the main_grad add
+                    # GTP_remat: drive post-hook from GTP_remat's manual call, not autograd's
+                    # AccumulateGrad. GTP_remat issues wgrad RS async, defers main_grad add
                     # to a later backward node, so AccumulateGrad can fire register_grad_ready
                     # before the wgrad lands in main_grad, dispatching the bucket reduce-scatter on
                     # stale grad_data (corrupts reduce_scatter_with_fp32_accumulation for
-                    # chain-boundary weights). GTP fires this hook from _handle_megatron_grad_accum
+                    # chain-boundary weights). GTP_remat fires hook from _handle_megatron_grad_accum
                     # after the add instead.
                     param.register_grad_accum_hook(None, self._make_backward_post_hook(param))
                 else:
@@ -505,7 +507,7 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    # GTP params legitimately have grad=None (async RS writes wgrad straight
+                    # GTP_remat params legitimately have grad=None (async RS writes wgrad straight
                     # into main_grad), so skip the assertion for them.
                     if not getattr(param, 'is_gtp', False):
                         assert (
@@ -635,12 +637,14 @@ class DistributedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
             is_gtp = getattr(param, 'is_gtp', False)
 
-            # Each (E)GTP peer holds a distinct 1/N shard, so broadcast over the (E)GTP-EXCLUDED
+            # Each (E)GTP_remat peer holds distinct 1/N shard; broadcast over (E)GTP_remat-EXCLUDED
             # group — else rank-0's shard would clobber the others.
             if is_expert_parallel:
-                data_parallel_group = self.expt_dp_no_egtp_group if is_gtp else self.expt_dp_group
+                data_parallel_group = (
+                    self.expt_dp_no_egtp_remat_group if is_gtp else self.expt_dp_group
+                )
             else:
-                data_parallel_group = self.dp_cp_no_gtp_group if is_gtp else self.dp_cp_group
+                data_parallel_group = self.dp_cp_no_gtp_remat_group if is_gtp else self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

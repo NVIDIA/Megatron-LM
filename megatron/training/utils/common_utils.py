@@ -103,12 +103,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # Each category needs different reduction groups.
     params_data = []                # Dense, non-sharded
     sharded_params_data = []        # Dense, sharded → reduce over dp_cp
-    gtp_params_data = []            # GTP, non-sharded
-    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_no_gtp
+    gtp_params_data = []            # GTP_remat, non-sharded
+    gtp_sharded_params_data = []    # GTP_remat, sharded → reduce over dp_cp_no_gtp_remat
     moe_params_data = []            # MoE, non-sharded
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
-    moe_gtp_params_data = []        # MoE-GTP, non-sharded
-    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_no_gtp
+    moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
+    moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp_no_gtp_remat
 
     gtp_rank = mpu.get_gtp_weight_remat_rank()
     egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
@@ -117,13 +117,13 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         for param in model_chunk.parameters():
             is_gtp = getattr(param, 'is_gtp', False)
 
-            # Filter TP duplicates. GTP params are always unique across TP ranks
+            # Filter TP duplicates. GTP_remat params are always unique across TP ranks
             # so skip this check for them.
             if not is_gtp and not param_is_not_tensor_parallel_duplicate(param):
                 continue
             is_expert = not getattr(param, 'allreduce', True)
 
-            # Filter GTP duplicates: non-GTP params are replicated across GTP ranks.
+            # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
             if is_expert:
                 if not is_gtp and egtp_rank != 0:
                     continue
@@ -169,23 +169,24 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # --- Sharded optimizer DP reductions (each category uses its own group) ---
     # Reduce over the gtp-EXCLUDED replicate group: the model-parallel reduce below already
     # spans the gtp axis, so a gtp-inclusive group here would over-count by gtp. No-op for
-    # non-GTP runs (the no_gtp group aliases the regular DP group).
+    # non-GTP_remat runs (the no_gtp_remat group aliases the regular DP group).
     _sum_reduce(
-        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp=True)
+        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp_remat=True)
     )
     _sum_reduce(
-        gtp_sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp=True)
+        gtp_sharded_norm_2,
+        mpu.get_data_parallel_group(with_context_parallel=True, no_gtp_remat=True),
     )
     _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(no_gtp=True))
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(no_gtp_remat=True))
 
-    # --- Combine dense + GTP norms ---
-    # model_parallel group = TP×GTP×PP, so GTP reduction is implicit.
+    # --- Combine dense + GTP_remat norms ---
+    # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
     norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
 
-    # --- Combine MoE + MoE-GTP norms ---
-    # expert_model_parallel = TP×EP×PP (does NOT include EGTP), so we need
-    # an explicit EGTP reduction for MoE-GTP before the model-parallel reduce.
+    # --- Combine MoE + MoE-GTP_remat norms ---
+    # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need
+    # an explicit EGTP_remat reduction for MoE-GTP_remat before the model-parallel reduce.
     moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
     _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_gtp_weight_remat_group())
     moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
