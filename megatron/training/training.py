@@ -1268,7 +1268,7 @@ def pretrain(
             )
 
             # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(model_cfg)
+            inference_config = copy.deepcopy(cfg_container.model)
             if args.rl_inference_tensor_model_parallel_size is not None:
                 inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
             if args.rl_inference_pipeline_model_parallel_size is not None:
@@ -1312,12 +1312,11 @@ def pretrain(
                 model_alloc_ctx = nullcontext()
 
             with model_alloc_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
+                builder_cls = inference_config.get_builder_cls()
+                builder = builder_cls(inference_config)
+                inference_model = builder.build_distributed_models(
                     pg_collection=inference_pg_collection,
-                    config=inference_config,
+                    wrap_with_ddp=False,
                 )
             inference_model[0].eval()
 

@@ -8,7 +8,6 @@ from functools import partial
 import torch
 
 from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -389,28 +388,6 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(
-        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
-    ):
-        if is_hybrid_model(args):
-            return hybrid_builder(
-                args,
-                pre_process,
-                post_process,
-                vp_stage,
-                config=config,
-                pg_collection=pg_collection,
-            )
-        else:
-            return _gpt_builder(
-                args,
-                pre_process,
-                post_process,
-                vp_stage,
-                config=config,
-                pg_collection=pg_collection,
-            )
-
     args = parse_and_validate_args(
         extra_args_provider=add_inference_args,
         args_defaults={},
@@ -425,5 +402,4 @@ if __name__ == "__main__":
         None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, _model_builder),
     )
