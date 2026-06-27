@@ -16,6 +16,7 @@ import argparse
 import os
 import sys
 import torch
+import functools
 
 HF_WEIGHTS = (
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
