@@ -439,8 +439,17 @@ class _ParamAndGradBucketGroup:
             # original path.
             decouple = not getattr(self.ddp_config, 'use_layer_wise_param_layout', True)
             for bucket in self.buckets:
+                # A decoupled LayerWise (Muon) bucket can MIX fp8 and bf16 params:
+                # merge_layerwise_fp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
+                # share ONE buffer (hence bucket) with their bf16 siblings (e.g. an MoE router /
+                # DSA indexer / mHC weight that is not fp8-quantized). The bf16-staged path handles
+                # both dtypes, so a bucket holding ANY fp8 param must take it -- scanning only
+                # params_list[0] mis-routes a bf16-first mixed bucket into the raw
+                # _flatten_dense_tensors() path, which crashes on the MXFP8 .view(-1).
                 bucket_is_fp8 = bool(
-                    decouple and bucket.params_list and is_float8tensor(bucket.params_list[0])
+                    decouple
+                    and bucket.params_list
+                    and any(is_float8tensor(p) for p in bucket.params_list)
                 )
                 # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
                 # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
