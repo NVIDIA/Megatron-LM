@@ -170,7 +170,6 @@ def _run_mlm(ids):
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
 
-    from ic_tests import _build_model, _init_distributed, _make_config
     from megatron.core import dist_checkpointing
     from megatron.core.models.gemma4.gemma4_layer_specs import get_gemma4_layer_local_spec
 
