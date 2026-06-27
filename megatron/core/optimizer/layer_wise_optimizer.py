@@ -130,15 +130,18 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
             if grp is None or grp.size() <= 1:
                 continue
             # Normalize the param name so it matches the optimizer-state checkpoint key suffix,
-            # which is wrapper-free and layer-collapsed. Two transforms, in order:
-            #   1. drop every leading 'module.' (DDP + Float16Module can double-wrap the model), and
-            #   2. collapse the layer index (the checkpoint key drops it -- it is a sharded axis).
+            # which is wrapper-free and layer-collapsed. Three transforms, in order:
+            #   1. drop every leading 'module.' (DDP + Float16Module can double-wrap the model),
+            #   2. collapse the layer index (the checkpoint key drops it -- a sharded axis), and
+            #   3. collapse SequentialMLP 'local_experts.<N>' to the grouped key 'experts' (the
+            #      checkpoint groups them, matching TEGroupedMLP), else expert replicas collide.
             # e.g.  'module.module.decoder.layers.3.mlp.router.weight'
             #         -> 'decoder.layers.mlp.router.weight'
             nm = name
             while nm.startswith('module.'):
                 nm = nm[len('module.') :]
             nm = re.sub(r'\.layers\.\d+\.', '.layers.', nm)
+            nm = re.sub(r'\.local_experts\.\d+\.', '.experts.', nm)
             gtp_fold[nm] = (grp.rank(), grp.size())
     return gtp_fold
 
