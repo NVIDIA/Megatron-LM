@@ -613,15 +613,6 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
-    static_cp_target_len = None
-    if (
-        config is not None
-        and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
-        and cp_group.size() > 1
-        and getattr(config, 'pad_packed_seq_alignment', None) == "max"
-        and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
-    ):
-        static_cp_target_len = int(config.max_seqlen_per_dp_cp_rank)
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
@@ -653,6 +644,32 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
+    use_dsv4_cp_slice = (
+        config is not None
+        and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
+    )
+    dsv4_cp_local_target_len = None
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    alignment = target_len = max_num_seqs = None
+    if pad_alignment is not None:
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_alignment,
+            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+            getattr(config, 'thd_max_packed_sequences', None),
+            getattr(config, 'cuda_graph_impl', 'none') != 'none',
+        )
+    if is_tp_rank_0 and use_dsv4_cp_slice and pad_alignment is not None:
+        if target_len is not None:
+            dsv4_cp_local_target_len = target_len
+        else:
+            # Fix the local width before slicing so later padding cannot shift rank origins.
+            assert alignment is not None
+            total_rows = int(batch['cu_seqlens_padded'][-1].item())
+            local_rows = (total_rows + cp_group.size() - 1) // cp_group.size()
+            dsv4_cp_local_target_len = ((local_rows + alignment - 1) // alignment) * alignment
+
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
     if is_tp_rank_0:
@@ -667,20 +684,16 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_slice_keys = ['padding_mask']
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-        csa_cp_partition_mode = None
-        if (
-            config is not None
-            and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
-        ):
-            csa_cp_partition_mode = config.csa_cp_partition_mode
         partition_total_tokens = (
-            static_cp_target_len * cp_group.size() if static_cp_target_len is not None else None
+            dsv4_cp_local_target_len * cp_group.size()
+            if dsv4_cp_local_target_len is not None
+            else None
         )
         get_cp_slice_for_thd(
             batch,
             cp_group,
             keys=cp_slice_keys,
-            csa_cp_partition_mode=csa_cp_partition_mode,
+            use_dsv4_cp_slice=use_dsv4_cp_slice,
             partition_total_tokens=partition_total_tokens,
         )
 
@@ -696,8 +709,8 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Broadcast total_tokens because padding_mask is prepared on every PP stage.
     # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
     if is_tp_rank_0:
-        if static_cp_target_len is not None:
-            total_tokens = torch.tensor([static_cp_target_len], dtype=torch.int32, device=dev)
+        if dsv4_cp_local_target_len is not None:
+            total_tokens = torch.tensor([dsv4_cp_local_target_len], dtype=torch.int32, device=dev)
         else:
             # Under VPP, the last PP stage has labels but no tokens, so derive
             # total_tokens from cu_seqlens_padded, which is present on every
@@ -824,16 +837,7 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
     # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    pad_alignment = (
-        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
-    )
     if pad_alignment is not None and packed_seq_params is not None:
-        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
-            pad_alignment,
-            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
-            getattr(config, 'thd_max_packed_sequences', None),
-            getattr(config, 'cuda_graph_impl', 'none') != 'none',
-        )
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,

@@ -128,7 +128,6 @@ class DSv4HybridAttention(Attention):
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
         self._dsv4_compress_ratio = compress_ratio
-        self._dsv4_rope_base = rope_base
         self._dsv4_uses_yarn_rope = use_compressed_yarn
         if not use_compressed_yarn:
             self.rotary_pos_emb = RotaryEmbedding(
@@ -275,9 +274,8 @@ class DSv4HybridAttention(Attention):
         if cp_size > 1:
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 hidden_states,
-                self.config.csa_compress_ratios,
+                self._dsv4_compress_ratio,
                 self.config.csa_window_size,
-                self.config.csa_cp_partition_mode,
                 self.pg_collection.cp,
             )
 
@@ -286,7 +284,7 @@ class DSv4HybridAttention(Attention):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value, q_compressed, _, boundary_kv = self.get_query_key_value_tensors(
+        query, key, value, q_compressed, boundary_kv = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
             position_ids,
@@ -383,12 +381,7 @@ class DSv4HybridAttention(Attention):
             if cp_size > 1:
                 if rope_seqlen is None:
                     raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
-                chunk_ranges = cp_utils.local_q_cp_chunk_ranges(
-                    self.config.csa_cp_partition_mode,
-                    core_attn_out.shape[0],
-                    cp_size,
-                    self.pg_collection.cp.rank(),
-                )
+                global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
                 core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
                     core_attn_out,
                     rotary_pos_cos,
@@ -396,7 +389,7 @@ class DSv4HybridAttention(Attention):
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
-                    chunk_ranges,
+                    global_start,
                     inverse=True,
                 )
             else:
@@ -583,7 +576,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
 
         Returns:
-            Tuple of ``(query, key, value, q_compressed, kv_compressed, boundary_kv)``.
+            Tuple of ``(query, key, value, q_compressed, boundary_kv)``.
             ``boundary_kv`` carries CP boundary rows when the DSv4 CP path is active.
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
@@ -651,7 +644,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
         kv_compressed = hidden_states
         boundary_kv_compressed = boundary_hidden
-        k_pos_emb = None
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
@@ -675,7 +667,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # =========================================
 
         def qkv_up_proj_and_rope_apply(
-            q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed
+            q_compressed, kv_compressed, rotary_pos_emb, boundary_kv_compressed
         ):
             """
             Apply the up projection and RoPE to the query and key.
@@ -702,19 +694,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             kv = self.kv_layernorm(kv)
             boundary_kv = None
 
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            if k_pos_emb is not None:
-                k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
-
             cp_size = self.pg_collection.cp.size()
             if self.config.apply_rope_fusion:
                 if cp_size > 1:
                     cp_rank = self.pg_collection.cp.rank()
-                    # CP local rows may start mid-sequence; use global THD ranges for RoPE.
+                    # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
                     assert packed_seq, "DSv4 CP fused RoPE expects THD packed sequence input."
-                    chunk_ranges = cp_utils.local_q_cp_chunk_ranges(
-                        self.config.csa_cp_partition_mode, q.shape[0], cp_size, cp_rank
-                    )
+                    global_start = cp_rank * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_fused(
                         q,
                         rotary_pos_cos,
@@ -722,18 +708,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
-                        chunk_ranges,
-                    )
-                    kv_chunk_ranges = (
-                        cp_utils.local_kv_cp_chunk_ranges(
-                            self.config.csa_cp_partition_mode,
-                            kv_compressed.shape[0],
-                            boundary_rows,
-                            cp_size,
-                            cp_rank,
-                        )
-                        if boundary_rows
-                        else chunk_ranges
+                        global_start,
                     )
                     kv = kv.unsqueeze(-2)
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
@@ -743,7 +718,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
-                        kv_chunk_ranges,
+                        global_start - boundary_rows,
                         clamp_to_valid_token=bool(boundary_rows),
                     )
                     if boundary_rows:
@@ -852,16 +827,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 qkv_up_proj_and_rope_apply,
                 q_compressed,
                 kv_compressed,
-                k_pos_emb,
                 rotary_pos_emb,
                 boundary_kv_compressed,
             )
         else:
             query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(
-                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed
+                q_compressed, kv_compressed, rotary_pos_emb, boundary_kv_compressed
             )
 
-        return query, key, value, q_compressed, kv_compressed, boundary_kv
+        return query, key, value, q_compressed, boundary_kv
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""

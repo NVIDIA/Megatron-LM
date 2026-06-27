@@ -15,26 +15,24 @@ def get_cp_slice_for_thd(
     batch,
     cp_group,
     keys: Optional[Sequence[str]] = None,
-    csa_cp_partition_mode: Optional[str] = None,
+    use_dsv4_cp_slice: bool = False,
     partition_total_tokens: Optional[int] = None,
 ):
     """Partition sequence data for context parallelism in THD format.
 
-    Uses TE's THD partitioned indices by default. When ``csa_cp_partition_mode``
-    is provided, uses the CSA partition helper so data row order matches the
-    DSv4 attention layer's CP row order. Only keys present in the batch are sliced.
+    Uses TE's THD partitioned indices by default. DSv4 instead assigns each rank one
+    ordered range of the global rows. Only keys present in the batch are sliced.
 
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
-        csa_cp_partition_mode: Optional CSA CP partition mode for DSv4 hybrid attention.
-        partition_total_tokens: Optional padded total used only for choosing CP row indices.
-            When set, tensors selected by ``keys`` are tail-padded to this length before
-            slicing. Existing cu_seqlens metadata is left unchanged.
+        use_dsv4_cp_slice: Whether to use the DSv4 row assignment.
+        partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
+            before slicing. Existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
-    if cp_size <= 1:
+    if cp_size <= 1 and partition_total_tokens is None:
         return
     cp_rank = cp_group.rank()
     # Partition with padded cumulative lengths so CP slices match the THD
@@ -63,16 +61,23 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
-    if csa_cp_partition_mode is None:
-        index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-    else:
-        from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-            thd_cp_local_row_indices,
-        )
+    if cp_size <= 1:
+        return
+    if use_dsv4_cp_slice:
+        if total_tokens % cp_size != 0:
+            raise RuntimeError(
+                f"DSv4 CP slicing requires total_tokens={total_tokens} to be divisible by "
+                f"cp_size={cp_size}."
+            )
+        local_rows = total_tokens // cp_size
+        # Rank r takes [r * local_rows, (r + 1) * local_rows).
+        row_slice = slice(cp_rank * local_rows, (cp_rank + 1) * local_rows)
+        for key in keys:
+            if key in batch and batch[key] is not None:
+                batch[key] = batch[key][row_slice]
+        return
 
-        index = thd_cp_local_row_indices(
-            csa_cp_partition_mode, total_tokens, cp_size, cp_rank, cu_seqlens.device
-        )
+    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
     for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)

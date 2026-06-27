@@ -6,11 +6,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -357,7 +355,7 @@ class TestDSv4HybridQKV:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
         ).cuda()
 
-        q, k, v, q_compressed, kv_compressed, _ = attn.get_query_key_value_tensors(hidden)
+        q, k, v, _, _ = attn.get_query_key_value_tensors(hidden)
 
         n_heads = self.config.num_attention_heads
         v_dim = self.config.v_head_dim
@@ -380,7 +378,7 @@ class TestDSv4HybridQKV:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
         ).cuda()
 
-        q, k, v, _, _, _ = attn.get_query_key_value_tensors(hidden)
+        q, k, v, _, _ = attn.get_query_key_value_tensors(hidden)
         assert torch.equal(k, v), "key and value should be identical in wkv path"
 
 

@@ -17,11 +17,6 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    DSV4_CP_PARTITION_CONTIGUOUS,
-    DSV4_CP_PARTITION_TWO_CHUNK,
-    thd_cp_local_row_indices,
-)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     _SEED,
@@ -270,7 +265,6 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     apply_dsa_kernel_fusion=True,
     apply_rope_fusion=True,
-    csa_cp_partition_mode=DSV4_CP_PARTITION_CONTIGUOUS,
 ):
     """Build the DSv4 flash attention config used by CP tests."""
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
@@ -299,7 +293,6 @@ def _make_dsv4_cp_config(
         expert_model_parallel_size=1,
         apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
         apply_rope_fusion=apply_rope_fusion,
-        csa_cp_partition_mode=csa_cp_partition_mode,
     )
 
 
@@ -311,20 +304,13 @@ def _copy_module_parameters(src, dst):
         param.data.copy_(src_params[name].data)
 
 
-def _make_cp_partition_indices(partition_mode, padded_total_tokens, cp_size, device='cuda'):
-    """Return local row indices for every CP rank."""
-    return tuple(
-        thd_cp_local_row_indices(partition_mode, padded_total_tokens, cp_size, rank, device)
-        for rank in range(cp_size)
-    )
-
-
-def _make_ragged_cp_case(partition_mode, cp_size, cp_rank):
+def _make_ragged_cp_case(cp_size, cp_rank):
     """Build the ragged THD packed params and local rows for one CP rank."""
     padded_total_tokens = sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS)
     packed = _make_thd_packed_seq_params(_DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_RAGGED_PADDED_SEG_LENS)
-    partition_indices = _make_cp_partition_indices(partition_mode, padded_total_tokens, cp_size)
-    return packed, padded_total_tokens, partition_indices[cp_rank]
+    local_rows = padded_total_tokens // cp_size
+    local_indices = torch.arange(cp_rank * local_rows, (cp_rank + 1) * local_rows, device='cuda')
+    return packed, padded_total_tokens, local_indices
 
 
 def _make_hidden_and_grad(padded_total_tokens, hidden_size):
@@ -445,13 +431,10 @@ def _measure_cuda_graph_time(attn, static_hidden, static_grad, packed_seq_params
     return _max_float_across_world(statistics.median(timings))
 
 
-def _format_scale_report(
-    metric, layer_number, cp_size, partition_mode, baseline, measured, scale, limit
-):
+def _format_scale_report(metric, layer_number, cp_size, baseline, measured, scale, limit):
     """Format a CP-vs-CP1 scale report line."""
     return (
         f"DSv4 THD CP {metric} scale layer={layer_number} cp{cp_size}: "
-        f"partition={partition_mode}, "
         f"cp1={baseline:.6f}, cp{cp_size}={measured:.6f}, "
         f"scale={scale:.6f}, limit={limit:.6f}"
     )
@@ -564,23 +547,14 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    @pytest.mark.parametrize(
-        "partition_mode",
-        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_TWO_CHUNK],
-        ids=["contiguous", "two_chunk"],
-    )
-    def test_thd_cp_matches_full_reference_forward_backward(self, layer_number, partition_mode):
+    def test_thd_cp_matches_full_reference_forward_backward(self, layer_number):
         """CP path matches the full-sequence THD reference on ragged
         packed inputs using the DSv4 layer configuration.
 
         Verifies local CP output, hidden grad, and reduced parameter grads
-        against the sliced full-reference tensors. The test body is shared by
-        contiguous and two-chunk CP; only the partition mode and
-        local row indices differ.
+        against the sliced full-reference tensors.
         """
-        packed, padded_tokens, local_idx = _make_ragged_cp_case(
-            partition_mode, self.cp_size, self.cp_rank
-        )
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
         torch.manual_seed(_SEED + layer_number)
         model_parallel_cuda_manual_seed(_SEED + layer_number)
@@ -590,7 +564,6 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             apply_dsa_kernel_fusion=self.fused_kernels_available,
             apply_rope_fusion=True,
-            csa_cp_partition_mode=partition_mode,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -624,7 +597,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_out.detach(),
             ref_out.detach().index_select(0, local_idx),
-            f"layer={layer_number}:{partition_mode}:output",
+            f"layer={layer_number}:output",
         )
 
         grad = torch.randn_like(ref_out)
@@ -633,7 +606,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_hidden.grad.detach(),
             ref_hidden.grad.index_select(0, local_idx),
-            f"layer={layer_number}:{partition_mode}:hidden_grad",
+            f"layer={layer_number}:hidden_grad",
         )
 
         ref_params = dict(ref_attn.named_parameters())
@@ -643,19 +616,14 @@ class TestDSv4HybridAttentionTHDCP:
             assert ref_grad is not None, f"Missing reference grad for {name}"
             grad_sum = param.grad.detach().clone()
             dist.all_reduce(grad_sum, group=self.pg.cp)
-            _assert_cp_tensor_match(
-                grad_sum, ref_grad, f"layer={layer_number}:{partition_mode}:param_grad:{name}"
-            )
+            _assert_cp_tensor_match(grad_sum, ref_grad, f"layer={layer_number}:param_grad:{name}")
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
     def test_thd_cp_ratio4_eval_matches_full_reference(self):
-        """Ratio-4 two-chunk inference lowers logical indexer top-k rows correctly."""
-        partition_mode = DSV4_CP_PARTITION_TWO_CHUNK
-        packed, padded_tokens, local_idx = _make_ragged_cp_case(
-            partition_mode, self.cp_size, self.cp_rank
-        )
+        """Ratio-4 inference lowers logical indexer top-k rows correctly."""
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
         torch.manual_seed(_SEED + 1202)
         model_parallel_cuda_manual_seed(_SEED + 1202)
@@ -663,7 +631,6 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             apply_dsa_kernel_fusion=self.fused_kernels_available,
             apply_rope_fusion=True,
-            csa_cp_partition_mode=partition_mode,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -688,7 +655,7 @@ class TestDSv4HybridAttentionTHDCP:
                 hidden_states=full_hidden, attention_mask=None, packed_seq_params=packed
             )
         _assert_cp_tensor_match(
-            local_out, ref_out.index_select(0, local_idx), f"layer=2:eval:{partition_mode}:output"
+            local_out, ref_out.index_select(0, local_idx), "layer=2:eval:output"
         )
 
         del cp_attn, ref_attn, full_hidden, local_hidden, local_out, ref_out
@@ -700,14 +667,7 @@ class TestDSv4HybridAttentionTHDCP:
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
     @pytest.mark.parametrize("fused", [True, False])
-    @pytest.mark.parametrize(
-        "partition_mode",
-        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_TWO_CHUNK],
-        ids=["contiguous", "two_chunk"],
-    )
-    def test_thd_cp_cuda_graph_matches_eager_forward_backward(
-        self, layer_number, fused, partition_mode
-    ):
+    def test_thd_cp_cuda_graph_matches_eager_forward_backward(self, layer_number, fused):
         """CUDA graph replay matches eager THD CP forward/backward.
 
         Captures the DSv4 attention layer's CP-local forward and backward
@@ -725,9 +685,7 @@ class TestDSv4HybridAttentionTHDCP:
         context = nullcontext() if fused else _deterministic_torch_algorithms()
         mode = "fused" if fused else "unfused"
         with context:
-            packed, padded_tokens, local_idx = _make_ragged_cp_case(
-                partition_mode, self.cp_size, self.cp_rank
-            )
+            packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
             torch.manual_seed(_SEED + 700 + layer_number)
             model_parallel_cuda_manual_seed(_SEED + 700 + layer_number)
@@ -737,7 +695,6 @@ class TestDSv4HybridAttentionTHDCP:
                 dsa_indexer_use_sparse_loss=True,
                 apply_dsa_kernel_fusion=fused,
                 apply_rope_fusion=True,
-                csa_cp_partition_mode=partition_mode,
             )
             graph_attn = _build_attention(
                 config, layer_number=layer_number, pg_collection=self.pg
@@ -784,21 +741,19 @@ class TestDSv4HybridAttentionTHDCP:
             )
             torch.cuda.synchronize()
             assert graph_param_grads.keys() == eager_param_grads.keys()
-            output_label = f"layer={layer_number}:{mode}:{partition_mode}:output"
+            output_label = f"layer={layer_number}:{mode}:output"
             _assert_cp_graph_bitwise_match(graph_out, eager_out, output_label)
             bwd_match_fn = (
                 _assert_cp_graph_fused_grad_match if fused else _assert_cp_graph_bitwise_match
             )
             bwd_match_fn(
-                graph_hidden_grad,
-                eager_hidden_grad,
-                f"layer={layer_number}:{mode}:{partition_mode}:hidden_grad",
+                graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:{mode}:hidden_grad"
             )
             for name, graph_grad in graph_param_grads.items():
                 bwd_match_fn(
                     graph_grad,
                     eager_param_grads[name],
-                    f"layer={layer_number}:{mode}:{partition_mode}:param_grad:{name}",
+                    f"layer={layer_number}:{mode}:param_grad:{name}",
                 )
 
             del graph, graph_output
@@ -809,14 +764,7 @@ class TestDSv4HybridAttentionTHDCP:
     @pytest.mark.parametrize(
         "layer_number", [2, 3], ids=["ratio_4_indexer", "ratio_128_compressor"]
     )
-    @pytest.mark.parametrize(
-        "partition_mode",
-        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_TWO_CHUNK],
-        ids=["contiguous", "two_chunk"],
-    )
-    def test_thd_cp_cuda_graph_replay_accepts_changed_padded_boundaries(
-        self, layer_number, partition_mode
-    ):
+    def test_thd_cp_cuda_graph_replay_accepts_changed_padded_boundaries(self, layer_number):
         """CUDA graph replay uses updated device cu_seqlens_padded values.
 
         The graph is captured with one padded THD layout, then replayed after
@@ -844,9 +792,10 @@ class TestDSv4HybridAttentionTHDCP:
         assert not torch.equal(
             capture_packed.cu_seqlens_q_padded, replay_packed.cu_seqlens_q_padded
         )
-        local_idx = _make_cp_partition_indices(partition_mode, padded_tokens, self.cp_size)[
-            self.cp_rank
-        ]
+        local_rows = padded_tokens // self.cp_size
+        local_idx = torch.arange(
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device='cuda'
+        )
 
         torch.manual_seed(_SEED + 1100 + layer_number)
         model_parallel_cuda_manual_seed(_SEED + 1100 + layer_number)
@@ -856,7 +805,6 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             apply_dsa_kernel_fusion=True,
             apply_rope_fusion=True,
-            csa_cp_partition_mode=partition_mode,
         )
         graph_attn = _build_attention(
             config, layer_number=layer_number, pg_collection=self.pg
@@ -911,18 +859,18 @@ class TestDSv4HybridAttentionTHDCP:
         torch.cuda.synchronize()
         assert graph_param_grads.keys() == eager_param_grads.keys()
         _assert_cp_graph_bitwise_match(
-            graph_out, eager_out, f"layer={layer_number}:metadata_replay:{partition_mode}:output"
+            graph_out, eager_out, f"layer={layer_number}:metadata_replay:output"
         )
         _assert_cp_graph_fused_grad_match(
             graph_hidden_grad,
             eager_hidden_grad,
-            f"layer={layer_number}:metadata_replay:{partition_mode}:hidden_grad",
+            f"layer={layer_number}:metadata_replay:hidden_grad",
         )
         for name, graph_grad in graph_param_grads.items():
             _assert_cp_graph_fused_grad_match(
                 graph_grad,
                 eager_param_grads[name],
-                f"layer={layer_number}:metadata_replay:{partition_mode}:param_grad:{name}",
+                f"layer={layer_number}:metadata_replay:param_grad:{name}",
             )
 
         del graph, graph_output, graph_attn, eager_attn, capture_full_hidden, replay_full_hidden
@@ -935,12 +883,7 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    @pytest.mark.parametrize(
-        "partition_mode",
-        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_TWO_CHUNK],
-        ids=["contiguous", "two_chunk"],
-    )
-    def test_thd_cp_peak_allocated_delta_scales_vs_cp1(self, layer_number, partition_mode):
+    def test_thd_cp_peak_allocated_delta_scales_vs_cp1(self, layer_number):
         """CP-local THD forward/backward peak allocated delta scales down vs CP1.
 
         This is a black-box guard against implementations that pass parity but
@@ -950,9 +893,7 @@ class TestDSv4HybridAttentionTHDCP:
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
-        packed, padded_tokens, local_idx = _make_ragged_cp_case(
-            partition_mode, self.cp_size, self.cp_rank
-        )
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
         ref_delta = self._measure_cp1_peak_allocated_delta(layer_number, packed, padded_tokens)
 
@@ -963,7 +904,6 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            csa_cp_partition_mode=partition_mode,
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg
@@ -984,7 +924,6 @@ class TestDSv4HybridAttentionTHDCP:
             "memory_delta_mib",
             layer_number,
             self.cp_size,
-            partition_mode,
             ref_delta / (1024.0**2),
             cp_delta / (1024.0**2),
             scale,
@@ -1001,12 +940,7 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    @pytest.mark.parametrize(
-        "partition_mode",
-        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_TWO_CHUNK],
-        ids=["contiguous", "two_chunk"],
-    )
-    def test_thd_cp_cuda_graph_time_scales_vs_cp1(self, layer_number, partition_mode):
+    def test_thd_cp_cuda_graph_time_scales_vs_cp1(self, layer_number):
         """CP-local CUDA graph replay time scales down vs CP1 on the same machine.
 
         This is a black-box performance guard: correctness and memory scaling
@@ -1016,9 +950,7 @@ class TestDSv4HybridAttentionTHDCP:
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
-        packed, padded_tokens, local_idx = _make_ragged_cp_case(
-            partition_mode, self.cp_size, self.cp_rank
-        )
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
         ref_time_ms = self._measure_cp1_cuda_graph_time(layer_number, packed, padded_tokens)
 
@@ -1029,7 +961,6 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            csa_cp_partition_mode=partition_mode,
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg
@@ -1047,14 +978,7 @@ class TestDSv4HybridAttentionTHDCP:
         limit = _DSV4_CP_GRAPH_TIME_RATIO_LIMITS[self.cp_size]
         scale = cp_time_ms / ref_time_ms
         report = _format_scale_report(
-            "graph_time_ms",
-            layer_number,
-            self.cp_size,
-            partition_mode,
-            ref_time_ms,
-            cp_time_ms,
-            scale,
-            limit,
+            "graph_time_ms", layer_number, self.cp_size, ref_time_ms, cp_time_ms, scale, limit
         )
         print(report)
         assert scale <= limit, report

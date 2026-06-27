@@ -1632,22 +1632,6 @@ def _ref_attn_full_score(
     return torch.where(valid, s, torch.zeros_like(s))
 
 
-def _ref_indexer_predict_sparse(q_bshd_fp32, k_bsd_fp32, w_bsh_fp32, topk_indices, sm_scale):
-    """Reference for ``sparse_indexer_score_recompute_wrapper.predict``.
-
-    Compute the full-KV indexer score, gather ``topk_indices``, softmax
-    over the topK axis. ``-1`` entries in topk are masked to ``-inf``
-    so they contribute zero probability.
-    """
-    qk = torch.einsum('bqhd,bkd->bqhk', q_bshd_fp32, k_bsd_fp32)
-    s = (torch.relu(qk) * w_bsh_fp32.unsqueeze(-1)).sum(dim=2) * sm_scale  # (B, Sq, Sk)
-    valid = topk_indices >= 0
-    safe = topk_indices.clamp(min=0).long()
-    s_topk = torch.gather(s, dim=-1, index=safe)
-    s_topk = torch.where(valid, s_topk, torch.full_like(s_topk, float('-inf')))
-    return torch.softmax(s_topk, dim=-1)
-
-
 def _ref_attn_target_sparse(q_bshd_fp32, k_bsd_fp32, lse_bsh_fp32, topk_indices, softmax_scale):
     """Reference for ``sparse_attn_score_recompute_wrapper.target``.
 
@@ -1835,17 +1819,16 @@ def _build_real_score_inputs(s, *, with_lse: bool = True, with_topk: bool = True
 
 
 class TestRealKernelScoreHelpers:
-    """Real-kernel parity tests for the four ``_compute_*`` score helpers
+    """Real-kernel parity tests for three ``_compute_*`` score helpers
     against PyTorch reference implementations. Single parametrized test
-    covers all four; numeric tolerance is bf16-friendly (raw fp32 score
+    covers all three; numeric tolerance is bf16-friendly (raw fp32 score
     sums agree to ~5%, normalized distributions to ~5e-3).
     """
 
     # Each case: (id, sm_min, kernel_name, runner). The runner does the
     # call + ref + assertion; it returns nothing on success.
     @pytest.mark.parametrize(
-        "case",
-        ['sparse_indexer_predict', 'sparse_attn_target', 'dense_indexer_score', 'dense_attn_score'],
+        "case", ['sparse_attn_target', 'dense_indexer_score', 'dense_attn_score']
     )
     def test_real_score_helper(self, case, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable(sm_min=10)
@@ -1860,29 +1843,7 @@ class TestRealKernelScoreHelpers:
 
         from megatron.core.transformer.experimental_attention_variant import dsa_kernels as _dk
 
-        if case == 'sparse_indexer_predict':
-            # The kernel takes sm_scale=1.0; scale is applied via weights
-            # pre-multiplication (relu(c·x)·W trick). Reference mirrors that.
-            scale = s['indexer_softmax_scale']
-            w_scaled = (x['w'].float() * scale).to(x['w'].dtype)
-            out = _dk._compute_indexer_predict(
-                x['q_idx'], x['k_idx'], w_scaled, x['topk'], qhead_per_kv_head=s['idx_nh']
-            )
-            ref = _ref_indexer_predict_sparse(
-                x['q_idx'].float(), x['k_idx'].float(), w_scaled.float(), x['topk'], sm_scale=1.0
-            )
-            # Softmax outputs in [0, 1]; bf16 element-wise noise can break
-            # absolute tolerance, so compare directions via cosine similarity.
-            assert out.shape == ref.shape == (s['b'], s['sq'], s['topk'])
-            cos = torch.nn.functional.cosine_similarity(
-                out.flatten().unsqueeze(0).float(), ref.flatten().unsqueeze(0).float()
-            ).item()
-            assert cos > 0.99, (
-                f"{case}: cos sim = {cos:.4f}, "
-                f"max abs diff = {(out - ref).abs().max().item():.3e}"
-            )
-
-        elif case == 'sparse_attn_target':
+        if case == 'sparse_attn_target':
             out = _dk._compute_attn_target(
                 x['q_attn'],
                 x['k_attn'],
@@ -2817,7 +2778,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         cu_comp_idx = _make_cu_seqlens([s['n_comp']], device=dev)
 
         # B=1: per-segment [kv, compressed] layout collapses to a single
-        # contiguous slice — same kv_offset as the SBHD case.
+        # Ordered slice with the same kv_offset as the SBHD case.
         compressed_kv_thd = kv_full_thd[kv_offset:]
         _, loss_thd = fused_indexer_sparse_attn(
             query_thd,

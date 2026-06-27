@@ -479,7 +479,7 @@ def _indexer_topk_core(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
-    visible_k_lengths: Optional[Tensor] = None,
+    valid_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
@@ -545,23 +545,23 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        if visible_k_lengths is not None:
-            if visible_k_lengths.shape[0] != total_q:
+        if valid_k_lengths is not None:
+            if valid_k_lengths.shape[0] != total_q:
                 raise ValueError(
-                    "visible_k_lengths must have one entry per THD query row: "
-                    f"got={visible_k_lengths.shape[0]}, expected={total_q}."
+                    "valid_k_lengths must have one entry per THD query row: "
+                    f"got={valid_k_lengths.shape[0]}, expected={total_q}."
                 )
-            if visible_k_lengths.dtype != torch.int32:
-                raise ValueError(f"visible_k_lengths must be int32, got {visible_k_lengths.dtype}.")
-            if visible_k_lengths.device != device:
-                raise ValueError("visible_k_lengths must be on the same device as q_indexer.")
-            seq_lens = visible_k_lengths
+            if valid_k_lengths.dtype != torch.int32:
+                raise ValueError(f"valid_k_lengths must be int32, got {valid_k_lengths.dtype}.")
+            if valid_k_lengths.device != device:
+                raise ValueError("valid_k_lengths must be on the same device as q_indexer.")
+            seq_lens = valid_k_lengths
         else:
             # Per-row valid KV length: for token ``i`` in batch ``b``,
             #   pos_in_seq = i - cu_seqlens_q[b]
             #   valid = min((pos_in_seq + 1) // ratio, seqlen_kv[b])
-            # CP callers with a trapezoid mask pass ``visible_k_lengths``
-            # directly because q/k local ranges can differ from this formula.
+            # Callers with nonstandard Q/K alignment pass ``valid_k_lengths``
+            # when this default bottom-right mask formula does not apply.
             row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
             row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
             row_valid = row_idx < cu_seqlens_q[-1]
@@ -631,7 +631,7 @@ def indexer_topk(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
-    visible_k_lengths: Optional[Tensor] = None,
+    valid_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -653,10 +653,10 @@ def indexer_topk(
         cu_seqlens_kv: THD only — ``(B+1,)`` int32 CUDA cumulative KV lens.
         max_seqlen_q: THD only — per-batch max Q length.
         max_seqlen_kv: THD only — per-batch max KV length.
-        visible_k_lengths: THD only — optional ``(total_q,)`` int32 CUDA
-            tensor with the per-row visible K length for the radix top-K wrapper.
-            Callers pass this from a layout kernel to avoid rebuilding the
-            same metadata with generic PyTorch indexing during CUDA graph replay.
+        valid_k_lengths: THD only — optional ``(total_q,)`` int32 CUDA tensor
+            overriding the per-row valid K count passed to the radix top-K
+            wrapper when the default bottom-right mask does not describe the
+            Q/K alignment.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -670,8 +670,8 @@ def indexer_topk(
             "indexer_topk THD mode requires cu_seqlens_q, cu_seqlens_kv, "
             "max_seqlen_q, and max_seqlen_kv to all be supplied."
         )
-    if not is_thd and visible_k_lengths is not None:
-        raise ValueError("visible_k_lengths is only supported in THD mode.")
+    if not is_thd and valid_k_lengths is not None:
+        raise ValueError("valid_k_lengths is only supported in THD mode.")
 
     # ``indexer_softmax_scale`` is applied via the
     # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
@@ -699,7 +699,7 @@ def indexer_topk(
         cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
-        visible_k_lengths=visible_k_lengths,
+        valid_k_lengths=valid_k_lengths,
     )
     return topk_indices, topk_length
 
@@ -717,63 +717,6 @@ def _thd_to_fake_bshd(*tensors: Tensor) -> Tuple[Tensor, ...]:
     return tuple(t.unsqueeze(0) for t in tensors)
 
 
-def _compute_indexer_predict(
-    q_indexer: Tensor,
-    k_indexer: Tensor,
-    weights: Tensor,
-    topk_indices: Tensor,
-    qhead_per_kv_head: int,
-    *,
-    topk_indices_global: bool = False,
-) -> Tensor:
-    """Compute ``predict`` distribution (softmax over top-K of indexer scores).
-
-    Wraps `cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
-    This function is not used now, but it is kept for potential future use.
-
-    Two layouts:
-
-    * **BSHD** (default; 4-D q): ``q (B, S_q, H, D)``, ``k (B, S_k, D)``,
-      ``w (B, S_q, H)``, ``topk (B, S_q, topk)``.
-    * **THD packed** (3-D q): ``q (total_q, H, D)``, ``k (total_k, D)``,
-      ``w (total_q, H)``, ``topk (total_q, topk)``. Internally
-      fake-BSHD'd with ``B=1`` so the wrapper's 4-D-Q shape check
-      passes; ``topk_indices_global=True`` is required (and enforced) so
-      the kernel decodes the flat ids directly as positions into the
-      ``(1*total_k, D)`` view.
-
-    Output shape matches the layout: BSHD ``(B, S_q, topk)`` or
-    THD ``(total_q, topk)``, fp32 softmax over the top-K axis.
-    """
-    _ensure_dsa_namespace()
-    is_thd = q_indexer.ndim == 3
-    if is_thd:
-        if not topk_indices_global:
-            raise ValueError(
-                "THD ``_compute_indexer_predict`` requires "
-                "``topk_indices_global=True`` so the kernel addresses K "
-                "by flat ids over the packed ``(total_k, D)`` buffer."
-            )
-        q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
-            q_indexer, k_indexer, weights, topk_indices
-        )
-    else:
-        q_bshd, k_bsd, w_bsh, topk_bst = q_indexer, k_indexer, weights, topk_indices
-
-    result = _DSA.sparse_indexer_score_recompute_wrapper(
-        q_bshd,
-        k_bsd,
-        w_bsh,
-        topk_bst,
-        qhead_per_kv_head=qhead_per_kv_head,
-        topk_indices_global=topk_indices_global,
-    )
-    predict = result["predict"]
-    if is_thd:
-        predict = predict.squeeze(0)
-    return predict
-
-
 def _compute_attn_target(
     q_attn: Tensor,
     k_attn: Tensor,
@@ -786,10 +729,9 @@ def _compute_attn_target(
 ) -> Tensor:
     """Compute ``target`` distribution (L1-normalised head-sum softmax).
 
-    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. Same
-    layout convention as :func:`_compute_indexer_predict`: 4-D q is
-    BSHD; 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
-    wrapper call (so the 4-D-Q shape check passes).
+    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. A 4-D q
+    is BSHD; a 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
+    wrapper call so the 4-D-Q shape check passes.
     """
     _ensure_dsa_namespace()
     is_thd = q_attn.ndim == 3
@@ -1068,7 +1010,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # THD: skip the permute; tensors are already flat.
         if is_thd:
             total_q = q_indexer.shape[0]
-            idx_nh = q_indexer.shape[1]
             np_, d = query.shape[1], query.shape[2]
 
             q_indexer_flat = q_indexer
@@ -1077,7 +1018,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         else:
             sq, b, np_, d = query.shape
             skv = kv_full.shape[0]
-            idx_nh = q_indexer.shape[2]
 
             q_indexer_flat = q_indexer.permute(1, 0, 2, 3).contiguous()
             k_indexer_flat = k_indexer.permute(1, 0, 2).contiguous()
@@ -1516,8 +1456,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         softmax_scale: float,
         indexer_softmax_scale: float,
         loss_coeff: float,
-        calculate_per_token_loss: bool,
-        global_query_rows: int,
+        loss_divisor: float,
         q_padding_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
@@ -1530,17 +1469,6 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         indexer_topk_idxs_for_loss = indexer_topk_idxs
         if q_padding_mask is not None:
-            if q_padding_mask.shape != (total_q,):
-                raise RuntimeError(
-                    "q_padding_mask must have shape "
-                    f"({total_q},), got {tuple(q_padding_mask.shape)}."
-                )
-            if q_padding_mask.dtype != torch.bool:
-                raise RuntimeError(f"q_padding_mask must be bool, got {q_padding_mask.dtype}.")
-            if q_padding_mask.device != query.device:
-                raise RuntimeError(
-                    f"q_padding_mask must be on {query.device}, got {q_padding_mask.device}."
-                )
             indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
                 q_padding_mask.unsqueeze(-1), -1
             )
@@ -1554,21 +1482,17 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             topk_length=None,
             indexer_topk=indexer_topk,
         )
-        if lse_indexer is None:
-            raise RuntimeError("Indexer sparse attention from top-k requires lse_indexer.")
 
         if indexer_softmax_scale != 1.0:
             weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
         else:
             weights_scaled = weights
-        predict = _compute_indexer_predict(
-            q_indexer,
-            k_indexer,
-            weights_scaled,
-            indexer_topk_idxs_for_loss,
-            qhead_per_kv_head=idx_nh,
-            topk_indices_global=True,
+        q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+            q_indexer, k_indexer, weights_scaled, indexer_topk_idxs_for_loss
         )
+        predict = _DSA.sparse_indexer_score_recompute_wrapper(
+            q_bshd, k_bsd, w_bsh, topk_bst, qhead_per_kv_head=idx_nh, topk_indices_global=True
+        )["predict"].squeeze(0)
         target = _compute_attn_target(
             query.detach(),
             compressed_kv.detach(),
@@ -1582,14 +1506,8 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         raw_local_loss = _kl_loss_from_target_predict(
             target, predict, indexer_topk_idxs_for_loss, loss_coeff, calculate_per_token_loss=True
         )
-        if calculate_per_token_loss:
-            indexer_loss = raw_local_loss
-            bwd_loss_coeff = loss_coeff * total_q
-        else:
-            if global_query_rows <= 0:
-                raise RuntimeError(f"global_query_rows must be positive, got {global_query_rows}.")
-            indexer_loss = raw_local_loss / float(global_query_rows)
-            bwd_loss_coeff = loss_coeff * float(total_q) / float(global_query_rows)
+        indexer_loss = raw_local_loss / loss_divisor
+        bwd_loss_coeff = loss_coeff * total_q / loss_divisor
 
         if loss_coeff > 0:
             ig = _DSA.indexer_backward_wrapper(
@@ -1666,7 +1584,6 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_q_indexer * grad_loss,
             saved_grad_k_indexer * grad_loss,
             saved_grad_weights * grad_loss,
-            None,
             None,
             None,
             None,
