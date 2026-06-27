@@ -228,205 +228,32 @@ def _native_compressor_input_compact(
             dim=0,
         )
 
-    cu_compact = torch.zeros_like(cu_seqlens)
-    running = 0
-    for seq in range(len(cu) - 1):
-        running += sum(1 for group_seq, _ in groups if group_seq == seq) * int(ratio)
-        cu_compact[seq + 1] = running
-
-    seq_ids = torch.full((c_cap,), -1, dtype=torch.int32, device=hidden_local.device)
     comp_ids = torch.full((c_cap,), -1, dtype=torch.int32, device=hidden_local.device)
-    valid = torch.zeros((c_cap,), dtype=torch.bool, device=hidden_local.device)
-    for slot, (seq, comp_id) in enumerate(groups[:c_cap]):
-        seq_start = cu[seq]
-        group_end = seq_start + (comp_id + 1) * int(ratio)
-        seq_ids[slot] = seq
+    for slot, (_, comp_id) in enumerate(groups[:c_cap]):
         comp_ids[slot] = comp_id
-        valid[slot] = group_end - 1 >= global_start and group_end - 1 < global_start + l_local
-    return hidden_compact, cu_compact, seq_ids, comp_ids, valid
-
-
-def _native_build_compressed_row_metadata(
-    cu_seqlens: torch.Tensor,
-    cp_size: int,
-    chunk_len: int,
-    ratio: int,
-    d_comp: int,
-    c_cap_per_chunk: int,
-    c_cap_per_rank: int,
-    use_two_chunk: bool,
-):
-    total_rows = int(cp_size) * int(c_cap_per_rank)
-    seq_ids = torch.full((total_rows,), -1, dtype=torch.int32, device=cu_seqlens.device)
-    comp_ids = torch.full((total_rows,), -1, dtype=torch.int32, device=cu_seqlens.device)
-    valid = torch.zeros((total_rows,), dtype=torch.bool, device=cu_seqlens.device)
-    for row in range(total_rows):
-        rank = row // c_cap_per_rank
-        rank_slot = row - rank * c_cap_per_rank
-        local_chunk = 0
-        slot = rank_slot
-        chunk_id = rank
-        if use_two_chunk:
-            local_chunk = rank_slot // c_cap_per_chunk
-            if local_chunk >= 2:
-                continue
-            slot = rank_slot - local_chunk * c_cap_per_chunk
-            chunk_id = rank if local_chunk == 0 else cp_size * 2 - 1 - rank
-        rank_start = chunk_id * chunk_len
-        groups = _compressed_groups(cu_seqlens, rank_start, chunk_len, ratio, d_comp)
-        if slot < len(groups):
-            seq, comp = groups[slot]
-            seq_start = int(cu_seqlens[seq].item())
-            group_end = seq_start + (comp + 1) * ratio
-            seq_ids[row] = seq
-            comp_ids[row] = comp
-            valid[row] = group_end - 1 >= rank_start and group_end - 1 < rank_start + chunk_len
-    return seq_ids, comp_ids, valid
-
-
-def _native_repack_compressed_kv_to_seq_major(
-    compressed_rank_major: torch.Tensor,
-    seq_ids: torch.Tensor,
-    comp_ids: torch.Tensor,
-    valid: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    seq_major_rows: int,
-):
-    out = compressed_rank_major.new_zeros(
-        (seq_major_rows,) + tuple(compressed_rank_major.shape[1:])
-    )
-    rank_by_seq = torch.full(
-        (seq_major_rows,), -1, dtype=torch.int32, device=compressed_rank_major.device
-    )
-    for rank_row in range(compressed_rank_major.shape[0]):
-        if bool(valid[rank_row]):
-            seq = int(seq_ids[rank_row])
-            comp = int(comp_ids[rank_row])
-            seq_major = int(cu_seqlens_compressed[seq]) + comp
-            if 0 <= seq_major < seq_major_rows:
-                out[seq_major] = compressed_rank_major[rank_row]
-                rank_by_seq[seq_major] = rank_row
-    return out, rank_by_seq
-
-
-def _native_indexer_topk_metadata(
-    k_seq_major: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    global_start: int,
-    l_local: int,
-    ratio: int,
-):
-    n_seq = cu_seqlens_q.shape[0] - 1
-    k_topk = torch.zeros_like(k_seq_major)
-    cu_q = torch.zeros((n_seq + 2,), dtype=torch.int32, device=k_seq_major.device)
-    cu_k = torch.zeros((n_seq + 2,), dtype=torch.int32, device=k_seq_major.device)
-    seq_lens = torch.empty((l_local,), dtype=torch.int32, device=k_seq_major.device)
-    q_prefix = 0
-    k_prefix = 0
-    for seq in range(n_seq):
-        seq_start = int(cu_seqlens_q[seq])
-        seq_end = int(cu_seqlens_q[seq + 1])
-        local_start = max(seq_start, int(global_start))
-        local_end = min(seq_end, int(global_start) + int(l_local))
-        q_len = 0
-        k_len = 0
-        if local_start < local_end:
-            q_len = local_end - local_start
-            seq_comp_start = int(cu_seqlens_compressed[seq])
-            seq_comp_end = int(cu_seqlens_compressed[seq + 1])
-            k_len = min((local_end - seq_start) // int(ratio), seq_comp_end - seq_comp_start)
-            if k_len:
-                k_topk[k_prefix : k_prefix + k_len] = k_seq_major[
-                    seq_comp_start : seq_comp_start + k_len
-                ]
-        if q_len:
-            seq_lens[q_prefix : q_prefix + q_len] = k_len
-        q_prefix += q_len
-        k_prefix += k_len
-        cu_q[seq + 1] = q_prefix
-        cu_k[seq + 1] = k_prefix
-    actual_total = int(cu_seqlens_q[-1])
-    padding_start = max(actual_total, int(global_start))
-    padding_q = max(0, int(global_start) + int(l_local) - padding_start)
-    if padding_q:
-        seq_lens[q_prefix : q_prefix + padding_q] = 0
-    cu_q[n_seq + 1] = q_prefix + padding_q
-    cu_k[n_seq + 1] = k_prefix
-    return k_topk, cu_q, cu_k, seq_lens
-
-
-def _native_thd_full_kv_pack(
-    kv_local: torch.Tensor,
-    boundary_kv: torch.Tensor,
-    compressed_rank_major: torch.Tensor,
-    seq_ids: torch.Tensor,
-    comp_ids: torch.Tensor,
-    valid: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    global_start: int,
-    l_local: int,
-    d_window: int,
-    ratio: int,
-    capacity: int,
-):
-    rows = []
-    n_seq = cu_seqlens.shape[0] - 1
-    for seq in range(n_seq):
-        seq_start = int(cu_seqlens[seq])
-        seq_end = int(cu_seqlens[seq + 1])
-        local_start = max(seq_start, int(global_start))
-        local_end = min(seq_end, int(global_start) + int(l_local))
-        if local_start >= local_end:
-            continue
-        window_start = max(seq_start, local_start - int(d_window))
-        for src_global in range(window_start, local_end):
-            if src_global < global_start:
-                rows.append(
-                    boundary_kv[
-                        src_global
-                        - (global_start - d_window) : src_global
-                        - (global_start - d_window)
-                        + 1
-                    ]
-                )
-            else:
-                rows.append(kv_local[src_global - global_start : src_global - global_start + 1])
-        if ratio > 1:
-            for comp_id in range((seq_end - seq_start) // int(ratio)):
-                for rank_row in range(compressed_rank_major.shape[0]):
-                    if (
-                        bool(valid[rank_row])
-                        and int(seq_ids[rank_row]) == seq
-                        and int(comp_ids[rank_row]) == comp_id
-                    ):
-                        rows.append(compressed_rank_major[rank_row : rank_row + 1])
-    if rows:
-        out = torch.cat(rows, dim=0)
-    else:
-        out = kv_local.new_empty((0,) + tuple(kv_local.shape[1:]))
-    if out.shape[0] < capacity:
-        out = torch.cat(
-            (out, kv_local.new_zeros((capacity - out.shape[0],) + tuple(kv_local.shape[1:]))), dim=0
-        )
-    return out
+    return hidden_compact, comp_ids
 
 
 def _native_attention_indices_one_seq(
-    l_local: int, window_size: int, ratio: int, compressed_width: int, device: torch.device
+    l_local: int,
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    compressed_width: int,
+    device: torch.device,
 ):
     rows = torch.arange(l_local, dtype=torch.int32, device=device).unsqueeze(1)
     window_cols = torch.arange(window_size, dtype=torch.int32, device=device).unsqueeze(0)
     window_start = (rows - int(window_size) + 1).clamp_min(0)
     window_count = rows - window_start + 1
-    window_values = window_start + window_cols
+    window_values = int(d_window) + window_start + window_cols
     window_values = torch.where(
         window_cols < window_count, window_values, torch.full_like(window_values, -1)
     )
     if ratio > 1 and compressed_width > 0:
         comp_cols = torch.arange(compressed_width, dtype=torch.int32, device=device).unsqueeze(0)
         visible = ((rows + 1) // int(ratio)).clamp(max=int(compressed_width))
-        comp_values = int(l_local) + comp_cols
+        comp_values = int(d_window) + int(l_local) + comp_cols
         comp_values = torch.where(
             comp_cols < visible, comp_values, torch.full_like(comp_values, -1)
         )
@@ -440,12 +267,15 @@ def _native_attention_indices_one_seq(
 
 def _native_attention_indices(
     cu_seqlens: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
     global_start: int,
     l_local: int,
     d_window: int,
     window_size: int,
     ratio: int,
     compressed_width: int,
+    rank_by_seq_major: torch.Tensor,
+    compressed_base: int,
     indexer_topk: torch.Tensor = None,
 ):
     """Reference contiguous final-index lowering for ragged THD CP rows."""
@@ -454,36 +284,32 @@ def _native_attention_indices(
     topk = torch.full((int(l_local), total_width), -1, dtype=torch.int32, device=device)
     lengths = torch.zeros((int(l_local),), dtype=torch.int32, device=device)
     cu = [int(x) for x in cu_seqlens.cpu().tolist()]
-    seq_infos = []
-    running = 0
-    global_end = int(global_start) + int(l_local)
-    for seq, (seq_start, seq_end) in enumerate(zip(cu[:-1], cu[1:])):
-        local_start = max(seq_start, int(global_start))
-        local_end = min(seq_end, global_end)
-        if local_start >= local_end:
-            continue
-        window_start = max(seq_start, local_start - int(d_window))
-        window_len = local_end - window_start
-        comp_len = (seq_end - seq_start) // int(ratio) if int(ratio) > 1 else 0
-        seq_infos.append((seq, seq_start, seq_end, window_start, window_len, comp_len, running))
-        running += window_len + comp_len
+    cu_comp = [int(x) for x in cu_seqlens_compressed.cpu().tolist()]
 
     for row in range(int(l_local)):
         global_q = int(global_start) + row
-        info = next((item for item in seq_infos if item[1] <= global_q < item[2]), None)
-        if info is None:
+        seq_id = next(
+            (
+                seq
+                for seq, (start, end) in enumerate(zip(cu[:-1], cu[1:]))
+                if start <= global_q < end
+            ),
+            None,
+        )
+        if seq_id is None:
             if total_width > 0:
                 topk[row, 0] = 0
                 lengths[row] = 1
             continue
-        _seq, seq_start, _seq_end, seq_window_start, seq_window_len, seq_comp_len, seq_offset = info
+        seq_start = cu[seq_id]
+        seq_comp_len = cu_comp[seq_id + 1] - cu_comp[seq_id]
         write_col = 0
-        window_start_for_q = max(global_q - int(window_size) + 1, seq_start, seq_window_start)
+        window_start_for_q = max(global_q - int(window_size) + 1, seq_start)
         window_count = max(0, global_q - window_start_for_q + 1)
         for w in range(int(window_size)):
             pos = window_start_for_q + w
-            if w < window_count and seq_window_start <= pos < seq_window_start + seq_window_len:
-                topk[row, write_col] = seq_offset + pos - seq_window_start
+            if w < window_count:
+                topk[row, write_col] = pos - (int(global_start) - int(d_window))
                 write_col += 1
         if int(ratio) > 1 and int(compressed_width) > 0:
             pos_in_seq = global_q - seq_start
@@ -494,14 +320,17 @@ def _native_attention_indices(
                     n_visible = min((pos_in_seq + 1) // int(ratio), int(compressed_width))
                     comp_id = j if j < n_visible else -1
                 if 0 <= comp_id < seq_comp_len:
-                    topk[row, write_col] = seq_offset + seq_window_len + comp_id
-                    write_col += 1
+                    rank_id = int(rank_by_seq_major[cu_comp[seq_id] + comp_id])
+                    if rank_id >= 0:
+                        topk[row, write_col] = int(compressed_base) + rank_id
+                        write_col += 1
         lengths[row] = write_col
     return topk, lengths
 
 
 def _native_indexer_loss_indices_one_seq(
     l_local: int,
+    d_window: int,
     window_size: int,
     ratio: int,
     logical_ids: torch.Tensor,
@@ -509,12 +338,14 @@ def _native_indexer_loss_indices_one_seq(
 ):
     device = logical_ids.device
     compressed_width = logical_ids.shape[1]
-    attention_topk, _ = _native_attention_indices_one_seq(l_local, window_size, ratio, 0, device)
+    attention_topk, _ = _native_attention_indices_one_seq(
+        l_local, d_window, window_size, ratio, 0, device
+    )
     compressed = torch.full((l_local, compressed_width), -1, dtype=torch.int32, device=device)
     rank_major = torch.full_like(compressed, -1)
     valid = (logical_ids >= 0) & (logical_ids < rank_by_seq_major.shape[0])
     if valid.any():
-        lowered = int(l_local) + logical_ids.clamp(min=0)
+        lowered = int(d_window) + int(l_local) + logical_ids.clamp(min=0)
         rank_ids = rank_by_seq_major.index_select(0, logical_ids.clamp(min=0).reshape(-1)).view_as(
             logical_ids
         )
@@ -533,6 +364,7 @@ def _native_indexer_loss_indices(
     ratio: int,
     logical_ids: torch.Tensor,
     rank_by_seq_major: torch.Tensor,
+    compressed_base: int,
 ):
     """Reference contiguous compressed-first indexer-loss lowering for ragged THD rows."""
     device = logical_ids.device
@@ -542,26 +374,20 @@ def _native_indexer_loss_indices(
     rank_major = torch.full((int(l_local), compressed_width), -1, dtype=torch.int32, device=device)
     cu = [int(x) for x in cu_seqlens.cpu().tolist()]
     cu_comp = [int(x) for x in cu_seqlens_compressed.cpu().tolist()]
-    seq_infos = []
-    running = 0
-    global_end = int(global_start) + int(l_local)
-    for seq, (seq_start, seq_end) in enumerate(zip(cu[:-1], cu[1:])):
-        local_start = max(seq_start, int(global_start))
-        local_end = min(seq_end, global_end)
-        if local_start >= local_end:
-            continue
-        window_start = max(seq_start, local_start - int(d_window))
-        window_len = local_end - window_start
-        comp_len = cu_comp[seq + 1] - cu_comp[seq] if int(ratio) > 1 else 0
-        seq_infos.append((seq, seq_start, seq_end, window_start, window_len, comp_len, running))
-        running += window_len + comp_len
-
     for row in range(int(l_local)):
         global_q = int(global_start) + row
-        info = next((item for item in seq_infos if item[1] <= global_q < item[2]), None)
-        if info is None:
+        seq_id = next(
+            (
+                seq
+                for seq, (start, end) in enumerate(zip(cu[:-1], cu[1:]))
+                if start <= global_q < end
+            ),
+            None,
+        )
+        if seq_id is None:
             continue
-        seq_id, seq_start, _seq_end, window_start, window_len, comp_len, offset = info
+        seq_start = cu[seq_id]
+        comp_len = cu_comp[seq_id + 1] - cu_comp[seq_id]
 
         for col in range(compressed_width):
             comp_id = int(logical_ids[row, col])
@@ -569,19 +395,15 @@ def _native_indexer_loss_indices(
                 seq_major = cu_comp[seq_id] + comp_id
                 rank_id = int(rank_by_seq_major[seq_major])
                 if rank_id >= 0:
-                    topk[row, col] = offset + window_len + comp_id
+                    topk[row, col] = int(compressed_base) + rank_id
                     rank_major[row, col] = rank_id
 
         window_start_for_q = max(global_q - int(window_size) + 1, seq_start)
         window_count = global_q - window_start_for_q + 1
         for window_col in range(int(window_size)):
             pos = window_start_for_q + window_col
-            if (
-                window_col < window_count
-                and pos >= window_start
-                and pos < window_start + window_len
-            ):
-                topk[row, compressed_width + window_col] = offset + pos - window_start
+            if window_col < window_count:
+                topk[row, compressed_width + window_col] = pos - (int(global_start) - int(d_window))
 
     return topk, rank_major
 
@@ -649,53 +471,6 @@ def test_thd_local_rope_matches_native_forward_backward_and_reports_bandwidth():
     )
 
 
-def test_thd_compressed_rope_matches_native_forward_backward_and_reports_bandwidth():
-    _require_cute_cuda()
-    torch.manual_seed(22)
-    comp_ids = torch.tensor([0, 2, -1, 17, 31, 127], dtype=torch.int32, device="cuda")
-    ratio = 4
-    nope_dim = 3
-    pos_dim = 4
-    x = torch.randn(comp_ids.numel(), 1, 2, nope_dim + pos_dim, device="cuda", requires_grad=True)
-    cos = torch.randn(max(_E2E_RAGGED_PADDED_SEG_LENS), 1, 1, pos_dim, device="cuda")
-    sin = torch.randn(max(_E2E_RAGGED_PADDED_SEG_LENS), 1, 1, pos_dim, device="cuda")
-    positions = comp_ids.clamp(min=0).to(torch.long) * ratio
-    ref_x = x.detach().clone().requires_grad_(True)
-    ref = _rope_reference(ref_x, cos, sin, positions, nope_dim, pos_dim)
-    grad = torch.randn_like(ref)
-    ref.backward(grad)
-
-    fused_x = x.detach().clone().requires_grad_(True)
-    fused = csa_cp_layout_kernels.ThdCompressedRope.apply(
-        fused_x, cos, sin, comp_ids, ratio, nope_dim, pos_dim, False
-    )
-    fused.backward(grad)
-    _assert_rope_close(fused, ref, "thd_compressed_rope.forward")
-    _assert_rope_close(fused_x.grad, ref_x.grad, "thd_compressed_rope.backward")
-
-    bench_x = torch.randn(1024, 4, nope_dim + pos_dim, device="cuda")
-    bench_grad = torch.randn_like(bench_x)
-    bench_ids = torch.arange(1024, dtype=torch.int32, device="cuda") % 8
-    bench_pos = bench_ids.to(torch.long) * ratio
-
-    def run_cute():
-        bx = bench_x.detach().clone().requires_grad_(True)
-        y = csa_cp_layout_kernels.ThdCompressedRope.apply(
-            bx, cos, sin, bench_ids, ratio, nope_dim, pos_dim, False
-        )
-        y.backward(bench_grad)
-
-    def run_torch():
-        bx = bench_x.detach().clone().requires_grad_(True)
-        y = _rope_reference(bx, cos, sin, bench_pos, nope_dim, pos_dim)
-        y.backward(bench_grad)
-
-    effective_bytes = 4 * _num_bytes(bench_x)
-    _print_perf(
-        "thd_compressed_rope_fwd_bwd", _time_cuda(run_cute), _time_cuda(run_torch), effective_bytes
-    )
-
-
 def test_compressor_input_compact_matches_native_forward_backward_and_reports_bandwidth():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -736,8 +511,7 @@ def test_compressor_input_compact_matches_native_forward_backward_and_reports_ba
     )
     fused[0].backward(grad)
     assert torch.equal(fused[0], ref[0])
-    for actual, expected in zip(fused[1:], ref[1:]):
-        assert torch.equal(actual, expected)
+    assert torch.equal(fused[1], ref[1])
     assert torch.equal(hidden.grad, ref_hidden_grad)
     assert torch.equal(boundary.grad, ref_boundary_grad)
 
@@ -793,301 +567,6 @@ def test_compressor_input_compact_matches_native_forward_backward_and_reports_ba
     )
 
 
-def test_thd_full_kv_pack_matches_native_forward_backward_and_reports_bandwidth():
-    _require_cute_cuda()
-    cu = _make_e2e_like_cu_seqlens()
-    global_start, l_local = _e2e_like_contiguous_range()
-    d_window = 128
-    ratio = 128
-    d_comp = 128
-    c_cap = (l_local + d_comp) // ratio
-    kv_local = torch.randn(l_local, 4, dtype=torch.bfloat16, device="cuda").requires_grad_(True)
-    boundary = torch.randn(d_window, 4, dtype=torch.bfloat16, device="cuda").requires_grad_(True)
-    seq_ids, comp_ids, valid = _native_build_compressed_row_metadata(
-        cu, _E2E_CP_SIZE, l_local, ratio, d_comp, c_cap, c_cap, False
-    )
-    compressed = torch.randn(
-        seq_ids.shape[0], 4, dtype=torch.bfloat16, device="cuda"
-    ).requires_grad_(True)
-    dummy = torch.empty((1,), dtype=torch.int32, device="cuda")
-    capacity = l_local + d_window * (cu.shape[0] - 1) + compressed.shape[0]
-
-    ref = _native_thd_full_kv_pack(
-        kv_local,
-        boundary,
-        compressed,
-        seq_ids,
-        comp_ids,
-        valid,
-        cu,
-        global_start,
-        l_local,
-        d_window,
-        ratio,
-        capacity,
-    )
-    grad = torch.randn_like(ref)
-    ref.backward(grad)
-    ref_grads = (
-        kv_local.grad.detach().clone(),
-        boundary.grad.detach().clone(),
-        compressed.grad.detach().clone(),
-    )
-    kv_local.grad.zero_()
-    boundary.grad.zero_()
-    compressed.grad.zero_()
-
-    fused = csa_cp_layout_kernels.ThdFullKvPack.apply(
-        kv_local,
-        boundary,
-        compressed,
-        seq_ids,
-        comp_ids,
-        valid,
-        cu,
-        dummy,
-        cu,
-        global_start,
-        l_local,
-        d_window,
-        ratio,
-        capacity,
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
-    fused.backward(grad)
-    assert torch.equal(fused, ref)
-    assert torch.equal(kv_local.grad, ref_grads[0])
-    assert torch.equal(boundary.grad, ref_grads[1])
-    assert torch.equal(compressed.grad, ref_grads[2])
-
-    bench_cu = torch.tensor([0, 8192], dtype=torch.int32, device="cuda")
-    bench_global_start = 2048
-    bench_l_local = 4096
-    bench_d_window = 128
-    bench_ratio = 128
-    bench_compressed_rows = int(bench_cu[-1]) // bench_ratio
-    bench_capacity = bench_d_window + bench_l_local + bench_compressed_rows
-    bench_kv = torch.randn(bench_l_local, 64, dtype=torch.bfloat16, device="cuda")
-    bench_boundary = torch.randn(bench_d_window, 64, dtype=torch.bfloat16, device="cuda")
-    bench_compressed = torch.randn(bench_compressed_rows, 64, dtype=torch.bfloat16, device="cuda")
-    bench_seq_ids = torch.zeros(bench_compressed_rows, dtype=torch.int32, device="cuda")
-    bench_comp_ids = torch.arange(bench_compressed_rows, dtype=torch.int32, device="cuda")
-    bench_valid = torch.ones(bench_compressed_rows, dtype=torch.bool, device="cuda")
-    bench_dummy = torch.empty((1,), dtype=torch.int32, device="cuda")
-    bench_grad = torch.randn(bench_capacity, 64, dtype=torch.bfloat16, device="cuda")
-
-    def run_cute():
-        k = bench_kv.detach().clone().requires_grad_(True)
-        b = bench_boundary.detach().clone().requires_grad_(True)
-        c = bench_compressed.detach().clone().requires_grad_(True)
-        y = csa_cp_layout_kernels.ThdFullKvPack.apply(
-            k,
-            b,
-            c,
-            bench_seq_ids,
-            bench_comp_ids,
-            bench_valid,
-            bench_cu,
-            bench_dummy,
-            bench_cu,
-            bench_global_start,
-            bench_l_local,
-            bench_d_window,
-            bench_ratio,
-            bench_capacity,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-        y.backward(bench_grad)
-
-    def run_torch():
-        k = bench_kv.detach().clone().requires_grad_(True)
-        b = bench_boundary.detach().clone().requires_grad_(True)
-        c = bench_compressed.detach().clone().requires_grad_(True)
-        y = _native_thd_full_kv_pack(
-            k,
-            b,
-            c,
-            bench_seq_ids,
-            bench_comp_ids,
-            bench_valid,
-            bench_cu,
-            bench_global_start,
-            bench_l_local,
-            bench_d_window,
-            bench_ratio,
-            bench_capacity,
-        )
-        y.backward(bench_grad)
-
-    effective_bytes = 2 * _num_bytes(bench_kv, bench_boundary, bench_compressed, bench_grad)
-    _print_perf(
-        "thd_full_kv_pack_fwd_bwd", _time_cuda(run_cute), _time_cuda(run_torch), effective_bytes
-    )
-
-
-def test_repack_compressed_kv_to_seq_major_matches_native_and_reports_bandwidth():
-    _require_cute_cuda()
-    cu = _make_e2e_like_cu_seqlens()
-    ratio = 128
-    d_comp = 128
-    global_start, l_local = _e2e_like_contiguous_range()
-    c_cap = (l_local + d_comp) // ratio
-    seq_ids, comp_ids, valid = _native_build_compressed_row_metadata(
-        cu, _E2E_CP_SIZE, l_local, ratio, d_comp, c_cap, c_cap, False
-    )
-    rank_major = torch.arange(seq_ids.numel() * 4, dtype=torch.bfloat16, device="cuda").reshape(
-        seq_ids.numel(), 4
-    )
-    cu_comp = _compressed_cu_seqlens(cu, ratio)
-    ref = _native_repack_compressed_kv_to_seq_major(
-        rank_major, seq_ids, comp_ids, valid, cu_comp, int(cu_comp[-1])
-    )
-    fused = csa_cp_layout_kernels.repack_compressed_kv_to_seq_major(
-        rank_major, seq_ids, comp_ids, valid, cu_comp, int(cu_comp[-1])
-    )
-    assert torch.equal(fused[0], ref[0])
-    assert torch.equal(fused[1], ref[1])
-
-    bench_rows = 4096
-    bench_width = 64
-    bench_rank_major = torch.randn(bench_rows, bench_width, dtype=torch.bfloat16, device="cuda")
-    bench_seq_ids = torch.zeros(bench_rows, dtype=torch.int32, device="cuda")
-    bench_comp_ids = torch.arange(bench_rows, dtype=torch.int32, device="cuda")
-    bench_valid = torch.ones(bench_rows, dtype=torch.bool, device="cuda")
-    bench_cu_comp = torch.tensor([0, bench_rows], dtype=torch.int32, device="cuda")
-
-    def run_cute():
-        csa_cp_layout_kernels.repack_compressed_kv_to_seq_major(
-            bench_rank_major, bench_seq_ids, bench_comp_ids, bench_valid, bench_cu_comp, bench_rows
-        )
-
-    def run_torch():
-        _native_repack_compressed_kv_to_seq_major(
-            bench_rank_major, bench_seq_ids, bench_comp_ids, bench_valid, bench_cu_comp, bench_rows
-        )
-
-    effective_bytes = _num_bytes(bench_rank_major) * 2 + bench_rows * 4
-    _print_perf(
-        "repack_compressed_kv_to_seq_major",
-        _time_cuda(run_cute),
-        _time_cuda(run_torch),
-        effective_bytes,
-    )
-
-
-def test_build_compressed_row_metadata_matches_native_and_reports_bandwidth():
-    _require_cute_cuda()
-    cu = _make_e2e_like_cu_seqlens()
-    cp_size = _E2E_CP_SIZE
-    chunk_len = (sum(_E2E_RAGGED_PADDED_SEG_LENS) // cp_size) // 2
-    ratio = 4
-    d_comp = 8
-    c_cap_per_chunk = (chunk_len + d_comp) // ratio
-    c_cap_per_rank = 2 * c_cap_per_chunk
-    ref = _native_build_compressed_row_metadata(
-        cu, cp_size, chunk_len, ratio, d_comp, c_cap_per_chunk, c_cap_per_rank, True
-    )
-    fused = csa_cp_layout_kernels.build_compressed_row_metadata(
-        cu,
-        cp_size,
-        chunk_len,
-        ratio,
-        d_comp,
-        c_cap_per_chunk,
-        c_cap_per_rank=c_cap_per_rank,
-        use_two_chunk=True,
-    )
-    for actual, expected in zip(fused, ref):
-        assert torch.equal(actual, expected)
-
-    bench_cu = torch.tensor([0, 65536], dtype=torch.int32, device="cuda")
-    bench_cp_size = 4
-    bench_chunk_len = 8192
-    bench_ratio = 128
-    bench_d_comp = 128
-    bench_c_cap = (bench_chunk_len + bench_d_comp) // bench_ratio
-    bench_c_cap_per_rank = bench_c_cap * 2
-
-    def run_cute():
-        csa_cp_layout_kernels.build_compressed_row_metadata(
-            bench_cu,
-            bench_cp_size,
-            bench_chunk_len,
-            bench_ratio,
-            bench_d_comp,
-            bench_c_cap,
-            c_cap_per_rank=bench_c_cap_per_rank,
-            use_two_chunk=True,
-        )
-
-    def run_torch():
-        _native_build_compressed_row_metadata(
-            bench_cu,
-            bench_cp_size,
-            bench_chunk_len,
-            bench_ratio,
-            bench_d_comp,
-            bench_c_cap,
-            bench_c_cap_per_rank,
-            True,
-        )
-
-    effective_bytes = bench_cp_size * bench_c_cap_per_rank * (4 + 4 + 1)
-    _print_perf(
-        "build_compressed_row_metadata",
-        _time_cuda(run_cute),
-        _time_cuda(run_torch),
-        effective_bytes,
-    )
-
-
-def test_build_indexer_topk_metadata_matches_native_and_reports_bandwidth():
-    _require_cute_cuda()
-    ratio = 4
-    cu_q = _make_e2e_like_cu_seqlens()
-    cu_comp = _compressed_cu_seqlens(cu_q, ratio)
-    k_seq = torch.arange(int(cu_comp[-1]) * 2, dtype=torch.bfloat16, device="cuda").reshape(
-        int(cu_comp[-1]), 2
-    )
-    global_start, l_local = _e2e_like_contiguous_range()
-    ref = _native_indexer_topk_metadata(k_seq, cu_q, cu_comp, global_start, l_local, ratio)
-    fused = csa_cp_layout_kernels.build_indexer_topk_metadata(
-        k_seq, cu_q, cu_comp, global_start, l_local, ratio
-    )
-    for actual, expected in zip(fused, ref):
-        assert torch.equal(actual, expected)
-
-    bench_ratio = 128
-    bench_l_local = 8192
-    bench_rows = 512
-    bench_k_seq = torch.randn(bench_rows, 64, dtype=torch.bfloat16, device="cuda")
-    bench_cu_q = torch.tensor([0, bench_l_local], dtype=torch.int32, device="cuda")
-    bench_cu_comp = torch.tensor([0, bench_rows], dtype=torch.int32, device="cuda")
-
-    def run_cute():
-        csa_cp_layout_kernels.build_indexer_topk_metadata(
-            bench_k_seq, bench_cu_q, bench_cu_comp, 0, bench_l_local, bench_ratio
-        )
-
-    def run_torch():
-        _native_indexer_topk_metadata(
-            bench_k_seq, bench_cu_q, bench_cu_comp, 0, bench_l_local, bench_ratio
-        )
-
-    effective_bytes = _num_bytes(bench_k_seq) * 2 + bench_l_local * 4
-    _print_perf(
-        "build_indexer_topk_metadata", _time_cuda(run_cute), _time_cuda(run_torch), effective_bytes
-    )
-
-
 def test_build_attention_indices_matches_native_and_reports_bandwidth():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -1096,14 +575,65 @@ def test_build_attention_indices_matches_native_and_reports_bandwidth():
     window = 16
     ratio = 4
     compressed_width = 16
+    cu_comp = _compressed_cu_seqlens(cu, ratio)
+    rank_by_seq = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
+    compressed_base = d_window + l_local
     fused = csa_cp_layout_kernels.build_attention_indices(
-        cu, global_start, l_local, d_window, window, ratio, compressed_width
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        compressed_width,
+        cu_seqlens_compressed=cu_comp,
+        rank_row_for_seq_row=rank_by_seq,
+        compressed_base=compressed_base,
     )
     expected = _native_attention_indices(
-        cu, global_start, l_local, d_window, window, ratio, compressed_width
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        compressed_width,
+        rank_by_seq,
+        compressed_base,
     )
     assert torch.equal(fused[0], expected[0])
     assert torch.equal(fused[1], expected[1])
+
+    logical_ids = torch.tensor([2, 0, -1], dtype=torch.int32, device="cuda").expand(l_local, -1)
+    fused_indexer = csa_cp_layout_kernels.build_attention_indices(
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        logical_ids.shape[1],
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        rank_row_for_seq_row=rank_by_seq,
+        compressed_base=compressed_base,
+    )
+    expected_indexer = _native_attention_indices(
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        logical_ids.shape[1],
+        rank_by_seq,
+        compressed_base,
+        logical_ids,
+    )
+    assert torch.equal(fused_indexer[0], expected_indexer[0])
+    assert torch.equal(fused_indexer[1], expected_indexer[1])
 
     padded = csa_cp_layout_kernels.build_attention_indices(
         torch.tensor([0, 8], dtype=torch.int32, device="cuda"), 0, 10, 2, 2, 0, 0
@@ -1119,8 +649,15 @@ def test_build_attention_indices_matches_native_and_reports_bandwidth():
     bench_ratio = 4
     bench_compressed_width = bench_l_local // bench_ratio
     bench_cu = torch.tensor([0, bench_l_local], dtype=torch.int32, device="cuda")
+    bench_cu_comp = torch.tensor([0, bench_compressed_width], dtype=torch.int32, device="cuda")
+    bench_rank_by_seq = torch.arange(bench_compressed_width, dtype=torch.int32, device="cuda")
     bench_ref = _native_attention_indices_one_seq(
-        bench_l_local, bench_window, bench_ratio, bench_compressed_width, torch.device("cuda")
+        bench_l_local,
+        bench_window,
+        bench_window,
+        bench_ratio,
+        bench_compressed_width,
+        torch.device("cuda"),
     )
 
     def run_cute():
@@ -1132,11 +669,19 @@ def test_build_attention_indices_matches_native_and_reports_bandwidth():
             bench_window,
             bench_ratio,
             bench_compressed_width,
+            cu_seqlens_compressed=bench_cu_comp,
+            rank_row_for_seq_row=bench_rank_by_seq,
+            compressed_base=bench_window + bench_l_local,
         )
 
     def run_torch():
         _native_attention_indices_one_seq(
-            bench_l_local, bench_window, bench_ratio, bench_compressed_width, torch.device("cuda")
+            bench_l_local,
+            bench_window,
+            bench_window,
+            bench_ratio,
+            bench_compressed_width,
+            torch.device("cuda"),
         )
 
     effective_bytes = _num_bytes(*bench_ref)
@@ -1160,12 +705,31 @@ def test_build_indexer_loss_indices_matches_native_and_reports_bandwidth():
         .repeat(l_local, 1)
     )
     logical_ids[1::5, -1] = -1
-    rank_by_seq = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda")
+    rank_by_seq = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
+    compressed_base = d_window + l_local
     fused = csa_cp_layout_kernels.build_indexer_loss_indices(
-        cu, cu_comp, global_start, l_local, d_window, window, ratio, logical_ids, rank_by_seq
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        logical_ids,
+        rank_by_seq,
+        compressed_base=compressed_base,
     )
     expected = _native_indexer_loss_indices(
-        cu, cu_comp, global_start, l_local, d_window, window, ratio, logical_ids, rank_by_seq
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        logical_ids,
+        rank_by_seq,
+        compressed_base,
     )
     assert torch.equal(fused[0], expected[0])
     assert torch.equal(fused[1], expected[1])
@@ -1183,7 +747,7 @@ def test_build_indexer_loss_indices_matches_native_and_reports_bandwidth():
     )
     bench_rank_by_seq = torch.arange(bench_compressed_width, dtype=torch.int32, device="cuda")
     bench_ref = _native_indexer_loss_indices_one_seq(
-        bench_l_local, bench_window, bench_ratio, bench_logical, bench_rank_by_seq
+        bench_l_local, bench_window, bench_window, bench_ratio, bench_logical, bench_rank_by_seq
     )
 
     def run_cute():
@@ -1197,11 +761,12 @@ def test_build_indexer_loss_indices_matches_native_and_reports_bandwidth():
             bench_ratio,
             bench_logical,
             bench_rank_by_seq,
+            compressed_base=bench_window + bench_l_local,
         )
 
     def run_torch():
         _native_indexer_loss_indices_one_seq(
-            bench_l_local, bench_window, bench_ratio, bench_logical, bench_rank_by_seq
+            bench_l_local, bench_window, bench_window, bench_ratio, bench_logical, bench_rank_by_seq
         )
 
     effective_bytes = _num_bytes(bench_logical, bench_rank_by_seq, *bench_ref)

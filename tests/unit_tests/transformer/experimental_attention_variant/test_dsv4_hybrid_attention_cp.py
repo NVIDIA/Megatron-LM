@@ -650,6 +650,50 @@ class TestDSv4HybridAttentionTHDCP:
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
+    def test_thd_cp_ratio4_eval_matches_full_reference(self):
+        """Ratio-4 two-chunk inference lowers logical indexer top-k rows correctly."""
+        partition_mode = DSV4_CP_PARTITION_TWO_CHUNK
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(
+            partition_mode, self.cp_size, self.cp_rank
+        )
+
+        torch.manual_seed(_SEED + 1202)
+        model_parallel_cuda_manual_seed(_SEED + 1202)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            apply_rope_fusion=True,
+            csa_cp_partition_mode=partition_mode,
+        )
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=1,
+            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            apply_rope_fusion=False,
+        )
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda().eval()
+        ref_attn = (
+            _build_attention(config_ref, layer_number=2, pg_collection=self.ref_pg).cuda().eval()
+        )
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx)
+        with torch.no_grad():
+            local_out, _ = cp_attn(
+                hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+            )
+            ref_out, _ = ref_attn(
+                hidden_states=full_hidden, attention_mask=None, packed_seq_params=packed
+            )
+        _assert_cp_tensor_match(
+            local_out, ref_out.index_select(0, local_idx), f"layer=2:eval:{partition_mode}:output"
+        )
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, local_out, ref_out
+        _clear_cuda_test_state()
+
     @pytest.mark.parametrize(
         "layer_number",
         [1, 2, 3],

@@ -1,10 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """MCore-facing utilities for the DSv4 THD context-parallel path.
 
-This module is the boundary between attention code and the small CP layout
-kernels in ``csa_cp_layout_kernels.py``.  It owns CP partition metadata, boundary
-communication, fixed-shape collectives, and the typed wrappers used by CSA/DSv4
-attention modules.
+This module owns CP partition semantics, boundary exchange, compressor-input
+layout, and indexer top-k metadata. It calls the retained RoPE/compaction
+kernels; ``csa.py`` calls the two final-index kernels directly.
 """
 
 import math
@@ -14,10 +13,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-    batch_of_row,
-    indexer_topk,
-)
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
 
 # =============================================================================
 # CP Partition Modes And Layout
@@ -141,45 +137,6 @@ def _normalize_row_ranges(
     return tuple(normalized), tuple(lengths), sum(lengths)
 
 
-def _two_chunk_layout(
-    chunk_ranges: Sequence[Tuple[int, int]], op_name: str
-) -> Tuple[Tuple[int, int], int, int]:
-    ranges, lengths, l_local = _normalize_row_ranges(chunk_ranges, op_name)
-    if len(ranges) != 2 or lengths[0] != lengths[1]:
-        raise RuntimeError(f"{op_name} expects exactly two equal-length chunks.")
-    return (int(ranges[0][0]), int(ranges[1][0])), int(lengths[0]), int(l_local)
-
-
-def build_thd_cp_local_padding_row_mask(
-    cu_seqlens_padded: torch.Tensor,
-    cu_seqlens_unpadded: Optional[torch.Tensor],
-    chunk_ranges: Sequence[Tuple[int, int]],
-    total_padded_rows: int,
-) -> Optional[torch.Tensor]:
-    """Return this CP rank's local query rows that are CUDA-graph padding rows."""
-    if cu_seqlens_unpadded is None:
-        return None
-    if cu_seqlens_padded.shape != cu_seqlens_unpadded.shape:
-        raise RuntimeError(
-            "padded and unpadded THD cu_seqlens must have the same shape, got "
-            f"{tuple(cu_seqlens_padded.shape)} and {tuple(cu_seqlens_unpadded.shape)}."
-        )
-
-    chunk_ranges, _, _ = _normalize_row_ranges(chunk_ranges, "DSv4 CP padding-row mask")
-    device = cu_seqlens_padded.device
-    global_rows = torch.cat(
-        [torch.arange(start, end, device=device, dtype=torch.int64) for start, end in chunk_ranges],
-        dim=0,
-    )
-
-    row_batch_ids_full = batch_of_row(cu_seqlens_padded, total_q=int(total_padded_rows))
-    row_batch_ids = row_batch_ids_full.index_select(0, global_rows)
-
-    real_seg_lens = cu_seqlens_unpadded[1:] - cu_seqlens_unpadded[:-1]
-    pos_in_seg = global_rows.to(cu_seqlens_padded.dtype) - cu_seqlens_padded[row_batch_ids]
-    return pos_in_seg >= real_seg_lens[row_batch_ids]
-
-
 # =============================================================================
 # RoPE Wrappers
 # =============================================================================
@@ -237,22 +194,6 @@ def apply_thd_cp_local_rope_fused(
         )
         row_start += int(length)
     return torch.cat(parts, dim=0)
-
-
-def apply_thd_cp_compressed_rope_fused(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    comp_ids_local: torch.Tensor,
-    ratio: int,
-    nope_dim: int,
-    pos_dim: int,
-    inverse: bool = False,
-) -> torch.Tensor:
-    """Apply fused RoPE to compressed rows using their original compression ids."""
-    return csa_cp_layout_kernels.ThdCompressedRope.apply(
-        x, cos, sin, comp_ids_local, ratio, nope_dim, pos_dim, bool(inverse)
-    )
 
 
 # =============================================================================
@@ -440,63 +381,13 @@ def exchange_cp_boundary_hidden(
 # =============================================================================
 
 
-def build_global_compressed_cu_seqlens(cu_seqlens_padded: torch.Tensor, ratio: int) -> torch.Tensor:
-    """Build fixed-shape compressed sequence prefix sums.
-
-    Inputs:
-        cu_seqlens_padded: int32 CUDA tensor, shape ``(n_seq + 1,)``.
-        ratio: positive compression ratio.
-
-    Output:
-        int32 CUDA tensor, shape ``(n_seq + 1,)`` where each prefix increments by
-        ``floor(seq_len / ratio)``. This is intentionally a PyTorch utility, not
-        a CuTe kernel, because it is fixed-shape and does not need a host sync.
-    """
-    if ratio <= 1:
-        raise RuntimeError(f"DSv4 CP compressed cu_seqlens expects ratio > 1, got {ratio}.")
-    out = torch.empty_like(cu_seqlens_padded)
-    out[:1].zero_()
-    compressed_lens = torch.div(
-        cu_seqlens_padded[1:] - cu_seqlens_padded[:-1], int(ratio), rounding_mode="floor"
-    )
-    out[1:].copy_(torch.cumsum(compressed_lens, dim=0, dtype=torch.int32))
-    return out
-
-
-def build_cp_rank_major_compressed_metadata_fused(
-    cu_seqlens: torch.Tensor,
-    chunk_ranges: Sequence[Tuple[int, int]],
-    cp_size: int,
-    ratio: int,
-    d_comp: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build rank-major compressed metadata for the selected CP partition mode."""
-    if len(chunk_ranges) == 2:
-        _, chunk_len, _ = _two_chunk_layout(chunk_ranges, "DSv4 two-chunk compressed metadata")
-        c_cap_per_chunk = (chunk_len + int(d_comp)) // int(ratio)
-        c_cap_per_rank = _compressed_group_capacity(2 * chunk_len, ratio, 2 * d_comp)
-        return csa_cp_layout_kernels.build_compressed_row_metadata(
-            cu_seqlens,
-            int(cp_size),
-            chunk_len,
-            ratio,
-            d_comp,
-            c_cap_per_chunk,
-            c_cap_per_rank=c_cap_per_rank,
-            use_two_chunk=True,
-        )
-    _, _, l_local = _normalize_row_ranges(chunk_ranges, "DSv4 CP compressed metadata")
-    c_cap = _compressed_group_capacity(l_local, ratio, d_comp)
-    return csa_cp_layout_kernels.build_compressed_row_metadata(
-        cu_seqlens, int(cp_size), l_local, ratio, d_comp, c_cap
-    )
-
-
 def build_cp_compressor_prep_compact_fused(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
     chunk_ranges: Sequence[Tuple[int, int]],
+    cp_size: int,
     ratio: int,
     d_comp: int,
     d_window: int,
@@ -506,20 +397,25 @@ def build_cp_compressor_prep_compact_fused(
     Returns:
         ``hidden_compact``: rank-local compressor input, shape
             ``(compact_group_capacity * ratio, ...)``.
-        ``cu_compact``: rank-local token-row prefix sums over global sequence
-            ids, shape ``(n_seq + 1,)``. The compressor divides these deltas
-            by ``ratio`` to recover this rank's visible compact groups.
         ``comp_ids_local``: original per-sequence compressed group id for each
             compact group, shape ``(compact_group_capacity,)``. For example,
             with ``ratio=4``, ``comp_id=3`` maps to RoPE position ``12``.
+        ``rank_row_for_seq_row``: map from global sequence-major compressed rows
+            to their canonical rank-major all-gather rows.
     """
     d_window = int(d_window)
 
     two_chunk = len(chunk_ranges) == 2
     if two_chunk:
-        chunk_starts, chunk_len, l_local = _two_chunk_layout(
+        chunk_ranges, chunk_lengths, l_local = _normalize_row_ranges(
             chunk_ranges, "DSv4 two-chunk compressor-prep"
         )
+        if chunk_lengths[0] != chunk_lengths[1]:
+            raise RuntimeError(
+                "DSv4 two-chunk compressor-prep expects exactly two equal-length chunks."
+            )
+        chunk_starts = (chunk_ranges[0][0], chunk_ranges[1][0])
+        chunk_len = chunk_lengths[0]
     else:
         start, end = chunk_ranges[0]
         chunk_ranges = ((int(start), int(end)),)
@@ -564,208 +460,74 @@ def build_cp_compressor_prep_compact_fused(
                 c_cap,
             )
         )
-    if not two_chunk:
-        hidden_compact, cu_compact, _seq_ids, comp_ids, _valid = parts[0]
-        return hidden_compact, cu_compact, comp_ids
-    hidden_parts, cu_parts, _seq_parts, comp_parts, _valid_parts = zip(*parts)
-    target_c_cap = _compressed_group_capacity(l_local, ratio, len(chunk_ranges) * d_comp)
-    current_c_cap = sum(part.shape[0] for part in comp_parts)
-    if current_c_cap > target_c_cap:
-        raise RuntimeError(
-            "DSv4 two-chunk compressor-prep produced more groups than its aligned capacity: "
-            f"current={current_c_cap}, capacity={target_c_cap}."
-        )
-    if current_c_cap < target_c_cap:
-        pad_groups = target_c_cap - current_c_cap
-        hidden_pad_rows = pad_groups * int(ratio)
-        hidden_parts = hidden_parts + (
-            hidden_local.new_zeros((hidden_pad_rows,) + tuple(hidden_local.shape[1:])),
-        )
-        comp_parts = comp_parts + (
-            torch.full((pad_groups,), -1, dtype=torch.int32, device=hidden_local.device),
-        )
-    cu_deltas = cu_parts[0][1:] - cu_parts[0][:-1]
-    for cu in cu_parts[1:]:
-        cu_deltas = cu_deltas + (cu[1:] - cu[:-1])
-    cu_compact = torch.cat(
-        (
-            torch.zeros((1,), dtype=cu_seqlens.dtype, device=cu_seqlens.device),
-            torch.cumsum(cu_deltas, dim=0),
-        )
-    )
-    return (torch.cat(hidden_parts, dim=0), cu_compact, torch.cat(comp_parts, dim=0))
-
-
-# =============================================================================
-# Fixed-Shape CP Collectives
-# =============================================================================
-
-
-class _AllGatherFixedCPTensor(torch.autograd.Function):
-    """All-gather a fixed local tensor and reduce-scatter gradients in backward."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, cp_group) -> torch.Tensor:
-        """Gather fixed-size CP-local rows into rank-major order."""
-        cp_size = 1 if cp_group is None else cp_group.size()
-        ctx.cp_group = cp_group
-        ctx.input_shape = tuple(tensor.shape)
-        ctx.cp_size = cp_size
-
-        if cp_size == 1:
-            return tensor
-
-        local = tensor.contiguous()
-        output_shape = (cp_size * local.shape[0],) + tuple(local.shape[1:])
-        output = local.new_empty(output_shape)
-        if hasattr(dist, "all_gather_into_tensor"):
-            dist.all_gather_into_tensor(output, local, group=cp_group)
-        elif hasattr(dist, "_all_gather_base"):
-            dist._all_gather_base(output, local, group=cp_group)
-        else:
-            raise RuntimeError("DSv4 CP fixed all-gather requires all_gather_into_tensor support")
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Reduce-scatter rank-major gradients back to the local CP shard."""
-        cp_size = ctx.cp_size
-        if cp_size == 1:
-            return grad_output, None
-
-        expected_shape = (cp_size * ctx.input_shape[0],) + tuple(ctx.input_shape[1:])
-        if tuple(grad_output.shape) != expected_shape:
+    if two_chunk:
+        hidden_parts, comp_parts = zip(*parts)
+        target_c_cap = _compressed_group_capacity(l_local, ratio, len(chunk_ranges) * d_comp)
+        current_c_cap = sum(part.shape[0] for part in comp_parts)
+        if current_c_cap > target_c_cap:
             raise RuntimeError(
-                "DSv4 CP fixed all-gather backward received an unexpected gradient shape: "
-                f"grad={tuple(grad_output.shape)}, expected={expected_shape}"
+                "DSv4 two-chunk compressor-prep produced more groups than its aligned capacity: "
+                f"current={current_c_cap}, capacity={target_c_cap}."
             )
-
-        grad_output = grad_output.contiguous()
-        grad_input = grad_output.new_empty(ctx.input_shape)
-        if hasattr(dist, "reduce_scatter_tensor"):
-            dist.reduce_scatter_tensor(
-                grad_input, grad_output, op=dist.ReduceOp.SUM, group=ctx.cp_group
+        if current_c_cap < target_c_cap:
+            pad_groups = target_c_cap - current_c_cap
+            hidden_parts = hidden_parts + (
+                hidden_local.new_zeros((pad_groups * int(ratio),) + tuple(hidden_local.shape[1:])),
             )
-        elif hasattr(dist, "_reduce_scatter_base"):
-            dist._reduce_scatter_base(
-                grad_input, grad_output, op=dist.ReduceOp.SUM, group=ctx.cp_group
+            comp_parts = comp_parts + (
+                torch.full((pad_groups,), -1, dtype=torch.int32, device=hidden_local.device),
             )
-        else:
-            raise RuntimeError(
-                "DSv4 CP fixed all-gather backward requires reduce_scatter_tensor support"
-            )
-        return grad_input, None
-
-
-def all_gather_fixed_cp_tensor(
-    tensor: torch.Tensor, cp_group: torch.distributed.ProcessGroup
-) -> torch.Tensor:
-    """All-gather fixed-capacity CP tensors along dim 0 with autograd support."""
-    return _AllGatherFixedCPTensor.apply(tensor, cp_group)
-
-
-# =============================================================================
-# KV Packing And Compressed KV Repacking
-# =============================================================================
-
-
-def pack_cp_kv_full_fused(
-    kv_local: torch.Tensor,
-    boundary_kv: torch.Tensor,
-    compressed_kv_rank_major: torch.Tensor,
-    seq_ids_rank_major: torch.Tensor,
-    comp_ids_rank_major: torch.Tensor,
-    valid_rank_major: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    chunk_ranges: Sequence[Tuple[int, int]],
-    d_window: int,
-    ratio: int,
-    rank_major_by_seq_major: Optional[torch.Tensor] = None,
-    cu_seqlens_compressed: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[int]]:
-    """Pack full KV for the selected CP partition mode."""
-    d_window = int(d_window)
-    shared_compressed_base = None
-    if len(chunk_ranges) == 2:
-        chunk_starts, chunk_len, l_local = _two_chunk_layout(chunk_ranges, "DSv4 two-chunk KV pack")
-        window_capacity = max(1, int(chunk_len) + d_window * (cu_seqlens.shape[0] - 1))
-        shared_compressed_base = 2 * window_capacity
-        total_capacity = max(1, shared_compressed_base + int(compressed_kv_rank_major.shape[0]))
-        dummy_ids = torch.empty((1,), dtype=torch.int32, device=kv_local.device)
-        dummy_valid = torch.empty((1,), dtype=torch.bool, device=kv_local.device)
-        seq_ids_rank_major = comp_ids_rank_major = rank_major_by_seq_major = dummy_ids
-        valid_rank_major = dummy_valid
-        cu_seqlens_compressed = cu_seqlens
-        global_start = local_rows = kernel_ratio = 0
-        chunk0_start, chunk1_start, chunk_count = int(chunk_starts[0]), int(chunk_starts[1]), 2
+        hidden_compact = torch.cat(hidden_parts, dim=0)
+        comp_ids_local = torch.cat(comp_parts, dim=0)
     else:
-        chunk_ranges, _, l_local = _normalize_row_ranges(chunk_ranges, "DSv4 CP KV pack")
-        total_capacity = max(
-            1,
-            int(l_local)
-            + d_window * (cu_seqlens.shape[0] - 1)
-            + int(compressed_kv_rank_major.shape[0]),
-        )
-        if rank_major_by_seq_major is None:
-            rank_major_by_seq_major = torch.empty((1,), dtype=torch.int32, device=kv_local.device)
-        if cu_seqlens_compressed is None:
-            cu_seqlens_compressed = cu_seqlens
-        global_start = int(chunk_ranges[0][0])
-        local_rows = int(l_local)
-        kernel_ratio = int(ratio)
-        chunk0_start = chunk1_start = chunk_count = chunk_len = window_capacity = 0
-    if kv_local.shape[0] != l_local:
-        raise RuntimeError(
-            f"DSv4 CP KV pack expects local KV rows to be {l_local}, got {kv_local.shape[0]}."
-        )
-    expected_boundary_rows = len(chunk_ranges) * d_window
-    if boundary_kv.shape[0] != expected_boundary_rows:
-        raise RuntimeError(
-            "DSv4 CP KV pack expects one boundary window per chunk: "
-            f"boundary={boundary_kv.shape[0]}, expected={expected_boundary_rows}."
-        )
+        hidden_compact, comp_ids_local = parts[0]
 
-    kv_full = csa_cp_layout_kernels.ThdFullKvPack.apply(
-        kv_local,
-        boundary_kv,
-        compressed_kv_rank_major,
-        seq_ids_rank_major,
-        comp_ids_rank_major,
-        valid_rank_major,
-        cu_seqlens,
-        rank_major_by_seq_major,
-        cu_seqlens_compressed,
-        global_start,
-        local_rows,
-        d_window,
-        kernel_ratio,
-        int(total_capacity),
-        chunk0_start,
-        chunk1_start,
-        chunk_count,
-        int(chunk_len),
-        window_capacity,
+    # A compressed group belongs canonically to the chunk containing its last
+    # token. From that chunk's first visible compressed row, its fixed-capacity
+    # rank-major slot follows directly; no (seq, comp, valid) tensors or repack
+    # kernel are needed.
+    cp_size = int(cp_size)
+    ratio = int(ratio)
+    total_chunks = cp_size * (2 if two_chunk else 1)
+    seq_major_rows = (l_local * cp_size) // ratio
+    logical_rows = torch.arange(seq_major_rows, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    n_seq = cu_seqlens.shape[0] - 1
+    seq_ids = torch.bucketize(
+        logical_rows, cu_seqlens_compressed[1:], out_int32=True, right=True
+    ).clamp_max(n_seq - 1)
+    comp_ids = logical_rows - cu_seqlens_compressed[seq_ids]
+    group_last_rows = cu_seqlens[seq_ids] + (comp_ids + 1) * ratio - 1
+    canonical_chunks = torch.div(
+        group_last_rows, chunk_len if two_chunk else l_local, rounding_mode="floor"
+    ).clamp_(0, total_chunks - 1)
+
+    chunk_length = chunk_len if two_chunk else l_local
+    chunk_starts = torch.arange(
+        total_chunks, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+    ) * int(chunk_length)
+    first_seq_ids = torch.bucketize(
+        chunk_starts, cu_seqlens[1:], out_int32=True, right=True
+    ).clamp_max(n_seq - 1)
+    first_comp_ids = torch.div(
+        (chunk_starts - int(d_comp) - cu_seqlens[first_seq_ids]).clamp_min_(0) + ratio - 1,
+        ratio,
+        rounding_mode="floor",
     )
-    return kv_full, shared_compressed_base
-
-
-def repack_rank_major_compressed_to_seq_major_fused(
-    rank_major: torch.Tensor,
-    seq_ids_rank_major: torch.Tensor,
-    comp_ids_rank_major: torch.Tensor,
-    valid_rank_major: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    seq_major_rows: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Repack gathered compressed KV from rank-major rows to sequence-major rows."""
-    return csa_cp_layout_kernels.repack_compressed_kv_to_seq_major(
-        rank_major,
-        seq_ids_rank_major,
-        comp_ids_rank_major,
-        valid_rank_major,
-        cu_seqlens_compressed,
-        seq_major_rows,
+    first_logical_rows = cu_seqlens_compressed[first_seq_ids] + first_comp_ids
+    rank_slots = logical_rows - first_logical_rows[canonical_chunks]
+    if two_chunk:
+        late_chunks = canonical_chunks >= cp_size
+        owner_ranks = torch.where(
+            late_chunks, total_chunks - 1 - canonical_chunks, canonical_chunks
+        )
+        rank_slots = rank_slots + late_chunks * int(c_cap)
+    else:
+        owner_ranks = canonical_chunks
+    rank_rows = owner_ranks * comp_ids_local.shape[0] + rank_slots
+    rank_row_for_seq_row = torch.where(logical_rows < cu_seqlens_compressed[-1], rank_rows, -1).to(
+        torch.int32
     )
+    return hidden_compact, comp_ids_local, rank_row_for_seq_row
 
 
 def compute_cp_indexer_topk_logical_fused(
@@ -817,17 +579,43 @@ def compute_cp_indexer_topk_logical_fused(
     outputs = []
     row_start = 0
     for (global_start, _), length in zip(chunk_ranges, lengths):
+        global_start, length = int(global_start), int(length)
+        global_end = global_start + length
         q_for_topk = q_indexer_local.narrow(0, row_start, int(length))
         weights_for_topk = weights_indexer_local.narrow(0, row_start, int(length))
-        k_for_topk, cu_q_topk, cu_k_topk, seq_lens_topk = (
-            csa_cp_layout_kernels.build_indexer_topk_metadata(
-                k_indexer_seq_major,
-                cu_seqlens_q,
-                cu_seqlens_compressed,
-                int(global_start),
-                int(length),
-                ratio,
-            )
+        local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
+        local_ends = cu_seqlens_q[1:].clamp_max(global_end)
+        q_lens = (local_ends - local_starts).clamp_min(0)
+        k_lens = torch.minimum(
+            torch.div(
+                (local_ends - cu_seqlens_q[:-1]).clamp_min(0), int(ratio), rounding_mode="floor"
+            ),
+            cu_seqlens_compressed[1:] - cu_seqlens_compressed[:-1],
+        )
+        k_lens = torch.where(q_lens > 0, k_lens, 0)
+        q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+        k_prefix = torch.cumsum(k_lens, dim=0, dtype=torch.int32)
+        zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+        padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
+        cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
+        cu_k_topk = torch.cat((zero, k_prefix, k_prefix[-1:]))
+
+        k_rows = torch.arange(
+            k_indexer_seq_major.shape[0],
+            dtype=cu_seqlens_compressed.dtype,
+            device=cu_seqlens_compressed.device,
+        )
+        k_seq_ids = torch.bucketize(k_rows, cu_k_topk[1:-1], out_int32=True, right=True).clamp_max(
+            cu_seqlens_q.shape[0] - 2
+        )
+        valid_k = k_rows < k_prefix[-1]
+        source_rows = cu_seqlens_compressed[k_seq_ids] + k_rows - cu_k_topk[k_seq_ids]
+        k_for_topk = torch.index_select(
+            k_indexer_seq_major, 0, torch.where(valid_k, source_rows, 0)
+        )
+        k_for_topk = k_for_topk * valid_k.view((-1,) + (1,) * (k_for_topk.ndim - 1))
+        seq_lens_topk = torch.repeat_interleave(
+            torch.cat((k_lens, zero)), torch.cat((q_lens, padding_q.view(1))), output_size=length
         )
         topk_chunk, _ = indexer_topk(
             q_for_topk,
@@ -843,116 +631,5 @@ def compute_cp_indexer_topk_logical_fused(
             visible_k_lengths=seq_lens_topk,
         )
         outputs.append(topk_chunk)
-        row_start += int(length)
+        row_start += length
     return torch.cat(outputs, dim=0)
-
-
-# =============================================================================
-# Final Attention And Indexer-Loss Indices
-# =============================================================================
-
-
-def build_cp_attention_indices_fused(
-    cu_seqlens: torch.Tensor,
-    chunk_ranges: Sequence[Tuple[int, int]],
-    d_window: int,
-    window_size: int,
-    ratio: int,
-    indexer_topk_compressed_logical_ids: Optional[torch.Tensor] = None,
-    max_n_compressed: int = 0,
-    rank_major_by_seq_major: Optional[torch.Tensor] = None,
-    cu_seqlens_compressed: Optional[torch.Tensor] = None,
-    shared_compressed_base: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build final sparse-attention indices for the selected CP partition mode."""
-    compressed_width = max_n_compressed if ratio > 1 else 0
-    if indexer_topk_compressed_logical_ids is not None:
-        compressed_width = indexer_topk_compressed_logical_ids.shape[-1]
-
-    if len(chunk_ranges) == 2:
-        chunk_starts, chunk_len, l_local = _two_chunk_layout(
-            chunk_ranges, "DSv4 two-chunk final idx"
-        )
-        if shared_compressed_base is None:
-            raise RuntimeError("DSv4 two-chunk final idx requires a shared compressed base.")
-        if compressed_width > 0 and (
-            rank_major_by_seq_major is None or cu_seqlens_compressed is None
-        ):
-            raise RuntimeError("DSv4 two-chunk final idx with compression requires metadata.")
-        if compressed_width == 0:
-            cu_seqlens_compressed = cu_seqlens
-            rank_major_by_seq_major = torch.empty((1,), dtype=torch.int32, device=cu_seqlens.device)
-        global_start, window_capacity_per_chunk = 0, int(shared_compressed_base) // 2
-    else:
-        chunk_ranges, _, l_local = _normalize_row_ranges(chunk_ranges, "DSv4 CP final idx")
-        global_start = chunk_ranges[0][0]
-        chunk_starts, chunk_len, window_capacity_per_chunk, shared_compressed_base = None, 0, 0, 0
-    if (
-        indexer_topk_compressed_logical_ids is not None
-        and indexer_topk_compressed_logical_ids.shape[0] != l_local
-    ):
-        raise RuntimeError(
-            "DSv4 CP final idx expects indexer rows to be "
-            f"{l_local}, got {indexer_topk_compressed_logical_ids.shape[0]}."
-        )
-    return csa_cp_layout_kernels.build_attention_indices(
-        cu_seqlens,
-        global_start,
-        l_local,
-        d_window,
-        window_size,
-        ratio,
-        compressed_width,
-        indexer_topk_compressed_logical_ids,
-        cu_seqlens_compressed=cu_seqlens_compressed,
-        rank_major_by_seq_major=rank_major_by_seq_major,
-        chunk_starts=chunk_starts,
-        chunk_len=chunk_len,
-        window_capacity_per_chunk=window_capacity_per_chunk,
-        shared_compressed_base=shared_compressed_base,
-    )
-
-
-def build_cp_indexer_loss_indices_fused(
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    chunk_ranges: Sequence[Tuple[int, int]],
-    d_window: int,
-    window_size: int,
-    ratio: int,
-    indexer_topk_compressed_logical_ids: torch.Tensor,
-    rank_major_by_seq_major: torch.Tensor,
-    shared_compressed_base: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build indexer-loss indices for the selected CP partition mode."""
-    if len(chunk_ranges) == 2:
-        chunk_starts, chunk_len, l_local = _two_chunk_layout(
-            chunk_ranges, "DSv4 two-chunk indexer-loss idx"
-        )
-        if shared_compressed_base is None:
-            raise RuntimeError("DSv4 two-chunk indexer-loss idx requires a shared compressed base.")
-        global_start, window_capacity_per_chunk = 0, int(shared_compressed_base) // 2
-    else:
-        chunk_ranges, _, l_local = _normalize_row_ranges(chunk_ranges, "DSv4 CP indexer-loss idx")
-        global_start = chunk_ranges[0][0]
-        chunk_starts, chunk_len, window_capacity_per_chunk, shared_compressed_base = None, 0, 0, 0
-    if indexer_topk_compressed_logical_ids.shape[0] != l_local:
-        raise RuntimeError(
-            "DSv4 CP indexer-loss idx expects indexer rows to be "
-            f"{l_local}, got {indexer_topk_compressed_logical_ids.shape[0]}."
-        )
-    return csa_cp_layout_kernels.build_indexer_loss_indices(
-        cu_seqlens,
-        cu_seqlens_compressed,
-        global_start,
-        l_local,
-        d_window,
-        window_size,
-        ratio,
-        indexer_topk_compressed_logical_ids,
-        rank_major_by_seq_major,
-        chunk_starts=chunk_starts,
-        chunk_len=chunk_len,
-        window_capacity_per_chunk=window_capacity_per_chunk,
-        shared_compressed_base=shared_compressed_base,
-    )
