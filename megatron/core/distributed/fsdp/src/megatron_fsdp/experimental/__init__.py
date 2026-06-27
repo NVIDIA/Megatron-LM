@@ -17,6 +17,7 @@
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard
 from .module import FsdpModule
+from .optimizer import fully_shard_optimizer
 from .parameter_group import FsdpParameterGroup
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
@@ -29,5 +30,6 @@ __all__ = [
     "Placement",
     "Placements",
     "Replicate",
+    "fully_shard_optimizer",
     "fully_shard",
 ]
