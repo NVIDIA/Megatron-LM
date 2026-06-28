@@ -58,10 +58,6 @@ except (ImportError, AttributeError):
 pytestmark = [
     pytest.mark.internal,
     pytest.mark.skipif(
-        not _BLACKWELL_AVAILABLE,
-        reason="Single grouped MXFP8/NVFP4 parity tests require Blackwell (SM >= 10)",
-    ),
-    pytest.mark.skipif(
         not is_te_min_version("2.14.0"),
         reason="moe_single_grouped_weight requires Transformer Engine >= 2.14.0",
     ),
@@ -76,6 +72,8 @@ def _skip_if_unsupported(precision: str) -> None:
     if Utils.world_size < 2:
         pytest.skip("distributed optimizer parity test requires torchrun with at least 2 ranks")
 
+    if precision in ("mxfp8", "nvfp4") and not _BLACKWELL_AVAILABLE:
+        pytest.skip(f"{precision} single grouped weight parity requires Blackwell (SM >= 10)")
     if precision == "mxfp8" and not _FP8_AVAILABLE:
         pytest.skip(_NO_FP8_REASON)
     if precision == "nvfp4" and not _NVFP4_AVAILABLE:
