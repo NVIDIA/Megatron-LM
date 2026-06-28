@@ -154,6 +154,7 @@ class TestMoESingleGroupedWeightNumerics:
         use_transformer_engine_op_fuser: bool,
         overlap_param_gather: bool = False,
         overlap_grad_reduce: bool = False,
+        grad_reduce_in_fp32: bool = False,
     ):
         self._cleanup()
 
@@ -178,12 +179,15 @@ class TestMoESingleGroupedWeightNumerics:
         args.bf16 = True
         args.attention_backend = "unfused"
         args.add_bias_linear = False
+        args.hidden_dropout = 0.0
+        args.attention_dropout = 0.0
         args.swiglu = True
         args.gradient_accumulation_fusion = gradient_accumulation_fusion
         args.use_distributed_optimizer = True
         args.use_transformer_engine_op_fuser = use_transformer_engine_op_fuser
         args.overlap_param_gather = overlap_param_gather
         args.overlap_grad_reduce = overlap_grad_reduce
+        args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         args.ddp_bucket_size = 40960
 
         args.num_experts = 2
@@ -324,7 +328,49 @@ class TestMoESingleGroupedWeightNumerics:
         )
         return torch.stack(losses)
 
-    def run_forced_param_sync_case(self) -> None:
+    def run_one_mxfp8_overlap_train_step(self, args, model, optimizer, batch):
+        model[0].zero_grad_buffer()
+        optimizer.zero_grad()
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            optimizer.prepare_model_params_for_param_sync()
+        model[0].set_is_first_microbatch()
+        output = model[0].forward(
+            input_ids=batch[0],
+            labels=batch[1],
+            position_ids=batch[2],
+            attention_mask=batch[3],
+            loss_mask=batch[4],
+        )
+        loss = output.mean()
+        assert torch.isfinite(loss)
+        loss.backward()
+
+        if args.overlap_grad_reduce:
+            model[0].finish_grad_sync()
+
+        update_successful, _, _ = optimizer.step()
+        assert update_successful
+        return loss.detach().float().cpu()
+
+    def run_mxfp8_eval_step(self, args, model, optimizer, batch):
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            optimizer.prepare_model_params_for_param_sync()
+
+        model[0].disable_forward_pre_hook(param_sync=True)
+        model[0].eval()
+        with torch.no_grad():
+            output = model[0].forward(
+                input_ids=batch[0],
+                labels=batch[1],
+                position_ids=batch[2],
+                attention_mask=batch[3],
+                loss_mask=batch[4],
+            )
+            assert torch.isfinite(output.mean())
+        model[0].train()
+        model[0].enable_forward_pre_hook()
+
+    def run_mxfp8_training_losses_with_optional_eval(self, eval_after_step: int | None):
         args = self.create_test_args(
             precision="mxfp8",
             primary_param_gather=True,
@@ -333,6 +379,7 @@ class TestMoESingleGroupedWeightNumerics:
             use_transformer_engine_op_fuser=True,
             overlap_param_gather=True,
             overlap_grad_reduce=True,
+            grad_reduce_in_fp32=True,
         )
         set_args(args)
         torch.manual_seed(_SEED)
@@ -347,19 +394,13 @@ class TestMoESingleGroupedWeightNumerics:
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, True)
         self.assert_execution_path_is_exercised(model[0], True)
 
-        # Seed cached DDP param-buffer shard views under no_grad, as explicit
-        # sync paths can do outside differentiable forward compute. The later
-        # hook-disable forced sync must not reuse those views in grad mode.
-        optimizer.prepare_model_params_for_param_sync()
-        with torch.no_grad():
-            model[0].start_param_sync(force_sync=True)
-
-        # Bridge evaluation/checkpointing stages MXFP8 master params, then disables
-        # pre-hooks with param_sync=True. Without the DDP no_grad boundary, this forced
-        # sync reuses no_grad-created cached shard views and mutates the same param buffer
-        # with grad mode enabled.
-        optimizer.prepare_model_params_for_param_sync()
-        model[0].disable_forward_pre_hook(param_sync=True)
+        batch = self.get_batch()
+        losses = []
+        for step in range(4):
+            if eval_after_step is not None and step == eval_after_step:
+                self.run_mxfp8_eval_step(args, model, optimizer, batch)
+            losses.append(self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch))
+        return torch.stack(losses)
 
     @staticmethod
     def assert_loss_parity(precision: str, single_weight_losses, discrete_weight_losses):
@@ -421,13 +462,24 @@ class TestMoESingleGroupedWeightNumerics:
 
         self.assert_all_ranks_passed(local_passed, local_error)
 
-    def test_single_grouped_mxfp8_forced_param_sync_after_staging(self):
-        """Exercise eval-style forced param sync after MXFP8 param-buffer staging."""
+    def test_single_grouped_mxfp8_train_eval_train_matches_train_only(self):
+        """Eval should not change subsequent MXFP8 single grouped weight training losses."""
         _skip_if_unsupported("mxfp8")
         local_passed = True
         local_error = ""
         try:
-            self.run_forced_param_sync_case()
+            train_only_losses = self.run_mxfp8_training_losses_with_optional_eval(
+                eval_after_step=None
+            )
+            train_eval_train_losses = self.run_mxfp8_training_losses_with_optional_eval(
+                eval_after_step=2
+            )
+            torch.testing.assert_close(
+                train_eval_train_losses,
+                train_only_losses,
+                atol=1e-4,
+                rtol=1e-4,
+            )
         except Exception:
             local_passed = False
             local_error = traceback.format_exc()
