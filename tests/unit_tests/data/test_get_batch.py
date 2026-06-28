@@ -2,13 +2,17 @@
 
 import os
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.utils import flatten_batch_for_packed_sequences
+from megatron.core.utils import (
+    _get_batch_on_this_cp_rank_per_sequence_balancing,
+    flatten_batch_for_packed_sequences,
+)
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
@@ -510,6 +514,173 @@ def test_flatten_batch_for_packed_sequences_padded_cu_seqlens(micro_batch_size, 
 
     expected_entries = 3 + (micro_batch_size - 1) * 2
     assert result['cu_seqlens'].shape[1] == expected_entries
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("pp_size", [1, 2, 4])
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [1024])
+def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
+    if tp_size * pp_size * cp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size * pp_size * cp_size > torch.cuda.device_count() "
+            f"({tp_size * pp_size * cp_size} > {torch.cuda.device_count()})"
+        )
+
+    global_batch_size = int(os.environ.get("WORLD_SIZE", 1)) // (tp_size * pp_size * cp_size)
+    if global_batch_size < 1:
+        pytest.skip("Not enough ranks for the requested parallelism configuration")
+    args = initialize_test_environment(
+        tp_size,
+        pp_size,
+        cp_size,
+        seq_length,
+        micro_batch_size=1,
+        global_batch_size=global_batch_size,
+        sft=False,
+    )
+    args.dataloader_inter_document_masking = True
+
+    data_iterator = None
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator, _ = create_sft_data_iterator(seq_length)
+
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    is_first = mpu.is_pipeline_first_stage()
+    is_last = mpu.is_pipeline_last_stage()
+
+    # With CP > 1 and per-sequence balancing, sequence-dimension tensors
+    # are zigzag-partitioned to seq_length // cp_size while cu_seqlens
+    # and max_seqlen are left unchanged.
+    partitioned_seq_length = seq_length // cp_size
+
+    if pp_size == 1:
+        assert tokens is not None
+        assert labels is not None
+        assert loss_mask is not None
+        assert position_ids is not None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+        assert attention_mask is None
+
+        assert tokens.shape[1] == partitioned_seq_length
+        assert labels.shape[1] == partitioned_seq_length
+        assert loss_mask.shape[1] == partitioned_seq_length
+        assert position_ids.shape[1] == partitioned_seq_length
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
+
+        assert max_seqlen.shape == (1,)
+        assert max_seqlen.dtype == torch.int32
+        assert 0 < max_seqlen.item() <= seq_length
+
+    elif is_first:
+        assert tokens is not None
+        assert position_ids is not None
+        assert labels is None
+        assert loss_mask is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+        assert tokens.shape[1] == partitioned_seq_length
+        assert position_ids.shape[1] == partitioned_seq_length
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+
+    elif is_last:
+        assert labels is not None
+        assert loss_mask is not None
+        assert tokens is None
+        assert position_ids is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+        assert labels.shape[1] == partitioned_seq_length
+        assert loss_mask.shape[1] == partitioned_seq_length
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+
+    else:
+        assert tokens is None
+        assert labels is None
+        assert loss_mask is None
+        assert position_ids is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [16, 1024])
+def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
+    """Verify that per-sequence zigzag balancing selects the correct chunks.
+
+    Constructs a batch with tokens = range(seq_length) and checks that each
+    simulated CP rank receives the expected zigzag-interleaved chunks.
+    """
+    tokens = torch.arange(seq_length, dtype=torch.int64).unsqueeze(0)
+    cu_seqlens = torch.tensor([[0, seq_length // 2, seq_length]], dtype=torch.int32)
+    max_seqlen = torch.tensor([seq_length // 2], dtype=torch.int32)
+
+    for cp_rank in range(cp_size):
+        batch = {
+            'tokens': tokens.clone(),
+            'cu_seqlens': cu_seqlens.clone(),
+            'max_seqlen': max_seqlen.clone(),
+        }
+
+        mock_group = MagicMock()
+        with (
+            patch('torch.distributed.get_world_size', return_value=cp_size),
+            patch('torch.distributed.get_rank', return_value=cp_rank),
+        ):
+            result = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=mock_group)
+
+        if cp_size == 1:
+            assert torch.equal(result['tokens'], tokens)
+        else:
+            # The sequence is split into 2*cp_size equal chunks. This rank
+            # gets chunk cp_rank and chunk 2*cp_size - cp_rank - 1.
+            chunk_size = seq_length // (2 * cp_size)
+            chunk_0_start = cp_rank * chunk_size
+            chunk_1_start = (2 * cp_size - cp_rank - 1) * chunk_size
+            expected = torch.cat(
+                [
+                    tokens[0, chunk_0_start : chunk_0_start + chunk_size],
+                    tokens[0, chunk_1_start : chunk_1_start + chunk_size],
+                ]
+            ).unsqueeze(0)
+            assert torch.equal(
+                result['tokens'], expected
+            ), f"cp_rank={cp_rank}: expected {expected}, got {result['tokens']}"
+
+        # cu_seqlens and max_seqlen must be unchanged.
+        assert torch.equal(result['cu_seqlens'], cu_seqlens)
+        assert torch.equal(result['max_seqlen'], max_seqlen)
 
 
 def create_pretrain_data_iterator(

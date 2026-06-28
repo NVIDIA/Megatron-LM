@@ -178,6 +178,7 @@ def get_batch(data_iterator, vp_stage=None):
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
+    has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
     is_hybrid_cp = args.hybrid_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -186,7 +187,7 @@ def get_batch(data_iterator, vp_stage=None):
         vp_stage=vp_stage,
     )
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:
         return None, None, None, None, None, None, None
 
     batch = {}
@@ -203,7 +204,7 @@ def get_batch(data_iterator, vp_stage=None):
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
-        is_sft=is_sft,
+        has_cu_seqlens=has_cu_seqlens,
         is_hybrid_cp=is_hybrid_cp,
         create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
         cp_size=cp_size,
@@ -221,7 +222,7 @@ def get_batch(data_iterator, vp_stage=None):
     # Intermediate PP stage under SFT only needs THD metadata (matches the
     # pretrain_hybrid.py PP-SFT shortcut, collapsed to the flex 7-tuple shape).
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert is_sft
+        assert has_cu_seqlens
         return None, None, None, None, None, batch['cu_seqlens'], batch['max_seqlen']
 
     batch = get_batch_on_this_cp_rank(
@@ -229,6 +230,9 @@ def get_batch(data_iterator, vp_stage=None):
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=(
+            getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
+        ),
     )
 
     cu_seqlens = batch.get('cu_seqlens')
@@ -474,6 +478,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        inter_document_masking=getattr(args, 'dataloader_inter_document_masking', False),
     )
 
 
