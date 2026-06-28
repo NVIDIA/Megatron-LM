@@ -2881,6 +2881,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
+        # Staging params into the DDP param buffer invalidates any prior "already
+        # dispatched" state. The next forward pre-hook must run post-sync cleanup,
+        # especially when MXFP8 reuses grad_data as the param AG buffer.
+        for model_chunk in self.model_chunks:
+            model_chunk.reset_param_sync_dispatch_state()
+
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):
         """Normalize state dict keys when grouped/indexed parameter formats differ.
