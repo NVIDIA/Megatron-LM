@@ -57,6 +57,7 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
+    get_gtp_weight_remat_group,
     get_pg_rank,
     get_pg_size,
     get_te_version,
@@ -381,10 +382,12 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
-def _maybe_setup_gtp(module, gtp_remat_group, extra_kwargs):
-    """Wire an active GTP group (size > 1) into TE's extra_kwargs and set module.gtp_remat_size.
+def _maybe_setup_gtp_remat_group(module, gtp_remat_group, extra_kwargs):
+    """Wire an active GTP_remat group (size > 1) into TE's extra_kwargs; set module.gtp_remat_size.
 
     No-op when GTP is inactive (gtp_remat_group None/size 1); module.gtp_remat_size unset.
+    Only the column/row/layernorm-column TE linears resolve a group and pass it here; the base
+    TELinear (used e.g. for duplicated MoE latent projections) leaves it None => unsharded.
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         return
@@ -915,7 +918,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
+        _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
         with init_quant_context:
             super().__init__(
                 in_features=input_size,
@@ -1025,7 +1028,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1123,7 +1125,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
+        gtp_remat_group = get_gtp_weight_remat_group(is_expert=is_expert)
+        _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1240,7 +1243,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1267,7 +1270,6 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1288,6 +1290,7 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
+        gtp_remat_group = get_gtp_weight_remat_group(is_expert=is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1359,7 +1362,7 @@ class TEColumnParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1515,7 +1518,6 @@ class TERowParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
-        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -1533,6 +1535,7 @@ class TERowParallelLinear(TELinear):
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        gtp_remat_group = get_gtp_weight_remat_group(is_expert=is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1601,7 +1604,7 @@ class TERowParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -2031,7 +2034,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
-            _maybe_setup_gtp(self, gtp_remat_group, extra_kwargs)
+            _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False
@@ -2442,7 +2445,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def __repr__(self):
             gtp_str = (
-                f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
+                f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
             )
             return (
                 f"{type(self).__name__}(per expert(["

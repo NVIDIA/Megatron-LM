@@ -489,8 +489,6 @@ class RankGenerator(object):
         self.dp = dp
         self.pp = pp
         self.cp = cp
-        # gtp_remat is a genuine world_size factor; gtp_remat_size=1 (default) is a size-1 identity dim,
-        # leaving world_size and all rank groups unchanged for non-GTP_remat callers.
         self.gtp_remat = gtp_remat
         self.rank_offset = rank_offset
         self.world_size = tp * dp * pp * cp * ep * gtp_remat
