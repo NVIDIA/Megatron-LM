@@ -177,6 +177,13 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    megatron_fsdp_zero_sm_all_gather: bool = False
+    """If true, request NCCL zero-CTA for Megatron-FSDP parameter all-gather
+      copy-engine collectives. Requires Megatron-FSDP, NCCL user-buffer registration,
+      symmetric registration, and dedicated all-gather process groups. NCCL uses zero
+      CTA whenever the collective and its buffers are eligible.
+    """
+
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
       This option is only effective when use_megatron_fsdp and nccl_ub is set.
@@ -281,6 +288,19 @@ class DistributedDataParallelConfig:
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
 
+        if self.megatron_fsdp_zero_sm_all_gather:
+            if not self.use_megatron_fsdp:
+                raise ValueError(
+                    "megatron_fsdp_zero_sm_all_gather is only supported with Megatron-FSDP."
+                )
+            if not self.nccl_ub:
+                raise ValueError(
+                    "megatron_fsdp_zero_sm_all_gather requires NCCL user-buffer registration."
+                )
+            if self.disable_symmetric_registration:
+                raise ValueError(
+                    "megatron_fsdp_zero_sm_all_gather requires symmetric NCCL registration."
+                )
         if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
             assert not self.grad_reduce_in_fp32, (
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "

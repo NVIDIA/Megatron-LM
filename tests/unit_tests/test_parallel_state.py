@@ -1,6 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from math import log2
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,53 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+class _FakeNCCLOptions:
+    def __init__(self, is_high_priority_stream=False):
+        self.is_high_priority_stream = is_high_priority_stream
+        self.config = SimpleNamespace()
+
+
+@pytest.fixture
+def fake_process_group_nccl(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "ProcessGroupNCCL",
+        SimpleNamespace(
+            Options=_FakeNCCLOptions,
+            NCCL_CTA_POLICY_DEFAULT=0,
+            NCCL_CTA_POLICY_EFFICIENCY=1,
+            NCCL_CTA_POLICY_ZERO=2,
+        ),
+        raising=False,
+    )
+
+
+def test_get_nccl_options_sets_cta_policy(fake_process_group_nccl):
+    options = ps.get_nccl_options(
+        "dp_cp_ag",
+        {"dp_cp_ag": {"is_high_priority_stream": True, "min_ctas": 2, "cta_policy": "zero"}},
+    )
+
+    assert options.is_high_priority_stream
+    assert options.config.min_ctas == 2
+    assert options.config.cta_policy == 2
+
+
+def test_get_nccl_options_with_fallback_merges_base_options(fake_process_group_nccl):
+    options = ps._get_nccl_options_with_fallback(
+        "dp_cp_ag",
+        "dp_cp",
+        {
+            "dp_cp": {"is_high_priority_stream": True, "min_ctas": 1},
+            "dp_cp_ag": {"min_ctas": 2, "cta_policy": "zero"},
+        },
+    )
+
+    assert options.is_high_priority_stream
+    assert options.config.min_ctas == 2
+    assert options.config.cta_policy == 2
 
 
 @pytest.mark.parametrize('order', test_parallel_order)

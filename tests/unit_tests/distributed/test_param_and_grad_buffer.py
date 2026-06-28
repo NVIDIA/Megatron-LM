@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 import math
@@ -10,10 +10,91 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig as StandaloneFSDPDistributedDataParallelConfig,
+)
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
+
+
+def test_megatron_fsdp_zero_sm_all_gather_config_valid(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True, nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True
+    )
+
+    assert ddp_config.megatron_fsdp_zero_sm_all_gather
+
+
+def test_standalone_fsdp_zero_sm_all_gather_config_valid(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = StandaloneFSDPDistributedDataParallelConfig(
+        nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True
+    )
+
+    assert ddp_config.megatron_fsdp_zero_sm_all_gather
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_megatron_fsdp_zero_sm_all_gather_preserves_allocator_fallback(
+    config_cls, kwargs, monkeypatch
+):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = config_cls(
+        nccl_ub=True,
+        megatron_fsdp_zero_sm_all_gather=True,
+        fsdp_db_use_persist_buf_on_alloc_fail=False,
+        **kwargs,
+    )
+
+    assert not ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+
+
+def test_megatron_fsdp_zero_sm_all_gather_config_requires_megatron_fsdp(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="only supported with Megatron-FSDP"):
+        DistributedDataParallelConfig(nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True)
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_megatron_fsdp_zero_sm_all_gather_config_requires_nccl_ub(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="requires NCCL user-buffer registration"):
+        config_cls(megatron_fsdp_zero_sm_all_gather=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_megatron_fsdp_zero_sm_all_gather_config_requires_symmetric_registration(
+    config_cls, kwargs, monkeypatch
+):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="requires symmetric NCCL registration"):
+        config_cls(
+            nccl_ub=True,
+            disable_symmetric_registration=True,
+            megatron_fsdp_zero_sm_all_gather=True,
+            **kwargs,
+        )
 
 
 class TestModelWithExperts(torch.nn.Module):

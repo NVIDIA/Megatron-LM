@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import gc
 import random
@@ -70,6 +70,66 @@ class TestModelUniform(torch.nn.Module):
         x = self.activation(x)
         x = self.linear4(x)
         return x
+
+
+def _make_zero_sm_all_gather_args(**extra_overrides):
+    import argparse
+
+    from megatron.training.arguments import add_megatron_arguments
+
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    add_megatron_arguments(parser)
+    defaults = {
+        "num_layers": 2,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "seq_length": 256,
+        "max_position_embeddings": 256,
+        "micro_batch_size": 1,
+        "global_batch_size": 8,
+        "train_iters": 1,
+        "lr": 1e-4,
+        "mock_data": True,
+        "tokenizer_type": "NullTokenizer",
+        "vocab_size": 256,
+        "bf16": True,
+        "use_megatron_fsdp": True,
+        "ckpt_format": "fsdp_dtensor",
+        "nccl_ub": True,
+        "megatron_fsdp_zero_sm_all_gather": True,
+        "data_parallel_sharding_strategy": "optim_grads_params",
+        "check_for_nan_in_loss_and_grad": False,
+        "eval_iters": 0,
+        "eval_interval": 1,
+    }
+    defaults.update(extra_overrides)
+    parser.set_defaults(**defaults)
+    args = parser.parse_args([])
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
+    args.rank = 0
+    args.world_size = 1
+    return args
+
+
+def test_zero_sm_all_gather_validation_enables_ag_group(monkeypatch):
+    from megatron.training.arguments import validate_args
+
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    args = _make_zero_sm_all_gather_args(create_all_gather_group=False)
+
+    validate_args(args)
+
+    assert args.create_all_gather_group
+
+
+def test_zero_sm_all_gather_validation_requires_nccl_ub(monkeypatch):
+    from megatron.training.arguments import validate_args
+
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    args = _make_zero_sm_all_gather_args(nccl_ub=False)
+
+    with pytest.raises(AssertionError, match="requires --use-nccl-ub"):
+        validate_args(args)
 
 
 def setup_seed(seed):

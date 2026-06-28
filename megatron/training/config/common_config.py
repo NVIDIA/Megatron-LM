@@ -103,7 +103,7 @@ class DistributedInitConfig:
     nccl_communicator_config_path: str | None = None
     """Path to the yaml file with NCCL communicator configurations. The number of min/max thread
     groups and thread group cluster size of each communicator can be configured by setting
-    `min_ctas`, `max_ctas`, and `cga_cluster_size`."""
+    `min_ctas`, `max_ctas`, `cga_cluster_size`, and `cta_policy`."""
 
     use_tp_pp_dp_mapping: bool = False
     """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.

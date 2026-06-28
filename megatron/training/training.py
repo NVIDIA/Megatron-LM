@@ -2058,12 +2058,18 @@ def get_model(
                 else None
             )
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(args.expert_model_parallel_size > 1), timeout=timeout
+                for_expert_parallelism=(args.expert_model_parallel_size > 1),
+                timeout=timeout,
+                nccl_communicator_config_path=getattr(args, "nccl_communicator_config_path", None),
+                high_priority_stream_groups=getattr(args, "high_priority_stream_groups", None),
+                zero_sm_all_gather=getattr(args, "megatron_fsdp_zero_sm_all_gather", False),
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
 
             print_rank_0("> created all-gather process groups for AG/RS overlap")
+            if getattr(args, "megatron_fsdp_zero_sm_all_gather", False):
+                print_rank_0(">   zero-SM all-gather enabled for Megatron-FSDP AG groups")
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")
 

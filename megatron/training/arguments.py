@@ -1304,6 +1304,23 @@ def validate_args(args, defaults={}):
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
 
+    if args.megatron_fsdp_zero_sm_all_gather:
+        assert (
+            args.use_megatron_fsdp
+        ), "Megatron-FSDP zero-SM all-gather requires --use-megatron-fsdp."
+        assert args.nccl_ub, "Megatron-FSDP zero-SM all-gather requires --use-nccl-ub."
+        assert not args.disable_symmetric_registration, (
+            "Megatron-FSDP zero-SM all-gather requires symmetric NCCL registration. "
+            "Do not set --disable-symmetric-registration."
+        )
+        if not args.create_all_gather_group:
+            args.create_all_gather_group = True
+            warn_rank_0(
+                'Megatron-FSDP zero-SM all-gather requires a dedicated all-gather '
+                'process group. Enabling --create-all-gather-group.',
+                args.rank,
+            )
+
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -4120,6 +4137,15 @@ def _add_distributed_args(parser):
         default=False,
         help='Disable symmetric (window) registration for NCCL userbuffer registration.'
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
+    )
+    group.add_argument(
+        '--megatron-fsdp-zero-sm-all-gather',
+        action='store_true',
+        dest='megatron_fsdp_zero_sm_all_gather',
+        default=False,
+        help='Request NCCL zero-CTA/copy-engine collectives for eligible Megatron-FSDP '
+        'parameter all-gather buffers. Requires --use-megatron-fsdp, --use-nccl-ub, '
+        'symmetric registration, and dedicated all-gather process groups.',
     )
     group.add_argument(
         '--fsdp-manual-registration',

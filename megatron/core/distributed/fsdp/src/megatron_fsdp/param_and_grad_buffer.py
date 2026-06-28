@@ -1736,6 +1736,19 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
+        if self.ddp_config.megatron_fsdp_zero_sm_all_gather:
+            assert self.ddp_config.nccl_ub, (
+                "Megatron-FSDP zero-SM all-gather requires NCCL user-buffer registration. "
+                "Please set nccl_ub=True."
+            )
+            assert not self.ddp_config.disable_symmetric_registration, (
+                "Megatron-FSDP zero-SM all-gather requires symmetric NCCL registration. "
+                "Please leave disable_symmetric_registration=False."
+            )
+            assert NCCL_ALLOCATOR == "MCORE", (
+                "Megatron-FSDP zero-SM all-gather requires megatron.core.nccl_allocator "
+                "for symmetric NCCL memory allocation."
+            )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
