@@ -90,12 +90,12 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
     """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
 
-    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per (e)gtp peer) WHOLE, so
+    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per gtp_remat peer) WHOLE, so
     their optimizer-state ShardedTensors share one key+offset across those peers. The DP-coord reset
     in ``sharded_state_dict`` would then mark all peers the all-zero "main replica" -> DCP sees N
     writers for one shard and rejects the save.
 
-    FIX: fold the (e)gtp rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
+    FIX: fold the (e)gtp_remat rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
     params (``GTPShardedParam``) are offset-sharded and excluded -- each shard already has a
     distinct offset, hence a unique writer.
 
@@ -113,8 +113,8 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
 
     from megatron.core import parallel_state
 
-    # Source the (e)gtp groups from pg_collection if populated, else from parallel_state
-    # (the default pg_collection leaves gtp/expt_gtp unset). Compatibility point.
+    # Source the (e)gtp_remat groups from pg_collection if populated, else from parallel_state
+    # (the default pg_collection leaves gtp_remat/expt_gtp_remat unset). Compatibility point.
     gtp_remat_group = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
     if gtp_remat_group is None:
         gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
@@ -153,7 +153,7 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
     remains. Correct for normal params.
 
     For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
-    fold the peer gtp rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
+    fold the peer gtp_remat rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
     gtp_rank`` (rank 0 stays the writer, the others move off the all-zero main replica) -> one
     writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
     layer index too, so it matches per-layer and already-collapsed keys.

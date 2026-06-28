@@ -1305,7 +1305,7 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     intra_dp_cp_no_gtp_remat_group.size() (asserted at param_and_grad_buffer.py:1427).
 
     Trigger:
-      GTP=2, DP=4  →  intra_dp_cp_no_gtp_remat_group.size()=2
+      GTP_remat_size=2, DP=4  →  intra_dp_cp_no_gtp_remat_group.size()=2
       pad_for_alignment=0, weight [out=2,in=3]  →  GTP shard=[1,3]=3 elements (odd)
       Two GTP params: total=6, 6%2==0 (total check passes); bucket_size=3 forces
       bucket-0 to contain only the first param, end=3, 3%2≠0  →  AssertionError
@@ -1361,7 +1361,8 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
     violating param_and_grad_buffer.py:1427 (end_index % data_parallel_world_size == 0).
 
     Trigger:
-      GTP=2, DP=4  →  intra_dp_cp_group.size()=4  (regular params reduce over the full DP group)
+      GTP_remat_size=2, DP=4  →  intra_dp_cp_group.size()=4
+      (regular params reduce over the full DP group)
       bias=True  →  each bias has 2 elements (not divisible by 4)
       Two layers: total regular numel=4, 4%4==0 (total check passes); bucket_size=2 forces
       bucket-0 to contain only the first bias, end=2, 2%4≠0  →  AssertionError

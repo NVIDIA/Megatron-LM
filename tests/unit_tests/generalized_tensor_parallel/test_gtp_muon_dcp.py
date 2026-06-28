@@ -99,7 +99,7 @@ class TestGTPMuonDCP:
                 )
                 assert any(
                     isinstance(p, GTPShardedParam) for p in model_A[0].parameters()
-                ), "GTP not active: no GTPShardedParam in the GTP=2 MoE model"
+                ), "GTP not active: no GTPShardedParam in the GTP_remat_size=2 MoE model"
 
                 model_sd_A = model_A[0].sharded_state_dict()
                 optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)

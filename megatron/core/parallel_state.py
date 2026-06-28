@@ -65,7 +65,7 @@ _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = None
 # Expert tensor, model, pipeline combined parallel group
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Same as above, but additionally merged across EGTP peers (analog of dense _MODEL_PARALLEL_GROUP
-# under GTP_remat). Identical to the above when EGTP=1.
+# under GTP_remat). Identical to the above when EGTP_remat_size=1.
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
@@ -489,7 +489,7 @@ class RankGenerator(object):
         self.dp = dp
         self.pp = pp
         self.cp = cp
-        # gtp is a genuine world_size factor; gtp=1 (default) is a size-1 identity dim,
+        # gtp_remat is a genuine world_size factor; gtp_remat_size=1 (default) is a size-1 identity dim,
         # leaving world_size and all rank groups unchanged for non-GTP_remat callers.
         self.gtp_remat = gtp_remat
         self.rank_offset = rank_offset
@@ -558,7 +558,7 @@ class RankGenerator(object):
         """Get the GTP weight-sharding groups (singletons when ``gtp_remat_size == 1``)."""
         assert (
             self.gtp_remat == gtp_remat_size
-        ), f"gtp axis size ({self.gtp_remat}) != requested gtp_remat_size ({gtp_remat_size})"
+        ), f"gtp_remat axis size ({self.gtp_remat}) != requested gtp_remat_size ({gtp_remat_size})"
         return self.get_ranks('gtp_remat')
 
 
@@ -790,15 +790,15 @@ def initialize_model_parallel(
     )
 
     # GTP_remat requires a single distributed-optimizer instance: partial-distopt sharding of the
-    # data domain would need gtp-aware sizing. Assert early so all group builds below can
+    # data domain would need gtp_remat-aware sizing. Assert early so all group builds below can
     # assume one instance when GTP_remat/EGTP is active.
     assert not (
         (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
         and num_distributed_optimizer_instances > 1
-    ), "GTP with num_distributed_optimizer_instances > 1 is not yet supported."
+    ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
 
-    # gtp counts toward model_size (it consumes its own ranks and carries distinct data),
-    # so data_parallel_size becomes the gtp-EXCLUDED replicate degree.
+    # gtp_remat counts toward model_size (it consumes its own ranks and carries distinct data),
+    # so data_parallel_size becomes the gtp_remat-EXCLUDED replicate degree.
     model_size = (
         tensor_model_parallel_size
         * pipeline_model_parallel_size
@@ -846,7 +846,7 @@ def initialize_model_parallel(
     #   - dense/decoder: inject after 'tp' → 'tp-gtp_remat-cp-ep-dp-pp' (GTP_remat local).
     #   - expert: inject after 'ep' → 'tp-cp-ep-gtp_remat-dp-pp' so EP keeps more-local placement
     #     than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
-    # When gtp/egtp size is 1 the injected axis is a no-op (singleton groups).
+    # When gtp_remat/egtp_remat size is 1 the injected axis is a no-op (singleton groups).
     def _inject_gtp(order_str: str, after: str = "tp") -> str:
         toks = order_str.split("-")
         if "gtp_remat" in toks:
@@ -872,7 +872,7 @@ def initialize_model_parallel(
     # Build expert rank generator
     if expert_tensor_parallel_size is None:
         expert_tensor_parallel_size = tensor_model_parallel_size
-    # EGTP is a world-size factor for the expert grid too (mirrors gtp on the dense grid).
+    # EGTP is a world-size factor for the expert grid too (mirrors gtp_remat on the dense grid).
     expert_tensor_model_pipeline_parallel_size = (
         expert_tensor_parallel_size
         * expert_model_parallel_size
@@ -885,7 +885,7 @@ def initialize_model_parallel(
             f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
         )
 
-    # Expert grid: inject gtp AFTER 'ep' so EP outranks EGTP for NCCL locality (heavy MoE
+    # Expert grid: inject gtp_remat AFTER 'ep' so EP outranks EGTP for NCCL locality (heavy MoE
     # all-to-all stays on the more-adjacent ranks; EGTP AG/RS takes the outer placement).
     expert_order = _inject_gtp(order, after="ep")
     expert_decoder_rank_generator = RankGenerator(
@@ -951,9 +951,9 @@ def initialize_model_parallel(
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
 
-    # Tokens for the FULL (gtp-inclusive) data-parallel domain. gtp is factored out of the
-    # generator's 'dp' axis, so the full data domain spans gtp explicitly ('gtp_remat-dp'). The
-    # replicate (gtp-excluded) groups are the _*_NO_GTP variants below.
+    # Tokens for the FULL (gtp_remat-inclusive) data-parallel domain. gtp_remat is factored out of
+    # the generator's 'dp' axis, so the full data domain spans gtp_remat explicitly ('gtp_remat-dp'
+    # ). The replicate (gtp_remat-excluded) groups are the _*_NO_GTP_remat variants below.
     dp_full_token = "gtp_remat-dp"
     dp_cp_full_token = "gtp_remat-dp-cp"
 
@@ -1080,9 +1080,9 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP
     if gtp_remat_size > 1:
-        # The replicate (gtp-excluded) DP groups ARE get_ranks('dp') / get_ranks('dp-cp') by
-        # construction (gtp is its own axis). Every rank iterates all groups so each create_group
-        # collective is entered by all ranks.
+        # The replicate (gtp_remat-excluded) DP groups ARE get_ranks('dp') / get_ranks('dp-cp') by
+        # construction (gtp_remat is its own axis). Every rank iterates all groups so each
+        # create_group collective is entered by all ranks.
         for dp_ranks in decoder_rank_generator.get_ranks('dp'):
             group = create_group(
                 dp_ranks,
@@ -1453,7 +1453,7 @@ def initialize_model_parallel(
     )
 
     # FULL (egtp-inclusive) expert data-parallel token (mirrors dp_full_token). Expert
-    # generator has cp=1, so the expert data domain spans gtp explicitly ('gtp_remat-dp').
+    # generator has cp=1, so the expert data domain spans gtp_remat explicitly ('gtp_remat-dp').
     expert_dp_full_token = "gtp_remat-dp"
     for ranks in expert_decoder_rank_generator.get_ranks(expert_dp_full_token):
         group = create_group(
@@ -2329,7 +2329,7 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, with
             ``get_model_parallel_group()`` (which merges across GTP peers). Use this when you
             need a group whose rank uniquely identifies each (ETP, EP, PP, EGTP) position;
             e.g. for the MoE distributed optimizer's ``data_parallel_group_idx``. Identical
-            to the vanilla group when EGTP=1.
+            to the vanilla group when EGTP_remat_size=1.
     """
     if with_egtp_remat:
         if check_initialized:

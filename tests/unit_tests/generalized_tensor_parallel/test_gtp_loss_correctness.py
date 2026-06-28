@@ -9,7 +9,7 @@ in parallel_state trains correctly.
 
 Mirrors TestAttentionGTPCorrectness. With world=4 and gtp_remat_size=4, GTP
 yields dp_replicate=1 and a single shard group [0,1,2,3], so the loss must match
-the GTP=1 baseline.
+the GTP_remat_size=1 baseline.
 """
 
 import pytest
@@ -34,7 +34,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 
 
 def _worker_gtp_loss_correctness(rank, world_size, port):
-    """Baseline (GTP=1, DP=4) vs GTP=4 (world=TP1*GTP4*CP1*DP1)."""
+    """Baseline (GTP_remat_size=1, DP=4) vs GTP_remat_size=4 (world=TP1*GTP4*CP1*DP1)."""
     from transformer_engine.common.recipe import MXFP8BlockScaling
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
@@ -186,7 +186,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     if rank == 0:
         assert len(baseline_losses) == STEPS and len(gtp_losses) == STEPS
         for step, (lb, lg) in enumerate(zip(baseline_losses, gtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  orth_gtp={lg:.6f}", flush=True)
+            print(f"Step {step:2d}: baseline={lb:.6f}  gtp_remat={lg:.6f}", flush=True)
         torch.testing.assert_close(
             torch.tensor(gtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
         )
@@ -194,7 +194,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
 
 class TestGTPLossCorrectness:
     def test_gtp_loss_trajectory_matches_baseline(self):
-        """GTP=4 per-step losses must match no-GTP baseline (atol=1e-5, rtol=1e-5)."""
+        """GTP_remat_size=4 per-step losses must match no-GTP baseline (atol=1e-5, rtol=1e-5)."""
         _requires_mxfp8()
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")

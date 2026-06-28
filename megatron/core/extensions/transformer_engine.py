@@ -1240,7 +1240,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1359,7 +1359,7 @@ class TEColumnParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -1601,7 +1601,7 @@ class TERowParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
         )
 
     def backward_dw(self):
@@ -2441,7 +2441,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 super().backward_dw()
 
         def __repr__(self):
-            gtp_str = f", GTP={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
+            gtp_str = (
+                f", GTP_remat_size={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
+            )
             return (
                 f"{type(self).__name__}(per expert(["
                 f"in={self.in_features}, out={self.out_features}]) "

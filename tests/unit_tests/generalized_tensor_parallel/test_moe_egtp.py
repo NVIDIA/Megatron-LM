@@ -276,7 +276,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
         assert len(baseline_losses) == STEPS
         assert len(egtp_losses) == STEPS
         for step, (lb, le) in enumerate(zip(baseline_losses, egtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  egtp={le:.6f}", flush=True)
+            print(f"Step {step:2d}: baseline={lb:.6f}  egtp_remat={le:.6f}", flush=True)
         torch.testing.assert_close(
             torch.tensor(egtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
         )

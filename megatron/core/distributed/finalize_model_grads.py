@@ -447,11 +447,12 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
 def _allreduce_replicated_grads_over_gtp_remat_group(model: List[torch.nn.Module]):
-    """Sum wgrads for replicated parameters over the gtp / egtp group.
+    """Sum wgrads for replicated parameters over the gtp_remat / egtp_remat group.
 
     The data-parallel collective already reduced wgrads over the GTP-excluded process groups with
-    1/full scaling, so the gtp-axis terms are still missing. A plain SUM (not AVG) over the gtp/egtp
-    group adds them and yields the exact full mean. No-op when GTP is inactive (group size <= 1).
+    1/full scaling, so the gtp_remat-axis terms are still missing. A plain SUM (not AVG) over the
+    gtp_remat/egtp_remat group adds them and yields the exact full mean. No-op when GTP is inactive
+    (group size <= 1).
     """
     gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
     egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
@@ -461,7 +462,7 @@ def _allreduce_replicated_grads_over_gtp_remat_group(model: List[torch.nn.Module
     for model_chunk in model:
         for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
             if not param.requires_grad or getattr(param, 'is_gtp', False):
-                continue  # GTP-sharded params: their gtp axis is handled by the RS-mean.
+                continue  # GTP-sharded params: their gtp_remat axis is handled by the RS-mean.
             grad_attr = _get_main_grad_attr(param)
             grad = getattr(param, grad_attr, None)
             if grad is None:
@@ -570,7 +571,7 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
-    # Complete the gtp-axis reduction for replicated (non-GTP) params (no-op when GTP inactive).
+    # Complete the gtp_remat-axis reduction for replicated params (no-op when GTP inactive).
     _allreduce_replicated_grads_over_gtp_remat_group(model)
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()

@@ -37,12 +37,12 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 def _worker_attention_gtp_correctness(rank, world_size, port):
     """Verify GTP TransformerLayer produces the same per-step loss as a no-GTP baseline.
 
-    Phase 1 — GTP=1, DP=4:
+    Phase 1 — GTP_remat_size=1, DP=4:
         All 4 ranks hold the full model and process identical inputs.  Gradients
         are identical across ranks (no all-reduce needed).  Weight update:
             param.data -= lr * param.grad
 
-    Phase 2 — GTP=4, DP=1:
+    Phase 2 — GTP_remat_size=4, DP=1:
         All linear weights (QKV proj, output proj, MLP fc1/fc2) sharded across
         4 ranks.  After backward, wgrad reduce-scatter sums each shard's wgrad:
             main_grad[rank_i] = gtp_remat_size * dW[shard_i]
@@ -54,7 +54,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
 
     Nemotron3-Super proxy hyperparameters:
         hidden=4096, num_heads=32 (head_dim=128), ffn_hidden_size=16384 (=4xhidden)
-    MXFP8 alignment with GTP=4:
+    MXFP8 alignment with GTP_remat_size=4:
         QKV shard: 3x4096/4=3072, 3072%32=0 ✓; proj shard: 4096/4=1024, 1024%32=0 ✓
         fc1 shard: 16384/4=4096, 4096%32=0 ✓; fc2 shard: 4096/4=1024, 1024%32=0 ✓
     """
@@ -131,7 +131,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
     # Verify baseline has no GTP_remat sharding (gtp_remat_size=1 should leave plain parameters).
     assert not any(
         isinstance(p, GTPShardedParam) for p in layers.parameters()
-    ), "Baseline GTP=1 stack should have no GTPShardedParam"
+    ), "Baseline GTP_remat_size=1 stack should have no GTPShardedParam"
 
     # Synchronize weights from rank 0 across all DP ranks.
     for p in layers.parameters():
@@ -185,7 +185,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
     gtp_params = [p for p in layers_gtp.parameters() if isinstance(p, GTPShardedParam)]
     assert (
         len(gtp_params) > 0
-    ), "GTP is not active: no GTPShardedParam found in GTP=4 transformer stack"
+    ), "GTP is not active: no GTPShardedParam found in GTP_remat_size=4 transformer stack"
 
     # Restore initial weights: GTP_remat params get the matching shard, others get the full tensor.
     for name, p in layers_gtp.named_parameters():
@@ -237,7 +237,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
         assert len(baseline_losses) == STEPS
         assert len(gtp_losses) == STEPS
         for step, (lb, lg) in enumerate(zip(baseline_losses, gtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  gtp={lg:.6f}", flush=True)
+            print(f"Step {step:2d}: baseline={lb:.6f}  gtp_remat={lg:.6f}", flush=True)
         torch.testing.assert_close(
             torch.tensor(gtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
         )

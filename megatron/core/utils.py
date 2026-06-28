@@ -965,7 +965,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
-    # GTP: a GTPShardedParam additionally shards out_features (axis 0) by 1/gtp. Layer that
+    # GTP: a GTPShardedParam additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
     # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.

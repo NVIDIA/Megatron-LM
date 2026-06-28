@@ -907,7 +907,7 @@ def _get_megatron_emerging_optimizer(
                         "the legacy LayerWise ping-pong path for MoE models."
                     )
                 fallback_config.use_distributed_optimizer = True
-                # Shard optimizer state over the gtp-EXCLUDED replicate group
+                # Shard optimizer state over the gtp_remat-EXCLUDED replicate group
                 # (intra_dp_cp_no_gtp_remat_group), matching how the DDP grad buffer is partitioned.
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -1060,16 +1060,16 @@ def get_megatron_optimizer(
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
     # Drives no-Gloo state path + sharding over the *_no_gtp_remat replicate group below.
-    gtp_active = ProcessGroupCollection.is_gtp_active(process_groups_dict)
+    gtp_active = ProcessGroupCollection.is_gtp_remat_active(process_groups_dict)
     optim_dp_group = intra_dp_cp_no_gtp_remat_group
-    # The gtp-excluded replicate group has no Gloo variant by design (parallel_state asserts it),
-    # so None is correct under GTP. Warn if a Gloo group was requested so the drop is not silent.
+    # The gtp_remat-excluded replicate group has no Gloo variant by design (parallel_state asserts
+    # it), warn if a Gloo group was requested so the drop is not silent.
     if gtp_active and intra_dp_cp_group_gloo is not None:
         log_single_rank(
             logger,
             logging.WARNING,
             "GTP is active: disabling the optimizer's Gloo data-parallel group (no Gloo variant "
-            "of the gtp-excluded replicate group). Use DCP (--ckpt-format torch_dist) for "
+            "of the gtp_remat-excluded replicate group). Use DCP (--ckpt-format torch_dist) for "
             "checkpointing; the legacy Gloo CPU scatter path is unavailable under GTP.",
         )
     optim_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo

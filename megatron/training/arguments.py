@@ -1455,7 +1455,7 @@ def validate_args(args, defaults={}):
 
         assert not args.ddp_average_in_collective, (
             "GTP requires --ddp-average-in-collective off (the default); averaged collectives "
-            "would need per-buffer 1/gtp scaling."
+            "would need per-buffer 1/gtp_remat scaling."
         )
 
         assert args.ckpt_format in ('torch', 'torch_dist'), (

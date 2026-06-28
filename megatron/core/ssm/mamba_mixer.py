@@ -1425,7 +1425,8 @@ class MambaMixer(MegatronModule):
         # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
         # rows with no padding. To reload into the live GTPShardedParam we must mirror init
         # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
-        # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP=1 has no pad/slice.
+        # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP_remat_size=1 has no
+        # pad/slice.
         if (
             in_proj_gtp_remat_size > 1
             and HAVE_GTP

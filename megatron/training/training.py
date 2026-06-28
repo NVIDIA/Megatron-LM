@@ -1647,9 +1647,9 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            # Size the layout for the replicate (gtp/egtp-EXCLUDED) DP group the DDP buffer
-            # actually shards over, so DDP can use it directly without recomputing. no_gtp_remat
-            # aliases the regular DP group when GTP is inactive.
+            # Size the layout for the replicate (gtp_remat/egtp_remat-EXCLUDED) DP group the DDP
+            # buffer actually shards over, so DDP can use it directly without recomputing.
+            # no_gtp_remat aliases the regular DP group when GTP is inactive.
             data_parallel_world_size = get_pg_size(layout_pgs.dp_cp_no_gtp_remat)
             expert_data_parallel_world_size = get_pg_size(
                 getattr(layout_pgs, "expt_dp_no_egtp_remat", None)

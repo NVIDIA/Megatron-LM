@@ -45,22 +45,22 @@ class ProcessGroupCollection:
         tp_ep: Tensor and expert parallel group
         tp_ep_pp: Tensor, expert, and pipeline parallel group
         tp_ep_pp_with_egtp_remat: tp_ep_pp merged across EGTP peers (dense ``mp`` analog);
-            identical to ``tp_ep_pp`` when EGTP=1
+            identical to ``tp_ep_pp`` when EGTP_remat_size=1
 
         # Data Parallelism Groups
         dp: Data parallel process group
         dp_cp: Data and context parallel group
         dp_cp_no_gtp_remat: Data and context parallel group excluding GTP peers
-            (true dense-weight replicas); identical to dp_cp when GTP=1
+            (true dense-weight replicas); identical to dp_cp when GTP_remat_size=1
         expt_dp: Expert data parallel group
         expt_dp_no_egtp_remat: Expert data parallel group excluding EGTP peers
-            (true expert-weight replicas); identical to expt_dp when EGTP=1
+            (true expert-weight replicas); identical to expt_dp when EGTP_remat_size=1
         intra_dp_cp: Intra partial data parallel group
         intra_dp_cp_no_gtp_remat: Intra partial data parallel group excluding GTP peers
-            (true dense-weight replicas); identical to intra_dp_cp when GTP=1
+            (true dense-weight replicas); identical to intra_dp_cp when GTP_remat_size=1
         intra_expt_dp: Intra partial expert data parallel group
         intra_expt_dp_no_egtp_remat: Intra expert data parallel group excluding EGTP peers
-            (true expert-weight replicas); identical to intra_expt_dp when EGTP=1
+            (true expert-weight replicas); identical to intra_expt_dp when EGTP_remat_size=1
         inter_dist_opt: Inter distributed optimizer instance group
 
     Example:
@@ -116,7 +116,7 @@ class ProcessGroupCollection:
 
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP — expert "model parallel" group
     # merged across EGTP peers (analog of dense ``mp`` under GTP). Identical to ``tp_ep_pp``
-    # when EGTP=1.
+    # when EGTP_remat_size=1.
     tp_ep_pp_with_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
@@ -130,7 +130,7 @@ class ProcessGroupCollection:
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — DP+CP excluding GTP peers (true dense-weight
-    # replicas). Identical to ``dp_cp`` when GTP=1.
+    # replicas). Identical to ``dp_cp`` when GTP_remat_size=1.
     dp_cp_no_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
@@ -150,7 +150,7 @@ class ProcessGroupCollection:
     expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — expert DP excluding EGTP peers (true expert-weight
-    # replicas). Identical to ``expt_dp`` when EGTP=1.
+    # replicas). Identical to ``expt_dp`` when EGTP_remat_size=1.
     expt_dp_no_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_DATA_PARALLEL_GROUP_AG
@@ -160,14 +160,14 @@ class ProcessGroupCollection:
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_NO_GTP — intra-instance DP+CP excluding GTP
-    # peers (true dense-weight replicas). Identical to ``intra_dp_cp`` when GTP=1.
+    # peers (true dense-weight replicas). Identical to ``intra_dp_cp`` when GTP_remat_size=1.
     intra_dp_cp_no_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP_NO_EGTP — intra-instance expert DP excluding EGTP
-    # peers (true expert-weight replicas). Identical to ``intra_expt_dp`` when EGTP=1.
+    # peers (true expert-weight replicas). Identical to ``intra_expt_dp`` when EGTP_remat_size=1.
     intra_expt_dp_no_egtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -338,16 +338,16 @@ class ProcessGroupCollection:
         return cls(**init_dict)
 
     @staticmethod
-    def is_gtp_active(process_group_dict: Dict) -> bool:
-        """True iff GTP or EGTP is active (a weight-shard group spans >1 rank).
+    def is_gtp_remat_active(process_group_dict: Dict) -> bool:
+        """True iff GTP_remat or EGTP_remat is active (a weight-shard group spans >1 rank).
 
         Reads 'gtp_remat_group'/'expt_gtp_remat_group' from setup_process_groups_for_*
         builders; a None group means that axis is unused.
         """
-        gtp = process_group_dict.get('gtp_remat_group')
-        expt_gtp = process_group_dict.get('expt_gtp_remat_group')
-        return (gtp is not None and gtp.size() > 1) or (
-            expt_gtp is not None and expt_gtp.size() > 1
+        gtp_remat = process_group_dict.get('gtp_remat_group')
+        expt_gtp_remat = process_group_dict.get('expt_gtp_remat_group')
+        return (gtp_remat is not None and gtp_remat.size() > 1) or (
+            expt_gtp_remat is not None and expt_gtp_remat.size() > 1
         )
 
     @staticmethod
@@ -377,7 +377,7 @@ class ProcessGroupCollection:
                 - intra_expt_dp_group: Intra expert data parallel group
                 - intra_expt_dp_no_egtp_remat_group: Intra expert data parallel group excluding
                     EGTP peers (true expert-weight replicas); identical to expt_dp_group when
-                    EGTP=1
+                    EGTP_remat_size=1
                 - mp_group: Model parallel group
                 - expt_tp_pp_group: Expert tensor-model-pipeline parallel group
                 - inter_dist_opt_group: Inter distributed optimizer group (may be None)

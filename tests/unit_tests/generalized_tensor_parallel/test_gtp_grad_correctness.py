@@ -11,8 +11,8 @@ condition: DP2 x GTP16). This test reproduces that condition at small scale
 no-GTP_remat DP=4 baseline.
 
 Decisive choices:
-  * SGD lr=1.0 (NOT Adam): the step is scale-SENSITIVE, so a gtp x gradient
-    under-scale shows up directly as a gtp x smaller weight delta. Adam would
+  * SGD lr=1.0 (NOT Adam): the step is scale-SENSITIVE, so a gtp_remat x gradient
+    under-scale shows up directly as a gtp_remat x smaller weight delta. Adam would
     normalize a uniform scale error away and mask the bug.
   * Distinct input per rank (seed=rank): each data-parallel position sees a
     different batch (the HSDP guarantee), so the correct reduced grad is the
@@ -119,8 +119,8 @@ def _run_one_backward(ddp_model, rank):
 def _full_main_grads(stack):
     """Reconstruct full (unsharded) reduced gradients keyed by param name.
 
-    GTPShardedParam.main_grad is the local gtp shard -> all-gather over the gtp
-    group. Non-GTP_remat params are replicated -> take the local (already gtp-summed) copy.
+    GTPShardedParam.main_grad is the local gtp_remat shard -> all-gather over the gtp_remat
+    group. Non-GTP_remat params are replicated -> take the local (already gtp_remat-summed) copy.
     """
     from megatron.core import parallel_state as ps
 
@@ -177,9 +177,9 @@ def _worker(rank, world_size, port):
 
     g = ps.get_gtp_weight_remat_group()
     gtp_rank = g.rank()
-    assert g.size() == 2, f"expected gtp shard group size 2, got {g.size()}"
+    assert g.size() == 2, f"expected gtp_remat shard group size 2, got {g.size()}"
 
-    # Load the SAME init weights as baseline: GTP_remat params get their gtp shard.
+    # Load the SAME init weights as baseline: GTP_remat params get their gtp_remat shard.
     for name, p in gtp_stack.named_parameters():
         full = saved[name]
         if isinstance(p, GTPShardedParam):
@@ -218,8 +218,8 @@ def _worker(rank, world_size, port):
             flush=True,
         )
         assert max_err < 2e-2, (
-            f"GTP2xDP2 reduced gradient does not match the no-GTP_remat DP4 baseline "
-            f"(max rel err {max_err:.3e} on {worst}) -> gtp-axis grad reduction/scaling error."
+            f"GTP_remat2xDP2 reduced gradient does not match the no-GTP_remat DP4 baseline "
+            f"(max rel err {max_err:.3e} on {worst}) -> gtp_remat-axis grad reduce/scaling error."
         )
 
 
@@ -258,7 +258,7 @@ def _build_ddp_distopt_and_optim(stack):
 
 
 def _run_step_distopt(ddp_model, optim, rank):
-    """Mirror production finalize order: finish_grad_sync -> gtp-finalize -> optim.step().
+    """Mirror production finalize order: finish_grad_sync -> gtp_remat-finalize -> optim.step().
     Returns the optimizer-reported grad-norm (computed pre-clip from the reduced grads)."""
     optim.zero_grad()
     ddp_model.zero_grad_buffer()
@@ -269,7 +269,7 @@ def _run_step_distopt(ddp_model, optim, rank):
         out, _ = layer(out, attention_mask=None)
     loss = out.float().mean()
     loss.backward()
-    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp finalize.
+    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat finalize.
     ddp_model.finish_grad_sync()
     from megatron.core.distributed.finalize_model_grads import (
         _allreduce_replicated_grads_over_gtp_remat_group,
@@ -442,7 +442,7 @@ def _worker_moe_distopt(rank, world_size, port):
     for name, p in moe_stack.named_parameters():
         full = saved[name]  # EP2 layout identical to baseline -> rank-local match
         if isinstance(p, GTPShardedParam):
-            # dense GTP_remat shards over gtp group; expert (EGTP_remat) over egtp group.
+            # dense GTP_remat shards over gtp_remat group; expert (EGTP_remat) over egtp_remat group.
             is_expert = _is_expert_param(name, p)
             r = egtp_rank if is_expert else gtp_rank
             ss = p.shape[0]
@@ -504,7 +504,7 @@ def _worker_idog_span(rank, world_size, port):
         )
         assert moe_idog == world_size, (
             f"MoE grad-stats group = {moe_idog}, expected world {world_size} "
-            f"-> grad-norm would under-count gtp/egtp-sharded params"
+            f"-> grad-norm would under-count gtp_remat/egtp_remat-sharded params"
         )
         assert dense_idog == world_size, f"dense grad-stats group = {dense_idog}"
 

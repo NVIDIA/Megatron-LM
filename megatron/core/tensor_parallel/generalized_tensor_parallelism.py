@@ -1902,7 +1902,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
             continue
 
         # GTP-sharded tensor: delegate to the GTP-aware single-tensor helper — it layers the
-        # axis-0 GTP split onto TP, elects the writer over the gtp-excluded DP group, and sets
+        # axis-0 GTP split onto TP, elects the writer over the gtp_remat-excluded DP group, and sets
         # allow_shape_mismatch for alignment padding. (tp_axis None → 0; tp_size 1 when no TP.)
         tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
         sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(

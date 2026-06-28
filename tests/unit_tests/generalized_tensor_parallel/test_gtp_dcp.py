@@ -564,7 +564,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    GTP_remat = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp peers and replicate DP)
+    GTP_remat = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp_remat peers and replicate DP)
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP_remat
