@@ -662,6 +662,7 @@ try:
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
+        cached_tokens_counts = []
 
         request_idx = 0
         for result_item in batch_results:
@@ -671,6 +672,7 @@ try:
             text_output = result["generated_text"]
             prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
+            cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -782,15 +784,11 @@ try:
                     ]
 
             choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
-                logger.warning(
-                    "Generation log probs is None for request:\n%s",
-                    json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
-                )
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "created": int(time.time()),
@@ -801,6 +799,9 @@ try:
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": cached_token_count,
+                },
             },
         }
 
