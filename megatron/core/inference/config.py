@@ -103,6 +103,9 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     ROUND_ROBIN = "round_robin"
     """Route requests to ranks in round-robin order, ignoring prefix affinity."""
 
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
+
 
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""

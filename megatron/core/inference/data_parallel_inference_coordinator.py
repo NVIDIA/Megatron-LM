@@ -315,6 +315,10 @@ class DataParallelInferenceCoordinator:
         if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN:
             return self.get_next_data_parallel_rank()
 
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
+            best_idx = int(np.argmin(self._pending_counts))
+            return self._identities_list[best_idx]
+
         if not self.enable_prefix_caching or not request_hashes:
             return self.get_next_data_parallel_rank()
 
