@@ -473,10 +473,7 @@ class TestMoESingleGroupedWeightNumerics:
                 eval_after_step=2
             )
             torch.testing.assert_close(
-                train_eval_train_losses,
-                train_only_losses,
-                atol=1e-4,
-                rtol=1e-4,
+                train_eval_train_losses, train_only_losses, atol=1e-4, rtol=1e-4
             )
         except Exception:
             local_passed = False
