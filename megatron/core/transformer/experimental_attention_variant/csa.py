@@ -1009,19 +1009,33 @@ class Compressor(MegatronModule):
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
         if pre_grouped:
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
-            )
-            compressed_thd = fused_mla_rope_inplace(
-                compressed_thd,
-                rotary_pos_cos,
-                rotary_pos_sin,
-                self.head_dim - self.qk_pos_emb_head_dim,
-                self.qk_pos_emb_head_dim,
-                cu_seqlens_q=cu_seqlens,
-                remove_interleaving=True,
-                position_ids=compressed_group_ids[:total_comp].clamp_min(0) * ratio,
-            )
+            position_ids = compressed_group_ids[:total_comp].clamp_min(0) * ratio
+            if self.config.apply_rope_fusion:
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
+                )
+                compressed_thd = fused_mla_rope_inplace(
+                    compressed_thd,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.head_dim - self.qk_pos_emb_head_dim,
+                    self.qk_pos_emb_head_dim,
+                    cu_seqlens_q=cu_seqlens,
+                    remove_interleaving=True,
+                    position_ids=position_ids,
+                )
+            else:
+                rope_result = self.rotary_pos_emb(int(max_seqlen_q), packed_seq=True)
+                rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                compressed_thd = _apply_unfused_rope(
+                    compressed_thd,
+                    torch.index_select(rotary_pos_emb, 0, position_ids.long()),
+                    self.head_dim - self.qk_pos_emb_head_dim,
+                    self.qk_pos_emb_head_dim,
+                    self.config,
+                    None,
+                    self.pg_collection.cp,
+                )
         else:
             # RoPE: applied in a single vectorized THD call.
             max_seqlen_rope = (max_seqlen_q // ratio) * ratio if max_seqlen_q is not None else None
@@ -2244,7 +2258,8 @@ class CompressedSparseAttention(MegatronModule):
                 ):
                     raise RuntimeError(
                         "DSv4 THD CP path currently supports sparse indexer loss only. "
-                        "Dense CP-aware indexer loss needs a CP-aware dense score kernel."
+                        "The current dense score and backward APIs cannot express the "
+                        "sequence position where this rank's local queries begin."
                     )
 
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -2256,11 +2271,11 @@ class CompressedSparseAttention(MegatronModule):
                 q_indexer_cp = q_indexer_cp.reshape(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                    max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
-                )
-                q_indexer_cp = rotate_activation(
-                    cp_utils.apply_thd_cp_local_rope_fused(
+                if self.config.apply_rope_fusion:
+                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                    )
+                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
                         q_indexer_cp,
                         rotary_pos_cos,
                         rotary_pos_sin,
@@ -2269,7 +2284,21 @@ class CompressedSparseAttention(MegatronModule):
                         cu_seqlens,
                         global_start,
                     )
-                )
+                else:
+                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                    rotary_pos_emb = (
+                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                    )
+                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
+                        q_indexer_cp,
+                        rotary_pos_emb,
+                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                        indexer.qk_pos_emb_head_dim,
+                        cu_seqlens,
+                        global_start,
+                        self.config,
+                    )
+                q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
 
@@ -2301,6 +2330,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    use_fused=self.apply_dsa_kernel_fusion,
                 )
 
             # ---- Step 5: attention compressed KV path -------------------------

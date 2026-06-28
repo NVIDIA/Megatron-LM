@@ -13,12 +13,32 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
 # =============================================================================
+
+
+def _thd_cp_position_ids(
+    cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
+) -> torch.Tensor:
+    """Map a consecutive CP row interval to positions within packed sequences."""
+    global_rows = torch.arange(
+        int(global_start),
+        int(global_start) + int(local_rows),
+        dtype=cu_seqlens_padded.dtype,
+        device=cu_seqlens_padded.device,
+    )
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
+    sequence_starts = cu_seqlens_padded[sequence_ids]
+    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    return torch.where(valid_rows, global_rows - sequence_starts, 0)
 
 
 def apply_thd_cp_local_rope_fused(
@@ -30,33 +50,16 @@ def apply_thd_cp_local_rope_fused(
     cu_seqlens_padded: torch.Tensor,
     global_start: int,
     inverse: bool = False,
-    clamp_to_valid_token: bool = False,
 ) -> torch.Tensor:
     """Apply fused non-interleaved RoPE to local THD CP rows."""
-    global_rows = torch.arange(
-        int(global_start),
-        int(global_start) + x.shape[0],
-        dtype=cu_seqlens_padded.dtype,
-        device=x.device,
-    )
-    if clamp_to_valid_token:
-        global_rows = torch.minimum(global_rows.clamp_min(0), cu_seqlens_padded[-1] - 1)
-    sequence_ids = torch.bucketize(
-        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
-    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
-    sequence_starts = cu_seqlens_padded[sequence_ids]
-    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
-    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
-    position_ids = torch.where(
-        valid_rows, global_rows - sequence_starts, torch.zeros_like(global_rows)
-    )
+    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
     rope_input = rope_input.unsqueeze(1) if squeezed_head else rope_input
     if inverse:
-        # Sparse attention saves its unrotated output for backward.
+        # The fused kernel is in-place, but sparse-attention backward needs its original output.
         rope_input = rope_input.clone()
     output = fused_mla_rope_inplace(
         rope_input,
@@ -69,6 +72,42 @@ def apply_thd_cp_local_rope_fused(
         remove_interleaving=True,
         position_ids=position_ids,
     )
+    if squeezed_batch:
+        return output.unsqueeze(1)
+    if squeezed_head:
+        return output.squeeze(1)
+    return output
+
+
+def apply_thd_cp_local_rope_unfused(
+    x: torch.Tensor,
+    rotary_pos_emb: torch.Tensor,
+    nope_dim: int,
+    pos_dim: int,
+    cu_seqlens_padded: torch.Tensor,
+    global_start: int,
+    config,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply unfused RoPE to a consecutive interval of packed CP rows."""
+    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
+
+    squeezed_batch = x.ndim == 4 and x.shape[1] == 1
+    squeezed_head = x.ndim == 2
+    rope_input = x.squeeze(1) if squeezed_batch else x
+    rope_input = rope_input.unsqueeze(1) if squeezed_head else rope_input
+    content, rotary = torch.split(rope_input, [nope_dim, pos_dim], dim=-1)
+    rotary = _apply_rotary_pos_emb_bshd(
+        rotary,
+        freqs,
+        rotary_interleaved=config.rotary_interleaved,
+        mscale=1.0,
+        mla_rotary_interleaved=True,
+        inverse=inverse,
+        mla_output_remove_interleaving=True,
+    )
+    output = torch.cat((content, rotary), dim=-1)
     if squeezed_batch:
         return output.unsqueeze(1)
     if squeezed_head:
@@ -242,24 +281,9 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
+    use_fused: bool,
 ) -> Optional[torch.Tensor]:
-    """Run indexer top-k for this rank's query block.
-
-    This is a workaround for the DSA fused indexer forward mask contract. A
-    rank may need a mask whose first local query already sees a compressed K
-    prefix, for example:
-
-    ```
-    1 1 1 0 0 0 0 0
-    1 1 1 1 0 0 0 0
-    1 1 1 1 1 0 0 0
-    ```
-
-    The fused kernel assumes the last Q row can see all K rows, then derives
-    earlier rows' causal masks from that endpoint. A rank's last Q row may
-    only see a prefix of the global K rows, so this helper copies that visible
-    prefix before calling the kernel.
-    """
+    """Run indexer top-k for this rank's query block."""
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None
@@ -271,6 +295,64 @@ def compute_cp_indexer_topk(
             "DSv4 CP indexer top-k expects weights rows to be "
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
+
+    if not use_fused:
+        global_rows = torch.arange(
+            global_start,
+            global_start + l_local,
+            dtype=cu_seqlens_q.dtype,
+            device=cu_seqlens_q.device,
+        )
+        sequence_ids = torch.bucketize(
+            global_rows, cu_seqlens_q[1:], out_int32=True, right=True
+        ).clamp_max(cu_seqlens_q.shape[0] - 2)
+        positions = global_rows - cu_seqlens_q[sequence_ids]
+        visible_k = torch.minimum(
+            torch.div(positions + 1, int(ratio), rounding_mode="floor"),
+            cu_seqlens_compressed[sequence_ids + 1] - cu_seqlens_compressed[sequence_ids],
+        ).clamp_min(0)
+        valid_q = (global_rows >= cu_seqlens_q[sequence_ids]) & (
+            global_rows < cu_seqlens_q[sequence_ids + 1]
+        )
+
+        k_rows = torch.arange(
+            k_indexer_seq_major.shape[0],
+            dtype=cu_seqlens_compressed.dtype,
+            device=cu_seqlens_compressed.device,
+        )
+        k_sequence_ids = torch.bucketize(
+            k_rows, cu_seqlens_compressed[1:], out_int32=True, right=True
+        ).clamp_max(cu_seqlens_compressed.shape[0] - 2)
+        k_positions = k_rows - cu_seqlens_compressed[k_sequence_ids]
+        output = torch.full(
+            (l_local, topk_width), -1, dtype=torch.int32, device=q_indexer_local.device
+        )
+        selected_width = min(topk_width, k_indexer_seq_major.shape[0])
+        for start in range(0, l_local, 128):
+            end = min(start + 128, l_local)
+            scores = torch.einsum(
+                "rhd,kd->rhk", q_indexer_local[start:end].float(), k_indexer_seq_major.float()
+            )
+            scores = torch.relu(scores) * weights_indexer_local[start:end].float().unsqueeze(-1)
+            scores = scores.sum(dim=1) * float(indexer_softmax_scale)
+            valid_k = (
+                (k_sequence_ids.unsqueeze(0) == sequence_ids[start:end].unsqueeze(1))
+                & (k_positions.unsqueeze(0) < visible_k[start:end].unsqueeze(1))
+                & valid_q[start:end].unsqueeze(1)
+            )
+            scores = scores.masked_fill(~valid_k, float("-inf"))
+            values, rows = torch.topk(scores, selected_width, dim=-1)
+            local_rows = k_positions[rows].to(torch.int32)
+            output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
+        return output
+
+    # The fused kernel derives a bottom-right causal mask from each Q/K
+    # segment. Copy only the prefix visible to this rank so that mask starts
+    # at the rank's true position in the global sequence. For example:
+
+    # 1 1 1 0 0 0 0 0
+    # 1 1 1 1 0 0 0 0
+    # 1 1 1 1 1 0 0 0
 
     global_end = global_start + l_local
     zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)

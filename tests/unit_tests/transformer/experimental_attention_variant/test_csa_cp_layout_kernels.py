@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
+from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+    prepare_cp_compressor_input,
+)
 
 # This file guards only DSv4 CP layout/metadata kernels. Layer-level CUDA graph
 # tests guard graph capture/replay behavior.
@@ -411,3 +414,198 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
     )
     assert torch.equal(fused[0], expected[0])
     assert torch.equal(fused[2], expected[1])
+
+
+@pytest.mark.parametrize(
+    ("ratio", "lengths"),
+    [(4, (3, 10, 20, 5, 33, 10, 27, 20)), (128, (3, 130, 170, 5, 260, 129, 200, 127))],
+    ids=["ratio4", "ratio128"],
+)
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, lengths, cp_size):
+    """Compose compaction, rank-major gather, and final index lowering."""
+    _require_cute_cuda()
+    total = sum(lengths)
+    local_rows = total // cp_size
+    d_window = 8 if ratio == 4 else ratio
+    window_size = 4
+    cu = torch.tensor(
+        [0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32, device="cuda"
+    )
+    cu_compressed = _compressed_cu_seqlens(cu, ratio)
+    hidden = (
+        torch.arange(1, total + 1, dtype=torch.float32, device="cuda")
+        .unsqueeze(1)
+        .requires_grad_(True)
+    )
+
+    boundaries = []
+    locals_ = []
+    compact_values = []
+    compact_first_tokens = []
+    compact_ids = []
+    row_maps = []
+    for rank in range(cp_size):
+        start = rank * local_rows
+        local = hidden[start : start + local_rows]
+        boundary = torch.cat(
+            (
+                hidden.new_zeros((max(0, d_window - start), 1)),
+                hidden[max(0, start - d_window) : start],
+            )
+        )
+        compact, group_ids, row_map = prepare_cp_compressor_input(
+            local, boundary, cu, cu_compressed, start, cp_size, ratio
+        )
+        grouped = compact.reshape(group_ids.shape[0], ratio, 1)
+        boundaries.append(boundary)
+        locals_.append(local)
+        compact_values.append(grouped.sum(dim=1))
+        compact_first_tokens.append(grouped[:, 0, 0])
+        compact_ids.append(group_ids)
+        row_maps.append(row_map)
+
+    capacity = compact_ids[0].shape[0]
+    expected_map = torch.full((total // ratio,), -1, dtype=torch.int32, device="cuda")
+    physical_to_tokens = {}
+    logical_values = []
+    logical_row = 0
+    seq_start = 0
+    for seq_len in lengths:
+        for group in range(seq_len // ratio):
+            first_token = seq_start + group * ratio
+            owner = (first_token + ratio - 1) // local_rows
+            matches = torch.nonzero(
+                compact_first_tokens[owner] == first_token + 1, as_tuple=False
+            ).flatten()
+            assert matches.numel() == 1
+            slot = int(matches[0])
+            assert int(compact_ids[owner][slot]) == group
+            physical_row = owner * capacity + slot
+            expected_map[logical_row] = physical_row
+            physical_to_tokens[physical_row] = range(first_token, first_token + ratio)
+            logical_values.append(sum(range(first_token + 1, first_token + ratio + 1)))
+            logical_row += 1
+        seq_start += seq_len
+
+    for row_map in row_maps:
+        assert torch.equal(row_map, expected_map)
+    reachable = set(int(row) for row in expected_map[expected_map >= 0].cpu().tolist())
+    all_ids = torch.cat(compact_ids)
+    assert all(int(row) not in reachable for row in torch.nonzero(all_ids < 0).flatten().tolist())
+
+    compressed_rank_major = torch.cat(compact_values)
+    sequence_major = torch.index_select(
+        compressed_rank_major, 0, expected_map[:logical_row].long()
+    ).squeeze(1)
+    assert torch.equal(
+        sequence_major, torch.tensor(logical_values, dtype=torch.float32, device="cuda")
+    )
+    compressed_width = 3 if ratio == 4 else max(lengths) // ratio
+    loss = hidden.new_zeros(())
+    expected_grad = torch.zeros_like(hidden)
+    cu_list = [int(value) for value in cu.cpu().tolist()]
+    for rank in range(cp_size):
+        start = rank * local_rows
+        logical_topk = None
+        if ratio == 4:
+            logical_topk = torch.full(
+                (local_rows, compressed_width), -1, dtype=torch.int32, device="cuda"
+            )
+            for row, global_row in enumerate(range(start, start + local_rows)):
+                seq = next(i for i in range(len(lengths)) if global_row < cu_list[i + 1])
+                visible = min((global_row - cu_list[seq] + 1) // ratio, lengths[seq] // ratio)
+                selected = list(range(visible - 1, max(-1, visible - compressed_width - 1), -1))
+                if selected:
+                    logical_topk[row, : len(selected)] = torch.tensor(
+                        selected, dtype=torch.int32, device="cuda"
+                    )
+
+        actual = csa_cp_layout_kernels.build_attention_indices(
+            cu,
+            start,
+            local_rows,
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            logical_topk,
+            cu_seqlens_compressed=cu_compressed,
+            seq_to_rank_row=expected_map,
+        )
+        expected = _native_attention_indices(
+            cu,
+            cu_compressed,
+            start,
+            local_rows,
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            expected_map,
+            d_window + local_rows,
+            logical_topk,
+        )
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+
+        if logical_topk is not None:
+            actual = csa_cp_layout_kernels.build_attention_indices(
+                cu,
+                start,
+                local_rows,
+                d_window,
+                window_size,
+                ratio,
+                compressed_width,
+                logical_topk,
+                cu_seqlens_compressed=cu_compressed,
+                seq_to_rank_row=expected_map,
+                for_indexer_loss=True,
+            )
+            expected_loss_indices = _native_indexer_loss_indices(
+                cu,
+                cu_compressed,
+                start,
+                local_rows,
+                d_window,
+                window_size,
+                ratio,
+                logical_topk,
+                expected_map,
+                d_window + local_rows,
+            )
+            assert torch.equal(actual[0], expected_loss_indices[0])
+            assert torch.equal(actual[2], expected_loss_indices[1])
+
+        indices = actual[0]
+        valid = indices >= 0
+        kv = torch.cat((boundaries[rank], locals_[rank], compressed_rank_major))
+        selected = torch.index_select(kv, 0, indices.clamp_min(0).long().flatten()).reshape(
+            indices.shape
+        )
+        coefficients = (
+            torch.arange(indices.numel(), dtype=torch.float32, device="cuda").reshape(indices.shape)
+            + rank * indices.numel()
+            + 1
+        )
+        loss = loss + (selected * coefficients * valid).sum()
+
+        compressed_base = d_window + local_rows
+        for row, index_row in enumerate(indices.cpu().tolist()):
+            for column, index in enumerate(index_row):
+                if index < 0:
+                    continue
+                coefficient = float(coefficients[row, column])
+                if index < compressed_base:
+                    token = start - d_window + index
+                    assert 0 <= token <= start + row
+                    expected_grad[token] += coefficient
+                else:
+                    physical_row = index - compressed_base
+                    assert physical_row in physical_to_tokens
+                    for token in physical_to_tokens[physical_row]:
+                        expected_grad[token] += coefficient
+
+    loss.backward()
+    assert torch.equal(hidden.grad, expected_grad)

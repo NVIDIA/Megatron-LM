@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant import csa_cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     apply_thd_cp_local_rope_fused,
+    apply_thd_cp_local_rope_unfused,
     compute_cp_indexer_topk,
     exchange_cp_boundary_hidden,
     prepare_cp_compressor_input,
@@ -38,11 +41,11 @@ def _rope_reference(x, cos, sin, positions, nope_dim, pos_dim, inverse=False):
     return torch.cat((x_nope, rotated), dim=-1)
 
 
-def _sequence_positions(cu_seqlens, rows, clamp=False):
-    if clamp:
-        rows = rows.clamp(0, cu_seqlens[-1] - 1)
+def _sequence_positions(cu_seqlens, rows):
     seq_ids = torch.bucketize(rows, cu_seqlens[1:], right=True).clamp_max(cu_seqlens.shape[0] - 2)
-    return rows - cu_seqlens[seq_ids]
+    starts = cu_seqlens[seq_ids]
+    ends = cu_seqlens[seq_ids + 1]
+    return torch.where((rows >= starts) & (rows < ends), rows - starts, 0)
 
 
 def test_thd_cp_left_boundary_exchange_forward_backward():
@@ -126,20 +129,48 @@ def test_apply_thd_cp_local_rope_matches_reference_forward_backward(dtype, inver
     torch.testing.assert_close(actual_x.grad, ref_x.grad, rtol=rtol, atol=atol)
 
 
-def test_apply_thd_cp_local_rope_clamps_boundary_rows():
+def test_apply_thd_cp_local_rope_maps_invalid_boundary_rows_to_position_zero():
     _require_cuda()
     cu = torch.tensor([0, 4, 12], dtype=torch.int32, device="cuda")
     global_start = -2
     global_rows = torch.arange(-2, 14, dtype=torch.int32, device="cuda")
-    positions = _sequence_positions(cu, global_rows, clamp=True)
+    positions = _sequence_positions(cu, global_rows)
     x = torch.randn(global_rows.shape[0], 1, 8, device="cuda")
     cos = torch.randn(8, 4, device="cuda")
     sin = torch.randn(8, 4, device="cuda")
     expected = _rope_reference(x, cos, sin, positions, 4, 4)
-    actual = apply_thd_cp_local_rope_fused(
-        x, cos, sin, 4, 4, cu, global_start, clamp_to_valid_token=True
-    )
+    actual = apply_thd_cp_local_rope_fused(x, cos, sin, 4, 4, cu, global_start)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_thd_cp_local_rope_unfused_matches_explicit_positions(inverse):
+    _require_cuda()
+    torch.manual_seed(17)
+    cu = torch.tensor([0, 3, 9], dtype=torch.int32, device="cuda")
+    global_start = 2
+    global_rows = torch.arange(2, 7, dtype=torch.int32, device="cuda")
+    positions = _sequence_positions(cu, global_rows)
+    x = torch.randn(5, 2, 8, device="cuda", requires_grad=True)
+    freqs = torch.randn(6, 1, 1, 4, device="cuda")
+    config = SimpleNamespace(
+        apply_rope_fusion=False, rotary_interleaved=False, multi_latent_attention=False
+    )
+
+    expected_x = x.detach().clone().requires_grad_(True)
+    expected = _rope_reference(
+        expected_x, torch.cos(freqs[:, 0, 0]), torch.sin(freqs[:, 0, 0]), positions, 4, 4, inverse
+    )
+    grad = torch.randn_like(expected)
+    expected.backward(grad)
+
+    actual_x = x.detach().clone().requires_grad_(True)
+    actual = apply_thd_cp_local_rope_unfused(
+        actual_x, freqs, 4, 4, cu, global_start, config, inverse=inverse
+    )
+    actual.backward(grad)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_x.grad, expected_x.grad)
 
 
 def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
@@ -200,6 +231,7 @@ def test_compute_cp_indexer_topk_passes_valid_lengths(monkeypatch):
         topk_width=2,
         indexer_softmax_scale=0.5,
         max_seqlen_q=10,
+        use_fused=True,
     )
 
     assert torch.equal(out, torch.ones(5, 2, dtype=torch.int32))
@@ -208,4 +240,55 @@ def test_compute_cp_indexer_topk_passes_valid_lengths(monkeypatch):
     assert torch.equal(topk_calls[0][1], torch.tensor([0, 2, 5], dtype=torch.int32))
     assert torch.equal(topk_calls[0][2], torch.tensor([0, 2, 2], dtype=torch.int32))
     assert torch.equal(topk_calls[0][3], torch.tensor([2, 2, 0, 0, 0], dtype=torch.int32))
-    assert compute_cp_indexer_topk(q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10) is None
+    assert (
+        compute_cp_indexer_topk(q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10, True)
+        is None
+    )
+
+
+def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch):
+    def fail_if_fused(*_args, **_kwargs):
+        raise AssertionError("unfused top-k must not call the fused kernel")
+
+    monkeypatch.setattr(csa_cp_utils, "indexer_topk", fail_if_fused)
+    torch.manual_seed(19)
+    q = torch.randn(8, 2, 3)
+    weights = torch.randn(8, 2)
+    k = torch.randn(4, 3)
+    cu_q = torch.tensor([0, 5, 13, 20], dtype=torch.int32)
+    cu_k = torch.tensor([0, 1, 3, 4], dtype=torch.int32)
+    ratio = 4
+    topk_width = 3
+    scale = 0.7
+
+    actual = compute_cp_indexer_topk(
+        q,
+        weights,
+        k,
+        cu_q,
+        cu_k,
+        global_start=7,
+        ratio=ratio,
+        topk_width=topk_width,
+        indexer_softmax_scale=scale,
+        max_seqlen_q=8,
+        use_fused=False,
+    )
+
+    expected = torch.full((q.shape[0], topk_width), -1, dtype=torch.int32)
+    for local_row, global_row in enumerate(range(7, 15)):
+        seq = next(i for i in range(len(cu_q) - 1) if global_row < int(cu_q[i + 1]))
+        visible = min((global_row - int(cu_q[seq]) + 1) // ratio, int(cu_k[seq + 1] - cu_k[seq]))
+        candidates = []
+        for local_k in range(visible):
+            k_row = int(cu_k[seq]) + local_k
+            score = 0.0
+            for head in range(q.shape[1]):
+                dot = torch.dot(q[local_row, head], k[k_row]).item()
+                score += max(dot, 0.0) * weights[local_row, head].item() * scale
+            candidates.append((score, local_k))
+        candidates.sort(reverse=True)
+        for column, (_, local_k) in enumerate(candidates[:topk_width]):
+            expected[local_row, column] = local_k
+
+    assert torch.equal(actual, expected)

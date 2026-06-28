@@ -547,7 +547,8 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    def test_thd_cp_matches_full_reference_forward_backward(self, layer_number):
+    @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused_rope", "unfused_rope"])
+    def test_thd_cp_matches_full_reference_forward_backward(self, layer_number, apply_rope_fusion):
         """CP path matches the full-sequence THD reference on ragged
         packed inputs using the DSv4 layer configuration.
 
@@ -558,12 +559,13 @@ class TestDSv4HybridAttentionTHDCP:
 
         torch.manual_seed(_SEED + layer_number)
         model_parallel_cuda_manual_seed(_SEED + layer_number)
+        apply_dsa_kernel_fusion = self.fused_kernels_available
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
-            apply_rope_fusion=True,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            apply_rope_fusion=apply_rope_fusion,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -571,7 +573,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             # Numerical parity uses the unfused CP1 reference so failures point
             # at the CP path instead of non-CP fused RoPE behavior.
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
             apply_rope_fusion=False,
         )
         cp_attn = _build_attention(
@@ -597,7 +599,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_out.detach(),
             ref_out.detach().index_select(0, local_idx),
-            f"layer={layer_number}:output",
+            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:output",
         )
 
         grad = torch.randn_like(ref_out)
@@ -606,7 +608,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_hidden.grad.detach(),
             ref_hidden.grad.index_select(0, local_idx),
-            f"layer={layer_number}:hidden_grad",
+            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:hidden_grad",
         )
 
         ref_params = dict(ref_attn.named_parameters())
@@ -616,7 +618,12 @@ class TestDSv4HybridAttentionTHDCP:
             assert ref_grad is not None, f"Missing reference grad for {name}"
             grad_sum = param.grad.detach().clone()
             dist.all_reduce(grad_sum, group=self.pg.cp)
-            _assert_cp_tensor_match(grad_sum, ref_grad, f"layer={layer_number}:param_grad:{name}")
+            _assert_cp_tensor_match(
+                grad_sum,
+                ref_grad,
+                f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:"
+                f"rope={apply_rope_fusion}:param_grad:{name}",
+            )
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
@@ -666,8 +673,14 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    @pytest.mark.parametrize("fused", [True, False])
-    def test_thd_cp_cuda_graph_matches_eager_forward_backward(self, layer_number, fused):
+    @pytest.mark.parametrize(
+        ("dsa_fused", "rope_fused"),
+        [(True, True), (False, True), (False, False)],
+        ids=["fused", "unfused_dsa", "unfused_dsa_rope"],
+    )
+    def test_thd_cp_cuda_graph_matches_eager_forward_backward(
+        self, layer_number, dsa_fused, rope_fused
+    ):
         """CUDA graph replay matches eager THD CP forward/backward.
 
         Captures the DSv4 attention layer's CP-local forward and backward
@@ -679,11 +692,11 @@ class TestDSv4HybridAttentionTHDCP:
         plus elementwise ``assert_close`` gates because they may be
         nondeterministic against eager execution.
         """
-        if fused and not self.fused_kernels_available:
+        if (dsa_fused or rope_fused) and not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
-        context = nullcontext() if fused else _deterministic_torch_algorithms()
-        mode = "fused" if fused else "unfused"
+        context = nullcontext() if dsa_fused else _deterministic_torch_algorithms()
+        mode = f"dsa_fused={dsa_fused}:rope_fused={rope_fused}"
         with context:
             packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
@@ -693,8 +706,8 @@ class TestDSv4HybridAttentionTHDCP:
                 context_parallel_size=self.cp_size,
                 dsa_indexer_loss_coeff=1.0,
                 dsa_indexer_use_sparse_loss=True,
-                apply_dsa_kernel_fusion=fused,
-                apply_rope_fusion=True,
+                apply_dsa_kernel_fusion=dsa_fused,
+                apply_rope_fusion=rope_fused,
             )
             graph_attn = _build_attention(
                 config, layer_number=layer_number, pg_collection=self.pg
@@ -744,7 +757,7 @@ class TestDSv4HybridAttentionTHDCP:
             output_label = f"layer={layer_number}:{mode}:output"
             _assert_cp_graph_bitwise_match(graph_out, eager_out, output_label)
             bwd_match_fn = (
-                _assert_cp_graph_fused_grad_match if fused else _assert_cp_graph_bitwise_match
+                _assert_cp_graph_fused_grad_match if dsa_fused else _assert_cp_graph_bitwise_match
             )
             bwd_match_fn(
                 graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:{mode}:hidden_grad"

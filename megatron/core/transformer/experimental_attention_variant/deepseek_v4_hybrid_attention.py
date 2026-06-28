@@ -409,6 +409,18 @@ class DSv4HybridAttention(Attention):
                 )
                 if packed_seq:
                     core_attn_out = core_attn_out.unsqueeze(1)
+        elif use_thd_cp:
+            global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
+            core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
+                core_attn_out,
+                rotary_pos_emb,
+                nope_dim,
+                pos_dim,
+                cu_seqlens_kv,
+                global_start,
+                self.config,
+                inverse=True,
+            )
         else:
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
@@ -723,7 +735,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
                         global_start - boundary_rows,
-                        clamp_to_valid_token=bool(boundary_rows),
                     )
                     if boundary_kv_compressed is not None:
                         boundary_kv = kv[:boundary_rows]
@@ -757,65 +768,76 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 value = kv
             else:
                 if packed_seq and cp_size > 1:
-                    raise RuntimeError(
-                        "DSv4 THD CP requires apply_rope_fusion=True; "
-                        "the unfused THD CP RoPE path is not implemented."
+                    global_start = self.pg_collection.cp.rank() * q.shape[0]
+                    query = cp_utils.apply_thd_cp_local_rope_unfused(
+                        q,
+                        rotary_pos_emb,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        global_start,
+                        self.config,
                     )
-
-                q_len = q.size()[0]
-                if packed_seq_params is None or self.config.context_parallel_size == 1:
+                    kv = cp_utils.apply_thd_cp_local_rope_unfused(
+                        kv.unsqueeze(-2),
+                        rotary_pos_emb,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_kv,
+                        global_start - boundary_rows,
+                        self.config,
+                    )
+                    if boundary_kv_compressed is not None:
+                        boundary_kv = kv[:boundary_rows]
+                        kv = kv[boundary_rows:]
+                    key = value = kv
+                else:
+                    q_len = q.size()[0]
                     # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
+                    # is not provided so direct forward accepts any sequence length.
                     rotary_pos_emb = rotary_pos_emb[0:q_len]
 
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
+                    # q_no_pe: [num_tokens, n, qk_head_dim]
+                    # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                    q_no_pe, q_pos_emb = torch.split(
+                        q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+                    )
 
-                # RoPE and query (shared for wkv and latent)
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    mla_output_remove_interleaving=True,
-                    max_seqlen=rope_max_seqlen_q,
-                )
-                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
-                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+                    # RoPE and query (shared for wkv and latent)
+                    # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                    q_pos_emb = apply_rotary_pos_emb(
+                        q_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_q,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        mla_output_remove_interleaving=True,
+                        max_seqlen=rope_max_seqlen_q,
+                    )
+                    # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                    query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
-                pos_dim = self.config.qk_pos_emb_head_dim
-                kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
+                    pos_dim = self.config.qk_pos_emb_head_dim
+                    kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    mla_output_remove_interleaving=True,
-                    max_seqlen=rope_max_seqlen_kv,
-                )
+                    # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                    k_pos_emb = apply_rotary_pos_emb(
+                        k_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        mla_output_remove_interleaving=True,
+                        max_seqlen=rope_max_seqlen_kv,
+                    )
 
-                # Single head: key = value = [num_tokens, 1, v_head_dim]
-                kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
-                key = kv
-                value = kv
+                    # Single head: key = value = [num_tokens, 1, v_head_dim]
+                    kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
+                    key = value = kv
 
             query = query.contiguous()
             key = key.contiguous()
