@@ -2038,7 +2038,7 @@ def is_submodule(module, parent_module, strict=True):
 
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
-    is_sft: bool,
+    has_cu_seqlens: bool,
     is_hybrid_cp: bool,
     create_attention_mask_in_dataloader: bool,
     broadcast_src_rank: int,
@@ -2073,8 +2073,8 @@ def get_batch_on_this_tp_rank(
         batch (dict[str, torch.Tensor]): The batch dict. On TP rank 0 this
             contains the actual data; on other ranks it is ignored (receive
             buffers are allocated internally).
-        is_sft (bool): Whether this is an SFT (supervised fine-tuning) run
-            using THD packed sequences.
+        has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
+            max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         create_attention_mask_in_dataloader (bool): Whether the dataloader
             creates an explicit attention mask tensor.
@@ -2131,7 +2131,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2147,7 +2147,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2161,7 +2161,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2169,8 +2169,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             batch["tokens"] = None
             batch["labels"] = None
             batch["loss_mask"] = None
@@ -2202,7 +2202,7 @@ def get_batch_on_this_tp_rank(
         attention_mask = None
         local_cp_size = None
 
-        if is_sft or is_hybrid_cp:
+        if has_cu_seqlens or is_hybrid_cp:
             max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
         if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
@@ -2242,7 +2242,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2258,7 +2258,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2272,7 +2272,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2280,8 +2280,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             tokens = None
             labels = None
             loss_mask = None
@@ -2524,50 +2524,55 @@ def get_batch_on_this_cp_rank(
     is_hybrid_cp: bool,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    use_per_sequence_balancing: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
+        ``use_per_sequence_balancing`` is True, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
         ``is_hybrid_cp`` is False, delegates to
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
-      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, delegates to
-        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
             'cu_seqlens' key (may be None for pretraining).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
-            process group used for SFT and pretraining CP partitioning.
+            process group used for CP partitioning.
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a hybrid CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
+        use_per_sequence_balancing (bool): When True, use per-sequence zigzag
+            even when ``cu_seqlens`` is present (e.g., for inter-document
+            masking where document lengths are not divisible by
+            ``2 * cp_size``).
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
 
-    if batch.get("cu_seqlens") is not None:  # NOTE(asolergi-nv): SFT & HybridCP case
-        if is_hybrid_cp:
-            assert (
-                batch['local_cp_size'] is not None
-            ), "local_cp_size is required for hybrid context parallel"
-            if batch['local_cp_size'].item() > 1:
-                hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                    batch, cp_group=hybrid_cp_group
-                )
-                batch["hybrid_cp_group"] = hybrid_cp_group
-        else:
-            batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
-    else:  # NOTE(asolergi-nv): Pretrain case
+    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
+    elif is_hybrid_cp:
+        assert (
+            batch['local_cp_size'] is not None
+        ), "local_cp_size is required for hybrid context parallel"
+        if batch['local_cp_size'].item() > 1:
+            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+            batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+                batch, cp_group=hybrid_cp_group
+            )
+            batch["hybrid_cp_group"] = hybrid_cp_group
+    else:
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
 
 
