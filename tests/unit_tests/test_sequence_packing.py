@@ -196,7 +196,7 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
     }
 
     get_cp_slice_for_thd(
-        batch, _MockCPGroup(size=4, rank=2), use_dsv4_cp_slice=True, partition_total_tokens=16
+        batch, _MockCPGroup(size=4, rank=2), use_contiguous_cp_slice=True, partition_total_tokens=16
     )
 
     assert torch.equal(batch["tokens"], torch.arange(8, 12, dtype=torch.int64))

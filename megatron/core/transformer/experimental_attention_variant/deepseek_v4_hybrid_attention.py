@@ -381,8 +381,6 @@ class DSv4HybridAttention(Attention):
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         if self.config.apply_rope_fusion:
             if use_thd_cp:
-                if rope_seqlen is None:
-                    raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
                 global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
                 core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
                     core_attn_out,
@@ -706,7 +704,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 if cp_size > 1 and packed_seq:
                     cp_rank = self.pg_collection.cp.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
-                    assert packed_seq, "DSv4 CP fused RoPE expects THD packed sequence input."
                     global_start = cp_rank * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_fused(
                         q,

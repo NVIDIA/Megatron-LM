@@ -655,13 +655,21 @@ def _unfused_indexer_sparse_attn_from_topk(
     row_valid = valid.any(dim=-1, keepdim=True)
     safe_indices = indexer_topk_indices.clamp(min=0).long()
 
-    index_scores_full = torch.einsum("rhd,kd->rhk", q_indexer.float(), k_indexer.float())
-    index_scores_full = torch.relu(index_scores_full)
     weights_scaled = weights.float() * float(indexer_softmax_scale)
-    index_scores_full = index_scores_full * weights_scaled.unsqueeze(-1)
-    index_scores_full = index_scores_full.sum(dim=1)
-
-    predict_logits = torch.gather(index_scores_full, dim=-1, index=safe_indices)
+    predict_chunks = []
+    # Avoid materializing the full [local_q, index_heads, global_k] score tensor.
+    for start in range(0, total_q, 512):
+        end = start + 512
+        chunk_indices = safe_indices[start:end]
+        selected_k_indexer = k_indexer.index_select(0, chunk_indices.reshape(-1)).reshape(
+            chunk_indices.shape[0], indexer_topk, -1
+        )
+        chunk_scores = torch.einsum(
+            "rhd,rkd->rhk", q_indexer[start:end].float(), selected_k_indexer.float()
+        )
+        chunk_scores = torch.relu(chunk_scores) * weights_scaled[start:end].unsqueeze(-1)
+        predict_chunks.append(chunk_scores.sum(dim=1))
+    predict_logits = torch.cat(predict_chunks)
     predict_logits = predict_logits.masked_fill(~valid, float("-inf"))
     predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
     predict = torch.softmax(predict_logits, dim=-1, dtype=torch.float32)
@@ -681,8 +689,9 @@ def _unfused_indexer_sparse_attn_from_topk(
     exp_scores = torch.exp(attn_scores - scores_max)
     exp_sink = torch.exp(sink - scores_max)
     attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-    attn_probs = attn_probs * row_valid.unsqueeze(1).float()
     target = attn_probs.sum(dim=1)
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    target = target * row_valid.float()
 
     eps = torch.finfo(torch.float32).tiny
     target = target.clamp(min=eps)
@@ -999,7 +1008,21 @@ class Compressor(MegatronModule):
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
-        if not pre_grouped:
+        if pre_grouped:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
+            )
+            compressed_thd = fused_mla_rope_inplace(
+                compressed_thd,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                cu_seqlens_q=cu_seqlens,
+                remove_interleaving=True,
+                position_ids=compressed_group_ids[:total_comp].clamp_min(0) * ratio,
+            )
+        else:
             # RoPE: applied in a single vectorized THD call.
             max_seqlen_rope = (max_seqlen_q // ratio) * ratio if max_seqlen_q is not None else None
             compressed_thd = _apply_rope(
@@ -1013,32 +1036,6 @@ class Compressor(MegatronModule):
                 cp_group=self.pg_collection.cp,
                 cu_seqlens=cu_seqlens_compressed,
                 max_seqlen_rope=max_seqlen_rope,
-            )
-        else:
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
-            )
-            positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
-            cos = rotary_pos_cos.flatten(1).index_select(0, positions)
-            sin = rotary_pos_sin.flatten(1).index_select(0, positions)
-            pos_dim = self.qk_pos_emb_head_dim
-            table_shape = (total_comp,) + (1,) * (compressed_thd.ndim - 2) + (pos_dim,)
-            cos = cos[:, :pos_dim].view(table_shape)
-            sin = sin[:, :pos_dim].view(table_shape)
-            x_nope, x_pos = torch.split(compressed_thd, [self.head_dim - pos_dim, pos_dim], dim=-1)
-            x1, x2 = x_pos[..., 0::2], x_pos[..., 1::2]
-            half = pos_dim // 2
-            dtype = compressed_thd.dtype
-            left = (
-                (x1.float() * cos[..., :half].float()).to(dtype).float()
-                - (x2.float() * sin[..., :half].float()).to(dtype).float()
-            ).to(dtype)
-            right = (
-                (x2.float() * cos[..., half:].float()).to(dtype).float()
-                + (x1.float() * sin[..., half:].float()).to(dtype).float()
-            ).to(dtype)
-            compressed_thd = torch.cat(
-                (x_nope, torch.stack((left, right), dim=-1).flatten(-2)), dim=-1
             )
 
         if self.rotate:
@@ -2200,8 +2197,9 @@ class CompressedSparseAttention(MegatronModule):
         compressed_kv_rank_major = kv_local.new_empty((0, kv_local.shape[-1]))
         cu_seqlens_compressed = None
 
-        # Logical top-k uses per-sequence comp ids; the map lowers them to
-        # rank-major gathered rows when needed.
+        # ``compressed_topk`` records which compressed blocks each query selects
+        # within its sequence. ``seq_to_rank_row`` maps each compressed block to
+        # the row where its K and KV are stored in the all-gathered buffer.
         compressed_topk = seq_to_rank_row = None
         ratio = self.compress_ratio
         indexer = self.indexer
@@ -2221,9 +2219,10 @@ class CompressedSparseAttention(MegatronModule):
                     torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
                 )
             )
-            # Compact local+boundary tokens for Compressor. ``compressed_group_ids``
-            # drives compressed RoPE; the row map directly lowers global
-            # sequence-major compressed ids into rank-major all-gather rows.
+            # ``hidden_compact`` packs the local and boundary tokens needed by the
+            # Compressor. ``compressed_group_ids`` gives each compressed block's
+            # position within its sequence for RoPE. ``seq_to_rank_row`` maps each
+            # block to its row in the all-gathered K and KV buffers.
             hidden_compact, compressed_group_ids, seq_to_rank_row = (
                 cp_utils.prepare_cp_compressor_input(
                     x,
@@ -2320,7 +2319,9 @@ class CompressedSparseAttention(MegatronModule):
         # Final indices address these source rows directly. This avoids a
         # second per-sequence packed KV layout and lets torch.cat own backward.
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
-        use_indexer_loss = training_with_grad and compressed_topk is not None
+        use_indexer_loss = (
+            training_with_grad and indexer_loss_coeff > 0 and compressed_topk is not None
+        )
         compressed_width = (
             compressed_topk.shape[-1]
             if compressed_topk is not None

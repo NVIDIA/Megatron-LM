@@ -15,19 +15,21 @@ def get_cp_slice_for_thd(
     batch,
     cp_group,
     keys: Optional[Sequence[str]] = None,
-    use_dsv4_cp_slice: bool = False,
+    use_contiguous_cp_slice: bool = False,
     partition_total_tokens: Optional[int] = None,
 ):
     """Partition sequence data for context parallelism in THD format.
 
-    Uses TE's THD partitioned indices by default. DSv4 instead assigns each rank one
-    ordered range of the global rows. Only keys present in the batch are sliced.
+    Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
+    With ``use_contiguous_cp_slice=True``, the flattened rows are split into ``cp_size`` equal
+    slices, and each rank receives the slice at its rank index.
+    Only keys present in the batch are sliced.
 
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
-        use_dsv4_cp_slice: Whether to use the DSv4 row assignment.
+        use_contiguous_cp_slice: Whether to assign one contiguous row range per CP rank.
         partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
             before slicing. Existing cu_seqlens metadata is left unchanged.
     """
@@ -61,10 +63,10 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
-    if use_dsv4_cp_slice:
+    if use_contiguous_cp_slice:
         if total_tokens % cp_size != 0:
             raise RuntimeError(
-                f"DSv4 CP slicing requires total_tokens={total_tokens} to be divisible by "
+                f"Contiguous CP slicing requires total_tokens={total_tokens} to be divisible by "
                 f"cp_size={cp_size}."
             )
         local_rows = total_tokens // cp_size

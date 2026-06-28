@@ -644,12 +644,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
-    use_dsv4_cp_slice = (
+    use_contiguous_cp_slice = (
         config is not None
         and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
         and cp_group.size() > 1
     )
-    dsv4_cp_local_target_len = None
+    contiguous_cp_local_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
@@ -661,15 +661,15 @@ def get_batch_on_this_rank_for_sequence_packing(
             getattr(config, 'thd_max_packed_sequences', None),
             getattr(config, 'cuda_graph_impl', 'none') != 'none',
         )
-    if is_tp_rank_0 and use_dsv4_cp_slice and pad_alignment is not None:
+    if is_tp_rank_0 and use_contiguous_cp_slice and pad_alignment is not None:
         if target_len is not None:
-            dsv4_cp_local_target_len = target_len
+            contiguous_cp_local_target_len = target_len
         else:
             # Fix the local width before slicing so later padding cannot shift rank origins.
             assert alignment is not None
             total_rows = int(batch['cu_seqlens_padded'][-1].item())
             local_rows = (total_rows + cp_group.size() - 1) // cp_group.size()
-            dsv4_cp_local_target_len = ((local_rows + alignment - 1) // alignment) * alignment
+            contiguous_cp_local_target_len = ((local_rows + alignment - 1) // alignment) * alignment
 
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
@@ -686,15 +686,15 @@ def get_batch_on_this_rank_for_sequence_packing(
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
         partition_total_tokens = (
-            dsv4_cp_local_target_len * cp_group.size()
-            if dsv4_cp_local_target_len is not None
+            contiguous_cp_local_target_len * cp_group.size()
+            if contiguous_cp_local_target_len is not None
             else None
         )
         get_cp_slice_for_thd(
             batch,
             cp_group,
             keys=cp_slice_keys,
-            use_dsv4_cp_slice=use_dsv4_cp_slice,
+            use_contiguous_cp_slice=use_contiguous_cp_slice,
             partition_total_tokens=partition_total_tokens,
         )
 
@@ -710,8 +710,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Broadcast total_tokens because padding_mask is prepared on every PP stage.
     # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
     if is_tp_rank_0:
-        if dsv4_cp_local_target_len is not None:
-            total_tokens = torch.tensor([dsv4_cp_local_target_len], dtype=torch.int32, device=dev)
+        if contiguous_cp_local_target_len is not None:
+            total_tokens = torch.tensor(
+                [contiguous_cp_local_target_len], dtype=torch.int32, device=dev
+            )
         else:
             # Under VPP, the last PP stage has labels but no tokens, so derive
             # total_tokens from cu_seqlens_padded, which is present on every

@@ -55,8 +55,11 @@ def apply_thd_cp_local_rope_fused(
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
     rope_input = rope_input.unsqueeze(1) if squeezed_head else rope_input
+    if inverse:
+        # Sparse attention saves its unrotated output for backward.
+        rope_input = rope_input.clone()
     output = fused_mla_rope_inplace(
-        rope_input.clone(),
+        rope_input,
         cos,
         sin,
         nope_dim,
