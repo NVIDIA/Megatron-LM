@@ -86,7 +86,7 @@ async def test_inference_client_lifecycle():
     assert 0 not in client.request_submission_times
     assert 0 not in client.completion_futures
 
-    # Control helpers send the matching Headers byte (PAUSE used as a representative;
+    # Control helpers send the matching control byte (PAUSE used as a representative;
     # the dispatch table is one ctype-style mapping shared across all helpers).
     fake_socket.send.reset_mock()
     client.pause_engines()
