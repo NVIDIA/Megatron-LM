@@ -150,7 +150,7 @@ main() {
 
         pip install --pre --no-cache-dir --upgrade pip
         pip install --pre --no-cache-dir torch pybind11 wheel_stub ninja wheel packaging "setuptools>=80"
-        pip install --pre --no-cache-dir --no-build-isolation -e .
+        pip install --pre --no-cache-dir --no-build-isolation .
     fi
 
 }
