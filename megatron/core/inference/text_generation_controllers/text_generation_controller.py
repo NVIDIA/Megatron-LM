@@ -2425,6 +2425,7 @@ class TextGenerationController:
             logits,
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=only_last_token_logits,
+            sampling=self._sampling,
         )
 
     def _dynamic_step_calculate_log_probs_speculative(
