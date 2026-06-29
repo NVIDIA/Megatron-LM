@@ -2130,6 +2130,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        skip_token_input_ids_transfer: bool = False,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -2138,6 +2139,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
+            skip_token_input_ids_transfer (bool): If true, leave the GPU
+                token_to_input_ids field unchanged during bookkeeping transfer.
         Return:
             None.
         """
@@ -2377,12 +2380,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
-        # Run the H2D transfer here so callers that bypass the controller
-        # (e.g. unit tests that call `model.forward()` directly after
-        # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        # Run the H2D transfer here so every caller sees populated GPU
+        # bookkeeping immediately after initialize_attention_state().
+        self.transfer_bookkeeping_to_gpu(
+            skip_token_input_ids=skip_token_input_ids_transfer
+        )
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2408,7 +2410,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(self, skip_token_input_ids: bool = False) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2420,6 +2422,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        Args:
+            skip_token_input_ids (bool): If true, leave
+                `gpu_view.token_to_input_ids` unchanged while copying the rest
+                of the bookkeeping buffer.
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2456,8 +2463,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        # redundant launch overheads vs. per-field copies. Async scheduling
+        # decode steps skip token_to_input_ids here because sampled tokens are
+        # already GPU-resident and copied directly into the GPU input buffer.
+        if skip_token_input_ids:
+            token_to_input_ids_offset = (
+                self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
+            )
+        else:
+            token_to_input_ids_offset = 0
+        self.gpu_view._buf[token_to_input_ids_offset:].copy_(
+            self._cpu_bookkeeping_buf[token_to_input_ids_offset:],
+            non_blocking=True,
+        )
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2467,6 +2485,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+    def copy_async_sched_input_tokens_to_gpu(self, sampled_tokens_cuda: Tensor) -> None:
+        """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
+
+        Async scheduling keeps sampled tokens GPU-resident for the next decode
+        forward. CPU bookkeeping is still prepared normally, but forward input
+        IDs are patched directly from the sampled CUDA tensor.
+
+        Args:
+            sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
+                token per active decode request.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+
+        self.gpu_view.token_to_input_ids[:active_request_count].copy_(
+            sampled_tokens_cuda, non_blocking=True
+        )
+        if active_request_count < self.padded_active_token_count:
+            self.gpu_view.token_to_input_ids[
+                active_request_count : self.padded_active_token_count
+            ].zero_()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

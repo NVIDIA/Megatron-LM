@@ -300,6 +300,90 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_transfer_bookkeeping_to_gpu_can_skip_input_token_ids(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        num_tokens = 4
+        dynamic_context.total_request_count = 2
+        dynamic_context.paused_request_count = 0
+        dynamic_context.padded_active_request_count = 2
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [11, 12, 13, 14], dtype=torch.int64
+        )
+        dynamic_context.token_to_pos_ids[:num_tokens] = torch.tensor(
+            [21, 22, 23, 24], dtype=torch.int64
+        )
+        existing_gpu_tokens = torch.tensor(
+            [91, 92, 93, 94],
+            dtype=torch.int64,
+            device=dynamic_context.gpu_view.token_to_input_ids.device,
+        )
+        dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = existing_gpu_tokens
+
+        dynamic_context.transfer_bookkeeping_to_gpu(skip_token_input_ids=True)
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens], existing_gpu_tokens
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_pos_ids[:num_tokens].cpu(),
+            torch.tensor([21, 22, 23, 24], dtype=torch.int64),
+        )
+
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [31, 32, 33, 34], dtype=torch.int64
+        )
+        dynamic_context.transfer_bookkeeping_to_gpu()
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens].cpu(),
+            torch.tensor([31, 32, 33, 34], dtype=torch.int64),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_copy_async_sched_input_tokens_to_gpu_populates_active_and_clears_padding(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=32,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=32,
+            max_requests=8,
+        )
+
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = 3
+        ctx.padded_active_token_count = 8
+        device = ctx.gpu_view.token_to_input_ids.device
+        ctx.gpu_view.token_to_input_ids[:8] = torch.full(
+            (8,), 777, dtype=torch.int64, device=device
+        )
+        sampled_tokens_cuda = torch.tensor([90, 91, 92], dtype=torch.int64, device=device)
+
+        ctx.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
+
+        assert torch.equal(ctx.gpu_view.token_to_input_ids[:3], sampled_tokens_cuda)
+        assert torch.equal(
+            ctx.gpu_view.token_to_input_ids[3:8].cpu(), torch.zeros(5, dtype=torch.int64)
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
 
