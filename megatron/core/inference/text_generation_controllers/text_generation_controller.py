@@ -2041,6 +2041,8 @@ class TextGenerationController:
 
             assert torch.equal(finished_request_ids, resolved_finished_request_ids)
             self._compact_async_sched_logits(survivor_idxs)
+
+            context.async_sched_step_count += 1
             if survivor_idxs.numel() < active_request_count:
                 context.async_sched_compaction_step_count += 1
 

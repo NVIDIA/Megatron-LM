@@ -281,6 +281,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.async_sched_step_count = 0
         self.async_sched_compaction_step_count = 0
 
         self.cache_mla_latent = (
@@ -2504,6 +2505,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.lifetime_prefill_token_count = 0
+        self.async_sched_step_count = 0
         self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(

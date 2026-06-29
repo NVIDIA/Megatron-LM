@@ -318,6 +318,7 @@ class TestDynamicContext:
         # Initialize all variables
         dynamic_context.total_request_count = 10
         dynamic_context.active_token_count = 10
+        dynamic_context.async_sched_step_count = 6
         dynamic_context.async_sched_compaction_step_count = 7
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
@@ -347,6 +348,7 @@ class TestDynamicContext:
         # Assert all variables are reset to zero or their default values
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
+        assert dynamic_context.async_sched_step_count == 0
         assert dynamic_context.async_sched_compaction_step_count == 0
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.padded_active_token_count == 0

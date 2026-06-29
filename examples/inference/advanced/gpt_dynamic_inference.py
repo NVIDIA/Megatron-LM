@@ -470,6 +470,7 @@ def main():
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            json_results["async_sched_step_count"] = engine.context.async_sched_step_count
             json_results["async_sched_compaction_step_count"] = (
                 engine.context.async_sched_compaction_step_count
             )

@@ -248,6 +248,7 @@ def test_async_sched_step_counts_compaction_after_logits_compaction():
     context.request_metadata = {"termination_id": torch.tensor([2, 2, 2], dtype=torch.int64)}
     context.get_active_sequence_lengths.return_value = torch.tensor([4, 4, 4], dtype=torch.int32)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10, 10])
+    context.async_sched_step_count = 0
     context.async_sched_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
 
@@ -265,6 +266,7 @@ def test_async_sched_step_counts_compaction_after_logits_compaction():
 
     def compact_logits(survivor_idxs):
         assert torch.equal(survivor_idxs, torch.tensor([0, 2]))
+        assert context.async_sched_step_count == 0
         assert context.async_sched_compaction_step_count == 0
 
     controller._compact_async_sched_logits = mock.Mock(side_effect=compact_logits)
@@ -272,6 +274,7 @@ def test_async_sched_step_counts_compaction_after_logits_compaction():
     result = asyncio.run(controller._run_async_sched_serial_step())
 
     controller._compact_async_sched_logits.assert_called_once()
+    assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
     assert result["finished_request_ids"].tolist() == [11]
     assert result["sample"].tolist() == [1, 2, 1]
@@ -311,6 +314,7 @@ def test_async_sched_primer_initializes_context_before_forward():
     context.request_metadata = {"termination_id": torch.tensor([2, 2], dtype=torch.int64)}
     context.get_active_sequence_lengths.return_value = torch.tensor([4, 4], dtype=torch.int32)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    context.async_sched_step_count = 0
     context.async_sched_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
 
@@ -331,6 +335,8 @@ def test_async_sched_primer_initializes_context_before_forward():
 
     assert result["finished_request_ids"].tolist() == []
     assert result["sample"].tolist() == [1, 1]
+    assert context.async_sched_step_count == 1
+    assert context.async_sched_compaction_step_count == 0
     assert controller._dynamic_step_context_init.call_count == 2
     assert controller._run_async_sched_forward.call_count == 2
     context.prepare_requests.assert_called_once()

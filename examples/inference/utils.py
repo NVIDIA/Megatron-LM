@@ -382,6 +382,7 @@ def dump_inference_results_to_json(
     peak_mem_stats: dict,
     step_count: int,
     lifetime_prefill_token_count: int,
+    async_sched_step_count: int = 0,
     async_sched_compaction_step_count: int = 0,
 ) -> None:
     """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
@@ -398,8 +399,9 @@ def dump_inference_results_to_json(
         peak_mem_stats (dict): Peak memory statistics to include in the output.
         step_count (int): Number of engine steps completed.
         lifetime_prefill_token_count (int): Total prefill tokens processed.
-        async_sched_compaction_step_count (int): Number of serial async-scheduled
-            decode steps where post-forward compaction discarded finished rows.
+        async_sched_step_count (int): Number of async scheduling decode steps.
+        async_sched_compaction_step_count (int): Number of async scheduling decode
+            steps where post-forward compaction discarded finished rows.
     """
     if not args.output_path:
         return
@@ -439,6 +441,7 @@ def dump_inference_results_to_json(
         json_results["throughput"] = throughputs
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
+    json_results["async_sched_step_count"] = async_sched_step_count
     json_results["async_sched_compaction_step_count"] = (
         async_sched_compaction_step_count
     )
