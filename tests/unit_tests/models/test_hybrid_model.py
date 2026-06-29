@@ -640,6 +640,8 @@ class _MLAQKNormTestBase:
         if self.experimental_attention_variant is not None:
             config_kwargs["experimental_attention_variant"] = self.experimental_attention_variant
             if self.experimental_attention_variant == "dsa":
+                # Must not be True for DSA.
+                config_kwargs.setdefault("add_bias_linear", False)
                 # DSAIndexer requires these; their config defaults are None.
                 config_kwargs.setdefault("dsa_indexer_n_heads", 8)
                 config_kwargs.setdefault("dsa_indexer_head_dim", 64)
@@ -656,13 +658,20 @@ class _MLAQKNormTestBase:
         )
 
     def _get_mla_attention(self, model):
-        """Return the MLA self-attention submodule, or None."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+        """Return the attention submodule for the selected MLA variant, or None."""
+        if self.experimental_attention_variant == "dsa":
+            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+                AbsorbedMLASelfAttention,
+            )
+
+            attention_cls = AbsorbedMLASelfAttention
+        else:
+            from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+            attention_cls = MLASelfAttention
 
         for layer in model.decoder.layers:
-            if hasattr(layer, 'self_attention') and isinstance(
-                layer.self_attention, MLASelfAttention
-            ):
+            if hasattr(layer, 'self_attention') and isinstance(layer.self_attention, attention_cls):
                 return layer.self_attention
         return None
 
