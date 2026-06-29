@@ -2,55 +2,17 @@
 
 import enum
 
-import torch
-
 from .fused_moe import ActivationType, mcore_fused_moe
+from .vllm_fused_moe import vllm_fused_moe
 
 
 class InferenceGroupedGemmBackend(enum.Enum):
-    """Resolved backend for grouped GEMM operations during inference."""
+    """Backend for grouped GEMM operations during inference.
+
+    The string value matches the inference_grouped_gemm_backend config field so
+    TransformerConfig.__post_init__ can convert via InferenceGroupedGemmBackend(str).
+    """
 
     FLASHINFER = "flashinfer"
     TORCH = "torch"
-    TE = "te"
-
-
-def resolve_inference_grouped_gemm_backend(
-    backend: str, is_cuda_graphed: bool, is_mxfp8: bool = False
-) -> InferenceGroupedGemmBackend:
-    """Resolve the grouped GEMM backend to use for the current iteration.
-
-    Prerequisites are validated at init time in MoELayer; this function
-    simply maps (backend, is_cuda_graphed) to the concrete backend enum.
-
-    Args:
-        backend: One of 'auto', 'torch', 'te'.
-        is_cuda_graphed: Whether this is a CUDA-graphed iteration.
-        is_mxfp8: Whether the model is using MXFP8 quantization (affects auto backend choice).
-    Returns:
-        An InferenceGroupedGemmBackend enum value.
-    """
-    if backend == 'auto':
-        if is_mxfp8:
-            assert hasattr(torch.nn.functional, 'scaled_grouped_mm'), (
-                "Auto backend selection for MXFP8 requires "
-                "torch.nn.functional.scaled_grouped_mm. "
-                "Please install PyTorch 2.10+."
-            )
-            return InferenceGroupedGemmBackend.TORCH
-        if is_cuda_graphed:
-            return InferenceGroupedGemmBackend.FLASHINFER
-        else:
-            if hasattr(torch.nn.functional, 'grouped_mm'):
-                return InferenceGroupedGemmBackend.TORCH
-            else:
-                return InferenceGroupedGemmBackend.TE
-    elif backend == 'torch':
-        return InferenceGroupedGemmBackend.TORCH
-    elif backend == 'te':
-        return InferenceGroupedGemmBackend.TE
-    else:
-        raise ValueError(
-            f"Unknown inference_grouped_gemm_backend: '{backend}'. "
-            "Must be 'auto', 'torch', or 'te'."
-        )
+    VLLM = "vllm"

@@ -60,6 +60,7 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
+    "qkv_split_shapes": None,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -235,6 +236,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
         self.deterministic_mode = config.deterministic_mode
+        self.config = config
+
+        self.use_inference_optimized_reduce_scatter = (
+            getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        )
 
         # Allocate weights and initialize.
         if config.use_cpu_initialization:
@@ -302,12 +308,22 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            output = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
-            )
-        else:
+            if self.use_inference_optimized_reduce_scatter and not self.training:
+                # Deferred to avoid circular import: inference_layers → TE → layers.
+                from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
+
+                output = inference_reduce_scatter_to_sequence_parallel_region(
+                    output_parallel, self.tp_group, self.config
+                )
+            else:
+                output = reduce_scatter_to_sequence_parallel_region(
+                    output_parallel, group=self.tp_group
+                )
+        elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+        else:
+            output = output_parallel
         return output
 
     def sharded_state_dict(
@@ -358,7 +374,14 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_input = grad_output.matmul(weight)
+        if grad_output.dim() > 2:
+            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
+            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
+            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+            grad_input = grad_output_2d.matmul(weight)
+            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
@@ -820,6 +843,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -920,6 +944,10 @@ class ColumnParallelLinear(torch.nn.Module):
             setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
             self.register_parameter("bias", None)
+
+        self.use_inference_optimized_all_gather = (
+            getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        )
 
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and world_size <= 1:
@@ -1056,7 +1084,17 @@ class ColumnParallelLinear(torch.nn.Module):
 
         if gather_output:
             # All-gather across the partitions.
-            output = gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            if self.use_inference_optimized_all_gather and not self.training:
+                # Deferred to avoid circular import: inference_layers → TE → layers.
+                from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
+
+                output = inference_all_gather_from_tensor_model_parallel_region(
+                    output_parallel, self.tp_group, self.config
+                )
+            else:
+                output = gather_from_tensor_model_parallel_region(
+                    output_parallel, group=self.tp_group
+                )
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -1092,7 +1130,7 @@ class ColumnParallelLinear(torch.nn.Module):
     def extra_repr(self) -> str:
         """Extra context to add to the module's string representation."""
         tp = self.output_size // self.output_size_per_partition
-        use_bias = self.bias is not None and self.bias is True
+        use_bias = self.bias is not None
         return (
             f"in_features={self.input_size}, "
             f"out_features={self.output_size}, "
@@ -1152,6 +1190,7 @@ class RowParallelLinear(torch.nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         super(RowParallelLinear, self).__init__()
 
@@ -1354,7 +1393,7 @@ class RowParallelLinear(torch.nn.Module):
     def extra_repr(self) -> str:
         """Extra context to add to the module's string representation."""
         tp = self.input_size // self.input_size_per_partition
-        use_bias = self.bias is not None and self.bias is True
+        use_bias = self.bias is not None
         return (
             f"in_features={self.input_size}, "
             f"out_features={self.output_size}, "

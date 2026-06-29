@@ -102,7 +102,7 @@ def _graceful_shutdown(signum, frame):
             # synchronize all ranks before exiting
             try:
                 # avoid deadlock if ranks don't all reach here
-                torch.distributed.barrier(timeout=timedelta(seconds=5))
+                torch.distributed.barrier()
             except Exception:
                 pass
 

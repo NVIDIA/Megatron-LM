@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import datetime
-import inspect
 import logging
 import math
 import os
@@ -774,8 +773,13 @@ class RerunStateMachine:
             data_iterator: the data iterator that needs to be checkpointed (or None
                 if this checkpoint is not requested by the rerun state machine).
             ckpt_format: the checkpoint format to use.
+            force: if True, emit the full state dict even when the machine is
+                disabled or no rerun is pending (used on the load path to
+                build a matching template).
         Returns:
-            A state dict representing the rerun state machine.
+            A state dict representing the rerun state machine, or None if
+            rerun checkpointing is not applicable (mode is DISABLED, or the
+            checkpoint format does not support ShardedObject).
 
         Example usage:
 
@@ -790,11 +794,18 @@ class RerunStateMachine:
                 return checkpoint
         """
 
-        # Only save a checkpoint if a step needs to be rerun.
+        # Short-circuits only apply on the save path. On the load path
+        # (``force=True``) we build a template that mirrors whatever the
+        # checkpoint happens to contain, regardless of the current mode or
+        # ckpt_format -- this preserves the behavior the load path in
+        # ``checkpointing.py`` has always relied on.
         if not force:
-            if self.state == RerunState.NOT_RUNNING_YET:
+            # Disabled mode never triggers a rerun workflow, so there's
+            # nothing to persist across a restart; keep returning None to
+            # avoid bloating the checkpoint.
+            if self.mode == RerunMode.DISABLED:
                 return None
-
+            # ShardedObject is only supported by the torch_dist format.
             if ckpt_format != "torch_dist":
                 log_single_rank(
                     logger,
@@ -804,11 +815,28 @@ class RerunStateMachine:
                 )
                 return None
 
-        data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
+        # Data-iterator buffers only need to be checkpointed when a rerun is
+        # actually pending. In steady state we skip sanitization so the
+        # caller isn't required to have wrapped its iterator in
+        # ``RerunDataIterator`` -- that requirement only applies when a
+        # fault is mid-flight.
+        if self.state == RerunState.NOT_RUNNING_YET and not force:
+            data_iterator_checkpoints = None
+        else:
+            data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
+            data_iterator_checkpoints = (
+                [d.state_dict() for d in data_iterators] if data_iterators else None
+            )
 
         # When saving a step to re-run, the RerunStateMachine state is different across all ranks.
         # We keep the common state in the non-sharded (common) checkpoint and move the rank-level
         # state to a sharded object.
+        # In NOT_RUNNING_YET this is all zero/None defaults (a sentinel);
+        # in WILL_RERUN_FROM_CHECKPOINT it carries the real fault context. The
+        # ShardedObject key/shape/offset are identical in both cases. This keeps the
+        # checkpoint's sharded structure constant across saves (a
+        # requirement of ``--ckpt-assume-constant-structure``)
+        # For details, see GitHub issue NVIDIA/Megatron-LM#4378.
         sharded_dict = {
             "rerun_requested": self.rerun_requested,
             "checkpoint_requested": self.checkpoint_requested,
@@ -822,9 +850,7 @@ class RerunStateMachine:
             "suspicious_node": self.suspicious_node,
             "suspicious_device": self.suspicious_device,
             # No need to save saved_state (RNG state  already captured in checkpoint).
-            "data_iterator_checkpoints": (
-                [d.state_dict() for d in data_iterators] if data_iterators else None
-            ),
+            "data_iterator_checkpoints": data_iterator_checkpoints,
             "large_value_counts": self.large_value_counts,
             "max_values": self.max_values,
             # No need to save saved_results and stats (resets when job resumes).
@@ -928,13 +954,6 @@ class RerunStateMachine:
     def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
-        frame = inspect.currentframe()
-        assert frame is not None
-        assert frame.f_back is not None
-        frame = frame.f_back.f_back
-        assert frame is not None
-        filename: str = inspect.getframeinfo(frame).filename
-        lineno: int = frame.f_lineno
         rank: int = safe_get_rank()
         caller = Caller(message=message, rank=rank)
         self.validation_counts[caller] += 1
@@ -989,7 +1008,7 @@ class RerunStateMachine:
                         self.stats[caller].combine(
                             [s.get(caller) for s in stats_list[1:] if s.get(caller)]
                         )
-                        logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                        logger.info(f"  From validation call '{caller.message}':")
                         logger.info(f"    {self.stats[caller].print_stats()}")
                 else:
                     for caller, stats in self.stats.items():
@@ -997,7 +1016,7 @@ class RerunStateMachine:
             else:
                 logger.info("Stats on computation determinism in validation calls")
                 for caller, stats in self.stats.items():
-                    logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                    logger.info(f"  From validation call '{caller.message}':")
                     logger.info(f"    {stats.print_stats()}")
 
     def _log_validation_error_to_file(

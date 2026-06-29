@@ -51,7 +51,6 @@ MODEL_OPTIONS="
 --te-rng-tracker \
 --tokenizer-type HuggingFaceTokenizer \
 --tokenizer-model Qwen/Qwen3-30B-A3B \
---tokenizer-hf-include-special-tokens \
 --untie-embeddings-and-output-weights \
 --num-layers 48 \
 --hidden-size 2048 \
