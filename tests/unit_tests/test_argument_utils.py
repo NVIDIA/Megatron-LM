@@ -680,6 +680,25 @@ def _make_args(**overrides):
     return Namespace(**defaults)
 
 
+def _make_ddp_args(**overrides):
+    """Build the minimum Namespace required by get_megatron_ddp_config."""
+    defaults = {
+        "accumulate_allreduce_grads_in_fp32": False,
+        "check_for_nan_in_loss_and_grad": False,
+        "check_for_large_grads": False,
+        "ddp_pad_buckets_for_high_nccl_busbw": False,
+        "ddp_reduce_scatter_with_fp32_accumulation": False,
+        "ddp_param_name_patterns_for_fp32_local_accumulation": [],
+        "ddp_average_in_collective": False,
+        "megatron_fsdp_main_params_dtype": None,
+        "megatron_fsdp_main_grads_dtype": None,
+        "megatron_fsdp_grad_comm_dtype": None,
+        "use_precision_aware_optimizer": False,
+    }
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
 @pytest.fixture
 def mock_optimizer_config():
     return MagicMock(spec=OptimizerConfig)
@@ -733,6 +752,37 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(args)
         mock_ddp.assert_called_once_with(args)
         assert result.ddp is mock_ddp_instance
+
+
+class TestDDPConfigMapping:
+    """Test argparse Namespace → DistributedDataParallelConfig mapping."""
+
+    def test_cpu_backup_disable_fields_map_from_args(self):
+        from megatron.training.training import get_megatron_ddp_config
+
+        args = _make_ddp_args(
+            disable_grad_buffers_cpu_backup=True, disable_param_buffers_cpu_backup=True
+        )
+
+        config = get_megatron_ddp_config(args)
+
+        assert config.disable_grad_buffers_cpu_backup is True
+        assert config.disable_param_buffers_cpu_backup is True
+
+    def test_cpu_backup_disable_cli_flags_map_to_ddp_config(self):
+        from megatron.training.arguments import _add_distributed_args
+        from megatron.training.training import get_megatron_ddp_config
+
+        parser = _add_distributed_args(ArgumentParser())
+        parsed_args = parser.parse_args(
+            ["--disable-grad-buffers-cpu-backup", "--disable-param-buffers-cpu-backup"]
+        )
+        args = _make_ddp_args(**vars(parsed_args))
+
+        config = get_megatron_ddp_config(args)
+
+        assert config.disable_grad_buffers_cpu_backup is True
+        assert config.disable_param_buffers_cpu_backup is True
 
 
 class TestCheckpointConfigMapping:

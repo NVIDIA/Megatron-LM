@@ -40,6 +40,7 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+_LOGGED_MISSING_TMS_FLAGS: set[str] = set()
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -926,8 +927,6 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
-        disable_grad_buffers_cpu_backup: bool = False,
-        disable_param_buffers_cpu_backup: bool = False,
     ):
 
         if pg_collection is None:
@@ -958,8 +957,10 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+        disable_grad_buffers_cpu_backup = self.ddp_config.disable_grad_buffers_cpu_backup
         disable_param_buffers_cpu_backup = (
-            disable_param_buffers_cpu_backup and self.ddp_config.use_distributed_optimizer
+            self.ddp_config.disable_param_buffers_cpu_backup
+            and self.ddp_config.use_distributed_optimizer
         )
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -1021,15 +1022,28 @@ class _ParamAndGradBuffer:
         self.param_data = None
         self.grad_data = None
         self.extra_main_grads = []
+        shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
+            is_mxfp8tensor(p) for p in self.params
+        )
+        if (
+            HAVE_TORCH_MEMORY_SAVER
+            and shared_param_grad_buffer
+            and disable_grad_buffers_cpu_backup != disable_param_buffers_cpu_backup
+        ):
+            raise ValueError(
+                "disable_grad_buffers_cpu_backup and disable_param_buffers_cpu_backup must "
+                "match when the param and grad "
+                "buffers share the same allocation."
+            )
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
-            assert not disable_grad_buffers_cpu_backup, (
-                "disable_grad_buffers_cpu_backup is not supported with nccl_ub=True"
-            )
-            assert not disable_param_buffers_cpu_backup, (
-                "disable_param_buffers_cpu_backup is not supported with nccl_ub=True"
-            )
+            assert not (
+                HAVE_TORCH_MEMORY_SAVER and disable_grad_buffers_cpu_backup
+            ), "disable_grad_buffers_cpu_backup is not supported with nccl_ub=True"
+            assert not (
+                HAVE_TORCH_MEMORY_SAVER and disable_param_buffers_cpu_backup
+            ), "disable_param_buffers_cpu_backup is not supported with nccl_ub=True"
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
@@ -1052,16 +1066,17 @@ class _ParamAndGradBuffer:
         def _make_no_backup_context(tag, disable, flag_name):
             if disable:
                 if not HAVE_TORCH_MEMORY_SAVER:
-                    raise RuntimeError(
-                        f"{flag_name}=True requires torch_memory_saver. "
-                        "Install torch_memory_saver or disable this option."
-                    )
+                    if flag_name not in _LOGGED_MISSING_TMS_FLAGS:
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            f"{flag_name}=True ignored because "
+                            "torch_memory_saver is not installed.",
+                        )
+                        _LOGGED_MISSING_TMS_FLAGS.add(flag_name)
+                    return nullcontext
 
-                return partial(
-                    torch_memory_saver.region,
-                    tag=tag,
-                    enable_cpu_backup=False,
-                )
+                return partial(torch_memory_saver.region, tag=tag, enable_cpu_backup=False)
 
             return nullcontext
 
@@ -1071,19 +1086,17 @@ class _ParamAndGradBuffer:
         param_mem_alloc_context = _make_no_backup_context(
             "param_buffer", disable_param_buffers_cpu_backup, "disable_param_buffers_cpu_backup"
         )
+        shared_mem_alloc_context = _make_no_backup_context(
+            "shared_param_grad_buffer",
+            disable_grad_buffers_cpu_backup,
+            "disable_grad_buffers_cpu_backup/disable_param_buffers_cpu_backup",
+        )
 
         with mem_alloc_context():
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) for p in self.params
-            ):
-                shared_mem_alloc_context = (
-                    param_mem_alloc_context
-                    if disable_param_buffers_cpu_backup
-                    else grad_mem_alloc_context
-                )
+            if shared_param_grad_buffer:
                 with shared_mem_alloc_context():
                     self.shared_buffer = torch.zeros(
                         self.numel,
