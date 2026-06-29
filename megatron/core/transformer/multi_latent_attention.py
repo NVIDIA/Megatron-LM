@@ -504,14 +504,14 @@ class MLASelfAttention(MultiLatentAttention):
             name=name,
         )
 
-        # Resolve which linear class to use for Q and KV up projections,
-        # based on QK-norm selection.
-        norm_cls = self._resolve_qk_norm_config(submodules)
+        # Resolve which classes to use for Q and KV linear up projections and norms, based on
+        # QK-norm selection.
+        layer_classes = self._resolve_qk_norm_config(submodules)
 
         if self.config.q_lora_rank is None:
             # Not projecting query
             self.linear_q_proj = build_module(
-                norm_cls["linear_q_proj"],
+                layer_classes["linear_q_proj"],
                 self.config.hidden_size,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -558,7 +558,7 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
             self.linear_q_up_proj = build_module(
-                norm_cls["linear_q_up_proj"],
+                layer_classes["linear_q_up_proj"],
                 self.config.q_lora_rank,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -605,7 +605,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            norm_cls["linear_kv_up_proj"],
+            layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -620,13 +620,13 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is not None:
-            self.q_layernorm = norm_cls["q_layernorm"](
+            self.q_layernorm = layer_classes["q_layernorm"](
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.kv_layernorm = norm_cls["kv_layernorm"](
+        self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
@@ -1267,7 +1267,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
         # Resolve which linear class to use for Q and KV up projections,
         # based on QK-norm selection.
-        norm_cls = self._resolve_qk_norm_config(submodules)
+        layer_classes = self._resolve_qk_norm_config(submodules)
 
         qkv_down_proj_kwargs = {}
         if submodules.linear_qkv_down_proj in [TELinear]:
@@ -1303,7 +1303,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_q_up_proj = build_module(
-            norm_cls["linear_q_up_proj"],
+            layer_classes["linear_q_up_proj"],
             self.config.q_lora_rank,
             self.config.num_attention_heads * self.q_head_dim,
             config=self.config,
@@ -1318,7 +1318,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            norm_cls["linear_kv_up_proj"],
+            layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -1332,12 +1332,12 @@ class FusedMLASelfAttention(MLASelfAttention):
             name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
 
-        self.q_layernorm = norm_cls["q_layernorm"](
+        self.q_layernorm = layer_classes["q_layernorm"](
             hidden_size=self.config.q_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
-        self.kv_layernorm = norm_cls["kv_layernorm"](
+        self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
