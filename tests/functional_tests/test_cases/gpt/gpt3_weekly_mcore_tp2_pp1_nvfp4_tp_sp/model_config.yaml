@@ -47,6 +47,8 @@ MODEL_ARGS:
   --fp4-format: e2m1
   --fp4-recipe: nvfp4
   --use-distributed-optimizer: true
+  --overlap-param-gather: true
+  --overlap-grad-reduce: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch_dist
   --dist-ckpt-strictness: log_all
