@@ -81,8 +81,9 @@ jobs:
           case "$permission" in
             admin|write) ;;
             *)
-              gh pr comment "$PR_NUMBER" --repo "$REPO" \
-                --body "❌ You need write access to use the Claude fix command."
+              gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+                -f body="❌ You need write access to use the Claude fix command." \
+                > /dev/null
               exit 1
               ;;
           esac
@@ -99,16 +100,18 @@ jobs:
           maintainer_can_modify=$(jq -r '.maintainer_can_modify' <<< "$pr_json")
 
           if [[ "$state" != "open" || "$merged" != "false" ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ The Claude fix command only works on open, unmerged pull requests."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ The Claude fix command only works on open, unmerged pull requests." \
+              > /dev/null
             exit 1
           fi
 
           if [[ -z "$head_ref" || -z "$head_sha" || -z "$head_repo" || \
                 -z "$head_default_branch" || -z "$base_ref" || \
                 "$base_repo" != "$REPO" ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ The pull request head or base repository is unavailable."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ The pull request head or base repository is unavailable." \
+              > /dev/null
             exit 1
           fi
 
@@ -126,15 +129,17 @@ jobs:
           # pull-request/* or deploy-release/* would bypass the repository's
           # human `/ok to test` boundary by directly starting internal CI.
           if [[ "$head_ref" == "$head_default_branch" || "$head_ref" == "$base_ref" ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ Claude fix will not push to a default or base branch. Use a dedicated feature branch."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ Claude fix will not push to a default or base branch. Use a dedicated feature branch." \
+              > /dev/null
             exit 1
           fi
           if [[ "$head_repo" == "$REPO" ]]; then
             case "$head_ref" in
               main|dev|pull-request/*|deploy-release/*|release/*|lts/*)
-                gh pr comment "$PR_NUMBER" --repo "$REPO" \
-                  --body "❌ Claude fix will not push to a shared or CI-reserved repository branch."
+                gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+                  -f body="❌ Claude fix will not push to a shared or CI-reserved repository branch." \
+                  > /dev/null
                 exit 1
                 ;;
             esac
@@ -143,20 +148,23 @@ jobs:
           encoded_head_ref=$(jq -rn --arg value "$head_ref" '$value | @uri')
           if ! head_branch_json=$(gh api \
             "repos/$head_repo/branches/$encoded_head_ref"); then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ Claude fix could not verify that the pull request head branch is safe to update."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ Claude fix could not verify that the pull request head branch is safe to update." \
+              > /dev/null
             exit 1
           fi
           if [[ "$(jq -r '.protected' <<< "$head_branch_json")" == "true" ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ Claude fix will not push directly to a protected branch."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ Claude fix will not push directly to a protected branch." \
+              > /dev/null
             exit 1
           fi
 
           if [[ "$head_repo" != "$REPO" ]]; then
             if [[ "$maintainer_can_modify" != "true" ]]; then
-              gh pr comment "$PR_NUMBER" --repo "$REPO" \
-                --body "❌ Enable **Allow edits by maintainers** before using the Claude fix command on a fork pull request."
+              gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+                -f body="❌ Enable **Allow edits by maintainers** before using the Claude fix command on a fork pull request." \
+                > /dev/null
               exit 1
             fi
           fi
@@ -167,8 +175,9 @@ jobs:
           steer=${steer%"${steer##*[![:space:]]}"}
           steer_bytes=$(printf '%s' "$steer" | wc -c)
           if (( steer_bytes > 2000 )); then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" \
-              --body "❌ Claude fix steering text is limited to 2,000 bytes."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="❌ Claude fix steering text is limited to 2,000 bytes." \
+              > /dev/null
             exit 1
           fi
           steer_b64=$(printf '%s' "$steer" | base64 -w 0)
@@ -906,11 +915,13 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$CREATED" == "true" ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
-              "✅ Pushed DCO-signed-off Claude fix commit \`$NEW_SHA\`. Review the generated diff, then authorize CI manually for this SHA."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="✅ Pushed DCO-signed-off Claude fix commit \`$NEW_SHA\`. Review the generated diff, then authorize CI manually for this SHA." \
+              > /dev/null
           else
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
-              "ℹ️ Claude found no safe low-hanging changes to publish for \`$HEAD_SHA\`."
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              -f body="ℹ️ Claude found no safe low-hanging changes to publish for \`$HEAD_SHA\`." \
+              > /dev/null
           fi
 
   report-failure:
@@ -933,5 +944,6 @@ jobs:
     steps:
       - name: Post deterministic failure summary
         run: |
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
-            "❌ Claude fix stopped without publishing because preparation, validation, or stale-head safety checks failed. Inspect the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+            -f body="❌ Claude fix stopped without publishing because preparation, validation, or stale-head safety checks failed. Inspect the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
+            > /dev/null
