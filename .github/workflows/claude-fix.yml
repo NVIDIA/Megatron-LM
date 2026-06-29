@@ -466,6 +466,8 @@ jobs:
 
       - name: Export raw binary patch
         working-directory: pr-head
+        env:
+          BASELINE_TREE: ${{ steps.merge-state.outputs.baseline_tree }}
         run: |
           set -euo pipefail
 
@@ -478,7 +480,8 @@ jobs:
           fi
 
           git add -A
-          git diff --cached --binary --full-index "$HEAD_SHA" -- \
+          test "$(git cat-file -t "$BASELINE_TREE")" = "tree"
+          git diff --cached --binary --full-index "$BASELINE_TREE" -- \
             > "$RUNNER_TEMP/claude-fix-result.patch"
 
           patch_bytes=$(wc -c < "$RUNNER_TEMP/claude-fix-result.patch")
@@ -595,7 +598,10 @@ jobs:
             exit 1
           fi
 
-          git reset --hard "$HEAD_SHA"
+          # The artifact contains only Claude's delta from the deterministic
+          # automatic-merge baseline, not the potentially very large set of
+          # unrelated changes between an old PR head and the current base.
+          test "$(git write-tree)" = "$baseline_tree"
           if [[ -s "$patch" ]]; then
             git apply --index "$patch"
           fi
@@ -708,6 +714,7 @@ jobs:
       BASE_REF: ${{ needs.authorize.outputs.base_ref }}
       BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
       NEEDS_MERGE: ${{ needs.prepare.outputs.needs_merge }}
+      EXPECTED_BASELINE_TREE: ${{ needs.prepare.outputs.baseline_tree }}
       EXPECTED_RESULT_TREE: ${{ needs.validate.outputs.result_tree }}
     steps:
       - name: Checkout immutable PR head without credentials
@@ -771,6 +778,7 @@ jobs:
 
           patch="$RUNNER_TEMP/claude-fix-validated/claude-fix-result.patch"
           test -f "$patch"
+          test "$(wc -c < "$patch")" -le 10485760
           test "$(sha256sum "$patch" | awk '{print $1}')" = "$EXPECTED_PATCH_SHA256"
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
 
@@ -778,6 +786,31 @@ jobs:
           git fetch --no-tags upstream "refs/heads/$BASE_REF"
           git cat-file -e "$BASE_SHA^{commit}"
 
+          if [[ "$NEEDS_MERGE" == "true" ]]; then
+            set +e
+            git -c user.name='claude-fix-publish' \
+              -c user.email='claude-fix-publish@users.noreply.github.com' \
+              merge --no-commit --no-ff "$BASE_SHA"
+            merge_status=$?
+            set -e
+
+            conflict_count=$(git diff --name-only --diff-filter=U | wc -l)
+            if (( merge_status != 0 && conflict_count == 0 )); then
+              echo "Pinned base merge failed without conflicts during publication."
+              exit "$merge_status"
+            fi
+            git add -A
+            baseline_tree=$(git write-tree)
+          else
+            if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+              echo "Validated no-merge state is no longer reproducible."
+              exit 1
+            fi
+            baseline_tree=$(git rev-parse "$HEAD_SHA^{tree}")
+          fi
+
+          test "$baseline_tree" = "$EXPECTED_BASELINE_TREE"
+          test "$(git write-tree)" = "$baseline_tree"
           if [[ -s "$patch" ]]; then
             git apply --index "$patch"
           fi
