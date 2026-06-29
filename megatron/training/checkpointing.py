@@ -390,7 +390,12 @@ def get_rng_state(
         'cuda_rng_state': torch.cuda.get_rng_state(),
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
-    dp_world_size = get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
+    # RNG state is per distinct-data rank (full DP x gtp_remat axis).
+    dp_world_size = (
+        get_pg_size(dp_group)
+        if dp_group is not None
+        else mpu.get_data_parallel_world_size(with_gtp_remat=True)
+    )
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
             dp_world_size > 1:
@@ -399,12 +404,17 @@ def get_rng_state(
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=dp_group if dp_group is not None else mpu.get_data_parallel_group(),
+            group=dp_group if dp_group is not None
+            else mpu.get_data_parallel_group(with_gtp_remat=True),
         )
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = get_pg_rank(dp_cp_group) if dp_cp_group is not None else mpu.get_data_parallel_rank(with_context_parallel=True)
+    dp_cp_rank = (
+        get_pg_rank(dp_cp_group)
+        if dp_cp_group is not None
+        else mpu.get_data_parallel_rank(with_context_parallel=True, with_gtp_remat=True)
+    )
     if ckpt_format == "torch_dist":
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
@@ -468,7 +478,7 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     metadata['chained_optim_avoid_prefix'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
-        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
     metadata['dp_cp_group'] = dp_cp_group
     return metadata
 
@@ -483,7 +493,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving {grad_label} "
                  f"from iteration {iteration:7d}")
 
-    if mpu.get_expert_data_parallel_rank() == 0:
+    if mpu.get_expert_data_parallel_rank(with_gtp_remat=True) == 0:
         # Create saving directory.
         ep_rank = mpu.get_expert_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -608,7 +618,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
     if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
-        dp_rank = mpu.get_data_parallel_rank()
+        dp_rank = mpu.get_data_parallel_rank(with_gtp_remat=True)
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
@@ -625,11 +635,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     dp_rank = 0
     expt_dp_rank = 0
     if torch.distributed.is_initialized():
-        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+        dp_rank = (
+            get_pg_rank(dp_group)
+            if dp_group is not None
+            else mpu.get_data_parallel_rank(with_gtp_remat=True)
+        )
         expt_dp_rank = (
             get_pg_rank(expt_dp_group)
             if expt_dp_group is not None
-            else mpu.get_expert_data_parallel_rank()
+            else mpu.get_expert_data_parallel_rank(with_gtp_remat=True)
         )
 
     # Collect args, model, RNG.
@@ -693,9 +707,19 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
                 if args.ckpt_fully_parallel_save:
                     if args.ckpt_fully_parallel_save_process_group == 'dp':
-                        process_group = dp_cp_group if dp_cp_group is not None else mpu.get_data_parallel_group(with_context_parallel=True)
+                        process_group = (
+                            dp_cp_group
+                            if dp_cp_group is not None
+                            else mpu.get_data_parallel_group(
+                                with_context_parallel=True, with_gtp_remat=True
+                            )
+                        )
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
-                        process_group = expt_dp_group if expt_dp_group is not None else mpu.get_expert_data_parallel_group()
+                        process_group = (
+                            expt_dp_group
+                            if expt_dp_group is not None
+                            else mpu.get_expert_data_parallel_group(with_gtp_remat=True)
+                        )
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
@@ -790,7 +814,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict, algo=algo, cached_metadata=cached_metadata,
-                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
+                    parallelization_group=mpu.get_data_parallel_group(
+                        with_context_parallel=True, with_gtp_remat=True
+                    ),
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
@@ -1020,7 +1046,7 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     if not first_rank:
         return
 
-    dp_rank = mpu.get_data_parallel_rank()
+    dp_rank = mpu.get_data_parallel_rank(with_gtp_remat=True)
     if dp_rank == 0:
         print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
     train_dataloader_state_dict = train_iterator.iterable.save_state()
@@ -1029,12 +1055,12 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         basename=f'train_dataloader_dprank{dp_rank:03d}.pt'
     )
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    torch.distributed.barrier(group=mpu.get_data_parallel_group(with_gtp_remat=True))
 
-    if mpu.get_data_parallel_rank() == 0:
+    if mpu.get_data_parallel_rank(with_gtp_remat=True) == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    torch.distributed.barrier(group=mpu.get_data_parallel_group(with_gtp_remat=True))
 
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
@@ -1070,7 +1096,9 @@ def generate_state_dict(
             model_sd = model[i].sharded_state_dict(
                 **(model_sd_kwargs or {
                     "metadata": {
-                        "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                        "dp_cp_group": mpu.get_data_parallel_group(
+                            with_context_parallel=True, with_gtp_remat=True
+                        )
                     }
                 })
             )
@@ -1088,7 +1116,9 @@ def generate_state_dict(
                     state_dict,
                     **(optim_sd_kwargs or {
                         "metadata": {
-                            "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                            "dp_cp_group": mpu.get_data_parallel_group(
+                                with_context_parallel=True, with_gtp_remat=True
+                            )
                         }
                     })
                 )
@@ -1260,7 +1290,9 @@ def _load_non_persistent_base_checkpoint(
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
             algo=args.non_persistent_local_ckpt_algo,
-            parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            parallelization_group = mpu.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
         )
         return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
@@ -1290,9 +1322,11 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
-            process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            process_group = mpu.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
         elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
-            process_group = mpu.get_expert_data_parallel_group()
+            process_group = mpu.get_expert_data_parallel_group(with_gtp_remat=True)
         else:
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
@@ -1798,7 +1832,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             gen_sd_opt_param_scheduler = None
 
         if dp_cp_group is None:
-            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            dp_cp_group = mpu.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
 
         # dist_checkpointing.load_content_metadata(...) may return None.
         # Ensure we have a dict before updating to avoid NoneType AttributeError.
@@ -2005,7 +2041,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load state dict.
             if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = mpu.get_data_parallel_rank()
+                dp_rank = mpu.get_data_parallel_rank(with_gtp_remat=True)
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
@@ -2075,7 +2111,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-                    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+                    dp_rank = (
+                        get_pg_rank(dp_group)
+                        if dp_group is not None
+                        else mpu.get_data_parallel_rank(with_gtp_remat=True)
+                    )
                     rng_state = rng_state[dp_rank]
                 else:
                     rng_state = rng_state[0]
@@ -2209,7 +2249,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
                                           args.use_distributed_optimizer,
                                           release=False)
 
-    if mpu.get_data_parallel_rank() == 0:
+    if mpu.get_data_parallel_rank(with_gtp_remat=True) == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
@@ -2225,7 +2265,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     model[0].load_state_dict(ret_state_dict)
     torch.distributed.barrier()
 
-    if mpu.get_data_parallel_rank() == 0:
+    if mpu.get_data_parallel_rank(with_gtp_remat=True) == 0:
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model

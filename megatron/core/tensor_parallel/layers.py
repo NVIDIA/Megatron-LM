@@ -105,9 +105,9 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
 
 
 def copy_gtp_attributes(destination, source):
-    """Copy the GTP dedup tags (is_gtp, allreduce) onto a param view/copy, so the optimizer's
-    master shards stay classifiable by param_is_not_gtp_duplicate."""
-    for attr in ("is_gtp", "allreduce"):
+    """Copy the GTP dedup tags (is_gtp_weight_remat, allreduce) onto a param view/copy, so the
+    optimizer's master shards stay classifiable by param_is_not_gtp_duplicate."""
+    for attr in ("is_gtp_weight_remat", "allreduce"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 
@@ -119,7 +119,7 @@ def param_is_not_gtp_duplicate(param):
     rank 0 of the gtp_remat/egtp_remat axis (else counted N times). When GTP_remat is off rank is 0,
     so every param is kept.
     """
-    if getattr(param, "is_gtp", False):
+    if getattr(param, "is_gtp_weight_remat", False):
         return True
     is_expert = not getattr(param, "allreduce", True)
     if is_expert:

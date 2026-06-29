@@ -169,7 +169,7 @@ class LogitsSaverHooks:
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         self.cp_rank = parallel_state.get_context_parallel_rank()
-        self.dp_rank = parallel_state.get_data_parallel_rank()
+        self.dp_rank = parallel_state.get_data_parallel_rank(with_gtp_remat=True)
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
 
         # Track number of MTP outputs to ignore

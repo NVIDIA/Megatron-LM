@@ -432,9 +432,13 @@ def _set_random_seed(
         # Ensure that different pipeline MP stages get different seeds.
         pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
         seed = seed_ + (100 * pp_rank)
-        # Ensure different data parallel ranks get different seeds
+        # Ensure different data parallel ranks get different seeds (full DP x gtp_remat rank).
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group)
+                if dp_group is not None
+                else mpu.get_data_parallel_rank(with_gtp_remat=True)
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)

@@ -316,6 +316,13 @@ class GTPConfig:
     # GTP companion to --fp8-param-gather: optimizer casts FP32 master directly into
     # GTPShardedParam.quantized; forward reuses the cached FP8 (BF16->FP8 off critical path).
     fp8_param_gather: bool = False
+    # Mirrors config.calculate_per_token_loss. When True, DDP applies NO 1/dp pre-scaling
+    # (gradient_scaling_factor=1.0) and finalize_model_grads normalizes every gradient by
+    # 1/total_global_tokens instead. In that mode the gtp_remat axis must be SUM-reduced (plain
+    # reduce-scatter, like DP), NOT mean-reduced — a 1/gtp mean would double-count the
+    # normalization. When False, the gtp_remat reduce-scatter takes the MEAN so it composes with
+    # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
+    calculate_per_token_loss: bool = False
 
 
 GTP_CONFIG = GTPConfig()
@@ -562,7 +569,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # Canonical flag — also set on distopt's main_param copy so both kinds
         # of param can be classified via a single attribute check.
-        self.is_gtp = True
+        self.is_gtp_weight_remat = True
 
         # all gather
         self.state = GTPWeightState.NONE
@@ -1258,11 +1265,27 @@ class GTPShardedParam(torch.nn.Parameter):
                     _wgrad_pool_put(buf)
             self._wgrad_input_bufs = None
 
+    def _prescale_wgrads_for_mean_rs(self, wgrads):
+        """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
+
+        Single choke point for every RS path. Composes with DDP's 1/replicate prescale and
+        finalize's AVG to give the full (replicate x gtp_remat) mean. Skipped under
+        calculate_per_token_loss, where DDP does no 1/dp scaling and total_global_tokens (which
+        counts gtp_remat peers' tokens) normalizes instead — there the gtp_remat axis must SUM
+        like the DP axis (a 1/gtp_remat mean would shrink every gtp_remat grad).
+        """
+        gtp_remat_size = self.group.size()
+        if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
+            torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
+
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
         """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
         multiple: coalesced RS."""
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
+
+        # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
+        self._prescale_wgrads_for_mean_rs(wgrads)
 
         if GTP_CONFIG.check_param_states:
             new_rs_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
@@ -1806,7 +1829,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     *,
     tp_group,
     dp_cp_group,
-    intra_dp_cp_no_gtp_remat_group=None,
+    intra_dp_cp_group=None,
 ):
     """GTP-aware analogue of make_sharded_tensors_for_checkpoint.
 
@@ -1849,37 +1872,35 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     gtp_rank = get_pg_rank(gtp_remat_group)
     gtp_remat_size = get_pg_size(gtp_remat_group)
 
-    # DP-with-GTP-with-CP rank — replicas of a given GTP chunk live here.
-    if intra_dp_cp_no_gtp_remat_group is not None:
-        dp_no_gtp_remat_rank = get_pg_rank(intra_dp_cp_no_gtp_remat_group)
+    # Replicate-group rank — the true replicas of a given GTP chunk live here.
+    if intra_dp_cp_group is not None:
+        dp_replica_rank = get_pg_rank(intra_dp_cp_group)
     else:
         from megatron.core import parallel_state  # noqa: E402
 
-        dp_no_gtp_remat_rank = parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, no_gtp_remat=True
-        )
+        dp_replica_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
 
     sharded_state_dict = {}
     for layer_name, tensor in state_dict.items():
         layer_key = f"{prefix}{layer_name}"
-        is_gtp = isinstance(tensor, GTPShardedParam)
+        is_gtp_weight_remat = isinstance(tensor, GTPShardedParam)
 
         if layer_name.endswith(extra_state_suffix):
             # ShardedObject (extra_state metadata): GTP-REPLICATED across the GTP group. Fold
             # gtp_rank into position 1 of the replica_id (PP, TP-replica-coord, DP) tuple so
             # GTP-peer ranks within the same TP slice get unique replica_ids.
-            replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_no_gtp_remat_rank)
+            replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_replica_rank)
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
                 tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
             continue
 
-        if not is_gtp:
+        if not is_gtp_weight_remat:
             # Non-GTPShardedParam under a GTP-active module (e.g. bias): GTP-replicated, so GTP
             # ranks would collide on the same replica_id. Inject gtp_rank into replica_id
             # position 1 (same as the GTP-sharded branch below).
             if layer_name in tensor_parallel_layers_axis_map:
-                replica_id = (0, gtp_rank, dp_no_gtp_remat_rank)
+                replica_id = (0, gtp_rank, dp_replica_rank)
                 sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,
@@ -1890,7 +1911,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
                     dp_cp_group=dp_cp_group,
                 )
             else:
-                replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_no_gtp_remat_rank)
+                replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_replica_rank)
                 sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,

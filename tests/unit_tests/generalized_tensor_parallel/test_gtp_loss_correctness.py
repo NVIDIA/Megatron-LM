@@ -25,7 +25,9 @@ from transformer_engine.pytorch import fp8_autocast
 
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401  (autouse, module-scoped: initializes the dist PG); noqa: F401  (autouse)
+    _assert_loss_trajectories_match,
     _requires_mxfp8,
+    _restore_gtp_shards_and_init_main_grad,
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -147,17 +149,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     gtp_params = [p for p in layers_gtp.parameters() if isinstance(p, GTPShardedParam)]
     assert len(gtp_params) > 0, "GTP not active: no GTPShardedParam found"
 
-    for name, p in layers_gtp.named_parameters():
-        full = saved_weights[name]
-        if isinstance(p, GTPShardedParam):
-            shard_size = p.shape[0]
-            p.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
-        else:
-            p.data.copy_(full)
-
-    for p in layers_gtp.parameters():
-        if isinstance(p, GTPShardedParam):
-            p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
+    _restore_gtp_shards_and_init_main_grad(layers_gtp, saved_weights, gtp_rank, dtype)
 
     gtp_losses = []
     for step in range(STEPS):
@@ -184,12 +176,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     GTPShardedParam._chain_state = {}
 
     if rank == 0:
-        assert len(baseline_losses) == STEPS and len(gtp_losses) == STEPS
-        for step, (lb, lg) in enumerate(zip(baseline_losses, gtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  gtp_remat={lg:.6f}", flush=True)
-        torch.testing.assert_close(
-            torch.tensor(gtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
-        )
+        _assert_loss_trajectories_match(baseline_losses, gtp_losses, STEPS)
 
 
 class TestGTPLossCorrectness:

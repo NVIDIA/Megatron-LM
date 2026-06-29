@@ -30,12 +30,19 @@ class HybridCPDataLoaderWrapper:
     ):
         self.data_iterator = data_iterator
         self.config = config
+        # Data scheduling redistributes micro-batches across every distinct-data holder, i.e. the
+        # full DP x gtp_remat group (gtp_remat peers consume distinct sequences); falls back to
+        # the replicate group when gtp_remat is inactive.
         if pg_collection is None:
-            self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-            self.dp_group = parallel_state.get_data_parallel_group()
+            self.dp_cp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
+            self.dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=True)
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         else:
-            self.dp_cp_group = pg_collection.dp_cp
+            self.dp_cp_group = (
+                getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+            )
             self.dp_group = pg_collection.dp
             self.tp_group = pg_collection.tp
         assert (

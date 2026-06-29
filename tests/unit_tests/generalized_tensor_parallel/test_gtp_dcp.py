@@ -601,7 +601,12 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
         isinstance(p, GTPShardedParam) for p in layer.parameters()
     ), "GTP_remat not active: no GTPShardedParam in the GTP_remat=2 Mamba layer"
 
-    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
+    # Checkpoint replica election for gtp_remat-REPLICATED params needs the gtp_remat-INCLUSIVE
+    # group so gtp_remat peers get distinct replica_ids (matches production's get_default
+    # metadata, which uses with_gtp_remat=True). The replicate group would collide across peers.
+    metadata = {
+        'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
+    }
     sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
 
     target_bases = {'A_log', 'dt_bias', 'D', 'conv1d.weight', 'conv1d.bias'}
@@ -632,6 +637,72 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
             ), f"{base}: replica_id collision across ranks -> DCP write conflict: {rids}"
             n_writers = sum(is_main_replica(r) for r in rids)
             assert n_writers == 1, f"{base}: expected exactly 1 writer, got {n_writers}: {rids}"
+
+
+def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
+    """Regression for the checkpoint-save duplicate-writer bug in save_checkpoint_and_time.
+
+    A REPLICATED param (identical on every gtp_remat peer) is checkpointed with replica_id
+    ``(0, tp_rank, get_pg_rank(metadata['dp_cp_group']))``. save_checkpoint_and_time threads that
+    group from the model's ProcessGroupCollection. It MUST be the gtp_remat-INCLUSIVE group
+    (``pg.dp_cp_gtp_remat``): with the gtp-excluded replicate group (``pg.dp_cp``) the gtp_remat
+    peers collapse to the same replica_id -> multiple writers -> dist_checkpointing.save
+    validation failure (the a55b OCI_HSG TP1GTP4 save crash). This guards the group *selection*
+    that save_checkpoint_and_time makes (the leaf logic is covered by the workers above, which
+    hardcode the full group).
+
+    world=4 -> tp1 * gtp2 * dp2: replicate group has 2 ranks (dp), full group has 4.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.dist_checkpointing.mapping import is_main_replica
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+    from megatron.core.utils import get_pg_size
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    pg = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
+    )
+
+    # The two attributes save_checkpoint_and_time may read must differ under GTP_remat, else the
+    # group choice would be moot: full = replicate x gtp_remat(2).
+    assert get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2, (
+        f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
+    )
+
+    replicated = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16, device="cuda"))
+
+    def _gather_replica_ids(dp_cp_group):
+        sd = make_sharded_tensors_for_checkpoint(
+            {"w": replicated},
+            prefix="",
+            tensor_parallel_layers_axis_map={},
+            tp_group=pg.tp,
+            dp_cp_group=dp_cp_group,
+        )
+        out = [None] * world_size
+        dist.all_gather_object(out, tuple(sd["w"].replica_id))
+        return out
+
+    rids_replicate = _gather_replica_ids(pg.dp_cp)  # the bug
+    rids_full = _gather_replica_ids(pg.dp_cp_gtp_remat)  # the fix
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+    if rank == 0:
+        # Replicate (gtp-excluded) group: gtp_remat peers collapse -> >1 writer (reproduces bug).
+        assert sum(is_main_replica(r) for r in rids_replicate) > 1, (
+            f"replicate dp_cp should collide across gtp_remat peers, got {rids_replicate}"
+        )
+        # gtp_remat-inclusive group: every holder distinct, exactly one writer.
+        assert len(set(rids_full)) == world_size, f"full-group replica_id collision: {rids_full}"
+        assert sum(is_main_replica(r) for r in rids_full) == 1, (
+            f"full group must elect exactly one writer, got {rids_full}"
+        )
 
 
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
@@ -742,6 +813,10 @@ class TestGtpDcpHelper:
     def test_mamba_inproj_optim_param_map(self):
         _require_world_size(4)
         _worker_mamba_inproj_optim_param_map(dist.get_rank(), 4, None)
+
+    def test_replicated_param_needs_gtp_inclusive_dp_cp(self):
+        _require_world_size(4)
+        _worker_replicated_param_needs_gtp_inclusive_dp_cp(dist.get_rank(), 4, None)
 
     def test_composite_offset_same_axis(self):
         _require_world_size(4)

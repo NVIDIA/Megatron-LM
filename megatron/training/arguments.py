@@ -408,7 +408,23 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
-    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
+    # args.data_parallel_size below is the replicate degree (matches
+    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    total_model_size = (
+        args.tensor_model_parallel_size
+        * args.pipeline_model_parallel_size
+        * args.context_parallel_size
+        * args.gtp_weight_remat_size
+    )
 
     # Total model size.
     assert args.world_size % total_model_size == 0, (
@@ -421,7 +437,12 @@ def validate_args(args, defaults={}):
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
-    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    total_model_size = (
+        args.tensor_model_parallel_size
+        * args.pipeline_model_parallel_size
+        * args.context_parallel_size
+        * args.gtp_weight_remat_size
+    )
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:

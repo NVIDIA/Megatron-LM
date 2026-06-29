@@ -22,7 +22,9 @@ from transformer_engine.pytorch import fp8_autocast
 
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
+    _assert_loss_trajectories_match,
     _requires_mxfp8,
+    _restore_gtp_shards_and_init_main_grad,
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -187,19 +189,8 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
         len(gtp_params) > 0
     ), "GTP is not active: no GTPShardedParam found in GTP_remat_size=4 transformer stack"
 
-    # Restore initial weights: GTP_remat params get the matching shard, others get the full tensor.
-    for name, p in layers_gtp.named_parameters():
-        full = saved_weights[name]
-        if isinstance(p, GTPShardedParam):
-            shard_size = p.shape[0]
-            p.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
-        else:
-            p.data.copy_(full)
-
-    # Pre-allocate main_grad for GTP_remat params (required before the first backward).
-    for p in layers_gtp.parameters():
-        if isinstance(p, GTPShardedParam):
-            p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
+    # Restore initial weights into shards and pre-allocate main_grad for the backward.
+    _restore_gtp_shards_and_init_main_grad(layers_gtp, saved_weights, gtp_rank, dtype)
 
     gtp_losses = []
     for step in range(STEPS):
@@ -234,13 +225,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
     # Compare per-step loss trajectories on rank 0
     # -------------------------------------------------------------------------
     if rank == 0:
-        assert len(baseline_losses) == STEPS
-        assert len(gtp_losses) == STEPS
-        for step, (lb, lg) in enumerate(zip(baseline_losses, gtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  gtp_remat={lg:.6f}", flush=True)
-        torch.testing.assert_close(
-            torch.tensor(gtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
-        )
+        _assert_loss_trajectories_match(baseline_losses, gtp_losses, STEPS)
 
 
 class TestAttentionGTPCorrectness:

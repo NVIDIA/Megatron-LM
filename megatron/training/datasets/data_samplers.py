@@ -43,8 +43,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+            data_parallel_rank=mpu.get_data_parallel_rank(with_gtp_remat=True),
+            data_parallel_size=mpu.get_data_parallel_world_size(with_gtp_remat=True))
     elif args.dataloader_type == 'single':
         if args.hybrid_context_parallel:
             batch_sampler = HybridCPMegatronPretrainingSampler(
@@ -52,24 +52,24 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 consumed_samples=consumed_samples,
                 micro_batch_size=micro_batch_size,
                 global_batch_size=global_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_rank=mpu.get_data_parallel_rank(with_gtp_remat=True),
+                data_parallel_size=mpu.get_data_parallel_world_size(with_gtp_remat=True))
         else:
             # Megatron sampler
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=micro_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_rank=mpu.get_data_parallel_rank(with_gtp_remat=True),
+                data_parallel_size=mpu.get_data_parallel_world_size(with_gtp_remat=True))
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=mpu.get_data_parallel_rank(with_gtp_remat=True),
+            data_parallel_size=mpu.get_data_parallel_world_size(with_gtp_remat=True),
             data_sharding=args.data_sharding,
         )
     else:

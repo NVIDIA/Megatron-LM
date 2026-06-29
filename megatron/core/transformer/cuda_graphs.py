@@ -393,7 +393,7 @@ def _backup_grads_before_capture(runner):
     if runner.gtp_remat:
         # GTP only: also protect the cross-graph next_w the cascade accumulates into.
         for p in runner.base_module.parameters():
-            nw = getattr(p, "next_w", None) if getattr(p, "is_gtp", False) else None
+            nw = getattr(p, "next_w", None) if getattr(p, "is_gtp_weight_remat", False) else None
             if nw is None:
                 continue
             shards = nw.weight_list if getattr(nw, "is_routed_expert", False) else [nw]
@@ -949,7 +949,7 @@ class _CudaGraphRunner(torch.nn.Module):
         """
         finalized = {}  # id → param
         for p in self.params_to_backprop:
-            if not getattr(p, 'is_gtp', False):
+            if not getattr(p, 'is_gtp_weight_remat', False):
                 continue
             if getattr(p, "prev_w", None) is None:
                 for w in getattr(p, "_weights", [p]):

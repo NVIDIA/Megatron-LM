@@ -48,7 +48,7 @@ LR = 1.0  # scale-sensitive SGD step
 dtype = torch.bfloat16
 
 
-def _make_config():
+def _make_config(calculate_per_token_loss=False):
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     return TransformerConfig(
@@ -63,6 +63,7 @@ def _make_config():
         bias_dropout_fusion=False,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
 
 
@@ -78,13 +79,13 @@ def _make_stack(config, pg_collection):
     )
 
 
-def _build_ddp(stack):
+def _build_ddp(stack, calculate_per_token_loss=False):
     """Wrap the stack in a NON-distributed-optimizer DDP so main_grad holds the
     full all-reduced gradient (no optimizer needed; no Adam scale-invariance to
     mask a scaling error)."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 
-    config = _make_config()
+    config = _make_config(calculate_per_token_loss=calculate_per_token_loss)
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=False, overlap_grad_reduce=False
     )
@@ -94,7 +95,7 @@ def _build_ddp(stack):
     return DistributedDataParallel(config, ddp_config, module)
 
 
-def _run_one_backward(ddp_model, rank):
+def _run_one_backward(ddp_model, rank, calculate_per_token_loss=False):
     ddp_model.zero_grad_buffer()
     # Distinct input per rank => the correct reduced grad is the MEAN over ranks.
     torch.manual_seed(1000 + rank)
@@ -112,7 +113,9 @@ def _run_one_backward(ddp_model, rank):
         _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
-    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model])
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        [ddp_model], calculate_per_token_loss=calculate_per_token_loss
+    )
     return float(loss.item())
 
 
@@ -139,7 +142,7 @@ def _full_main_grads(stack):
     return out
 
 
-def _worker(rank, world_size, port):
+def _worker(rank, world_size, port, calculate_per_token_loss=False):
     from megatron.core import parallel_state as ps
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -151,15 +154,15 @@ def _worker(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
     pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    base_stack = _make_stack(_make_config(), pgc)
+    base_stack = _make_stack(_make_config(calculate_per_token_loss=calculate_per_token_loss), pgc)
     for layer in base_stack:
         layer.cuda()
     for p in base_stack.parameters():
         dist.broadcast(p.data, src=0)
     saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
 
-    base_ddp = _build_ddp(base_stack)
-    _run_one_backward(base_ddp, rank)
+    base_ddp = _build_ddp(base_stack, calculate_per_token_loss=calculate_per_token_loss)
+    _run_one_backward(base_ddp, rank, calculate_per_token_loss=calculate_per_token_loss)
     base_grads = _full_main_grads(base_stack)
 
     ps.destroy_model_parallel()
@@ -171,7 +174,7 @@ def _worker(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
     pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
-    gtp_stack = _make_stack(_make_config(), pgc)
+    gtp_stack = _make_stack(_make_config(calculate_per_token_loss=calculate_per_token_loss), pgc)
     for layer in gtp_stack:
         layer.cuda()
 
@@ -188,8 +191,8 @@ def _worker(rank, world_size, port):
         else:
             p.data.copy_(full)
 
-    gtp_ddp = _build_ddp(gtp_stack)
-    _run_one_backward(gtp_ddp, rank)
+    gtp_ddp = _build_ddp(gtp_stack, calculate_per_token_loss=calculate_per_token_loss)
+    _run_one_backward(gtp_ddp, rank, calculate_per_token_loss=calculate_per_token_loss)
     gtp_grads = _full_main_grads(gtp_stack)
 
     ps.destroy_model_parallel()
@@ -521,6 +524,25 @@ class TestGTPGradCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker, 4)
+
+    def test_gtp2_dp2_grad_matches_dp4_baseline_per_token_loss(self):
+        """Same as above but with calculate_per_token_loss=True (the a55b config).
+
+        Per-token-loss disables DDP's 1/dp pre-scaling and normalizes by 1/total_global_tokens,
+        so the gtp_remat axis must be SUM-reduced (plain reduce-scatter + SUM finalize), NOT the
+        1/gtp MEAN used otherwise. A regression to an unconditional mean shrinks every gtp grad by
+        1/gtp and this test catches it (GTP2xDP2 sum-grad must still match the DP4 sum-grad).
+        GTP_CONFIG is a process-global, so set it for this test and always reset it.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        from megatron.core.tensor_parallel.gtp import update_gtp_config
+
+        update_gtp_config(calculate_per_token_loss=True)
+        try:
+            _run_distributed(_worker, 4, True)
+        finally:
+            update_gtp_config(calculate_per_token_loss=False)
 
     def test_gtp2_dp2_distopt_grad_norm_matches_dp4_baseline(self):
         """GTP2xDP2 dist-opt grad-norm must match no-GTP_remat DP4 (the 64-GPU path)."""

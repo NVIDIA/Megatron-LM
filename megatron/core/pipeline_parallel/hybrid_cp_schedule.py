@@ -559,7 +559,9 @@ def hybrid_context_parallel_forward_backward(
 
     # We get data once per global batch and schedule the sub-samples.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
-    hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    hdp_rank = parallel_state.get_data_parallel_rank(
+        with_context_parallel=True, with_gtp_remat=True
+    )
     is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
 
     if is_first_tp_rank:
@@ -614,7 +616,9 @@ def hybrid_context_parallel_forward_backward(
             # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
             # no rank is starting a sub-sample ahead of it's partner ranks.
             torch.distributed.barrier(
-                parallel_state.get_data_parallel_group(with_context_parallel=True)
+                parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp_remat=True
+                )
             )
 
     # For the last group, we need to run the last sub-sample out of the context handler.

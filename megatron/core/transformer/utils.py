@@ -130,7 +130,10 @@ def make_sharded_tensors_for_checkpoint(
 
     if tp_group is None and dp_cp_group is None:
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # Full DP x CP x gtp_remat group so gtp_remat peers get distinct replica_ids.
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=True
+        )
 
     # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
     # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
@@ -240,11 +243,18 @@ def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
     If `metadata` is a dict and missing `dp_cp_group`, it is updated in-place.
     Otherwise, asserts that `dp_cp_group` exists.
     """
+    # Full DP x CP x gtp_remat group so gtp_remat peers get distinct checkpoint replica_ids.
     if metadata is None:
-        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
+        return {
+            'dp_cp_group': parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
+        }
     assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
     if 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=True
+        )
     return metadata
 
 

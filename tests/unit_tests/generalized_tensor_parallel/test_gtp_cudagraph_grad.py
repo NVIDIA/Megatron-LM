@@ -29,7 +29,7 @@ if not HAVE_GTP:
 def _gtp_param(value: float, numel: int = 8) -> torch.nn.Parameter:
     """A param with a finalized (reduced + scaled) main_grad, flagged as a GTP weight."""
     p = torch.nn.Parameter(torch.zeros(numel, device="cuda"))
-    p.is_gtp = True
+    p.is_gtp_weight_remat = True
     p.main_grad = torch.full((numel,), value, device="cuda")
     return p
 

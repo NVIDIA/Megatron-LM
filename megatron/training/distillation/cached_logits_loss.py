@@ -665,8 +665,8 @@ class CachedLogitsKDLoss:
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         self.cp_rank = parallel_state.get_context_parallel_rank()
-        self.dp_rank = parallel_state.get_data_parallel_rank()
-        self.dp_size = parallel_state.get_data_parallel_world_size()
+        self.dp_rank = parallel_state.get_data_parallel_rank(with_gtp_remat=True)
+        self.dp_size = parallel_state.get_data_parallel_world_size(with_gtp_remat=True)
 
         # ---- DataLoader (lazy-initialised on first call) ----
         self._dataloader_iter: Optional[Iterator] = None

@@ -22,6 +22,7 @@ from transformer_engine.pytorch import fp8_autocast
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
+    _assert_loss_trajectories_match,
     _requires_mxfp8,
     _run_distributed,
     _torchrun_dist_init,
@@ -273,12 +274,60 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     # Compare per-step loss trajectories on rank 0
     # -------------------------------------------------------------------------
     if rank == 0:
-        assert len(baseline_losses) == STEPS
-        assert len(egtp_losses) == STEPS
-        for step, (lb, le) in enumerate(zip(baseline_losses, egtp_losses)):
-            print(f"Step {step:2d}: baseline={lb:.6f}  egtp_remat={le:.6f}", flush=True)
-        torch.testing.assert_close(
-            torch.tensor(egtp_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
+        _assert_loss_trajectories_match(baseline_losses, egtp_losses, STEPS, label="egtp_remat")
+
+
+def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
+    """Router expert-bias must stay identical across gtp_remat peers.
+
+    The aux-loss-free balancer (``get_updated_expert_bias``) all-reduces per-expert token counts
+    over the router's tp_dp_cp group, then sign-updates the replicated expert_bias. gtp_remat peers
+    hold DISTINCT tokens but share the replicated router, so the reduction must span gtp_remat.
+    ``get_tensor_and_data_parallel_group`` therefore spans gtp_remat (like dp); over a gtp-EXCLUDED
+    group the peers reduce different token sums and the bias diverges -> routing instability (a55b
+    loss spikes). world=4 -> tp1 * gtp_remat2 * dp2.
+    """
+    import torch.distributed as dist
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
+    from megatron.core.utils import get_pg_size
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    gtp_group = ps.get_gtp_weight_remat_group()
+    tp_dp_cp = ps.get_tensor_and_data_parallel_group(with_context_parallel=True)  # spans gtp_remat
+    replicate = ps.get_data_parallel_group(with_context_parallel=True)  # gtp-EXCLUDED (the bug)
+
+    num_experts = 8
+    torch.manual_seed(1000 + rank)  # distinct per-rank tokens (distinct data on each rank)
+    base = torch.randint(0, 100, (num_experts,), device="cuda").float()
+
+    def _max_bias_diff_across_gtp(group):
+        bias = torch.zeros(num_experts, device="cuda")  # identical start on every rank
+        updated = get_updated_expert_bias(base.clone(), bias, 0.01, tp_dp_cp_group=group)
+        buf = [torch.zeros_like(updated) for _ in range(gtp_group.size())]
+        dist.all_gather(buf, updated, group=gtp_group)
+        return max((buf[i] - buf[0]).abs().max().item() for i in range(gtp_group.size()))
+
+    # tp_dp_cp must span gtp_remat (size = replicate_dp_cp x gtp_remat at tp=1).
+    spans_gtp = get_pg_size(tp_dp_cp) == get_pg_size(replicate) * get_pg_size(gtp_group)
+    diff_excluded = _max_bias_diff_across_gtp(replicate)
+    diff_included = _max_bias_diff_across_gtp(tp_dp_cp)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+    if rank == 0:
+        assert spans_gtp, "tp_dp_cp group must span the gtp_remat axis (like dp)"
+        # gtp-excluded reduction reproduces the bug; tp_dp_cp (spans gtp_remat) keeps peers in sync.
+        assert diff_excluded > 0, (
+            f"gtp-excluded group should diverge across gtp_remat peers, got {diff_excluded}"
+        )
+        assert diff_included == 0, (
+            f"tp_dp_cp must keep expert_bias identical across gtp_remat peers, got {diff_included}"
         )
 
 
@@ -289,3 +338,9 @@ class TestMoEEGTPCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_moe_egtp_correctness, 4)
+
+    def test_expert_bias_gtp_inclusive(self):
+        """expert_bias stays synced across gtp_remat peers only with the gtp-inclusive group."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires at least 4 CUDA devices")
+        _run_distributed(_worker_expert_bias_gtp_inclusive, 4)

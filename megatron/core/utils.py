@@ -885,10 +885,7 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group(no_gtp_remat=True),
-            parallel_state.get_expert_data_parallel_group(no_gtp_remat=True),
-        ],
+        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -948,10 +945,13 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets = []
 
-    # Get groups with fallback to parallel_state
+    # Full DP x CP x gtp_remat group so gtp_remat peers get distinct replica_ids (a
+    # replicate-only group would collide -> DCP duplicate-writer error).
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=True
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
@@ -999,10 +999,8 @@ def make_tp_sharded_tensor_for_checkpoint(
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
                 new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
             # GTP peers hold distinct shards (disambiguated by the offset above); the true
-            # replicas are the gtp-EXCLUDED DP group, so elect the writer over that group.
-            dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, no_gtp_remat=True
-            )
+            # replicas are the replicate DP group, so elect the writer over that group.
+            dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)
@@ -1057,9 +1055,13 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     new_offsets = []
 
     # Get groups with fallback to parallel_state
+    # Full DP x CP x gtp_remat group so gtp_remat peers get distinct replica_ids (a
+    # replicate-only group would collide -> DCP duplicate-writer error).
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=True
+        )
 
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)

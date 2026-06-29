@@ -101,3 +101,34 @@ def _make_gtp_remat_grouped_linear(
         gtp_remat_group=gtp_remat_group,
         **kwargs,
     )
+
+
+def _restore_gtp_shards_and_init_main_grad(module, saved_weights, gtp_rank, dtype=torch.bfloat16):
+    """Load saved full weights into a GTP_remat_size>1 module and prep it for backward.
+
+    GTPShardedParams receive their ``gtp_rank`` axis-0 shard; replicated params get the full
+    tensor. Then pre-allocate ``main_grad`` on every GTPShardedParam (required before the first
+    backward). Used by the dense two-phase baseline-vs-GTP tests.
+    """
+    for name, p in module.named_parameters():
+        full = saved_weights[name]
+        if isinstance(p, GTPShardedParam):
+            shard_size = p.shape[0]
+            p.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
+        else:
+            p.data.copy_(full)
+    for p in module.parameters():
+        if isinstance(p, GTPShardedParam):
+            p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
+
+
+def _assert_loss_trajectories_match(baseline_losses, test_losses, steps, label="gtp_remat"):
+    """On rank 0: print and assert two per-step loss trajectories match (atol=rtol=1e-5)."""
+    assert len(baseline_losses) == len(test_losses) == steps, (
+        f"loss counts: baseline={len(baseline_losses)} {label}={len(test_losses)} want {steps}"
+    )
+    for step, (lb, lt) in enumerate(zip(baseline_losses, test_losses)):
+        print(f"Step {step:2d}: baseline={lb:.6f}  {label}={lt:.6f}", flush=True)
+    torch.testing.assert_close(
+        torch.tensor(test_losses), torch.tensor(baseline_losses), atol=1e-5, rtol=1e-5
+    )

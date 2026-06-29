@@ -104,18 +104,18 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []                # Dense, non-sharded
     sharded_params_data = []        # Dense, sharded → reduce over dp_cp
     gtp_params_data = []            # GTP_remat, non-sharded
-    gtp_sharded_params_data = []    # GTP_remat, sharded → reduce over dp_cp_no_gtp_remat
+    gtp_sharded_params_data = []    # GTP_remat, sharded → reduce over dp_cp
     moe_params_data = []            # MoE, non-sharded
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
-    moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp_no_gtp_remat
+    moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
 
     gtp_rank = mpu.get_gtp_weight_remat_rank()
     egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            is_gtp = getattr(param, 'is_gtp', False)
+            is_gtp = getattr(param, 'is_gtp_weight_remat', False)
 
             # Filter TP duplicates. GTP_remat params are always unique across TP ranks
             # so skip this check for them.
@@ -167,18 +167,18 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
 
     # --- Sharded optimizer DP reductions (each category uses its own group) ---
-    # Reduce over the gtp_remat-EXCLUDED replicate group: the model-parallel reduce below already
-    # spans the gtp_remat axis, so a gtp_remat-inclusive group here would over-count by gtp_remat.
-    # No-op for non-GTP_remat runs (the no_gtp_remat group aliases the regular DP group).
+    # Reduce over the replicate group (the default DP group): the model-parallel reduce below
+    # already spans the gtp_remat axis, so the full group here would over-count by gtp_remat.
+    # No-op for non-GTP_remat runs (the default group is the full DP group).
     _sum_reduce(
-        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp_remat=True)
+        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True)
     )
     _sum_reduce(
         gtp_sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True, no_gtp_remat=True),
+        mpu.get_data_parallel_group(with_context_parallel=True),
     )
     _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(no_gtp_remat=True))
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group())
 
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
@@ -250,10 +250,10 @@ def average_losses_across_data_parallel_group(
 ):
     """Reduce a tensor of losses across all GPUs.
 
-    group: data-parallel process group; defaults to mpu.get_data_parallel_group().
+    group: data-parallel process group; defaults to the full DP x gtp_remat group.
     """
     if group is None:
-        group = mpu.get_data_parallel_group()
+        group = mpu.get_data_parallel_group(with_gtp_remat=True)
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(averaged_losses, group=group)
     averaged_losses = averaged_losses / group.size()

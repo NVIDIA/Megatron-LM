@@ -776,14 +776,15 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
 
 def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_groups) -> None:
-    """Backfill the optimizer id->ShardedTensor map with GTP shards it is missing (in place).
+    """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
 
     WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
-    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). A GTP weight
-    whose model entry is a gathered+split factory (Mamba ``in_proj``) exposes the *gathered* tensor,
-    not the per-shard ``GTPShardedParam``, so it fails to match and is absent from the map -- the
-    generic conversion below would then KeyError on it. This backfills the same per-shard
-    ShardedTensor every other GTP weight already gets, so its optimizer state is saved per-shard.
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). A GTP_remat
+    weight whose model entry is a gathered+split factory (Mamba ``in_proj``) exposes the *gathered*
+    tensor, not the per-shard ``GTPShardedParam``, so it fails to match and is absent from the
+    map -- the generic conversion below would then KeyError on it. This backfills the same
+    per-shard ShardedTensor every other GTP_remat weight already gets, so its optimizer state is
+    saved per-shard.
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
@@ -793,7 +794,6 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
     No-op when GTP is unavailable or when every param already matched.
     """
     try:
-        from megatron.core import parallel_state
         from megatron.core.tensor_parallel.gtp import (
             GTPShardedParam,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
@@ -804,14 +804,17 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
     # Groups sourced lazily (below) only when a GTP param is found, so GTP-free models on
     # explicit grids (e.g. MiMo) never require the global MPU groups to be initialized.
     tp_group = None
-    dp_cp_group = None
+    dp_cp_gtp_remat_group = None
     for param_id, p in enumerate(chain.from_iterable(float16_groups)):
         # Skip params that already matched, and any non-GTP param (those always match).
         if param_id in id_to_sharded_param_map or not isinstance(p, GTPShardedParam):
             continue
         if tp_group is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
-            dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
+            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
@@ -820,7 +823,7 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
             prefix='',
             tensor_parallel_layers_axis_map={key: 0},
             tp_group=tp_group,
-            dp_cp_group=dp_cp_group,
+            dp_cp_group=dp_cp_gtp_remat_group,
         )
         id_to_sharded_param_map[param_id] = entry[key]
 

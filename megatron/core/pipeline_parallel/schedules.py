@@ -703,6 +703,9 @@ def forward_backward_no_pipelining(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False, with_gtp_remat=True
+        )
         pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
             with_context_parallel=True
         )
@@ -1032,6 +1035,9 @@ def forward_backward_pipelining_with_interleaving(
         pg_collection.pp = pp_group
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
+        )
+        pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False, with_gtp_remat=True
         )
         pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
             with_context_parallel=True
@@ -2191,6 +2197,11 @@ def forward_backward_pipelining_without_interleaving(
         pg_collection.cp = cp_group
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
+        )
+        # Full batch-split group (DP x CP x gtp_remat): finalize_model_grads reduces global-batch
+        # num_tokens over it, since gtp_remat peers hold distinct tokens.
+        pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False, with_gtp_remat=True
         )
         pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
             with_context_parallel=True

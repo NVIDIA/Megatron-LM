@@ -2414,13 +2414,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 if self.use_bias:
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
             # Set the expert-DP replica_id, picking the group by what EGTP_remat does to each entry:
-            #   - weight ShardedTensor: SHARDED across EGTP_remat (distinct) → not replicas →
-            #     use ``intra_expt_dp_no_egtp_remat``.
             #   - _extra_state ShardedObject: REPLICATED across EGTP_remat → need distinct ids
-            #     to avoid duplicate-writer collisions → use full ``expt_dp``.
+            #     to avoid duplicate-writer collisions → use the full ``expt_dp_gtp_remat``.
+            #   - weight ShardedTensor: SHARDED across EGTP_remat (distinct) → not replicas →
+            #     elect the writer over the replicate group ``expt_dp``.
             # EGTP_remat=1: the two groups coincide, so this is a no-op.
-            expt_dp_full = self._pg_collection.expt_dp
-            expt_dp_intra = self._pg_collection.intra_expt_dp_no_egtp_remat
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (
@@ -2429,9 +2427,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
                 elif isinstance(sh_ten, ShardedObject):
-                    edp_replica_id = get_pg_rank(expt_dp_full)
+                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp_gtp_remat)
                 else:
-                    edp_replica_id = get_pg_rank(expt_dp_intra)
+                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
