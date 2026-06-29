@@ -548,6 +548,14 @@ class CheckpointConfig:
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
+    ckpt_fully_parallel_load_per_rank_objects: bool = False
+    """Load ShardedObjects per-rank during fully parallel load of distributed checkpoints.
+    When True, every rank reads all of its own ShardedObjects (RNG states,
+    TE `_extra_state`, ...) directly from storage, which removes the WORLD-wide
+    `all_gather_object` that otherwise exchanges them. Objects are
+    content-addressable by `unique_key`, so the loaded values are identical.
+    When False (default), the legacy gather-based object exchange is used."""
+
     ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel save of distributed checkpoints.
     "dp"(default): Data parallel process group.
