@@ -230,6 +230,70 @@ class TestGPTModel:
         assert seen["output_layer"] is self.gpt_model.output_layer
 
 
+@pytest.mark.parametrize(
+    "pre_process,provide_decoder_input", [(True, False), (False, False), (False, True)]
+)
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_preprocess_sequence_parallel_shards_padding_mask_on_every_pipeline_stage(
+    pre_process, provide_decoder_input, tp_rank
+):
+    """The MoE padding mask must have one entry per TP-local decoder token on every PP stage."""
+    model = MagicMock()
+    model.pre_process = pre_process
+    model.config.sequence_parallel = True
+    model.position_embedding_type = 'learned_absolute'
+    model.tp_group = object()
+
+    batch_size = 2
+    sequence_length = 8
+    local_sequence_length = 4
+    hidden_size = 12
+    padding_mask = torch.tensor(
+        [
+            [False, False, False, True, False, False, True, True],
+            [False, False, True, True, False, True, True, True],
+        ]
+    )
+    local_hidden_states = torch.randn(local_sequence_length, batch_size, hidden_size)
+    input_ids = (
+        torch.ones((batch_size, sequence_length), dtype=torch.int64) if pre_process else None
+    )
+    position_ids = input_ids
+    model.embedding.return_value = local_hidden_states
+    decoder_input = local_hidden_states if provide_decoder_input else None
+
+    sequence_first_mask = padding_mask.transpose(0, 1).contiguous()
+    shard_start = tp_rank * local_sequence_length
+    local_sequence_first_mask = sequence_first_mask[
+        shard_start : shard_start + local_sequence_length
+    ]
+    with (
+        patch.object(InferenceMode, "is_active", return_value=False),
+        patch(
+            "megatron.core.models.gpt.gpt_model.tensor_parallel.scatter_to_sequence_parallel_region",
+            return_value=local_sequence_first_mask,
+        ) as scatter,
+    ):
+        preprocessed = GPTModel._preprocess(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            padding_mask=padding_mask,
+        )
+
+    expected_decoder_input = local_hidden_states if pre_process or provide_decoder_input else None
+    assert preprocessed[0] is expected_decoder_input
+    scatter.assert_called_once()
+    assert scatter.call_args.args[0].is_contiguous()
+    assert torch.equal(scatter.call_args.args[0], sequence_first_mask)
+    assert scatter.call_args.kwargs == {"group": model.tp_group}
+
+    local_padding_mask = preprocessed[5]
+    assert torch.equal(local_padding_mask, local_sequence_first_mask.transpose(0, 1))
+    assert local_padding_mask.numel() == local_hidden_states.shape[0] * local_hidden_states.shape[1]
+
+
 def test_get_mlp_module_spec_interface():
     # Get the function signature
     sig = inspect.signature(get_mlp_module_spec)
