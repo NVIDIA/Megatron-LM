@@ -417,9 +417,7 @@ class DynamicInferenceEngine(AbstractEngine):
             from megatron.core.parallel_state import get_global_memory_buffer
 
             max_ag_numel = self.context.max_tokens * model_config.hidden_size
-            get_global_memory_buffer().get_tensor(
-                (max_ag_numel,), model_config.params_dtype, "mpu"
-            )
+            get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
