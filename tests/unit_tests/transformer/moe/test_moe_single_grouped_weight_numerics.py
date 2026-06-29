@@ -22,14 +22,16 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
 )
-from megatron.training.training import setup_model_and_optimizer
+from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -368,37 +370,99 @@ class TestMoESingleGroupedWeightNumerics:
         model[0].train()
         model[0].enable_forward_pre_hook()
 
-    def run_mxfp8_training_losses_with_optional_eval(self, eval_after_step: int | None):
+    def setup_mxfp8_overlap_case(self, single_weight: bool, checkpoint_dir=None):
         args = self.create_test_args(
             precision="mxfp8",
             primary_param_gather=True,
-            single_weight=True,
+            single_weight=single_weight,
             gradient_accumulation_fusion=True,
             use_transformer_engine_op_fuser=True,
             overlap_param_gather=True,
             overlap_grad_reduce=True,
             grad_reduce_in_fp32=True,
         )
+        if checkpoint_dir is not None:
+            args.save = checkpoint_dir
+            args.load = checkpoint_dir
+            args.ckpt_format = "torch_dist"
+            args.use_dist_ckpt = True
+            args.auto_detect_ckpt_format = False
+            args.async_save = False
+            args.ckpt_assume_constant_structure = False
+            args.ckpt_load_validate_sharding_integrity = True
+            args.dist_ckpt_strictness = "assume_ok_unexpected"
+            args.no_save_optim = True
+            args.no_load_optim = True
+            args.no_save_rng = True
+            args.no_load_rng = True
+            args.load_main_params_from_ckpt = True
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, expert_model_parallel_size=args.expert_model_parallel_size
         )
 
-        model, optimizer, _ = setup_model_and_optimizer(
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
         assert len(model) == 1
-        self.assert_storage_path_is_exercised(model[0], "mxfp8", True, True)
+        self.assert_storage_path_is_exercised(model[0], "mxfp8", True, single_weight)
         self.assert_execution_path_is_exercised(model[0], True)
 
         batch = self.get_batch()
+        return args, model, optimizer, opt_param_scheduler, batch
+
+    def run_mxfp8_training_losses_with_optional_eval(
+        self, eval_after_step: int | None, single_weight: bool = True
+    ):
+        args, model, optimizer, _, batch = self.setup_mxfp8_overlap_case(
+            single_weight=single_weight
+        )
         losses = []
         for step in range(4):
             if eval_after_step is not None and step == eval_after_step:
                 self.run_mxfp8_eval_step(args, model, optimizer, batch)
             losses.append(self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch))
         return torch.stack(losses)
+
+    def run_mxfp8_training_losses_with_optional_checkpoint(
+        self, checkpoint_dir, checkpoint_before_step: int | None
+    ):
+        args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
+            single_weight=True, checkpoint_dir=checkpoint_dir
+        )
+        losses = []
+        for step in range(4):
+            if checkpoint_before_step is not None and step == checkpoint_before_step:
+                force_param_sync(model, optimizer=optimizer)
+                save_checkpoint(step, model, optimizer, opt_param_scheduler, 0)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+            losses.append(self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch))
+        return torch.stack(losses)
+
+    def run_mxfp8_checkpoint_save_load_next_loss(
+        self, checkpoint_dir, save_single_weight: bool, load_single_weight: bool
+    ):
+        args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
+            single_weight=save_single_weight, checkpoint_dir=checkpoint_dir
+        )
+
+        for _ in range(2):
+            self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
+        force_param_sync(model, optimizer=optimizer)
+        save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        self._cleanup()
+
+        args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
+            single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
+        )
+        loaded_iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+        assert loaded_iteration == 2
+        return self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
 
     @staticmethod
     def assert_loss_parity(precision: str, single_weight_losses, discrete_weight_losses):
@@ -475,6 +539,53 @@ class TestMoESingleGroupedWeightNumerics:
             torch.testing.assert_close(
                 train_eval_train_losses, train_only_losses, atol=1e-4, rtol=1e-4
             )
+        except Exception:
+            local_passed = False
+            local_error = traceback.format_exc()
+
+        self.assert_all_ranks_passed(local_passed, local_error)
+
+    @pytest.mark.parametrize(
+        "checkpoint_case, save_single_weight, load_single_weight",
+        [
+            # Save-only: checkpointing should not perturb live training state.
+            pytest.param("save_only", True, None, id="save-only-single"),
+            # Layout interchange: torch_dist saves grouped MoE weights as per-expert keys.
+            pytest.param("save_load", True, False, id="save-single-load-discrete"),
+            # Reverse interchange: per-expert checkpoint keys must fold into one grouped param.
+            pytest.param("save_load", False, True, id="save-discrete-load-single"),
+        ],
+    )
+    def test_mxfp8_single_weight_torch_dist_checkpoint_matches_discrete_baseline(
+        self, tmp_path_dist_ckpt, checkpoint_case, save_single_weight, load_single_weight
+    ):
+        """torch_dist checkpoint save/load should preserve MXFP8 discrete baseline numerics."""
+        _skip_if_unsupported("mxfp8")
+        local_passed = True
+        local_error = ""
+        try:
+            discrete_train_only_losses = self.run_mxfp8_training_losses_with_optional_eval(
+                eval_after_step=None, single_weight=False
+            )
+            with TempNamedDir(
+                tmp_path_dist_ckpt / "test_mxfp8_single_weight_torch_dist_checkpoint", sync=True
+            ) as checkpoint_dir:
+                if checkpoint_case == "save_only":
+                    # This catches forced-param-sync/checkpoint side effects without reload.
+                    checkpoint_losses = self.run_mxfp8_training_losses_with_optional_checkpoint(
+                        checkpoint_dir=checkpoint_dir, checkpoint_before_step=2
+                    )
+                    self.assert_loss_parity("mxfp8", checkpoint_losses, discrete_train_only_losses)
+                else:
+                    # This catches checkpoint key/layout conversion bugs across single/discrete.
+                    loaded_next_loss = self.run_mxfp8_checkpoint_save_load_next_loss(
+                        checkpoint_dir,
+                        save_single_weight=save_single_weight,
+                        load_single_weight=load_single_weight,
+                    )
+                    torch.testing.assert_close(
+                        loaded_next_loss, discrete_train_only_losses[2], atol=2e-2, rtol=2e-2
+                    )
         except Exception:
             local_passed = False
             local_error = traceback.format_exc()
