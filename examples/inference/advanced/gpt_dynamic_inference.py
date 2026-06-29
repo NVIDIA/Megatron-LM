@@ -508,7 +508,7 @@ def main():
         print(
             f"{setup_prefix} … " f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
-            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"mem {peak_alloc_gb:.1f} allocated/{peak_resvd_gb:.1f} reserved GB … "
             f"steps: {engine.context.step_count:d} … "
             f"capture {capture_str}",
         )

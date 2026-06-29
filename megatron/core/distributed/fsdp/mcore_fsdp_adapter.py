@@ -40,8 +40,9 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -151,7 +152,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
 
@@ -173,9 +174,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            assert self.fsdp_unit_modules == [TransformerLayer], (
+            supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            assert self.fsdp_unit_modules and all(
+                module in supported_fsdp_unit_modules for module in self.fsdp_unit_modules
+            ), (
                 "EP overlap with FSDP currently requires fsdp_unit_modules "
-                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+                "to contain only supported MCore modules "
+                f"{supported_fsdp_unit_modules}, "
+                f"got {self.fsdp_unit_modules}."
             )
         super().__init__(
             config=config,

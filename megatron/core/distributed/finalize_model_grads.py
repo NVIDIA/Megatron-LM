@@ -345,7 +345,11 @@ def _update_router_expert_bias(
             # cases where only the student is in training mode but the teacher is in eval mode
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
-            if hasattr(module, 'expert_bias') and module.training:
+            if (
+                hasattr(module, 'expert_bias')
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.

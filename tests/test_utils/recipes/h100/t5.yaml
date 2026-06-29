@@ -101,7 +101,7 @@ products:
   - test_case: [t5_mcore_tp1_pp1_vp1]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [nightly, L0-smoke]
         platforms: [dgx_a100, dgx_h100]
   - test_case: [t5_mcore_tp1_pp1_vp1_resume_torch]
     products:

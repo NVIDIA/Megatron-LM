@@ -78,11 +78,27 @@ def main() -> int:
     ap.add_argument(
         "--config", required=True, help="Path to model_config.yaml (for tolerance + metrics list)."
     )
+    ap.add_argument(
+        "--platform",
+        required=True,
+        help="Hardware platform key (e.g. h100, gb200). baseline_values.json is a "
+        "{platform: {batch_key: {metrics}}} mapping; this picks the subtree to compare against.",
+    )
     args = ap.parse_args()
 
     results = json.loads(Path(args.results).read_text())
-    baseline = json.loads(Path(args.baseline).read_text())
+    full_baseline = json.loads(Path(args.baseline).read_text())
     config = yaml.safe_load(Path(args.config).read_text())
+
+    if args.platform not in full_baseline:
+        available = ", ".join(sorted(full_baseline.keys())) or "<none>"
+        print(
+            f"ERROR: no baseline for platform '{args.platform}' in {args.baseline}. "
+            f"Recorded platforms: {available}.\n"
+            f"  Run once with RECORD_BASELINE=1 on a '{args.platform}' node to bootstrap."
+        )
+        return 1
+    baseline = full_baseline[args.platform]
 
     tol = float(config.get("TOLERANCE_PCT", 10)) / 100.0
     upper_tol = float(config.get("UPPER_TOLERANCE_PCT", 20)) / 100.0
