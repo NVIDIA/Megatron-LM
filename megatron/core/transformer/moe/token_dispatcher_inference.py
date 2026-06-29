@@ -253,17 +253,47 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """Scatter-reduce expert outputs back to each EP rank.
 
+        Default paths
+        -------------
         CG path: standard ReduceScatter (equal token counts guaranteed).
         Non-CG path: expand compact output to padded layout, ReduceScatter, truncate.
 
-        BIK path: under batch_invariant_mode the InferenceGroupedMLP has
-        already AllGather'd raw contribs across EP and run a global
-        `deterministic_index_add`, so `hidden_states` already contains the
-        FULL per-token sum (identical on all ranks). ReduceScatter would
-        multiply it by ep_size, so we slice instead.
+        BIK path: ReduceScatter is replaced by AllToAll
+        ------------------------------------------------
+        Under batch_invariant_mode the cross-rank combine is restructured
+        to match training's reduction tree. The exchange is moved out of
+        token_combine and into the experts module:
+
+        1. mcore_fused_moe skips its internal unpermute and returns the
+           RAW per-contribution data (`return_pre_unpermute=True`).
+        2. InferenceGroupedMLP._bik_global_unpermute packs each contrib
+           with its destination's local_token_id, then performs ONE
+           fixed-shape AllToAll-single so every contribution travels
+           exactly once to its home rank.
+        3. Each home rank runs ONE local `deterministic_index_add` over
+           the received contribs, producing its final [local_tokens, H]
+           output in fp32, cast to bf16.
+
+        Why AllToAll instead of ReduceScatter:
+          * ReduceScatter sums partial sums *across ranks*. That is a
+            second reduction tree on top of the per-rank topk-sum
+            (atomic-add scatter), and the two-tree combine diverges in
+            bf16 from training's single-tree AllToAll-then-local-sum.
+          * AllToAll routes each contribution exactly once and lets the
+            home rank do ONE deterministic sum. Same reduction tree as
+            training → bitwise identical bf16.
+          * Bandwidth: equal to ReduceScatter — both transfer roughly
+            (ep_size - 1) / ep_size * N_local * H bytes per rank.
+
+        Once the AllToAll + local sum has run upstream, hidden_states is
+        already the final [local_tokens, H] bf16 result on this rank.
+        token_combine is a pass-through; running ReduceScatter here would
+        sum garbage from other ranks into the (already-final) answer.
 
         Args:
-            hidden_states: [total_tokens, hidden_dim] expert outputs.
+            hidden_states: expert outputs.
+              - non-BIK: [total_tokens, hidden_dim]
+              - BIK:     [local_tokens, hidden_dim] bf16 (already final)
 
         Returns:
             [local_tokens, hidden_dim] bf16 local token outputs.
@@ -275,10 +305,10 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             is_batch_invariant_mode_enabled,
         )
         if is_batch_invariant_mode_enabled():
-            # Pass-through: the cross-rank reduction already happened in
-            # InferenceGroupedMLP._bik_global_unpermute (AllToAll-padded combine
-            # + local deterministic_index_add), so hidden_states is already
-            # this rank's final [local_tokens, H] bf16 result.
+            # Pass-through: the BIK path replaces ReduceScatter with
+            # AllToAll + local deterministic_index_add inside
+            # InferenceGroupedMLP._bik_global_unpermute. hidden_states is
+            # already this rank's final [local_tokens, H] bf16 result.
             return hidden_states
 
         if not self.__class__._use_allgather_v:
@@ -581,9 +611,39 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
+        BIK path: ReduceScatter is replaced by AllToAll
+        ------------------------------------------------
+        Under batch_invariant_mode the cross-rank combine is restructured
+        to match training's reduction tree. The exchange is moved out of
+        token_combine and into the experts module:
+
+        1. mcore_fused_moe skips its internal unpermute and returns the
+           RAW per-contribution data (`return_pre_unpermute=True`).
+        2. InferenceGroupedMLP._bik_global_unpermute packs each contrib
+           with its destination's local_token_id, then performs ONE
+           fixed-shape AllToAll-single so every contribution travels
+           exactly once to its home rank.
+        3. Each home rank runs ONE local `deterministic_index_add` over
+           the received contribs, producing its final [local_tokens, H]
+           output in fp32, cast to bf16.
+
+        Why AllToAll instead of ReduceScatter-V:
+          * ReduceScatter-V sums partial sums across ranks — a second
+            reduction tree on top of the per-rank topk-sum. The two-tree
+            combine diverges from training's single AllToAll-then-local
+            in bf16. AllToAll + one local deterministic sum matches.
+          * Bandwidth is unchanged at order (ep_size - 1) / ep_size *
+            N_local * H per rank.
+
+        Once the AllToAll + local sum has run upstream, hidden_states is
+        already this rank's final [local_tokens, H] bf16 result;
+        token_combine is a pass-through.
+
         Args:
-            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
-                written directly to the RSV buffer, bf16 otherwise).
+            hidden_states: expert outputs.
+              - non-BIK: [global_max, hidden_size] (fp32 when written
+                  directly to the RSV buffer, bf16 otherwise).
+              - BIK:     [local_tokens, hidden_size] bf16 (already final).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
