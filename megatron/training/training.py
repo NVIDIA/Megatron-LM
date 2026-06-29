@@ -2908,10 +2908,6 @@ def save_checkpoint_and_time(
     timers('interval-time').stop()
     energy_monitor.pause()
 
-    # Extra barrier is added to make sure all ranks report the max time.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
-
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
@@ -2928,6 +2924,10 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+
+    # timer.log() reports the min & max time. We do not need a barrier here.
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=False)
 
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
@@ -2960,7 +2960,8 @@ def save_checkpoint_and_time(
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-    timers(timer_key).stop(barrier=True)
+    # Since timer.log() reports the min & max time, we do not need a barrier here.
+    timers(timer_key).stop(barrier=False)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
 
     if should_report_memory:
