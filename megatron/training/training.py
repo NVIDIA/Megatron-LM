@@ -48,11 +48,15 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
 from .log_handler import CustomHandler
@@ -67,60 +71,16 @@ import torch
 
 try:
     from megatron.rl import rl_utils
+    from megatron.rl.rl_profiling import (
+        RL_LOGGABLE_TIMER_NAMES,
+        initialize_rl_profiler,
+        log_iteration_profile,
+        shutdown_rl_profiler,
+    )
 
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
-
-
-# Canonical list of RL timer names to include in timers_to_log.
-# When the profiling branch is merged, this will be imported from rl_profiling
-# as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
-RL_LOGGABLE_TIMER_NAMES = [
-    # Top-level RL phases
-    'rl/rollout-collection',
-    'rl/prepare-data-for-update',
-    # Rollout collection breakdown
-    'rl/inference-setup',
-    'rl/collect-rollouts',
-    'rl/sync-rollouts',
-    'rl/suspend-engine',
-    # Optimizer offload/restore
-    'rl/offload-optimizer-before-inference',
-    'rl/restore-optimizer-after-inference',
-    'rl/offload-kv-cache-after-inference',
-    'rl/restore-kv-cache-before-inference',
-    # Fine-grained offload/restore breakdown
-    'rl/restore/grad-buffers',
-    'rl/restore/optimizer-state',
-    'rl/restore/wait-for-transfers',
-    'rl/offload/grad-buffers',
-    'rl/offload/optimizer-state',
-    # Weight prefetching
-    'rl/prefetch-weights-to-gpu',
-    'rl/prefetch-weights-to-cpu',
-    # Data preparation
-    'rl/compute-group-stats',
-    'rl/prepare-advantages',
-    'rl/prepare-trajectories',
-    'rl/get-ltor-masks',
-    'rl/create-dataloader',
-    'rl/sequence-packing',
-    'rl/align-inference-logprobs',
-    'rl/log-wandb-tb',
-    'rl/pack-sequences',
-    'rl/regather-trajectories',
-    # Logprobs computation
-    'rl/compute-logprobs',
-    'rl/compute-old-logprobs',
-    'rl/compute-ref-logprobs',
-    'rl/get-logprobs',
-    'rl/forward-pass',
-    'rl/log-softmax',
-    # Inference / cuda graphs
-    'rl/build-cuda-graphs',
-    'rl/wait-for-decode-only',
-]
 
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
@@ -129,7 +89,7 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -147,15 +107,20 @@ from megatron.core.optimizer import get_mup_config_overrides, get_standard_confi
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -180,7 +145,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -191,6 +156,8 @@ from megatron.core.parallel_state import (
     create_all_gather_groups,
     destroy_global_memory_buffer,
     destroy_model_parallel,
+    get_context_parallel_group,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.rerun_state_machine import (
@@ -202,8 +169,9 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -211,11 +179,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    is_hybrid_model,
-)
+from megatron.training.utils import is_hybrid_model
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -267,7 +231,6 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
-    unwrap_model,
     update_use_dist_ckpt,
 )
 
@@ -296,15 +259,154 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
-def num_floating_point_operations(args, batch_size):
-    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+# Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
+# both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
+# -- ``cu_seqlens_padded`` is intentionally ignored so that neither the
+# per-chunk CP alignment padding nor any end-of-sequence padding is counted as
+# useful work):
+#   index 0 -> ``sum_i(L_i)``   (total real tokens; used for token-linear FLOPs:
+#                               projections, MLP, MoE, MTP, logits)
+#   index 1 -> ``sum_i(L_i**2)`` (used for core-attention FLOPs)
+# Lives on GPU as fp64 so per-micro-batch updates run as fused kernels with
+# no host sync; the only host sync happens once at ``consume`` time after a
+# single 2-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
+# first time an update lands this iteration and is the gate that decides
+# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
+# never call ``update_*`` so the flag stays ``False`` and no collective fires.
+_seqlen_stats_in_iteration: Optional[torch.Tensor] = None
+_seqlen_stats_active: bool = False
+
+
+def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
+
+    Args:
+        cu_seqlens: 1-D ``int32`` tensor of cumulative REAL (unpadded) sequence
+            lengths (``[0, L_1, L_1 + L_2, ...]``). Pass the unpadded
+            ``cu_seqlens`` rather than ``cu_seqlens_padded`` so the FLOPs
+            metric reports useful work only, not work on CP-alignment or
+            end-of-sequence padding tokens.
+
+    Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
+    broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
+    no ``.item()`` -- so this is a fused kernel launch with no host sync. The
+    ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
+    the all-reduce; BSHD callers that never invoke this function leave the
+    flag at ``False`` and pay zero collective cost.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return
+    # Pin the accumulator to the current CUDA device when available so the
+    # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
+    # (e.g. unit tests). Production always supplies a CUDA tensor.
+    if _seqlen_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else cu_seqlens.device
+        )
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
+        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
+    )
+    _seqlen_stats_in_iteration[0] += seqlens.sum()
+    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    _seqlen_stats_active = True
+
+
+def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+    """Read, reset and globally reduce the per-iteration packed-sequence stats.
+
+    Returns:
+        ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
+        global batch (all DP ranks combined) for packed (THD) iterations.
+        Both are ``None`` if no update happened this iteration -- the BSHD
+        path -- so the caller forwards them straight to
+        ``num_floating_point_operations`` and takes its closed-form
+        ``batch_size * seq_length`` / ``batch_size * seq_length ** 2`` defaults
+        without paying for a collective.
+
+        ``sum(L_i)`` and ``sum(L_i ** 2)`` are mathematically independent (you
+        cannot derive one from the other), so both must be tracked. Computing
+        them in tandem costs essentially nothing: the per-micro-batch updates
+        fuse onto one device tensor and consume issues a single 2-element
+        all-reduce.
+
+    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+
+    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
+    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
+    factor of ``TP * CP * PP``, which we divide out.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if not _seqlen_stats_active:
+        # BSHD path: never allocated the tensor; tell the caller to use the
+        # closed-form defaults.
+        return None, None
+    t = _seqlen_stats_in_iteration
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        torch.distributed.all_reduce(t)
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        cp_size = max(mpu.get_context_parallel_world_size(), 1)
+        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        dedup = tp_size * cp_size * pp_size
+    else:
+        # No model-parallel state -> treat as a single rank, no reduction.
+        # This is the standalone unit-test path; production always initializes mpu.
+        dedup = 1
+    # Single host sync drains both stats at once.
+    total_real_tokens, seqlen_squared_sum = t.tolist()
+    # Reset for the next iteration. Keep the tensor allocated so subsequent
+    # iterations reuse it without reallocating.
+    t.zero_()
+    _seqlen_stats_active = False
+    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+
+
+def num_floating_point_operations(
+    args, batch_size, seqlen_squared_sum_in_batch=None, total_real_tokens_in_batch=None
+):
+    """Compute the number of floating-point operations for one global batch.
+
+    Args:
+        args: Megatron args (provides hidden size, num layers, seq length, ...).
+        batch_size: Global batch size (samples per iteration). Only used to
+            compute the default token counts for the BSHD path -- with THD
+            both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
+            are passed in explicitly and ``batch_size`` is irrelevant.
+        seqlen_squared_sum_in_batch: ``sum_i(L_i ** 2)`` across all REAL
+            (unpadded) sub-sequences in the global batch. Drives the
+            core-attention L^2 FLOPs. For BSHD this equals
+            ``batch_size * args.seq_length ** 2`` (the default when ``None``).
+            For THD it is the actual ragged sum and is strictly less than the
+            BSHD value, reflecting per-chunk causal masking AND the fact that
+            padding tokens do not contribute to attention scores.
+        total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
+            token count across the global batch. Drives all token-linear FLOPs
+            (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
+            BSHD this equals ``batch_size * args.seq_length`` (the default when
+            ``None``). For THD it equals the real token count -- strictly less
+            than ``batch_size * args.seq_length`` whenever the dataloader added
+            CP-alignment padding or end-of-sequence padding, so neither kind of
+            padding shows up in the reported FLOPs.
+    """
+    # Defaults: BSHD layout assumption (full causal mask, every sample length =
+    # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
+    if seqlen_squared_sum_in_batch is None:
+        seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+    if total_real_tokens_in_batch is None:
+        total_real_tokens_in_batch = batch_size * args.seq_length
+
+    def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+        return 4 * expansion * scale_factor * total_tokens * hidden_size**2
 
     def moe_layer_flops(
-        batch_size,
-        seq_len,
+        total_tokens,
         hidden_size,
         moe_ffn_hidden_size,
         shared_expert_ffn_hidden_size,
@@ -317,8 +419,7 @@ def num_floating_point_operations(args, batch_size):
         if moe_latent_size is None:
             routed_flops = (
                 4
-                * batch_size
-                * seq_len
+                * total_tokens
                 * hidden_size
                 * moe_ffn_hidden_size
                 * num_experts_routed_to
@@ -328,37 +429,46 @@ def num_floating_point_operations(args, batch_size):
             # Routed experts run on moe_latent_size.
             routed_flops = (
                 4
-                * batch_size
-                * seq_len
+                * total_tokens
                 * moe_latent_size
                 * moe_ffn_hidden_size
                 * num_experts_routed_to
                 * scale_factor
             )
             # Up proj and down proj.
-            routed_flops += 4 * batch_size * seq_len * hidden_size * moe_latent_size
-        shared_flops = (
-            4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
-        )
+            routed_flops += 4 * total_tokens * hidden_size * moe_latent_size
+        shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        gqa=True,
+        gqa_groups=8,
+        kv_channels=None,
     ):
-        """Calculate FLOPs for an attention layer."""
+        """Calculate FLOPs for an attention layer.
+
+        Two parts:
+          - Token-linear (QKV + output projections): scales with ``total_tokens``
+            (= ``sum_i(L_i)``). Padding tokens are excluded by passing the real
+            (unpadded) token count.
+          - Core attention (``QK^T`` and ``softmax(QK^T) V``): scales with
+            ``seqlen_squared_sum`` (= ``sum_i(L_i ** 2)``).
+        """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
-            4
-            * batch_size
-            * seq_len
-            * hidden_size
-            * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            4 * total_tokens * hidden_size * p * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * seqlen_squared_sum * hidden_size * p
         )
 
     def mamba_layer_flops(
-        batch_size, seq_len, hidden_size, state_dim=16, head_dim=64, num_groups=1, num_heads=128
+        total_tokens, hidden_size, state_dim=16, head_dim=64, num_groups=1, num_heads=128
     ):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
@@ -370,19 +480,14 @@ def num_floating_point_operations(args, batch_size):
             nheads = d_in // head_dim
         return (
             (
-                2
-                * batch_size
-                * seq_len
-                * hidden_size
-                * (2 * d_in + 2 * num_groups * state_dim + nheads)
+                2 * total_tokens * hidden_size * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
-            + (7 * batch_size * seq_len * d_in * state_dim)  # scan
-            + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
+            + (7 * total_tokens * d_in * state_dim)  # scan
+            + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
     def gdn_layer_flops(
-        batch_size,
-        seq_len,
+        total_tokens,
         hidden_size,
         qk_head_dim=128,
         v_head_dim=128,
@@ -395,8 +500,7 @@ def num_floating_point_operations(args, batch_size):
         v_dim = v_head_dim * num_v_heads
         return (
             2
-            * batch_size
-            * seq_len
+            * total_tokens
             * (
                 # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
                 hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
@@ -410,8 +514,8 @@ def num_floating_point_operations(args, batch_size):
         )
 
     def hybrid_flops(
-        batch_size,
-        seq_len,
+        total_tokens,
+        seqlen_squared_sum,
         hidden_size,
         num_attn_layers,
         num_mamba_layers,
@@ -444,14 +548,18 @@ def num_floating_point_operations(args, batch_size):
         flops_fwd = (
             num_attn_layers
             * attn_layer_flops(
-                batch_size, seq_len, hidden_size, num_attn_heads, gqa, gqa_groups, kv_channels
+                total_tokens,
+                seqlen_squared_sum,
+                hidden_size,
+                num_attn_heads,
+                gqa,
+                gqa_groups,
+                kv_channels,
             )
-            + num_mlp_layers
-            * mlp_layer_flops(batch_size, seq_len, hidden_size, mlp_expansion, swiglu)
+            + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
             + num_mamba_layers
             * mamba_layer_flops(
-                batch_size,
-                seq_len,
+                total_tokens,
                 hidden_size,
                 mamba_state_dim,
                 mamba_head_dim,
@@ -460,8 +568,7 @@ def num_floating_point_operations(args, batch_size):
             )
             + num_moe_layers
             * moe_layer_flops(
-                batch_size,
-                seq_len,
+                total_tokens,
                 hidden_size,
                 moe_ffn_hidden_size,
                 shared_expert_ffn_hidden_size,
@@ -471,8 +578,7 @@ def num_floating_point_operations(args, batch_size):
             )
             + num_gdn_layers
             * gdn_layer_flops(
-                batch_size,
-                seq_len,
+                total_tokens,
                 hidden_size,
                 gdn_qk_head_dim,
                 gdn_v_head_dim,
@@ -481,7 +587,7 @@ def num_floating_point_operations(args, batch_size):
                 gdn_conv_kernel_dim,
             )
             + (
-                2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers)
+                2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
             )  # logits computation
         )
         return flops_fwd * 3
@@ -549,6 +655,13 @@ def num_floating_point_operations(args, batch_size):
         # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
         ffn_expansion_factor = 3 if args.swiglu else 2
 
+        # self_attn is split into a token-linear part (projections, multiplied by
+        # ``batch_size * args.seq_length`` like all other token-linear work) and a
+        # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
+        # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
+        # two are equal, so the BSHD result is unchanged. With THD/packed sequences
+        # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
+        # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
             '''
@@ -572,14 +685,12 @@ def num_floating_point_operations(args, batch_size):
                 ## Full core attention is replaced by sparse attention and is accounted
                 ## for in the dsv4_hybrid branch below.
                 q_term = args.q_lora_rank * (
-                    args.hidden_size
-                    + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                    + 1  # q norm
+                    args.hidden_size + args.num_attention_heads * args.v_head_dim + 1  # q norm
                 )
                 kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim  # kv proj + kv norm
                 ## Grouped low-rank output projection:
-                ##  wo_a:        (n_head * v_head_dim) -> (o_groups * o_lora_rank)
-                ##  linear_proj: (o_groups * o_lora_rank) -> hidden
+                ## wo_a: (n_head * v_head_dim) -> (o_groups * o_lora_rank)
+                ## linear_proj: (o_groups * o_lora_rank) -> hidden
                 o_term = (
                     args.num_attention_heads * args.v_head_dim * args.o_lora_rank
                     + args.o_groups * args.o_lora_rank * args.hidden_size
@@ -589,6 +700,9 @@ def num_floating_point_operations(args, batch_size):
                     * fma_expansion_factor
                     * (q_term + kv_term + o_term)
                 )
+                # Sparse attention replaces full core attention; its cost is captured
+                # in dsv4_hybrid_extra_term below.
+                standard_self_attn_core_term = 0
             else:
                 ## MLA
                 if args.q_lora_rank is None:
@@ -603,6 +717,7 @@ def num_floating_point_operations(args, batch_size):
                         + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
+                # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
                 standard_self_attn_term = (
                     forward_backward_expansion_factor
                     * fma_expansion_factor
@@ -619,11 +734,16 @@ def num_floating_point_operations(args, batch_size):
                         + args.hidden_size * args.qk_pos_emb_head_dim
                         ## o proj
                         + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                        ## core attn
-                        + args.seq_length
-                        * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                        / 2  # causal mask (only half of the mask is non-zero)
-                        + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                    )
+                )
+                # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
+                # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
+                standard_self_attn_core_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
+                        + args.num_attention_heads * args.v_head_dim / 2
                     )
                 )
 
@@ -633,6 +753,7 @@ def num_floating_point_operations(args, batch_size):
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
             gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            # Token-linear part of self-attention (QKV projection + output projection).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -645,17 +766,21 @@ def num_floating_point_operations(args, batch_size):
                         + value_projection_size
                         + gate_projection_size
                     )
-                    ## core attention
-                    + query_projection_size
-                    * args.seq_length
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    * 2  # QK^T and (QK^T)V
                     ## out proj
                     + query_projection_size * args.hidden_size
                 )
             )
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * query_projection_size
+                / 2  # causal mask (only half of the mask is non-zero)
+                * 2  # QK^T and (QK^T)V
+            )
 
         dsv4_hybrid_extra_term = 0
+        dsv4_hybrid_extra_core_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -724,9 +849,7 @@ def num_floating_point_operations(args, batch_size):
             num_standard_attention_layers = num_layers
 
             compress_ratios = args.csa_compress_ratios
-            assert compress_ratios is not None, (
-                "csa_compress_ratios must be set for dsv4_hybrid"
-            )
+            assert compress_ratios is not None, "csa_compress_ratios must be set for dsv4_hybrid"
             assert len(compress_ratios) == num_layers, (
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
@@ -744,33 +867,39 @@ def num_floating_point_operations(args, batch_size):
             seq_len = args.seq_length
 
             # ---- Sparse attention (replaces full core attention) ----
-            # Per token per layer: n_head * (positions_attended) * v_head_dim, ×2 for
-            # QK^T and softmax @ V. Average valid positions account for the causal mask.
+            # Split into token-linear parts (window attention, constant per token)
+            # and L^2 parts (compressed-KV attention, scales with sequence length)
+            # so THD packed sequences get correct seqlen_squared_sum_in_batch scaling.
+
+            # r=0: window-only, fixed per-token cost.
             sparse_attn_r0 = n_layers_r0 * n_head * window * v_head_dim * 2
-            avg_comp_128 = (seq_len // 128) / 2
-            sparse_attn_r128 = n_layers_r128 * n_head * (window + avg_comp_128) * v_head_dim * 2
+
+            # r=128: window (token-linear) + all compressed KV (L^2).
+            # Compressed positions per token ≈ L/(128*2) (causal /2), x2 for
+            # QK^T + softmax@V → L^2 coefficient: n_head * v_head_dim / 128.
+            sparse_attn_r128_window = n_layers_r128 * n_head * window * v_head_dim * 2
+            sparse_attn_r128_core = n_layers_r128 * n_head * v_head_dim / 128
 
             # ---- Main compressor (ratio > 0 layers) ----
             # Two projections per layer (wkv + wgate): hidden -> coff * v_head_dim.
-            #   ratio == 4:   coff = 2 (overlapping windows)
-            #   ratio == 128: coff = 1 (non-overlapping)
+            # ratio == 4: coff = 2 (overlapping windows)
+            # ratio == 128: coff = 1 (non-overlapping)
             main_compressor_term = (
                 n_layers_r4 * args.hidden_size * (2 * v_head_dim) * 2
                 + n_layers_r128 * args.hidden_size * (1 * v_head_dim) * 2
             )
 
             # ---- r=4 layers: sparse attention + indexer ----
-            # Indexer parameters are only required when at least one ratio==4 layer exists.
             if n_layers_r4 > 0:
-                assert args.dsa_indexer_n_heads is not None, (
-                    "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
-                )
-                assert args.dsa_indexer_head_dim is not None, (
-                    "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
-                )
-                assert args.dsa_indexer_topk is not None, (
-                    "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
-                )
+                assert (
+                    args.dsa_indexer_n_heads is not None
+                ), "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
+                assert (
+                    args.dsa_indexer_head_dim is not None
+                ), "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
+                assert (
+                    args.dsa_indexer_topk is not None
+                ), "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
                 idx_n_heads = args.dsa_indexer_n_heads
                 idx_head_dim = args.dsa_indexer_head_dim
                 idx_topk = args.dsa_indexer_topk
@@ -779,39 +908,55 @@ def num_floating_point_operations(args, batch_size):
                 avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_len))
                 sparse_attn_r4 = n_layers_r4 * n_head * (window + avg_comp_4) * v_head_dim * 2
 
-                # Indexer's own compressor (coff=2, wkv + wgate), Q proj, weights proj,
-                # and scoring each query against the seq_len // 4 compressed positions.
-                indexer_term = (
+                # Indexer token-linear: compressor (coff=2, wkv + wgate), Q proj,
+                # weights proj.
+                indexer_token_term = (
                     n_layers_r4 * args.hidden_size * (2 * idx_head_dim) * 2
                     + n_layers_r4 * args.q_lora_rank * idx_n_heads * idx_head_dim
                     + n_layers_r4 * args.hidden_size * idx_n_heads
-                    + n_layers_r4 * idx_n_heads * idx_head_dim * (seq_len // 4)
                 )
+                # Indexer L^2: scoring each query against ~L/4 compressed positions.
+                indexer_scoring_core = n_layers_r4 * idx_n_heads * idx_head_dim / 4
             else:
                 sparse_attn_r4 = 0
-                indexer_term = 0
+                indexer_token_term = 0
+                indexer_scoring_core = 0
 
-            sparse_attn_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128
+            sparse_attn_token_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128_window
 
             dsv4_hybrid_extra_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * (sparse_attn_term + main_compressor_term + indexer_term)
+                * (sparse_attn_token_term + main_compressor_term + indexer_token_term)
+            )
+            dsv4_hybrid_extra_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (sparse_attn_r128_core + indexer_scoring_core)
             )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+        # Token-linear self-attention work (projections + linear-attention variants).
+        # Linear attention has no L^2 term, so it stays entirely token-linear.
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
         )
+        # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
+        # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
+        self_attn_core_term = (
+            standard_self_attn_core_term * num_standard_attention_layers
+            + dsv4_hybrid_extra_core_term
+        )
 
+        # Token-linear FLOPs scale with the real (unpadded) token count.
+        # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
-            batch_size
-            * args.seq_length
+            total_real_tokens_in_batch
             * (
                 # MLP
                 forward_backward_expansion_factor
@@ -839,7 +984,7 @@ def num_floating_point_operations(args, batch_size):
                     # Shared Experts.
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor) * num_moe_layers
                 )
-                # Self Attention
+                # Self Attention (token-linear part).
                 + self_attn_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
@@ -858,6 +1003,11 @@ def num_floating_point_operations(args, batch_size):
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
+            # Self Attention (core L^2 part). For BSHD the default
+            # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
+            # original ``batch * seq^2 * Q_proj`` term; for THD this uses the actual
+            # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
+            + seqlen_squared_sum_in_batch * self_attn_core_term
         )
         return total_floating_point_operations
 
@@ -882,8 +1032,8 @@ def num_floating_point_operations(args, batch_size):
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
-            batch_size=batch_size,
-            seq_len=args.seq_length,
+            total_tokens=total_real_tokens_in_batch,
+            seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -1121,7 +1271,7 @@ def pretrain(
         set_ideal_affinity_for_current_gpu()
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log("Starting job")
+        append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -1270,7 +1420,7 @@ def pretrain(
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
         ):
-            from megatron.rl.parallel_utils import build_inference_pg_collection
+            from megatron.core.inference.shards import build_inference_pg_collection
 
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
@@ -1403,6 +1553,30 @@ def pretrain(
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+
+    # Initialize RL profiler if enabled
+    if args.rl_profile:
+        # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
+        profile_dir = getattr(args, 'rl_profile_dir', None)
+        if profile_dir is None:
+            if args.save:
+                profile_dir = os.path.join(args.save, 'profiles')
+            else:
+                profile_dir = './profiles'
+
+        # Generate run ID from job name or timestamp
+        run_id = os.getenv("SLURM_JOB_ID", None)
+        if run_id is None:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        initialize_rl_profiler(
+            output_dir=profile_dir,
+            run_id=run_id,
+            enabled=True,
+            log_to_wandb=(wandb_writer is not None),
+            log_to_tensorboard=(get_tensorboard_writer() is not None),
+        )
+        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
     if not cfg_container.validation.skip_train or args.perform_rl_step:
         if cfg_container.validation.skip_train:
@@ -1547,6 +1721,146 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
+    """Resolve the absolute DDP grad-bucket size.
+
+    With ``num_buckets`` set: ``num_parameters // num_buckets``; else if no explicit
+    ``bucket_size``: ``max(40_000_000, 1_000_000 * dp_cp_size)``; if ``overlap_grad_reduce``
+    is False: ``None`` (overrides the above).
+    """
+    if ddp_config.num_buckets is not None:
+        bucket_size = num_parameters // ddp_config.num_buckets
+    elif ddp_config.bucket_size is None:
+        bucket_size = max(40000000, 1000000 * get_pg_size(dp_cp_group))
+    else:
+        bucket_size = ddp_config.bucket_size
+    if not overlap_grad_reduce:
+        bucket_size = None
+    return bucket_size
+
+
+def wrap_model_chunks_with_ddp(
+    model_chunks,
+    config,
+    ddp_config,
+    *,
+    use_layer_wise_distributed_optimizer=False,
+    use_layer_wise_param_layout=True,
+    DP=DDP,
+    pg_collection=None,
+    bucket_sizes=None,
+    disable_bucketing_per_chunk=None,
+):
+    """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
+
+    Centralises the DDP-wrapping wiring shared between :func:`get_model` and
+    unit tests.
+
+    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
+    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
+    for reduce-scatter), and computes per-chunk shard-aligned layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
+    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
+    to its legacy ``allgather_params`` sync path.
+
+    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
+    computes per-chunk byte-level layouts via
+    :meth:`DistributedOptimizer.compute_full_param_layout`.
+
+    Otherwise: no layouts are computed.
+
+    Layouts are only computed when ``DP is DDP`` (i.e. the standard
+    ``DistributedDataParallel``); FSDP variants don't accept
+    ``full_param_layout``.
+
+    Args:
+        model_chunks: List of model chunks to wrap (un-DDP-wrapped).
+        config: :class:`TransformerConfig`.
+        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
+            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+        use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+            controls whether to compute and supply a shard-aligned param layout
+            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+        DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
+            variant).
+        pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
+            forwarded to both standard DDP and FSDP variants, and used to source
+            DP world sizes for layout computation.
+        bucket_sizes: Optional per-chunk bucket size override; defaults to
+            ``[ddp_config.bucket_size] * len(model_chunks)``.
+        disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
+            defaults to ``[False] * len(model_chunks)``.
+
+    Returns:
+        List of DDP-wrapped chunks.
+    """
+    n = len(model_chunks)
+    if bucket_sizes is None:
+        bucket_sizes = [ddp_config.bucket_size] * n
+    if disable_bucketing_per_chunk is None:
+        disable_bucketing_per_chunk = [False] * n
+
+    # Compute per-chunk layouts (DDP only).
+    per_chunk_layouts = [None] * n
+    if DP is DDP:
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+            ddp_config.use_distributed_optimizer = True
+            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
+            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
+            # everything else (embeddings, biases, layernorm) to a separate
+            # DistOpt-style buffer.
+            tag_params_for_buffer_routing(model_chunks)
+        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+        else:
+            compute_layout = None
+        if compute_layout is not None:
+            layout_pgs = (
+                pg_collection
+                if pg_collection is not None
+                else ProcessGroupCollection.use_mpu_process_groups()
+            )
+            assert layout_pgs.dp_cp is not None, (
+                "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
+                "the distributed-optimizer parameter layout"
+            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
+                all_params = [p for p in chunk.parameters() if p.requires_grad]
+                per_chunk_layouts[i] = compute_layout(
+                    all_params,
+                    bucket_size,
+                    data_parallel_world_size,
+                    ddp_config,
+                    expert_data_parallel_world_size=expert_data_parallel_world_size,
+                )
+
+    # Wrap each chunk.
+    wrapped = []
+    for chunk, layout, disable_bucketing in zip(
+        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+    ):
+        chunk_kwargs = {}
+        # TorchFSDP takes process_group, not pg_collection.
+        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+            chunk_kwargs["pg_collection"] = pg_collection
+        if layout is not None:
+            chunk_kwargs["full_param_layout"] = layout
+        wrapped.append(
+            DP(
+                config=config,
+                ddp_config=ddp_config,
+                module=chunk,
+                disable_bucketing=disable_bucketing,
+                **chunk_kwargs,
+            )
+        )
+    return wrapped
+
+
 def get_model(
     model_provider_func,
     model_type=ModelType.encoder_or_decoder,
@@ -1635,6 +1949,15 @@ def get_model(
     if not isinstance(model, list):
         model = [model]
 
+    # For rare operations like post-training logits saving
+    if args.freeze_all_layers:
+        for model_module in model:
+            model_module.requires_grad_(False)
+            # Additionally freeze expert biases of routers
+            for module in model_module.modules():
+                if hasattr(module, "frozen_expert_bias"):
+                    module.frozen_expert_bias = True
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
@@ -1696,37 +2019,25 @@ def get_model(
 
         config = get_model_config(model[0])
 
-        if getattr(args, "use_torch_fsdp2", False):
-            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-            ddp_config = TorchFullyShardedDataParallelConfig(
-                reshard_after_forward=reshard_after_forward
-            )
-        else:
-            if args.ddp_num_buckets is not None:
-                assert (
-                    args.ddp_bucket_size is None
-                ), "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                assert args.ddp_num_buckets > 0, "--ddp-num-buckets must be greater than 0"
-                bucket_size = num_parameters // args.ddp_num_buckets
-            else:
-                bucket_size = args.ddp_bucket_size
-
-            # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args)
-            ddp_config.bucket_size = bucket_size
-
+        ddp_config = get_megatron_ddp_config(args)
+        if not getattr(args, "use_torch_fsdp2", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-            # If bucket_size is not provided as an input, use sane default.
-            # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-            # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-            # latency-bound.
-            if ddp_config.bucket_size is None:
-                ddp_config.bucket_size = max(
-                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-                )
-            # Set bucket_size to infinity if overlap_grad_reduce is False.
-            if not ddp_config.overlap_grad_reduce:
-                ddp_config.bucket_size = None
+            ddp_config.bucket_size = resolve_ddp_bucket_size(
+                ddp_config, pg_collection.dp_cp, ddp_config.overlap_grad_reduce, num_parameters
+            )
+
+        # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
+        # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
+        # is on, or for non-zero pipeline-parallel ranks.
+        pp_rank = get_pg_rank(pg_collection.pp)
+        per_chunk_disable_bucketing = [
+            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            for chunk_idx in range(len(model))
+        ]
+        per_chunk_bucket_sizes = [
+            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            for disable in per_chunk_disable_bucketing
+        ]
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
@@ -1735,48 +2046,19 @@ def get_model(
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
-            dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                dp_init_kwargs["pg_collection"] = pg_collection
-
-            wrapped_model = []
-            for model_chunk_idx, model_chunk in enumerate(model):
-                chunk_kwargs = dict(dp_init_kwargs)
-                disable_bucketing = (
-                    model_chunk_idx > 0
-                ) or args.overlap_param_gather_with_optimizer_step
-
-                # Pre-compute parameter layouts for the distributed optimizer.
-                # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
-                    all_params = [p for p in model_chunk.parameters() if p.requires_grad]
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
-                    effective_bucket_size = (
-                        None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
-                    )
-                    chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
-                            all_params,
-                            effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
-                            ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
-                        )
-                    )
-
-                wrapped_model.append(
-                    DP(
-                        config=config,
-                        ddp_config=ddp_config,
-                        module=model_chunk,
-                        disable_bucketing=disable_bucketing,
-                        **chunk_kwargs,
-                    )
-                )
-            model = wrapped_model
+            model = wrap_model_chunks_with_ddp(
+                model,
+                config,
+                ddp_config,
+                use_layer_wise_distributed_optimizer=getattr(
+                    args, 'use_layer_wise_distributed_optimizer', False
+                ),
+                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                DP=DP,
+                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                bucket_sizes=per_chunk_bucket_sizes,
+                disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+            )
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -1864,29 +2146,49 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
-    kwargs = {}
-    for f in dataclasses.fields(DistributedDataParallelConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-    kwargs["check_for_large_grads"] = args.check_for_large_grads
-    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-    kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
-    kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
-        args.ddp_param_name_patterns_for_fp32_local_accumulation
-    )
-    kwargs["average_in_collective"] = args.ddp_average_in_collective
-    # Megatron-FSDP arguments.
-    kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-    kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-    kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-    kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+    else:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+        kwargs["check_for_large_grads"] = args.check_for_large_grads
+        kwargs["num_buckets"] = args.ddp_num_buckets
+        kwargs["bucket_size"] = args.ddp_bucket_size
+        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs["reduce_scatter_with_fp32_accumulation"] = (
+            args.ddp_reduce_scatter_with_fp32_accumulation
+        )
+        kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
+            args.ddp_param_name_patterns_for_fp32_local_accumulation
+        )
+        kwargs["average_in_collective"] = args.ddp_average_in_collective
+        # Megatron-FSDP arguments.
+        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
+            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
+            # operations (such as pointer dereferencing) that can break CUDA graph replay.
+            kwargs["megatron_fsdp_cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "full_iteration":
+                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
+                # during start_param_sync(), which is called during the DistOpt.step(). This
+                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
+                # the scope of the full-iter / FWD-BWD CUDA graph capture.
+                kwargs["fsdp_all_gather_in_start_param_sync"] = False
 
-    return DistributedDataParallelConfig(**kwargs)
+        return DistributedDataParallelConfig(**kwargs)
 
 
-def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_context=None):
+def setup_model_and_optimizer(
+    model_provider_func, model_type, checkpointing_context=None, pg_collection=None
+):
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
@@ -1898,8 +2200,28 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+    model = get_model(
+        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
+    )
     unwrapped_model = unwrap_model(model)
+
+    if args.logits_save_dir is not None:
+        from megatron.training.distillation import LogitsSaverHooks
+
+        logits_saver = LogitsSaverHooks(
+            save_dir=args.logits_save_dir,
+            k=args.logits_save_top_k,
+            p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
+            save_dtype=args.logits_save_dtype,
+        )
+        logits_saver.attach_hooks(unwrapped_model[-1])
+
+    if args.logits_load_dir is not None:
+        from megatron.training.distillation import StudentLogitsCapture
+
+        student_logits_capture = StudentLogitsCapture()
+        student_logits_capture.attach_hooks(unwrapped_model[-1])
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()}
@@ -2065,13 +2387,60 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
 
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
+    args = get_args()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    is_sft = getattr(args, 'sft', False)
+    is_hybrid_cp = args.dynamic_context_parallel
+
+    BATCH_KEYS = [
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "attention_mask",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "max_seqlen",
+        "local_cp_size",
+        "hybrid_cp_group",
+    ]
+
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         for _ in range(num_microbatches):
             # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-            batch = get_batch_on_this_tp_rank(data_iterator)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = {}
+            if tp_rank == 0:
+                batch = next(data_iterator)
+                for key in BATCH_KEYS:
+                    batch[key] = (
+                        batch[key].cuda(non_blocking=True)
+                        if key in batch and batch[key] is not None
+                        else None
+                    )
+            batch = get_batch_on_this_tp_rank(
+                batch,
+                broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+                broadcast_group=mpu.get_tensor_model_parallel_group(),
+                is_sft=is_sft,
+                is_hybrid_cp=is_hybrid_cp,
+                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+                cp_size=args.context_parallel_size,
+                tp_rank=tp_rank,
+                micro_batch_size=args.micro_batch_size,
+                seq_length=args.seq_length,
+                mtp_on_this_rank=False,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+                is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+            )
+            batch = get_batch_on_this_cp_rank(
+                batch,
+                is_hybrid_cp=is_hybrid_cp,
+                cp_group=get_context_parallel_group(),
+                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+            )
 
 
 def train_step(
@@ -2083,10 +2452,22 @@ def train_step(
     config,
     forward_backward_func,
     iteration=None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
 ):
-    """Single training step."""
+    """Single training step.
+
+    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
+        otherwise it must define mp, pp, and dp_cp.
+    p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
+        preserves the default behavior.
+    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
+        cross-grid case; None preserves the default behavior.
+    """
     args = get_args()
     timers = get_timers()
+    num_microbatches = get_num_microbatches()
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (
@@ -2148,27 +2529,6 @@ def train_step(
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
-        if config.sequence_packing_scheduler is not None:
-            # This wrapper is designed to support DP-balanced THD and dynamic-CP.
-            # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
-            # The wrapper is responsible for:
-            # 1. scheduling the sequences across ranks
-            # 2. packing them into THD format
-            # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
-            # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
-            # 5. returning the packed data iterator and the FLOPs parameters
-            (
-                data_iterator,
-                num_microbatches,
-                seqlen_sum_this_global_batch,
-                seqlen_squared_sum_this_global_batch,
-            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
-        else:
-            # data_iterator unchanged
-            num_microbatches = get_num_microbatches()
-            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
-            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
-
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2176,6 +2536,21 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if getattr(config, 'sequence_packing_scheduler', None) is not None:
+            # Dynamic-CP / sequence packing (dev feature): produce the per-step packed
+            # iterator and recompute num_microbatches. wrap_data_iterator returns a
+            # RerunDataIterator-compatible iterator so the rerun-state-machine validation
+            # in should_run_forward_backward() above continues to hold.
+            (
+                data_iterator,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+        else:
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2187,6 +2562,8 @@ def train_step(
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
+            p2p_communicator=p2p_communicator,
+            pg_collection=schedule_pg_collection,
         )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
@@ -2222,7 +2599,19 @@ def train_step(
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2250,14 +2639,25 @@ def train_step(
     if save_params_in_this_iteration:
         _save_state_dict(attr_name="data", label="params")
 
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    for _required in ("mp", "pp", "dp_cp"):
+        assert (
+            getattr(pg_collection, _required, None) is not None
+        ), f"pg_collection passed to train_step must define {_required}"
+    mp_group = pg_collection.mp
+    dp_cp_group = pg_collection.dp_cp
+    is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
+    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
     if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+            num_zeros_in_grad, group=mp_group
+        )
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2276,19 +2676,16 @@ def train_step(
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if is_last_stage:
         # Average loss across microbatches.
         loss_reduced = {}
-
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
                 # there is one dict per microbatch. in new reporting, we average
                 # over the total number of tokens across the global batch.
                 val = torch.vstack(val).sum(dim=0)
-                torch.distributed.all_reduce(
-                    val, group=mpu.get_data_parallel_group(with_context_parallel=True)
-                )
+                torch.distributed.all_reduce(val, group=dp_cp_group)
                 loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
@@ -2305,6 +2702,9 @@ def train_step(
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
     return (
         {},
@@ -2315,6 +2715,9 @@ def train_step(
         grad_norm,
         num_zeros_in_grad,
         log_max_attention_logit,
+        num_microbatches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
     )
 
 
@@ -2332,6 +2735,9 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    seqlen_squared_sum_in_batch: float | None = None,
+    total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2407,7 +2813,7 @@ def training_log(
             ]
         )
     # Add timers from RL loop if needed.
-    if getattr(args, 'perform_rl_step', False):
+    if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size.
@@ -2420,6 +2826,8 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    if learning_rate is None and args.freeze_all_layers:
+        learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2503,10 +2911,10 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-
     # Log MoE metrics.
+    moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2529,12 +2937,11 @@ def training_log(
         else:
             layers = args.num_layers
 
-        track_moe_metrics(
+        moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -2542,11 +2949,15 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        # MTP tracker stores raw loss sums and token counts, so after reduction
+        # tracker["values"] already equals the per-token loss (loss_sum / num_tokens)
+        # aggregated across all ranks and microbatches. No further scaling needed.
+        mtp_loss_scale = 1.0
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -2578,9 +2989,12 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
-            elapsed_time_per_iteration * 10**12 * args.world_size
-        )
+        throughput = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2633,6 +3047,8 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        if args.num_experts is not None and moe_log_string:
+            log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -2674,6 +3090,19 @@ def training_log(
             and not reported_memory_in_this_iteration
         ):
             report_memory(f'(after {iteration} iterations)')
+        # Log RL profiling data if enabled (must be before timers.log which resets timers).
+        # Token throughput metrics are read from RLRuntimeState automatically.
+        if args.rl_profile:
+            log_iteration_profile(
+                iteration=iteration,
+                timers=timers,
+                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
+                throughput_tflops=throughput if args.log_throughput else None,
+                global_batch_size=batch_size,
+                wandb_writer=wandb_writer,
+                tb_writer=writer,
+            )
+
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(
@@ -2713,11 +3142,12 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
+        args.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
         f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
-        f"Tokens (in billions): {tokens_so_far / 10**9:.2f}"
+        f"Tokens (in billions): {tokens_so_far / 10**9:.2f}",
     )
 
 
@@ -3038,8 +3468,16 @@ def train(
     checkpointing_context,
     non_loss_data_func,
     inference_model=None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
 ):
-    """Training function: run train_step desired number of times, run validation, checkpoint."""
+    """Training function: run train_step desired number of times, run validation, checkpoint.
+
+    p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
+        preserves the default behavior.
+    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
+        cross-grid case; None preserves the default behavior.
+    """
     args = get_args()
     timers = get_timers()
     fault_injector_kwargs = {}
@@ -3257,11 +3695,21 @@ def train(
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config, copy_main_params, model, optimizer, forward_backward_func
         )
     if args.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
-            optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+            optimizer.step,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
 
     def get_e2e_base_metrics():
@@ -3348,6 +3796,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
     # Run training iterations till done.
@@ -3391,9 +3840,9 @@ def train(
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
-        # as it intentionally reconfigures microbatches
+        # as it intentionally reconfigures microbatches.
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -3481,6 +3930,9 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = None
+            seqlen_squared_sum_this_global_batch = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -3492,6 +3944,9 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = train_step(
                 forward_step_func,
                 train_data_iterator,
@@ -3501,6 +3956,9 @@ def train(
                 config,
                 forward_backward_func,
                 iteration=iteration,
+                pg_collection=model_pg_collection,
+                p2p_communicator=p2p_communicator,
+                schedule_pg_collection=schedule_pg_collection,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -3597,7 +4055,29 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
+            # Scheduler-based packing does not feed the packed-sequence accumulator.
+            # The scheduler already computed these from the real per-sample lengths
+            # before CP padding/rerouting, so use them directly here.
+            assert seqlen_sum_this_global_batch is not None
+            assert seqlen_squared_sum_this_global_batch is not None
+            total_real_tokens_in_batch = seqlen_sum_this_global_batch
+            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
+        else:
+            # Drain the per-iteration packed-sequence stats so the FLOPs computation
+            # reflects THD per-chunk causal attention AND excludes padding tokens
+            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+            # runs (no collective issued), letting ``num_floating_point_operations``
+            # fall back to its closed-form defaults.
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+                consume_seqlen_stats_in_iteration()
+            )
+        num_floating_point_operations_in_batch = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+        )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
@@ -3628,6 +4108,9 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            num_microbatches=num_microbatches,
         )
         is_first_iteration = False
 
@@ -3709,7 +4192,7 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
-                clear_aux_losses_tracker()
+                get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -3768,8 +4251,24 @@ def train(
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
+    # Shutdown RL profiler and export summary
+    if args.rl_profile:
+        shutdown_rl_profiler()
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
+        # Deregister NCCL user-buffer memory pools before exit.
+        # Without this, ProcessGroupNCCL's destructor calls abort() which uses
+        # ncclCommDeregister on handles created by ncclCommWindowRegister,
+        # causing "NCCL WARN Deregister: Could not find handle" and a crash.
+        torch.distributed.barrier()
+        for model_module in model:
+            if isinstance(model_module, DDP):
+                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                        nccl_allocator.deregister_mem_pool(
+                            buf.nccl_mem_pool, buf.data_parallel_group
+                        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -3816,7 +4315,15 @@ def evaluate(
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config, copy_main_params, model, None, forward_backward_func
         )
 
     if has_nvidia_modelopt:
@@ -4348,6 +4855,46 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp
         and has_optimizer
-        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+        and (
+            args.use_distributed_optimizer
+            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        )
         and args.overlap_param_gather
     )
+
+
+def _get_thd_sequence_length_upper_bound(args):
+    """Return the padded per-sample THD length upper bound used for graph sizing."""
+    max_sequence_length = getattr(args, "seq_length", None)
+    mock_config_spec = None
+    if getattr(args, "use_varlen_dataset", False):
+        mock_config_spec = getattr(args, "varlen_mock_dataset_config_json", None)
+    elif getattr(args, "sft", False):
+        mock_config_spec = getattr(args, "sft_mock_dataset_config_json", None)
+
+    if mock_config_spec is not None:
+        from megatron.training.datasets.utils import load_json_arg
+
+        mock_config = load_json_arg(mock_config_spec)
+        if isinstance(mock_config, dict) and mock_config.get("max_seq_len") is not None:
+            max_sequence_length = int(mock_config["max_seq_len"])
+
+    if max_sequence_length is None:
+        return None
+
+    if getattr(args, "seq_length", None) is not None:
+        max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
+
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    pad_granularity = cp_pad * sp_pad
+    return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)

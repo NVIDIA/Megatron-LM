@@ -14,6 +14,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
@@ -71,8 +72,13 @@ class MambaLayer(GraphableMegatronModule):
         layer_number: int = 1,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        name: str | None = None,
     ):
-        """Initialize Mamba Layer."""
+        """Initialize Mamba Layer.
+
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
 
@@ -87,6 +93,7 @@ class MambaLayer(GraphableMegatronModule):
             layer_number=layer_number,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=(name + f".mixer") if name is not None else None,
         )
         self.norm = submodules.norm(self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
@@ -203,7 +210,7 @@ class MambaLayer(GraphableMegatronModule):
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
-        elif not self.training and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None

@@ -17,6 +17,7 @@ spec:
   test_case:
   scope:
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -40,6 +41,7 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
+    set -euo pipefail
     ls
     cd /opt/megatron-lm
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')

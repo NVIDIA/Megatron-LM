@@ -9,12 +9,73 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    DefaultDynamicCPScheduler,
+    _build_thd_padding_mask,
+    _get_scheduler_max_real_num_seqs,
+    _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
+    config = SimpleNamespace(
+        thd_max_packed_sequences=32,
+        pad_packed_seq_alignment="max",
+        pad_packed_seq_by_appending_dummy_seq=True,
+    )
+
+    assert _get_scheduler_max_real_num_seqs(config) == 31
+
+    config.pad_packed_seq_by_appending_dummy_seq = False
+    assert _get_scheduler_max_real_num_seqs(config) == 32
+
+    config.pad_packed_seq_alignment = None
+    config.pad_packed_seq_by_appending_dummy_seq = True
+    assert _get_scheduler_max_real_num_seqs(config) == 32
+
+
+def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
+    config = SimpleNamespace(
+        thd_max_packed_sequences=1,
+        pad_packed_seq_alignment="max",
+        pad_packed_seq_by_appending_dummy_seq=True,
+    )
+
+    with pytest.raises(ValueError, match="includes that dummy sequence"):
+        _get_scheduler_max_real_num_seqs(config)
+
+
+def test_scheduler_thd_padding_mask_from_cu_seqlens():
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+
+    padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
+
+    assert torch.equal(
+        padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
+    )
+
+
+def test_scheduler_sanitizes_thd_padding_values():
+    padding_mask = torch.tensor([False, False, True, False, True])
+    batch = {
+        'tokens': torch.tensor([11, 12, -1, 21, -1], dtype=torch.int64),
+        'labels': torch.tensor([12, 13, -1, 22, -1], dtype=torch.int64),
+        'loss_mask': torch.ones(5, dtype=torch.float32),
+        'position_ids': torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64),
+    }
+
+    _sanitize_thd_padding_values(batch, padding_mask)
+
+    assert torch.equal(batch['tokens'], torch.tensor([11, 12, 0, 21, 0]))
+    assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
+    assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
+    assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
 class MockVariableLengthSequencePackingDataIterator:
@@ -108,6 +169,41 @@ class MockVariableLengthSequencePackingDataIterator:
             )
 
         return batch
+
+
+def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[6144, 2048], [6144, 2048]]
+    assert sample_ids == [[0, 1], [0, 1]]
+    assert exec_times[0] == exec_times[1]
+
+
+def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[50, 50] for _ in range(14)]
+    assert sample_ids == [[0, 1] for _ in range(14)]
+    assert exec_times == [exec_times[0] for _ in range(14)]
+
+
+def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping_by_default():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=2,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+    )
+
+    sample_id_groups = scheduler.get_groups_and_subsamples([(0, 6144), (1, 2048)])
+
+    assert sample_id_groups == [[[0, 1], [0, 1]]]
 
 
 def _gather_tensor_from_tp_group(tensor):
@@ -210,8 +306,14 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             dynamic_cp=dynamic_cp,
         )
 
-        # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        # The helper returns a 7-tuple; scheduler THD always provides padding_mask.
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
+            result
+        )
+        assert padding_mask is not None
+        assert padding_mask.dtype == torch.bool
+        assert padding_mask.dim() == 2
+        assert not padding_mask.any(), "Mock data has no per-sequence padding."
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -288,7 +390,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         # TEST 3: Verify TP ranks receive identical data after broadcast
         # =====================================================================
         if tp > 1:
-            test_tensors = []
+            test_tensors = [padding_mask]
             if is_first_stage:
                 test_tensors.extend([tokens, position_ids])
             if is_last_stage:
@@ -319,6 +421,11 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
                 assert (
                     actual_seq_len == expected_seq_len
                 ), f"CP partitioned labels have wrong shape: {actual_seq_len} != {expected_seq_len}"
+
+            actual_seq_len = padding_mask.shape[1]
+            assert (
+                actual_seq_len == expected_seq_len
+            ), f"CP partitioned padding_mask has wrong shape: {actual_seq_len} != {expected_seq_len}"
 
     finally:
         Utils.destroy_model_parallel()
@@ -396,6 +503,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     config.microbatch_group_size_per_vp_stage = pp
     config.virtual_pipeline_model_parallel_size = vpp
     config.sequence_packing_scheduler = scheduler_type
+    # wrap_data_iterator -> mtp_on_this_rank reads these two config fields.
+    # A real TransformerConfig defaults both to None when MTP is unused, so
+    # mirror that here (this test does not exercise MTP).
+    config.pipeline_model_parallel_layout = None
+    config.mtp_num_layers = None
     if is_dynamic_cp:
         config.min_dynamic_context_parallel_size = 1
 
@@ -412,7 +524,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
 
     num_micro_batches_old = global_batch_size // micro_batch_size // dp_size
 
-    if is_tp_first and (is_pp_first or is_pp_last):
+    # In packed-sequence mode is_dataset_built_on_rank returns True for every
+    # PP stage on TP rank 0 (not just first/last), so all PP stages — including
+    # middle ones — own a data_iterator and run the scheduler. Middle stages
+    # later strip their samples down to metadata only.
+    if is_tp_first:
         # Seed torch RNG so CP siblings produce identical token values
         torch.manual_seed(42 + dp_rank)
         torch.cuda.manual_seed(42 + dp_rank)
@@ -431,7 +547,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             elif is_pp_last:
                 data_iterator = [None for _ in range(vpp - 1)] + [data_iterator]
             else:
-                data_iterator = [None for _ in range(vpp)]
+                # Middle PP stage: no VPP sub-stage needs full data, but the
+                # scheduler still needs an iterator (slot 0) to derive the
+                # microbatch count and per-stage metadata.
+                data_iterator = [data_iterator] + [None for _ in range(vpp - 1)]
     try:
         # Call the function under test
         (
@@ -465,6 +584,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             batch_keys = ["cu_seqlens", "max_seqlen", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 batch_keys.append("local_cp_size")
+            # Per-stage data field stripping (see data_schedule.py): the first PP
+            # stage keeps tokens/position_ids, the last PP stage keeps labels/
+            # loss_mask. When pp==1 a single stage is both first and last, so it
+            # keeps all four. Middle stages carry metadata only.
+            stage_data_keys = []
+            if is_pp_first:
+                stage_data_keys += ["tokens", "position_ids"]
+            if is_pp_last:
+                stage_data_keys += ["labels", "loss_mask"]
+
             if vpp is not None and vpp > 1:
                 # check metadata for all stages (save batches to avoid re-consuming iterators)
                 all_stage_batches = []
@@ -476,30 +605,34 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # check for first or last stage on first or last pp rank
                 if is_pp_first_or_last:
                     batch_all = all_stage_batches[0] if is_pp_first else all_stage_batches[-1]
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                    _check_batch(batch_all, batch_keys)
+                    _check_batch(batch_all, batch_keys + stage_data_keys)
             else:
                 # non-VPP: single iterator
                 batch_all = [next(new_data_iterator) for _ in range(num_micro_batches)]
-                if is_pp_first_or_last:
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                _check_batch(batch_all, batch_keys)
+                _check_batch(batch_all, batch_keys + stage_data_keys)
 
-            # CHECK TOKEN SUM ON FIRST OR LAST PP RANK
+            # CHECK TOKEN SUM ON FIRST PP RANK
             # Note: data_iterator is consumed by wrap_data_iterator, new_data_iterator is consumed above.
             # Use `samples` for before-wrap, reuse `batch_all` from the check above for after-wrap.
             # Skip for VPP: microbatch alignment may pad/duplicate samples,
             # changing the total token count.
-            if is_pp_first_or_last and (vpp is None or vpp <= 1):
+            # Only the first PP stage is checked: with per-stage data stripping the
+            # last PP stage (when pp>1) keeps labels/loss_mask and no longer carries
+            # 'tokens'. The dp/dp_cp all-reduce groups are disjoint per PP rank, so
+            # running this on the first PP stage alone is collective-safe.
+            if is_pp_first and (vpp is None or vpp <= 1):
                 dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                 cp_size = parallel_state.get_context_parallel_world_size()
-                cp_group = parallel_state.get_context_parallel_group()
 
                 # Count each sequence exactly once using int64 for bitwise comparison.
                 # THD (dp_balanced): CP siblings hold identical packed data,
                 #   so reduce across DP only (not CP) on both sides.
-                # DCP: data is redistributed uniquely across dp_cp ranks,
-                #   so per-microbatch CP all_reduce + scale, then dp_cp all_reduce.
+                # DCP: wrap_data_iterator returns packed samples before
+                #   get_batch_on_this_rank_for_sequence_packing applies CP
+                #   slicing, so local CP siblings still hold identical packed
+                #   tokens here. Scale each rank by max_cp / local_cp, then
+                #   reduce across DPxCP. A local-CP all-reduce here would
+                #   overcount the pre-slice tokens.
                 # Both sides multiply by max_cp so DCP (with varying local_cp)
                 # can be normalized to the same integer scale without division.
                 max_cp = cp_size
@@ -518,21 +651,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # After wrap.
                 token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
                 if is_dynamic_cp:
-                    # DCP: per-microbatch CP all_reduce + scale to max_cp,
-                    # then dp_cp all_reduce to aggregate unique contributions.
                     for batch in batch_all:
                         mb_sum = batch['tokens'].long().sum().clone()
                         local_cp = batch['local_cp_size']
                         if isinstance(local_cp, torch.Tensor):
                             local_cp = local_cp.item()
-                        mb_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
-                            group_size=local_cp
-                        )
-                        torch.distributed.all_reduce(
-                            mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
-                        )
-                        # all_reduce result = mb_sum * local_cp.
-                        # Scale to mb_sum * max_cp.
                         mb_sum *= max_cp // local_cp
                         token_sum_after += mb_sum
                     torch.distributed.all_reduce(

@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_OPT_PARAM_SCHEDULER_OVERRIDE_KEYS = ('max_lr', 'min_lr', 'start_wd', 'end_wd')
+
 
 class ParamGroupOverride(TypedDict, total=False):
     """Override values for a parameter group. These values may be optimizer-state/scheduler related.
@@ -143,6 +145,14 @@ class OptimizerParamScheduler:
 
         # Class values.
         self.optimizer = optimizer
+        self._param_group_scheduler_overrides = [
+            {
+                key: param_group[key]
+                for key in _OPT_PARAM_SCHEDULER_OVERRIDE_KEYS
+                if key in param_group
+            }
+            for param_group in self.optimizer.param_groups
+        ]
 
         self.init_lr = init_lr
         self.max_lr = float(max_lr)
@@ -338,6 +348,32 @@ class OptimizerParamScheduler:
         log_single_rank(logger, logging.INFO, f" > using checkpoint value {sd_value} for {name}")
         return sd_value
 
+    def _restore_param_group_scheduler_overrides(self) -> None:
+        """Restore runtime scheduler fields after optimizer param groups are loaded.
+
+        Optimizer checkpoints may carry per-param-group scheduler fields such as
+        max_lr/min_lr/start_wd/end_wd. These fields take precedence over the scheduler's class
+        values in get_lr()/get_wd(), so override mode must restore the values created
+        from the current run's arguments before reapplying the schedule.
+        """
+        if not self.override_opt_param_scheduler:
+            return
+
+        if len(self.optimizer.param_groups) != len(self._param_group_scheduler_overrides):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                " > unable to restore optimizer param group scheduler overrides due to "
+                "param group count mismatch",
+            )
+            return
+
+        for param_group, scheduler_overrides in zip(
+            self.optimizer.param_groups, self._param_group_scheduler_overrides
+        ):
+            for key, value in scheduler_overrides.items():
+                param_group[key] = value
+
     def load_state_dict(self, state_dict: dict) -> None:
         """Load the state dict.
 
@@ -383,12 +419,6 @@ class OptimizerParamScheduler:
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
 
-        if 'num_iters' in state_dict:
-            num_steps = state_dict['num_iters']
-        else:
-            num_steps = state_dict['num_steps']
-        self.step(increment=num_steps)
-
         if 'start_wd' in state_dict:
             self.start_wd = self._check_and_set(
                 self.start_wd, state_dict['start_wd'], "start weight decay"
@@ -402,3 +432,10 @@ class OptimizerParamScheduler:
             self.wd_incr_style = self._check_and_set(
                 self.wd_incr_style, state_dict['wd_incr_style'], "weight decay incr style"
             )
+
+        if 'num_iters' in state_dict:
+            num_steps = state_dict['num_iters']
+        else:
+            num_steps = state_dict['num_steps']
+        self._restore_param_group_scheduler_overrides()
+        self.step(increment=num_steps)

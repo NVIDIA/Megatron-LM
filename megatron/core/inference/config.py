@@ -117,6 +117,22 @@ class KVCacheManagementMode(str, Enum):
     """Deallocate large tensors and recompute them from scratch during allocation."""
 
 
+class CudaGraphSizingDistribution(str, Enum):
+    """How CUDA graph token-count sizes are spaced when generating the captured graphs.
+
+    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
+    `log2(max_tokens)` total graphs.
+
+    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
+    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
+    Higher graph density at the top end.
+    """
+
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -188,18 +204,40 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs share that same bound by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
+    """
+
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
+        CudaGraphSizingDistribution.EXPONENTIAL
+    )
+    """
+    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
+    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    a bigger step size at the top end).
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
     """
     Whether to use CUDA graphs for non-decode steps.
+    """
+
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
+    `max_requests * (num_speculative_tokens + 1)`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
     """
 
     static_kv_memory_pointers: bool = False

@@ -1,18 +1,18 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 import torch
 
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.rerun_state_machine import RerunDataIterator
 
+_DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
 
-def get_cp_slice_for_thd(batch, cp_group):
+
+def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
     """Partition sequence data for context parallelism in THD format.
 
     Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
@@ -21,19 +21,24 @@ def get_cp_slice_for_thd(batch, cp_group):
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
+        keys: Sequence data keys to slice. Defaults to the original THD data tensors.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:
         return
     cp_rank = cp_group.rank()
-    total_tokens = batch['tokens'].size(0)
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
-    # cu_seqlens to get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
+    # Partition with padded cumulative lengths so CP slices match the THD
+    # sequence boundaries consumed by attention kernels.
     cu_seqlens = batch["cu_seqlens_padded"]
+    # Use cu_seqlens_padded[-1] for total_tokens instead of batch['tokens'].size(0):
+    # under VPP, the last PP stage has labels/loss_mask but no tokens, so
+    # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
+    total_tokens = int(cu_seqlens[-1].item())
     index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
-        if key in batch:
+    if keys is None:
+        keys = ('tokens', 'position_ids', 'labels', 'loss_mask')
+    for key in keys:
+        if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
 
 
@@ -43,11 +48,36 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     Since each sub-sample may be routed to different DPxCP ranks,
     we unpack the sample here to avoid unnecessarily transferring
     the entire packed sample.
+
+    Two input shapes are accepted:
+
+      * **Pre-packed** (e.g. :class:`SFTDataset`): each sample carries a
+        ``cu_seqlens`` tensor and the tokens of multiple sub-samples
+        concatenated together. We slice them apart and synthesize
+        ``original_seq_len`` / ``padded_seq_len`` from the cu_seqlens deltas.
+
+      * **Already unpacked** (e.g. :class:`VarlenDataset`): each sample is a
+        single sub-sample that already carries ``padded_seq_len`` (and
+        usually ``original_seq_len``). We just normalize the leading batch
+        dimension introduced by the default collate_fn and return as-is.
     """
+    # Short-circuit for datasets that already emit one sub-sample per index.
+    if batch and "padded_seq_len" in batch[0]:
+        for sample in batch:
+            for key in sample.keys():
+                if sample[key].ndim == 2 and sample[key].shape[0] == 1:
+                    # Drop the redundant batch dim added by collate_fn.
+                    sample[key] = sample[key].squeeze(0)
+            if "original_seq_len" not in sample:
+                sample["original_seq_len"] = sample["padded_seq_len"].clone()
+        return batch
+
     batch_unpacked = []
-    dev = batch[0]["tokens"].device
+    dev = batch[0]["cu_seqlens"].device
     original_seq_lens = []
     padded_seq_lens = []
+    # Determine which data fields exist in the batch
+    data_keys = [k for k in ["tokens", "labels", "loss_mask", "position_ids"] if k in batch[0]]
     for sample in batch:
         for key in sample.keys():
             if len(sample[key].shape) == 2:
@@ -63,7 +93,7 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
             end_idx = sample["cu_seqlens"][sub_sample + 1]
             if end_idx - start_idx == 0:
                 continue
-            for key in ["tokens", "labels", "loss_mask", "position_ids"]:
+            for key in data_keys:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
             # Since sft_dataset.py does not provide cu_seqlens_original,
             # we assume original_seq_len equals padded_seq_len here.
@@ -151,16 +181,10 @@ def _pack_sequences(
     def _pack_tensors(tensors):
         return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
-    tokens = _pack_tensors([sample["tokens"] for sample in samples])
-    labels = _pack_tensors([sample["labels"] for sample in samples])
-    loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
-    position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
-
     new_sample = {}
-    new_sample["tokens"] = tokens
-    new_sample["labels"] = labels
-    new_sample["loss_mask"] = loss_mask
-    new_sample["position_ids"] = position_ids
+    for key in ['tokens', 'labels', 'loss_mask', 'position_ids']:
+        if key in samples[0]:
+            new_sample[key] = _pack_tensors([sample[key] for sample in samples])
 
     padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
     cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)
@@ -189,103 +213,6 @@ def broadcast_tensor(item, src_rank, group) -> None:
     """Broadcast a tensor from src_rank to all ranks in the group."""
     if item is not None:
         torch.distributed.broadcast(item, src_rank, group=group)
-
-
-def broadcast_to_pp_group(
-    new_samples,
-    num_micro_batches,
-    seqlen_sum_this_global_batch,
-    seqlen_squared_sum_this_global_batch,
-    pp_group,
-    dev,
-    is_dynamic_cp: bool = False,
-):
-    """
-    Broadcast num_micro_batches, seqlen_sum_this_global_batch,
-    seqlen_squared_sum_this_global_batch and metadata to middle PP stages.
-    Before this broadcast, the new_samples on middle PP stages are None,
-    after this broadcast, the new_samples on middle PP stages contain the metadata but
-    without tokens, labels, loss_mask, position_ids.
-    """
-
-    pp_src_rank = torch.distributed.get_process_group_ranks(pp_group)[0]
-
-    if pp_group.size() > 2:
-        if pp_group.rank() == 0:
-            tensor_list = [
-                torch.tensor(
-                    [
-                        num_micro_batches,
-                        seqlen_sum_this_global_batch,
-                        seqlen_squared_sum_this_global_batch,
-                    ],
-                    dtype=torch.float32,
-                ).cuda()
-            ]
-            for sample in new_samples:
-                tensor_list.append(sample["max_seqlen"].unsqueeze(0))
-
-            if is_dynamic_cp:
-                for sample in new_samples:
-                    tensor_list.append(sample["local_cp_size"].unsqueeze(0))
-
-            for sample in new_samples:
-                tensor_list.append(sample["cu_seqlens"])
-                tensor_list.append(sample["cu_seqlens_padded"])
-            info_to_broadcast = torch.cat(tensor_list, dim=0).to(device=dev, dtype=torch.float32)
-            info_length_tensor = torch.tensor(info_to_broadcast.shape[0], dtype=torch.int32).cuda()
-            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-        else:
-            info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
-            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-            info_to_broadcast = torch.empty(info_length_tensor.item(), dtype=torch.float32).cuda()
-            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-            if pp_group.rank() != pp_group.size() - 1:
-                # middle PP stages receive the broadcasted info and unpack it
-                info_numpy = info_to_broadcast.cpu().numpy()
-                num_micro_batches = int(info_numpy[0])
-                seqlen_sum_this_global_batch = info_numpy[1]
-                seqlen_squared_sum_this_global_batch = info_numpy[2]
-                max_seqlens = info_to_broadcast[3 : 3 + num_micro_batches]
-                local_cp_sizes = (
-                    info_to_broadcast[3 + num_micro_batches : 3 + 2 * num_micro_batches]
-                    if is_dynamic_cp
-                    else None
-                )
-                cu_seqlens_list = []
-                cu_seqlens_padded_list = []
-                # cu_seqlens always starts with 0, and the other metadata values
-                # (num_micro_batches, seqlen_sum, seqlen_squared_sum, max_seqlens)
-                # are always positive, so we can use 0 as the delimiter to locate
-                # the start of each cu_seqlens / cu_seqlens_padded tensor.
-                # This avoids an extra broadcast for the lengths of cu_seqlens.
-                indices = np.where(info_numpy == 0)[0]
-                for i in range(num_micro_batches):
-                    cu_seqlens_list.append(info_to_broadcast[indices[i * 2] : indices[i * 2 + 1]])
-                    if i == num_micro_batches - 1:
-                        cu_seqlens_padded_list.append(info_to_broadcast[indices[i * 2 + 1] :])
-                    else:
-                        cu_seqlens_padded_list.append(
-                            info_to_broadcast[indices[i * 2 + 1] : indices[i * 2 + 2]]
-                        )
-
-                new_samples = []
-                for i in range(num_micro_batches):
-                    new_sample = {}
-                    new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
-                    new_sample["cu_seqlens"] = cu_seqlens_list[i].to(torch.int32)
-                    new_sample["cu_seqlens_padded"] = cu_seqlens_padded_list[i].to(torch.int32)
-                    if is_dynamic_cp:
-                        new_sample["local_cp_size"] = local_cp_sizes[i].to(torch.int32)
-                    new_samples.append(new_sample)
-
-    return (
-        new_samples,
-        num_micro_batches,
-        seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch,
-    )
 
 
 def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
@@ -321,21 +248,21 @@ def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
 
 
 def create_data_iterator(
-    new_samples, tp_group, config, vpp_has_data=None, is_dynamic_cp: bool = False
+    new_samples, tp_group, config, vpp_needs_data=None, is_dynamic_cp: bool = False
 ):
     """Handle virtual pipeline parallelism.
 
     For VPP, each PP rank needs a list of data iterators (one per VPP stage).
-    VPP stages that originally had a data_iterator (indicated by vpp_has_data)
-    get full samples; others get metadata only (cu_seqlens, cu_seqlens_padded,
+    VPP stages that need full data (first/last pipeline stage, or MTP) get
+    full samples; others get metadata only (cu_seqlens, cu_seqlens_padded,
     max_seqlen).
 
     Args:
         new_samples: The packed samples after scheduling.
         tp_group: Tensor parallel process group.
         config: Model parallel config.
-        vpp_has_data: A list of booleans (one per VPP stage) indicating which
-            VPP stages originally had a data_iterator. None if VPP is disabled.
+        vpp_needs_data: A list of booleans (one per VPP stage) indicating which
+            VPP stages need full samples (data fields). None if VPP is disabled.
     """
     if (
         config.virtual_pipeline_model_parallel_size is not None
@@ -346,14 +273,19 @@ def create_data_iterator(
             metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
-            metadata = [
-                {k: sample[k] for k in metadata_keys if k in sample} for sample in new_samples
-            ]
             new_data_iterator = []
             for i in range(vpp_size):
-                if vpp_has_data is not None and vpp_has_data[i]:
-                    new_data_iterator.append(RerunDataIterator(iter(new_samples)))
+                if vpp_needs_data is not None and vpp_needs_data[i]:
+                    # Give each data-carrying VPP stage its own shallow-copied
+                    # sample dicts.
+                    samples_copy = [dict(sample) for sample in new_samples]
+                    new_data_iterator.append(RerunDataIterator(iter(samples_copy)))
                 else:
+                    # Create independent metadata dicts to avoid shared-reference mutation
+                    metadata = [
+                        {k: sample[k] for k in metadata_keys if k in sample}
+                        for sample in new_samples
+                    ]
                     new_data_iterator.append(RerunDataIterator(iter(metadata)))
         else:
             new_data_iterator = [None for _ in range(vpp_size)]
@@ -599,28 +531,25 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
 # =============================================================================
 
 
-def next_hdp_group(
+def next_hdp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
-    compute_estimator: Callable[[int], float],
     total_gpus: int,
-    gpus_needed_fn: Callable[[int], int],
-    make_buckets_equal_fn: Callable,
-    max_seq_len_per_rank: float,
-    get_total_workload_fn: Callable,
-    delta: float = 0.05,
-    strategy: str = "dp",
-    eps_bucket: float = 0.10,
+    max_seq_len_per_rank: int,
+    min_cp_size: int = 1,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
-    """Form one balanced micro-batch group across DPxCP ranks.
+    """Form one DCP microbatch with packing-aware CP group selection.
 
-    This is a standalone version of the scheduling algorithm extracted from
-    DefaultDynamicCPScheduler so it can live in a utils module.
+    This differs from the legacy DCP scheduler in two ways:
+    1. Short sequences may use a larger CP group than their minimum required
+       CP size when that lowers the critical-path rank workload.
+    2. Candidate placements are bounded by ``tall * max_seq_len_per_rank``,
+       the per-rank workload upper bound for packing sequences no longer than
+       the local tallest sequence in the microbatch.
 
-    Extra args compared to the method version:
-        gpus_needed_fn: callable(seq_len) -> int
-        make_buckets_equal_fn: callable(sample_seqlens, compute_estimator) -> list[deque]
-        max_seq_len_per_rank: max tokens per rank for packing
-        get_total_workload_fn: callable(seq_len, cp_size) -> float
+    The scheduler keeps the legacy invariant that each returned microbatch has
+    no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
+    it falls back to the full DPxCP group if power-of-two expansion cannot fill
+    every rank.
     """
     if not sample_seqlens:
         return (
@@ -630,241 +559,216 @@ def next_hdp_group(
             [[] for _ in range(total_gpus)],
         )
 
-    buckets = make_buckets_equal_fn(sample_seqlens, compute_estimator)
+    def cp_min_fn(seq_len: int) -> int:
+        return dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
 
-    micro_batches = [[] for _ in range(total_gpus)]
-    exec_times = [0.0 for _ in range(total_gpus)]
-    sample_ids_per_gpu = [[] for _ in range(total_gpus)]
-    packing_sequence_len = {}
+    def workload(seq_len: int, cp_size: int) -> float:
+        return (seq_len * seq_len) / cp_size
 
-    gpu_group_id = [None] * total_gpus
-    group_members = {}
-    group_size = {}
+    sample_seqlens = sorted(sample_seqlens, key=lambda x: x[1], reverse=True)
+    local_tall = sample_seqlens[0][1]
+    cap = float(local_tall) * float(max_seq_len_per_rank) * (1.0 + _DYNAMIC_CP_WORKLOAD_CAP_DELTA)
+
+    micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+    exec_times: List[float] = [0.0 for _ in range(total_gpus)]
+    sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
+    packing_sequence_len: Dict[int, float] = {}
+
+    gpu_group_id: List[Optional[int]] = [None] * total_gpus
+    group_members: Dict[int, List[int]] = {}
+    group_size: Dict[int, int] = {}
     next_gid = 0
 
-    pp_cursor = 0
-    prev_needed = None
-    check_balance = False
+    sample_id, seq_len = sample_seqlens[0]
+    cp_size = cp_min_fn(seq_len)
+    assert cp_size <= total_gpus, (
+        f"Sequence length {seq_len} requires CP size {cp_size}, "
+        f"but only {total_gpus} DPxCP ranks are available."
+    )
+    group_id = next_gid
+    next_gid += 1
+    members = list(range(cp_size))
+    group_members[group_id] = members
+    group_size[group_id] = cp_size
+    packing_sequence_len[group_id] = seq_len / cp_size
+    per_gpu_cost = workload(seq_len, cp_size)
+    for rank in members:
+        gpu_group_id[rank] = group_id
+        micro_batches[rank].append(seq_len)
+        exec_times[rank] += per_gpu_cost
+        sample_ids_per_gpu[rank].append(sample_id)
 
-    while buckets:
-        sample_seq_tuple = bucket_idx = None
-        needed = None
+    leftovers: List[Tuple[int, int]] = []
+    for sample_id, seq_len in sample_seqlens[1:]:
+        min_needed = cp_min_fn(seq_len)
+        best = None
 
-        scan_order = (
-            range(len(buckets))
-            if strategy == "dp"
-            else [(pp_cursor + i) % len(buckets) for i in range(len(buckets))]
-        )
+        cp_size = min_needed
+        while cp_size <= total_gpus:
+            per_gpu_cost = workload(seq_len, cp_size)
 
-        for idx in scan_order:
-            if not buckets[idx]:
-                continue
-            cand_tuple = buckets[idx][0]
-            cand_seq_len = cand_tuple[1]
-            needed = gpus_needed_fn(cand_seq_len)
+            for group_id, size in list(group_size.items()):
+                if size != cp_size:
+                    continue
+                if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
+                    continue
+                members = group_members[group_id]
+                member_set = set(members)
+                projected_max = max(
+                    time + per_gpu_cost if rank in member_set else time
+                    for rank, time in enumerate(exec_times)
+                )
+                if projected_max <= cap and (best is None or projected_max < best[0]):
+                    best = (projected_max, cp_size, "add", group_id, None)
 
-            candidate_gids = [gid for gid, sz in group_size.items() if sz == needed]
-            free_ranks = [r for r, gid in enumerate(gpu_group_id) if gid is None]
-            if candidate_gids or len(free_ranks) >= needed:
-                sample_seq_tuple, bucket_idx = cand_tuple, idx
-                break
+            free_ranks = [
+                rank
+                for rank, assigned_group_id in enumerate(gpu_group_id)
+                if assigned_group_id is None
+            ]
+            if len(free_ranks) >= cp_size:
+                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
+                chosen_set = set(chosen_members)
+                projected_max = max(
+                    time + per_gpu_cost if rank in chosen_set else time
+                    for rank, time in enumerate(exec_times)
+                )
+                if projected_max <= cap and (best is None or projected_max < best[0]):
+                    best = (projected_max, cp_size, "new", None, chosen_members)
 
-        if sample_seq_tuple is None:
-            break
+            cp_size *= 2
 
-        if strategy == "pp":
-            pp_cursor = (bucket_idx + 1) % len(buckets)
+        if best is None:
+            leftovers.append((sample_id, seq_len))
+            continue
 
-        sample_id, seq_len = sample_seq_tuple
-        needed = gpus_needed_fn(seq_len)
-        if prev_needed is None:
-            prev_needed = needed
-
-        candidate_gids = [
-            gid
-            for gid, sz in group_size.items()
-            if sz == needed and packing_sequence_len[gid] + seq_len / needed <= max_seq_len_per_rank
-        ]
-        if candidate_gids:
-            best_gid, best_load = min(
-                ((gid, max(exec_times[r] for r in group_members[gid])) for gid in candidate_gids),
-                key=lambda t: t[1],
-            )
+        _, selected_cp_size, action, group_id, chosen_members = best
+        per_gpu_cost = workload(seq_len, selected_cp_size)
+        if action == "add":
+            members = group_members[group_id]
+            packing_sequence_len[group_id] += seq_len / selected_cp_size
+            for rank in members:
+                micro_batches[rank].append(seq_len)
+                exec_times[rank] += per_gpu_cost
+                sample_ids_per_gpu[rank].append(sample_id)
         else:
-            best_gid, best_load = None, float("inf")
-
-        free_ranks = [r for r, gid in enumerate(gpu_group_id) if gid is None]
-        if len(free_ranks) >= needed:
-            free_sorted = sorted(free_ranks, key=lambda r: exec_times[r])
-            new_members = free_sorted[:needed]
-            new_load = exec_times[new_members[-1]]
-
-            if new_load < best_load:
-                best_gid = None
-                chosen_members = new_members
-            else:
-                chosen_members = group_members[best_gid]
-        else:
-            if best_gid is None:
-                break
-            chosen_members = group_members[best_gid]
-
-        if best_gid is None:
-            best_gid = next_gid
+            group_id = next_gid
             next_gid += 1
-            group_members[best_gid] = chosen_members
-            group_size[best_gid] = needed
-            for r in chosen_members:
-                gpu_group_id[r] = best_gid
+            group_members[group_id] = chosen_members
+            group_size[group_id] = selected_cp_size
+            packing_sequence_len[group_id] = seq_len / selected_cp_size
+            for rank in chosen_members:
+                gpu_group_id[rank] = group_id
+                micro_batches[rank].append(seq_len)
+                exec_times[rank] += per_gpu_cost
+                sample_ids_per_gpu[rank].append(sample_id)
 
-        per_gpu_cost = compute_estimator(seq_len)
+    def fill_empty_gpus_once() -> bool:
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu
 
-        packing_sequence_len[best_gid] = packing_sequence_len.get(best_gid, 0) + seq_len / needed
-        for r in chosen_members:
-            micro_batches[r].append(seq_len)
-            exec_times[r] += per_gpu_cost
-            sample_ids_per_gpu[r].append(sample_id)
-
-        buckets[bucket_idx].popleft()
-
-        while buckets and not buckets[0]:
-            buckets.pop(0)
-            pp_cursor %= max(1, len(buckets))
-
-        if needed < prev_needed:
-            check_balance = True
-
-        if (
-            check_balance
-            and buckets
-            and max(exec_times) - min(exec_times) <= delta * max(exec_times)
-        ):
-            break
-
-    leftovers = []
-    for b in buckets:
-        for sample_seq_tuple in b:
-            leftovers.append(sample_seq_tuple)
-
-    def trim_overload():
-        while True:
-            cur_max = max(exec_times)
-            cur_min = min(exec_times)
-            cur_slack = cur_max - cur_min
-            if cur_slack <= delta * cur_max:
-                break
-            if cur_min == 0:
-                break
-
-            max_r = exec_times.index(cur_max)
-            gid = gpu_group_id[max_r]
-            members = group_members[gid]
-
-            if not micro_batches[max_r] or len(micro_batches[max_r]) <= 1:
-                break
-
-            seq = micro_batches[max_r][-1]
-            per_gpu_cost = compute_estimator(seq)
-
-            proj_times = exec_times[:]
-            for r in members:
-                proj_times[r] -= per_gpu_cost
-
-            proj_slack = max(proj_times) - min(proj_times)
-
-            if proj_slack < cur_slack:
-                sample_id_to_remove = sample_ids_per_gpu[max_r][-1]
-                for r in members:
-                    micro_batches[r].pop()
-                    exec_times[r] -= per_gpu_cost
-                    sample_ids_per_gpu[r].pop()
-                leftovers.append((sample_id_to_remove, seq))
-            else:
-                break
-
-    # TODO(tailaim): uncomment this to support different ranks have different num_microbatches
-    # trim_overload()
-
-    total_work_before = sum(len(mb) for mb in micro_batches)
-
-    def fill_empty_gpus(micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size):
-        empty_gpus = [i for i in range(total_gpus) if not micro_batches[i]]
-        if not empty_gpus:
-            return (micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size)
+        empty_ranks = [rank for rank, micro_batch in enumerate(micro_batches) if not micro_batch]
+        if not empty_ranks:
+            return False
+        assert all(
+            not micro_batches[rank] for rank in range(empty_ranks[0], total_gpus)
+        ), "fill_empty_gpus_once assumes empty ranks are contiguous at the tail"
 
         existing_group_sizes = set(group_size.values())
-        assert (
-            existing_group_sizes
-        ), "There should be at least one group existing, cannot redistribute, "
-        "try to increase 'max-seqlen-per-dp-cp-rank'."
-
+        if not existing_group_sizes:
+            return False
         min_group_size = min(existing_group_sizes)
         next_power = min(min_group_size * 2, total_gpus)
 
-        for gid, size in group_size.items():
-            if size == min_group_size:
-                members = group_members[gid]
-                needed_count = next_power - min_group_size
-                group_start_gpu = members[0]
-                group_end_gpu = members[-1]
-                empty_gpu = [idx for idx, work in enumerate(micro_batches) if not work][0]
-                assert not all(
-                    work for work in micro_batches[empty_gpu : empty_gpu + needed_count]
-                ), "Empty GPUs were detected but not enough to expand."
-                work_to_push = micro_batches[group_end_gpu + 1 : empty_gpu]
-                exec_times_to_push = exec_times[group_end_gpu + 1 : empty_gpu]
-                sample_ids_to_push = sample_ids_per_gpu[group_end_gpu + 1 : empty_gpu]
+        for group_id, size in list(group_size.items()):
+            if size != min_group_size:
+                continue
 
-                new_micro_batches = [[]] * len(micro_batches)
-                new_exec_times = [0.0] * len(exec_times)
-                new_sample_ids_per_gpu = [[]] * len(sample_ids_per_gpu)
+            members = group_members[group_id]
+            needed_count = next_power - min_group_size
+            group_start_rank = members[0]
+            group_end_rank = members[-1]
+            empty_rank = empty_ranks[0]
+            if group_end_rank + 1 > empty_rank or group_end_rank + needed_count >= total_gpus:
+                continue
 
-                for i in range(group_start_gpu):
-                    new_micro_batches[i] = micro_batches[i]
-                    new_exec_times[i] = exec_times[i]
-                    new_sample_ids_per_gpu[i] = sample_ids_per_gpu[i]
+            work_to_push = micro_batches[group_end_rank + 1 : empty_rank]
+            exec_times_to_push = exec_times[group_end_rank + 1 : empty_rank]
+            sample_ids_to_push = sample_ids_per_gpu[group_end_rank + 1 : empty_rank]
 
-                for i in range(group_start_gpu, group_end_gpu + needed_count + 1):
-                    new_micro_batches[i] = micro_batches[group_end_gpu]
-                    new_exec_times[i] = get_total_workload_fn(
-                        micro_batches[group_end_gpu][0], next_power
-                    )
-                    new_sample_ids_per_gpu[i] = sample_ids_per_gpu[group_end_gpu]
+            new_micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+            new_exec_times: List[float] = [0.0 for _ in range(total_gpus)]
+            new_sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
 
-                for i, work in enumerate(work_to_push):
-                    new_micro_batches[group_end_gpu + needed_count + 1 + i] = work
-                    new_exec_times[group_end_gpu + needed_count + 1 + i] = exec_times_to_push[i]
-                    new_sample_ids_per_gpu[group_end_gpu + needed_count + 1 + i] = (
-                        sample_ids_to_push[i]
-                    )
+            for rank in range(group_start_rank):
+                new_micro_batches[rank] = micro_batches[rank]
+                new_exec_times[rank] = exec_times[rank]
+                new_sample_ids_per_gpu[rank] = sample_ids_per_gpu[rank]
 
-                group_size[gid] = next_power
-                group_members[gid] = list(range(members[0], members[-1] + needed_count + 1))
-                for pushed_gid in group_size.keys():
-                    if pushed_gid > gid:
-                        group_members[pushed_gid] = [
-                            x + needed_count for x in group_members[pushed_gid]
-                        ]
-
-                return (
-                    new_micro_batches,
-                    new_exec_times,
-                    new_sample_ids_per_gpu,
-                    group_members,
-                    group_size,
+            for rank in range(group_start_rank, group_end_rank + needed_count + 1):
+                new_micro_batches[rank] = list(micro_batches[group_end_rank])
+                new_exec_times[rank] = sum(
+                    workload(length, next_power) for length in micro_batches[group_end_rank]
                 )
+                new_sample_ids_per_gpu[rank] = list(sample_ids_per_gpu[group_end_rank])
 
-    empty_gpus = any([not micro_batches[i] for i in range(total_gpus)])
-    while empty_gpus:
-        micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size = fill_empty_gpus(
-            micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size
+            for idx, work in enumerate(work_to_push):
+                target_rank = group_end_rank + needed_count + 1 + idx
+                new_micro_batches[target_rank] = work
+                new_exec_times[target_rank] = exec_times_to_push[idx]
+                new_sample_ids_per_gpu[target_rank] = sample_ids_to_push[idx]
+
+            group_size[group_id] = next_power
+            group_members[group_id] = list(
+                range(group_start_rank, group_end_rank + needed_count + 1)
+            )
+            for other_group_id in list(group_size.keys()):
+                if other_group_id == group_id:
+                    continue
+                if min(group_members[other_group_id]) > group_end_rank:
+                    group_members[other_group_id] = [
+                        rank + needed_count for rank in group_members[other_group_id]
+                    ]
+
+            micro_batches = new_micro_batches
+            exec_times = new_exec_times
+            sample_ids_per_gpu = new_sample_ids_per_gpu
+            return True
+
+        return False
+
+    def fill_with_full_dpxcp_group() -> None:
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu, leftovers
+
+        selected: List[Tuple[int, int]] = []
+        next_leftovers: List[Tuple[int, int]] = []
+        packed_sequence_len = 0.0
+
+        for sample_id, seq_len in sample_seqlens:
+            per_rank_len = seq_len / total_gpus
+            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+                selected.append((sample_id, seq_len))
+                packed_sequence_len += per_rank_len
+            else:
+                next_leftovers.append((sample_id, seq_len))
+
+        assert selected, (
+            "At least one sequence should fit in the full DPxCP group; "
+            "try to increase 'max-seqlen-per-dp-cp-rank'."
         )
-        empty_gpus = any([not micro_batches[i] for i in range(total_gpus)])
 
-    total_work_after = sum(len(mb) for mb in micro_batches)
-    assert (
-        total_work_after >= total_work_before
-    ), f"Samples were removed: {total_work_before} -> {total_work_after}"
+        selected_ids = [sample_id for sample_id, _ in selected]
+        selected_lens = [seq_len for _, seq_len in selected]
+        per_rank_work = sum(workload(seq_len, total_gpus) for _, seq_len in selected)
+
+        micro_batches = [list(selected_lens) for _ in range(total_gpus)]
+        exec_times = [per_rank_work for _ in range(total_gpus)]
+        sample_ids_per_gpu = [list(selected_ids) for _ in range(total_gpus)]
+        leftovers = next_leftovers
+
+    while any(not micro_batch for micro_batch in micro_batches):
+        if not fill_empty_gpus_once():
+            fill_with_full_dpxcp_group()
+            break
 
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
@@ -972,49 +876,3 @@ def dcp_gpus_needed(seq_len: int, max_seq_len_per_rank: int, min_cp_size: int = 
     """Number of GPUs needed, rounded up to the next power of 2, lower-bounded by min_cp_size."""
     raw = max(1, 2 ** ceil(log2(seq_len / max_seq_len_per_rank)))
     return max(min_cp_size, raw)
-
-
-@lru_cache(maxsize=128)
-def dcp_get_total_workload(
-    seq_length: int, max_seq_len_per_rank: int, cp_size: Optional[int] = None, min_cp_size: int = 1
-) -> float:
-    """Estimate workload of a sub-sample for scheduling balance."""
-    if cp_size is None:
-        cp_size = dcp_gpus_needed(seq_length, max_seq_len_per_rank, min_cp_size)
-    return (seq_length * seq_length) / cp_size
-
-
-def dcp_make_buckets_equal(
-    sample_seqlens: List[Tuple[int, int]],
-    compute_estimator: Callable,
-    max_seq_len_per_rank: int,
-    min_cp_size: int = 1,
-) -> List[deque]:
-    """Split samples into buckets of roughly equal work, one per unique CP size."""
-    seqlens = [seq_len for _, seq_len in sample_seqlens]
-    k = len({dcp_gpus_needed(L, max_seq_len_per_rank, min_cp_size) for L in seqlens})
-
-    work = []
-    for _, s in sample_seqlens:
-        cp_size = dcp_gpus_needed(s, max_seq_len_per_rank, min_cp_size)
-        work.append(compute_estimator(s, cp_size))
-    total_work = sum(work)
-    target = total_work / k
-    buckets, cur, cur_work = [], [], 0.0
-    remaining_k = k
-
-    for i, (sample_id, seq_len) in enumerate(sample_seqlens):
-        w = compute_estimator(seq_len)
-        projected = cur_work + w
-        if cur and (
-            projected > target * 1.1 or len(sample_seqlens) - i <= remaining_k - len(buckets)
-        ):
-            buckets.append(deque(cur))
-            cur, cur_work = [], 0.0
-            remaining_k -= 1
-        cur.append((sample_id, seq_len))
-        cur_work += w
-
-    if cur:
-        buckets.append(deque(cur))
-    return buckets
