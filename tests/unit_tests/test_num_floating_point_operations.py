@@ -325,9 +325,9 @@ class TestHybridMatchesStandard:
         batch_size = 4
 
         # BSHD: closed-form defaults.
-        assert num_floating_point_operations(
-            standard, batch_size
-        ) == num_floating_point_operations(hybrid, batch_size)
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length
@@ -941,8 +941,12 @@ def _make_dsv4_pair(*, ratios, mtp, moe):
 
     # ---- standard-model args (fused layers) ----
     standard = _make_gpt_args(
-        num_layers=len(ratios), hidden_size=512, num_attention_heads=8,
-        seq_length=256, ffn_hidden_size=2048, padded_vocab_size=1024,
+        num_layers=len(ratios),
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
     )
     _configure(standard)
     # ``csa_compress_ratios`` must cover main + MTP layers; the MTP layer is a
@@ -952,8 +956,12 @@ def _make_dsv4_pair(*, ratios, mtp, moe):
 
     # ---- hybrid-model args (split layers, same dims) ----
     hybrid = _make_gpt_args(
-        num_layers=len(ratios), hidden_size=512, num_attention_heads=8,
-        seq_length=256, ffn_hidden_size=2048, padded_vocab_size=1024,
+        num_layers=len(ratios),
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
     )
     _configure(hybrid)
     hybrid.mamba_state_dim = 128
@@ -988,20 +996,22 @@ class TestDSv4HybridMatchesStandard:
         batch_size = 2
 
         # BSHD (closed-form defaults).
-        assert num_floating_point_operations(
-            standard, batch_size
-        ) == num_floating_point_operations(hybrid, batch_size)
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length
         thd_sum_sq = batch_size * 4 * (s // 4) ** 2
         thd_tokens = batch_size * s * 3 // 4
         assert num_floating_point_operations(
-            standard, batch_size,
+            standard,
+            batch_size,
             seqlen_squared_sum_in_batch=thd_sum_sq,
             total_real_tokens_in_batch=thd_tokens,
         ) == num_floating_point_operations(
-            hybrid, batch_size,
+            hybrid,
+            batch_size,
             seqlen_squared_sum_in_batch=thd_sum_sq,
             total_real_tokens_in_batch=thd_tokens,
         )
