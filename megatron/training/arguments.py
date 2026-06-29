@@ -1252,6 +1252,12 @@ def validate_args(args, defaults={}):
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
 
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -2987,6 +2993,10 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--dataloader-inter-document-masking', action='store_true',
+                       help='Return cu_seqlens marking document boundaries '
+                       'within each sample so that attention is restricted '
+                       'to individual documents.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
