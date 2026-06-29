@@ -832,7 +832,7 @@ jobs:
           echo "created=true" >> "$GITHUB_OUTPUT"
           echo "sha=$new_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Push exact fast-forward commit
+      - name: Push fast-forward commit
         if: steps.commit.outputs.created == 'true'
         env:
           # The PAT is needed so the new PR SHA emits normal synchronize/check
@@ -844,10 +844,12 @@ jobs:
           set -euo pipefail
           auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w 0)
           echo "::add-mask::$auth"
+          # Deliberately use an ordinary push: NEW_SHA has HEAD_SHA as its
+          # first parent, so an independently advanced branch is rejected as
+          # non-fast-forward. Never force-update a contributor's branch.
           git -c core.hooksPath=/dev/null \
             -c http.extraHeader="AUTHORIZATION: basic $auth" \
-            push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" \
-              "https://github.com/$HEAD_REPO.git" \
+            push "https://github.com/$HEAD_REPO.git" \
               "$NEW_SHA:refs/heads/$HEAD_REF"
 
   report-success:
