@@ -58,8 +58,8 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    This is used to calculate the number and length of sub-samples assigned to each rank when
+    using hybrid context parallelism or a sequence packing scheduler.
     """
 
     hybrid_context_parallel: bool = False
@@ -68,6 +68,9 @@ class ModelParallelConfig:
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    """Scheduler used to balance variable-length packed sequences across data-parallel ranks."""
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
@@ -423,6 +426,24 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.sequence_packing_scheduler is not None:
+            supported_schedulers = ('dp_balanced',)
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported sequence packing scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}."
+                )
+            if (
+                isinstance(self.max_seqlen_per_dp_cp_rank, bool)
+                or not isinstance(self.max_seqlen_per_dp_cp_rank, int)
+                or self.max_seqlen_per_dp_cp_rank <= 0
+            ):
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be a positive integer when using a "
+                    "sequence packing scheduler."
+                )
+            self.variable_seq_lengths = True
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

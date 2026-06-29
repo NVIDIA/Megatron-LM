@@ -2072,6 +2072,7 @@ def _add_network_size_args(parser):
         "tp_comm_overlap_disable_fc1",
         "pipeline_dtype",
         "variable_seq_lengths",
+        "sequence_packing_scheduler",
         "batch_p2p_comm",
         "batch_p2p_sync",
         "deallocate_pipeline_outputs",

@@ -270,6 +270,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,
     "rotary_interleaved": False,
+    "sequence_packing_scheduler": None,
     "sequence_parallel": True,
     "softmax_scale": None,
     "softmax_type": "vanilla",

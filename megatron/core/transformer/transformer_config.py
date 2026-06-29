@@ -1213,6 +1213,26 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        if self.sequence_packing_scheduler is not None:
+            if self.moe_token_dispatcher_type != 'alltoall':
+                raise ValueError(
+                    "Sequence packing schedulers require moe_token_dispatcher_type='alltoall', "
+                    f"got {self.moe_token_dispatcher_type!r}."
+                )
+
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+
+            # TODO: Remove this after the convergence issue with TE < 2.9 is fixed.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "Sequence packing schedulers require Transformer Engine >= 2.9.0, "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
