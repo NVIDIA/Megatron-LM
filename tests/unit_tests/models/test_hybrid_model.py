@@ -571,9 +571,9 @@ class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
             hidden_size=256,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            # MLASelfAttention forwards `x` and `qr` to the core attention only when
-            # `experimental_attention_variant == "dsa"`; without this the DSA core
-            # attention's forward fails on missing positional arguments.
+            add_bias_linear=False,
+            # AbsorbedMLASelfAttention forwards `x` and `qr` to the DSA core attention; without
+            # this, the DSA core attention's forward fails on missing positional arguments.
             experimental_attention_variant="dsa",
             # DSA-specific settings; defaults are None and DSAIndexer requires them.
             dsa_indexer_n_heads=8,
@@ -1036,18 +1036,16 @@ class TestMLADownProjFusion:
         assert result.mla_layer.submodules.self_attention.module is FusedMLASelfAttention
 
     def test_enabled_leaves_dsa_layer_alone(self):
-        """DSA layer spec shares the MLA self-attention class, but fusion
-        should only rewrite `mla_layer` — not `dsa_layer`.
-        """
-        from megatron.core.transformer.multi_latent_attention import (
-            FusedMLASelfAttention,
-            MLASelfAttention,
+        """MLA fusion must not rewrite the absorbed DSA attention specification."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
         )
+        from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 
         submodules = self._fresh_submodules()
         result = self._call_fuse(submodules, mla_down_proj_fusion=True)
 
-        assert result.dsa_layer.submodules.self_attention.module is MLASelfAttention
+        assert result.dsa_layer.submodules.self_attention.module is AbsorbedMLASelfAttention
         assert result.dsa_layer.submodules.self_attention.module is not FusedMLASelfAttention
         # DSA's down projections must remain non-`None` (they're still used
         # via the unfused path).
