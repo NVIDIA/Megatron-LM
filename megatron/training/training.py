@@ -2062,15 +2062,13 @@ def setup_model_and_optimizer(
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
         # Optional: dump per-rank optimizer parameter sharding for fixture capture.
-        # Gated by `DUMP_OPTIMIZER_PARAMETERS_OUTPUT` env var; each rank writes a
-        # JSON snapshot under that path. Optimizer-agnostic — fires regardless
-        # of optimizer class. See `megatron.core.optimizer.utils` for the schema.
-        dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
-        if dump_path:
+        # Optimizer-agnostic — fires regardless of optimizer class. See
+        # `megatron.core.optimizer.utils` for the schema.
+        if args.optimizer_parameters_dump_dir:
             # `MegatronOptimizer` wraps an inner `torch.optim.Optimizer` and
             # exposes it at `.optimizer`. Unwrap so the helper receives a
             # real `torch.optim.Optimizer` (matches its type signature).
-            dump_optimizer_parameters(optimizer.optimizer, dump_path)
+            dump_optimizer_parameters(optimizer.optimizer, args.optimizer_parameters_dump_dir)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 

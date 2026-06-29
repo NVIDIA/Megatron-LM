@@ -35,10 +35,10 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     sharded.is_qkv = True  # exercise the optional attribute capture
     optimizer = torch.optim.SGD([sharded, replicated], lr=0.1, momentum=0.9)
 
-    out_path = tmp_path / "dump.json"
-    dump_optimizer_parameters(optimizer, out_path)
+    dump_dir = tmp_path / "dump"
+    dump_optimizer_parameters(optimizer, dump_dir)
 
-    written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
+    written = dump_dir / f"rank{distributed_setup.rank}.json"
     assert written.exists(), f"per-rank dump file missing: {written}"
     spec = json.loads(written.read_text())
 
@@ -77,10 +77,10 @@ def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: path
         [{"params": [a], "weight_decay": 0.1}, {"params": [b], "weight_decay": 0.0}], lr=0.01
     )
 
-    out_path = tmp_path / "multi.json"
-    dump_optimizer_parameters(optimizer, out_path)
+    dump_dir = tmp_path / "multi"
+    dump_optimizer_parameters(optimizer, dump_dir)
 
-    written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
+    written = dump_dir / f"rank{distributed_setup.rank}.json"
     spec = json.loads(written.read_text())
     assert len(spec["groups"]) == 2
     assert len(spec["groups"][0]["params"]) == 1

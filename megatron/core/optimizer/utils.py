@@ -36,16 +36,15 @@ logger = logging.getLogger(__name__)
 
 
 def dump_optimizer_parameters(
-    optimizer: torch.optim.Optimizer, out_path: str | os.PathLike
+    optimizer: torch.optim.Optimizer, dump_dir: str | os.PathLike
 ) -> None:
     """Write a per-rank JSON snapshot of `optimizer`'s parameter sharding.
 
-    Each rank writes its own file. If `out_path` ends in `.json`, the
-    suffix becomes `.rank<N>.json`; otherwise `.rank<N>.json` is appended.
+    Each rank writes its own ``rank<N>.json`` file under ``dump_dir``.
 
     Args:
         optimizer: any PyTorch optimizer over DTensor params.
-        out_path: output path; rank suffix is added.
+        dump_dir: output directory.
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -58,16 +57,12 @@ def dump_optimizer_parameters(
     ]
     spec: dict[str, Any] = {"world_size": world_size, "rank": rank, "groups": groups}
 
-    out = pathlib.Path(out_path)
-    rank_out = (
-        out.with_suffix(f".rank{rank}.json")
-        if out.suffix == ".json"
-        else out.parent / f"{out.name}.rank{rank}.json"
-    )
-    rank_out.parent.mkdir(parents=True, exist_ok=True)
+    out = pathlib.Path(dump_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rank_out = out / f"rank{rank}.json"
     rank_out.write_text(json.dumps(spec, indent=2))
     if rank == 0:
-        logger.info("Optimizer inputs dumped to %s (and rank-N siblings)", rank_out)
+        logger.info("Optimizer inputs dumped to %s", out)
 
 
 def _dump_param(p: DTensor) -> dict[str, Any]:
