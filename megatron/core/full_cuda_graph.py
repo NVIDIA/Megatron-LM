@@ -72,16 +72,6 @@ def copy_tensors_in_struct(src):
         return src
 
 
-def _static_tensor_matches(tgt, src):
-    """Return whether tgt can be reused as the static CUDA buffer for src."""
-    return (
-        isinstance(tgt, torch.Tensor)
-        and tgt.is_cuda
-        and tgt.shape == src.shape
-        and tgt.dtype == src.dtype
-    )
-
-
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
