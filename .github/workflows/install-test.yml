@@ -83,10 +83,12 @@ jobs:
           package-name: megatron.training
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
+      - name: Install megatron.training extra
+        shell: bash -x -e -u -o pipefail {0}
+        run: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python -m pip install --no-build-isolation -e ".[training]"
+
       - name: Check imports for megatron.inference
         uses: ./FW-CI-templates/.github/actions/check-imports
-        env:
-          PYTHONPATH: ${{ github.workspace }}
         with:
           package-name: megatron.inference
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
