@@ -355,6 +355,8 @@ class DSv4HybridAttention(Attention):
         else:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         if self.config.apply_rope_fusion:
+            if packed_seq:
+                core_attn_out = core_attn_out.squeeze(1)
             core_attn_out = fused_mla_rope_inplace(
                 core_attn_out,
                 rotary_pos_cos,
@@ -367,12 +369,21 @@ class DSv4HybridAttention(Attention):
                 inverse=True,
                 remove_interleaving=True,
             )
+            if packed_seq:
+                core_attn_out = core_attn_out.unsqueeze(1)
         else:
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
             )
-            rot_part = apply_rotary_pos_emb(
-                rot_part,
+            # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
+            # and adds its own batch dim internally; drop the dummy ``b=1`` axis
+            # for THD before the rope and add it back after.
+            if packed_seq:
+                rot_part_in = rot_part.squeeze(1)
+            else:
+                rot_part_in = rot_part
+            rot_part_out = apply_rotary_pos_emb(
+                rot_part_in,
                 rotary_pos_emb,
                 self.config,
                 cu_seqlens=cu_seqlens_kv,
@@ -383,6 +394,10 @@ class DSv4HybridAttention(Attention):
                 mla_output_remove_interleaving=True,
                 max_seqlen=rope_max_seqlen_kv,
             )
+            if packed_seq:
+                rot_part = rot_part_out.unsqueeze(1)
+            else:
+                rot_part = rot_part_out
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
@@ -592,6 +607,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
+            kv_compressed = kv_compressed.squeeze(1)
 
         # =========================================
         # Apply norm

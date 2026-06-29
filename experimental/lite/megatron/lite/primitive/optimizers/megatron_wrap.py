@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,23 +13,22 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 
 
-def validate_mc_config(engine_cfg) -> None:
+def validate_dist_opt_config(engine_cfg) -> None:
     """Validate dist_opt constraints owned by this optimizer primitive."""
     p = engine_cfg.parallel
     if p.vpp > 1 and p.pp == 1:
         raise ValueError("dist_opt requires pp>1 when vpp>1.")
 
 
-# Legacy alias — kept for compat shim path
-validate_mc_session = validate_mc_config
+validate_dist_opt_session = validate_dist_opt_config
 
 
 def _effective_etp(parallel) -> int:
     return int(parallel.etp if parallel.etp is not None else 1)
 
 
-def _ensure_mc_mpu_parallel_state(engine_cfg) -> None:
-    """Initialize Megatron-Core mpu globals when MC fallback groups are used."""
+def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
+    """Initialize Megatron-Core mpu globals when dist_opt fallback groups are used."""
 
     from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
 
@@ -61,8 +60,10 @@ def _ensure_mc_mpu_parallel_state(engine_cfg) -> None:
     )
 
 
-def build_mc_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] | None = None):
-    """Build MC OptimizerConfig from user's OptimizerConfig (duck-typed).
+def build_dist_opt_optimizer_config(
+    opt, *, override_optimizer_config: dict[str, Any] | None = None
+):
+    """Build Megatron-Core OptimizerConfig from user's OptimizerConfig (duck-typed).
 
     Single source of truth for Megatron Lite's Megatron-Core optimizer stack.
 
@@ -70,7 +71,7 @@ def build_mc_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] 
     or a `SimpleNamespace` with the same field names (legacy lite path).
     """
     from megatron.core.optimizer.optimizer_config import (
-        OptimizerConfig as MCOptimizerConfig,  # pyright: ignore[reportMissingImports]
+        OptimizerConfig as CoreOptimizerConfig,  # pyright: ignore[reportMissingImports]
     )
 
     offload = getattr(opt, "offload_fraction", None) or 0.0
@@ -100,10 +101,10 @@ def build_mc_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] 
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
     if override_optimizer_config:
         args.update(override_optimizer_config)
-    return MCOptimizerConfig(**args)
+    return CoreOptimizerConfig(**args)
 
 
-def build_mc_stack(
+def build_dist_opt_stack(
     model_chunks: list[nn.Module],
     *,
     model_cfg,
@@ -113,11 +114,11 @@ def build_mc_stack(
     proto=None,
     skip_ddp_wrap: bool = False,
 ):
-    """Wrap ML model chunks with MC DDP and build the matching MC optimizer.
+    """Wrap ML model chunks with Megatron-Core DDP and build the matching dist_opt optimizer.
 
     Args:
         skip_ddp_wrap: when True, ``model_chunks`` are assumed to already be
-            MC ``DistributedDataParallel``-wrapped; we skip our own wrapping
+            Megatron-Core ``DistributedDataParallel``-wrapped; we skip our own wrapping
             and feed them directly to the optimizer. The bucket layout
             influences optimizer master-grad sharding, so callers that prewrap
             chunks own the DDP config compatibility.
@@ -127,13 +128,13 @@ def build_mc_stack(
     from megatron.core.optimizer import get_megatron_optimizer
     from megatron.core.transformer.enums import ModelType
 
-    validate_mc_config(engine_cfg)
+    validate_dist_opt_config(engine_cfg)
 
     p = engine_cfg.parallel
     opt = engine_cfg.optimizer
 
-    mc_transformer_cfg = _build_transformer_config(model_cfg, engine_cfg)
-    mc_transformer_cfg.finalize_model_grads_func = finalize_model_grads
+    dist_opt_transformer_cfg = _build_transformer_config(model_cfg, engine_cfg)
+    dist_opt_transformer_cfg.finalize_model_grads_func = finalize_model_grads
     if is_expert is not None:
         is_expert_param = is_expert
     elif proto is not None and hasattr(proto, "EXPERT_CLASSIFIER"):
@@ -142,12 +143,12 @@ def build_mc_stack(
         is_expert_param = default_expert_classifier
     use_mpu_groups = bool(getattr(engine_cfg, "deterministic", False))
     if use_mpu_groups:
-        _ensure_mc_mpu_parallel_state(engine_cfg)
+        _ensure_dist_opt_mpu_parallel_state(engine_cfg)
     pg_collection = None if use_mpu_groups else _build_pg_collection(ps, engine_cfg)
 
     if skip_ddp_wrap:
         # Caller already wrapped and marked every param. Our helper setting
-        # `param.allreduce` on dense params could clash with MC code paths that
+        # `param.allreduce` on dense params could clash with Megatron-Core code paths that
         # distinguish `hasattr(param,'allreduce')` from `getattr(..., True)`.
         wrapped_chunks = list(model_chunks)
     else:
@@ -157,13 +158,13 @@ def build_mc_stack(
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
             chunk.model_type = ModelType.encoder_or_decoder
-            _mark_mc_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
+            _mark_dist_opt_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
             ddp_kwargs = {}
             if pg_collection is not None:
                 ddp_kwargs["pg_collection"] = pg_collection
             wrapped_chunks.append(
                 DistributedDataParallel(
-                    mc_transformer_cfg,
+                    dist_opt_transformer_cfg,
                     ddp_config,
                     chunk,
                     disable_bucketing=(chunk_idx > 0),
@@ -173,14 +174,14 @@ def build_mc_stack(
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.
-    opt_config = build_mc_optimizer_config(opt)
+    opt_config = build_dist_opt_optimizer_config(opt)
 
-    # This branch falls back to MC mpu globals for the optimizer's process
+    # This branch falls back to Megatron-Core mpu globals for the optimizer's process
     # groups. Long term, this primitive should always pass its own
     # `pg_collection`.
     if skip_ddp_wrap or use_mpu_groups:
         optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
-        optimizer._mc_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer._dist_opt_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
     else:
         optimizer = get_megatron_optimizer(
             config=opt_config,
@@ -188,11 +189,13 @@ def build_mc_stack(
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        optimizer._mc_pg_collection = pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer._dist_opt_pg_collection = (
+            pg_collection  # pyright: ignore[reportAttributeAccessIssue]
+        )
     return wrapped_chunks, optimizer
 
 
-def build_mc_training_optimizer(
+def build_dist_opt_training_optimizer(
     model_chunks: list[nn.Module],
     *,
     model_cfg,
@@ -203,7 +206,7 @@ def build_mc_training_optimizer(
     skip_ddp_wrap: bool = False,
     deterministic: bool | None = None,
 ):
-    """Build the MC DDP+optimizer stack from a Megatron Lite model ImplConfig."""
+    """Build the dist_opt DDP+optimizer stack from a Megatron Lite model ImplConfig."""
 
     opt = impl_cfg.optimizer_config
     if opt is None:
@@ -228,7 +231,7 @@ def build_mc_training_optimizer(
         optimizer=opt,
         deterministic=bool(deterministic),
     )
-    model_chunks[:], optimizer = build_mc_stack(
+    model_chunks[:], optimizer = build_dist_opt_stack(
         model_chunks,
         model_cfg=model_cfg,
         engine_cfg=engine_cfg,
@@ -238,16 +241,16 @@ def build_mc_training_optimizer(
     )
 
     def finalize_grads() -> None:
-        finalize_mc_grads(model_chunks, optimizer)
+        finalize_dist_opt_grads(model_chunks, optimizer)
 
     return optimizer, finalize_grads
 
 
-def finalize_mc_grads(model_chunks: list[nn.Module], optimizer) -> None:
-    """Run MC gradient finalization to match the optimizer's expected contract."""
+def finalize_dist_opt_grads(model_chunks: list[nn.Module], optimizer) -> None:
+    """Run Megatron-Core gradient finalization to match the optimizer's expected contract."""
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 
-    finalize_model_grads(model_chunks, pg_collection=optimizer._mc_pg_collection)
+    finalize_model_grads(model_chunks, pg_collection=optimizer._dist_opt_pg_collection)
 
 
 def _build_transformer_config(model_cfg, engine_cfg):
@@ -272,31 +275,31 @@ def _build_transformer_config(model_cfg, engine_cfg):
     )
     if hasattr(model_cfg, "add_bias_linear"):
         kwargs["add_bias_linear"] = bool(model_cfg.add_bias_linear)
-    elif kwargs["num_moe_experts"] is not None and kwargs["expert_tensor_parallel_size"] > 1:
+    elif kwargs["num_moe_experts"] is not None:
         kwargs["add_bias_linear"] = False
     if p.pp > 1:
         kwargs["pipeline_dtype"] = torch.bfloat16
     return TransformerConfig(**kwargs)
 
 
-def _mark_mc_parallel_attrs(
+def _mark_dist_opt_parallel_attrs(
     model: nn.Module, is_expert_param: ExpertClassifierFn, *, tp_size: int
 ) -> None:
-    """Mark per-param MC metadata (allreduce / tensor_model_parallel / sequence_parallel).
+    """Mark per-param optimizer metadata (allreduce / tensor_model_parallel / sequence_parallel).
 
-    IMPORTANT: respect attrs that are already set. Prewrapped MC models may
+    IMPORTANT: respect attrs that are already set. Prewrapped Megatron-Core models may
     mark these correctly per-param (e.g. `moe.router.weight` is 2D but
     TP-replicated, and must NOT have `tensor_model_parallel=True`). Blind
-    override would cause MC grad-norm to over-count replicated params.
+    override would cause dist_opt grad-norm to over-count replicated params.
     """
     sp_param_ids = {id(param) for param in getattr(model, "sp_params", [])}
     for name, param in model.named_parameters():
-        # MC uses `allreduce=False` to route expert params into expert-DP buffers.
+        # Megatron-Core uses `allreduce=False` to route expert params into expert-DP buffers.
         if not hasattr(param, "allreduce"):
             param.allreduce = not is_expert_param(name)
         if tp_size > 1 and id(param) not in sp_param_ids and param.ndim > 1:
             # vision params are replicated across TP (AVG all-reduce, not TP-split).
-            # tensor_model_parallel=True would cause MC to wrong-account their grad-norm.
+            # tensor_model_parallel=True would cause dist_opt to wrong-account their grad-norm.
             if getattr(param, "average_gradients_across_tp_domain", False):
                 continue
             # Skip params already marked sequence_parallel=True: they are TP-replicated
@@ -304,7 +307,7 @@ def _mark_mc_parallel_attrs(
             # Stacking tensor_model_parallel=True on top would cause double all-reduce.
             if getattr(param, "sequence_parallel", False):
                 continue
-            # MC excludes TP replicas from grad-norm accounting via this metadata.
+            # Distopt excludes TP replicas from grad-norm accounting via this metadata.
             if not hasattr(param, "tensor_model_parallel"):
                 param.tensor_model_parallel = True
 
@@ -339,7 +342,7 @@ def _build_pg_collection(ps, engine_cfg):
             singleton_group = group
     if singleton_group is None:
         raise RuntimeError(
-            "Failed to construct singleton process group for optional MC reductions."
+            "Failed to construct singleton process group for optional dist_opt reductions."
         )
 
     if engine_cfg.parallel.pp == 1:
@@ -371,9 +374,9 @@ def _build_pg_collection(ps, engine_cfg):
                 tp_ep_pp_group = group
 
         if mp_group is None or tp_ep_pp_group is None:
-            raise RuntimeError("Failed to construct mc pipeline-aware process groups.")
+            raise RuntimeError("Failed to construct dist_opt pipeline-aware process groups.")
 
-    return ProcessGroupCollection(
+    pg_kwargs = dict(
         tp=ps.tp_group,
         cp=ps.cp_group,
         pp=ps.pp_group,
@@ -385,14 +388,18 @@ def _build_pg_collection(ps, engine_cfg):
         expt_tp=ps.etp_group,
         tp_ep=ps.tp_ep_group,
         tp_ep_pp=tp_ep_pp_group,
-        # For MC distributed optimizer, grad stats are reduced over the full optimizer instance.
+        # For dist_opt, grad stats are reduced over the full optimizer instance.
         # With a single dist-opt instance in this benchmark proof, that is the global world group.
         intra_dist_opt=dist.group.WORLD,
-        # ML models do not expose MC's embedding/position-embedding sharing surface.
-        # Use singleton groups so MC's optional embedding reductions become no-ops
+        # ML models do not expose Megatron-Core's embedding/position-embedding sharing surface.
+        # Use singleton groups so optional embedding reductions become no-ops
         # without falling back to the global MCore embedding group.
         embd=singleton_group,
         pos_embd=singleton_group,
+    )
+    supported_fields = {field.name for field in fields(ProcessGroupCollection)}
+    return ProcessGroupCollection(
+        **{key: value for key, value in pg_kwargs.items() if key in supported_fields}
     )
 
 
@@ -402,9 +409,9 @@ def _build_pg_collection(ps, engine_cfg):
 
 
 @dataclass(frozen=True, slots=True)
-class MCBackend:
-    name: str = "mc"
-    runtime_backend: str = "mc"
+class DistOptBackend:
+    name: str = "dist_opt"
+    runtime_backend: str = "dist_opt"
 
     def zero_grad(self, optimizer: Any) -> None:
         optimizer.zero_grad()
@@ -431,14 +438,15 @@ class MCBackend:
         finalize_fn(model_chunks, optimizer)
 
 
-BACKEND = MCBackend()
+BACKEND = DistOptBackend()
 
 __all__ = [
     "BACKEND",
-    "MCBackend",
-    "build_mc_stack",
-    "build_mc_training_optimizer",
-    "finalize_mc_grads",
-    "validate_mc_config",
-    "validate_mc_session",
+    "DistOptBackend",
+    "build_dist_opt_optimizer_config",
+    "build_dist_opt_stack",
+    "build_dist_opt_training_optimizer",
+    "finalize_dist_opt_grads",
+    "validate_dist_opt_config",
+    "validate_dist_opt_session",
 ]

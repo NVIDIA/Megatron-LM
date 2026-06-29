@@ -8,6 +8,7 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
+load_hf_weights: true
 
 model_name: auto
 impl: lite

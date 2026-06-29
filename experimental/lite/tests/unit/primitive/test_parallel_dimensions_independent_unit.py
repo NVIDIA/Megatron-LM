@@ -85,11 +85,15 @@ def test_cp_packed_split_handles_each_sample_independently():
     assert rank1[3] == 4
 
 
-def test_pp_layout_rejects_non_divisible_layer_counts():
-    ps = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
+def test_pp_layout_auto_balances_non_divisible_layer_counts():
+    # Non-divisible counts no longer raise "not divisible": mcore's layout balances
+    # them. 7/pp2 with embedding/loss accounting -> [4, 3]. (Needs megatron.core.)
+    pytest.importorskip("megatron.core.transformer.pipeline_parallel_layer_layout")
+    rank0 = ParallelState(pp_size=2, pp_rank=0, pp_is_first=True, pp_is_last=False)
+    rank1 = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
 
-    with pytest.raises(ValueError, match="not divisible"):
-        build_pipeline_chunk_layout(7, ps)
+    assert build_pipeline_chunk_layout(7, rank0).layer_indices == [0, 1, 2, 3]
+    assert build_pipeline_chunk_layout(7, rank1).layer_indices == [4, 5, 6]
 
 
 def test_dp_dimension_controls_dense_microbatch_contract():

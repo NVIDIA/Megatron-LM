@@ -24,6 +24,6 @@ class ModelBundle:
     parallel_state: ParallelState
     optimizer: Any | None = None
     finalize_grads: Callable[[], None] | None = None
-    forward_step: Callable[[nn.Module, dict], dict] | None = None
+    forward_step: Callable[..., dict] | None = None
     # extra metadata (expert_classifier, model_cfg, etc.)
     extras: dict[str, Any] = field(default_factory=dict)

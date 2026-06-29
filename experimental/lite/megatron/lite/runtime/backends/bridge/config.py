@@ -27,6 +27,11 @@ class BridgeConfig:
     load_hf_weights: bool = True
     build_optimizer: bool = True
 
+    # When False, the bridge feeds a dense [b=1, s] forward (no THD packing).
+    # Used for deterministic layout-matched parity vs models whose Megatron-Core
+    # kernel is dense-only (e.g. GatedDeltaNet). Default True keeps THD packing.
+    use_thd: bool = True
+
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     override_optimizer_config: dict[str, Any] = field(default_factory=dict)

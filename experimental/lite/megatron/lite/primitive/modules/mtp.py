@@ -17,7 +17,22 @@ from megatron.lite.primitive.parallel import (
     scatter_to_sequence_parallel,
 )
 
-__all__ = ["MTPBlock", "MTPDecoderLayer", "MTPLossAutoScaler"]
+__all__ = ["MTPBlock", "MTPDecoderLayer", "MTPLossAutoScaler", "roll_mtp_tensor_left"]
+
+
+def roll_mtp_tensor_left(
+    tensor: torch.Tensor, *, packed_seq_params=None, dims: int = -1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Roll MTP inputs/labels one token left for dense or packed THD batches."""
+    if packed_seq_params is not None:
+        return roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=dims)
+
+    dim = dims if dims >= 0 else tensor.dim() + dims
+    rolled = torch.roll(tensor, shifts=-1, dims=dim)
+    index = [slice(None)] * tensor.dim()
+    index[dim] = slice(-1, None)
+    rolled[tuple(index)] = 0
+    return rolled, rolled.sum()
 
 
 class MTPLossAutoScaler(torch.autograd.Function):
@@ -76,9 +91,9 @@ class MTPDecoderLayer(nn.Module):
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
-        input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = roll_mtp_tensor_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
         if position_ids is not None:
-            position_ids, _ = roll_packed_thd_left(
+            position_ids, _ = roll_mtp_tensor_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
             )
         decoder_input = scatter_to_sequence_parallel(self.embedding(input_ids), self.ps)

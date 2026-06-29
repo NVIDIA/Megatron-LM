@@ -24,6 +24,10 @@ add_pythonpath "${VERL_ROOT:-}"
 add_pythonpath "${MEGATRON_ROOT:-}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  unset ROCR_VISIBLE_DEVICES
+  unset HIP_VISIBLE_DEVICES
+fi
 
 : "${MODEL_PATH:?set MODEL_PATH to a Hugging Face checkpoint directory or model id}"
 : "${TRAIN_FILES:?set TRAIN_FILES to a messages parquet path or comma-separated parquet paths}"
@@ -46,13 +50,14 @@ SAVE_FREQ="${SAVE_FREQ:-${TOTAL_STEPS}}"
 TEST_FREQ="${TEST_FREQ:--1}"
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
+CHECKPOINT_SAVE_CONTENTS="${CHECKPOINT_SAVE_CONTENTS:-[model,optimizer,extra]}"
+LOAD_HF_WEIGHTS="${LOAD_HF_WEIGHTS:-True}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 MAX_LENGTH="${MAX_LENGTH:-${MAX_TOKENS_PER_GPU}}"
 PAD_MODE="${PAD_MODE:-no_padding}"
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
-USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
 IGNORE_INPUT_IDS_MISMATCH="${IGNORE_INPUT_IDS_MISMATCH:-True}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-True}"
 MESSAGES_KEY="${MESSAGES_KEY:-messages}"
@@ -70,9 +75,9 @@ MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # Optimizer backend:
-# - distopt (default): Megatron-Core DDP + distributed optimizer.
+# - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
-MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-distopt}"
+MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
 
 LR="${LR:-1e-5}"
 MIN_LR="${MIN_LR:-${LR}}"
@@ -102,14 +107,14 @@ if [[ "${PAD_MODE}" != "no_padding" ]]; then
 fi
 
 case "${MLITE_OPTIMIZER_BACKEND}" in
-  distopt)
-    MLITE_IMPL_OPTIMIZER="mc"
+  dist_opt)
+    MLITE_IMPL_OPTIMIZER="dist_opt"
     ;;
   fsdp2)
     MLITE_IMPL_OPTIMIZER="fsdp2"
     ;;
   *)
-    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt or fsdp2." >&2
+    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected dist_opt or fsdp2." >&2
     exit 1
     ;;
 esac
@@ -149,7 +154,6 @@ COMMON_ARGS=(
   "model=hf_model"
   "model.path=${MODEL_PATH}"
   "model.trust_remote_code=${TRUST_REMOTE_CODE}"
-  "model.use_remove_padding=${USE_REMOVE_PADDING}"
   "optim=megatron"
   "optim.lr=${LR}"
   "optim.min_lr=${MIN_LR}"
@@ -172,7 +176,7 @@ COMMON_ARGS=(
   "trainer.resume_from_path=${RESUME_FROM_PATH}"
   "trainer.nnodes=${NNODES}"
   "trainer.n_gpus_per_node=${NPROC_PER_NODE}"
-  "checkpoint.save_contents=[model,optimizer,extra]"
+  "checkpoint.save_contents=${CHECKPOINT_SAVE_CONTENTS}"
 )
 
 if [[ -n "${VAL_FILES}" ]]; then
@@ -195,6 +199,7 @@ BACKEND_ARGS=(
   "engine.optimizer_offload=${OPTIMIZER_OFFLOAD}"
   "engine.grad_offload=${GRAD_OFFLOAD}"
   "engine.attention_backend_override=${ATTENTION_BACKEND}"
+  "engine.load_hf_weights=${LOAD_HF_WEIGHTS}"
   "engine.impl_cfg.use_thd=True"
   "+engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
@@ -215,6 +220,7 @@ COMMAND=(
   --master_port="${MASTER_PORT}"
   --nproc_per_node="${NPROC_PER_NODE}"
   -m
+  verl_mlite.launch
   verl.trainer.sft_trainer
   "${COMMON_ARGS[@]}"
   "${BACKEND_ARGS[@]}"

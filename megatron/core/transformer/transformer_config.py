@@ -376,6 +376,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
     ####################
     # initialization
     ####################
@@ -1250,6 +1253,10 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
+    """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
+    None causes the states to follow the activation dtype."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )
@@ -1294,7 +1301,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1302,6 +1309,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "fused_group_mlp": offload the input of the whole fused grouped MLP.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1554,6 +1562,15 @@ class TransformerConfig(ModelParallelConfig):
                         f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
                         f"PyTorch fallback."
                     )
+
+        if (
+            self.gdn_pre_gated_delta_rule_fusion
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "gdn_pre_gated_delta_rule_fusion is only supported with "
+                "experimental_attention_variant='gated_delta_net'."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2029,6 +2046,7 @@ class TransformerConfig(ModelParallelConfig):
                 "core_attn",
                 "attn_proj",
                 "expert_fc1",
+                "fused_group_mlp",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -2067,16 +2085,28 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.fine_grained_offloading_max_inflight_offloads >= 0
                 ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
+            if "fused_group_mlp" in self.offload_modules:
+                if not self.use_transformer_engine_op_fuser:
+                    raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+                moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+                if moe_partial_offload:
+                    raise ValueError(
+                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
+                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+                    )
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
                 "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                 "there is no need to use paged stashing without it."
             )
-            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+                self.offload_modules
+            )
             assert not moe_offload_conflict, (
                 "When moe_paged_stash is enabled, offload_modules must not include "
-                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"expert_fc1, moe_act, or fused_group_mlp "
+                f"(paged stash covers those activations). "
                 f"Remove: {moe_offload_conflict}"
             )
 
@@ -2784,9 +2814,22 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert self.cuda_graph_impl in ("transformer_engine", "full_iteration"), (
+                offload_modules = set(self.offload_modules or [])
+                local_partial_moe_offload = (
+                    self.cuda_graph_impl == "local"
+                    and bool(offload_modules)
+                    and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    and CudaGraphModule.moe not in self.cuda_graph_modules
+                )
+                assert (
+                    self.cuda_graph_impl in ("transformer_engine", "full_iteration")
+                    or local_partial_moe_offload
+                ), (
                     "fine-grained activation offloading is only supported with "
-                    "transformer_engine or full_iteration CUDA graph implementation."
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope. Local partial CUDA graphs "
+                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
+                    "offload when the full MoE module is not captured."
                 )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules

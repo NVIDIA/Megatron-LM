@@ -193,6 +193,7 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
         self.mtp_layer_number: Optional[int] = None
+        self.frozen_expert_bias = False
 
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
@@ -716,7 +717,11 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    flat_mask = padding_mask.reshape(-1)
+                    assert (
+                        flat_mask.shape[0] == routing_map.shape[0]
+                    ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
+                    routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
