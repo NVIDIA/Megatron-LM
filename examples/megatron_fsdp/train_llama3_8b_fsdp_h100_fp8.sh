@@ -220,7 +220,8 @@ if [ "${NSYS_PROFILE}" = 1 ]; then
         --profile-step-end 12
         --profile-ranks 0
         --record-memory-history
-        --memory-snapshot-path "${NSYS_PROFILE_PATH}/torch_memprof_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
+        # To produce a PyTorch memory profile...
+        # --memory-snapshot-path "${NSYS_PROFILE_PATH}/torch_memprof_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
     )
     PROFILE_CMD=(
         nsys profile
