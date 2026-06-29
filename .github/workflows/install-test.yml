@@ -84,10 +84,8 @@ jobs:
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
       - name: Check imports for megatron.inference
-        uses: ./FW-CI-templates/.github/actions/check-imports
-        with:
-          package-name: megatron.inference
-          python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
+        shell: bash -x -e -u -o pipefail {0}
+        run: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python -c "import megatron.inference"
 
   uv-test-pytorch:
     needs: [pre-flight]
