@@ -26,9 +26,13 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version
 
 try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_mla_rope_inplace,
+        fused_mla_rope_out_of_place,
+    )
 except Exception:
     fused_mla_rope_inplace = None
+    fused_mla_rope_out_of_place = None
 
 
 if HAVE_TE:
@@ -357,7 +361,11 @@ class DSv4HybridAttention(Attention):
         if self.config.apply_rope_fusion:
             if packed_seq:
                 core_attn_out = core_attn_out.squeeze(1)
-            core_attn_out = fused_mla_rope_inplace(
+            # Fused DSA backward retains the raw attention output O. Applying
+            # inverse RoPE to its view in-place corrupts the retained O used by
+            # the softmax backward, so this call needs private storage.
+            assert fused_mla_rope_out_of_place is not None
+            core_attn_out = fused_mla_rope_out_of_place(
                 core_attn_out,
                 rotary_pos_cos,
                 rotary_pos_sin,
