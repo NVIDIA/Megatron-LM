@@ -151,6 +151,17 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         device = torch.cuda.current_device()
 
         if cls._use_allgather_v:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                is_batch_invariant_mode_enabled,
+            )
+            assert not is_batch_invariant_mode_enabled(), (
+                "batch_invariant_mode is incompatible with NCCLAllGatherDispatcher's "
+                "non-CG AllGatherV path: BIK's _bik_global_unpermute assumes uniform "
+                "[ep_size * local_tokens, H] partitioning, but the AllGatherV path "
+                "produces a compact [sum(per-rank tokens), H] layout where per-rank "
+                "blocks are not aligned at rank * local_tokens boundaries. BIK runs "
+                "are expected to use CUDA graphs (which take the equal-token path)."
+            )
             local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
