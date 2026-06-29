@@ -22,7 +22,6 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -454,7 +453,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, hybrid_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         store=store,

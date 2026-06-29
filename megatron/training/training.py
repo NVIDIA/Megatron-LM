@@ -1004,7 +1004,6 @@ def preprocess_common_state_dict(common_state_dict):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
-    model_provider,
     model_type,
     forward_step_func,
     process_non_loss_data_func=None,
@@ -1094,6 +1093,8 @@ def pretrain(
         seed_ep_group=getattr(init_pg_collection, "ep", None),
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1221,7 +1222,10 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_type,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        pg_collection=pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1262,7 +1266,7 @@ def pretrain(
             )
 
             # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(model_cfg)
+            inference_config = copy.deepcopy(cfg_container.model)
             if args.rl_inference_tensor_model_parallel_size is not None:
                 inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
             if args.rl_inference_pipeline_model_parallel_size is not None:
@@ -1306,12 +1310,11 @@ def pretrain(
                 model_alloc_ctx = nullcontext()
 
             with model_alloc_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
+                builder_cls = inference_config.get_builder_cls()
+                builder = builder_cls(inference_config)
+                inference_model = builder.build_distributed_models(
                     pg_collection=inference_pg_collection,
-                    config=inference_config,
+                    wrap_with_ddp=False,
                 )
             inference_model[0].eval()
 
@@ -1990,10 +1993,11 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
     checkpointing_context=None,
-    pg_collection=None,
+    *,
+    cfg_container: PretrainConfigContainer,
+    pg_collection: ProcessGroupCollection,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2006,9 +2010,27 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(
-        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
-    )
+
+    def _build_model_wrapper(wrap_with_ddp: bool):
+        from megatron.training.utils import start_memory_history_recording
+
+        start_memory_history_recording(cfg_container.profiling)
+
+        cfg = cfg_container
+        model_config = cfg.model
+        builder_cls = model_config.get_builder_cls()
+        builder = builder_cls(model_config)
+        return builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg.ddp,
+            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            wrap_with_ddp=wrap_with_ddp,
+            data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        )
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:
@@ -2081,7 +2103,7 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
