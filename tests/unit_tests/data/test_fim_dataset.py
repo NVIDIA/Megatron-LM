@@ -12,6 +12,7 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize("spm_rate", [0.0, 1.0])
 @pytest.mark.parametrize("split_sample", [None, "python"])
+@pytest.mark.usefixtures("ensure_test_data")
 def test_fim_gpt_dataset(spm_rate, split_sample):
     if torch.distributed.is_available():
         Utils.initialize_distributed()

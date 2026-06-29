@@ -1,10 +1,19 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Training Examples
 
 Get started with Megatron Core training using these practical examples.
 
-## Simple Training Example
+## Basic Training Example
 
-The simplest way to get started is with the basic training loop using mock data:
+Use the basic training loop with mock data to get started:
 
 ```bash
 # Distributed training on 2 GPUs with mock data
@@ -12,23 +21,25 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ```
 
 This example:
-- Runs on 2 GPUs
+
+- Runs on two GPUs
 - Uses generated mock data (no data preparation needed)
 - Demonstrates basic distributed training setup
-- Perfect for testing your installation
+- Provides a quick way to verify your installation
 
 ## LLaMA-3 Training Examples
 
 ### LLaMA-3 8B with FP8
 
-Train LLaMA-3 8B model with FP8 mixed precision on 8 GPUs:
+Train the LLaMA-3 8B model with FP8 mixed precision on eight GPUs:
 
 ```bash
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/llama/train_llama3_8b_h100_fp8.sh
 ```
 
-**Configuration:**
-- 8 GPUs
+**Configuration**
+
+- Eight GPUs
 - FP8 mixed precision (requires Hopper/Ada/Blackwell GPUs)
 - Mock data for quick testing
 
@@ -95,6 +106,8 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 ## Key Training Arguments
 
+The following tables group common training arguments by category.
+
 ### Model Architecture
 
 | Argument | Description |
@@ -134,13 +147,13 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 | Argument | Description |
 |----------|-------------|
 | `--data-path` | Path to preprocessed data |
-| `--split` | Train/validation/test split (e.g., 949,50,1) |
+| `--split` | Train/validation/test split (for example, 949,50,1) |
 | `--save` | Checkpoint save directory |
 | `--load` | Checkpoint load directory |
 | `--save-interval` | Save checkpoint every N iterations |
 
 ## Next Steps
 
-- **Optimize Performance**: See [Advanced Features](features/index.md) for FSDP, distributed optimizer, and other optimizations
-- **Scale Up**: Learn about [Parallelism Strategies](parallelism-guide.md) to train larger models across more GPUs
+- **Optimize Performance**: Refer to [Advanced Features](features/index.md) for FSDP, the distributed optimizer, and other optimizations
+- **Scale Up**: Refer to [Parallelism Strategies](parallelism-guide.md) to train larger models across more GPUs
 - **Prepare Data**: Follow the [Data Preparation](data-preparation.md) guide to process your own datasets

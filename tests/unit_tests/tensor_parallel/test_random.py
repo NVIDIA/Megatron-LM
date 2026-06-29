@@ -193,10 +193,20 @@ def test_checkpoint():
     assert torch.equal(
         torch.ones(16) * 3, checkpoint(test_forward, None, torch.ones(16), torch.ones(16) * 2)
     )
-    Utils.initialize_model_parallel()
-    input1 = torch.ones((4, 4))
-    checkpoint(test_forward, True, input1, torch.ones((4, 4)) * 2)
-    assert torch.equal(torch.ones(input1.numel()).cuda(), input1)
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    input1 = torch.ones((4, 4)).cuda()
+    input1.requires_grad_(True)
+    input2 = torch.ones((4, 4)).cuda() * 2
+    output = checkpoint(test_forward, True, input1, input2)
+
+    assert torch.equal(output, torch.ones((4, 4)).cuda() * 3)
+    assert input1.data.shape == (8,)
+
+    output.sum().backward()
+    assert input1.grad is not None
+    assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
+
     Utils.destroy_model_parallel()
 
 
@@ -227,4 +237,62 @@ def test_checkpoint_without_output():
     output2.backward(torch.ones((4, 4)), retain_graph=True)
     assert torch.equal(input1.grad, input2.grad)
 
-    Utils.destroy_model_parallel()
+
+class _ViewSavingLinear(torch.autograd.Function):
+    """Saves view tensors in forward to mimic TE GroupedLinear-style backward inputs."""
+
+    @staticmethod
+    def forward(ctx, inp, weight):
+        inp_2d = inp.reshape(-1, inp.shape[-1])
+        inputmats = torch.tensor_split(inp_2d, 2, dim=0)
+        ctx.save_for_backward(*inputmats, weight)
+        ctx.input_shape = inp.shape
+        out_2d = inp_2d.matmul(weight.t())
+        return out_2d.reshape(*inp.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        *inputmats, weight = ctx.saved_tensors
+        for inputmat in inputmats:
+            if inputmat.numel() > 0 and inputmat.untyped_storage().size() == 0:
+                raise RuntimeError("Saved view tensor points to an empty storage.")
+
+        inp_2d = torch.cat(inputmats, dim=0)
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_input_2d = grad_output_2d.matmul(weight)
+        grad_weight = grad_output_2d.t().matmul(inp_2d)
+        grad_input = grad_input_2d.reshape(ctx.input_shape)
+        return grad_input, grad_weight
+
+
+def test_checkpoint_without_output_view_sharing_regression():
+    def normal_forward(input_, weight):
+        x = torch.nn.functional.gelu(input_)
+        return _ViewSavingLinear.apply(x, weight)
+
+    def checkpoint_forward(input_, weight):
+        checkpoint = CheckpointWithoutOutput()
+        x = checkpoint.checkpoint(torch.nn.functional.gelu, input_)
+        y = _ViewSavingLinear.apply(x, weight)
+        checkpoint.discard_output_and_register_recompute(y)
+        return y
+
+    Utils.initialize_model_parallel()
+    try:
+        input1 = torch.randn((3, 2, 8), requires_grad=True)
+        weight1 = torch.randn((6, 8), requires_grad=True)
+
+        input2 = input1.detach().clone().requires_grad_(True)
+        weight2 = weight1.detach().clone().requires_grad_(True)
+
+        output1 = normal_forward(input1, weight1)
+        output2 = checkpoint_forward(input2, weight2)
+        assert torch.allclose(output1, output2)
+
+        grad = torch.randn_like(output1)
+        output1.backward(grad, retain_graph=True)
+        output2.backward(grad, retain_graph=True)
+        assert torch.allclose(input1.grad, input2.grad)
+        assert torch.allclose(weight1.grad, weight2.grad)
+    finally:
+        Utils.destroy_model_parallel()

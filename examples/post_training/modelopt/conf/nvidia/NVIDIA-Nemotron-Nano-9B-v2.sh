@@ -19,15 +19,13 @@ MODEL_ARGS=" \
     --no-rope-fusion \
     --normalization RMSNorm \
     --squared-relu \
-    --num-layers 56 \
     --hidden-size 4480 \
     --ffn-hidden-size 15680 \
     --num-attention-heads 40 \
     --kv-channels 128 \
     --group-query-attention \
     --num-query-groups 8 \
-    --hybrid-override-pattern M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M- \
-    --is-hybrid-model \
+    --hybrid-layer-pattern M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M- \
     --mamba-head-dim 80 \
     --mamba-num-heads 128 \
     --mamba-num-groups 8 \
@@ -37,6 +35,6 @@ MODEL_ARGS=" \
     --tokenizer-type HuggingFaceTokenizer \
     --make-vocab-size-divisible-by 1 \
     --use-mcore-models \
-    --export-model-type MambaModel \
+    --export-model-type HybridModel \
     --padded-vocab-size 131072 \
 "

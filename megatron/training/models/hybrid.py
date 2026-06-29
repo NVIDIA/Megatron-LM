@@ -1,0 +1,255 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar, Literal, override
+
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.enums import ModelType
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec as default_hybrid_stack_spec,
+    hybrid_inference_stack_spec,
+)
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models.base import (
+    ModelBuilder,
+    ModelConfig,
+    compose_hooks,
+)
+from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.vocab_utils import calculate_padded_vocab_size
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(kw_only=True)
+class HybridModelConfig(ModelConfig):
+    """Configuration for a Megatron Core Hybrid model.
+
+    This is purely a configuration object. All model construction
+    logic lives in ``HybridModelBuilder``.
+
+    Contains a ``TransformerConfig`` alongside Hybrid-specific parameters. Attributes
+    on the embedded ``transformer`` config are accessible directly on this object
+    via ``__getattr__``/``__setattr__`` proxying.
+
+    Supports hybrid architectures via ``hybrid_layer_pattern``
+
+    Note:
+        ``vocab_size`` must be set before passing this config to ``HybridModelBuilder``.
+        ``hybrid_attention_ratio``,``hybrid_mlp_ratio``, and
+        ``hybrid_override_pattern`` are deprecated and will be removed in a future release.
+    """
+
+    builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
+    transformer: TransformerConfig
+    fp16_lm_cross_entropy: bool = False
+    parallel_output: bool = True
+    share_embeddings_and_output_weights: bool = False
+    hybrid_attention_ratio: float = 0.0
+    hybrid_mlp_ratio: float = 0.0
+    hybrid_override_pattern: str | None = None
+    hybrid_layer_pattern: str | None = None
+    seq_length: int = 8192
+    # HybridModel with no attention has no need for position embeddings, so none is default
+    position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
+    rotary_percent: float = 1.0
+    rotary_base: int = 10000
+    seq_len_interpolation_factor: float | None = None
+    make_vocab_size_divisible_by: int = 128
+    hybrid_stack_spec: ModuleSpec | None = None
+    vocab_size: int | None = None
+    should_pad_vocab: bool = False
+
+    @property
+    def mamba_stack_spec(self):
+        """Deprecated alias for hybrid_stack_spec."""
+        return self.hybrid_stack_spec
+
+    @mamba_stack_spec.setter
+    def mamba_stack_spec(self, value):
+        self.hybrid_stack_spec = value
+
+    @override
+    def __getattr__(self, name: str, /) -> Any:
+        # __getattr__ is only called when normal attribute lookup has already failed,
+        # so use object.__getattribute__ to fetch `transformer` without recursing.
+        try:
+            transformer = object.__getattribute__(self, "transformer")
+        except AttributeError:
+            raise AttributeError(f"HybridModelConfig has no attribute '{name}'")
+        if hasattr(transformer, name):
+            return getattr(transformer, name)
+        raise AttributeError(f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'.")
+
+    @override
+    def __setattr__(self, name: str, value: Any, /) -> None:
+        # Use object.__getattribute__ to avoid triggering __getattr__ while
+        # `transformer` may not yet exist (e.g. during dataclass __init__).
+        try:
+            transformer = object.__getattribute__(self, "transformer")
+        except AttributeError:
+            # `transformer` not yet initialised; store the attribute on self.
+            super().__setattr__(name, value)
+            return
+        if hasattr(transformer, name):
+            setattr(transformer, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def finalize(self) -> None:
+        """One time validation to run once config is ready to be used by builder."""
+
+        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
+            self.transformer.finalize()
+
+
+class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
+    """Builder to construct Megatron Core Hybrid models.
+
+    Example:
+        >>> transformer_cfg = TransformerConfig(num_layers=32, hidden_size=4096, ...)
+        >>> model_cfg = HybridModelConfig(transformer=transformer_cfg, vocab_size=32000, seq_length=2048, ...)
+        >>>
+        >>> # Single stage (e.g. inference)
+        >>> model = HybridModelBuilder(model_cfg).build_model(pg_collection)
+        >>>
+        >>> # Distributed training
+        >>> models = HybridModelBuilder(model_cfg).build_distributed_models(pg_collection)
+    """
+
+    def __init__(self, model_config: HybridModelConfig):
+        super().__init__(model_config)
+
+    def build_model(
+        self,
+        pg_collection: ProcessGroupCollection,
+        pre_process: bool | None = None,
+        post_process: bool | None = None,
+        vp_stage: int | None = None,
+    ) -> HybridModel:
+        """Build a single ``MCoreHybridModel`` stage.
+
+        Args:
+            pg_collection: Process groups for distributed training
+            pre_process: Include embedding layer
+            post_process: Include output layer
+            vp_stage: Virtual pipeline stage
+
+        Returns:
+            The constructed model
+
+        Note:
+            Virtual pipeline model parallelism is not supported for Hybrid models.
+        """
+        hybrid_stack_spec = self._model_config.hybrid_stack_spec
+        if hybrid_stack_spec is None:
+            if self._model_config.transformer.transformer_impl == "inference_optimized":
+                hybrid_stack_spec = hybrid_inference_stack_spec
+            elif self._model_config.restore_modelopt_state:
+                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
+                    local_core_attention=False,
+                    remap_te_layernorm=False,
+                )
+            else:
+                hybrid_stack_spec = default_hybrid_stack_spec
+
+        assert (
+            getattr(self._model_config.transformer, "virtual_pipeline_model_parallel_size", None) is None
+            and vp_stage is None
+        ), (
+            "Virtual pipeline model parallelism is temporarily unsupported in Hybrid "
+            "models due to upstream MCore HybridModel API dependency"
+        )
+
+        assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
+        if self._model_config.should_pad_vocab:
+            padded_vocab_size = calculate_padded_vocab_size(
+                self._model_config.vocab_size,
+                self._model_config.make_vocab_size_divisible_by,
+                self._model_config.transformer.tensor_model_parallel_size,
+            )
+        else:
+            padded_vocab_size = self._model_config.vocab_size
+
+        pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
+        post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        return HybridModel(
+            config=self._model_config.transformer,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=padded_vocab_size,
+            max_sequence_length=self._model_config.seq_length,
+            hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
+            fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            parallel_output=self._model_config.parallel_output,
+            share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
+            position_embedding_type=self._model_config.position_embedding_type,
+            rotary_percent=self._model_config.rotary_percent,
+            rotary_base=self._model_config.rotary_base,
+            seq_len_interpolation_factor=self._model_config.seq_len_interpolation_factor,
+            pre_process=pre_process,
+            post_process=post_process,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+        )
+
+    def build_distributed_models(
+        self,
+        pg_collection: ProcessGroupCollection,
+        ddp_config: DistributedDataParallelConfig | None = None,
+        overlap_param_gather_with_optimizer_step: bool = False,
+        use_megatron_fsdp: bool = False,
+        use_torch_fsdp2: bool = False,
+        wrap_with_ddp: bool = True,
+        data_parallel_random_init: bool = False,
+        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        model_type: ModelType = ModelType.encoder_or_decoder,
+    ) -> list[HybridModel]:
+        """Build model stages and wrap for distributed training.
+
+        Args:
+            pg_collection: Model communication process groups.
+            ddp_config: DistributedDataParallel configuration
+            overlap_param_gather_with_optimizer_step: Whether to overlap parameter
+                gather with optimizer step.
+            use_megatron_fsdp: Whether to use Megatron FSDP
+            use_torch_fsdp2: Whether to use Torch FSDP 2.0
+            wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
+            data_parallel_random_init: Whether to use data parallel random initialization
+            mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
+            model_type: Deprecated flag, only used for backwards compatibility.
+
+        Returns:
+            List of model stages.
+        """
+        transformer_config = self._model_config.transformer
+        composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
+        model_list = unimodal_build_distributed_models(
+            self.build_model,
+            transformer_config,
+            pg_collection,
+            ddp_config,
+            overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp,
+            use_torch_fsdp2,
+            wrap_with_ddp,
+            data_parallel_random_init,
+            mixed_precision_wrapper,
+            composed_pre_wrap_hook,
+            model_type,
+        )
+
+        composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
+        _model = composed_post_wrap_hook(model_list)
+        if _model is not None:
+            model_list = _model
+        else:
+            logger.warning("Final post wrap hook returned None, skipping post wrap hooks.")
+
+        return model_list

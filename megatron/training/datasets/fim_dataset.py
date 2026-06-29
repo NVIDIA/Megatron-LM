@@ -101,14 +101,15 @@ class GPTFIMDataset(GPTDataset):
             self.eod_tok_id,
         ) = fim_tokens_ids
 
-    def _query_document_sample_shuffle_indices(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _query_document_sample_shuffle_indices(self, idx: int) -> Tuple[np.ndarray, np.ndarray, list]:
         """Get the text (token ids) and document ids for a given index
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[np.ndarray, np.ndarray]: The text ids and document ids
+            Tuple[np.ndarray, np.ndarray, list]: The text ids, document ids,
+                and per-document token counts.
         """
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
@@ -179,7 +180,7 @@ class GPTFIMDataset(GPTDataset):
 
         assert sample.shape[0] == sample_len
 
-        return (np.array(sample, dtype=np.int64), np.array(document_ids, dtype=np.int64))
+        return (np.array(sample, dtype=np.int64), np.array(document_ids, dtype=np.int64), [sample_len])
 
     def _fim_permute_sequence(self, sequence, rate):
         return self._permute(
@@ -249,7 +250,10 @@ class GPTFIMDataset(GPTDataset):
         """
         if self.np_rng.binomial(1, fim_rate):  # sample bernoulli dist
 
-            contents = tokenizer._tokenizer.ids_to_text(sample)
+            # Use remove_special_tokens=True so character-level boundaries and re-tokenization
+            # are consistent; otherwise ids_to_text(..., None) keeps special tokens when
+            # include_special_tokens=True, changing contents and breaking e.g. split_sample.
+            contents = tokenizer._tokenizer.ids_to_text(sample, remove_special_tokens=True)
 
             # Do not apply FIM if the sample starts with no_fim_prefix
             if no_fim_prefix is not None and contents.startswith(no_fim_prefix):

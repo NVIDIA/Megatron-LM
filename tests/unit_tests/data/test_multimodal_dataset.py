@@ -11,7 +11,7 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
-from megatron.training.tokenizer.tokenizer import _NullTokenizer
+from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -26,6 +26,9 @@ def test_mock_multimodal_dataset():
     else:
         compile_helpers()
 
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
     config = MultimodalDatasetConfig(
         random_seed=1234,
         sequence_length=1024,
@@ -35,7 +38,7 @@ def test_mock_multimodal_dataset():
         image_h=336,
         image_w=336,
         split="990,9,1",
-        tokenizer=_NullTokenizer(vocab_size=_MOCK_VOCAB_SIZE),
+        tokenizer=tokenizer,
         mid_level_dataset_surplus=0.005,
     )
 

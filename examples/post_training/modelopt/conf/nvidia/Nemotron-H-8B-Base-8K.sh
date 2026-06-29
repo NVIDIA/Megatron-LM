@@ -20,14 +20,12 @@ MODEL_ARGS=" \
     --no-position-embedding \
     --normalization RMSNorm \
     --squared-relu \
-    --num-layers 52 \
     --hidden-size 4096 \
     --ffn-hidden-size 21504 \
     --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 8 \
-    --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
-    --is-hybrid-model \
+    --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
     --mamba-head-dim 64 \
     --mamba-num-heads 128 \
     --mamba-num-groups 8 \
@@ -39,6 +37,6 @@ MODEL_ARGS=" \
     --use-mcore-models \
     --rotary-percent 0.5 \
     --rotary-base 500000 \
-    --export-model-type MambaModel \
+    --export-model-type HybridModel \
 "
 #    --rotary-base 10000 \

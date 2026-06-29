@@ -38,7 +38,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch_dist \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --num-layers 64 \

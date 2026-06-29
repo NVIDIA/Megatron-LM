@@ -25,16 +25,12 @@ assert (
 class GSM8KAgent(MathAgent):
     def __init__(self,
         answer_format: str = "boxed",
-        chat_mode: bool = False,
-        assistant_suffix: str = "Assistant: Let me solve this step by step.\n<think>",
         format_reward: float = 0.0,
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
         **kwargs):
         super().__init__(
             answer_format=answer_format,
-            chat_mode=chat_mode,
-            assistant_suffix=assistant_suffix,
             format_reward=format_reward,
             negative_reward=negative_reward,
             partial_end_reward=partial_end_reward,
@@ -68,8 +64,8 @@ class GSM8KAgent(MathAgent):
         prompt = self.make_prefix(**golden)
         return prompt, golden
 
-    async def get_reward(self, response, golden: dict) -> float:
-        return self.compute_score(response, golden, golden_key="numeric_answer")
+    async def get_reward(self, response, golden: dict, finish_reason: str) -> float:
+        return self.compute_score(response, golden, golden_key="numeric_answer", finish_reason=finish_reason)
 
 
 # pytest

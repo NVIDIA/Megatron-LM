@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 import sys
@@ -16,7 +17,7 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
+from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator, CommRole
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -108,6 +109,9 @@ def _shard_and_copy_(
         )
 
 
+_active_grids: list = []
+
+
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
@@ -128,7 +132,17 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     _ = grid.create_pg(["cp"])
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
+    _active_grids.append(grid)
     return grid
+
+
+def destroy_all_grids():
+    """Destroy all tracked grids and bridge communicator PGs."""
+    for grid in _active_grids:
+        grid.destroy()
+    _active_grids.clear()
+    BridgeCommunicator.destroy_broadcast_pgs()
+    BridgeCommunicator.destroy_bridge_pgs()
 
 
 def _get_pg_collection_from_grid(grid):
@@ -180,6 +194,82 @@ def get_transformer_block_and_grid(
     return block, grid
 
 
+class TestBridgeCommunicatorSplitMetadata:
+    """CPU-only checks for packed modality split metadata."""
+
+    @staticmethod
+    def _bridge():
+        bridge = BridgeCommunicator.__new__(BridgeCommunicator)
+        bridge.tensor_ndim = 2
+        bridge.dim_mapping = {'b': 0}
+        return bridge
+
+    def test_split_tensor_aggregates_per_sample_metadata_by_peer(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [0, 3, 1, 2]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+        assert [split.shape[0] for split in splits] == [3, 3]
+        torch.testing.assert_close(splits[0], tensor[:3])
+        torch.testing.assert_close(splits[1], tensor[3:])
+
+    def test_split_tensor_keeps_per_peer_metadata(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 3, 2]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=3)
+
+        assert [split.shape[0] for split in splits] == [1, 3, 2]
+        torch.testing.assert_close(splits[0], tensor[:1])
+        torch.testing.assert_close(splits[1], tensor[1:4])
+        torch.testing.assert_close(splits[2], tensor[4:])
+
+    def test_split_tensor_rejects_non_divisible_sample_metadata(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 2, 3]
+
+        with pytest.raises(ValueError, match="bridge split metadata has 3 entries"):
+            self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+    def test_split_tensor_rejects_metadata_sum_mismatch(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [2, 2]
+
+        with pytest.raises(ValueError, match="bridge split metadata sums to 4"):
+            self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+    def test_split_tensor_short_circuits_metadata_for_single_split(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 5]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=1)
+
+        assert len(splits) == 1
+        torch.testing.assert_close(splits[0], tensor)
+
+    def test_as_per_peer_tensors_broadcasts_single_tensor(self):
+        tensor = torch.zeros(2, 1)
+
+        peers = BridgeCommunicator._as_per_peer_tensors(tensor, expected_count=3)
+
+        assert len(peers) == 3
+        assert all(peer is tensor for peer in peers)
+
+    def test_as_per_peer_tensors_passes_through_list(self):
+        tensors = [torch.zeros(2, 1), torch.zeros(3, 1)]
+
+        peers = BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=2)
+
+        assert peers == tensors
+
+    def test_as_per_peer_tensors_rejects_count_mismatch(self):
+        tensors = [torch.zeros(2, 1), torch.zeros(3, 1)]
+
+        with pytest.raises(ValueError, match="expected 3 tensors for shape communication, got 2"):
+            BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=3)
+
+
 class TestBridgeCommunicator:
 
     @classmethod
@@ -200,6 +290,9 @@ class TestBridgeCommunicator:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def teardown_method(self):
+        destroy_all_grids()
+
     def test_bridge_communicator_init(self):
 
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
@@ -209,6 +302,29 @@ class TestBridgeCommunicator:
         assert bridge_communicator.dest_grid is grid2
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
+
+    @pytest.mark.parametrize(
+        "grid1_tp, grid1_dp, grid2_tp, grid2_dp",
+        [
+            (2, 2, 4, 1),  # fan-in: 2 src leaders -> 1 dest leader
+            (4, 1, 2, 2),  # fan-out: 1 src leader -> 2 dest leaders
+            (2, 1, 2, 1),  # equal leaders
+        ],
+    )
+    def test_bridge_pg_membership(self, grid1_tp, grid1_dp, grid2_tp, grid2_dp):
+        grid1 = create_hypercomm_grid(offset=0, tp=grid1_tp, cp=1, pp=1, dp=grid1_dp)
+        grid2 = create_hypercomm_grid(offset=4, tp=grid2_tp, cp=1, pp=1, dp=grid2_dp)
+        bridge = BridgeCommunicator(grid1, grid2)
+
+        assert bridge.bridge_pg is not None
+        expected = sorted(set(bridge.src_tp_leaders) | set(bridge.dest_tp_leaders))
+        assert dist.get_process_group_ranks(bridge.bridge_pg) == expected
+
+        # MEMBER (broadcast-only) ranks must not be in the bridge group.
+        member_ranks = [
+            rank for rank, info in bridge.comm_map.items() if info.role == CommRole.MEMBER
+        ]
+        assert all(rank not in expected for rank in member_ranks)
 
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
@@ -469,3 +585,47 @@ class TestBridgeCommunicator:
         assert (
             dest_leaders == expected_dest_leaders
         ), f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+
+    def test_2d_fan_in_fwd_bwd(self):
+        """Fan-in with 2D tensors: 4 src DP ranks → 1 dest DP group, forward + backward."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
+        bridge = BridgeCommunicator(
+            src_grid,
+            dest_grid,
+            dim_mapping={'s': 0, 'h': 2, 'b': 1},
+            comm_dtype=torch.float32,
+            tensor_ndim=2,
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.full((577, 128), float(rank + 1), device='cuda')
+            grad = bridge.send_forward_recv_backward(tensor)
+            assert grad.shape == (577, 128)
+        else:
+            grad = torch.randn(577 * 4, 128, device='cuda')
+            activation = bridge.send_backward_recv_forward(grad)
+            assert activation.shape == (577 * 4, 128)
+
+    def test_2d_fan_out_fwd_bwd(self):
+        """Fan-out with 2D tensors: 1 src DP group → 4 dest DP ranks, forward + backward."""
+        src_grid = create_hypercomm_grid(offset=0, tp=4, cp=1, pp=1, dp=1)
+        dest_grid = create_hypercomm_grid(offset=4, tp=1, cp=1, pp=1, dp=4)
+        bridge = BridgeCommunicator(
+            src_grid,
+            dest_grid,
+            dim_mapping={'s': 0, 'h': 2, 'b': 1},
+            comm_dtype=torch.float32,
+            tensor_ndim=2,
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.randn(577 * 4, 128, device='cuda')
+            grad = bridge.send_forward_recv_backward(tensor)
+            assert grad.shape == (577 * 4, 128)
+        else:
+            grad = torch.full((577, 128), float(rank), device='cuda')
+            activation = bridge.send_backward_recv_forward(grad)
+            assert activation.shape == (577, 128)

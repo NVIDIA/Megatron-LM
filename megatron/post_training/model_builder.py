@@ -1,7 +1,8 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 """ModelOpt GPT model provider."""
 
+import logging
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -12,19 +13,20 @@ import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
-from megatron.core.models.mamba import MambaModel as MCoreMambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel as MCoreHybridModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-
-from megatron.post_training.utils import print_distributed_quant_summary
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -47,9 +49,9 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
 def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
-    The config provided via --teacher-model-config should specify
-    (in NEMO format) any model architecture settings which differ from the main student model's.
-    This function will translate NEMO field names to MCore as needed.
+    The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
+    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
+    This function will translate NeMo field names to MCore as needed.
     """
     required_teacher_fields = (
         "num_layers",
@@ -59,18 +61,22 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     )
 
     args = get_args()
-    config_path = os.path.join(checkpoint_path, "model_config.yaml") if args.teacher_model_config is None else args.teacher_model_config
+    if args.export_kd_teacher_model_config is not None:
+        config_path = args.export_kd_teacher_model_config
+    else:
+        config_path = os.path.join(checkpoint_path, "model_config.yaml")
     if not os.path.exists(config_path):
         raise FileNotFoundError(
-            "Teacher checkpoint dir must contain a NEMO-format yaml config named 'model_config.yaml'"
+            f"Teacher model-config file {config_path} not found.\n"
+            "Teacher checkpoint dir must contain a NeMo-format config named 'model_config.yaml'"
+            " or provide it via --export-kd-teacher-model-config."
         )
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    missing_keys = [k for k in required_teacher_fields if k not in config]
-    if missing_keys:
+    if missing_keys := [k for k in required_teacher_fields if k not in config]:
         raise ValueError(
-            f"Teacher `model_config.yaml` file missing the following fields: {missing_keys}"
+            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
         )
 
     if "encoder_seq_length" in config:
@@ -99,25 +105,34 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
     args_dict.update(config)
+
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (args_dict.get('hybrid_override_pattern') is not None
+            and args_dict.get('hybrid_layer_pattern') is None):
+        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
 
     return Namespace(**args_dict)
 
 
-def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
     """Teacher model creator."""
     args = get_args()
 
     if config.is_hybrid_model:
-        # These parameters are not part of the TransformerConfig and need to be passed separately.
-        if "hybrid_override_pattern" in config_raw:
-            model_kwargs["hybrid_override_pattern"] = config_raw.hybrid_override_pattern
-        if "hybrid_attention_ratio" in config_raw:
-            model_kwargs["hybrid_attention_ratio"] = config_raw.hybrid_attention_ratio
-        if "hybrid_mlp_ratio" in config_raw:
-            model_kwargs["hybrid_mlp_ratio"] = config_raw.hybrid_mlp_ratio
+        # This parameter is not part of the TransformerConfig and needs to be passed separately.
+        # Note: hybrid_override_pattern is remapped to hybrid_layer_pattern in
+        # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
+        model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
 
-        teacher = MCoreMambaModel(config=config, **model_kwargs)
+        teacher = MCoreHybridModel(config=config, **model_kwargs)
     else:
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
@@ -131,35 +146,96 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+                use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
+
     _add_load_convert_hooks(teacher)
 
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
-    # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
-    # True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
-    load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-    args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("...teacher loaded successfully.")
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
 
     return teacher
 
 
-def modelopt_gpt_mamba_builder(
+def _freeze_for_qad(model, target):
+    """Select which side of an MTP model trains during QAD / MTP QAT.
+
+    Splits parameters into the MTP heads (``mtp.layers.*``) and the base model,
+    and freezes one side so controlled QAD+MTP experiments can be run:
+
+    * ``"mtp"``  — train the MTP heads only, freeze the base. Used after QAD:
+      load a quantized checkpoint, add MTP heads, and train them while the
+      quantized base stays fixed (the production two-phase recipe).
+    * ``"base"`` — train the base only, freeze the MTP heads. QAD on the base
+      with the MTP head held at its init (e.g. measuring how well a frozen MTP
+      head rides on a quantizing base).
+    * ``"both"`` — train the base and the MTP heads together (QAD co-training).
+    """
+    if target not in ("mtp", "base", "both"):
+        raise ValueError(f"qad train target must be one of mtp/base/both, got {target!r}")
+
+    if target == "both":
+        for param in model.parameters():
+            param.requires_grad = True
+        # Nothing is frozen, so no router expert_bias should be pinned.
+        for module in model.modules():
+            if hasattr(module, 'expert_bias'):
+                module.frozen_expert_bias = False
+        print_rank_0("QAD train target 'both': all parameters trainable")
+        return
+
+    train_mtp = target == "mtp"
+    trainable, frozen = 0, 0
+    for name, param in model.named_parameters():
+        is_mtp = 'mtp.layers.' in name
+        param.requires_grad = is_mtp == train_mtp
+        if param.requires_grad:
+            trainable += 1
+        else:
+            frozen += 1
+
+    # The MoE router's expert bias is updated from load-balancing token counts in
+    # finalize_model_grads._update_router_expert_bias, independently of requires_grad.
+    # Setting requires_grad=False does NOT stop it, so the frozen side would keep
+    # drifting. Flag the frozen side's routers so the update is skipped; the trainable
+    # side's routers must keep updating (so we clear the flag there).
+    frozen_bias = 0
+    for name, module in model.named_modules():
+        if hasattr(module, 'expert_bias'):
+            is_mtp = 'mtp.layers.' in name
+            freeze_this = is_mtp != train_mtp
+            module.frozen_expert_bias = freeze_this
+            if freeze_this:
+                frozen_bias += 1
+    print_rank_0(
+        f"QAD train target '{target}': training {'MTP' if train_mtp else 'base'} "
+        f"({trainable} trainable, {frozen} frozen, {frozen_bias} router expert_bias frozen)"
+    )
+
+
+def _freeze_base_for_mtp(model):
+    """Deprecated alias for ``_freeze_for_qad(model, "mtp")``."""
+    _freeze_for_qad(model, "mtp")
+
+
+def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
     post_process,
     vp_stage=None,
     config=None,
     pg_collection=None,
-) -> MCoreGPTModel | MCoreMambaModel:
+    *,
+    disable_moe_grouped_gemm: bool = False,
+) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
+
+    Args:
+        disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
+            linears) instead of the default TEGroupedMLP. Pruning sets this so
+            ``mtp.prune`` can operate on individual expert linears; quantize / generate /
+            finetune leave the default so MoE quantization (e.g. QuantTEGroupedMLP) works
+            and TP+EP > 1 doesn't trip the QuantSequentialMLP unsupported-combo check.
 
     Args:
         args (Namespace): The arguments namespace.
@@ -172,7 +248,7 @@ def modelopt_gpt_mamba_builder(
             attached to the returned model for downstream routing/resharding utilities.
 
     Returns:
-        MCoreGPTModel | MCoreMambaModel: The returned model
+        MCoreGPTModel | MCoreHybridModel: The returned model
     """
     print_rank_0("building GPT model ...")
 
@@ -196,10 +272,6 @@ def modelopt_gpt_mamba_builder(
 
     if vp_stage is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
-    if args.use_legacy_models:
-        raise ValueError(
-            "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
-        )
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
@@ -221,22 +293,48 @@ def modelopt_gpt_mamba_builder(
                 config=config,
                 use_te=args.transformer_impl == "transformer_engine",
             )
+        elif args.export_default_te_spec:
+            # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
+            # of the modelopt-customized spec. Required by pruning, which operates on the
+            # un-customized layer graph. ``disable_moe_grouped_gemm`` (set by prune.py)
+            # forces SequentialMLP so mtp.prune can act on individual expert linears.
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                config.num_moe_experts,
+                not disable_moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                config.experimental_attention_variant,
+                qk_l2_norm=config.qk_l2_norm,
+            )
         else:
-            local_core_attention=args.export_force_local_attention
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
-                use_arbitrary_attention_mask = False
             else:
-                use_arbitrary_attention_mask = True
+                local_core_attention=args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                use_arbitrary_attention_mask=False,
+            )
+
+        # Build MTP block spec if MTP is enabled.
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            from megatron.core.models.gpt.gpt_layer_specs import (
+                get_gpt_decoder_layer_specs,
+                get_gpt_mtp_block_spec,
+            )
+
+            use_te = args.transformer_impl == "transformer_engine"
+            decoder_layer_specs = get_gpt_decoder_layer_specs(
+                config, use_transformer_engine=use_te,
+            )
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
             )
 
         model_kwargs = {
@@ -252,23 +350,43 @@ def modelopt_gpt_mamba_builder(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
-        from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+    elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+        if args.export_model_type == "MambaModel":
+            import warnings
 
-        mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model
+            warnings.warn(
+                '--export-model-type "MambaModel" is deprecated. '
+                'Use --export-model-type "HybridModel" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        if args.export_default_te_spec and args.export_te_mcore_model:
+            logging.getLogger(__name__).warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            args.export_te_mcore_model = False
+
+        # Default to grouped MLP for the export spec (matches the pre-modernization
+        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
+        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
+        # mtp.prune can act on individual expert linears.
+        hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
+            moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
         model_kwargs = {
-            "mamba_stack_spec": mamba_stack_spec,
+            "hybrid_stack_spec": hybrid_stack_spec,
             "vocab_size": args.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
+            "hybrid_layer_pattern": args.hybrid_layer_pattern,
             "pre_process": pre_process,
-            "hybrid_attention_ratio": args.hybrid_attention_ratio,
-            "hybrid_mlp_ratio": args.hybrid_mlp_ratio,
-            "hybrid_override_pattern": args.hybrid_override_pattern,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
@@ -279,7 +397,7 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
 
-        model = MCoreMambaModel(config=config, **model_kwargs)
+        model = MCoreHybridModel(config=config, **model_kwargs)
 
         for l in range(model.decoder.num_layers_per_pipeline_rank):
             layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
@@ -298,6 +416,17 @@ def modelopt_gpt_mamba_builder(
     if args.load is not None:
         load_modelopt_state(model=model)
 
+    qad_train_target = getattr(args, 'qad_train_target', None)
+    if args.freeze_base_for_mtp:
+        if qad_train_target not in (None, 'mtp'):
+            raise ValueError(
+                "--freeze-base-for-mtp is an alias for --qad-train-target mtp and "
+                f"conflicts with --qad-train-target {qad_train_target}"
+            )
+        qad_train_target = 'mtp'
+    if qad_train_target is not None:
+        _freeze_for_qad(model, qad_train_target)
+
     _add_load_convert_hooks(model)
 
     # Distillation mode.
@@ -313,6 +442,9 @@ def modelopt_gpt_mamba_builder(
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
         if args.pipeline_model_parallel_size > 1:
             assert (
                 args.virtual_pipeline_model_parallel_size is None
@@ -325,7 +457,7 @@ def modelopt_gpt_mamba_builder(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
         )
         kd_config = {
-            "teacher_model": _load_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
+            "teacher_model": _build_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
@@ -336,6 +468,10 @@ def modelopt_gpt_mamba_builder(
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-    
+
     print_distributed_quant_summary(model)
     return model
+
+
+# Backward-compatible alias
+modelopt_gpt_mamba_builder = modelopt_gpt_hybrid_builder

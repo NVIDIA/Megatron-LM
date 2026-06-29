@@ -118,7 +118,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
-    valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
+    valid_dataloader_ = build_data_loader(valid_dataset, args.eval_micro_batch_size,
                                           args.num_workers, not args.keep_last,
                                           task_collate_fn)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
@@ -138,6 +138,8 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
         # account for that when setting the micro batch size.
         args.micro_batch_size *= train_dataset.sample_multiplier
         args.global_batch_size *= train_dataset.sample_multiplier
+        args.eval_micro_batch_size *= train_dataset.sample_multiplier
+        args.eval_global_batch_size *= train_dataset.sample_multiplier
 
     return train_dataloader, valid_dataloader
 
@@ -213,7 +215,8 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 saved_checkpoint = True
 
             # Evaluation
-            if args.eval_interval and iteration % args.eval_interval == 0:
+            if args.eval_interval and iteration % args.eval_interval == 0 \
+                    and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
                 prefix = 'iteration {}'.format(iteration)
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
@@ -244,9 +247,6 @@ def finetune(train_valid_datasets_provider, model_provider,
     """Main finetune function used across all tasks."""
     args = get_args()
     timers = get_timers()
-
-    assert args.rampup_batch_size is None, \
-        'batch size scaling is not supported for finetuning'
 
     # Train and validation data loaders.
     timers('train/valid/test dataset/dataloder', log_level=0).start()

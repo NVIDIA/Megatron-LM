@@ -8,8 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.kitchen import KitchenDotProductAttention, KitchenFlashAttention
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
@@ -21,27 +20,29 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]
+    from megatron.core.extensions.kitchen import (
+        HAVE_KITCHEN,
+        KitchenDotProductAttention,
+        KitchenFlashAttention,
+    )
 
-    HAVE_KITCHEN = True
 except ImportError:
     from unittest.mock import MagicMock
 
     HAVE_KITCHEN = False
-    nvidia_kitchen = MagicMock()
+    KitchenDotProductAttention = MagicMock()
+    KitchenFlashAttention = MagicMock()
 
-try:
-    import transformer_engine  # type: ignore[import-untyped]
+if HAVE_TE:
     from transformer_engine.pytorch.attention import (  # type: ignore[import-untyped]
         dot_product_attention,
     )
 
-    HAVE_TE = True
-except ImportError:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+else:
     from unittest.mock import MagicMock
 
-    HAVE_TE = False
-    transformer_engine = MagicMock()
+    TEDotProductAttention = MagicMock()
     dot_product_attention = MagicMock()
 
 

@@ -4,7 +4,6 @@
 import os
 import sys
 import warnings
-from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -14,16 +13,11 @@ from contextlib import nullcontext
 
 import torch
 
-from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -31,10 +25,18 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from model_provider import model_provider
+
+try:
+    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
+    HAS_NVIDIA_MODELOPT = True
+except ImportError:
+    HAS_NVIDIA_MODELOPT = False
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -42,6 +44,7 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -63,27 +66,15 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_requests=args.inference_max_batch_size,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
-    )
-    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
     inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_wrapper_config, inference_context
+        model, inference_context
     )
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
     return StaticInferenceEngine(
         text_generation_controller=text_generation_controller,
-        max_batch_size=args.inference_max_batch_size,
     )
 
 
@@ -113,7 +104,7 @@ def add_text_generate_args(parser):
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--max-batch-size",
@@ -128,7 +119,7 @@ def add_text_generate_args(parser):
 @torch.inference_mode()
 def main(model_type: str = "gpt"):
     """Runs the text generation server with the specified model type."""
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -136,6 +127,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -150,14 +142,18 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        # Set up model and load checkpoint
-        if model_type == "gpt":
-            model_builder = gpt_builder
-        elif model_type == "mamba":
-            model_builder = mamba_builder
+        if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+            # ModelOpt path keeps the legacy callable-based builder because the
+            # modelopt hooks have not been ported to the new ``ModelBuilder``
+            # API yet. ``get_model`` also handles the modelopt-checkpoint
+            # auto-detection side effect.
+            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
         else:
-            raise ValueError(f"Invalid model provider {model_type}")
-        model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+            builder = get_model_builder(args, provider=model_type)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
@@ -165,14 +161,6 @@ def main(model_type: str = "gpt"):
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
     model.eval()
-
-    if args.max_batch_size is not None:
-        assert args.inference_max_batch_size is not None
-        args.inference_max_batch_size = max(args.inference_max_batch_size, args.max_batch_size)
-        warnings.warn(
-            "`--max-batch-size` has been deprecated in favor of `--inference-max-requests`, "
-            f"setting maximum batch size to {args.inference_max_batch_size}"
-        )
 
     inference_engine = get_inference_engine(args, model)
 

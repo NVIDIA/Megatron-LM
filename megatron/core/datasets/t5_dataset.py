@@ -314,7 +314,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         # For padded sequences, ensure the embedding layer can map the token ID
         encoder_input[encoder_input == self._pad_token_id] = 0
         decoder_input[decoder_input == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        decoder_output[decoder_output == self._pad_token_id] = 0
 
         return {
             "text_enc": encoder_input,

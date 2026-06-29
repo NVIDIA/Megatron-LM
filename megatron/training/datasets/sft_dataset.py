@@ -117,10 +117,6 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-            # Add EOD, unless it's already present
-            if tokens_list[-1] != eod:
-                tokens_list.append(eod)
-                targets_list.append(eod)
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
@@ -142,19 +138,12 @@ class SFTDataset(MegatronDataset):
 
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
-                truncate_left_not_right = True  # TODO(duncan): plumb this switch in
-                if truncate_left_not_right:  # Retain existing eod
-                    max_body = pack_length
-                    pack_tokens = pack_tokens[-max_body:]
-                    pack_targets = pack_targets[-max_body:]
-                    pack_tokens.append(pad)
-                    pack_targets.append(pad)
-                else:  # Truncate right (need to add eod)
-                    max_body = pack_length - 1
-                    pack_tokens = pack_tokens[:max_body]
-                    pack_targets = pack_targets[:max_body]
-                    pack_tokens.extend([eod, pad])
-                    pack_targets.extend([eod, pad])
+                # Truncate on the right
+                max_body = pack_length
+                pack_tokens = pack_tokens[:max_body]
+                pack_targets = pack_targets[:max_body]
+                pack_tokens.append(pad)
+                pack_targets.append(pad)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
@@ -192,12 +181,21 @@ class SFTDataset(MegatronDataset):
         adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
 
+        # Pad cu_seqlens to a fixed length so that default_collate can
+        # stack samples with different numbers of documents.  Trailing
+        # entries are filled with pack_length; the merge helper strips
+        # them later.
+        padded_cu_seqlens = torch.full(
+            (pack_length + 1,), pack_length, dtype=torch.int32,
+        )
+        padded_cu_seqlens[:cu_seqlens.numel()] = cu_seqlens
+
         return {
             'tokens': input_ids,
             'labels': labels,
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
             'loss_mask': loss_mask,
             'position_ids': position_ids,
-            'cu_seqlens': cu_seqlens,
+            'cu_seqlens': padded_cu_seqlens,
             'max_seqlen': max_seqlen,
         }
