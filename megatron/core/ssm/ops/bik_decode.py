@@ -134,8 +134,8 @@ def bik_decode_buffered_scan(
     """CG-compat batched buffered `chunk_scan` for decode, bitwise to a full scan.
 
     Drift values below are empirical max-abs differences vs a full
-    prefill+decode scan, observed in `tests/.../bik/test_mamba_decode.py`
-    (nemotron6_3b_moe dims: nheads=128, headdim=64, d_state=128,
+    prefill+decode scan, observed in the batch-invariant Mamba decode
+    test (nemotron6_3b_moe dims: nheads=128, headdim=64, d_state=128,
     chunk_size=256; bf16 weights and bf16 inputs; single decode step after
     a prefill of varying length).
 
@@ -164,8 +164,8 @@ def bik_decode_buffered_scan(
     B_dec, S_dec, nh, p = x.shape
     dev = x.device
     assert S_dec == 1, (
-        "BIK Mamba decode assumes one new token per request per call "
-        "(no speculative decoding)."
+        "batch-invariant Mamba decode assumes one new token per request "
+        "per call (no speculative decoding)."
     )
 
     # --- Slot indices + active mask ---

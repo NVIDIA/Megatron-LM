@@ -840,17 +840,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
-        # BIK only instruments the TORCH backend (mcore_fused_moe → bf16
-        # grouped GEMM → grouped_gemm_batch_invariant). FlashInfer and vLLM
-        # backends use their own Triton/atomic_add combine kernels that we
-        # do not intercept.
+        # Batch-invariant mode only instruments the TORCH backend
+        # (mcore_fused_moe → bf16 grouped GEMM → grouped_gemm_batch_invariant).
+        # FlashInfer and vLLM backends use their own Triton/atomic_add combine
+        # kernels that we do not intercept.
         if getattr(config, "batch_invariant_mode", False):
             assert (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
             ), (
                 f"batch_invariant_mode requires "
-                f"--inference-grouped-gemm-backend=torch (BIK is only wired into "
-                f"the TORCH backend); got {self.inference_grouped_gemm_backend}."
+                f"--inference-grouped-gemm-backend=torch (batch-invariant mode is "
+                f"only wired into the TORCH backend); got "
+                f"{self.inference_grouped_gemm_backend}."
             )
 
     def _resolve_flashinfer_activation_type(self):
@@ -992,20 +993,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe.
 
-        BIK + EP > 1 path: skip mcore_fused_moe's internal unpermute, AllGather
-        raw per-contribution expert outputs across EP, and run a single
-        global `deterministic_index_add` on each rank. This makes the
-        topk reduction order identical to training's local unpermute
-        (which sums all K contribs in sorted-index order). The combine
-        ReduceScatter then turns into a slice (handled in the dispatcher).
+        batch-invariant + EP > 1 path: skip mcore_fused_moe's internal
+        unpermute, AllToAll-route raw per-contribution expert outputs to
+        their home ranks, and run a single local `deterministic_index_add`
+        on each rank. This makes the topk reduction order identical to
+        training's local unpermute (which sums all K contribs in sorted-
+        index order). The dispatcher's token_combine then becomes a
+        pass-through (the cross-rank work has already happened).
         """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         ep_size = self.ep_group.size()
-        bik_global_unpermute = (
+        use_batch_invariant_global_unpermute = (
             getattr(self.config, "batch_invariant_mode", False) and ep_size > 1
         )
 
-        if bik_global_unpermute:
+        if use_batch_invariant_global_unpermute:
             fc2_output, permuted_probs, permutation_map, n_used = mcore_fused_moe(
                 hidden_states,
                 probs,
@@ -1042,7 +1044,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _bik_global_unpermute(
         self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
     ):
-        """AllToAll-padded cross-EP deterministic unpermute (BIK + EP > 1).
+        """AllToAll-padded cross-EP deterministic unpermute (batch-invariant + EP > 1).
 
         Each rank's contribs (fc2_output * permuted_probs in fp32) are routed
         directly to the rank that owns their destination token: one fixed-shape
@@ -1067,8 +1069,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         AllToAll-single uses equal chunks per rank).
 
         Returns [local_tokens, H] bf16 — the final per-rank output. The
-        dispatcher's BIK token_combine branch is a pass-through; no further
-        cross-rank reduction is needed.
+        dispatcher's batch-invariant token_combine branch is a pass-through;
+        no further cross-rank reduction is needed.
         """
         import torch.distributed as dist
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -1165,7 +1167,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Return the natural [local_tokens, H] shape. The cross-rank reduction
         # has already happened in the AllToAll + local deterministic_index_add
-        # above, so the dispatcher's BIK token_combine branch is a pass-through.
+        # above, so the dispatcher's batch-invariant token_combine branch is
+        # a pass-through.
         return local_out.to(hidden_states.dtype)
 
     def _vllm_forward(self, hidden_states, probs, routing_map):

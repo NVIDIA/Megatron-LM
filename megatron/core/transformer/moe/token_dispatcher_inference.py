@@ -156,11 +156,12 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             )
             assert not is_batch_invariant_mode_enabled(), (
                 "batch_invariant_mode is incompatible with NCCLAllGatherDispatcher's "
-                "non-CG AllGatherV path: BIK's _bik_global_unpermute assumes uniform "
-                "[ep_size * local_tokens, H] partitioning, but the AllGatherV path "
-                "produces a compact [sum(per-rank tokens), H] layout where per-rank "
-                "blocks are not aligned at rank * local_tokens boundaries. BIK runs "
-                "are expected to use CUDA graphs (which take the equal-token path)."
+                "non-CG AllGatherV path: the batch-invariant _bik_global_unpermute "
+                "assumes uniform [ep_size * local_tokens, H] partitioning, but the "
+                "AllGatherV path produces a compact [sum(per-rank tokens), H] layout "
+                "where per-rank blocks are not aligned at rank * local_tokens "
+                "boundaries. batch-invariant runs are expected to use CUDA graphs "
+                "(which take the equal-token path)."
             )
             local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
@@ -258,8 +259,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         CG path: standard ReduceScatter (equal token counts guaranteed).
         Non-CG path: expand compact output to padded layout, ReduceScatter, truncate.
 
-        BIK path: ReduceScatter is replaced by AllToAll
-        ------------------------------------------------
+        Batch-invariant path: ReduceScatter is replaced by AllToAll
+        ------------------------------------------------------------
         Under batch_invariant_mode the cross-rank combine is restructured
         to match training's reduction tree. The exchange is moved out of
         token_combine and into the experts module:
@@ -292,8 +293,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
 
         Args:
             hidden_states: expert outputs.
-              - non-BIK: [total_tokens, hidden_dim]
-              - BIK:     [local_tokens, hidden_dim] bf16 (already final)
+              - non-batch-invariant: [total_tokens, hidden_dim]
+              - batch-invariant:     [local_tokens, hidden_dim] bf16 (already final)
 
         Returns:
             [local_tokens, hidden_dim] bf16 local token outputs.
@@ -305,8 +306,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             is_batch_invariant_mode_enabled,
         )
         if is_batch_invariant_mode_enabled():
-            # Pass-through: the BIK path replaces ReduceScatter with
-            # AllToAll + local deterministic_index_add inside
+            # Pass-through: the batch-invariant path replaces ReduceScatter
+            # with AllToAll + local deterministic_index_add inside
             # InferenceGroupedMLP._bik_global_unpermute. hidden_states is
             # already this rank's final [local_tokens, H] bf16 result.
             return hidden_states
@@ -611,8 +612,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
-        BIK path: ReduceScatter is replaced by AllToAll
-        ------------------------------------------------
+        Batch-invariant path: ReduceScatter is replaced by AllToAll
+        ------------------------------------------------------------
         Under batch_invariant_mode the cross-rank combine is restructured
         to match training's reduction tree. The exchange is moved out of
         token_combine and into the experts module:
@@ -641,9 +642,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         Args:
             hidden_states: expert outputs.
-              - non-BIK: [global_max, hidden_size] (fp32 when written
-                  directly to the RSV buffer, bf16 otherwise).
-              - BIK:     [local_tokens, hidden_size] bf16 (already final).
+              - non-batch-invariant: [global_max, hidden_size] (fp32 when
+                  written directly to the RSV buffer, bf16 otherwise).
+              - batch-invariant:     [local_tokens, hidden_size] bf16
+                  (already final).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.

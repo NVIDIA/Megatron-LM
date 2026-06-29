@@ -1001,8 +1001,8 @@ class TransformerConfig(ModelParallelConfig):
        - "deepgemm" (default): DeepGEMM `bf16_gemm_nn`. Requires bf16 CUDA
          inputs and DeepGEMM with bf16 bindings (Hopper / Blackwell).
          Bitwise-identical to `torch.mm`.
-       - "triton": BIK Triton `matmul_persistent` kernel. Works on any
-         CUDA device for bf16/fp16/fp32 inputs.
+       - "triton": batch-invariant Triton `matmul_persistent` kernel.
+         Works on any CUDA device for bf16/fp16/fp32 inputs.
        Grouped GEMM always uses DeepGEMM regardless. Ignored when
        `batch_invariant_mode=False`."""
 

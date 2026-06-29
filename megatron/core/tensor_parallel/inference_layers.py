@@ -45,10 +45,10 @@ except ImportError:
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
-    # In batch-invariant mode, route through the BIK pure-torch RMSNorm so
-    # the inference path uses the same kernel as the training-side recompute.
-    # tex.rmsnorm_fwd is empirically batch-invariant for common shapes, but
-    # not contractually so — this branch makes the guarantee explicit.
+    # In batch-invariant mode, route through the pure-torch batch-invariant
+    # RMSNorm so the inference path uses the same kernel as the training-side
+    # recompute. tex.rmsnorm_fwd is empirically batch-invariant for common
+    # shapes, but not contractually so — this branch makes the guarantee explicit.
     if is_batch_invariant_mode_enabled():
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
@@ -415,11 +415,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
-        # Under BIK we force the NCCL fallback: multimem reduce sums across
-        # ranks via hardware multicast atomics whose ordering doesn't match
-        # NCCL's ring-traversal order, so it drifts vs training (which uses
-        # NCCL RS under sequence parallelism). NCCL RS is deterministic for a
-        # fixed topology and matches training bitwise.
+        # Under batch-invariant mode we force the NCCL fallback: multimem
+        # reduce sums across ranks via hardware multicast atomics whose
+        # ordering doesn't match NCCL's ring-traversal order, so it drifts
+        # vs training (which uses NCCL RS under sequence parallelism). NCCL
+        # RS is deterministic for a fixed topology and matches training
+        # bitwise.
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             is_batch_invariant_mode_enabled,
         )
@@ -551,9 +552,9 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    # Under BIK, drop the NVLS multimem path: its cross-rank reduction order
-    # differs from NCCL's ring traversal, so it drifts vs training (which
-    # uses NCCL RS under sequence parallelism).
+    # Under batch-invariant mode, drop the NVLS multimem path: its
+    # cross-rank reduction order differs from NCCL's ring traversal, so it
+    # drifts vs training (which uses NCCL RS under sequence parallelism).
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         is_batch_invariant_mode_enabled,
     )

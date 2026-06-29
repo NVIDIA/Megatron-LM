@@ -147,9 +147,9 @@ def mcore_fused_moe(
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
 
     if is_batch_invariant_mode_enabled():
-        # BIK intercepts the bf16 grouped GEMM path (`_bf16_grouped_mm` →
-        # `grouped_gemm_batch_invariant`). The MXFP8 path uses
-        # `scaled_grouped_mm` and is not BIK-instrumented.
+        # batch-invariant mode intercepts the bf16 grouped GEMM path
+        # (`_bf16_grouped_mm` → `grouped_gemm_batch_invariant`). The MXFP8
+        # path uses `scaled_grouped_mm` and is not batch-invariant-instrumented.
         assert not use_mxfp8, (
             "batch_invariant_mode requires the bf16 grouped GEMM path; got "
             "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
@@ -219,9 +219,10 @@ def mcore_fused_moe(
 
     # --- Post-processing: unpermute ---
     if return_pre_unpermute:
-        # Caller wants to do the unpermute itself (e.g. EP > 1 BIK path
-        # needs to AllGather raw contribs across EP and run a single global
-        # deterministic_index_add to match training's reduction tree).
+        # Caller wants to do the unpermute itself (e.g. the EP > 1
+        # batch-invariant path needs to AllToAll-route raw contribs to
+        # their home ranks and run a single local deterministic_index_add
+        # to match training's reduction tree).
         return fc2_output, permuted_probs, permutation_map, n_used
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out

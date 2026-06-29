@@ -3,10 +3,10 @@
 
 `bik_decode_buffered_scan` claims that its single-token output is bitwise
 identical to running `mamba_chunk_scan_combined` over the full
-(prefill + decode_token) sequence — that's what makes BIK RL rollout
-log-probs match the training-side recompute. These tests verify that claim
-directly on plain tensors, across the configurations the BIK decode path
-needs to handle.
+(prefill + decode_token) sequence — that's what makes batch-invariant RL
+rollout log-probs match the training-side recompute. These tests verify
+that claim directly on plain tensors, across the configurations the
+batch-invariant decode path needs to handle.
 """
 
 import unittest
@@ -40,12 +40,13 @@ def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
 @unittest.skipIf(not HAVE_BIK_DECODE, "mamba_ssm / bik_decode unavailable")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
 class TestBikDecodeBufferedScan(unittest.TestCase):
-    """Verify the BIK decode scan matches a full-sequence scan bitwise."""
+    """Verify the batch-invariant decode scan matches a full-sequence scan bitwise."""
 
     def setUp(self):
         torch.manual_seed(0)
         # No global flags: bik_decode_buffered_scan is a pure tensor-ops function
-        # and BIK by design does not require torch.use_deterministic_algorithms.
+        # and batch-invariant mode by design does not require
+        # torch.use_deterministic_algorithms.
         self.device = torch.device("cuda")
         self.dtype = torch.bfloat16
         # Small but non-trivial mamba dims.
@@ -81,7 +82,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
 
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
         """Run the prefill through the reference scan, store its ssm_state at
-        the slot, and seed the BIK buffer with the partial-chunk tail."""
+        the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
         ssm_state = torch.zeros(
             max_batch, self.nh, self.headdim, self.dstate,
             device=self.device, dtype=self.dtype,
@@ -128,7 +129,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
 
     def _assert_bitwise(self, a, b, msg):
-        # bf16 outputs — bitwise-equal is the actual BIK claim.
+        # bf16 outputs — bitwise-equal is the actual batch-invariant claim.
         diff = (a.float() - b.float()).abs().max().item()
         self.assertEqual(diff, 0.0, f"{msg}: max_abs_diff={diff:.3e}")
 
@@ -143,7 +144,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 y_full, _ = _full_scan(
                     x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
                 )
-                # BIK: seed from prefill, then one decode step.
+                # batch-invariant: seed from prefill, then one decode step.
                 bufs = self._make_bufs(max_batch)
                 ssm_state = self._seed_from_prefill(
                     bufs, x, dt, B, C, prefill_len, slot, max_batch,

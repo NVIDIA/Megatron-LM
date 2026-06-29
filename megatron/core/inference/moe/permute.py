@@ -469,10 +469,11 @@ def unpermute_tokens(
     ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
     output_size, hidden_dim = expert_output.shape
 
-    # Triton kernel below uses tl.atomic_add (non-deterministic). BIK path
-    # replaces it with an order-invariant sort + cumsum combine. Rows past
-    # `n_used` and rows with `permutation_map < 0` are masked out instead
-    # of sliced so the shape stays static (CUDA-graph capturable).
+    # Triton kernel below uses tl.atomic_add (non-deterministic). The
+    # batch-invariant path replaces it with an order-invariant
+    # sort + cumsum combine. Rows past `n_used` and rows with
+    # `permutation_map < 0` are masked out instead of sliced so the
+    # shape stays static (CUDA-graph capturable).
     if is_batch_invariant_mode_enabled():
         if out is None:
             out = torch.zeros(

@@ -61,7 +61,7 @@ _LOGGER = logging.getLogger(__name__)
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Build launch metadata for Triton matmul kernels used in BIK matmul."""
+    """Build launch metadata for Triton matmul kernels used in batch-invariant matmul."""
     ret = {}
     m, n, k = args["M"], args["N"], args["K"]
     ret["name"] = f"{kernel.name} [M={m}, N={n}, K={k}]"
@@ -554,8 +554,8 @@ def deterministic_index_add(
 # from `TransformerConfig.batch_invariant_kernel_backend`.
 #   "deepgemm" (default): DeepGEMM `bf16_gemm_nn` — bitwise-identical to
 #       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
-#   "triton": BIK Triton `matmul_persistent` — works on any CUDA device with
-#       bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
+#   "triton": batch-invariant Triton `matmul_persistent` — works on any CUDA
+#       device with bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
 _BIK_BACKENDS = ("deepgemm", "triton")
 _BIK_BACKEND: str = "deepgemm"
 
@@ -1637,9 +1637,9 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     Args:
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
             "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
-            `bf16_gemm_nn`. "triton" routes through the BIK Triton
-            `matmul_persistent` kernel (works for bf16/fp16/fp32 and on
-            any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
+            `bf16_gemm_nn`. "triton" routes through the batch-invariant
+            Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
+            on any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB, _BIK_BACKEND
     if _batch_invariant_MODE:
@@ -1699,8 +1699,9 @@ def set_batch_invariant_mode(enabled: bool = True):
     try:
         yield
     finally:
-        # Restore the previous state. If we turned BIK on at entry, turn it off here.
-        # If we turned it off at entry (inside an outer True scope), turn it back on.
+        # Restore the previous state. If we turned batch-invariant mode on at
+        # entry, turn it off here. If we turned it off at entry (inside an
+        # outer True scope), turn it back on.
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
         elif not enabled and prev_enabled:

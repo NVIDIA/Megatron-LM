@@ -1057,7 +1057,7 @@ class MambaMixer(MegatronModule):
     def _bik_get_decode_buffers(
         self, max_batch, nh, p, ng, n, device, x_dtype, dt_dtype, B_dtype, C_dtype, z_dtype,
     ):
-        """Lazily allocate (once) and return the per-slot BIK decode buffers."""
+        """Lazily allocate (once) and return the per-slot batch-invariant decode buffers."""
         if not hasattr(self, "_bik_decode_bufs"):
             self._bik_decode_bufs = make_bik_decode_buffers(
                 max_batch, self.chunk_size, nh, p, ng, n, device,
