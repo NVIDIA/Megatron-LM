@@ -52,7 +52,7 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
-    def get_dsa_mamba_block(self, layer_pattern):
+    def get_dsa_hybrid_block(self, layer_pattern):
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = MLATransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -212,7 +212,7 @@ class TestHybridBlock:
     )
     def test_fused_gpu_forward_backward(self, layer_pattern, expected_layer_type):
         """Test CUDA forward+backward through a fused hybrid-pattern block."""
-        block = self.get_mamba_block(layer_pattern)
+        block = self.get_hybrid_block(layer_pattern)
         assert block.layer_type_list == [expected_layer_type]
         assert len(block.layers) == 1
         assert isinstance(block.layers[0], TransformerLayer)
@@ -323,7 +323,7 @@ class TestHybridBlock:
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
-        block = self.get_dsa_mamba_block(layer_pattern)
+        block = self.get_dsa_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
@@ -335,7 +335,7 @@ class TestHybridBlock:
         """* and D in the same block fail."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
-            block = self.get_dsa_mamba_block(layer_pattern)
+            block = self.get_dsa_hybrid_block(layer_pattern)
 
 
 @pytest.mark.internal
