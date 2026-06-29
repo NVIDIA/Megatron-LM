@@ -942,14 +942,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
-    # Wait so everyone is done (not necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
-    ft_integration.on_checkpointing_end(is_async_finalization=False)
+    ft_integration.on_checkpointing_end(is_async_finalization=args.async_save)
 
 @_disable_gc()
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
