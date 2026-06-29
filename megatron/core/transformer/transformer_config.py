@@ -381,7 +381,7 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
-    This is only valid without all-gather CP: padding a chunk-local causal-conv input changes
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
     ####################
@@ -983,6 +983,8 @@ class TransformerConfig(ModelParallelConfig):
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
     cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    This option controls standard attention layers. Linear-attention layers use
+    `linear_cp_mode` instead.
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
@@ -994,15 +996,17 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
-    linear_cp_comm_type: Optional[str] = "all_gather"
-    """Inter-gpu communication type for context parallelism in linear-attention layers
+    linear_cp_mode: Optional[str] = "chunkwise"
+    """Context-parallel execution mode for linear-attention layers
     (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
-    Can be "a2a" or "all_gather":
-    "a2a": Scatter heads across the CP group (Ulysses-style); each rank runs the linear-attention
-    kernel on the full sequence for a shard of heads. Correct but memory-heavy.
-    "all_gather": Keep the sequence sharded across CP ranks and use CP-aware linear kernels
-    (chunk_gated_delta_rule + causal_conv1d with a CP context). Cheaper memory footprint; requires
-    a chunk-level reshuffle when the input is in Megatron's zigzag load-balanced layout.
+    Can be "chunkwise" or "headwise":
+    "chunkwise": Keep sequence chunks sharded across CP ranks and use CP-aware linear kernels
+    (e.g. chunk_gated_delta_rule + causal_conv1d with a CP context). This follows the chunkwise
+    DeltaNet idea of storing state at chunk boundaries and doing chunk-local matrix work, avoiding
+    a full per-token recurrent state materialization while keeping tensor-core-friendly matmuls.
+    See https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet.
+    "headwise": Scatter heads across the CP group with all-to-all (Ulysses-style); each rank runs
+    the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
     """
 
     ##################
@@ -1522,14 +1526,14 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
             if self.context_parallel_size > 1:
-                assert self.linear_cp_comm_type in ("a2a", "all_gather"), (
-                    f"linear_cp_comm_type must be one of 'a2a' or 'all_gather', "
-                    f"got {self.linear_cp_comm_type!r}."
+                assert self.linear_cp_mode in ("headwise", "chunkwise"), (
+                    f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
+                    f"got {self.linear_cp_mode!r}."
                 )
                 if self.gdn_conv_pad_alignment is not None:
-                    assert self.linear_cp_comm_type != "all_gather", (
+                    assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
-                        "linear_cp_comm_type='all_gather' when context_parallel_size > 1. "
+                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
