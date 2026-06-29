@@ -18,6 +18,7 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
