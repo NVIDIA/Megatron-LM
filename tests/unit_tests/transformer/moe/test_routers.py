@@ -134,9 +134,13 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_with_padding_mask(self):
+    @pytest.mark.parametrize("router_fusion", [False, True])
+    def test_router_with_padding_mask(self, router_fusion):
         """Test that padding mask correctly excludes padding tokens from routing."""
+        if router_fusion and not HAVE_ROUTER_FUSION:
+            pytest.skip("TE fused router ops not available")
         self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = router_fusion
         seq_len = 32
         batch_size = 2
         hidden_size = self.router.config.hidden_size
@@ -175,6 +179,10 @@ class TestTop2Router:
                 seq_len * batch_size,
                 self.router.config.num_moe_experts,
             )
+
+            padding_rows = padding_mask.reshape(-1)
+            assert torch.count_nonzero(probs_with_mask[padding_rows]) == 0
+            assert not routing_map_with_mask[padding_rows].any()
 
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)

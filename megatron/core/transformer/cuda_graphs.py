@@ -2344,7 +2344,7 @@ class TECudaGraphHelper:
         if max_num_seqs is not None:
             max_num_seqs = int(max_num_seqs)
             if getattr(self.config, 'pad_packed_seq_alignment', None) is not None and getattr(
-                self.config, 'pad_packed_seq_by_appending_dummy_seq', True
+                self.config, 'pad_packed_seq_by_appending_dummy_seq', False
             ):
                 max_num_seqs -= 1
 

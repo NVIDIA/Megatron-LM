@@ -159,6 +159,16 @@ def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[
     return torch.cat((cu_seqlens, dummy), dim=0)
 
 
+def _replace_last_cu_seqlen(cu_seqlens: Optional[Tensor], padded_end: int) -> Optional[Tensor]:
+    """Return cu_seqlens with its final physical endpoint replaced."""
+    if cu_seqlens is None:
+        return None
+
+    result = cu_seqlens.clone()
+    result[-1] = int(padded_end)
+    return result
+
+
 def _round_up_to_alignment(value: int, alignment: int) -> int:
     assert alignment > 0, f"Packed sequence padding alignment must be > 0, got {alignment}."
     return ((value + alignment - 1) // alignment) * alignment
@@ -225,9 +235,14 @@ def _resolve_thd_padding_lengths(
             mask_device = candidate.device
             break
 
-    # Prefer THD metadata for the global packed length when it is available.
+    # The padded endpoint describes tensor storage. The unpadded endpoint is
+    # only the compact valid-token count when gaps exist between sequences.
     has_local_tensor = local_tensor_T is not None
-    if packed_seq_params.cu_seqlens_q is not None:
+    if packed_seq_params.cu_seqlens_q_padded is not None:
+        global_actual_T = int(packed_seq_params.cu_seqlens_q_padded[-1].item())
+        if mask_device is None:
+            mask_device = packed_seq_params.cu_seqlens_q_padded.device
+    elif packed_seq_params.cu_seqlens_q is not None:
         global_actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
         if mask_device is None:
             mask_device = packed_seq_params.cu_seqlens_q.device
@@ -335,7 +350,7 @@ def pad_sequence_for_thd(
     alignment: Optional[int] = None,
     target_len: Optional[int] = None,
     max_num_seqs: Optional[int] = None,
-    pad_by_appending_dummy_seq: bool = True,
+    pad_by_appending_dummy_seq: bool = False,
     padding_mask: Optional[Tensor] = None,
     cp_group: Optional[dist.ProcessGroup] = None,
     cp_size: Optional[int] = None,
@@ -371,7 +386,8 @@ def pad_sequence_for_thd(
         max_num_seqs: If set, pad cu_seqlens tensors to
             ``max_num_seqs + 1`` entries for static CUDA Graph inputs.
         pad_by_appending_dummy_seq: If true, represent the post-pack padding
-            tail as an extra dummy sequence in cu_seqlens metadata.
+            tail as an extra dummy sequence. Otherwise leave cu_seqlens unchanged
+            and extend the final cu_seqlens_padded endpoint over the tail.
         padding_mask: Existing bool padding mask for already-packed tokens,
             with True marking padding positions.
         cp_group: Context-parallel process group for resolving local/global
@@ -386,8 +402,10 @@ def pad_sequence_for_thd(
           stages, Megatron asks TE which packed rows this CP rank would receive
           and uses that row count as the local length instead of assuming equal
           division by CP size.
-        - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
-          represented as an ordinary dummy sequence in cu_seqlens metadata.
+        - By default, post-pack padding extends only the last padded sequence;
+          original cu_seqlens continue to describe valid-token counts.
+        - When ``pad_by_appending_dummy_seq`` is true, the padding tail is
+          represented as a separate zero-valid-token dummy sequence.
         - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
           by CUDA Graph replay because those tensors are graph inputs.
 
@@ -437,16 +455,40 @@ def pad_sequence_for_thd(
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
 
-    # Represent post-pack padding as a dummy sequence when requested.
+    # Cover post-pack padding by extending the last physical sequence, or by
+    # representing it as a separate zero-valid-token dummy sequence.
     target_cu_entries = None if max_num_seqs is None else max_num_seqs + 1
-    has_dummy_padding_seq = pad_by_appending_dummy_seq and global_target_len > global_actual_T
-    dummy_seq_len = global_target_len - global_actual_T if has_dummy_padding_seq else 0
+    has_padding_tail = global_target_len > global_actual_T
+    has_dummy_padding_seq = pad_by_appending_dummy_seq and has_padding_tail
 
     if has_dummy_padding_seq:
-        cu_seqlens_q = _append_dummy_seq(cu_seqlens_q, global_target_len)
-        cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, global_target_len)
-        cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
-        cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+        # None is TE's auto-detect mode. Keep real and physical boundaries
+        # separate unless the caller explicitly disables padding between sequences.
+        if (
+            packed_seq_params.pad_between_seqs is not False
+            and cu_seqlens_q is not None
+            and cu_seqlens_q_padded is not None
+        ):
+            cu_seqlens_q = _append_dummy_seq(cu_seqlens_q, int(cu_seqlens_q[-1].item()))
+            cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
+        else:
+            cu_seqlens_q = _append_dummy_seq(cu_seqlens_q, global_target_len)
+            cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
+        if (
+            packed_seq_params.pad_between_seqs is not False
+            and cu_seqlens_kv is not None
+            and cu_seqlens_kv_padded is not None
+        ):
+            cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, int(cu_seqlens_kv[-1].item()))
+            cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+        else:
+            cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, global_target_len)
+            cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+    elif has_padding_tail:
+        q_physical_cu = cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        kv_physical_cu = cu_seqlens_kv_padded if cu_seqlens_kv_padded is not None else cu_seqlens_kv
+        cu_seqlens_q_padded = _replace_last_cu_seqlen(q_physical_cu, global_target_len)
+        cu_seqlens_kv_padded = _replace_last_cu_seqlen(kv_physical_cu, global_target_len)
 
     # Pad cu_seqlens entry counts for static CUDA Graph inputs.
     if target_cu_entries is not None:
@@ -454,6 +496,12 @@ def pad_sequence_for_thd(
         cu_seqlens_kv = _pad_cu_seqlens(cu_seqlens_kv, target_cu_entries)
         cu_seqlens_q_padded = _pad_cu_seqlens(cu_seqlens_q_padded, target_cu_entries)
         cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
+
+    def _max_physical_seqlen(cu_seqlens: Optional[Tensor], fallback: int) -> int:
+        if cu_seqlens is None or cu_seqlens.numel() < 2:
+            return fallback
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        return max(fallback, int(lengths.max().item()))
 
     # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
     padded_params = PackedSeqParams(
@@ -465,17 +513,17 @@ def pad_sequence_for_thd(
         max_seqlen_q=(
             global_target_len
             if target_cu_entries is not None
-            else max(packed_seq_params.max_seqlen_q, dummy_seq_len)
+            else _max_physical_seqlen(cu_seqlens_q_padded, packed_seq_params.max_seqlen_q)
         ),
         max_seqlen_kv=(
             global_target_len
             if target_cu_entries is not None
-            else max(packed_seq_params.max_seqlen_kv, dummy_seq_len)
+            else _max_physical_seqlen(cu_seqlens_kv_padded, packed_seq_params.max_seqlen_kv)
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
         total_tokens=local_target_len if target_cu_entries is None else None,
-        pad_between_seqs=False if has_dummy_padding_seq else packed_seq_params.pad_between_seqs,
+        pad_between_seqs=packed_seq_params.pad_between_seqs,
     )
 
     # True marks padded local token slots for routing/loss paths.

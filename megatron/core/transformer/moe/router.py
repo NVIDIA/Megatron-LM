@@ -827,7 +827,15 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
-        # Apply token dropping to probs and routing_map.
+        # Padding tokens must not enter the dispatcher. Masking only auxiliary
+        # losses still lets padding alter expert capacity and grouped-GEMM shapes.
+        if padding_mask is not None:
+            valid_tokens = (~padding_mask).unsqueeze(-1)
+            probs = probs * valid_tokens
+            routing_map = routing_map & valid_tokens
+
+        # Apply token dropping after removing padding so padding tokens cannot
+        # consume expert capacity.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
                 probs,

@@ -468,7 +468,7 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
         raise ValueError(f"thd_max_packed_sequences must be >= 1, got {max_num_seqs}.")
 
     if getattr(config, 'pad_packed_seq_alignment', None) is not None and getattr(
-        config, 'pad_packed_seq_by_appending_dummy_seq', True
+        config, 'pad_packed_seq_by_appending_dummy_seq', False
     ):
         if max_num_seqs < 2:
             raise ValueError(
@@ -778,7 +778,6 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
-        pad_between_seqs=False,
     )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -804,7 +803,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
                 pad_by_appending_dummy_seq=getattr(
-                    config, 'pad_packed_seq_by_appending_dummy_seq', True
+                    config, 'pad_packed_seq_by_appending_dummy_seq', False
                 ),
                 padding_mask=padding_mask,
                 cp_group=cp_group,
