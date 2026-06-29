@@ -2036,6 +2036,43 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
+def _build_thd_padding_mask(
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
+) -> torch.Tensor:
+    """Build a THD padding mask from real and physical sequence boundaries."""
+
+    cu_seqlens = cu_seqlens.reshape(-1)
+    cu_seqlens_padded = cu_seqlens_padded.reshape(-1)
+    assert cu_seqlens.numel() == cu_seqlens_padded.numel()
+
+    total_tokens = int(cu_seqlens_padded[-1].item())
+    if total_tokens == 0:
+        return torch.empty(0, dtype=torch.bool, device=cu_seqlens.device)
+
+    positions = torch.arange(
+        total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
+    )
+    sequence_indices = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
+    valid_ends = cu_seqlens_padded[:-1] + valid_lengths
+    return positions >= valid_ends[sequence_indices]
+
+
+def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
+    """Replace padded token-like values with safe neutral values in-place."""
+
+    pad_values = {"tokens": 0, "labels": 0, "loss_mask": 0.0, "position_ids": 0}
+    for key, pad_value in pad_values.items():
+        tensor = batch.get(key)
+        if tensor is None:
+            continue
+        assert tensor.shape == padding_mask.shape, (
+            f"{key} shape {tuple(tensor.shape)} must match padding-mask shape "
+            f"{tuple(padding_mask.shape)}."
+        )
+        batch[key] = tensor.masked_fill(padding_mask, pad_value)
+
+
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
     has_cu_seqlens: bool,
@@ -2051,6 +2088,8 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    variable_seq_lengths: bool = False,
+    has_padding_mask: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2065,8 +2104,7 @@ def get_batch_on_this_tp_rank(
     rank 0 first sends the numel, then the tensor itself, so receivers can
     allocate the correct buffer size.
 
-    For hybrid-CP, the sequence length may differ per micro-batch (since it
-    depends on `local_cp_size`), so the actual sequence length is broadcast
+    For hybrid CP and variable-length scheduling, the batch shape is broadcast
     before allocating receive buffers on non-zero TP ranks.
 
     Args:
@@ -2091,19 +2129,36 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        variable_seq_lengths (bool): Whether each microbatch may have a different
+            physical sequence length.
+        has_padding_mask (bool): Whether to build and broadcast a THD padding mask.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
         every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+        'max_seqlen', 'padding_mask', 'local_cp_size', and 'hybrid_cp_group'.
     """
 
     def _broadcast(item):
         if item is not None:
             torch.distributed.broadcast(item, broadcast_src_rank, group=broadcast_group)
 
+    if has_padding_mask and not has_cu_seqlens:
+        raise ValueError("has_padding_mask requires has_cu_seqlens")
+
+    dynamic_seq_length = is_hybrid_cp or variable_seq_lengths
+
     if tp_rank == 0:
+        batch.setdefault("padding_mask", None)
+        if has_padding_mask:
+            assert batch.get("cu_seqlens") is not None
+            assert batch.get("cu_seqlens_padded") is not None
+            padding_mask = _build_thd_padding_mask(
+                batch["cu_seqlens"], batch["cu_seqlens_padded"]
+            ).reshape(1, -1)
+            batch["padding_mask"] = padding_mask
+            _sanitize_thd_padding_values(batch, padding_mask)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
@@ -2120,11 +2175,18 @@ def get_batch_on_this_tp_rank(
                 ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
                 _broadcast(cu_seqlens)
 
-        if is_hybrid_cp:
-            hybrid_cp_seq_length = torch.tensor(
-                batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
+        if dynamic_seq_length:
+            reference_tensor = batch["padding_mask"] if has_padding_mask else None
+            if reference_tensor is None:
+                for key in ("tokens", "labels"):
+                    if batch.get(key) is not None:
+                        reference_tensor = batch[key]
+                        break
+            assert reference_tensor is not None
+            batch_shape = torch.tensor(
+                reference_tensor.shape[:2], dtype=torch.int32, device=torch.cuda.current_device()
             )
-            _broadcast(hybrid_cp_seq_length)
+            _broadcast(batch_shape)
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
@@ -2138,6 +2200,8 @@ def get_batch_on_this_tp_rank(
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
 
@@ -2154,6 +2218,8 @@ def get_batch_on_this_tp_rank(
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
 
         elif is_pipeline_last_stage:
             batch["tokens"] = None
@@ -2168,6 +2234,8 @@ def get_batch_on_this_tp_rank(
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
 
         elif has_cu_seqlens:
             # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
@@ -2181,15 +2249,20 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['max_seqlen'])
             if cp_size > 1:
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
+
+        if cp_size == 1 and (has_cu_seqlens or is_hybrid_cp):
+            _broadcast_cu_seqlens(batch.get('cu_seqlens_padded'))
 
     else:
-        if is_hybrid_cp:
-            hybrid_cp_seq_length = torch.tensor(
-                0, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            _broadcast(hybrid_cp_seq_length)
-            shape = (micro_batch_size, hybrid_cp_seq_length.item())
+        if dynamic_seq_length:
+            batch_shape = torch.zeros(2, dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(batch_shape)
+            dynamic_micro_batch_size, sequence_length = (int(value) for value in batch_shape)
+            shape = (dynamic_micro_batch_size, sequence_length)
         else:
+            sequence_length = seq_length
             shape = (micro_batch_size, seq_length)
 
         tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
@@ -2200,16 +2273,19 @@ def get_batch_on_this_tp_rank(
         cu_seqlens_padded = None
         max_seqlen = None
         attention_mask = None
+        padding_mask = None
         local_cp_size = None
 
         if has_cu_seqlens or is_hybrid_cp:
             max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
         if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
-                (micro_batch_size, 1, seq_length, seq_length),
+                (shape[0], 1, sequence_length, sequence_length),
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
+        if has_padding_mask:
+            padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
 
         if is_hybrid_cp:
             local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
@@ -2249,6 +2325,8 @@ def get_batch_on_this_tp_rank(
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
+            if has_padding_mask:
+                _broadcast(padding_mask)
             if is_hybrid_cp:
                 _broadcast(local_cp_size)
 
@@ -2265,6 +2343,8 @@ def get_batch_on_this_tp_rank(
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
+            if has_padding_mask:
+                _broadcast(padding_mask)
 
         elif is_pipeline_last_stage:
             tokens = None
@@ -2279,6 +2359,8 @@ def get_batch_on_this_tp_rank(
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
+            if has_padding_mask:
+                _broadcast(padding_mask)
 
         elif has_cu_seqlens:
             # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
@@ -2291,6 +2373,11 @@ def get_batch_on_this_tp_rank(
             _broadcast(max_seqlen)
             if cp_size > 1:
                 cu_seqlens_padded = _broadcast_cu_seqlens()
+            if has_padding_mask:
+                _broadcast(padding_mask)
+
+        if cp_size == 1 and (has_cu_seqlens or is_hybrid_cp):
+            cu_seqlens_padded = _broadcast_cu_seqlens()
 
         batch = {
             'tokens': tokens,
@@ -2298,6 +2385,7 @@ def get_batch_on_this_tp_rank(
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'attention_mask': attention_mask,
+            'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
@@ -2348,15 +2436,13 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+        sequence_tensor = next(
+            batch[key] for key in ("tokens", "labels", "padding_mask") if batch.get(key) is not None
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
+        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)
@@ -2497,7 +2583,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
         return batch
 
     seq_length = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
@@ -2512,7 +2598,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 
