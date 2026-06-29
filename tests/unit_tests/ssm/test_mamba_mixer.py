@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -91,19 +92,20 @@ class TestMambaMixer:
             max_batch_size=max(micro_batch_sizes), max_sequence_length=sequence_length
         )
 
-        for micro_batch_size in micro_batch_sizes:
-            inference_context.max_seqlen = inference_context.max_sequence_length
-            inference_context.seqlen_offset = inference_context.sequence_len_offset
-            hidden_states = torch.ones(
-                (sequence_length, micro_batch_size, mixer.config.hidden_size)
-            )
-            hidden_states = hidden_states.cuda()
-            output, bias = mixer(hidden_states, inference_context=inference_context)
-            assert mixer.config.mamba_num_heads == None
-            assert output.shape[0] == sequence_length
-            assert output.shape[1] == micro_batch_size
-            assert output.shape[2] == mixer.config.hidden_size
-            assert output.dtype == torch.float32
+        with InferenceMode.active():
+            for micro_batch_size in micro_batch_sizes:
+                inference_context.max_seqlen = inference_context.max_sequence_length
+                inference_context.seqlen_offset = inference_context.sequence_len_offset
+                hidden_states = torch.ones(
+                    (sequence_length, micro_batch_size, mixer.config.hidden_size)
+                )
+                hidden_states = hidden_states.cuda()
+                output, bias = mixer(hidden_states, inference_context=inference_context)
+                assert mixer.config.mamba_num_heads == None
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == mixer.config.hidden_size
+                assert output.dtype == torch.float32
 
 
 class TestMambaMixerErrorChecks:

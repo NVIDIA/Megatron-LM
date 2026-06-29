@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:experimental
 
-ARG FROM_IMAGE_NAME
-FROM $FROM_IMAGE_NAME as main
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.04-py3
+FROM $FROM_IMAGE_NAME AS main
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
@@ -16,7 +16,7 @@ COPY megatron/core/package_info.py megatron/core/__init__.py /opt/megatron-lm/me
 RUN uv sync --locked --only-group linting --only-group test --only-group ci
 
 ##### For NVIDIANS only #####
-FROM main as jet
+FROM main AS jet
 ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
       JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \ 

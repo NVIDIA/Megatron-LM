@@ -2,7 +2,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -58,7 +58,7 @@ else:
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
+    total_num_tokens: Union[int, torch.Tensor],
     topk: int,
     num_experts: int,
     moe_aux_loss_coeff: float,
@@ -108,7 +108,7 @@ def switch_load_balancing_loss_func(
                               Shape in [num_tokens, num_experts].
         tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert in the batch.
                                           Shape in [num_experts]
-        total_num_tokens (int): Total number of tokens in the batch.
+        total_num_tokens (int or torch.Tensor): Total number of tokens in the batch.
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
@@ -226,22 +226,31 @@ def get_capacity(
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
     reduce_group: torch.distributed.ProcessGroup,
+    reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
     topk: int = None,
     with_padding_mask: bool = False,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Union[int, torch.Tensor], Union[int, torch.Tensor]]:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
+    if reduce_groups is None:
+        reduce_groups = (reduce_group,)
+
+    global_tokens_per_expert = local_tokens_per_expert
+    reduce_world_size = 1
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+        reduce_world_size *= group.size()
+
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+        total_num_tokens = local_num_tokens * reduce_world_size
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
@@ -1155,7 +1164,10 @@ def track_moe_metrics(
 
 
 def get_updated_expert_bias(
-    tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    expert_bias_update_rate: float,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
@@ -1163,17 +1175,21 @@ def get_updated_expert_bias(
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
+        tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
+            data, and context parallel ranks that share the router expert-bias update.
 
     Returns:
         torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
-        # All Reduce Across TPxCPxDP group
-        torch.distributed.all_reduce(
-            tokens_per_expert,
+        if tp_dp_cp_group is None:
             # TODO(Hepteract): delete the usage of the global parallel_state.
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
-        )
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate

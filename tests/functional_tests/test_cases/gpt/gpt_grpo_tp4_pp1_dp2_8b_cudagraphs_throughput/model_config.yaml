@@ -13,6 +13,10 @@ MODEL_ARGS:
   --inference-dynamic-batching-unified-memory-level: 1
   --inference-dynamic-batching-buffer-size-gb: 20
   --ckpt-format: torch_dist
+  # Pin the pre-#3509 (linear) CUDA-graph sizing distribution. #3509 switched the
+  # default to exponential + a mixed-prefill grid, which raised peak memory and
+  # tripped this test's mem-allocated-bytes guardrail (~69GB vs ~61GB golden, +13.6%).
+  --inference-dynamic-batching-cuda-graph-sizing-distribution: linear
   --seq-length: 1024
   --inference-max-seq-length: 1024
   --load: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist

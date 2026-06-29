@@ -17,6 +17,7 @@ from packaging.version import Version as PkgVersion
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -89,6 +90,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
+    parser = _add_logits_distillation_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -154,11 +157,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -266,12 +285,12 @@ def _normalize_cuda_graph_modules_args(args):
         args.cuda_graph_modules
     )
     validate_deprecated_cuda_graph_modules_migration_inputs(
-        deprecated_scopes,
-        args.cuda_graph_impl,
-        args.inference_cuda_graph_scope,
+        deprecated_scopes, args.cuda_graph_impl, args.inference_cuda_graph_scope
     )
     if used_full_scope:
-        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.'
+        )
 
     for scope, attr, value in deprecated_scopes:
         migration = get_deprecated_cuda_graph_modules_migration(
@@ -676,12 +695,10 @@ def validate_args(args, defaults={}):
             del args.external_cuda_graph
 
     if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
-        assert not args.cuda_graph_modules, (
-            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
-        )
-        warn_rank_0(
-            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
-        )
+        assert (
+            not args.cuda_graph_modules
+        ), "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        warn_rank_0('--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.')
         args.cuda_graph_modules = args.cuda_graph_scope_deprecated
     del args.cuda_graph_scope_deprecated
 
@@ -689,10 +706,7 @@ def validate_args(args, defaults={}):
     # all subsequent validation sees fully-typed enum values.
     _normalize_cuda_graph_modules_args(args)
     _normalize_inference_cuda_graph_scope_arg(args)
-    assert (
-        args.inference_cuda_graph_scope
-        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
-    ), (
+    assert args.inference_cuda_graph_scope in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl], (
         "Invalid inference CUDA graph scope "
         f"{args.inference_cuda_graph_scope.name!r} for "
         f"--cuda-graph-impl={args.cuda_graph_impl!r}."
@@ -1173,6 +1187,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1267,6 +1282,27 @@ def validate_args(args, defaults={}):
         assert (
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+
+        if args.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert args.data_parallel_sharding_strategy == "optim_grads_params", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                'with --data-parallel-sharding-strategy optim_grads_params.'
+            )
+            assert args.recompute_granularity == "full", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                "with full activation recomputation."
+            )
+            assert not args.overlap_moe_expert_parallel_comm, (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
+                "with --overlap-moe-expert-parallel-comm."
+            )
+    else:
+        assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
+            "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
+        )
+        assert not args.megatron_fsdp_cache_param_bucket_views, (
+            "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
+        )
 
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
@@ -1559,15 +1595,43 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
-    if args.sequence_packing_scheduler is not None:
-        if args.sequence_packing_scheduler == 'dp_balanced':
-            total_cp_ranks = args.context_parallel_size
-        else:
-            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
+    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
+        args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+            args.pad_packed_seq_alignment
         )
+        if args.max_seqlen_per_dp_cp_rank is None:
+            raise ValueError(
+                '--max-seqlen-per-dp-cp-rank must be set when '
+                '--pad-packed-seq-alignment is enabled.'
+            )
+        if args.pad_packed_seq_alignment != 'max':
+            if args.pad_packed_seq_alignment <= 0:
+                raise ValueError(
+                    "--pad-packed-seq-alignment must be 'max' or a positive integer "
+                    "alignment."
+                )
+            if args.pad_packed_seq_alignment > args.max_seqlen_per_dp_cp_rank:
+                raise ValueError(
+                    '--pad-packed-seq-alignment must not exceed '
+                    f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                    f'got {args.pad_packed_seq_alignment}.'
+                )
+
+    if args.cuda_graph_impl != "none" and (
+        args.sequence_packing_scheduler is not None or args.dynamic_context_parallel
+    ):
+        if getattr(args, 'pad_packed_seq_alignment', None) is None:
+            raise ValueError('THD CUDA Graph requires --pad-packed-seq-alignment to be set.')
+        if (
+            args.pad_packed_seq_alignment != 'max'
+            and args.pad_packed_seq_alignment != args.max_seqlen_per_dp_cp_rank
+        ):
+            raise ValueError(
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                'or --pad-packed-seq-alignment equal to '
+                f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                f'got {args.pad_packed_seq_alignment}.'
+            )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1697,6 +1761,61 @@ def validate_args(args, defaults={}):
             args.use_megatron_fsdp
         ), "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-sbhd-validation`` is
+            # checked in ``GPTDatasetConfig.__post_init__``; only the
+            # scheduler check stays here, since ``sequence_packing_scheduler``
+            # is a training-framework flag not stored on the dataset config.
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            #   * ``--dynamic-context-parallel`` is already wired to
+            #     ``default_dynamic_cp`` upstream (see the dynamic-cp block
+            #     earlier in ``validate_args``).
+            #   * Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after all scheduler auto-select
+    # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
+    # so it validates the final resolved scheduler; the varlen path picks its
+    # default after the earlier generic validation has run.
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = (
+                args.seq_length + total_cp_ranks - 1
+            ) // total_cp_ranks
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
+
     # Data blend checks
     assert (
         args.mock_data
@@ -1719,6 +1838,11 @@ def validate_args(args, defaults={}):
         assert all(
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
+
+    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -2097,8 +2221,51 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+        _pat = args.hybrid_layer_pattern
+        _has_dsv4_csa = (
+            (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
+        )
+        _has_dsa = Symbols.DS_ATTENTION in _pat
+        if getattr(args, 'experimental_attention_variant', None) is None:
+            # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
+            # requires the full dsv4_hybrid contract (MLA, TP==1, no qk_clip,
+            # qk_head_dim/kv_lora_rank derivation). Set the variant so transformer_config runs
+            # that validation+derivation rather than silently skipping it. 'D' alone stays legacy
+            # DSv3 'dsa'. An explicit --experimental-attention-variant is always respected.
+            if _has_dsv4_csa:
+                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+            elif _has_dsa:
+                kw_args['experimental_attention_variant'] = 'dsa'
+        # When the dsv4_hybrid variant is active (set above or explicitly) and the user did not
+        # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
+        # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
+        # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
+        _variant = kw_args.get('experimental_attention_variant',
+                               getattr(args, 'experimental_attention_variant', None))
+        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
+            _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
+            # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
+            # depth (a depth can contain multiple hybrid layers, e.g. "/MD-E"). This makes the
+            # array long enough for the deepseek attn index (num_layers + layer_number - 1) for
+            # any MTP attention position, not just depth-first. C->4, H->128, others->0.
+            _sections = _pat.split(Symbols.MTP_SEPARATOR)
+            _ratios = [_ratio_map.get(c, 0) for c in _sections[0].replace(Symbols.PIPE, '')]
+            for _mtp_sec in _sections[1:]:
+                _ratios += [_ratio_map.get(c, 0) for c in _mtp_sec.replace(Symbols.PIPE, '')]
+            kw_args['csa_compress_ratios'] = _ratios
+            args.csa_compress_ratios = _ratios
+        # Exact length check (the pattern is known here, so the precise per-layer count is too):
+        # one ratio per main layer + one per MTP layer of every MTP depth. This catches a
+        # mis-sized user-provided --csa-compress-ratios with a clear error. (transformer_config
+        # keeps a >= backstop because it does not have the pattern to recompute this exactly.)
+        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is not None:
+            _secs = _pat.split(Symbols.MTP_SEPARATOR)
+            _exact_len = sum(len(s.replace(Symbols.PIPE, '')) for s in _secs)
+            assert len(args.csa_compress_ratios) == _exact_len, (
+                f"csa_compress_ratios length ({len(args.csa_compress_ratios)}) must equal the "
+                f"number of layers in the hybrid pattern (main + every MTP-depth layer) "
+                f"= {_exact_len} for pattern '{_pat}'."
+            )
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -2481,6 +2648,38 @@ def _add_inference_args(parser):
         'Pause/unpause take effect as soon as the signal is delivered to a rank. '
         'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
     )
+    group.add_argument(
+        '--inference-shards',
+        type=str,
+        default=None,
+        metavar='SPEC',
+        help='Partition the world into independent inference models, each with '
+        'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
+        'Shards are separated by "+" or ";"; per-shard keys are '
+        'tp,pp,ep,expt_tp,dp (each defaults to 1) and must partition the full '
+        'world. Tagging shards role=prefill|decode enables disaggregated '
+        'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
+        'is several independent decode instances.',
+    )
+    group.add_argument(
+        '--inference-cuda-graph-all-prefills',
+        action='store_true',
+        default=False,
+        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+        'By default, all graphs are limited by the decode limit of '
+        '`max_requests * (num_speculative_tokens + 1)`.',
+    )
+    group.add_argument(
+        '--inference-dynamic-batching-cuda-graph-sizing-distribution',
+        type=str,
+        default='exponential',
+        choices=['exponential', 'linear'],
+        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+        help='Spacing of CUDA graph token counts. "exponential" (default) '
+        'halves from cuda_graph_max_tokens down to tp_size, giving a '
+        'log-spaced distribution with bounded relative padding. '
+        '"linear" uses varying linear strides across the range.',
+    )
     return parser
 
 
@@ -2490,6 +2689,8 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "moe_grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
@@ -2564,6 +2765,8 @@ def _add_network_size_args(parser):
         "actual_vocab_size",
         "fp8_param",
         "fp4_param",
+        # already generated by data args
+        "create_attention_mask_in_dataloader",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2573,6 +2776,7 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "apply_dsa_kernel_fusion",
+        "mamba_training_ssm_states_dtype",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3342,6 +3546,18 @@ def _add_rl_args(parser):
         help='Skip BOS token at the beginning of the sequences. Default is False.',
     )
     group.add_argument(
+        '--rl-profile',
+        action='store_true',
+        default=False,
+        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).',
+    )
+    group.add_argument(
+        '--rl-profile-dir',
+        type=str,
+        default=None,
+        help='Directory to write RL profiling data. Defaults to {save}/profiles.',
+    )
+    group.add_argument(
         '--rl-inference-parsers',
         nargs='*',
         default=[],
@@ -3606,6 +3822,9 @@ def _add_learning_rate_args(parser):
         help='Minimum value for learning rate for the input and output layer. The scheduler'
         'clip values below this threshold',
     )
+    group.add_argument(
+        '--freeze-all-layers', action='store_true', help='Freeze all layers of the model.'
+    )
 
     return parser
 
@@ -3726,6 +3945,13 @@ def _add_mixed_precision_args(parser):
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
         help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+    )
+    group.add_argument(
+        '--mamba-training-ssm-states-dtype',
+        type=str,
+        choices=['fp32', 'bf16'],
+        default=None,
+        help='Dtype of the materialized inter-chunk SSM states in Mamba training',
     )
 
     return parser
@@ -3990,6 +4216,19 @@ def _add_distributed_args(parser):
         help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
+    )
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Opt out of the precomputed LayerWise param layout. When set, '
+        'falls back to the legacy LayerWise ping-pong path: all params '
+        '(including non-Muon embeddings, biases, layernorm) live in a single '
+        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
+        'The default (precomputed layout) routes non-Muon params through a '
+        'separate DistributedOptimizer with byte-level sharding, which is faster '
+        'and uses less padding but produces different bf16 reduction ordering '
+        'and so will not match legacy-path loss curves bit-for-bit.',
     )
     return parser
 
@@ -4619,7 +4858,8 @@ def _add_experimental_attention_variant_args(parser):
         'Accepts a string containing a Python list expression, e.g.: '
         '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
         'Each value is the compression ratio for the corresponding '
-        'transformer layer (valid values: 0, 4, 128). '
+        'transformer layer (valid values: 0, 4, 128; 0 = sliding-window-only, the "W" '
+        'hybrid layer symbol). '
         'The list length must equal num_layers.',
     )
     group.add_argument(
@@ -4629,6 +4869,10 @@ def _add_experimental_attention_variant_args(parser):
         'and fall back to unfused PyTorch implementations.',
         dest='apply_dsa_kernel_fusion',
     )
+    # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss},
+    # --csa-window-size, --csa-compress-rotary-base, --csa-dense-mode are
+    # auto-generated by ArgumentGroupFactory from TransformerConfig fields
+    # (none of them are in the exclude list at line 2500-2576).
     return parser
 
 
@@ -4797,6 +5041,43 @@ def _add_experimental_args(parser):
         "be used for the gradient communication / reduction data-type. When using NCCL "
         "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.",
     )
+    group.add_argument(
+        '--megatron-fsdp-prefetch-recompute-forward-weights',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_prefetch_recompute_forward_weights',
+        help=(
+            'If set, Megatron-FSDP prefetches rowwise weights needed by activation '
+            'recomputation during backward before prefetching backward transpose '
+            'weights.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-cache-param-bucket-views',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_cache_param_bucket_views',
+        help=(
+            'If set, Megatron-FSDP caches parameter bucket views to reduce repeated '
+            'Python-side view setup when attaching module parameters to all-gather buckets.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-enable-fine-grained-param-gather',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_enable_fine_grained_param_gather',
+        help=(
+            'If set, enables fine-grained parameter gathering for Megatron-FSDP. '
+            'This allows greater overlap between parameter all-gather operations and '
+            'forward computation, at the cost of additional communication calls. '
+            'For MXFP8, this helps save memory during fine-grained activation '
+            'recomputation, because MXFP8 forward and backward passes use different '
+            'parameter representations (rowwise data for forward, colwise data for '
+            'backward). Only the rowwise parameters of modules involved in '
+            'recomputation will be unsharded.'
+        ),
+    )
 
     return parser
 
@@ -4804,11 +5085,20 @@ def _add_experimental_args(parser):
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument(
-        '--disable-msc',
-        default=True,
-        action='store_false',
+        '--enable-msc',
+        default=False,
+        action='store_true',
         dest='enable_msc',
-        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.',
+        help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+        'Disabled by default; pass this flag to opt in.',
+    )
+    group.add_argument(
+        '--disable-msc',
+        default=False,
+        action='store_true',
+        dest='disable_msc_deprecated',
+        help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+        'and will be removed in a future release.',
     )
     return parser
 
@@ -4857,10 +5147,102 @@ def _add_sft_args(parser):
         '--sft-mock-dataset-config-json',
         type=str,
         default=None,
-        help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced`` by default, '
+        '``default_dynamic_cp`` when ``--dynamic-context-parallel`` is set. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --dynamic-context-parallel and '
+        '--sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_logits_distillation_args(parser):
+    group = parser.add_argument_group(title='Logits Distillation')
+
+    group.add_argument('--logits-save-top-k', type=int, default=None,
+                       help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-load-dir', type=str, default=None,
+                       help='Directory to load logits.')
+    group.add_argument('--logits-load-decode-threads', type=int, default=4,
+                       help='Number of decode threads for cached-logits zstd '
+                            'decompression and torch.load processing.')
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
+                       help='PyTorch DataLoader prefetch factor for decoded '
+                            'cached-logits iterations. (Non-MSC only)')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of sequential tar consumption.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
+                       help='KD loss alpha for loading logits. Total loss is calculated as '
+                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings and '
+                            'training falls back to LM-only loss instead of crashing.')
     return parser
 
 

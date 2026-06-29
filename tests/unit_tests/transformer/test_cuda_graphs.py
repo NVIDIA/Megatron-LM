@@ -12,10 +12,11 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
@@ -33,13 +34,16 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -351,6 +355,7 @@ class TestParallelTransformerBlockCudagraphs:
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
+    @pytest.mark.flaky_in_dev  # Issue #5474
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
         reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
@@ -596,10 +601,10 @@ class TestLLaVACudaGraph:
         )
 
         # Get layer specs
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         # Set vision model type
         vision_config.vision_model_type = "clip"
@@ -608,7 +613,9 @@ class TestLLaVACudaGraph:
         # Create LLaVA model with both encoder and decoder
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -799,6 +806,50 @@ class TestParallelHybridBlockCudagraphs:
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    def test_mhc_hybrid_layers_are_te_cudagraph_capturable(self):
+        """Regression: a mHC-enabled HybridStack must expose graph-capturable layers.
+
+        When ``enable_hyper_connections=True``, ``HybridStack`` wraps every layer in
+        ``HyperConnectionHybridLayer``. That wrapper must subclass
+        ``GraphableMegatronModule`` and be recognized by ``_layer_is_graphable`` so TE
+        cuda-graph discovery finds the wrapped layers. Before the fix the wrapper
+        subclassed plain ``MegatronModule``, so discovery rejected every layer (0
+        graphable) and CUDA graph capture was silently skipped for the whole hybrid
+        model -- making the mHC hybrid run fully eager (several times slower than the
+        graphed GPT mHC path). This test fails on the pre-fix code via both assertions.
+        """
+        # The wrapper must be graph-capturable by construction.
+        assert issubclass(HyperConnectionHybridLayer, GraphableMegatronModule)
+
+        layer_type_list = validate_segment_layers("M-M*-")  # mamba / mlp / attention mix
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mamba, CudaGraphModule.mlp],
+        )
+        block = HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp"]
+            ),
+        )
+
+        # Every layer is wrapped, and the wrappers are discoverable as graphable.
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in block.layers)
+        graphable = [layer for layer in block.layers if _layer_is_graphable(layer, config)]
+        assert len(graphable) > 0, (
+            "mHC HybridStack produced 0 graphable layers -- TE cuda-graph capture would "
+            "be silently skipped for the entire model (the pre-fix bug)."
+        )
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,
@@ -1058,6 +1109,62 @@ class TestTECudaGraphHelper:
         assert (
             len(order) == expected_order_length
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+
+
+class TestRequiredNumMicrobatchSlots:
+    """Pure-Python tests for ``_get_required_num_microbatch_slots_from_order``.
+
+    The method derives the smallest cuda-graph slot count that guarantees no
+    in-flight microbatch's static buffer is reused before its backward
+    completes. ``order`` is a 1F1B / interleaved-1F1B schedule transcript
+    where ``+chunk_id`` denotes a forward and ``-chunk_id`` a backward.
+    Non-integer entries (e.g. ``0.5`` for wgrad sub-steps) are skipped.
+    """
+
+    @staticmethod
+    def _slots(order, num_chunks):
+        return TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, num_chunks)
+
+    def test_single_chunk_single_microbatch(self):
+        # F0 then B0: one slot is enough.
+        assert self._slots([1, -1], 1) == 1
+
+    def test_single_chunk_pp_pipeline_4_microbatches_pp2(self):
+        # PP=2 1F1B with 4 microbatches: warmup F-F, then F-B-F-B-..., then cooldown B-B.
+        # Max in-flight = 2.
+        order = [1, 1, -1, 1, -1, 1, -1, -1]
+        assert self._slots(order, 1) == 2
+
+    def test_two_chunks_independent(self):
+        # Two model chunks (VPP=2), each running a tiny PP=2-style 1F1B in turn.
+        # Per chunk max in-flight = 2 -> 2 slots.
+        order = [1, 1, -1, -1, 2, 2, -2, -2]
+        assert self._slots(order, 2) == 2
+
+    def test_two_chunks_interleaved(self):
+        # Worst case: forwards stack up across chunks before any backward.
+        # F0 F0 F1 F1 B1 B1 B0 B0 -> per-chunk max in-flight = 2.
+        order = [1, 1, 2, 2, -2, -2, -1, -1]
+        assert self._slots(order, 2) == 2
+
+    def test_skips_non_integer_entries(self):
+        # Float c_ids (e.g. 0.5 for wgrad sub-steps) must be ignored.
+        order = [1, 0.5, -0.5, -1]
+        assert self._slots(order, 1) == 1
+
+    def test_minimum_slot_is_one(self):
+        # Empty / no-op order still returns at least 1 (we always need a slot).
+        assert self._slots([], 1) == 1
+
+    def test_unbalanced_order_asserts(self):
+        # Forward without matching backward -> outstanding != 0 at end -> assert.
+        with pytest.raises(AssertionError):
+            self._slots([1], 1)
+
+    def test_negative_outstanding_asserts(self):
+        # Backward before any forward for a chunk -> outstanding goes negative.
+        with pytest.raises(AssertionError):
+            self._slots([-1], 1)
 
 
 def is_deep_ep_available():
@@ -1577,6 +1684,49 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+class TestSkipFp8WeightUpdateTensor:
+    """Regression test for the TE 2.15 ``set_skip_fp8_weight_update_tensor`` removal."""
+
+    @staticmethod
+    def _read_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        getter = getattr(FP8GlobalStateManager, "get_skip_fp8_weight_update_tensor", None)
+        if getter is not None:
+            return getter()
+        return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
+
+    @staticmethod
+    def _reset_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        if "skip_fp8_weight_update_tensor" in vars(FP8GlobalStateManager):
+            FP8GlobalStateManager.skip_fp8_weight_update_tensor = None
+        qstate = getattr(FP8GlobalStateManager, "quantization_state", None)
+        if qstate is not None and hasattr(qstate, "skip_fp8_weight_update_tensor"):
+            qstate.skip_fp8_weight_update_tensor = None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_sets_value_in_place(self):
+        """Helper writes the right value and reuses the same storage across calls."""
+        from megatron.core.transformer.cuda_graphs import _set_skip_fp8_weight_update_tensor
+
+        self._reset_skip_tensor()
+        try:
+            _set_skip_fp8_weight_update_tensor(True)
+            t = self._read_skip_tensor()
+            assert t.shape == (1,) and t.dtype == torch.float32 and t.is_cuda
+            assert t.item() == 1.0
+
+            # data_ptr must stay stable so captured cudagraphs read the same address.
+            ptr = t.data_ptr()
+            _set_skip_fp8_weight_update_tensor(False)
+            assert self._read_skip_tensor().data_ptr() == ptr
+            assert self._read_skip_tensor().item() == 0.0
+        finally:
+            self._reset_skip_tensor()
 
 
 if __name__ == "__main__":

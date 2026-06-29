@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # TODO: Split this file into smaller files.
 
@@ -57,6 +45,18 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
+    if a is None:
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.storage_offset() == b.storage_offset()
+    )
 
 
 try:
@@ -724,7 +724,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
-        self.backup_allocator = TemporaryBucketAllocator()
+        self.backup_allocator = StorageResizeBasedBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -906,7 +906,7 @@ class DataParallelBuffer:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
-            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
+            self.item_index_map, self.bucket_index, self.shard_bucket_index = (
                 build_data_parallel_buffer_index(
                     [to_local_if_dtensor(p).shape for p in self.params],
                     self.dp_rank,
@@ -924,6 +924,8 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self.cache_param_bucket_views = ddp_config.megatron_fsdp_cache_param_bucket_views
+        self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -970,6 +972,30 @@ class DataParallelBuffer:
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
+            self.set_param_data_from_bucket(bucket)
+        return bucket
+
+    def _bucket_view_cache_key(self, bucket: Bucket):
+        return (
+            bucket.data.data_ptr(),
+            bucket.data.numel(),
+            bucket.data.dtype,
+            str(bucket.data.device),
+            self.is_transpose_buffer,
+        )
+
+    def _build_param_bucket_view_entries(self, bucket: Bucket):
+        entries = []
+        for p in self.params:
+            item_id = self.param_idx[p]
+            p = to_local_if_dtensor(p)
+            data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
+            entries.append((p, data, is_float8tensor(p)))
+        return entries
+
+    def set_param_data_from_bucket(self, bucket: Bucket) -> None:
+        """Attach module parameter tensors to their views in an all-gather bucket."""
+        if not self.cache_param_bucket_views:
             for p in self.params:
                 item_id = self.param_idx[p]
                 p = to_local_if_dtensor(p)
@@ -978,7 +1004,24 @@ class DataParallelBuffer:
                     fp8_set_raw_data(p, data, self.is_transpose_buffer)
                 else:
                     p.data = data
-        return bucket
+            return
+
+        cache_key = self._bucket_view_cache_key(bucket)
+        entries = self._param_bucket_view_cache.get(cache_key)
+        if entries is None:
+            entries = self._build_param_bucket_view_entries(bucket)
+            self._param_bucket_view_cache[cache_key] = entries
+
+        for p, data, is_fp8 in entries:
+            if is_fp8:
+                old_data = fp8_get_raw_data(p, self.is_transpose_buffer)
+                if _same_tensor_view(old_data, data):
+                    continue
+                fp8_set_raw_data(p, data, self.is_transpose_buffer)
+            else:
+                if _same_tensor_view(p.data, data):
+                    continue
+                p.data = data
 
     def allocate_bucket_storage(
         self,
@@ -1800,7 +1843,7 @@ class ParamAndGradBuffer:
                         )
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group) = (
+        self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group = (
             _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
@@ -2167,6 +2210,7 @@ class ParamAndGradBuffer:
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
@@ -2724,18 +2768,23 @@ class ParamAndGradBuffer:
                 p._item_id = item_id
 
                 def main_grad_getter(p):
+                    # Get gradient buffer and item ID.
+                    gbuf = p._gbuf
+                    item_id = p._item_id
+                    # Need to free a bucket for the incoming bucket if double-buffering.
+                    p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
+                        [gbuf.bucket_id]
+                    )
                     # Make sure main_grad memory is allocated when initially accessed.
                     # When gradients are sharded, we can pre-allocate a communication
                     # bucket to avoid casting to a communication data-type. Otherwise,
                     # return the item backed by the main gradient buffer required to
                     # support un-sharded gradient accumulation at high precision.
-                    bucket = p._gbuf.fetch_bucket(
+                    bucket = gbuf.fetch_bucket(
                         dtype=(
                             self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
                         )
                     )
-                    gbuf = p._gbuf
-                    item_id = p._item_id
                     # View it as p.shape so you can insert the param.grad into
                     # the bucket seamlessly.
                     return gbuf.get_item_from_bucket(bucket, item_id).view(
@@ -2817,14 +2866,31 @@ class ParamAndGradBuffer:
         """
         Zero out the underlying grad_buffer and reset all buckets in preparation
         for the next iteration of training.
-        """
-        for name, param in self.optimizer_named_parameters:
-            param.grad = None
-            if hasattr(param, "decoupled_grad"):
-                param.decoupled_grad = None
-            if name in self.dist_main_grad:
-                self.dist_main_grad[name]._local_tensor = None
 
+        Gradient shards are dereferenced to free memory. However, dereferencing is
+        not compatible with (FWD-BWD / full-iteration) CUDA graph-ability, because
+        we need to preserve this reference to the sharded gradient generated during
+        CUDA graph replay (`setattr` in `update_main_grads` not executed during
+        CUDA graph replay, as it is not a CUDA kernel).
+
+        If the gradient is decoupled (precision-aware) or is equivalent to the
+        distributed optimizer parameter precision, the gradient shard is a view of
+        the Megatron-FSDP sharded gradient buffer. If not, then not dereferencing
+        this gradient shard will increase memory utilization as this gradient is a
+        persistent casted-copy of the accumulated gradient.
+        """
+        if not self.ddp_config.megatron_fsdp_cuda_graph_mode:
+            # Dereference the sharded gradient to reclaim memory
+            # unless a full-iteration CUDA graph is utilized.
+            for name, param in self.optimizer_named_parameters:
+                param.grad = None
+                if hasattr(param, "decoupled_grad"):
+                    param.decoupled_grad = None
+                if name in self.dist_main_grad:
+                    self.dist_main_grad[name]._local_tensor = None
+
+        # Zero the Megatron-FSDP sharded gradient buffer. If param.grad or param.decoupled_grad
+        # is a view of this buffer, they will be zero'd as well.
         for group in self.parameter_groups:
             if group.main_grad_buffer:
                 group.main_grad_buffer.data.zero_()
@@ -2931,6 +2997,7 @@ class ParamAndGradBuffer:
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
                             "_tensor_parallel_mode",
+                            "_megatron_fsdp_model",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -2963,11 +3030,6 @@ class ParamAndGradBuffer:
         from the main gradient buffer. If the model parameters are sharded,
         we only need to update the gradient shard associated with the model
         parameter shard, as both are sharded symmetrically.
-
-        Checks if high-precision main weights are utilized for optimization.
-        Otherwise, falls back to low-precision model weights, and further
-        falls back to the original module parameters not managed by cFSDP
-        in the case of no sharding / cFSDP OFF.
         """
         for name, param in self.optimizer_named_parameters:
             orig_param = param.orig_param
@@ -2988,11 +3050,11 @@ class ParamAndGradBuffer:
             optimizer_grad = group.main_grad_buffer.get_item(
                 item_id, only_shard=sharded_optimizer_state
             )
-            if group.main_weight_buffer is not None:
-                if not self.use_decoupled_grad:
-                    # Convert the gradient to the main weight buffer dtype.
-                    # TODO(@cspades): Why this is necessary? Casted below.
-                    optimizer_grad = optimizer_grad.to(param.dtype)
+            if group.main_weight_buffer is not None and not self.use_decoupled_grad:
+                # Convert the gradient to the main weight data-type for optimization.
+                # Not needed for decoupled gradients, because the precision-aware
+                # optimizer can apply gradients to parameters of different precision!
+                optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
                 # Register the gradient as a distributed tensor.
@@ -3021,7 +3083,7 @@ class ParamAndGradBuffer:
                 setattr(param, "decoupled_grad", grad)
             else:
                 # Attach the gradient to the optimizer parameter.
-                setattr(param, "grad", grad.to(param.dtype) if grad is not None else None)
+                setattr(param, "grad", grad)
 
     @property
     def num_buckets(self):
@@ -3419,13 +3481,15 @@ class BucketStatus(Enum):
 
     Attributes:
         EMPTY (int): The bucket is empty and not in use.
+        PRESERVED (int): The bucket storage is retained but not ready for use.
         COMMUNICATING (int): The bucket is currently being used for communication.
         READY_TO_USE (int): The bucket is filled with data and ready for use.
     """
 
     EMPTY = 1
-    COMMUNICATING = 2
-    READY_TO_USE = 3
+    PRESERVED = 2
+    COMMUNICATING = 3
+    READY_TO_USE = 4
 
 
 class GradReducePipeline:
@@ -3582,7 +3646,7 @@ class GradReducePipeline:
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 1:
+            if len(double_buf_units) > 2:
                 keep_n -= 1
 
         with torch.cuda.stream(self.rs_stream):
@@ -3947,8 +4011,14 @@ class AllGatherPipeline:
         """Return the number of buckets."""
         return self.buffer.num_buckets
 
-    def reset(self):
-        """Reset the pipeline state."""
+    def reset(self, preserve_non_fsdp_units: bool = True):
+        """Reset the pipeline state.
+
+        Non-FSDP-unit buckets are preserved by default because their params may
+        be read across module boundaries. Setting preserve_non_fsdp_units=False
+        releases all bucket storage and is intended only for debugging when the
+        model will not be reused.
+        """
         if len(self.param_gather_event_map) > 0:
             warnings.warn(
                 (
@@ -3958,14 +4028,28 @@ class AllGatherPipeline:
                 UserWarning,
             )
             while len(self.param_gather_event_map) > 0:
-                (bucket_id, bwd) = next(iter(self.param_gather_event_map))
+                bucket_id, bwd = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
+
         for bucket_id in range(self.num_buckets):
+            is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
-                self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = True
+                bucket_key = self.get_bucket_key(bucket_id, bwd)
+                # If preserve_non_fsdp_units is set, then do not release buckets
+                # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
+                # (not NEW) so a later all-gather refreshes preserved non-unit bucket
+                # storage in place.
+                if preserve_non_fsdp_units and not is_unit_bucket:
+                    self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                else:
+                    self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
-        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+        expected_statuses = (BucketStatus.EMPTY,)
+        if preserve_non_fsdp_units:
+            expected_statuses += (BucketStatus.PRESERVED,)
+
+        assert all(status in expected_statuses for status in self.bucket_status.values()), (
             f"There are still working buckets, it is not safe to reset. "
             f"bucket_status: {self.bucket_status}."
         )
@@ -4019,10 +4103,6 @@ class AllGatherPipeline:
                     f"{double_buf_units} FSDP units were requested, "
                     "but double buffers can support no more than 2 FSDP units."
                 )
-
-        # Do not release the buckets that are being all-gathered.
-        for bucket_id in ag_buckets:
-            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
@@ -4093,11 +4173,18 @@ class AllGatherPipeline:
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
 
-        # Only all-gather on buckets that have not been allocated yet.
+        # Do not release the buckets that are requested by this call, even if
+        # they are already ready and do not need a new all-gather.
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
+
+        # Only all-gather on buckets that have not been allocated yet or whose
+        # persistent storage was preserved but is not ready for use.
         ag_buckets = [
             bucket_id
             for bucket_id in ag_buckets
-            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)] == BucketStatus.EMPTY
+            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
             return
@@ -4171,12 +4258,13 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.READY_TO_USE:
             # Already ready to use.
             return
-        if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.PRESERVED):
             if empty_ok:
                 return
-            # Bucket shouldn't be empty, this implies that the bucket
-            # was not allocated or NCCL operations are not complete.
-            raise ValueError(f"Bucket {bucket_id} is empty.")
+            # Bucket should not be empty or merely preserved here; this implies that
+            # the bucket was not allocated, was not made ready for use, or NCCL
+            # operations are not complete.
+            raise ValueError(f"Bucket {bucket_id} is {self.bucket_status[bucket_key].name}.")
 
         # Wait for asynchronous / overlapped NCCL operations to complete.
         param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_key)
@@ -4267,7 +4355,10 @@ class AllGatherPipeline:
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
         self.bucket_can_be_released[bucket_key] = False
-        if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (
+            BucketStatus.COMMUNICATING,
+            BucketStatus.READY_TO_USE,
+        ):
             return
 
         self.bucket_status[bucket_key] = BucketStatus.COMMUNICATING
