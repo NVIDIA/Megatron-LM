@@ -154,6 +154,71 @@ class TestBertModel:
         assert encoder_forward.call_args.kwargs['rotary_pos_emb'] is rotary_pos_emb
         assert output is hidden_states
 
+    @pytest.mark.internal
+    def test_forward_validates_dense_attention_mask_and_packed_format(self):
+        sequence_length = self.bert_model.max_sequence_length
+        input_ids = torch.arange(sequence_length, dtype=torch.int64).unsqueeze(0)
+        attention_mask = torch.ones((1, sequence_length), dtype=bool)
+        cu_seqlens = torch.tensor([0, sequence_length], dtype=torch.int32)
+
+        with pytest.raises(ValueError, match='attention_mask must be provided'):
+            self.bert_model.forward(input_ids=input_ids, attention_mask=None)
+
+        with pytest.raises(ValueError, match='qkv_format'):
+            self.bert_model.forward(
+                input_ids=input_ids,
+                attention_mask=None,
+                packed_seq_params=PackedSeqParams(
+                    qkv_format='sbhd',
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=sequence_length,
+                    max_seqlen_kv=sequence_length,
+                ),
+            )
+
+        with pytest.raises(ValueError, match='attention_mask must be None'):
+            self.bert_model.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=PackedSeqParams(
+                    qkv_format='thd',
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=sequence_length,
+                    max_seqlen_kv=sequence_length,
+                ),
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ('token_ids', 'cu_seqlens', 'error_match'),
+        [
+            (
+                torch.arange(4, dtype=torch.int64).repeat((2, 1)),
+                torch.tensor([0, 4]),
+                'dummy batch',
+            ),
+            (
+                torch.arange(4, dtype=torch.int64).unsqueeze(0),
+                None,
+                'cu_seqlens_q must be provided',
+            ),
+            (torch.arange(4, dtype=torch.int64).unsqueeze(0), torch.tensor([1, 4]), 'start at 0'),
+            (torch.arange(4, dtype=torch.int64).unsqueeze(0), torch.tensor([0, 3]), 'end at'),
+            (
+                torch.arange(4, dtype=torch.int64).unsqueeze(0),
+                torch.tensor([0, 3, 2, 4]),
+                'monotonically',
+            ),
+        ],
+    )
+    def test_packed_position_ids_validate_cu_seqlens(self, token_ids, cu_seqlens, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            self.bert_model.bert_position_ids(
+                token_ids, PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu_seqlens)
+            )
+
 
 class TestBertModelAttentionDimensions:
 
