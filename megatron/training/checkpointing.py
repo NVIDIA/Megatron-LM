@@ -848,6 +848,8 @@ def save_checkpoint(
                         process_group,
                         args.ckpt_assume_constant_structure,
                         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
             # Allow opting out of save-side sharding validation entirely (even on
             # the first save) via --no-ckpt-load-validate-sharding-integrity. This
@@ -1754,6 +1756,8 @@ def _load_global_dist_base_checkpoint(
             per_rank_object_load=getattr(
                 args, 'ckpt_fully_parallel_load_per_rank_objects', False
             ),
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
