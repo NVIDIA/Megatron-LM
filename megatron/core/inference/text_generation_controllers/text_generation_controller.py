@@ -758,24 +758,24 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _run_async_sched_prepare(
-        self, new_sample_copy: Tensor, sampled_tokens_cuda: Tensor
+        self, sampled_tokens_cpu: Tensor, sampled_tokens_gpu: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """Prepare decode requests and GPU-visible forward state for async scheduling.
 
         Args:
-            new_sample_copy (Tensor): CPU copy of sampled tokens for active requests.
-            sampled_tokens_cuda (Tensor): GPU-resident sampled tokens to use as
+            sampled_tokens_cpu (Tensor): CPU copy of sampled tokens for active requests.
+            sampled_tokens_gpu (Tensor): GPU-resident sampled tokens to use as
                 input IDs for the speculative forward.
 
         Returns:
             Tuple[Tensor, Tensor]: Input token IDs and position IDs for the speculative forward.
         """
         context = self.inference_wrapped_model.inference_context
-        context.prepare_requests(new_sample_copy)
+        context.prepare_requests(sampled_tokens_cpu)
         input_ids, position_ids = self._dynamic_step_context_init(
             skip_token_input_ids_transfer=True
         )
-        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
+        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
         return input_ids, position_ids
 
     def _run_async_sched_forward(self, input_ids: Tensor, position_ids: Tensor) -> Optional[int]:
@@ -2011,10 +2011,10 @@ class TextGenerationController:
             cached_cuda_graph_request_count = self._decode_forward_primer.cuda_graph_request_count
 
             range_push("sampling")
-            sampled_tokens_cuda = torch.argmax(
+            sampled_tokens_gpu = torch.argmax(
                 self._all_logits_cuda.squeeze(0)[:active_request_count].float(), dim=-1
             )
-            sampled_tokens_cpu = sampled_tokens_cuda.cpu()
+            sampled_tokens_cpu = sampled_tokens_gpu.cpu()
             range_pop()
 
             range_push("active_request_mask")
@@ -2032,12 +2032,11 @@ class TextGenerationController:
             )
             finished_request_ids = context.request_ids[finished_idxs].clone()
             survivor_idxs = torch.nonzero(active_request_mask == 1, as_tuple=True)[0]
-            new_sample_copy = sampled_tokens_cpu.clone()
             range_pop()
 
             range_push("prepare_requests")
             input_ids, position_ids = self._run_async_sched_prepare(
-                new_sample_copy, sampled_tokens_cuda
+                sampled_tokens_cpu, sampled_tokens_gpu
             )
             range_pop()
 

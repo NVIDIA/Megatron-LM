@@ -352,9 +352,9 @@ def test_run_async_sched_prepare_updates_context_before_h2d_init():
         or (input_ids, position_ids)
     )
 
-    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu):
         call_order.append("copy_async_sched_input_tokens_to_gpu")
-        assert torch.equal(sampled_tokens_cuda, sample_cuda)
+        assert torch.equal(sampled_tokens_gpu, sample_cuda)
 
     context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
         side_effect=copy_async_sched_input_tokens_to_gpu
@@ -464,13 +464,13 @@ def test_async_sched_serial_step(
         controller._decode_forward_primer.mark_primed(5)
         return 5
 
-    def prepare_requests(new_sample_copy):
+    def prepare_requests(sampled_tokens_cpu):
         call_order.append("prepare")
-        assert torch.equal(new_sample_copy, sample_tokens)
+        assert torch.equal(sampled_tokens_cpu, sample_tokens)
 
-    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu):
         call_order.append("copy_async_sched_input_tokens_to_gpu")
-        assert torch.equal(sampled_tokens_cuda, sample_tokens)
+        assert torch.equal(sampled_tokens_gpu, sample_tokens)
 
     def resolve_requests(active_request_mask):
         call_order.append("resolve")
