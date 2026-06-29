@@ -759,25 +759,25 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _run_async_sched_prepare(
-        self, new_sample_copy: Optional[Tensor], sampled_tokens_cuda: Tensor
+        self, sampled_tokens_cpu: Optional[Tensor], sampled_tokens_gpu: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """Prepare decode requests and GPU-visible forward state for async scheduling.
 
         Args:
-            new_sample_copy (Optional[Tensor]): CPU copy of sampled tokens for
+            sampled_tokens_cpu (Optional[Tensor]): CPU copy of sampled tokens for
                 active requests, or `None` to defer CPU token materialization.
-            sampled_tokens_cuda (Tensor): GPU-resident sampled tokens to use as
+            sampled_tokens_gpu (Tensor): GPU-resident sampled tokens to use as
                 input IDs for the speculative forward.
 
         Returns:
             Tuple[Tensor, Tensor]: Input token IDs and position IDs for the speculative forward.
         """
         context = self.inference_wrapped_model.inference_context
-        context.prepare_requests(new_sample_copy)
+        context.prepare_requests(sampled_tokens_cpu)
         input_ids, position_ids = self._dynamic_step_context_init(
             skip_token_input_ids_transfer=True
         )
-        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
+        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
         return input_ids, position_ids
 
     def _record_async_sched_event(self, reference_tensor: Optional[Tensor] = None):
@@ -797,11 +797,11 @@ class TextGenerationController:
             event.synchronize()
 
     def _copy_async_sched_sample_to_cpu(
-        self, sampled_tokens_cuda: Tensor, active_request_count: int
+        self, sampled_tokens_gpu: Tensor, active_request_count: int
     ) -> Tuple[Tensor, Optional[Any]]:
         """Start copying sampled tokens to CPU and return a view plus ready event."""
-        sample_slice = sampled_tokens_cuda[:active_request_count]
-        if not sampled_tokens_cuda.is_cuda:
+        sample_slice = sampled_tokens_gpu[:active_request_count]
+        if not sampled_tokens_gpu.is_cuda:
             return sample_slice.cpu(), None
 
         context = self.inference_wrapped_model.inference_context
@@ -815,7 +815,7 @@ class TextGenerationController:
 
         sample_cpu = buffer[:active_request_count]
         sample_cpu.copy_(sample_slice, non_blocking=True)
-        return sample_cpu, self._record_async_sched_event(sampled_tokens_cuda)
+        return sample_cpu, self._record_async_sched_event(sampled_tokens_gpu)
 
     def _build_async_sched_request_state(
         self, sampled_tokens_cpu: Tensor
@@ -2076,11 +2076,11 @@ class TextGenerationController:
             cached_cuda_graph_request_count = self._decode_forward_primer.cuda_graph_request_count
 
             range_push("sampling")
-            sampled_tokens_cuda = torch.argmax(
+            sampled_tokens_gpu = torch.argmax(
                 self._all_logits_cuda.squeeze(0)[:active_request_count].float(), dim=-1
             )
             sampled_tokens_cpu_view, sample_ready_event = self._copy_async_sched_sample_to_cpu(
-                sampled_tokens_cuda, active_request_count
+                sampled_tokens_gpu, active_request_count
             )
             range_pop()
 
@@ -2088,9 +2088,9 @@ class TextGenerationController:
                 self._wait_async_sched_event(sample_ready_event)
 
             range_push("prepare_requests")
-            input_ids, position_ids = self._run_async_sched_prepare(None, sampled_tokens_cuda)
+            input_ids, position_ids = self._run_async_sched_prepare(None, sampled_tokens_gpu)
             range_pop()
-            phase_one_event = self._record_async_sched_event(sampled_tokens_cuda)
+            phase_one_event = self._record_async_sched_event(sampled_tokens_gpu)
             self._wait_async_sched_event(phase_one_event)
 
             range_push("active_request_mask")

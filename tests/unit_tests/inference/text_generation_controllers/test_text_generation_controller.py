@@ -355,9 +355,9 @@ def test_run_async_sched_prepare_updates_context_before_h2d_init():
         or (input_ids, position_ids)
     )
 
-    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu):
         call_order.append("copy_async_sched_input_tokens_to_gpu")
-        assert torch.equal(sampled_tokens_cuda, sample_cuda)
+        assert torch.equal(sampled_tokens_gpu, sample_cuda)
 
     context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
         side_effect=copy_async_sched_input_tokens_to_gpu
@@ -467,17 +467,17 @@ def test_async_sched_serial_step(
         controller._decode_forward_primer.mark_primed(5)
         return 5
 
-    def prepare_requests(new_sample_copy):
+    def prepare_requests(sampled_tokens_cpu):
         call_order.append("prepare")
-        assert new_sample_copy is None
+        assert sampled_tokens_cpu is None
 
-    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu):
         call_order.append("copy_async_sched_input_tokens_to_gpu")
-        assert torch.equal(sampled_tokens_cuda, sample_tokens)
+        assert torch.equal(sampled_tokens_gpu, sample_tokens)
 
-    def finalize_prepared_request_tokens(new_sample_copy):
+    def finalize_prepared_request_tokens(sampled_tokens_cpu):
         call_order.append("finalize_prepared_request_tokens")
-        assert torch.equal(new_sample_copy, sample_tokens)
+        assert torch.equal(sampled_tokens_cpu, sample_tokens)
 
     def resolve_requests(active_request_mask):
         call_order.append("resolve")
@@ -549,7 +549,7 @@ def test_async_sched_overlap_step_waits_at_phase_barriers():
     call_order = []
 
     controller._copy_async_sched_sample_to_cpu = mock.Mock(
-        side_effect=lambda sampled_tokens_cuda, _: call_order.append("copy_sample_to_cpu")
+        side_effect=lambda sampled_tokens_gpu, _: call_order.append("copy_sample_to_cpu")
         or (sample_tokens, "sample")
     )
 
@@ -574,7 +574,7 @@ def test_async_sched_overlap_step_waits_at_phase_barriers():
         side_effect=lambda new_tokens: call_order.append("prepare")
     )
     context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
-        side_effect=lambda sampled_tokens_cuda: call_order.append(
+        side_effect=lambda sampled_tokens_gpu: call_order.append(
             "copy_async_sched_input_tokens_to_gpu"
         )
     )
