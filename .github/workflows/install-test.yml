@@ -89,6 +89,8 @@ jobs:
 
       - name: Check imports for megatron.inference
         uses: ./FW-CI-templates/.github/actions/check-imports
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         with:
           package-name: megatron.inference
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
