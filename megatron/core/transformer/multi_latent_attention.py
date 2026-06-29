@@ -18,7 +18,6 @@ except ImportError:
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.models.backends import get_backend
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -37,7 +36,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -632,206 +631,8 @@ class MLASelfAttention(MultiLatentAttention):
     def _resolve_qk_norm_config(
         self, submodules
     ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
-        """Validate and resolve Q/KV norm placement for MLA and DSA.
-
-        Q/KV norm can be represented either by a standalone norm module or by
-        a fused norm+linear projection. MLA can use the fused form; DSA cannot
-        because it needs the normalized Q/KV values outside the projection.
-
-        Constraints:
-        - `qk_l2_norm` is unsupported for MLA/DSA.
-        - A standalone Q norm is only usable when `q_lora_rank` is set.
-        - Explicit norm modules cannot be paired with fused norm+linear projections.
-        - Disabled QK norm rejects both explicit norms and fused norm+linear projections.
-        - DSA with QK norm requires non-fused projections and standalone Q/KV norms.
-        """
-        is_dsa = self.config.experimental_attention_variant == "dsa"
-        variant_str = "DSA" if is_dsa else "MLA"
-
-        backend = get_backend(self.config.transformer_impl)
-        qk_norm_impl = backend.layer_norm(
-            rms_norm=self.config.normalization == "RMSNorm", for_qk=True
-        )
-        # Unfused linear layer
-        linear_impl = backend.column_parallel_linear()
-        fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
-
-        def is_fused_norm_linear(module_spec):
-            module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
-            return fused_norm_linear_impl is not None and module_cls is fused_norm_linear_impl
-
-        def is_trivial(module_spec):
-            return module_spec in (None, IdentityOp)
-
-        def default_if_trivial(module_spec, default):
-            if is_trivial(module_spec):
-                return default
-            return module_spec
-
-        def qk_layernorm_unavailable(module_name):
-            raise RuntimeError(
-                "qk_layernorm requires TransformerEngine or "
-                "q_layernorm/kv_layernorm to be set in the spec "
-                f"to build `{module_name}`."
-            )
-
-        def require_linear(module_spec, module_name):
-            if module_spec is None:
-                qk_layernorm_unavailable(module_name)
-            return module_spec
-
-        def explicit_q_norm_without_q_lora():
-            help_msg = ""
-            if not is_fused_norm_linear(submodules.linear_q_proj):
-                help_msg = (
-                    f"Please use a fused norm+linear for "
-                    f"`linear_q_proj={submodules.linear_q_proj}` if "
-                    f"you intend to have a Q-norm."
-                )
-            raise ValueError(
-                f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
-                f"but `q_lora_rank is None`, meaning it will not be used."
-                f"{help_msg}"
-            )
-
-        def reject_disabled_norm(module_spec, norm_spec, module_name, norm_name):
-            if is_fused_norm_linear(module_spec) or not is_trivial(norm_spec):
-                raise ValueError(
-                    f"spec sets {module_name}={module_spec} and "
-                    f"{norm_name}={norm_spec}, but "
-                    "qk_layernorm/qk_l2_norm are supposed to be disabled"
-                )
-
-        def reject_explicit_norm_with_fused_linear(module_spec, norm_spec, module_name, norm_name):
-            if not is_trivial(norm_spec) and is_fused_norm_linear(module_spec):
-                raise ValueError(
-                    f"`{norm_name}={norm_spec}` is non-trivial "
-                    f"and `{module_name}={module_spec}` is a "
-                    f"fused norm+linear; either unset `{norm_name}` or use a "
-                    f"linear layer without norm fusion for `{module_name}`"
-                )
-
-        def non_fused_or_default(module_spec, module_name):
-            linear_cls = module_spec or linear_impl
-            require_linear(linear_cls, module_name)
-            if is_fused_norm_linear(linear_cls):
-                raise ValueError(
-                    f"`{module_name}={module_spec}` is fused norm+linear, but a non-fused linear "
-                    f"is required"
-                )
-            return linear_cls
-
-        def dsa_linear_or_default(module_spec, module_name):
-            linear_cls = module_spec or linear_impl
-            require_linear(linear_cls, module_name)
-            if is_fused_norm_linear(linear_cls):
-                raise ValueError(
-                    f"`{module_name}={module_spec}` is fused norm+linear, "
-                    f"which is not supported for DSA."
-                )
-            return linear_cls
-
-        def mla_fused_linear_or_default(module_spec, module_name):
-            if is_fused_norm_linear(module_spec):
-                return module_spec
-            return require_linear(fused_norm_linear_impl, module_name)
-
-        has_q_lora = self.config.q_lora_rank is not None
-        linear_q_proj_cls = linear_q_up_proj_cls = IdentityOp
-        if self.config.qk_l2_norm:
-            raise ValueError(f"qk_l2_norm is not supported with {variant_str}.")
-
-        if not has_q_lora and not is_trivial(submodules.q_layernorm):
-            explicit_q_norm_without_q_lora()
-        if has_q_lora:
-            reject_explicit_norm_with_fused_linear(
-                submodules.linear_q_up_proj,
-                submodules.q_layernorm,
-                "linear_q_up_proj",
-                "q_layernorm",
-            )
-        reject_explicit_norm_with_fused_linear(
-            submodules.linear_kv_up_proj,
-            submodules.kv_layernorm,
-            "linear_kv_up_proj",
-            "kv_layernorm",
-        )
-
-        if self.config.qk_layernorm:
-            if is_dsa:
-                if not has_q_lora:
-                    raise ValueError(
-                        "`qk_layernorm=True` with `q_lora_rank is None` is not supported for DSA "
-                        "because DSA cannot fuse Q norm into `linear_q_proj`."
-                    )
-                q_norm_cls = default_if_trivial(submodules.q_layernorm, qk_norm_impl)
-                linear_q_up_proj_cls = dsa_linear_or_default(
-                    submodules.linear_q_up_proj, "linear_q_up_proj"
-                )
-                kv_norm_cls = default_if_trivial(submodules.kv_layernorm, qk_norm_impl)
-                linear_kv_up_proj_cls = dsa_linear_or_default(
-                    submodules.linear_kv_up_proj, "linear_kv_up_proj"
-                )
-            else:
-                q_norm_cls = submodules.q_layernorm or IdentityOp
-                if has_q_lora:
-                    if is_trivial(q_norm_cls):
-                        linear_q_up_proj_cls = mla_fused_linear_or_default(
-                            submodules.linear_q_up_proj, "linear_q_up_proj"
-                        )
-                    else:
-                        linear_q_up_proj_cls = non_fused_or_default(
-                            submodules.linear_q_up_proj, "linear_q_up_proj"
-                        )
-                else:
-                    if not is_trivial(q_norm_cls):
-                        explicit_q_norm_without_q_lora()
-                    linear_q_proj_cls = mla_fused_linear_or_default(
-                        submodules.linear_q_proj, "linear_q_proj"
-                    )
-
-                kv_norm_cls = submodules.kv_layernorm or IdentityOp
-                if is_trivial(kv_norm_cls):
-                    linear_kv_up_proj_cls = mla_fused_linear_or_default(
-                        submodules.linear_kv_up_proj, "linear_kv_up_proj"
-                    )
-                else:
-                    linear_kv_up_proj_cls = non_fused_or_default(
-                        submodules.linear_kv_up_proj, "linear_kv_up_proj"
-                    )
-        else:
-            if has_q_lora:
-                reject_disabled_norm(
-                    submodules.linear_q_up_proj,
-                    submodules.q_layernorm,
-                    "linear_q_up_proj",
-                    "q_layernorm",
-                )
-                linear_q_up_proj_cls = submodules.linear_q_up_proj or linear_impl
-            else:
-                if is_fused_norm_linear(submodules.linear_q_proj):
-                    raise ValueError(
-                        f"spec sets linear_q_proj={submodules.linear_q_proj}, but "
-                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
-                    )
-                linear_q_proj_cls = submodules.linear_q_proj or linear_impl
-
-            reject_disabled_norm(
-                submodules.linear_kv_up_proj,
-                submodules.kv_layernorm,
-                "linear_kv_up_proj",
-                "kv_layernorm",
-            )
-            linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_impl
-            q_norm_cls = kv_norm_cls = IdentityOp
-
-        return dict(
-            linear_q_proj=linear_q_proj_cls,
-            linear_q_up_proj=linear_q_up_proj_cls,
-            linear_kv_up_proj=linear_kv_up_proj_cls,
-            q_layernorm=q_norm_cls,
-            kv_layernorm=kv_norm_cls,
-        )
+        """Resolve which Q/KV norm and up-projection implementations to build."""
+        return QKNormConfigResolver(self.config, submodules).resolve()
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
