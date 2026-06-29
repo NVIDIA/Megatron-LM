@@ -276,9 +276,9 @@ class BertModel(LanguageModule):
         """Position ids for bert model"""
         if packed_seq_params is not None:
             assert token_ids.size(0) == 1, 'Packed BERT input should use dummy batch size 1'
-            assert packed_seq_params.cu_seqlens_q is not None, (
-                'packed_seq_params.cu_seqlens_q must be provided for packed BERT input'
-            )
+            assert (
+                packed_seq_params.cu_seqlens_q is not None
+            ), 'packed_seq_params.cu_seqlens_q must be provided for packed BERT input'
             cu_seqlens = packed_seq_params.cu_seqlens_q.to(device=token_ids.device)
             seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
             seq_starts = torch.repeat_interleave(cu_seqlens[:-1].to(torch.long), seq_lengths)
@@ -363,8 +363,7 @@ class BertModel(LanguageModule):
             )
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
-                packed_seq=packed_seq_params is not None
-                and packed_seq_params.qkv_format == 'thd',
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
