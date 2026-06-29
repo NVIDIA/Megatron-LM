@@ -41,6 +41,13 @@ class KVTransportBackend(abc.ABC):
     do; gloo is same-tag FIFO) -- callers must not rely on it for matching.
     """
 
+    # Transport family. Push backends (NCCL/NVSHMEM) have both peers post
+    # matched send/recv ops; the coordinator triggers both sides. Pull backends
+    # (NIXL/RDMA) have the prefill side *publish* (register + export descriptors)
+    # and the decode side *fetch* (one-sided READ); the coordinator only relays
+    # the opaque ``handoff_meta`` from publish to fetch. Callers branch on this.
+    is_pull: bool = False
+
     @abc.abstractmethod
     def is_initialized(self) -> bool:
         """Whether :meth:`init` has run."""
@@ -103,17 +110,66 @@ class KVTransportBackend(abc.ABC):
 _backend: Optional[KVTransportBackend] = None
 
 
-def get_kv_transport_backend() -> KVTransportBackend:
-    """Return the active backend, constructing the default (NCCL) on
-    first call."""
-    global _backend
-    if _backend is None:
-        # Lazy import avoids a base <-> nccl import cycle.
+def _construct_backend(name: str) -> KVTransportBackend:
+    """Build a backend by name. ``auto`` picks the best available given what's
+    installed in the container: NIXL (cross-node RDMA, if importable) >
+    NVSHMEM (if importable) > NCCL (always available via torch.distributed).
+
+    Lazy imports avoid a base <-> backend import cycle and keep optional deps
+    (NIXL, NVSHMEM) from being hard requirements of the disaggregation package.
+    """
+    name = (name or "auto").lower().replace("_", "-")
+
+    def _nccl():
         from megatron.core.inference.disaggregation.transfer_backends.nccl import (
             NcclTransportBackend,
         )
+        return NcclTransportBackend()
 
-        _backend = NcclTransportBackend()
+    def _nvshmem():
+        from megatron.core.inference.disaggregation.transfer_backends.nvshmem import (
+            NvshmemTransportBackend,
+        )
+        return NvshmemTransportBackend()
+
+    def _nixl():
+        from megatron.core.inference.disaggregation.transfer_backends.nixl import (
+            NixlTransportBackend,
+        )
+        return NixlTransportBackend()
+
+    if name == "nccl":
+        return _nccl()
+    if name == "nvshmem":
+        return _nvshmem()
+    if name == "nixl":
+        return _nixl()
+    if name == "auto":
+        from megatron.core.inference.disaggregation.transfer_backends import nixl as _nx
+        if _nx.is_available():
+            return _nixl()
+        try:
+            from megatron.core.inference.disaggregation.transfer_backends import (
+                nvshmem as _nv,
+            )
+            if _nv.is_available():
+                return _nvshmem()
+        except Exception:
+            pass
+        return _nccl()
+    raise ValueError(
+        f"Unknown KV transfer backend {name!r}; expected auto|nccl|nvshmem|nixl"
+    )
+
+
+def get_kv_transport_backend() -> KVTransportBackend:
+    """Return the active backend (singleton), selecting on first call from
+    ``MEGATRON_KV_TRANSFER_BACKEND`` (default ``auto``)."""
+    global _backend
+    if _backend is None:
+        import os
+
+        _backend = _construct_backend(os.getenv("MEGATRON_KV_TRANSFER_BACKEND", "auto"))
     return _backend
 
 
