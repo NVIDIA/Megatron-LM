@@ -442,7 +442,7 @@ class HybridStack(MegatronModule):
             )
 
             sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
-            sharded_pp_offset = []
+            sharded_pp_offset: list[tuple[int, int, int]] = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
                 state_dict_prefix, sharded_pp_offset, metadata
