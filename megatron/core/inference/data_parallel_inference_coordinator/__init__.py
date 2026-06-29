@@ -10,11 +10,12 @@ module re-exports the public names so existing imports of
 
 from .coordinator import DataParallelInferenceCoordinator
 from .handlers import HANDLERS, message_handler
-from .state import CONTROL_TRANSITIONS, CoordinatorState
+from .state import CONTROL_TRANSITIONS, ControlTransition, CoordinatorState
 
 __all__ = [
     "DataParallelInferenceCoordinator",
     "CoordinatorState",
+    "ControlTransition",
     "CONTROL_TRANSITIONS",
     "HANDLERS",
     "message_handler",

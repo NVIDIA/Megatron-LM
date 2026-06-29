@@ -149,16 +149,16 @@ def handle_control_signal(coordinator, sender_identity, payload):
         return
 
     header = Headers(payload[0])
-    allowed_from, new_state, idempotent_states = CONTROL_TRANSITIONS[header]
-    if coordinator.state not in allowed_from:
+    transition = CONTROL_TRANSITIONS[header]
+    if coordinator.state not in transition.allowed_from:
         # Silently ignore redundant signals; warn on genuinely invalid ones.
-        if coordinator.state not in idempotent_states:
+        if coordinator.state not in transition.idempotent_in:
             logging.warning(
                 "Coordinator: ignoring %s in state %s", header.name, coordinator.state
             )
         return
-    if new_state is not None:
-        coordinator.state = new_state
+    if transition.new_state is not None:
+        coordinator.state = transition.new_state
 
     # Broadcast the control signal. Forward the full deserialized payload so
     # that data-bearing signals (e.g. SET_GENERATION_EPOCH) retain their args.
