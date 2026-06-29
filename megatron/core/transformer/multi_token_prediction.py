@@ -371,8 +371,8 @@ class MTPLossLoggingHelper:
         """Save normalized MTP loss and acceptance counts for logging.
 
         This compatibility path is used by tests and callers that already
-        computed a normalized per-layer loss. Dynamic-CP code should use
-        ``save_loss_to_tracker`` so loss is weighted by token counts.
+        computed a normalized per-layer loss. Dynamic-CP code uses
+        ``save_loss_to_tracker`` to normalize each local contribution safely.
         """
         if layer_number is None:
             return
@@ -402,11 +402,12 @@ class MTPLossLoggingHelper:
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Save the mtp loss sum and token count for logging.
+        """Normalize and accumulate a local MTP loss for logging.
 
-        Stores raw sums so that the global per-token loss can be computed
-        correctly after all-reduce, even when token counts differ across
-        ranks (e.g. Dynamic CP) or microbatches.
+        MTP is normalized independently for each microbatch. The tracker
+        accumulates those normalized losses, then reduction combines the sums
+        across ranks. This intentionally preserves sequence-packing semantics
+        instead of changing the metric to global ``sum(loss) / sum(tokens)``.
 
         Args:
             loss_sum (torch.Tensor): Sum of per-element losses on this rank.
@@ -415,8 +416,8 @@ class MTPLossLoggingHelper:
             num_layers (int): The number of total layers.
             correct (Optional[torch.Tensor]): Number of correct MTP predictions.
             total (Optional[torch.Tensor]): Total number of MTP predictions.
-            reduce_group (torch.distributed.ProcessGroup): The group for sum-reducing losses.
-            avg_group (torch.distributed.ProcessGroup): The group for sum-reducing before averaging.
+            reduce_group (torch.distributed.ProcessGroup): Group for summing losses.
+            avg_group (torch.distributed.ProcessGroup): Group for averaging losses.
         """
         if layer_number is None:
             return
@@ -424,9 +425,8 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
             tracker["loss_sums"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-            tracker["num_tokens"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        loss_sum = (loss_sum * (num_tokens > 0).to(loss_sum.dtype)) / num_tokens.clamp(min=1)
         tracker["loss_sums"][layer_number] += loss_sum.detach()
-        tracker["num_tokens"][layer_number] += num_tokens.detach()
         if correct is not None and total is not None:
             if "correct_values" not in tracker:
                 tracker["correct_values"] = torch.zeros(
@@ -485,7 +485,6 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
-            tracker["num_tokens"].zero_()
         if "values" in tracker:
             tracker["values"].zero_()
         if "correct_values" in tracker:
@@ -499,21 +498,21 @@ class MTPLossLoggingHelper:
     def reduce_loss_in_tracker():
         """Collect and reduce the mtp losses across ranks.
 
-        Packs loss sums and token counts into a single tensor for one
-        all-reduce, then computes per-token loss.  This produces correct
-        weighted-average results even when ranks hold different numbers
-        of tokens (e.g. Dynamic CP with variable CP sizes).
+        Each element is already a sum of normalized microbatch losses. Sum
+        reductions preserve additive groups, while the DP+CP average keeps the
+        legacy logging contract.
         """
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
             return
-        packed = torch.cat([tracker["loss_sums"], tracker["num_tokens"]])
-        for group_key in ('reduce_group', 'avg_group'):
-            group = tracker.get(group_key)
-            if group is not None:
-                torch.distributed.all_reduce(packed, group=group)
-        loss_sums, num_tokens = packed.chunk(2)
-        tracker["values"] = loss_sums / num_tokens.clamp(min=1)
+        values = tracker["loss_sums"]
+        if tracker.get('reduce_group') is not None:
+            torch.distributed.all_reduce(values, group=tracker['reduce_group'])
+        if tracker.get('avg_group') is not None:
+            torch.distributed.all_reduce(
+                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
+        tracker["values"] = values
 
     @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
