@@ -1065,6 +1065,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         CG-compat: all shapes are static (bincount uses minlength=ep_size+1;
         AllToAll-single uses equal chunks per rank).
+
+        Returns [local_tokens, H] bf16 — the final per-rank output. The
+        dispatcher's BIK token_combine branch is a pass-through; no further
+        cross-rank reduction is needed.
         """
         import torch.distributed as dist
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -1072,7 +1076,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
 
         ep_size = self.ep_group.size()
-        rank = self.ep_group.rank()
         max_tokens = hidden_states.shape[0]
         H = hidden_states.shape[-1]
         N_local = fc2_output.shape[0]
@@ -1160,13 +1163,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             local_out, recv_local_id, recv_weighted, valid_mask=valid_mask,
         )
 
-        # Return as [max_tokens, H] so the dispatcher's slice extracts our part.
-        # Non-local positions are uninitialized but ignored by the slice.
-        full = torch.empty(max_tokens, H, device=device, dtype=hidden_states.dtype)
-        full[rank * local_tokens : (rank + 1) * local_tokens] = local_out.to(
-            hidden_states.dtype
-        )
-        return full
+        # Return the natural [local_tokens, H] shape. The cross-rank reduction
+        # has already happened in the AllToAll + local deterministic_index_add
+        # above, so the dispatcher's BIK token_combine branch is a pass-through.
+        return local_out.to(hidden_states.dtype)
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
