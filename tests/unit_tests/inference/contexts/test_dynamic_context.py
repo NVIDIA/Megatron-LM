@@ -869,11 +869,7 @@ class TestDynamicContext:
 
     @staticmethod
     def _setup_async_sched_decode_rows(
-        ctx,
-        active_request_count=3,
-        request_ids=None,
-        kv_offsets=None,
-        last_block_offsets=None,
+        ctx, active_request_count=3, request_ids=None, kv_offsets=None, last_block_offsets=None
     ):
         request_ids = request_ids or list(range(10, 10 + active_request_count))
         kv_offsets = kv_offsets or list(range(3, 3 + active_request_count))
@@ -949,8 +945,7 @@ class TestDynamicContext:
             torch.tensor(expected_last_offsets, dtype=torch.int32),
         )
         assert torch.equal(
-            ctx.token_to_input_ids[: len(new_tokens)],
-            torch.tensor(new_tokens, dtype=torch.long),
+            ctx.token_to_input_ids[: len(new_tokens)], torch.tensor(new_tokens, dtype=torch.long)
         )
         assert torch.equal(
             ctx.token_to_pos_ids[: len(new_tokens)],
@@ -977,10 +972,7 @@ class TestDynamicContext:
         """Async scheduling prepare raises instead of performing lifecycle operations."""
         ctx = self._get_async_sched_context()
         self._setup_async_sched_decode_rows(
-            ctx,
-            active_request_count=2,
-            kv_offsets=[3, 5],
-            last_block_offsets=[3, 1],
+            ctx, active_request_count=2, kv_offsets=[3, 5], last_block_offsets=[3, 1]
         )
         if "pause requests" in expected_message:
             ctx.kv_block_allocator.get_active_avail = mock.Mock(return_value=0)
@@ -997,11 +989,7 @@ class TestDynamicContext:
     @rounder_override(8)
     @pytest.mark.parametrize(
         "mask, expected_finished_ids, expected_request_ids",
-        [
-            ([1, 1, 1], [], [10, 11, 12]),
-            ([1, 0, 1], [11], [10, 12]),
-            ([0, 0, 0], [10, 11, 12], []),
-        ],
+        [([1, 1, 1], [], [10, 11, 12]), ([1, 0, 1], [11], [10, 12]), ([0, 0, 0], [10, 11, 12], [])],
     )
     def test_async_sched_resolve_requests_success(
         self, mask, expected_finished_ids, expected_request_ids

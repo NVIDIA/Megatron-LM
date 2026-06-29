@@ -61,9 +61,7 @@ def test_capture_engine_stats_includes_async_sched_counters():
         async_sched_step_count=3,
         async_sched_compaction_step_count=4,
     )
-    llm = SimpleNamespace(
-        engine=SimpleNamespace(context=context, capture_stats={"graphs": 5})
-    )
+    llm = SimpleNamespace(engine=SimpleNamespace(context=context, capture_stats={"graphs": 5}))
 
     assert _capture_engine_stats(llm) == {
         "step_count": 1,

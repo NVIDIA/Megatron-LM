@@ -198,8 +198,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
     return SimpleNamespace(
         config=SimpleNamespace(
-            materialize_only_last_token_logits=True,
-            async_sched_mode=AsyncScheduleMode.SERIAL,
+            materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.SERIAL
         ),
         is_hybrid_model=False,
         enable_prefix_caching=False,
@@ -241,8 +240,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     )
     controller = TextGenerationController.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=context,
-        model=SimpleNamespace(config=model_config),
+        inference_context=context, model=SimpleNamespace(config=model_config)
     )
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
@@ -294,11 +292,7 @@ def test_validate_async_sched_support_for_step_errors(attr_path, value):
         moe_enable_routing_replay=False,
     )
     controller = _make_async_sched_controller(context, model_config)
-    target = SimpleNamespace(
-        context=context,
-        controller=controller,
-        model_config=model_config,
-    )
+    target = SimpleNamespace(context=context, controller=controller, model_config=model_config)
     if attr_path == "context.request_metadata":
         context.request_metadata.update(value)
     else:
@@ -334,8 +328,7 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs):
     expected_logits = logits[:, survivor_idxs, :]
     if enable_cuda_graph:
         assert torch.equal(
-            controller._all_logits_cuda[:, : survivor_idxs.numel(), :],
-            expected_logits,
+            controller._all_logits_cuda[:, : survivor_idxs.numel(), :], expected_logits
         )
         assert controller._all_logits_cuda.shape == logits.shape
     else:
@@ -366,8 +359,7 @@ def test_run_async_sched_prepare_updates_context_before_h2d_init():
 
 
 @pytest.mark.parametrize(
-    "using_cuda_graph, expected_cuda_graph_request_count",
-    [(False, None), (True, 8)],
+    "using_cuda_graph, expected_cuda_graph_request_count", [(False, None), (True, 8)]
 )
 def test_run_async_sched_forward_records_primer(
     using_cuda_graph, expected_cuda_graph_request_count
@@ -421,10 +413,7 @@ def test_async_sched_serial_step_returns_none_without_active_requests():
 
 @pytest.mark.parametrize(
     "is_primed, termination_ids, expected_finished_ids, expected_compaction_count",
-    [
-        (True, torch.tensor([99, 99, 99]), [], 0),
-        (False, torch.tensor([99, 2, 99]), [11], 1),
-    ],
+    [(True, torch.tensor([99, 99, 99]), [], 0), (False, torch.tensor([99, 2, 99]), [11], 1)],
 )
 def test_async_sched_serial_step(
     is_primed, termination_ids, expected_finished_ids, expected_compaction_count
@@ -506,9 +495,7 @@ def test_async_generate_output_tokens_dynamic_batch_routes(
     controller._run_legacy_step = mock.AsyncMock(return_value="legacy")
     controller._run_async_sched_serial_step = mock.AsyncMock(return_value="async")
 
-    result = asyncio.run(
-        controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping)
-    )
+    result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping))
 
     assert result == expected_result
 
