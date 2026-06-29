@@ -976,11 +976,11 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.requests[request_id].record[-1]
 
     def _validate_async_sched_support_for_config(self) -> None:
-        """Validate config-level restrictions for serial async scheduling.
+        """Validate config-level restrictions for async scheduling.
 
-        Raises if the config does not support serial async scheduling.
+        Raises if the config does not support async scheduling.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
@@ -1000,12 +1000,12 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for serial async scheduling.
+        """Validate request-level restrictions for async scheduling.
 
         Args:
             request (DynamicInferenceRequest): Request being added to the engine.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         sampling_params = request.sampling_params

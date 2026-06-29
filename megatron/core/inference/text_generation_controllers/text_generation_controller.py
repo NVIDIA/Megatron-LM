@@ -203,6 +203,7 @@ class TextGenerationController:
         #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
         #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
         self._sampled_tokens_cuda = None
+        self._sampled_tokens_cpu_buffer = None
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -758,12 +759,13 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _run_async_sched_prepare(
-        self, new_sample_copy: Tensor, sampled_tokens_cuda: Tensor
+        self, new_sample_copy: Optional[Tensor], sampled_tokens_cuda: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """Prepare decode requests and GPU-visible forward state for async scheduling.
 
         Args:
-            new_sample_copy (Tensor): CPU copy of sampled tokens for active requests.
+            new_sample_copy (Optional[Tensor]): CPU copy of sampled tokens for
+                active requests, or `None` to defer CPU token materialization.
             sampled_tokens_cuda (Tensor): GPU-resident sampled tokens to use as
                 input IDs for the speculative forward.
 
@@ -777,6 +779,67 @@ class TextGenerationController:
         )
         context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
         return input_ids, position_ids
+
+    def _record_async_sched_event(self, reference_tensor: Optional[Tensor] = None):
+        """Record an event on the current CUDA stream when CUDA work is active."""
+        if reference_tensor is not None and not reference_tensor.is_cuda:
+            return None
+        if not torch.cuda.is_available():
+            return None
+        event = torch.cuda.Event()
+        event.record()
+        return event
+
+    @staticmethod
+    def _wait_async_sched_event(event) -> None:
+        """Wait for an async-scheduler CUDA event if one was recorded."""
+        if event is not None:
+            event.synchronize()
+
+    def _copy_async_sched_sample_to_cpu(
+        self, sampled_tokens_cuda: Tensor, active_request_count: int
+    ) -> Tuple[Tensor, Optional[Any]]:
+        """Start copying sampled tokens to CPU and return a view plus ready event."""
+        sample_slice = sampled_tokens_cuda[:active_request_count]
+        if not sampled_tokens_cuda.is_cuda:
+            return sample_slice.cpu(), None
+
+        context = self.inference_wrapped_model.inference_context
+        buffer = getattr(self, "_sampled_tokens_cpu_buffer", None)
+        required_size = max(
+            active_request_count, getattr(context, "max_requests", active_request_count)
+        )
+        if buffer is None or buffer.numel() < required_size:
+            buffer = torch.empty(required_size, dtype=torch.int64, device="cpu", pin_memory=True)
+            self._sampled_tokens_cpu_buffer = buffer
+
+        sample_cpu = buffer[:active_request_count]
+        sample_cpu.copy_(sample_slice, non_blocking=True)
+        return sample_cpu, self._record_async_sched_event(sampled_tokens_cuda)
+
+    def _build_async_sched_request_state(
+        self, sampled_tokens_cpu: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Build request IDs and active/finished row sets after prepare."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].long()
+
+        active_sequence_lengths = context.get_active_sequence_lengths()
+        max_sequence_lengths = context.get_max_sequence_lengths()
+        active_request_mask = (
+            sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_request_ids = context.request_ids[finished_idxs].clone()
+        survivor_idxs = torch.nonzero(active_request_mask == 1, as_tuple=True)[0]
+        assert sampled_tokens_cpu.numel() == active_request_count
+
+        return active_request_ids, finished_request_ids, active_request_mask, survivor_idxs
 
     def _run_async_sched_forward(self, input_ids: Tensor, position_ids: Tensor) -> Optional[int]:
         """Run one dynamic forward pass and cache logits for async scheduling.
@@ -1980,8 +2043,13 @@ class TextGenerationController:
             ret.update(request_bookkeeping)
             return ret
 
-    async def _run_async_sched_serial_step(self) -> Optional[Dict]:
-        """Run one decode-only step using serial async scheduling.
+    async def _run_async_sched_step(self, *, overlap: bool) -> Optional[Dict]:
+        """Run one decode-only step using the async scheduling path.
+
+        Args:
+            overlap (bool): If true, overlap prepare/sample and forward/resolve
+                within the two explicit phase barriers. If false, wait early to
+                preserve serial async-scheduling order.
 
         Returns:
             Optional[Dict]: Step result for sampled and finished requests, or
@@ -2005,52 +2073,51 @@ class TextGenerationController:
 
         with torch.inference_mode():
             active_request_count = context.total_request_count - context.paused_request_count
-            active_request_slice = slice(context.paused_request_count, context.total_request_count)
-            active_request_ids = context.request_ids[active_request_slice].long()
-
             cached_cuda_graph_request_count = self._decode_forward_primer.cuda_graph_request_count
 
             range_push("sampling")
             sampled_tokens_cuda = torch.argmax(
                 self._all_logits_cuda.squeeze(0)[:active_request_count].float(), dim=-1
             )
-            sampled_tokens_cpu = sampled_tokens_cuda.cpu()
-            range_pop()
-
-            range_push("active_request_mask")
-            active_sequence_lengths = context.get_active_sequence_lengths()
-            active_sequence_lengths += 1
-            max_sequence_lengths = context.get_max_sequence_lengths()
-            active_request_mask = (
-                sampled_tokens_cpu
-                != context.request_metadata["termination_id"][active_request_slice]
-            ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-
-            finished_idxs = (
-                torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-                + context.paused_request_count
+            sampled_tokens_cpu_view, sample_ready_event = self._copy_async_sched_sample_to_cpu(
+                sampled_tokens_cuda, active_request_count
             )
-            finished_request_ids = context.request_ids[finished_idxs].clone()
-            survivor_idxs = torch.nonzero(active_request_mask == 1, as_tuple=True)[0]
-            new_sample_copy = sampled_tokens_cpu.clone()
             range_pop()
+
+            if not overlap:
+                self._wait_async_sched_event(sample_ready_event)
 
             range_push("prepare_requests")
-            input_ids, position_ids = self._run_async_sched_prepare(
-                new_sample_copy, sampled_tokens_cuda
+            input_ids, position_ids = self._run_async_sched_prepare(None, sampled_tokens_cuda)
+            range_pop()
+            phase_one_event = self._record_async_sched_event(sampled_tokens_cuda)
+            self._wait_async_sched_event(phase_one_event)
+
+            range_push("active_request_mask")
+            sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
+            context.finalize_prepared_request_tokens(sampled_tokens_cpu)
+            (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
+                self._build_async_sched_request_state(sampled_tokens_cpu)
             )
             range_pop()
 
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids, position_ids)
             range_pop()
+            forward_done_event = self._record_async_sched_event(self._all_logits_cuda)
+
+            if not overlap:
+                self._wait_async_sched_event(forward_done_event)
 
             range_push("resolve_requests")
             resolved_finished_request_ids = context.resolve_requests(active_request_mask)
             range_pop()
 
             assert torch.equal(finished_request_ids, resolved_finished_request_ids)
+            self._wait_async_sched_event(forward_done_event)
             self._compact_async_sched_logits(survivor_idxs)
+            phase_two_event = self._record_async_sched_event(self._all_logits_cuda)
+            self._wait_async_sched_event(phase_two_event)
 
             context.async_sched_step_count += 1
             if survivor_idxs.numel() < active_request_count:
@@ -2068,6 +2135,14 @@ class TextGenerationController:
                 "top_n_logprobs": None,
                 "cuda_graph_request_count": cached_cuda_graph_request_count,
             }
+
+    async def _run_async_sched_serial_step(self) -> Optional[Dict]:
+        """Run one decode-only step using serial async scheduling."""
+        return await self._run_async_sched_step(overlap=False)
+
+    async def _run_async_sched_overlap_step(self) -> Optional[Dict]:
+        """Run one decode-only step using overlapped async scheduling."""
+        return await self._run_async_sched_step(overlap=True)
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -2088,8 +2163,11 @@ class TextGenerationController:
         if mode == AsyncScheduleMode.LEGACY or context.num_prefill_requests != 0:
             return await self._run_legacy_step(skip_bookkeeping)
         if mode == AsyncScheduleMode.SERIAL:
-            assert not skip_bookkeeping, "Serial async scheduling requires request bookkeeping."
+            assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
             return await self._run_async_sched_serial_step()
+        if mode == AsyncScheduleMode.OVERLAP:
+            assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
+            return await self._run_async_sched_overlap_step()
         raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
     @torch.inference_mode()

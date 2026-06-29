@@ -1041,6 +1041,26 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    def test_async_sched_prepare_requests_can_defer_token_materialization(self):
+        """Async scheduling prepare can run before sampled CPU tokens are ready."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2, kv_offsets=[3, 5])
+        original_tokens = ctx.token_to_input_ids[:2].clone()
+
+        ctx.prepare_requests()
+
+        assert torch.equal(ctx.token_to_input_ids[:2], original_tokens)
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:2], torch.tensor([4, 6], dtype=torch.int32)
+        )
+
+        new_tokens = torch.tensor([90, 91], dtype=torch.int64)
+        ctx.finalize_prepared_request_tokens(new_tokens)
+
+        assert torch.equal(ctx.token_to_input_ids[:2], new_tokens)
+
+    @pytest.mark.internal
+    @rounder_override(8)
     @pytest.mark.parametrize(
         "setup, new_tokens, expected_message",
         [

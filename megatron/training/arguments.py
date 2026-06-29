@@ -1988,11 +1988,13 @@ def _add_inference_args(parser):
                             'is requested but the package is not installed.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
-                       choices=['legacy', 'serial'],
+                       choices=['legacy', 'serial', 'overlap'],
                        help='Async scheduling mode for dynamic batching. '
                             '"legacy" (default) preserves the existing resolve-before-prepare '
                             'path. "serial" speculatively prepares and forwards decode-only '
-                            'steps before resolving finished requests.')
+                            'steps before resolving finished requests. "overlap" uses the same '
+                            'async scheduling path while overlapping prepare/sample and '
+                            'forward/resolve phases.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
