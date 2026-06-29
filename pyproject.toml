@@ -13,6 +13,8 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "megatron.inference",
+    "megatron.inference.*",
 ]
 
 [tool.setuptools.dynamic]
