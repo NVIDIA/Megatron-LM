@@ -66,7 +66,7 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
 
 ### Steps
 
-1. Receive notification via Slack
+1. Monitor CI Slack channel
 2. Work with CI to find root cause
 3. Resolve
   - If it's a low-hanging fruit, try to fix immediately
