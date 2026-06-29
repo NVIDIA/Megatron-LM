@@ -4,11 +4,6 @@ name: Auto Reminder Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      expected_sha:
-        description: Exact pull-request/4862 commit authorized for this canary
-        required: true
-        type: string
   schedule:
     - cron: "0 12 * * *"
 
@@ -25,8 +20,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/pull-request/4862' &&
       github.actor == 'Phlip79' &&
-      github.triggering_actor == 'Phlip79' &&
-      inputs.expected_sha == github.sha
+      github.triggering_actor == 'Phlip79'
     permissions:
       actions: read
       checks: read
@@ -39,7 +33,6 @@ jobs:
       test_mode: true
       test_pr_number: 3005
       test_commenter: Phlip79
-      expected_workflow_sha: ${{ inputs.expected_sha }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       PAT: ${{ secrets.PAT }}

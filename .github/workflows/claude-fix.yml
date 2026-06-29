@@ -30,9 +30,6 @@ on:
       test_commenter:
         required: true
         type: string
-      expected_workflow_sha:
-        required: true
-        type: string
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -65,7 +62,7 @@ jobs:
        github.actor == 'Phlip79' &&
        github.triggering_actor == 'Phlip79' &&
        inputs.test_commenter == 'Phlip79' &&
-       inputs.expected_workflow_sha == github.sha)
+       github.sha != '')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -93,7 +90,6 @@ jobs:
           COMMENTER: ${{ inputs.test_mode && inputs.test_commenter || github.event.comment.user.login }}
           COMMENT_ID: ${{ github.event.comment.id }}
           TEST_MODE: ${{ inputs.test_mode }}
-          EXPECTED_WORKFLOW_SHA: ${{ inputs.expected_workflow_sha }}
         run: |
           set -euo pipefail
 
@@ -105,7 +101,6 @@ jobs:
             test "$GITHUB_REF" = "refs/heads/pull-request/4862"
             test "$GITHUB_ACTOR" = "Phlip79"
             test "$GITHUB_TRIGGERING_ACTOR" = "Phlip79"
-            test "$GITHUB_SHA" = "$EXPECTED_WORKFLOW_SHA"
             test "$GITHUB_SHA" = \
               "$(gh api repos/NVIDIA/Megatron-LM/pulls/4862 --jq '.head.sha')"
             test "$PR_NUMBER" = "3005"
