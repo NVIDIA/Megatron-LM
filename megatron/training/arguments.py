@@ -2726,6 +2726,25 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-metadata', type=str, default=None,
+                       help='Path to a prepared distributed-checkpoint `.metadata` '
+                       'file. When set, '
+                       'every SAVE reuses this metadata: the nvrx async planning '
+                       '+ finalize SKIP both `gather_object` collectives (failures '
+                       'detected via a cheap all_reduce), while each checkpoint dir '
+                       'still gets its own complete `.metadata`. The LOAD path is '
+                       'unaffected and always reads each checkpoint\'s own '
+                       '`.metadata`. Requires the structure / world size / '
+                       'dist-ckpt-workers to match the run that produced the '
+                       'metadata (the user owns this guarantee).')
+    group.add_argument('--ckpt-metadata-create', action='store_true', default=False,
+                       help='Create the `--ckpt-metadata` file instead of reading '
+                       'it. Use for the '
+                       'very first job, when no prepared metadata exists yet: the '
+                       'first checkpoint save runs the normal save-plan/metadata '
+                       'collectives and writes the resulting complete metadata to '
+                       'the `--ckpt-metadata` path; subsequent saves in the SAME '
+                       'job then reuse it and take the collective-free fast path.')
     return parser
 
 
