@@ -52,7 +52,6 @@ from megatron.core.distributed import (
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as megatron_FSDP,
 )
-from megatron.core.distributed.dump_parameters import dump_optimizer_parameters
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
@@ -84,6 +83,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.optimizer.utils import dump_optimizer_parameters
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
@@ -2064,7 +2064,7 @@ def setup_model_and_optimizer(
         # Optional: dump per-rank optimizer parameter sharding for fixture capture.
         # Gated by `DUMP_OPTIMIZER_PARAMETERS_OUTPUT` env var; each rank writes a
         # JSON snapshot under that path. Optimizer-agnostic — fires regardless
-        # of optimizer class. See `megatron.core.distributed.dump_parameters` for the schema.
+        # of optimizer class. See `megatron.core.optimizer.utils` for the schema.
         dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
         if dump_path:
             # `MegatronOptimizer` wraps an inner `torch.optim.Optimizer` and

@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dump per-rank optimizer parameter sharding info to JSON.
+"""Optimizer utilities for dumping per-rank parameter sharding info to JSON.
 
 Useful for replaying optimizer steps in tests/microbenchmarks without
 re-running the model. The dump captures everything needed to reconstruct
 the parameter layout: global/local shape, per-param mesh, placements,
 dtype, and the QKV flag.
 
-Optimizer-agnostic: works with any PyTorch optimizer whose params are
-DTensors managed by Megatron-FSDP.
+Optimizer-agnostic: works with any PyTorch optimizer whose params are DTensors.
 """
 
 import json
