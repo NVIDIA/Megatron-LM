@@ -198,6 +198,7 @@ def _resolve_thd_padding_lengths(
     packed_seq_params: PackedSeqParams,
     target_len: Optional[int],
     alignment: Optional[int],
+    padding_mask: Optional[Tensor] = None,
     cp_group: Optional[dist.ProcessGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
@@ -205,7 +206,7 @@ def _resolve_thd_padding_lengths(
     """Resolve local/global THD padding lengths without changing tensors.
 
     Returns:
-        local_actual_T: Current rank's token-like tensor length.
+        local_actual_T: Current rank's physical row count.
         global_actual_T: Global packed length represented by THD metadata.
         local_target_len: Current rank's padded token-like tensor length.
         global_target_len: Global padded endpoint represented by THD metadata.
@@ -216,10 +217,10 @@ def _resolve_thd_padding_lengths(
         packed_seq_params, cp_group=cp_group, cp_size=cp_size, cp_rank=cp_rank
     )
 
-    # Find the first token-like tensor that carries this rank's local length.
+    # Find a tensor that already carries this rank's local physical row count.
     local_tensor_T = None
     mask_device = None
-    for candidate in (tokens, labels, loss_mask, position_ids):
+    for candidate in (tokens, labels, loss_mask, position_ids, padding_mask):
         if candidate is not None:
             local_tensor_T = int(candidate.shape[-1])
             mask_device = candidate.device
@@ -234,7 +235,7 @@ def _resolve_thd_padding_lengths(
     else:
         assert has_local_tensor, (
             "packed_seq_params.cu_seqlens_q must be available to derive padding_mask "
-            "when tokens/labels/loss_mask/position_ids are all None."
+            "when tokens/labels/loss_mask/position_ids/padding_mask are all None."
         )
         global_actual_T = local_tensor_T * cp_size
 
@@ -382,10 +383,9 @@ def pad_sequence_for_thd(
         cp_rank: Explicit context-parallel rank used with ``cp_size``.
 
     Notes:
-        - THD CP slicing is defined by Transformer Engine. On metadata-only
-          stages, Megatron asks TE which packed rows this CP rank would receive
-          and uses that row count as the local length instead of assuming equal
-          division by CP size.
+        - On stages without token-like tensors, an already CP-sliced padding
+          mask supplies the local physical row count. Legacy callers without a
+          padding mask ask TE which packed rows this CP rank would receive.
         - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
           represented as an ordinary dummy sequence in cu_seqlens metadata.
         - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
@@ -408,6 +408,7 @@ def pad_sequence_for_thd(
             packed_seq_params,
             target_len=target_len,
             alignment=alignment,
+            padding_mask=padding_mask,
             cp_group=cp_group,
             cp_size=cp_size,
             cp_rank=cp_rank,

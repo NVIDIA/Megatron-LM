@@ -476,6 +476,42 @@ class TestPadSequenceForThd:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_metadata_only_uses_local_padding_mask(self, monkeypatch):
+        """A middle PP stage must not repartition already CP-sliced physical rows."""
+        packed_seq_params = _make_psp([15])
+        cu_seqlens_padded = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        packed_seq_params.cu_seqlens_q_padded = cu_seqlens_padded
+        packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_padded.clone()
+        padding_mask = torch.tensor(
+            [[False, False, False, True]], dtype=torch.bool, device="cuda"
+        )
+
+        def fail_if_called(*_args, **_kwargs):
+            pytest.fail("already sliced padding_mask must avoid TE repartitioning")
+
+        monkeypatch.setattr(
+            "megatron.core.extensions.transformer_engine.get_thd_partitioned_indices",
+            fail_if_called,
+        )
+
+        _, _, _, _, padded_params, padded_mask = pad_sequence_for_thd(
+            None,
+            None,
+            None,
+            None,
+            packed_seq_params,
+            target_len=4,
+            padding_mask=padding_mask,
+            cp_size=4,
+            cp_rank=3,
+        )
+
+        assert torch.equal(padded_mask, padding_mask)
+        assert padded_params.cu_seqlens_q.tolist() == [0, 15, 16]
+        assert padded_params.cu_seqlens_q_padded.tolist() == [0, 16, 16]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cu_seqlens_fill_value(self):
         """Static cu padding repeats dummy valid/padded cumulative values."""
         seqlens, total_T = [50, 30], 80
