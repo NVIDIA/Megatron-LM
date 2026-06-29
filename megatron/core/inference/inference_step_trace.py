@@ -40,6 +40,7 @@ class InferenceStepTracer:
         self._callbacks: List[Callable[[], Dict]] = []
         self._file = None
         self._n_since_flush = 0
+        self._last_t: Optional[float] = None
 
     def register_callback(self, fn: Callable[[], Dict]) -> None:
         """Register a ``() -> dict`` sampled on each recorded step (merged into the record)."""
@@ -64,14 +65,22 @@ class InferenceStepTracer:
         decode: int,
         active_tokens: int,
     ) -> None:
-        """Append one step's batch-size record (subject to the stride)."""
+        """Append one step's batch-size record (subject to the stride).
+
+        ``dt`` = wall-clock seconds since the previous recorded step (``None``
+        first); at stride 1 it is the preceding step's duration. No GPU sync.
+        """
         if step % self.stride != 0:
             return
+        now = time.time()
+        dt = now - self._last_t if self._last_t is not None else None
+        self._last_t = now
         record = {
             "rank": self.rank,
             "dp_rank": self.dp_rank,
             "step": int(step),
-            "t": time.time(),
+            "t": now,
+            "dt": dt,
             "active": int(active),
             "waiting": int(waiting),
             "paused": int(paused),
