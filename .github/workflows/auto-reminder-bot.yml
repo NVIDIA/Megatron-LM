@@ -4,14 +4,53 @@ name: Auto Reminder Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact pull-request/4862 commit authorized for this canary
+        required: true
+        type: string
   schedule:
     - cron: "0 12 * * *"
 
+permissions: {}
+
 jobs:
+  # Temporary, explicitly dispatched canary. The workflow path is already
+  # registered on main, so the Actions API can run this branch revision with
+  # ref=pull-request/4862. Remove this job after the PR #3005 test.
+  claude-fix-pr-3005:
+    name: Claude Fix PR 3005 Canary
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/pull-request/4862' &&
+      github.actor == 'Phlip79' &&
+      github.triggering_actor == 'Phlip79' &&
+      inputs.expected_sha == github.sha
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+    uses: ./.github/workflows/claude-fix.yml
+    with:
+      test_mode: true
+      test_pr_number: 3005
+      test_commenter: Phlip79
+      expected_workflow_sha: ${{ inputs.expected_sha }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PAT: ${{ secrets.PAT }}
+
   run-script:
     name: Run Auto Reminder Bot
     runs-on: ubuntu-latest
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      !(github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/pull-request/4862')
     steps:
       - name: Check out repository code
         uses: actions/checkout@v6

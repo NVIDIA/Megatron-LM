@@ -17,9 +17,30 @@ name: Claude Fix PR
 on:
   issue_comment:
     types: [created]
+  # Temporary reusable entrypoint for the PR #3005 canary. This is removed
+  # after the explicitly dispatched test run.
+  workflow_call:
+    inputs:
+      test_mode:
+        required: true
+        type: boolean
+      test_pr_number:
+        required: true
+        type: number
+      test_commenter:
+        required: true
+        type: string
+      expected_workflow_sha:
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      PAT:
+        required: true
 
 concurrency:
-  group: claude-fix-pr-${{ github.event.issue.number }}
+  group: claude-fix-pr-${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
   cancel-in-progress: false
 
 # Start every job with no token permissions. Each job opts into only what its
@@ -30,12 +51,21 @@ jobs:
   authorize:
     name: Authorize Claude Fix
     if: |
-      github.repository == 'NVIDIA/Megatron-LM' &&
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
-      github.event.comment.user.type == 'User' &&
-      github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
-      startsWith(github.event.comment.body, '/claude fix')
+      (github.repository == 'NVIDIA/Megatron-LM' &&
+       github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       github.event.comment.user.type == 'User' &&
+       github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
+       startsWith(github.event.comment.body, '/claude fix')) ||
+      (github.repository == 'NVIDIA/Megatron-LM' &&
+       inputs.test_mode &&
+       github.event_name == 'workflow_dispatch' &&
+       inputs.test_pr_number == 3005 &&
+       github.ref == 'refs/heads/pull-request/4862' &&
+       github.actor == 'Phlip79' &&
+       github.triggering_actor == 'Phlip79' &&
+       inputs.test_commenter == 'Phlip79' &&
+       inputs.expected_workflow_sha == github.sha)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -53,19 +83,34 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
     steps:
       - name: Validate command, actor, and PR
         id: authorize
         shell: bash
         env:
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ inputs.test_mode && '/claude fix' || github.event.comment.body }}
+          COMMENTER: ${{ inputs.test_mode && inputs.test_commenter || github.event.comment.user.login }}
           COMMENT_ID: ${{ github.event.comment.id }}
+          TEST_MODE: ${{ inputs.test_mode }}
+          EXPECTED_WORKFLOW_SHA: ${{ inputs.expected_workflow_sha }}
         run: |
           set -euo pipefail
 
           echo "should_run=false" >> "$GITHUB_OUTPUT"
+
+          if [[ "$TEST_MODE" == "true" ]]; then
+            test "$GITHUB_REPOSITORY" = "NVIDIA/Megatron-LM"
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test "$GITHUB_REF" = "refs/heads/pull-request/4862"
+            test "$GITHUB_ACTOR" = "Phlip79"
+            test "$GITHUB_TRIGGERING_ACTOR" = "Phlip79"
+            test "$GITHUB_SHA" = "$EXPECTED_WORKFLOW_SHA"
+            test "$GITHUB_SHA" = \
+              "$(gh api repos/NVIDIA/Megatron-LM/pulls/4862 --jq '.head.sha')"
+            test "$PR_NUMBER" = "3005"
+            test "$COMMENTER" = "Phlip79"
+          fi
 
           # The command must be the entire first token, at the beginning of
           # the comment. This rejects quotations, `/claude fixed`, and prose
@@ -97,6 +142,15 @@ jobs:
           base_ref=$(jq -r '.base.ref // empty' <<< "$pr_json")
           base_repo=$(jq -r '.base.repo.full_name // empty' <<< "$pr_json")
           maintainer_can_modify=$(jq -r '.maintainer_can_modify' <<< "$pr_json")
+
+          if [[ "$TEST_MODE" == "true" ]]; then
+            test "$head_repo" = "Phlip79/Megatron-LM"
+            test "$head_ref" = "philip/fifteen-minutes"
+            test "$head_sha" = "50d49f4479c316ad5576bc0c49dc1ddb39c97dd8"
+            test "$base_repo" = "NVIDIA/Megatron-LM"
+            test "$base_ref" = "main"
+            test "$maintainer_can_modify" = "true"
+          fi
 
           if [[ "$state" != "open" || "$merged" != "false" ]]; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" \
@@ -183,9 +237,11 @@ jobs:
             echo "base_sha=$base_sha"
           } >> "$GITHUB_OUTPUT"
 
-          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
-            --method POST \
-            -f content='eyes'
+          if [[ -n "$COMMENT_ID" ]]; then
+            gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+              --method POST \
+              -f content='eyes'
+          fi
 
   prepare:
     name: Prepare Claude Fix
@@ -205,7 +261,7 @@ jobs:
       needs_merge: ${{ steps.merge-state.outputs.needs_merge }}
     env:
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
       BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
       BASE_REF: ${{ needs.authorize.outputs.base_ref }}
@@ -401,7 +457,7 @@ jobs:
             }
           prompt: |
             You are preparing one bounded, local fix proposal for pull request
-            #${{ github.event.issue.number }} in ${{ github.repository }}.
+            #${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }} in ${{ github.repository }}.
 
             Security boundary:
             - The workspace root is the trusted base checkout. Read its
@@ -707,7 +763,7 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
     env:
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
       HEAD_REPO: ${{ needs.authorize.outputs.head_repo }}
       HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
@@ -736,7 +792,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENTER: ${{ inputs.test_mode && inputs.test_commenter || github.event.comment.user.login }}
           EXPECTED_PATCH_SHA256: ${{ needs.validate.outputs.patch_sha256 }}
         run: |
           set -euo pipefail
@@ -873,8 +929,15 @@ jobs:
           # only to this deterministic, no-checkout-execution push step.
           PUSH_TOKEN: ${{ secrets.PAT }}
           NEW_SHA: ${{ steps.commit.outputs.sha }}
+          TEST_MODE: ${{ inputs.test_mode }}
         run: |
           set -euo pipefail
+          if [[ "$TEST_MODE" == "true" ]]; then
+            test "$HEAD_REPO" = "Phlip79/Megatron-LM"
+            test "$HEAD_REF" = "philip/fifteen-minutes"
+            test "$HEAD_SHA" = "50d49f4479c316ad5576bc0c49dc1ddb39c97dd8"
+          fi
+          test -n "$PUSH_TOKEN"
           auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w 0)
           echo "::add-mask::$auth"
           # Deliberately use an ordinary push: NEW_SHA has HEAD_SHA as its
@@ -896,7 +959,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
       CREATED: ${{ needs.publish.outputs.created }}
       NEW_SHA: ${{ needs.publish.outputs.sha }}
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
@@ -929,7 +992,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.issue.number }}
+      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
     steps:
       - name: Post deterministic failure summary
         run: |
