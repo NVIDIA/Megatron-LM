@@ -369,8 +369,45 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+    # Build config.
+    config = config_class(**kw_args)
+
+    _apply_yarn_config_from_args(config, args)
+
     # Return config.
-    return config_class(**kw_args)
+    return config
+
+
+def _apply_yarn_config_from_args(config, args) -> None:
+    """Populate ``config.yarn_*`` attributes from args for non-MLA YaRN models.
+
+    GPTModel's ``yarn`` branch and ``yarn_rotary_pos_embedding`` read these as
+    dynamic attributes off the config (``getattr(config, "yarn_rotary_scaling_factor")``
+    etc.) with no default, so the attributes must exist whenever
+    ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
+    ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
+    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
+    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
+    """
+    if getattr(args, 'position_embedding_type', None) != 'yarn':
+        return
+    if getattr(args, 'multi_latent_attention', False):
+        # MLATransformerConfig declares the unprefixed YaRN fields and its
+        # attention path consumes them directly; do not shadow them here.
+        return
+
+    def _set(attr: str, value, default) -> None:
+        if hasattr(config, attr):
+            return
+        setattr(config, attr, value if value is not None else default)
+
+    _set('yarn_rotary_scaling_factor', args.rotary_scaling_factor, 1.0)
+    _set('yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings, 4096)
+    _set('yarn_beta_fast', args.yarn_beta_fast, 32.0)
+    _set('yarn_beta_slow', args.yarn_beta_slow, 1.0)
+    _set('yarn_mscale', args.mscale, 1.0)
+    _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
+    _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
