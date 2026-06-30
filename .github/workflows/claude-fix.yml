@@ -12,12 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Workflow overview
+# -----------------
+# A repository maintainer starts one bounded repair pass by commenting
+# `/claude fix [optional steering text]` on an open pull request. Without
+# steering text, Claude attempts only low-hanging work: ordinary text merge
+# conflicts and clear terminal lint or unit-test failures attributable to the
+# PR. Steering may narrow that task, but it cannot relax the safety policy.
+# GitHub loads `issue_comment` workflows from the default branch, so this
+# command becomes available only after the workflow reaches that branch.
+#
+# For a fork pull request, publication targets the PR's actual head repository
+# and branch. It never pushes to NVIDIA's synthetic `pull-request/<number>` CI
+# ref. A successful run creates at most one DCO-signed-off commit with an
+# ordinary fast-forward push; it never force-pushes. A maintainer must review
+# the generated diff and authorize CI for the new SHA separately.
+#
+# Trust and data flow:
+#
+#   issue comment
+#       -> authorize  (validate actor/PR/branch; pin head and live base SHAs)
+#       -> prepare    (read-only Claude produces a raw patch artifact)
+#       -> validate   (a clean runner checks scope and binds the result tree)
+#       -> publish    (trusted code commits the validated tree and pushes it)
+#       -> report     (minimal `issues: write` jobs post the outcome)
+#
+# The jobs are intentionally separate security boundaries. Claude reads
+# untrusted PR content but never receives the write PAT or any GitHub write
+# capability. The PAT exists only in the final hard-coded push step after
+# the patch and live PR state have been independently revalidated.
+
 name: Claude Fix PR
 
 on:
   issue_comment:
     types: [created]
 
+# Serialize commands for the same PR instead of letting two publishers race.
 concurrency:
   group: claude-fix-pr-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -27,6 +58,9 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Gate the command before any PR content reaches Claude. This job requires an
+  # exact command from a human with write access, rejects unsafe destinations,
+  # and freezes the PR head plus current base tip for every downstream job.
   authorize:
     name: Authorize Claude Fix
     if: |
@@ -196,6 +230,13 @@ jobs:
             --method POST \
             -f content='eyes'
 
+  # Work on immutable checkouts with read-only GitHub access. Trusted base
+  # instructions stay at the workspace root; the untrusted PR lives under
+  # `pr-head/`. Sandboxed Claude may edit that checkout locally, but it cannot
+  # commit, push, comment, or make arbitrary outbound/Bash network requests.
+  # Only the supplied read-only CI MCP tools may access GitHub, and Claude's
+  # tool subprocesses cannot read action credentials. The only Claude-authored
+  # content crossing this boundary is a bounded patch.
   prepare:
     name: Prepare Claude Fix
     needs: authorize
@@ -507,6 +548,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Reconstruct the pinned merge on a fresh runner with no repository secrets
+  # and only a contents-read workflow token, then apply Claude's patch. Reject
+  # edits outside the PR/conflict scope, sensitive repository files, remaining
+  # markers in originally conflicted files, binaries, file/type/mode changes,
+  # and oversized proposals. Export the validated patch hash and exact tree.
   validate:
     name: Validate Claude Fix
     needs: [authorize, prepare]
@@ -703,6 +749,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Recheck authorization and all live PR/branch metadata immediately before
+  # writing. Reproduce the validated tree, create a trusted commit with the
+  # service account's exact DCO trailer, and expose the PAT only to one ordinary
+  # push. A concurrent advance or divergence is rejected; no force update is
+  # attempted.
   publish:
     name: Publish Claude Fix
     needs: [authorize, prepare, validate]
@@ -894,6 +945,9 @@ jobs:
             push "https://github.com/$HEAD_REPO.git" \
               "$NEW_SHA:refs/heads/$HEAD_REF"
 
+  # Only authorization and these two reporting jobs receive `issues: write`,
+  # and they use fixed comment templates. Claude and the publisher cannot
+  # author arbitrary PR comments.
   report-success:
     name: Report Claude Fix Result
     needs: [authorize, publish]
@@ -924,6 +978,8 @@ jobs:
               > /dev/null
           fi
 
+  # A failure in prepare, validate, or publish gets a fixed pointer to the run.
+  # This job cannot modify repository contents or the contributor's branch.
   report-failure:
     name: Report Claude Fix Failure
     needs: [authorize, prepare, validate, publish]
