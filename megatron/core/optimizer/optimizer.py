@@ -213,7 +213,6 @@ class MegatronOptimizer(ABC):
                 param, getattr(self, 'tp_group', None)
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
-
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
@@ -813,7 +812,7 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
             tp_group = parallel_state.get_tensor_model_parallel_group()
             # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
             dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, with_gtp_remat=True
+                with_context_parallel=True
             )
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.

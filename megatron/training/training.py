@@ -1836,7 +1836,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, gtp, pipeline) '
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
             'model parallel rank ({}, {}, {}): {}'.format(
                 get_pg_rank(pg_collection.tp),
                 get_pg_rank(pg_collection.gtp_remat),
@@ -2207,7 +2207,7 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size(with_gtp_remat=True)
+    data_parallel_size = mpu.get_data_parallel_world_size()
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
@@ -3375,7 +3375,7 @@ def train(
         if lang_pgc is not None:
             return lang_pgc.dp.size() * gtp_remat
         if mpu.model_parallel_is_initialized():
-            return mpu.get_data_parallel_world_size(with_gtp_remat=True)
+            return mpu.get_data_parallel_world_size()
         return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
@@ -4172,14 +4172,10 @@ def evaluate(
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(
-                                    with_context_parallel=True, with_gtp_remat=True
-                                )
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
                             )
                             val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(
-                                    with_context_parallel=True, with_gtp_remat=True
-                                )
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
                             )
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
@@ -4187,9 +4183,7 @@ def evaluate(
                             val = torch.vstack(val).sum(dim=0)
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(
-                                    with_context_parallel=True, with_gtp_remat=True
-                                )
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
                             )
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
@@ -4547,9 +4541,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(
-                            with_context_parallel=True, with_gtp_remat=True
-                        ),
+                        group=mpu.get_data_parallel_group(with_context_parallel=True),
                     )
                     args.eval_iters = eval_iters_tensor.tolist()
             else:
@@ -4558,9 +4550,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(
-                        with_context_parallel=True, with_gtp_remat=True
-                    ),
+                    group=mpu.get_data_parallel_group(with_context_parallel=True),
                 )
                 args.eval_iters = eval_iters_tensor.item()
 

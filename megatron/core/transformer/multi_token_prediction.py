@@ -870,10 +870,7 @@ def process_mtp_loss(
                 total,
                 mtp_layer_number,
                 config.mtp_num_layers,
-                # Averaged over the full DP x gtp_remat axis, like the main loss.
-                avg_group=parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, with_gtp_remat=True
-                ),
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:

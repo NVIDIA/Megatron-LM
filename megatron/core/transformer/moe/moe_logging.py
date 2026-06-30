@@ -264,7 +264,7 @@ class MoEMetricsTracker:
         # group; CP ranks (already summed in reduce_group) average as a no-op.
         if dp_group is None:
             dp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=False, partial_data_parallel=False, with_gtp_remat=True
+                with_context_parallel=False, partial_data_parallel=False
             )
 
         for name in metric_names:

@@ -257,22 +257,27 @@ class ProcessGroupCollection:
             'pos_embd': partial(
                 parallel_state.get_position_embedding_group, check_initialized=False
             ),
-            'dp': parallel_state.get_data_parallel_group,
-            'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'dp': partial(parallel_state.get_data_parallel_group, with_gtp_remat=False),
+            'dp_cp': partial(
+                parallel_state.get_data_parallel_group,
+                with_context_parallel=True,
+                with_gtp_remat=False,
+            ),
             'dp_cp_gtp_remat': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
-                with_gtp_remat=True,
             ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
+                with_gtp_remat=False,
                 partial_data_parallel=True,
             ),
             'intra_expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group,
                 check_initialized=False,
+                with_gtp_remat=False,
                 partial_expert_data_parallel=True,
             ),
             'inter_dist_opt': partial(
@@ -285,12 +290,13 @@ class ProcessGroupCollection:
             ),
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
             'expt_dp': partial(
-                parallel_state.get_expert_data_parallel_group, check_initialized=False
+                parallel_state.get_expert_data_parallel_group,
+                check_initialized=False,
+                with_gtp_remat=False,
             ),
             'expt_dp_gtp_remat': partial(
                 parallel_state.get_expert_data_parallel_group,
                 check_initialized=False,
-                with_gtp_remat=True,
             ),
             'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(
@@ -364,17 +370,17 @@ class ProcessGroupCollection:
         if pg_collection is None:
             # Use parallel_state groups
             dp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=False, partial_data_parallel=False
+                with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
             )
             dp_cp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, partial_data_parallel=False
+                with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=False
             )
             intra_dp_cp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, partial_data_parallel=True
+                with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
             )
-            expt_dp_group = parallel_state.get_expert_data_parallel_group()
+            expt_dp_group = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
-                partial_expert_data_parallel=True
+                with_gtp_remat=False, partial_expert_data_parallel=True
             )
             gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
             expt_gtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(
@@ -575,17 +581,19 @@ class ProcessGroupCollection:
             # Use parallel_state groups
             return {
                 'dp_group': parallel_state.get_data_parallel_group(
-                    with_context_parallel=False, partial_data_parallel=False
+                    with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
                 ),
                 'dp_cp_group': parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=False
+                    with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=False
                 ),
                 'intra_dp_cp_group': parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=True
+                    with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
                 ),
-                'expt_dp_group': parallel_state.get_expert_data_parallel_group(),
+                'expt_dp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp_remat=False
+                ),
                 'intra_expt_dp_group': parallel_state.get_expert_data_parallel_group(
-                    partial_expert_data_parallel=True
+                    with_gtp_remat=False, partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
                 'gtp_remat_group': parallel_state.get_gtp_weight_remat_group(

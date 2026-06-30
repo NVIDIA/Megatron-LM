@@ -2,15 +2,12 @@
 
 """Generalized Tensor Parallelism (GTP) public API.
 
-GTP shards weight tensors 1/N across a GTP process group along ``out_features``
-and materializes them on-demand via async all-gather. The implementation lives
-in ``megatron.core.tensor_parallel.generalized_tensor_parallelism`` and depends
-on TransformerEngine's FP8 / MXFP8 / NVFP4 primitives.
-
-If TransformerEngine is missing or too old, the inner module imports cleanly
-but stubs its TE-backed symbols and reports ``HAVE_TE = False``; this module
-mirrors that as ``HAVE_GTP = False``. Consumers gate every GTP code path behind
-``if HAVE_GTP:``, so no core module uses GTP symbols without TE.
+Thin re-export of the implementation in
+``megatron.core.tensor_parallel.generalized_tensor_parallelism`` (see that module
+for the design). GTP depends on TransformerEngine: if TE is missing or too old the
+inner module imports cleanly but reports ``HAVE_TE = False``, mirrored here as
+``HAVE_GTP = False``. Consumers gate every GTP code path behind ``if HAVE_GTP:``,
+so no core module uses GTP symbols without TE.
 """
 
 try:

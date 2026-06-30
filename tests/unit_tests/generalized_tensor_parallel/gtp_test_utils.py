@@ -124,9 +124,9 @@ def _restore_gtp_shards_and_init_main_grad(module, saved_weights, gtp_rank, dtyp
 
 def _assert_loss_trajectories_match(baseline_losses, test_losses, steps, label="gtp_remat"):
     """On rank 0: print and assert two per-step loss trajectories match (atol=rtol=1e-5)."""
-    assert len(baseline_losses) == len(test_losses) == steps, (
-        f"loss counts: baseline={len(baseline_losses)} {label}={len(test_losses)} want {steps}"
-    )
+    assert (
+        len(baseline_losses) == len(test_losses) == steps
+    ), f"loss counts: baseline={len(baseline_losses)} {label}={len(test_losses)} want {steps}"
     for step, (lb, lt) in enumerate(zip(baseline_losses, test_losses)):
         print(f"Step {step:2d}: baseline={lb:.6f}  {label}={lt:.6f}", flush=True)
     torch.testing.assert_close(

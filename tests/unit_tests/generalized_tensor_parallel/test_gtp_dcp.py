@@ -603,9 +603,9 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
 
     # Checkpoint replica election for gtp_remat-REPLICATED params needs the gtp_remat-INCLUSIVE
     # group so gtp_remat peers get distinct replica_ids (matches production's get_default
-    # metadata, which uses with_gtp_remat=True). The replicate group would collide across peers.
+    # metadata, which uses the gtp_remat-inclusive default). The replicate group would collide.
     metadata = {
-        'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
+        'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)
     }
     sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
 
@@ -669,9 +669,9 @@ def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
 
     # The two attributes save_checkpoint_and_time may read must differ under GTP_remat, else the
     # group choice would be moot: full = replicate x gtp_remat(2).
-    assert get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2, (
-        f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
-    )
+    assert (
+        get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2
+    ), f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
 
     replicated = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16, device="cuda"))
 
@@ -695,14 +695,14 @@ def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
 
     if rank == 0:
         # Replicate (gtp-excluded) group: gtp_remat peers collapse -> >1 writer (reproduces bug).
-        assert sum(is_main_replica(r) for r in rids_replicate) > 1, (
-            f"replicate dp_cp should collide across gtp_remat peers, got {rids_replicate}"
-        )
+        assert (
+            sum(is_main_replica(r) for r in rids_replicate) > 1
+        ), f"replicate dp_cp should collide across gtp_remat peers, got {rids_replicate}"
         # gtp_remat-inclusive group: every holder distinct, exactly one writer.
         assert len(set(rids_full)) == world_size, f"full-group replica_id collision: {rids_full}"
-        assert sum(is_main_replica(r) for r in rids_full) == 1, (
-            f"full group must elect exactly one writer, got {rids_full}"
-        )
+        assert (
+            sum(is_main_replica(r) for r in rids_full) == 1
+        ), f"full group must elect exactly one writer, got {rids_full}"
 
 
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):

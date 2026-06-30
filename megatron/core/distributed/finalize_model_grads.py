@@ -556,9 +556,7 @@ def finalize_model_grads(
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        dp_cp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, with_gtp_remat=True
-        )
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Fence the current stream against all GTP backward grad work before the DP gradient sync.
     if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:

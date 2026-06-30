@@ -1420,7 +1420,7 @@ def initialize_model_parallel(
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
+            pg_options=get_nccl_options("tp_ep_gtp_remat_pp", nccl_comm_cfgs),
             group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
         )
         if rank in ranks:
@@ -1756,20 +1756,20 @@ def get_pipeline_model_parallel_group(check_initialized=True):
 
 
 def get_data_parallel_group(
-    with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
 ):
     """Get the data-parallel group the caller rank belongs to.
 
-    GTP_remat is an independent axis layered on top of DP. The DEFAULT returns the
-    weight-replica (replicate) group — the true data-parallel axis used for gradient
-    all-reduce, optimizer-state sharding, and checkpoint replica bookkeeping. Pass
-    ``with_gtp_remat=True`` for the full group (size = replicate_DP x
-    gtp_remat), needed only where distinct-data distribution matters: input batch split,
-    num-microbatches, gradient scaling, and reductions that must cover every distinct-data rank.
+    GTP_remat is an independent axis layered on DP.
+    DEFAULT (``with_gtp_remat=True``): full data-distribution group (replicate_DP x
+    gtp_remat) — gtp_remat peers hold distinct micro-batches, so use it for batch split,
+    num-microbatches, grad scaling, and reductions over all distinct-data ranks.
+    ``with_gtp_remat=False``: replicate group — grad all-reduce, optimizer-state
+    sharding, checkpoint replicas.
 
     Args:
-        with_context_parallel: If True, include context-parallel ranks in the group.
-        with_gtp_remat: If True, return the full data-distribution group.
+        with_context_parallel: If True, include context-parallel ranks.
+        with_gtp_remat: True (default) = full data-distribution group; False = replicate.
         partial_data_parallel: If True, return partial DP group (requires with_context_parallel).
     """
     assert (
@@ -2118,11 +2118,12 @@ def get_pipeline_model_parallel_prev_rank():
 
 
 def get_data_parallel_world_size(
-    with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
 ):
-    """Return world size for the data parallel group (default: replicate).
+    """Return the data-parallel world size.
 
-    Pass with_gtp_remat=True for the full data-distribution degree.
+    DEFAULT (with_gtp_remat=True): full degree (replicate_DP x gtp_remat).
+    with_gtp_remat=False: replicate degree.
     """
     global _MPU_DATA_PARALLEL_WORLD_SIZE
     if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
@@ -2144,11 +2145,12 @@ def set_data_parallel_rank(rank):
 
 
 def get_data_parallel_rank(
-    with_context_parallel=False, with_gtp_remat=False, partial_data_parallel=False
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
 ):
-    """Return caller's rank in the data-parallel group (default: replicate).
+    """Return the caller's data-parallel rank.
 
-    Pass with_gtp_remat=True for the caller's rank in the full group.
+    DEFAULT (with_gtp_remat=True): rank in the full group (replicate_DP x gtp_remat).
+    with_gtp_remat=False: rank in the replicate group.
     """
     global _MPU_DATA_PARALLEL_RANK
     if _MPU_DATA_PARALLEL_RANK is not None:
@@ -2378,13 +2380,14 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, with
 
 
 def get_expert_data_parallel_group(
-    check_initialized=True, with_gtp_remat=False, partial_expert_data_parallel=False
+    check_initialized=True, with_gtp_remat=True, partial_expert_data_parallel=False
 ):
-    """Get expert data parallel group.
+    """Get the expert data parallel group.
 
-    Default returns the replicate group — expert gradient all-reduce, optimizer
-    state, checkpoint replicas. with_gtp_remat=True returns the full group for
-    data distribution.
+    DEFAULT (with_gtp_remat=True): full group for data distribution (EGTP_remat peers
+    hold distinct micro-batches).
+    with_gtp_remat=False: replicate group — expert grad all-reduce, optimizer state,
+    checkpoint replicas.
     """
     # (with_gtp_remat, partial_expert_data_parallel) -> (group, description). Read at call time.
     group_table = {
@@ -2422,8 +2425,8 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
         return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
-def get_expert_data_parallel_rank(with_gtp_remat=False, partial_expert_data_parallel=False):
-    """Return caller's rank in the expert data parallel group (default: EGTP-excluded replicate)."""
+def get_expert_data_parallel_rank(with_gtp_remat=True, partial_expert_data_parallel=False):
+    """Return the caller's expert-data-parallel rank (default: EGTP_remat-inclusive)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
             with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel
@@ -2432,8 +2435,8 @@ def get_expert_data_parallel_rank(with_gtp_remat=False, partial_expert_data_para
         return 0
 
 
-def get_expert_data_parallel_world_size(with_gtp_remat=False, partial_expert_data_parallel=False):
-    """Return world size for the expert data parallel group (default: EGTP-excluded replicate)."""
+def get_expert_data_parallel_world_size(with_gtp_remat=True, partial_expert_data_parallel=False):
+    """Return the expert-data-parallel world size (default: EGTP_remat-inclusive)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
             with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel

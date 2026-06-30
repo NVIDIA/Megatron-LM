@@ -376,13 +376,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 elif getattr(param, 'is_gtp_weight_remat', False) and hasattr(
                     param, 'register_grad_accum_hook'
                 ):
-                    # GTP_remat: drive post-hook from GTP_remat's manual call, not autograd's
-                    # AccumulateGrad. GTP_remat issues wgrad RS async, defers main_grad add
-                    # to a later backward node, so AccumulateGrad can fire register_grad_ready
-                    # before the wgrad lands in main_grad, dispatching the bucket reduce-scatter on
-                    # stale grad_data (corrupts reduce_scatter_with_fp32_accumulation for
-                    # chain-boundary weights). GTP_remat fires hook from _handle_megatron_grad_accum
-                    # after the add instead.
+                    # GTP_remat defers the main_grad add to a later backward node, so drive the
+                    # post-hook from its manual call (_handle_megatron_grad_accum) rather than
+                    # autograd's AccumulateGrad, which would fire grad-ready on stale main_grad.
                     param.register_grad_accum_hook(None, self._make_backward_post_hook(param))
                 else:
                     # Expand so we get access to grad_fn.
@@ -608,7 +604,11 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            data_parallel_group = self.expt_dp_group if is_expert_parallel else self.dp_cp_group
+
+            if is_expert_parallel:
+                data_parallel_group = self.expt_dp_group
+            else:
+                data_parallel_group = self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

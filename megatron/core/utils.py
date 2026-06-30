@@ -885,7 +885,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -945,13 +948,10 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets = []
 
-    # Full DP x CP x gtp_remat group so gtp_remat peers get distinct replica_ids (a
-    # replicate-only group would collide -> DCP duplicate-writer error).
+    # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, with_gtp_remat=True
-        )
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
@@ -1055,13 +1055,9 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     new_offsets = []
 
     # Get groups with fallback to parallel_state
-    # Full DP x CP x gtp_remat group so gtp_remat peers get distinct replica_ids (a
-    # replicate-only group would collide -> DCP duplicate-writer error).
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, with_gtp_remat=True
-        )
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)

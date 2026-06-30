@@ -167,18 +167,19 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
 
     # --- Sharded optimizer DP reductions (each category uses its own group) ---
-    # Reduce over the replicate group (the default DP group): the model-parallel reduce below
-    # already spans the gtp_remat axis, so the full group here would over-count by gtp_remat.
-    # No-op for non-GTP_remat runs (the default group is the full DP group).
+    # Reduce over the gtp_remat-EXCLUDED replicate group (with_gtp_remat=False): the model-parallel
+    # reduce below already spans the gtp_remat axis, so a gtp_remat-inclusive group here would
+    # over-count by gtp_remat. No-op for non-GTP_remat runs.
     _sum_reduce(
-        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True)
+        sharded_norm_2,
+        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
     )
     _sum_reduce(
         gtp_sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True),
+        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
     )
-    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group())
+    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
 
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
@@ -250,10 +251,10 @@ def average_losses_across_data_parallel_group(
 ):
     """Reduce a tensor of losses across all GPUs.
 
-    group: data-parallel process group; defaults to the full DP x gtp_remat group.
+    group: data-parallel process group; defaults to mpu.get_data_parallel_group().
     """
     if group is None:
-        group = mpu.get_data_parallel_group(with_gtp_remat=True)
+        group = mpu.get_data_parallel_group()
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(averaged_losses, group=group)
     averaged_losses = averaged_losses / group.size()

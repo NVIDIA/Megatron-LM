@@ -299,7 +299,8 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
     )
     gtp_group = ps.get_gtp_weight_remat_group()
     tp_dp_cp = ps.get_tensor_and_data_parallel_group(with_context_parallel=True)  # spans gtp_remat
-    replicate = ps.get_data_parallel_group(with_context_parallel=True)  # gtp-EXCLUDED (the bug)
+    # gtp-EXCLUDED replicate group (explicit, since get_data_parallel_group now defaults inclusive).
+    replicate = ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
 
     num_experts = 8
     torch.manual_seed(1000 + rank)  # distinct per-rank tokens (distinct data on each rank)
@@ -323,12 +324,12 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
     if rank == 0:
         assert spans_gtp, "tp_dp_cp group must span the gtp_remat axis (like dp)"
         # gtp-excluded reduction reproduces the bug; tp_dp_cp (spans gtp_remat) keeps peers in sync.
-        assert diff_excluded > 0, (
-            f"gtp-excluded group should diverge across gtp_remat peers, got {diff_excluded}"
-        )
-        assert diff_included == 0, (
-            f"tp_dp_cp must keep expert_bias identical across gtp_remat peers, got {diff_included}"
-        )
+        assert (
+            diff_excluded > 0
+        ), f"gtp-excluded group should diverge across gtp_remat peers, got {diff_excluded}"
+        assert (
+            diff_included == 0
+        ), f"tp_dp_cp must keep expert_bias identical across gtp_remat peers, got {diff_included}"
 
 
 class TestMoEEGTPCorrectness:

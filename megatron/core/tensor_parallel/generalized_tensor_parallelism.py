@@ -1878,7 +1878,9 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     else:
         from megatron.core import parallel_state  # noqa: E402
 
-        dp_replica_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        dp_replica_rank = parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, with_gtp_remat=False
+        )
 
     sharded_state_dict = {}
     for layer_name, tensor in state_dict.items():
