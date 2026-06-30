@@ -51,6 +51,7 @@ from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.distillation.utils_logits import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
+    LOGPROBS_FORMAT_VERSION,
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
     batched_tar_filename,
@@ -59,7 +60,6 @@ from megatron.training.distillation.utils_logits import (
     is_remote_storage_path,
     open_logit_file,
     pack_indices,
-    pad_topk_dim,
     reassemble_cp_sequence,
     storage_makedirs,
     storage_move,
@@ -174,6 +174,7 @@ class LogitsSaverHooks:
         self.cp_size = parallel_state.get_context_parallel_world_size()
         self.cp_group = parallel_state.get_context_parallel_group()
         self.dp_rank = parallel_state.get_data_parallel_rank()
+        self.dp_size = parallel_state.get_data_parallel_world_size()
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
         self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
 
@@ -194,6 +195,12 @@ class LogitsSaverHooks:
                 "p": self.p,
                 "min_k": self.min_k,
                 "save_dtype": save_dtype,
+                # Recorded so the loader can build a LogprobsReshardPlan and
+                # support changing MBS / DP / GBS at student-side load time.
+                "format_version": LOGPROBS_FORMAT_VERSION,
+                "mbs_save": int(args.micro_batch_size),
+                "dp_size_save": int(self.dp_size),
+                "gbs_save": int(args.global_batch_size),
             },
         }
         self._meta_bytes: bytes = json.dumps(
@@ -283,8 +290,15 @@ class LogitsSaverHooks:
         """Move accumulated top-K results to CPU and save to disk.
 
         By this point each microbatch has already been processed in the
-        forward hook, so this method only transfers the small top-K tensors
-        to CPU and writes them out in a single I/O call.
+        forward hook, so this method only transfers the small top-K
+        tensors to CPU, concatenates them into a single per-iteration
+        monolith along the sample (batch) dim, and writes them out in a
+        single I/O call.
+
+        Every microbatch carries the same K (= ``effective_k =
+        min(self.k, global_vocab_size)``) because
+        :meth:`_apply_topp_truncation` masks rather than truncates, so
+        the concat is a single allocation with no K-padding step.
         """
         if self.tp_rank != 0:
             return
@@ -310,7 +324,11 @@ class LogitsSaverHooks:
             self._topp_kept_counts.clear()
             return
 
-        self._buffer_iteration(all_values, all_indices_low, all_high_bits)
+        if all_values:
+            values_tensor = torch.cat(all_values, dim=1)
+            indices_low_tensor = torch.cat(all_indices_low, dim=1)
+            bit_17_tensor = torch.cat(all_high_bits, dim=1)
+            self._buffer_iteration(values_tensor, indices_low_tensor, bit_17_tensor)
 
         if self._topp_kept_counts:
             # Log the average number of top-P kept tokens per microbatch to tensorboard
@@ -398,15 +416,15 @@ class LogitsSaverHooks:
         values: torch.Tensor,
         indices: torch.Tensor,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Gather CP-local top-K tensors and reconstruct full sequence order on CP rank 0."""
+        """Gather CP-local top-K tensors and reconstruct full sequence order on CP rank 0.
+
+        Every CP rank reaches this point with the same K
+        (= ``effective_k = min(self.k, global_vocab_size)``) because
+        :meth:`_apply_topp_truncation` masks rather than truncates, so no
+        inter-rank K coordination is required before the gather.
+        """
         if self.cp_size == 1:
             return values, indices
-
-        local_k = torch.tensor([values.size(-1)], dtype=torch.int64, device=values.device)
-        dist.all_reduce(local_k, op=dist.ReduceOp.MAX, group=self.cp_group)
-        max_k = int(local_k.item())
-        values = pad_topk_dim(values, max_k, CACHED_LOGITS_LOGPROB_SENTINEL)
-        indices = pad_topk_dim(indices, max_k, CACHED_LOGITS_INDEX_SENTINEL)
 
         if self.cp_rank == 0:
             values_gather_list = [torch.empty_like(values) for _ in range(self.cp_size)]
@@ -501,15 +519,24 @@ class LogitsSaverHooks:
 
         Keeps the smallest set of leading entries per token whose
         cumulative probability mass is at least ``self.p``, with a floor
-        of ``self.min_k`` kept entries.
+        of ``self.min_k`` kept entries.  Out-of-nucleus entries are
+        replaced with cached-logit value/index sentinels but the full K
+        dimension is preserved, so every saved microbatch (and therefore
+        every saved iteration's monolith and every CP rank's gather
+        buffer) carries the same uniform K = ``effective_k``.
 
-        Because the number of surviving entries varies per token, the K
-        dimension is truncated to the *maximum* kept count across all
-        tokens in the microbatch.  Tokens whose individual nucleus is
-        smaller than that maximum have their trailing entries masked with
-        cached-logit value/index sentinels.  These sentinels are compatible
-        with :func:`topk_kl_div` because the value sentinel makes masked
-        teacher probability effectively zero.
+        Keeping a uniform K simplifies the rest of the pipeline:
+
+        * No CP-rank max-K coordination collective or pad before the
+          ``dist.gather``.
+        * No per-microbatch pad-and-cat when concatenating microbatches
+          into the per-iter monolith on the saver side.
+        * No cross-iter pad-and-cat when the loader assembles a load
+          microbatch from slices that span multiple saved iterations.
+
+        zstd compresses sentinel runs in masked positions down to roughly
+        the proportional unmasked size, so the disk-cost overhead of
+        carrying the full K is small in practice.
 
         Args:
             values: Top-K log-prob values, sorted descending along the
@@ -517,9 +544,13 @@ class LogitsSaverHooks:
             indices: Corresponding global vocab indices (int64).
 
         Returns:
-            Tuple of ``(values, indices)`` with K dimension truncated to
-            the maximum per-token nucleus size, and trailing out-of-nucleus
-            entries masked with sentinels.
+            Tuple of ``(values, indices)`` with the same shape as the
+            inputs, with out-of-nucleus entries masked by
+            :data:`CACHED_LOGITS_LOGPROB_SENTINEL` /
+            :data:`CACHED_LOGITS_INDEX_SENTINEL`.  These sentinels are
+            compatible with :func:`topk_kl_div`, which masks by the
+            value sentinel to zero out the corresponding loss
+            contributions.
         """
         probs = values.float().exp()
         cumprobs = probs.cumsum(dim=-1)
@@ -533,15 +564,9 @@ class LogitsSaverHooks:
         arange = torch.arange(k, device=values.device)
         keep_mask = keep_mask | (arange < min_keep)
 
-        kept_per_token = keep_mask.sum(dim=-1)
         # For logging purposes
+        kept_per_token = keep_mask.sum(dim=-1)
         self._topp_kept_counts.append(kept_per_token.float().mean().item())
-
-        # Truncate to reduce storage
-        max_kept = int(kept_per_token.max().item())
-        values = values[..., :max_kept]
-        indices = indices[..., :max_kept]
-        keep_mask = keep_mask[..., :max_kept]
 
         # Mask out-of-nucleus entries
         values = torch.where(keep_mask, values, CACHED_LOGITS_LOGPROB_SENTINEL)
@@ -553,24 +578,33 @@ class LogitsSaverHooks:
 
     def _buffer_iteration(
         self,
-        values_list: List[torch.Tensor],
-        indices_low_list: List[torch.Tensor],
-        bit_17_list: List[torch.Tensor],
+        values_tensor: torch.Tensor,
+        indices_low_tensor: torch.Tensor,
+        bit_17_tensor: torch.Tensor,
     ) -> None:
-        """Serialize microbatch data and buffer for async flush at checkpoint time.
+        """Serialize a per-iteration monolith and buffer for async flush.
 
-        File format: serialized dict with:
-        - values: list of tensors of log-probabilities (one per microbatch)
-          in ``self._save_dtype`` (default ``torch.float16``)
-        - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
-        - bit_17: list of bool tensors (17th bit, same shape as indices_low)
+        File format (``format_version == 2``): serialized dict with:
+
+        - ``values``: ``(seq, samples_per_dp_per_iter, K_max)`` tensor of
+          log-probabilities in ``self._save_dtype`` (default ``torch.float16``)
+        - ``indices_low``: ``(seq, samples_per_dp_per_iter, K_max)`` uint16
+          tensor (lower 16 bits of vocab indices)
+        - ``bit_17``: ``(seq, samples_per_dp_per_iter, K_max)`` bool tensor
+          (17th bit, same shape as ``indices_low``)
+        - ``format_version``: integer payload-format identifier
+
+        Storing one monolith per iteration (rather than a list of per-mb
+        tensors) lets the loader serve any load microbatch as a contiguous
+        view along the sample dim, which is what the
+        :class:`LogprobsReshardPlan`-driven loader relies on.
         """
-        # Serialize all tensors together
         buffer = io.BytesIO()
         torch.save({
-            'values': values_list,
-            'indices_low': indices_low_list,
-            'bit_17': bit_17_list,
+            'values': values_tensor,
+            'indices_low': indices_low_tensor,
+            'bit_17': bit_17_tensor,
+            'format_version': LOGPROBS_FORMAT_VERSION,
         }, buffer)
         data = buffer.getvalue()
         iteration = get_current_iteration()
