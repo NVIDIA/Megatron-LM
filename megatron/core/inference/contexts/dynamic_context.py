@@ -3398,23 +3398,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def prepare_requests(self, new_tokens: Optional[Tensor] = None) -> None:
+    def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
         Async scheduling only supports decode-only steps with no pause,
         evict, or resume lifecycle changes. If preparing the next token would
         require one of those lifecycle changes, this method raises and the caller
         should treat async scheduling as unsupported for that workload.
-
-        Args:
-            new_tokens (Optional[Tensor]): Newly sampled token for each active
-                request. When omitted, token-independent bookkeeping is prepared
-                first and `finalize_prepared_request_tokens()` must materialize
-                CPU token IDs before request resolution.
         """
-        if new_tokens is not None and new_tokens.is_cuda:
-            new_tokens = new_tokens.cpu()
-
         active_request_count = self.total_request_count - self.paused_request_count
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
@@ -3422,15 +3413,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
-        if new_tokens is not None and new_tokens.numel() != active_request_count:
-            raise RuntimeError(
-                f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
-            )
 
         if active_request_count == 0:
             self.active_token_count = 0
-            if new_tokens is not None:
-                self.finalize_prepared_request_tokens(new_tokens)
             return
 
         active_slice = slice(0, active_request_count)
@@ -3472,25 +3457,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
         )
         self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
-        if new_tokens is not None:
-            self.finalize_prepared_request_tokens(new_tokens)
 
-    def finalize_prepared_request_tokens(self, new_tokens: Tensor) -> None:
-        """Materialize CPU token IDs for an async-scheduled prepared decode step.
+    def commit_sampled_tokens(self, sampled_tokens_cpu: Tensor) -> None:
+        """Commit sampled CPU token IDs to the prepared request state.
 
         Args:
-            new_tokens (Tensor): Newly sampled token for each active request.
+            sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
         """
-        if new_tokens.is_cuda:
-            new_tokens = new_tokens.cpu()
+        assert sampled_tokens_cpu.device == torch.device('cpu'), (
+            "Sampled tokens must be on the CPU before they are committed."
+        )
 
         active_request_count = self.total_request_count - self.paused_request_count
-        if new_tokens.numel() != active_request_count:
+        if sampled_tokens_cpu.numel() != active_request_count:
             raise RuntimeError(
-                f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
+                f"Expected {active_request_count} new tokens, got {sampled_tokens_cpu.numel()}."
             )
 
-        self.token_to_input_ids[:active_request_count] = new_tokens
+        self.token_to_input_ids[:active_request_count] = sampled_tokens_cpu
 
     def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
         """Resolve finished requests after an async scheduling forward pass.

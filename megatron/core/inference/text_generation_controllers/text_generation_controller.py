@@ -758,27 +758,15 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-    def _run_async_sched_prepare(
-        self, sampled_tokens_cpu: Optional[Tensor], sampled_tokens_gpu: Tensor
-    ) -> Tuple[Tensor, Tensor]:
+    def _run_async_sched_prepare(self) -> Tuple[Tensor, Tensor]:
         """Prepare decode requests and GPU-visible forward state for async scheduling.
-
-        Args:
-            sampled_tokens_cpu (Optional[Tensor]): CPU copy of sampled tokens for
-                active requests, or `None` to defer CPU token materialization.
-            sampled_tokens_gpu (Tensor): GPU-resident sampled tokens to use as
-                input IDs for the speculative forward.
 
         Returns:
             Tuple[Tensor, Tensor]: Input token IDs and position IDs for the speculative forward.
         """
         context = self.inference_wrapped_model.inference_context
-        context.prepare_requests(sampled_tokens_cpu)
-        input_ids, position_ids = self._dynamic_step_context_init(
-            skip_token_input_ids_transfer=True
-        )
-        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
-        return input_ids, position_ids
+        context.prepare_requests()
+        return self._dynamic_step_context_init(skip_token_input_ids_transfer=True)
 
     def _record_async_sched_event(self, reference_tensor: Optional[Tensor] = None):
         """Record an event on the current CUDA stream when CUDA work is active."""
@@ -2088,14 +2076,15 @@ class TextGenerationController:
                 self._wait_async_sched_event(sample_ready_event)
 
             range_push("prepare_requests")
-            input_ids, position_ids = self._run_async_sched_prepare(None, sampled_tokens_gpu)
+            input_ids, position_ids = self._run_async_sched_prepare()
             range_pop()
+            context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
             phase_one_event = self._record_async_sched_event(sampled_tokens_gpu)
             self._wait_async_sched_event(phase_one_event)
 
             range_push("active_request_mask")
             sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
-            context.finalize_prepared_request_tokens(sampled_tokens_cpu)
+            context.commit_sampled_tokens(sampled_tokens_cpu)
             (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
                 self._build_async_sched_request_state(sampled_tokens_cpu)
             )
