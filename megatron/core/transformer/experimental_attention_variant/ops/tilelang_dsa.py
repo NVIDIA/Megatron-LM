@@ -12,7 +12,11 @@ from typing import Optional, Tuple
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.experimental_attention_variant import dsa_layout, dsa_masking
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_indexer_loss,
+    dsa_layout,
+    dsa_masking,
+)
 
 try:
     from megatron.core.transformer.experimental_attention_variant.ops.indexer import (
@@ -270,20 +274,11 @@ def _compute_sparse_topk_kl_chunk(
             index_logits_chunk.detach(), valid_seq, dim=-1
         )
         index_scores_chunk = index_log_scores_chunk.exp().masked_fill(~valid_seq, 0.0)
-        kl_value = (
-            (target_chunk * (torch.log(target_chunk.clamp_min(1e-10)) - index_log_scores_chunk))
-            .masked_fill(~valid_seq, 0.0)
-            .sum()
-        )
+        kl_value = dsa_indexer_loss.indexer_kl_sum(target_chunk, index_log_scores_chunk, valid_seq)
         grad_logits = (index_scores_chunk - target_chunk).masked_fill(~valid_seq, 0.0)
     index_logits_for_grad = index_logits_chunk.masked_fill(~valid_seq, 0.0)
     grad_surrogate = (index_logits_for_grad * grad_logits).sum()
     return grad_surrogate + (kl_value - grad_surrogate).detach()
-
-
-def _normalize_topk_target_chunk_(target_chunk: torch.Tensor) -> torch.Tensor:
-    """Normalize target probability mass over top-k support in place."""
-    return target_chunk.div_(target_chunk.sum(dim=-1, keepdim=True).clamp_min(1e-10))
 
 
 def _canonicalize_topk_scores_for_tp_reduce(
@@ -309,7 +304,7 @@ def _accumulate_topk_kl_chunk(
     kl_sum: torch.Tensor,
 ) -> torch.Tensor:
     """Normalize one target chunk and accumulate its sparse KL contribution."""
-    normalized_target = _normalize_topk_target_chunk_(target_chunk)
+    normalized_target = dsa_indexer_loss.normalize_indexer_target_(target_chunk)
     return kl_sum + _compute_sparse_topk_kl_chunk(
         target_chunk=normalized_target, index_logits_chunk=index_logits_chunk, valid_seq=valid_seq
     )
@@ -420,7 +415,14 @@ def fused_qk_topk_lighting_with_streaming_sparse_kl(
     topk_chunk_size: int = 1024,
     use_relu: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Run fused TileLang indexer and stream top-k logits into sparse KL accumulation."""
+    """Run the fused TileLang indexer with streaming sparse KL accumulation.
+
+    The objective matches ``compute_dsa_indexer_loss`` on the selected top-k support. TileLang
+    streams query/head/top-k chunks and overlaps TP target reduction to avoid materializing dense
+    scores; its custom gradient surrogate supplies the same log-softmax gradient for fused indexer
+    logits. Target normalization, KL evaluation, and token reduction use the shared backend-neutral
+    helpers in ``dsa_indexer_loss``.
+    """
     if lighting_indexer is None:
         return None
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
@@ -565,15 +567,13 @@ def fused_qk_topk_lighting_with_streaming_sparse_kl(
 
     if topk_out is None:
         return None
-    if calculate_per_token_loss:
-        kl_div = kl_sum
-    else:
-        valid_row_count = (
-            query_valid_rows.sum().to(dtype=torch.float32, device=q.device).clamp_min(1.0)
-            if query_valid_rows is not None
-            else torch.tensor(float(b * sq), dtype=torch.float32, device=q.device)
-        )
-        kl_div = kl_sum / valid_row_count
+    valid_row_count = query_valid_rows.sum() if query_valid_rows is not None else None
+    kl_div = dsa_indexer_loss.reduce_indexer_kl_sum(
+        kl_sum,
+        num_rows=b * sq,
+        calculate_per_token_loss=calculate_per_token_loss,
+        valid_row_count=valid_row_count,
+    )
     return topk_out, kl_div * loss_coeff
 
 

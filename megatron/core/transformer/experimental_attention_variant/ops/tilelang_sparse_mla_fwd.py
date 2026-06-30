@@ -202,7 +202,8 @@ def sparse_mla_fwd(  # pragma: no cover
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
+                # Reduce the current tile; the online softmax accumulation happens below.
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
                 for h_i, d_i in T.Parallel(H_per_block, D):

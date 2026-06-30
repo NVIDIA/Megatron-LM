@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -273,7 +274,7 @@ def test_sparse_mla_head_mask_helpers():
         sparse_mla._valid_head_mask(indices, num_heads=3)
 
 
-def test_tilelang_dsa_sanitize_and_normalize_helpers():
+def test_tilelang_dsa_sanitize_helper():
     topk_indices = torch.tensor([[0, 2, 5], [-1, 3, 4]], dtype=torch.int32)
     topk_scores = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
     starts = torch.tensor([1, 3], dtype=torch.int32)
@@ -287,11 +288,6 @@ def test_tilelang_dsa_sanitize_and_normalize_helpers():
     assert torch.equal(
         torch.isneginf(sanitized_scores), torch.tensor([[True, False, True], [True, False, True]])
     )
-
-    target = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
-    normalized = tilelang_dsa._normalize_topk_target_chunk_(target)
-    assert normalized is target
-    assert torch.allclose(target, torch.tensor([[0.5, 0.5], [0.0, 0.0]]))
 
 
 def test_tilelang_dsa_scratch_cache_reuses_buffers(monkeypatch):
@@ -891,3 +887,44 @@ def test_tilelang_ops_decline_non_bfloat16_inputs(monkeypatch, dtype):
         is None
     )
     assert tilelang_dsa.fused_sparse_mla_absorbed(query, key, topk_indices, 1.0, 1) is None
+
+
+def test_fused_sparse_mla_absorbed_accepts_thd_sentinels():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TileLang SparseMLA tests")
+    if tilelang_dsa.SparseMLA is None:
+        pytest.skip("TileLang SparseMLA kernel is unavailable")
+
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    seqlen = 64
+    num_heads = 64
+    dim = 576
+    v_channels = 512
+    topk = 64
+
+    query = torch.randn(
+        (seqlen, 1, num_heads, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    key = torch.randn((seqlen, 1, 1, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    topk_indices = torch.full((1, seqlen, topk), -1, dtype=torch.int32, device="cuda")
+    for row in range(1, seqlen):
+        valid = min(row, topk)
+        topk_indices[0, row, :valid] = torch.arange(valid, dtype=torch.int32, device="cuda")
+
+    output = tilelang_dsa.fused_sparse_mla_absorbed(
+        query, key, topk_indices, softmax_scale=1.0 / math.sqrt(dim), v_channels=v_channels
+    )
+
+    assert output is not None
+    assert output.shape == (seqlen, 1, num_heads, v_channels)
+    assert torch.isfinite(output).all()
+    assert output[0].abs().max() == 0
+
+    output.float().square().mean().backward()
+    assert query.grad is not None
+    assert key.grad is not None
+    assert torch.isfinite(query.grad).all()
+    assert torch.isfinite(key.grad).all()
+    assert query.grad[0].abs().max() == 0

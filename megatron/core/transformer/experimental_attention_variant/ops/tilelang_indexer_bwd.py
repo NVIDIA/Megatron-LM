@@ -117,7 +117,6 @@ def tl_indexer_bwd_impl(  # pragma: no cover
             T.fill(d_index_q_frag, 0)
             T.fill(d_weights_frag, 0)
 
-            # for bi_i in T.Pipelined(num_blocks, num_stages=num_stages):
             for bi_i in T.serial(num_blocks):
                 for i in T.Parallel(block_I):
                     if bi_i * block_I + i < topk:
