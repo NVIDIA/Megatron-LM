@@ -2318,7 +2318,8 @@ class CompressedSparseAttention(MegatronModule):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                # Top-k is still in logical compressed coordinates here.
+                # Each top-k entry is still a logical compressed id within that
+                # query's sequence here.
                 compressed_topk = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
@@ -2357,6 +2358,9 @@ class CompressedSparseAttention(MegatronModule):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
+        # Lower the logical ids into two physical spaces: indexer_topk_rank_major
+        # addresses the rank-major compressed buffers without kv_full_thd's
+        # compressed base, while topk_idxs addresses final rows in kv_full_thd.
         topk_idxs, topk_length, indexer_topk_rank_major = (
             csa_cp_layout_kernels.build_attention_indices(
                 cu_seqlens,

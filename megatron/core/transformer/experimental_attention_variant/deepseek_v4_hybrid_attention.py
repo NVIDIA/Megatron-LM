@@ -265,6 +265,8 @@ class DSv4HybridAttention(Attention):
 
         cp_size = cp_group.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        if cp_size > 1 and qkv_format != 'thd':
+            raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
         if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
@@ -657,6 +659,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # q_compressed: [s, b, q_lora_rank]
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
+        # Despite their legacy names, these are hidden-state inputs to linear_kv_proj;
+        # DSv4's actual compressed KV is produced later by the CSA compressor.
         kv_compressed = hidden_states
         k_pos_emb = None
         boundary_kv_compressed = boundary_hidden

@@ -225,6 +225,9 @@ def prepare_cp_compressor_input(
             with ``ratio=4``, ``comp_id=3`` maps to RoPE position ``12``.
         ``seq_to_rank_row``: map from global sequence-major compressed rows
             to their canonical rank-major all-gather rows.
+            If rank 0 owns ``A0, A1`` and rank 1 owns ``B0, B1``, with four
+            slots per rank, logical rows ``[A0, A1, B0, B1]`` are stored as
+            ``[A0, A1, pad, pad | B0, B1, pad, pad]`` and map to ``[0, 1, 4, 5]``.
     """
     cp_size = int(cp_size)
     ratio = int(ratio)

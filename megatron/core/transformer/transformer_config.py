@@ -1460,6 +1460,13 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
+        if self.experimental_attention_variant == "dsv4_hybrid" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+
         if self.context_parallel_size > 1:
             if (
                 self.experimental_attention_variant == "dsv4_hybrid"
