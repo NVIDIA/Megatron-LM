@@ -95,7 +95,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
     def _fine_grained_recurse_module_types(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
-        """Container module classes that need ``parameters(recurse=True)`` for fine-grained hooks."""
+        """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
         if (
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
