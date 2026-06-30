@@ -66,7 +66,7 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
 
 ### Steps
 
-1. Monitor CI Slack channel
+1. Monitor CI Slack channel (#megatron-core-pipeline-alerts-main)
 2. Work with CI to find root cause
 3. Resolve
   - If it's a low-hanging fruit, try to fix immediately
@@ -75,6 +75,7 @@ iteration time, or memory usage. Even improvements will cause CI to fail!
 
 ### Tips
 
-- Leverage the [CI Dashboard](https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci?orgId=43)
+- Leverage the CI Dashboard
+  - Find link in #megatron-core-pipeline-alerts-main channel description
   - You will need to join the `nemo-fw-eng` DL
 - Setup the GitLab MCP server with Codex
