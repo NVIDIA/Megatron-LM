@@ -347,6 +347,58 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
+def _detect_gpu_identity(local_rank):
+    """Best-effort physical GPU identity for this rank: index/name/UUID/serial/PCI.
+
+    Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
+    this runs from ``set_global_variables`` during arg parsing, before
+    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``_initialize_distributed`` -- ``current_device()`` would still read back
+    the default (always 0) at this point. ``local_rank`` is resolved against
+    ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
+    so the reported index matches reality. Returns {} on any failure (no NVML,
+    no visible GPU, MIG/UUID-style CUDA_VISIBLE_DEVICES entries we can't map
+    positionally, etc.) -- this is best-effort metadata, never load-bearing.
+    """
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+    if cuda_visible:
+        visible_list = cuda_visible.split(',')
+        if local_rank >= len(visible_list):
+            return {}
+        try:
+            physical_index = int(visible_list[local_rank])
+        except ValueError:
+            return {}
+    else:
+        physical_index = local_rank
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
+            attrs = {
+                'dl.gpu.index': physical_index,
+                'dl.gpu.name': pynvml.nvmlDeviceGetName(handle),
+                'dl.gpu.uuid': pynvml.nvmlDeviceGetUUID(handle),
+            }
+            try:
+                attrs['dl.gpu.serial'] = pynvml.nvmlDeviceGetSerial(handle)
+            except Exception:
+                pass  # not supported on most modern datacenter GPUs.
+            try:
+                attrs['dl.gpu.pci_bus_id'] = pynvml.nvmlDeviceGetPciInfo(handle).busId
+            except Exception:
+                pass
+            return {
+                k: (v.decode() if isinstance(v, bytes) else v) for k, v in attrs.items()
+            }
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return {}
+
+
 def _set_telemetry(args):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     global _GLOBAL_TELEMETRY_HANDLE
@@ -393,6 +445,8 @@ def _set_telemetry(args):
         resource_attrs['megatron.precision'] = 'bf16'
     else:
         resource_attrs['megatron.precision'] = 'fp32'
+
+    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
 
     # The "console" exporter defaults to stdout, which interleaves spans/metrics
     # with regular training logs. If --otel-json-dir is set, redirect it to a
