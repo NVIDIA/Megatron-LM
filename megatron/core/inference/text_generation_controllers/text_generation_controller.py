@@ -654,9 +654,8 @@ class TextGenerationController:
                 token_to_input_ids into GPU bookkeeping. The caller must
                 populate GPU input token IDs before forward.
 
-        Return:
-            input_ids (Tensor): The active input IDs.
-            position_ids (Tensor): The active position IDs.
+        Returns:
+            Tuple[Tensor, Tensor]: The active input IDs and position IDs.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -789,7 +788,16 @@ class TextGenerationController:
         return self._dynamic_step_context_init(skip_token_input_ids_transfer=True)
 
     def _record_async_sched_event(self, reference_tensor: Optional[Tensor] = None):
-        """Record an event on the current CUDA stream when CUDA work is active."""
+        """Record an event on the current CUDA stream when CUDA work is active.
+
+        Args:
+            reference_tensor (Optional[Tensor]): Tensor used to determine whether
+                CUDA work is active.
+
+        Returns:
+            Optional[torch.cuda.Event]: Recorded CUDA event, or `None` when no
+            CUDA work is active.
+        """
         if reference_tensor is not None and not reference_tensor.is_cuda:
             return None
         if not torch.cuda.is_available():
@@ -800,14 +808,28 @@ class TextGenerationController:
 
     @staticmethod
     def _wait_async_sched_event(event) -> None:
-        """Wait for an async-scheduler CUDA event if one was recorded."""
+        """Wait for an async-scheduler CUDA event if one was recorded.
+
+        Args:
+            event (Optional[torch.cuda.Event]): CUDA event to synchronize, or
+                `None` when no CUDA work was recorded.
+        """
         if event is not None:
             event.synchronize()
 
     def _copy_async_sched_sample_to_cpu(
         self, sampled_tokens_gpu: Tensor, active_request_count: int
     ) -> Tuple[Tensor, Optional[Any]]:
-        """Start copying sampled tokens to CPU and return a view plus ready event."""
+        """Start copying sampled tokens to CPU and return a view plus ready event.
+
+        Args:
+            sampled_tokens_gpu (Tensor): Sampled token IDs for active requests.
+            active_request_count (int): Number of active request rows to copy.
+
+        Returns:
+            Tuple[Tensor, Optional[Any]]: CPU view of sampled token IDs and the
+                copy-completion event, or `None` when the copy is synchronous.
+        """
         sample_slice = sampled_tokens_gpu[:active_request_count]
         if not sampled_tokens_gpu.is_cuda:
             return sample_slice.cpu(), None
@@ -828,7 +850,15 @@ class TextGenerationController:
     def _build_async_sched_request_state(
         self, sampled_tokens_cpu: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Build request IDs and active/finished row sets after prepare."""
+        """Build request IDs and active/finished row sets after prepare.
+
+        Args:
+            sampled_tokens_cpu (Tensor): Sampled CPU token IDs for active requests.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor, Tensor]: Active request IDs, finished
+                request IDs, active-request mask, and survivor row indices.
+        """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
