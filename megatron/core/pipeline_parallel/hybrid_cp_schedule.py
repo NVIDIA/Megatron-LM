@@ -609,7 +609,7 @@ def hybrid_context_parallel_forward_backward(
                     forward_data_store,
                     config,
                     pg_collection.cp.size(),
-                    collect_non_loss_data,
+                    collect_non_loss_data=collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(
                         first_val_step, forward_only, current_microbatch == 0
                     ),
@@ -632,7 +632,7 @@ def hybrid_context_parallel_forward_backward(
         forward_data_store,
         config,
         pg_collection.cp.size(),
-        collect_non_loss_data,
+        collect_non_loss_data=collect_non_loss_data,
         is_first_microbatch=check_first_val_step(
             first_val_step, forward_only, current_microbatch == 0
         ),
