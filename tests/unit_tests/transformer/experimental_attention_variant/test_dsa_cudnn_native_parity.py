@@ -2802,6 +2802,107 @@ def test_cudnn_full_fusion_declines_varlen_dense_indexer_loss(monkeypatch):
     )
 
 
+def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
+    """``varlen_is_plain_causal`` drives the plain-causal normalization without a device sync.
+
+    ``build_dsattention_forward_mask`` emits explicit plain-causal bounds and flags them via
+    ``varlen_is_plain_causal``. The hook must normalize those bounds back to ``None`` based on the
+    flag alone (instead of a ``torch.equal`` host/device sync), so dense indexer loss takes the
+    fused no-varlen path. Identical bounds without the flag are left intact and decline fusion.
+    """
+
+    class Config:
+        dsa_kernel_backend = "cudnn"
+        attention_backend = AttnBackend.auto
+        kv_lora_rank = 512
+        calculate_per_token_loss = True
+
+    seen = {}
+
+    def fake_fused_indexer_sparse_attn(
+        query,
+        kv_full,
+        q_indexer,
+        k_indexer,
+        weights,
+        indexer_topk,
+        softmax_scale,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        calculate_per_token_loss=False,
+        d_v=0,
+        varlen_starts=None,
+        varlen_ends=None,
+        key_positions=None,
+        query_valid_rows=None,
+        use_local_indexer_varlen=False,
+        single_packed_thd_sequence=False,
+        local_packed_cp_rank=0,
+        local_packed_cp_query_start=0,
+        local_packed_cp_query_len=None,
+        tp_group=None,
+    ):
+        seen["called"] = True
+        seen["varlen_starts"] = varlen_starts
+        seen["varlen_ends"] = varlen_ends
+        seen["loss_coeff"] = loss_coeff
+        return torch.zeros(
+            (query.size(0), query.size(1), query.size(2) * d_v),
+            dtype=query.dtype,
+            device=query.device,
+        ), torch.zeros((), dtype=torch.float32, device=query.device)
+
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "fused_indexer_sparse_attn", fake_fused_indexer_sparse_attn
+    )
+
+    sq = sk = 4
+    batch, heads = 1, 2
+    hidden = Config.kv_lora_rank
+    idx_heads, idx_hidden = 2, 4
+    up_v_weight = torch.zeros((heads, hidden, hidden), dtype=torch.bfloat16)
+
+    def run(varlen_is_plain_causal):
+        seen.clear()
+        return dsa_cudnn_kernels.run_fused_dsa_attention(
+            config=Config(),
+            query=torch.zeros((sq, batch, heads, hidden), dtype=torch.bfloat16),
+            key=torch.zeros((sk, batch, 1, hidden), dtype=torch.bfloat16),
+            value=None,
+            up_v_weight=up_v_weight,
+            q_indexer=torch.zeros((sq, batch, idx_heads, idx_hidden), dtype=torch.bfloat16),
+            k_indexer=torch.zeros((sk, batch, idx_hidden), dtype=torch.bfloat16),
+            indexer_weights=torch.zeros((sq, batch, idx_heads), dtype=torch.bfloat16),
+            indexer_topk=4,
+            softmax_scale=1.0,
+            loss_coeff=0.01,
+            sparse_loss=False,
+            calculate_per_token_loss=True,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=torch.zeros(sq, dtype=torch.int64),
+            varlen_ends=torch.arange(1, sq + 1, dtype=torch.int64),
+            key_positions=None,
+            query_valid_rows=None,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_relu=True,
+        )
+
+    # Flagged: bounds are normalized to None, so dense indexer loss runs on the fused path.
+    flagged_output = run(varlen_is_plain_causal=True)
+    assert flagged_output is not None
+    assert seen["called"] is True
+    assert seen["varlen_starts"] is None
+    assert seen["varlen_ends"] is None
+    assert seen["loss_coeff"] == 0.01
+
+    # Unflagged: the identical bounds are left intact, so dense indexer loss declines fusion.
+    assert run(varlen_is_plain_causal=False) is None
+    assert "called" not in seen
+
+
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
 # case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
 # kernel/build root cause is resolved.

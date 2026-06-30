@@ -162,6 +162,7 @@ def run_fused_dsa_attention(
     varlen_ends: Optional[Tensor],
     key_positions: Optional[Tensor],
     query_valid_rows: Optional[Tensor],
+    varlen_is_plain_causal: bool = False,
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
     single_packed_thd_sequence: bool = False,
@@ -186,6 +187,19 @@ def run_fused_dsa_attention(
         return None
     if not torch.is_grad_enabled():
         loss_coeff = 0.0
+    # build_dsattention_forward_mask emits explicit varlen bounds even for the plain (non-packed,
+    # non-CP) causal case and flags them via ``varlen_is_plain_causal``. Those bounds are exactly
+    # equivalent to the no-varlen causal path the dense fused indexer loss was written for, so
+    # normalize them back to None: plain causal then takes the same fused path (relying on the
+    # kernel's internal causal masking) it took before that mask change, instead of declining
+    # dense loss and falling back to the slow reference-loss path. The flag carries the mask
+    # builder's structural knowledge, so we avoid the per-forward host/device sync a ``torch.equal``
+    # bounds comparison would force on this common path. Genuine packed/CP/custom-position varlen
+    # is left untouched (``varlen_is_plain_causal`` is False there) and is gated below, where it
+    # would otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
+    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
+        varlen_starts = None
+        varlen_ends = None
     has_varlen = varlen_starts is not None or varlen_ends is not None or key_positions is not None
     if has_varlen:
         if varlen_starts is None or varlen_ends is None:
@@ -467,17 +481,17 @@ def _compute_indexer_scores_chunk_with_global_rows(
     if k_bshd.size(2) != 1:
         raise RuntimeError(f"cuDNN DSA indexer expects one key head, got {k_bshd.size(2)}.")
 
-    b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
+    _b, sq, _idx_nh, _idx_hd = q_chunk_bshd.shape
     sk = k_bshd.size(1)
-    scores_chunk = torch.zeros((b, sq, sk), dtype=torch.float32, device=q_chunk_bshd.device)
     if k_bdk is None:
         k_bdk = k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
 
-    for head_idx in range(idx_nh):
-        head_scores = torch.bmm(q_chunk_bshd[:, :, head_idx, :].to(dtype=torch.float32), k_bdk)
-        head_scores.relu_()
-        head_scores.mul_(w_chunk_bsh[:, :, head_idx].to(dtype=torch.float32).unsqueeze(-1))
-        scores_chunk.add_(head_scores)
+    # Batched over the indexer-head axis (equivalent to the previous per-head bmm loop):
+    # relu(Q.K^T) weighted by the per-head indexer weight, summed over heads, in one matmul.
+    head_scores = torch.einsum("bshd,bdk->bshk", q_chunk_bshd.to(dtype=torch.float32), k_bdk)
+    head_scores.relu_()
+    head_scores.mul_(w_chunk_bsh.to(dtype=torch.float32).unsqueeze(-1))
+    scores_chunk = head_scores.sum(dim=2)
 
     if sm_scale != 1.0:
         scores_chunk.mul_(sm_scale)

@@ -257,7 +257,10 @@ def extract_query_positions_from_position_ids(
     if position_ids is None:
         return None
     if position_ids.ndim == 2:
-        if position_ids.size(0) > 1:
+        # ``torch.equal`` on CUDA forces a per-forward host/device sync, so only run the eager
+        # cross-batch consistency check off the CUDA training path (tests/CPU). On CUDA we rely on
+        # the dataloader contract that DSA position_ids are identical across the batch dimension.
+        if position_ids.size(0) > 1 and not position_ids.is_cuda:
             assert torch.equal(
                 position_ids[0], position_ids[-1]
             ), "Allgather-CP DSA expects identical position_ids across batch"

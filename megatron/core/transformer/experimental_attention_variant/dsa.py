@@ -1787,51 +1787,37 @@ class DSAttention(MegatronModule):
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
+
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
+            def _build_kv_reorder_idx(local_len):
+                if packed_thd:
+                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=local_len,
+                        key_local_output_size=local_len,
+                        global_output_size=local_len * cp_size,
+                    )
+                    return idx
+                return dsa_layout.build_zigzag_allgather_cp_key_reorder(
+                    sq=local_len, cp_size=cp_size, device=query.device
+                )
+
             gathered_cp_key = False
             gathered_cp_value = False
             if key.size(0) in local_cp_kv_lens:
                 local_cp_kv_len = key.size(0)
-                if packed_thd:
-                    _, kv_reorder_idx = (
-                        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                            cu_seqlens_q=cu_seqlens_q,
-                            cu_seqlens_kv=cu_seqlens_kv,
-                            cp_size=cp_size,
-                            cp_rank=cp_rank,
-                            device=query.device,
-                            local_output_size=local_cp_kv_len,
-                            key_local_output_size=local_cp_kv_len,
-                            global_output_size=local_cp_kv_len * cp_size,
-                        )
-                    )
-                else:
-                    kv_reorder_idx = dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                        sq=local_cp_kv_len, cp_size=cp_size, device=query.device
-                    )
+                kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
                 gathered_cp_key = True
             if value is not None and value.size(0) in local_cp_kv_lens:
                 if local_cp_kv_len is None:
                     local_cp_kv_len = value.size(0)
-                    if packed_thd:
-                        _, kv_reorder_idx = (
-                            dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                                cu_seqlens_q=cu_seqlens_q,
-                                cu_seqlens_kv=cu_seqlens_kv,
-                                cp_size=cp_size,
-                                cp_rank=cp_rank,
-                                device=query.device,
-                                local_output_size=local_cp_kv_len,
-                                key_local_output_size=local_cp_kv_len,
-                                global_output_size=local_cp_kv_len * cp_size,
-                            )
-                        )
-                    else:
-                        kv_reorder_idx = dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                            sq=local_cp_kv_len, cp_size=cp_size, device=query.device
-                        )
+                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 elif value.size(0) != local_cp_kv_len:
                     raise RuntimeError(
                         "DSA local key/value sequence length mismatch before CP gather: "
@@ -1890,21 +1876,23 @@ class DSAttention(MegatronModule):
                 "DSA indexer loss requires TP ranks to own the same query rows; "
                 "sequence-local TP query shards cannot form a global-head target."
             )
-        float_mask, varlen_params = dsa_masking.build_dsattention_forward_mask(
-            sq=sq,
-            skv=skv,
-            b=b,
-            device=x.device,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            cp_comm_type=self.cp_comm_type,
-            cp_group=cp_group,
-            attn_mask_type=attn_mask_type,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            packed_query_positions=packed_query_positions,
-            nonpacked_query_positions=nonpacked_query_positions,
+        float_mask, varlen_params, varlen_is_plain_causal = (
+            dsa_masking.build_dsattention_forward_mask(
+                sq=sq,
+                skv=skv,
+                b=b,
+                device=x.device,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                cp_comm_type=self.cp_comm_type,
+                cp_group=cp_group,
+                attn_mask_type=attn_mask_type,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                packed_query_positions=packed_query_positions,
+                nonpacked_query_positions=nonpacked_query_positions,
+            )
         )
         if varlen_params is not None:
             varlen_starts, varlen_ends, key_positions = varlen_params
@@ -2048,6 +2036,7 @@ class DSAttention(MegatronModule):
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
                 query_valid_rows=query_valid_rows,
+                varlen_is_plain_causal=varlen_is_plain_causal,
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 use_local_indexer_varlen=use_local_indexer_varlen,
                 single_packed_thd_sequence=single_packed_thd_sequence,
@@ -2141,7 +2130,8 @@ class DSAttention(MegatronModule):
 
             if topk_indices is None or indexer_loss is None:
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
-            slice_topk_to_local_sequence_parallel_rows()
+            # No TP-local top-k slicing here: the guard above forbids the indexer loss
+            # under sequence-local TP query shards, so the top-k rows are already global.
 
             # Save indexer loss for logging.
             if indexer_loss_coeff > 0:

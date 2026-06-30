@@ -41,10 +41,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
     build_packed_allgather_cp_local_positions,
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_zigzag_allgather_cp_key_reorder,
+    extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     build_causal_mask_from_positions,
+    build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
@@ -644,6 +646,7 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
             varlen_ends=ends,
             key_positions=None,
             query_valid_rows=None,
+            varlen_is_plain_causal=True,
             use_relu=False,
             use_local_indexer_varlen=True,
         )
@@ -651,6 +654,7 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     )
     assert seen["full_kwargs"]["varlen_starts"] is starts
     assert seen["full_kwargs"]["use_relu"] is False
+    assert seen["full_kwargs"]["varlen_is_plain_causal"] is True
 
 
 def test_dsa_kernel_dependency_validation(monkeypatch):
@@ -1211,6 +1215,100 @@ class TestDSACPPositionHelpers:
             )
             is None
         )
+
+    def test_build_mask_flags_plain_causal_varlen_bounds(self):
+        """Plain (non-packed, non-CP) causal bounds are flagged for the fused fast path.
+
+        The flag lets the fused dispatcher recognize the no-varlen-equivalent causal bounds
+        without a per-forward ``torch.equal`` host/device sync.
+        """
+        sq, skv, b = 4, 4, 2
+        float_mask, varlen_params, is_plain_causal = build_dsattention_forward_mask(
+            sq=sq,
+            skv=skv,
+            b=b,
+            device=torch.device("cpu"),
+            cp_size=1,
+            cp_rank=0,
+            cp_comm_type="p2p",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+        )
+        assert float_mask is None
+        assert is_plain_causal is True
+        starts, ends, key_positions = varlen_params
+        torch.testing.assert_close(starts, torch.zeros(sq, dtype=torch.int64))
+        torch.testing.assert_close(ends, torch.arange(1, sq + 1, dtype=torch.int64))
+        assert key_positions is None
+
+    def test_build_mask_additive_mask_is_not_flagged_plain_causal(self):
+        """The explicit additive-mask branch never sets the plain-causal flag."""
+        sq, skv, b = 3, 3, 1
+        attention_mask = torch.zeros((b, 1, sq, skv), dtype=torch.bool)
+        float_mask, varlen_params, is_plain_causal = build_dsattention_forward_mask(
+            sq=sq,
+            skv=skv,
+            b=b,
+            device=torch.device("cpu"),
+            cp_size=1,
+            cp_rank=0,
+            cp_comm_type="p2p",
+            cp_group=None,
+            attn_mask_type=None,
+            attention_mask=attention_mask,
+            position_ids=None,
+            packed_seq_params=None,
+        )
+        assert float_mask is not None
+        assert varlen_params is None
+        assert is_plain_causal is False
+
+    def test_build_mask_nonpacked_positions_not_flagged_plain_causal(self):
+        """Custom query-position bounds are conservatively not flagged plain causal.
+
+        Even when the explicit positions coincide with plain causal, only the trivial causal
+        branch sets the flag; every other branch leaves the value-based decision to the kernel.
+        """
+        sq, skv = 4, 4
+        positions = torch.arange(sq, dtype=torch.int64)
+        _float_mask, varlen_params, is_plain_causal = build_dsattention_forward_mask(
+            sq=sq,
+            skv=skv,
+            b=1,
+            device=torch.device("cpu"),
+            cp_size=1,
+            cp_rank=0,
+            cp_comm_type="p2p",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            nonpacked_query_positions=positions,
+        )
+        assert is_plain_causal is False
+        starts, ends, _key_positions = varlen_params
+        torch.testing.assert_close(starts, torch.zeros(sq, dtype=torch.int64))
+        torch.testing.assert_close(ends, torch.arange(1, sq + 1, dtype=torch.int64))
+
+    def test_extract_query_positions_rejects_mismatched_batch_on_cpu(self):
+        """The cross-batch consistency guard still fires for CPU position_ids."""
+        position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 9]], dtype=torch.int64)
+        with pytest.raises(AssertionError, match="identical position_ids across batch"):
+            extract_query_positions_from_position_ids(
+                position_ids, sq=4, device=torch.device("cpu")
+            )
+
+    def test_extract_query_positions_returns_first_row(self):
+        """Matching batch rows return the shared per-query positions."""
+        position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int64)
+        out = extract_query_positions_from_position_ids(
+            position_ids, sq=4, device=torch.device("cpu")
+        )
+        torch.testing.assert_close(out, torch.arange(4, dtype=torch.int64))
 
     def test_scatter_topk_chunked_matches_manual_with_negative_indices(self):
         """Chunked top-k scatter should match manual behavior for -1 invalid indices."""

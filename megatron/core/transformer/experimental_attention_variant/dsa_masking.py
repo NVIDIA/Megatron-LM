@@ -412,7 +412,9 @@ def build_dsattention_forward_mask(
     packed_query_positions: Optional[torch.Tensor] = None,
     nonpacked_query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[
-    Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
+    Optional[torch.Tensor],
+    Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
+    bool,
 ]:
     """Build DSAttention mask.
 
@@ -420,6 +422,13 @@ def build_dsattention_forward_mask(
         float_mask: Optional additive mask [sq, skv] or [b, sq, skv].
         varlen_params: Optional (starts, ends, key_positions). ``key_positions`` is ``None`` for
             identity key positions.
+        varlen_is_plain_causal: ``True`` only when ``varlen_params`` are the plain (non-packed,
+            non-CP, identity query/key position) causal bounds, i.e. exactly ``starts == 0`` and
+            ``ends == arange(1, sq + 1).clamp(max=skv)``. Fused dispatchers can treat these as
+            equivalent to the no-varlen causal path without a device-side equality check (which
+            would force a per-forward host/device sync). ``False`` for every other branch
+            (packed/CP/custom-position varlen and the additive-mask path), even when those bounds
+            happen to coincide with plain causal.
     """
     packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
     if attn_mask_type is not None:
@@ -445,13 +454,13 @@ def build_dsattention_forward_mask(
             varlen_starts, varlen_ends = generate_varlen_mask_params_for_positions(
                 cu_seqlens_q, query_idx
             )
-            return None, (varlen_starts, varlen_ends, None)
+            return None, (varlen_starts, varlen_ends, None), False
 
         if nonpacked_query_positions is not None:
             query_pos = nonpacked_query_positions.to(device=device, dtype=torch.int64)
             varlen_starts = torch.zeros_like(query_pos, dtype=torch.int64, device=device)
             varlen_ends = (query_pos + 1).clamp(max=skv)
-            return None, (varlen_starts, varlen_ends, None)
+            return None, (varlen_starts, varlen_ends, None), False
 
         if cp_size > 1:
             query_pos = dsa_layout.extract_query_positions_from_position_ids(
@@ -469,17 +478,17 @@ def build_dsattention_forward_mask(
                 )
             varlen_starts = torch.zeros_like(query_pos, dtype=torch.int64, device=device)
             varlen_ends = (query_pos.to(dtype=torch.int64) + 1).clamp(max=skv)
-            return None, (varlen_starts, varlen_ends, None)
+            return None, (varlen_starts, varlen_ends, None), False
 
         varlen_starts = torch.zeros(sq, dtype=torch.int64, device=device)
         varlen_ends = torch.arange(1, sq + 1, dtype=torch.int64, device=device).clamp(max=skv)
-        return None, (varlen_starts, varlen_ends, None)
+        return None, (varlen_starts, varlen_ends, None), True
 
     assert attention_mask is not None, "attention_mask is required when attn_mask_type is None"
     assert attention_mask.shape == (b, 1, sq, skv), "attention_mask shape mismatch"
     mask = attention_mask[:, 0, :, :]
     float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(mask, float("-inf"))
-    return float_mask, None
+    return float_mask, None, False
 
 
 def build_fused_indexer_varlen_bounds(
