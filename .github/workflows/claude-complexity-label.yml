@@ -28,6 +28,7 @@ jobs:
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
           CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
           anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ secrets.PAT }}
