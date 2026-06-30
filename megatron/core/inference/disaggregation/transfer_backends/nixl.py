@@ -176,6 +176,26 @@ class NixlTransportBackend(KVTransportBackend):
             [(region, local_src, peer_dst) for region, local_src, peer_dst in transfers],
         )
 
+    def begin_pull_raw(self, peer_meta: dict, region_name: str, triples: list) -> NixlPullHandle:
+        """Remote READ of arbitrary byte sub-ranges within a single registered
+        region -- used for hetero-TP fragment reads, where a decode rank pulls
+        head/layer sub-ranges of blocks rather than whole entries. ``triples`` is
+        a list of ``(local_byte_off, remote_byte_off, nbytes)`` relative to the
+        region base on each side. All batched into one transfer."""
+        assert self._init, "NixlTransportBackend.init() not called"
+        if not triples:
+            return NixlPullHandle(self._agent, None)
+        peer = self._ensure_peer(peer_meta)
+        ld = self._regions[region_name].layout()
+        pr = peer_meta["regions"][region_name]
+        local_tuples = [(ld["base_addr"] + lo, nb, ld["device_id"]) for lo, ro, nb in triples]
+        remote_tuples = [(pr["base_addr"] + ro, nb, pr["device_id"]) for lo, ro, nb in triples]
+        local_descs = self._agent.get_xfer_descs(local_tuples, mem_type="VRAM")
+        remote_descs = self._agent.get_xfer_descs(remote_tuples, mem_type="VRAM")
+        xfer = self._agent.initialize_xfer("READ", local_descs, remote_descs, peer)
+        self._agent.transfer(xfer)
+        return NixlPullHandle(self._agent, xfer)
+
     def _begin(self, op: str, peer_meta: dict, items: list) -> NixlPullHandle:
         """Issue one one-sided transfer (``op`` = READ/WRITE) batching every
         ``(region, local_index, remote_index)`` in ``items``. ``local_descs``
