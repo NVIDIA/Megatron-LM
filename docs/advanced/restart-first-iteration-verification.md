@@ -45,7 +45,9 @@ only `[ITER1-ENV-ABA]` legs, so the measured control/treatment/control runs must
 still pass iteration-1, startup-through-iteration-1, and complete-wall gates.
 
 `tools/first_iter/verify_restart.py` enforces these gates for launcher logs that
-contain the standard `[ITER1-ENV-ABA]` and `[ULTRAHALF-ITER1CAP]` markers:
+contain the standard `[ITER1-ENV-ABA]` and `[ULTRAHALF-ITER1CAP]` markers.
+The wall marker may use integer or decimal seconds; the verifier preserves
+millisecond precision so subsecond gains cannot be hidden by display rounding:
 
 ```bash
 python tools/first_iter/verify_restart.py \

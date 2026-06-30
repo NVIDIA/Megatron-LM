@@ -7,6 +7,7 @@ from tools.first_iter.verify_restart import (
     AbaLeg,
     IterationMetrics,
     RunMetrics,
+    _format_table,
     parse_run_log,
     verify_aba,
 )
@@ -255,6 +256,18 @@ def test_verify_aba_rejects_relocation_before_startup_marker(tmp_path: Path) -> 
     )
 
     assert any("srun wall did not improve enough" in failure for failure in failures)
+
+
+def test_subsecond_srun_wall_is_reported_at_millisecond_precision(tmp_path: Path) -> None:
+    leg = AbaLeg(
+        label="treatment",
+        nodes=16,
+        world=64,
+        srun_wall_s=105.057,
+        metrics=_run_metrics(tmp_path / "t.log", init=13, pre_training=18, iter_1=8),
+    )
+
+    assert "105.057" in _format_table([leg])
 
 
 def test_verify_aba_rejects_late_numeric_drift(tmp_path: Path) -> None:

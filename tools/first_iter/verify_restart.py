@@ -257,8 +257,8 @@ def verify_aba(
     if control_wall_spread > max_control_wall_spread_s:
         failures.append(
             "control srun-wall spread is too large for causal attribution: "
-            f"spread={control_wall_spread:.1f}s "
-            f"maximum={max_control_wall_spread_s:.1f}s"
+            f"spread={control_wall_spread:.3f}s "
+            f"maximum={max_control_wall_spread_s:.3f}s"
         )
 
     numeric_fields = ("loss", "grad_norm")
@@ -362,15 +362,15 @@ def verify_aba(
     if wall_improvement < minimum_wall_improvement_s:
         failures.append(
             "srun wall did not improve enough: "
-            f"treatment={treatment.srun_wall_s:.1f}s "
-            f"control_mean={control_wall_mean:.1f}s "
-            f"improvement={wall_improvement:.1f}s "
-            f"minimum={minimum_wall_improvement_s:.1f}s"
+            f"treatment={treatment.srun_wall_s:.3f}s "
+            f"control_mean={control_wall_mean:.3f}s "
+            f"improvement={wall_improvement:.3f}s "
+            f"minimum={minimum_wall_improvement_s:.3f}s"
         )
     if treatment.srun_wall_s > control_wall_mean + wall_tolerance_s:
         failures.append(
-            f"srun wall regressed: treatment={treatment.srun_wall_s:.1f}s "
-            f"control_mean={control_wall_mean:.1f}s tolerance={wall_tolerance_s:.1f}s"
+            f"srun wall regressed: treatment={treatment.srun_wall_s:.3f}s "
+            f"control_mean={control_wall_mean:.3f}s tolerance={wall_tolerance_s:.3f}s"
         )
     return failures
 
@@ -384,7 +384,7 @@ def _format_table(legs: list[AbaLeg]) -> str:
         rows.append(
             f"{leg.label:<20} {metrics.initialization_s:>7.3f}  {metrics.pre_training_s:>12.3f}  "
             f"{metrics.iteration_1.elapsed_s:>8.4f}  "
-            f"{metrics.startup_through_iteration_1_s:>16.4f}  {leg.srun_wall_s:>7.1f}  "
+            f"{metrics.startup_through_iteration_1_s:>16.4f}  {leg.srun_wall_s:>7.3f}  "
             f"{metrics.iteration_1.loss:<10} {metrics.iteration_1.grad_norm}"
         )
     return "\n".join(rows)
