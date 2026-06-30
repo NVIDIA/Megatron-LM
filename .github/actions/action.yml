@@ -101,7 +101,7 @@ runs:
     - name: Install uuid-runtime
       shell: bash -x -e -u -o pipefail {0}
       run: |
-        for i in 1 2 3; do
+        for i in 1 2 3 4 5; do
           apt-get update && apt-get install -y uuid-runtime && break
           echo "apt attempt $i failed, retrying..."
           sleep 10
@@ -110,7 +110,7 @@ runs:
     - name: Install uv
       shell: bash -x -e -u -o pipefail {0}
       run: |
-        for i in 1 2 3; do
+        for i in 1 2 3 4 5; do
           curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
           echo "uv install attempt $i failed, retrying..."
           sleep 10
