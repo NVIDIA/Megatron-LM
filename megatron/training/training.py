@@ -1121,33 +1121,13 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
-    # OTel: start megatron.pretrain span (covers training + eval + test).
-    # Uses explicit span API (start_span + context.attach) to avoid restructuring
-    # this large function body.  An atexit handler ensures the span is ended even
-    # if pretrain() exits via unhandled exception.
+    # OTel span setup is deferred until after set_jit_fusion_options() below,
+    # where program_start/main_entry/pretrain_entry and the other startup
+    # timestamps are all available -- see the block right after those are
+    # extracted from _STARTUP_TIMESTAMPS.
     _pretrain_span = _pretrain_ctx_token = None
+    _startup_span = _startup_ctx_token = None
     _otel_ctx = None
-    if _otel_sg_enabled('job'):
-        from opentelemetry import context as _otel_ctx, trace as _otel_trace
-        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
-        _otel_tracer = get_telemetry().tracer
-        _pretrain_span = _otel_tracer.start_span("megatron.pretrain")
-        _otel_set_attrs(_pretrain_span, {
-            'megatron.model_type': str(model_type),
-        })
-        _pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_pretrain_span))
-
-    def _end_pretrain_span():
-        """End the pretrain span and detach its context token."""
-        nonlocal _pretrain_span
-        if _pretrain_span is not None:
-            if _otel_ctx is not None and _pretrain_ctx_token is not None:
-                _otel_ctx.detach(_pretrain_ctx_token)
-            _pretrain_span.end()
-            _pretrain_span = None  # Prevent double-end from atexit
-
-    import atexit
-    atexit.register(_end_pretrain_span)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1167,6 +1147,85 @@ def pretrain(
     program_start = _STARTUP_TIMESTAMPS.get('program_start')
     main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
     pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+
+    # OTel: start megatron.pretrain (outermost) and megatron.startup (its
+    # first child; megatron.train, decorated separately, is its sibling --
+    # see the explicit _end_startup_span() call right before train() below).
+    # Both use the explicit span API (start_span + context.attach), not
+    # managed_span, because (a) megatron.pretrain needs to stay open for the
+    # rest of this large function without restructuring it into one `with`
+    # block, and (b) both are backdated to this rank's actual program_start --
+    # no tracer exists yet during imports/arg-parsing (telemetry isn't
+    # initialized until parse_and_validate_args() finishes, in __main__,
+    # before pretrain() is even called), so that window can only be
+    # represented by retroactively creating already-closed spans for it once
+    # the tracer exists, from timestamps the entry script and pretrain() have
+    # already been capturing. An atexit handler ensures both are ended even if
+    # pretrain() exits via unhandled exception.
+    if _otel_sg_enabled('job'):
+        from opentelemetry import context as _otel_ctx, trace as _otel_trace
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        _otel_tracer = get_telemetry().tracer
+
+        _program_start_ns = int(program_start * 1e9) if program_start is not None else None
+        _pretrain_span = _otel_tracer.start_span("megatron.pretrain", start_time=_program_start_ns)
+        _otel_set_attrs(_pretrain_span, {
+            'megatron.model_type': str(model_type),
+        })
+        _pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_pretrain_span))
+
+        _startup_span = _otel_tracer.start_span("megatron.startup", start_time=_program_start_ns)
+        _startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_startup_span))
+
+        def _backdated_span(name, start, end):
+            """Record an already-elapsed phase as a closed span with explicit timestamps."""
+            if start is None or end is None:
+                return
+            _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
+            _s.end(end_time=int(end * 1e9))
+
+        _backdated_span('megatron.startup.imports', program_start, main_entry)
+        _backdated_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
+        _backdated_span(
+            'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
+        )
+        _backdated_span(
+            'megatron.startup.in_job_setup',
+            timestamp_after_inprocess_setup,
+            timestamp_after_in_job_setup,
+        )
+        _backdated_span(
+            'megatron.startup.initialize_megatron',
+            timestamp_after_in_job_setup,
+            timestamp_after_initialize_megatron,
+        )
+        _backdated_span(
+            'megatron.startup.jit_fusion_options',
+            timestamp_after_initialize_megatron,
+            timestamp_after_set_jit_fusion_options,
+        )
+
+    def _end_startup_span():
+        """End the startup span (sibling to the training-loop span) and detach its token."""
+        nonlocal _startup_span
+        if _startup_span is not None:
+            if _otel_ctx is not None and _startup_ctx_token is not None:
+                _otel_ctx.detach(_startup_ctx_token)
+            _startup_span.end()
+            _startup_span = None  # Prevent double-end from atexit/_end_pretrain_span.
+
+    def _end_pretrain_span():
+        """End the pretrain span (and startup, if a crash skipped the normal end point above)."""
+        nonlocal _pretrain_span
+        _end_startup_span()
+        if _pretrain_span is not None:
+            if _otel_ctx is not None and _pretrain_ctx_token is not None:
+                _otel_ctx.detach(_pretrain_ctx_token)
+            _pretrain_span.end()
+            _pretrain_span = None  # Prevent double-end from atexit
+
+    import atexit
+    atexit.register(_end_pretrain_span)
 
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
@@ -1453,6 +1512,12 @@ def pretrain(
             log_to_tensorboard=(get_tensorboard_writer() is not None),
         )
         print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
+
+    # OTel: startup phase ends here -- everything above this point (imports,
+    # arg parsing, initialize_megatron, model/optimizer setup, checkpoint
+    # load, dataset/dataloader build) is megatron.startup; train() below is
+    # its sibling, megatron.train (decorated separately).
+    _end_startup_span()
 
     if not cfg_container.validation.skip_train or args.perform_rl_step:
         if cfg_container.validation.skip_train:
