@@ -2,6 +2,7 @@
 
 from functools import partial
 from typing import Callable, Dict, List, Optional, Union
+from collections import defaultdict
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -319,7 +320,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if (config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias') 
+            and getattr(module, 'local_tokens_per_expert', None) is not None):
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -358,17 +360,18 @@ def _update_router_expert_bias(
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    groups: dict[int, list] = defaultdict(list)
+    for tokens, bias in zip(tokens_per_expert_list, expert_bias_list):
+        groups[tokens.numel()].append((tokens, bias))
+    for _, pairs in sorted(groups.items()):
+        updated = get_updated_expert_bias(
+            torch.stack([t for t, _ in pairs], dim=0),
+            torch.stack([b for _, b in pairs], dim=0),
+            config.moe_router_bias_update_rate, tp_dp_cp_group=tp_dp_cp_group,
+        )
+        for (_, bias), new_bias in zip(pairs, updated):
+            bias.copy_(new_bias)
 
 
 def _update_router_qb_beta(
