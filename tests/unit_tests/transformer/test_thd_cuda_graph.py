@@ -485,9 +485,7 @@ class TestPadSequenceForThd:
         cu_seqlens_padded = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
         packed_seq_params.cu_seqlens_q_padded = cu_seqlens_padded
         packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_padded.clone()
-        padding_mask = torch.tensor(
-            [[False, False, False, True]], dtype=torch.bool, device="cuda"
-        )
+        padding_mask = torch.tensor([[False, False, False, True]], dtype=torch.bool, device="cuda")
 
         def fail_if_called(*_args, **_kwargs):
             pytest.fail("already sliced padding_mask must avoid TE repartitioning")
