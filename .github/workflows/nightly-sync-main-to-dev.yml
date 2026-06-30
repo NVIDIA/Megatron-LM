@@ -304,6 +304,6 @@ jobs:
           show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
-            --model "opus[1m]"
+            --model "us/aws/anthropic/eccn-claude-opus-4-8"
             --effort max
             --max-turns 1500
