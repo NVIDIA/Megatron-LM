@@ -46,10 +46,6 @@ class PullRegion:
     tensor: torch.Tensor
     index_axis: int
 
-    @property
-    def count(self) -> int:
-        return int(self.tensor.shape[self.index_axis])
-
     def layout(self) -> dict:
         """JSON-safe per-region layout for a remote peer to compute addresses."""
         shape = self.tensor.shape
@@ -65,7 +61,6 @@ class PullRegion:
             "num_outer": num_outer,
             "outer_stride_bytes": int(shape[self.index_axis]) * inner * elem,
             "inner_bytes": inner * elem,
-            "count": int(shape[self.index_axis]),
             "device_id": self.tensor.device.index or 0,
         }
 
@@ -185,10 +180,6 @@ class KVTransportBackend(abc.ABC):
                 h.wait()
 
         return TransferHandle(wait_fn=_wait), bufs
-
-    def stream(self) -> Optional[torch.cuda.Stream]:
-        """Optional dedicated stream; default ``None`` (use current)."""
-        return None
 
 
 def construct_kv_transport_backend(name: str) -> KVTransportBackend:

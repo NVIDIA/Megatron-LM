@@ -31,8 +31,6 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-import torch
-
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     PullRegion,

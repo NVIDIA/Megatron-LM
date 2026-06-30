@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -17,10 +16,8 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 )
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 
-logger = logging.getLogger(__name__)
 
-
-def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
+def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
     """Reconstruct the KV schema on the decode side with no control message.
 
     Header-free: the metadata (tensor shapes/dtypes, block count, optional
@@ -130,7 +127,7 @@ def send_request_kv_resharded(
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
-) -> Optional["PrefillHandoff"]:
+) -> "PrefillHandoff":
     """Hetero-layout prefill send: reshard this rank's KV sub-blocks to
     the decode layout via global-coordinate range intersection.
 
@@ -310,17 +307,15 @@ def post_recv_request_kv_resharded(
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
-) -> Optional["DecodeRecv"]:
+) -> "DecodeRecv":
     """Hetero-layout decode receive (non-blocking): post the irecv for every
     KV sub-block covering this rank's (layer x head) rectangle and return a
     :class:`DecodeRecv` to complete later. For hybrid models the conv/ssm
     sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
-    config + prompt). Returns ``None`` if there is no KV to receive."""
+    config + prompt)."""
 
     assert backend is not None, "post_recv_request_kv_resharded requires an explicit backend"
     meta = derive_decode_schema(engine, prompt_token_ids)
-    if meta is None:
-        return None
     if meta["has_mamba"] and my_mamba_layout is None:
         raise NotImplementedError(
             "hybrid (Mamba) hetero handoff requires Mamba shard layouts; "
