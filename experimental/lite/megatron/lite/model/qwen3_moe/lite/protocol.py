@@ -25,7 +25,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
+from megatron.lite.model.protocol_utils import (
+    add_cross_entropy_fusion,
+    add_loss_context_kwargs,
+    pack_thd_forward_kwargs,
+    set_cross_entropy_fusion,
+    unpack_thd_forward_output,
+)
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
@@ -41,6 +47,7 @@ from megatron.lite.primitive.modules.lora import (
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 
 __all__ = [
     "EXPERT_CLASSIFIER",
@@ -63,11 +70,12 @@ class ImplConfig:
     """Lite impl knobs. Constructed by runtime from user config."""
 
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "mc"  # None = no optimizer (inference)
+    optimizer: str | None = "dist_opt"  # None = no optimizer (inference)
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
     use_thd: bool = False
+    cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
     router_bias_rate: float = 0.0
     # User-level OptimizerConfig threaded through the runtime.
@@ -117,24 +125,15 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
 # ---------------------------------------------------------------------------
 
 
-def _forward_step(model: nn.Module, batch: dict) -> dict:
-    kwargs = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
-    if "packed_seq_params" in batch:
-        kwargs["packed_seq_params"] = batch["packed_seq_params"]
-    if "position_ids" in batch:
-        kwargs["position_ids"] = batch["position_ids"]
-    for key in (
-        "loss_mask",
-        "temperature",
-        "use_fused_kernels",
-        "calculate_entropy",
-        "return_log_probs",
-    ):
-        if key in batch:
-            kwargs[key] = batch[key]
-    if kwargs["input_ids"].dim() == 1:
-        kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(0)
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
+    kwargs = pack_thd_forward_kwargs(model, batch)
+    add_loss_context_kwargs(kwargs, include_return_log_probs=True)
+    add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
+
+
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    return unpack_thd_forward_output(model, batch, output)
 
 
 def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -193,6 +192,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                 .cuda()
             )
 
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
+
     # ── recompute ──
     if recompute_spec:
         for chunk in chunks:
@@ -217,10 +218,12 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
-    if impl_cfg.optimizer == "mc":
-        from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
+    if impl_cfg.optimizer == "dist_opt":
+        from megatron.lite.primitive.optimizers.megatron_wrap import (
+            build_dist_opt_training_optimizer,
+        )
 
-        optimizer, finalize_grads = build_mc_training_optimizer(
+        optimizer, finalize_grads = build_dist_opt_training_optimizer(
             chunks,
             model_cfg=model_cfg,
             impl_cfg=impl_cfg,
@@ -234,7 +237,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
-        optimizer_backend = "distopt"
+        optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

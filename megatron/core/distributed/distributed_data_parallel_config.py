@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -215,6 +215,16 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_prefetch_recompute_forward_weights: bool = False
+    """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
+      recomputation during backward before prefetching backward transpose weights.
+    """
+
+    megatron_fsdp_cache_param_bucket_views: bool = False
+    """If set to True, Megatron-FSDP caches parameter bucket views to reduce repeated
+      Python-side view setup when attaching module parameters to all-gather buckets.
+    """
+
     megatron_fsdp_cuda_graph_mode: bool = False
     """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
     not dereferencing `param.grad` after the optimizer step to preserve references for
@@ -243,6 +253,20 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert (
+                self.use_megatron_fsdp
+            ), "megatron_fsdp_prefetch_recompute_forward_weights requires use_megatron_fsdp."
+            assert self.data_parallel_sharding_strategy == "optim_grads_params", (
+                "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
+                "data_parallel_sharding_strategy='optim_grads_params'."
+            )
+
+        if self.megatron_fsdp_cache_param_bucket_views:
+            assert (
+                self.use_megatron_fsdp
+            ), "megatron_fsdp_cache_param_bucket_views requires use_megatron_fsdp."
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

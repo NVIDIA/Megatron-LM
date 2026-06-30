@@ -79,6 +79,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": True,
+    "cuda_graph_dynamic_microbatches": False,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
@@ -158,6 +159,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
+    "gdn_pre_gated_delta_rule_fusion": False,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "log_moe_overload_factor": False,
@@ -165,6 +167,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_num_groups": 8,
     "mamba_num_heads": 64,
     "mamba_state_dim": 128,
+    "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
     "mhc_init_gating_factor": 0.01,
@@ -180,6 +183,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
+    "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
     "moe_hybridep_num_sms": None,
     "moe_hybridep_num_sms_preprocessing": 108,
@@ -281,6 +285,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "test_mode": False,
+    "thd_max_packed_sequences": 32,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -349,7 +354,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "pad_packed_seq_by_appending_dummy_seq"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:
