@@ -85,9 +85,9 @@ MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # Optimizer backend:
-# - distopt (default): Megatron-Core DDP + distributed optimizer.
+# - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
-MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-distopt}"
+MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
 
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
@@ -124,14 +124,14 @@ if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER
 fi
 
 case "${MLITE_OPTIMIZER_BACKEND}" in
-  distopt)
-    MLITE_IMPL_OPTIMIZER="mc"
+  dist_opt)
+    MLITE_IMPL_OPTIMIZER="dist_opt"
     ;;
   fsdp2)
     MLITE_IMPL_OPTIMIZER="fsdp2"
     ;;
   *)
-    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt or fsdp2." >&2
+    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected dist_opt or fsdp2." >&2
     exit 1
     ;;
 esac
@@ -184,7 +184,6 @@ DATA=(
 MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
-  "actor_rollout_ref.model.use_remove_padding=True"
   "actor_rollout_ref.model.use_fused_kernels=False"
 )
 

@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from types import SimpleNamespace
 
+import pytest
+
 from verl_mlite.engine.config import MegatronLiteEngineConfig
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -111,3 +113,36 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.attention_backend_override == "flash"
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
+
+
+def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
+    optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
+    opt = SimpleNamespace(
+        total_training_steps=4,
+        lr_warmup_steps=1,
+        lr_warmup_steps_ratio=0.0,
+        lr_warmup_init=0.0,
+        lr=1.0,
+        min_lr=0.1,
+        lr_decay_steps=4,
+        lr_decay_style="linear",
+        weight_decay=0.1,
+        weight_decay_incr_style="constant",
+        lr_wsd_decay_steps=None,
+        lr_wsd_decay_style="exponential",
+    )
+
+    scheduler = _build_lr_scheduler(optimizer, opt)
+
+    assert optimizer.param_groups[0]["lr"] == 0.0
+    scheduler.step(1)
+    assert optimizer.param_groups[0]["lr"] == 1.0
+    scheduler.step(1)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+    state = scheduler.state_dict()
+    scheduler.step(10)
+    scheduler.load_state_dict(state)
+
+    assert scheduler.state_dict() == state
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)

@@ -74,7 +74,7 @@ def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path):
 
 
 class DistOptLike:
-    """Small optimizer wrapper with the same checkpoint contract as distopt."""
+    """Small optimizer wrapper with the same checkpoint contract as dist_opt."""
 
     def __init__(self, optimizer: torch.optim.Optimizer):
         self.optimizer = optimizer
@@ -91,11 +91,11 @@ class DistOptLike:
 
     def state_dict(self):
         state = self.optimizer.state_dict()
-        state["distopt_like_marker"] = {"load_calls": self.load_calls}
+        state["dist_opt_like_marker"] = {"load_calls": self.load_calls}
         return state
 
     def load_state_dict(self, state):
-        marker = state.pop("distopt_like_marker")
+        marker = state.pop("dist_opt_like_marker")
         self.load_calls = int(marker["load_calls"]) + 1
         self.optimizer.load_state_dict(state)
 

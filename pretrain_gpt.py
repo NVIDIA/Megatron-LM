@@ -30,7 +30,11 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
@@ -125,12 +129,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
+        # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
+        # and returns a 7-tuple including `padding_mask`.
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
+            config=config,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -140,7 +147,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         and not is_packed_sequence
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -176,6 +183,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 max_seqlen_kv=int(max_seqlen[0].item()),
                 qkv_format='thd',
             ),
+            None,
         )
 
     if cu_seqlens is None:
@@ -187,7 +195,52 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
 
-    return (*batch.values(), packed_seq_params)
+    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
+    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    padding_mask = None
+    if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
+        tokens = batch.get('tokens', None)
+        labels = batch.get('labels', None)
+        loss_mask = batch.get('loss_mask', None)
+        position_ids = batch.get('position_ids', None)
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            config.pad_packed_seq_alignment,
+            config.max_seqlen_per_dp_cp_rank,
+            config.thd_max_packed_sequences,
+            config.cuda_graph_impl != "none",
+        )
+        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+            pad_sequence_for_thd(
+                tokens,
+                labels,
+                loss_mask,
+                position_ids,
+                packed_seq_params,
+                alignment=alignment,
+                target_len=target_len,
+                max_num_seqs=max_num_seqs,
+                pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
+            )
+        )
+        if 'tokens' in batch:
+            batch['tokens'] = tokens
+        if 'labels' in batch:
+            batch['labels'] = labels
+        if 'loss_mask' in batch:
+            batch['loss_mask'] = loss_mask
+        if 'position_ids' in batch:
+            batch['position_ids'] = position_ids
+
+    # Unpack explicitly to avoid relying on dict insertion order.
+    return (
+        batch.get('tokens'),
+        batch.get('labels'),
+        batch.get('loss_mask'),
+        batch.get('attention_mask'),
+        batch.get('position_ids'),
+        packed_seq_params,
+        padding_mask,
+    )
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -272,8 +325,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(
-            data_iterator, vp_stage
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
+            get_batch(data_iterator, vp_stage)
         )
     timers('batch-generator').stop()
 
@@ -283,7 +336,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 args.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
@@ -294,6 +353,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 labels=labels,
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

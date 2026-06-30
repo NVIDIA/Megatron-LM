@@ -167,6 +167,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
         moe_token_dispatcher_type=None,
         moe_flex_dispatcher_backend=None,
         moe_paged_stash=False,
+        delay_offload_until_cuda_graph=False,
     )
     module._fused_ops = None
     fused_ops = FakeFusedOps()

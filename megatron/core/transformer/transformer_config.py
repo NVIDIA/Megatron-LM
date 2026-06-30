@@ -376,6 +376,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
     ####################
     # initialization
     ####################
@@ -554,7 +557,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc".
+             "shared_experts", "mhc", "gdn".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -566,8 +569,11 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
+    "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
+            gated norm, CP all-to-all and out_proj). Requires
+            experimental_attention_variant="gated_delta_net".
     "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
     ####################
@@ -1082,6 +1088,26 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
+    thd_max_packed_sequences: int = field(
+        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    )
+    """Maximum number of THD packed sequences per microbatch, including any dummy
+    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
+    tensors are padded to this size + 1.
+
+    Sizing guidance: choose a value that comfortably covers the worst-case packing,
+    roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
+    Setting it too small results in more microbatches with smaller packs (wasted
+    token budget); setting it too large just allocates a slightly larger cu_seqlens
+    buffer."""
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Allow CUDA graph replay when runtime microbatch count varies across iterations.
+    This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
+    packing, capture uses a conservative upper bound on the packed microbatch count so graph
+    replay can cover iterations whose real packed microbatch count changes."""
+
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -1227,6 +1253,10 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
+    """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
+    None causes the states to follow the activation dtype."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )
@@ -1271,7 +1301,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1279,6 +1309,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "fused_group_mlp": offload the input of the whole fused grouped MLP.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1432,6 +1463,12 @@ class TransformerConfig(ModelParallelConfig):
             ), f"linear_attention_freq must be set for linear attention."
 
             if self.experimental_attention_variant == "gated_delta_net":
+                if self.pad_packed_seq_alignment is not None:
+                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                        "gated_delta_net with pad_packed_seq_alignment requires "
+                        "pad_packed_seq_by_appending_dummy_seq."
+                    )
+
                 # Check required parameters
                 assert (
                     self.linear_conv_kernel_dim is not None
@@ -1525,6 +1562,15 @@ class TransformerConfig(ModelParallelConfig):
                         f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
                         f"PyTorch fallback."
                     )
+
+        if (
+            self.gdn_pre_gated_delta_rule_fusion
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "gdn_pre_gated_delta_rule_fusion is only supported with "
+                "experimental_attention_variant='gated_delta_net'."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1865,6 +1911,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "mhc",
+                    "gdn",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1881,6 +1928,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -1990,6 +2046,7 @@ class TransformerConfig(ModelParallelConfig):
                 "core_attn",
                 "attn_proj",
                 "expert_fc1",
+                "fused_group_mlp",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -2028,16 +2085,28 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.fine_grained_offloading_max_inflight_offloads >= 0
                 ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
+            if "fused_group_mlp" in self.offload_modules:
+                if not self.use_transformer_engine_op_fuser:
+                    raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+                moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+                if moe_partial_offload:
+                    raise ValueError(
+                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
+                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+                    )
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
                 "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                 "there is no need to use paged stashing without it."
             )
-            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+                self.offload_modules
+            )
             assert not moe_offload_conflict, (
                 "When moe_paged_stash is enabled, offload_modules must not include "
-                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"expert_fc1, moe_act, or fused_group_mlp "
+                f"(paged stash covers those activations). "
                 f"Remove: {moe_offload_conflict}"
             )
 
@@ -2647,6 +2716,12 @@ class TransformerConfig(ModelParallelConfig):
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
 
+                if self.cuda_graph_impl != "transformer_engine":
+                    assert not self.cuda_graph_dynamic_microbatches, (
+                        "cuda_graph_dynamic_microbatches is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
+
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
                     or CudaGraphModule.moe_router not in self.cuda_graph_modules
@@ -2739,9 +2814,22 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert self.cuda_graph_impl in ("transformer_engine", "full_iteration"), (
+                offload_modules = set(self.offload_modules or [])
+                local_partial_moe_offload = (
+                    self.cuda_graph_impl == "local"
+                    and bool(offload_modules)
+                    and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    and CudaGraphModule.moe not in self.cuda_graph_modules
+                )
+                assert (
+                    self.cuda_graph_impl in ("transformer_engine", "full_iteration")
+                    or local_partial_moe_offload
+                ), (
                     "fine-grained activation offloading is only supported with "
-                    "transformer_engine or full_iteration CUDA graph implementation."
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope. Local partial CUDA graphs "
+                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
+                    "offload when the full MoE module is not captured."
                 )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
@@ -2973,6 +3061,21 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.cuda_graph_impl != "none" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            assert (
+                self.pad_packed_seq_alignment is not None
+            ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
+            assert (
+                self.pad_packed_seq_alignment == "max"
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

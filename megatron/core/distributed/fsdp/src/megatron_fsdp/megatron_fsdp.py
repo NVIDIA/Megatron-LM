@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.import functools
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import importlib
@@ -272,6 +260,9 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
         )
+        self.prefetch_recompute_forward_weights = (
+            self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
+        )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -340,15 +331,8 @@ class MegatronFSDP(torch.nn.Module):
         self._init_fsdp_param_and_grad_buffer()
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
-
-        # Add a reference from the distributed parameters to self for API
-        # accessibility, e.g. when attaching MegatronFSDP scheduled ops
-        # to the distributed optimizer.step() and optimizer.zero_grad().
         self.is_param_fsdp_distributed = False
         self._replace_param_with_distributed_if_needed()
-        for param in self.module.parameters():
-            # Attach MegatronFSDP reference to the parameter.
-            setattr(param, "_megatron_fsdp_model", self)
 
     def _check_module_parameter_types(self):
         """
@@ -604,12 +588,7 @@ class MegatronFSDP(torch.nn.Module):
                 # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
                 # already holds the wgrad and param.grad_added_to_main_grad=True.
                 if not param.grad_added_to_main_grad:
-                    # Get `main_grad` will allocate bucket, check that the currently
-                    # used main_grad buffer does not exceed the scope of two FSDP Unit
-                    # Modules, i.e., the buffer limit imposed by double-buffer allocator.
-                    if self.ddp_config.fsdp_double_buffer:
-                        self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
-
+                    # Allocate a unsharded gradient buffer.
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
@@ -879,9 +858,29 @@ class MegatronFSDP(torch.nn.Module):
                 param_list = list(module.parameters(recurse=False))
 
             # All-gather / unshard the module parameters before the backward pass.
-            self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
-            )
+            if self.prefetch_recompute_forward_weights:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=False,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=False,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+            else:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                )
 
         self._root_pre_backward_hook_issued = False
 
@@ -1359,6 +1358,8 @@ class MegatronFSDP(torch.nn.Module):
             # DTensor parameter is managed by Megatron FSDP.
             if not hasattr(dist_param, "__fsdp_param__"):
                 dist_param.__fsdp_param__ = True
+            if not hasattr(dist_param, "_megatron_fsdp_model"):
+                dist_param._megatron_fsdp_model = self
             _replace_module_parameter(self.module, name, dist_param)
 
         # Handle shared weights
@@ -1371,6 +1372,8 @@ class MegatronFSDP(torch.nn.Module):
 
         for name, _ in self.module.named_parameters():
             assert name in self.raw_param, f"Raw parameter {name} not found in module."
+            if not hasattr(self.raw_param[name], "_megatron_fsdp_model"):
+                self.raw_param[name]._megatron_fsdp_model = self
             _replace_module_parameter(self.module, name, self.raw_param[name])
 
         # Handle shared weights

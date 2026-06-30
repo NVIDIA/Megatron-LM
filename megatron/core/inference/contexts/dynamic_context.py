@@ -1686,6 +1686,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cp_group=cp_group,
             mscale=mscale,
             mla_rotary_interleaved=config.multi_latent_attention,
+            max_seqlen=query_emb.size(0),
         )
         return query
 

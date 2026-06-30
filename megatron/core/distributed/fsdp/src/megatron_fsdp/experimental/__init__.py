@@ -11,19 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Sync skills → agent dirs
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "skills/**"
-      - "AGENTS.md"
+"""Experimental Megatron-FSDP implementation."""
 
-jobs:
-  sync:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_sync_skills.yml@v0.91.0
-    secrets:
-      PAT: ${{ secrets.PAT }}
+from .dbuffer import DBuffer
+from .placement import Flat, Partial, Placement, Replicate
+
+__all__ = ["DBuffer", "Flat", "Partial", "Placement", "Replicate"]

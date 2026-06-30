@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from megatron.lite.runtime.backends import Runtime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -66,26 +65,33 @@ def _resolve_vocab_size(handle: ModelHandle) -> int:
     return 151936
 
 
+def _infinite_packed_batches(
+    vocab_size: int, seq_len: int, *, device: str, seed: int
+):
+    """Yield raw, model-agnostic :class:`PackedBatch` objects for the bench.
+
+    The bench is the single source of truth for one unpadded packed batch (1-D
+    ``input_ids``/``labels`` plus true per-sequence ``seq_lens``). Padding, CP
+    layout and THD metadata (``packed_seq_params``) are derived by whichever
+    runtime/model consumes the batch at the forward boundary, never baked into
+    bench data — that is what keeps the mlite-vs-bridge comparison fair.
+    """
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+    while True:
+        yield PackedBatch(
+            input_ids=torch.randint(0, vocab_size, (seq_len,), device=device, generator=g),
+            labels=torch.randint(0, vocab_size, (seq_len,), device=device, generator=g),
+            seq_lens=seq_lens.clone(),
+        )
+
+
 def _make_data_iter(handle: ModelHandle, cfg: PretrainSessionConfig):
     data_seed = cfg.seed if cfg.same_data_across_dp else cfg.seed + handle.dp_rank
     vocab_size = _resolve_vocab_size(handle)
-
-    if cfg.use_thd:
-        from megatron.lite.primitive.data import infinite_batches_thd
-
-        ps = handle._parallel_state
-        return infinite_batches_thd(
-            vocab_size,
-            cfg.seq_len,
-            cp_size=getattr(ps, "cp_size", 1),
-            cp_rank=getattr(ps, "cp_rank", 0),
-            device=cfg.device,
-            seed=data_seed,
-        )
-
-    from megatron.lite.primitive.data import infinite_batches
-
-    return infinite_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
+    return _infinite_packed_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
 
 
 def _calc_tflops_per_gpu(

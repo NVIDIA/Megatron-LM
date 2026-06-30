@@ -47,6 +47,11 @@ class ParallelState:
     pp_is_last: bool = True
     pp_next_rank: int = -1
     pp_prev_rank: int = -1
+    virtual_pipeline_size: int | None = None
+    virtual_pipeline_rank: int | None = None
+
+    # Optional explicit mcore pipeline layout (custom mode); None -> auto-infer.
+    pp_layout: str | list | None = None
 
 
 def init_parallel(config) -> ParallelState:
@@ -66,6 +71,7 @@ def init_parallel(config) -> ParallelState:
     expert_dp = ensure_divisible(world, etp * ep * pp)
 
     ps = ParallelState()
+    ps.pp_layout = getattr(config, "pp_layout", None)
     ps.tp_size, ps.ep_size, ps.etp_size = tp, ep, etp
     ps.cp_size, ps.pp_size, ps.dp_size = cp, pp, dense_dp
     ps.expert_dp_size = expert_dp

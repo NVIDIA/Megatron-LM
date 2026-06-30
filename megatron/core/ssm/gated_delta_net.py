@@ -7,13 +7,15 @@
 
 import logging
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple, Union
+from functools import lru_cache
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -90,7 +92,7 @@ class GatedDeltaNet(MegatronModule):
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
         use_qk_l2norm: bool = True,
-        A_init_range: Tuple[float, float] = (1, 16),
+        A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
         name: str | None = None,
         **kwargs,
@@ -130,9 +132,16 @@ class GatedDeltaNet(MegatronModule):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.gdn_pre_gated_delta_rule_fusion = config.gdn_pre_gated_delta_rule_fusion
 
         # Attributes from config
         self.config = config
+        if self.config.deterministic_mode:
+            if self.gdn_pre_gated_delta_rule_fusion:
+                raise ValueError(
+                    "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
+                    "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+                )
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
@@ -260,6 +269,13 @@ class GatedDeltaNet(MegatronModule):
             name=(name + ".out_proj") if name is not None else None,
         )
 
+        # Whole-module recompute: when "gdn" is in recompute_modules (selective granularity),
+        # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
+        # in the backward pass.
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -308,7 +324,7 @@ class GatedDeltaNet(MegatronModule):
                 inference CUDA graphs.
 
         Return:
-            (Tuple[Tensor, Tensor]) GDN output and bias.
+            (tuple[Tensor, Tensor]) GDN output and bias.
 
         """
         # TODO: Deal with attention_mask
@@ -363,47 +379,106 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_compute(hidden_states):
+                return self._forward_compute(
+                    hidden_states,
+                    batch,
+                    seq_len,
+                    cp_size,
+                    cp_group,
+                    cu_seqlens_q,
+                    packed_seq_params,
+                )
+
+            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+        else:
+            out, out_bias = self._forward_compute(
+                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+            )
+
+        return out, out_bias
+
+    def _forward_compute(
+        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+    ):
+        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
+
+        Extracted from ``forward`` so the entire module can be wrapped in a recompute
+        checkpoint when ``recompute_modules`` contains ``"gdn"`` (selective full-module
+        recompute, normal checkpointing).
+
+        Returns:
+            Tuple of (output, output_bias).
+        """
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # CP All to All: CP to HP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=cp_group,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
-                )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
+        qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
+            qkvzba, cp_size, cp_group, cu_seqlens_q, seq_len, packed_seq_params
+        )
+
+        if self.gdn_pre_gated_delta_rule_fusion:
+            # Existing all-to-all CP reaches this point in hidden-parallel layout.
+            # Chunkwise CP has a different sequence and halo contract; revisit
+            # fused pre-GDR metadata before enabling this path there.
+            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
             )
+            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+            )
+            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+        else:
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q
+            )
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+
+        norm_out = self._a2a_hp_to_cp(
+            norm_out, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv
+        )
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        return out, out_bias
+
+    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+        """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -498,47 +573,108 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+        return query, key, value, gate, beta, g
+
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper."""
+
+        try:
+            from megatron.core.fusions.fused_pre_gated_delta_rule import (
+                fused_streamed_pre_gated_delta_rule,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
+            ) from exc
+
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
         )
-        nvtx_range_pop(suffix="gated_delta_rule")
 
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
+    def _a2a_cp_to_hp(
+        self,
+        qkvzba: torch.Tensor,
+        cp_size: int,
+        cp_group: torch.distributed.ProcessGroup,
+        cu_seqlens_q: Optional[torch.Tensor],
+        seq_len: int,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run GDN context-parallel to hidden-parallel A2A and return its inverse context."""
+        if cp_size > 1:
+            # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
+            head_perm = _build_head_perm_for_split_sections(
+                (
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ),
+                cp_size,
+                qkvzba.device,
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
 
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # CP all to all: HP to CP
+        thd_cp_a2a_inv = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group)
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=cp_group,
+                undo_attention_load_balancing=False,
+            )
+            if cp_size > 1:
+                # Permute at the seq dim so that a single unsectioned a2a
+                # is equivalent to per-sequence a2a.
+                # This also folds the ``_undo_attention_load_balancing`` step.
+                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    cu_seqlens_q, cp_size, seq_len
+                )
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+        else:
+            qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
+
+        return qkvzba, thd_cp_a2a_inv
+
+    def _a2a_hp_to_cp(
+        self,
+        norm_out: torch.Tensor,
+        cp_size: int,
+        cp_group: torch.distributed.ProcessGroup,
+        packed_seq_params: Optional[PackedSeqParams],
+        thd_cp_a2a_inv: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run GDN hidden-parallel to context-parallel A2A using CP-to-HP context."""
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            if cp_size > 1:
+                assert thd_cp_a2a_inv is not None
+                norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+            norm_out = tensor_a2a_hp2cp(
+                norm_out,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=cp_group,
+                redo_attention_load_balancing=False,
+            )
         else:
             norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        return out, out_bias
+        return norm_out
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -602,7 +738,7 @@ class GatedDeltaNet(MegatronModule):
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
-    ):
+    ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
@@ -724,23 +860,69 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-def _unpack_sequence(x, cu_seqlens, dim=1):
-    unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
-    num_seqs = len(cu_seqlens_list) - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens_list[i]
-        idx_end = cu_seqlens_list[i + 1]
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
+def _build_thd_cp_a2a_perm(
+    cu_seqlens: torch.Tensor, cp_size: int, t_global: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cu = cu_seqlens.to(dtype=torch.long)
+    t_local = t_global // cp_size
+
+    positions = torch.arange(t_global, device=cu.device)
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    seq_lens = torch.diff(cu)
+    halves = seq_lens // (2 * cp_size)  # per-sequence half-chunk size
+    local_starts = cu[:-1] // cp_size
+    global_starts = cu[:-1]
+
+    half_i = halves[seq_idx]
+    pos_in_seq = positions - global_starts[seq_idx]
+
+    natural_chunk = pos_in_seq // half_i  # in [0, 2*cp)
+    offset = pos_in_seq - natural_chunk * half_i
+
+    # Invert the ordering produced by `_undo_attention_load_balancing`:
+    #   natural_chunk < cp:   load_balanced = 2 * natural_chunk
+    #   natural_chunk >= cp:  load_balanced = 4*cp - 2*natural_chunk - 1
+    lb_chunk = torch.where(
+        natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1
+    )
+
+    # In the per-sequence load-balanced layout each rank owns load-balanced
+    # chunks (2r) and (2r+1), in that order, of every sequence.
+    rank = lb_chunk // 2
+    half_within_rank = lb_chunk - 2 * rank
+    k = half_within_rank * half_i + offset
+
+    idx = rank * t_local + local_starts[seq_idx] + k
+
+    inv = torch.empty_like(idx)
+    inv[idx] = positions
+
+    return idx, inv
+
+
+@lru_cache(maxsize=8)
+def _build_head_perm_for_split_sections(
+    split_sections: tuple[int, ...], cp_size: int, device: torch.device
+) -> torch.Tensor:
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN"
+    offset = 0
+    parts = []
+    for s in split_sections:
+        parts.append(
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+        )
+        offset += s
+
+    return torch.cat(parts, dim=-1).view(-1)
 
 
 ####################
 # Sharded state dict utilities
 ####################
 def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
+    orig_sh_ten: ShardedTensor, split_sections: list[int], split_names: list[str], split_dim: int
 ) -> ShardedTensorFactory:
     """Builds a factory that splits a given ShardedTensor into several independent chunks."""
     assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
@@ -806,7 +988,7 @@ def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
 
@@ -814,7 +996,7 @@ def get_parameter_local_cp(
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None,
+        split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
             finally concatenate the local hidden parallel weights along the dimension dim.
@@ -852,7 +1034,7 @@ def tensor_a2a_cp2hp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
     """All-to-all context parallel to hidden parallel.
@@ -863,7 +1045,7 @@ def tensor_a2a_cp2hp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, split the tensor along the dimension
+        split_sections (Optional[list[int]]): If not None, split the tensor along the dimension
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         undo_attention_load_balancing (bool): Whether to undo the attention load balancing of CP.
@@ -915,7 +1097,7 @@ def tensor_a2a_hp2cp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
     """All-to-all hidden parallel to context parallel.
@@ -926,7 +1108,7 @@ def tensor_a2a_hp2cp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, first split the tensor along the
+        split_sections (Optional[list[int]]): If not None, first split the tensor along the
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         redo_attention_load_balancing (bool): Whether to redo the attention load balancing of HP.
@@ -942,13 +1124,13 @@ def tensor_a2a_hp2cp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
-    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
-    ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
+    ), f"tensor_a2a_hp2cp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
     assert (
         tensor.dim() == 3
-    ), f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
+    ), f"tensor_a2a_hp2cp only supports 3-d input tensor for now, but got {tensor.dim()=}"
 
     # Redo attention load balancing first if needed.
     if redo_attention_load_balancing:

@@ -156,18 +156,18 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
 
         def truncate_layers_hook(model_cfg):
             old_layers = getattr(model_cfg, "num_hidden_layers", None)
-            layer_types = getattr(model_cfg, "layer_types", None)
-            if old_layers is None or layer_types is None:
-                raise ValueError("truncate_layers requires num_hidden_layers and layer_types.")
+            if old_layers is None:
+                raise ValueError("truncate_layers requires num_hidden_layers.")
             if keep_layers <= 0 or keep_layers > old_layers:
                 raise ValueError(
                     f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
                 )
-            return replace(
-                model_cfg,
-                num_hidden_layers=keep_layers,
-                layer_types=list(layer_types[:keep_layers]),
-            )
+            updates = {"num_hidden_layers": keep_layers}
+            # layer_types is qwen-style metadata; deepseek_v4 / kimi_k2 configs don't carry it.
+            layer_types = getattr(model_cfg, "layer_types", None)
+            if layer_types is not None:
+                updates["layer_types"] = list(layer_types[:keep_layers])
+            return replace(model_cfg, **updates)
 
         hooks.append(truncate_layers_hook)
 
@@ -289,6 +289,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             model_name=cfg.model_name,
             parallel=parallel,
             optimizer=optimizer,
+            use_thd=cfg.use_thd,
             load_hf_weights=not cfg.skip_load_hf_weights,
             build_optimizer=not cfg.skip_optimizer_build,
             override_ddp_config=_json_mapping(cfg.override_ddp_json, name="override_ddp_json"),

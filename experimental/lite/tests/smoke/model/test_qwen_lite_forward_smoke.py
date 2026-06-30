@@ -88,7 +88,7 @@ def _tiny_qwen35_config():
         max_position_embeddings=16,
         partial_rotary_factor=1.0,
         mrope_section=[1, 1, 0],
-        layer_types=["full_attention"],
+        layer_types=["linear_attention"],
     )
 
 
@@ -115,13 +115,19 @@ def _assert_loss_and_backward(output: dict, model: torch.nn.Module):
         param for param in model.parameters() if param.requires_grad and param.grad is not None
     ]
     assert grad_params
-    assert all(torch.isfinite(param.grad.detach().float()).all() for param in grad_params)
+    assert all(
+        torch.isfinite(param.grad.detach().float()).all() for param in grad_params
+    )
 
 
 def test_qwen3_moe_lite_tiny_forward_backward_smoke():
     _Qwen3MoEConfig, Qwen3MoEModel = _qwen3_symbols()
     config = _tiny_qwen3_config()
-    model = Qwen3MoEModel(config, _parallel_state(), use_deepep=False).cuda().to(torch.bfloat16)
+    model = (
+        Qwen3MoEModel(config, _parallel_state(), use_deepep=False)
+        .cuda()
+        .to(torch.bfloat16)
+    )
     input_ids, labels = _token_batch(config.vocab_size)
 
     output = model(input_ids=input_ids, labels=labels, return_log_probs=True)
@@ -146,7 +152,9 @@ def test_qwen35_lite_tiny_forward_backward_smoke():
         recompute_modules=[],
         deterministic=True,
     )
-    model = Qwen35Model(config, train_config, _parallel_state()).cuda().to(torch.bfloat16)
+    model = (
+        Qwen35Model(config, train_config, _parallel_state()).cuda().to(torch.bfloat16)
+    )
     input_ids, labels = _token_batch(config.vocab_size)
 
     output = model(input_ids=input_ids, labels=labels)

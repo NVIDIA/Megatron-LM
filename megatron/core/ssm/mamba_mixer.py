@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -81,6 +82,12 @@ if not HAVE_MAMBA_SSM:
 
     RMSNormGated = MagicMock()
     HAVE_MAMBA_SSM = False
+
+MAMBA_HAS_STATE_DTYPE = (
+    HAVE_MAMBA_SSM
+    and ("state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters)
+    and ("state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters)
+)
 
 try:
     from einops import rearrange, repeat
@@ -208,6 +215,14 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.mamba_training_ssm_states_dtype = (
+            config.mamba_training_ssm_states_dtype or config.params_dtype
+        )
+        if config.mamba_training_ssm_states_dtype is not None and not MAMBA_HAS_STATE_DTYPE:
+            raise RuntimeError(
+                "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
+                "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
+            )
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -738,6 +753,9 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -755,6 +773,7 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            **state_dtype_kwarg,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
@@ -1031,6 +1050,11 @@ class MambaMixer(MegatronModule):
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
+            state_dtype_kwarg = (
+                {"state_dtype": self.mamba_training_ssm_states_dtype}
+                if MAMBA_HAS_STATE_DTYPE
+                else {}
+            )
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -1048,6 +1072,7 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
             )
 
             if ssm_state is not None:

@@ -58,15 +58,15 @@ def save_training_checkpoint(
     if not use_dcp:
         _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
         return
-    if _supports_distopt_distckpt(model, optimizer):
+    if _supports_dist_opt_distckpt(model, optimizer):
         ckpt_path = os.path.join(path, f"step_{step}")
         os.makedirs(ckpt_path, exist_ok=True)
-        _save_distopt_checkpoint(
+        _save_dist_opt_checkpoint(
             model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
         )
         if save_rng:
             _save_rng_sidecar(ckpt_path)
-        log_rank0(f"Saved distopt checkpoint at step {step} to {ckpt_path}")
+        log_rank0(f"Saved dist_opt checkpoint at step {step} to {ckpt_path}")
         return
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
@@ -74,12 +74,17 @@ def save_training_checkpoint(
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
+    # Pipeline stages own DIFFERENT parameters but their local layers re-index
+    # to 0..N, so without a per-stage prefix the DCP FQNs collide across pp ranks
+    # (stage0 layer0 and stage1 layer1 both -> "model.0.layers.0..."), corrupting
+    # the round-trip. Mirror distckpt's pp-aware keying: disjoint keyspace per stage.
+    model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -118,13 +123,13 @@ def load_training_checkpoint(
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
-    if _supports_distopt_distckpt(model, optimizer):
-        step = _load_distopt_checkpoint(
+    if _supports_dist_opt_distckpt(model, optimizer):
+        step = _load_dist_opt_checkpoint(
             model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
         )
         if load_rng:
             _load_rng_sidecar(ckpt_path)
-        log_rank0(f"Loaded distopt checkpoint from {path} at step {step}")
+        log_rank0(f"Loaded dist_opt checkpoint from {path} at step {step}")
         return step
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
@@ -133,18 +138,23 @@ def load_training_checkpoint(
     dense_mesh, expert_mesh = _build_meshes(config)
 
     state_dict: dict = {"step": 0}
+    # Same pp-aware keying as save (see save_training_checkpoint): per-stage
+    # disjoint keyspace so pp ranks don't read each other's colliding FQNs.
+    model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _empty_dcp_tensor_like_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
+                param, mesh, placements
+            )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
         for name, param in model.named_parameters():
-            key = f"model.{name}"
+            key = f"{model_prefix}.{name}"
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():
@@ -172,13 +182,18 @@ def _resolve_step_checkpoint_path(path: str) -> str:
     return path
 
 
-def _supports_distopt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
-    from megatron.lite.primitive.ckpt.distckpt import supports_distopt_distckpt
+def _supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
+    try:
+        from megatron.lite.primitive.ckpt.distckpt import supports_dist_opt_distckpt
+    except ModuleNotFoundError as exc:
+        if exc.name != "megatron.core":
+            raise
+        return False
 
-    return supports_distopt_distckpt(model, optimizer)
+    return supports_dist_opt_distckpt(model, optimizer)
 
 
-def _save_distopt_checkpoint(
+def _save_dist_opt_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer,
     step: int,
@@ -187,14 +202,14 @@ def _save_distopt_checkpoint(
     save_model: bool,
     save_optimizer: bool,
 ) -> None:
-    from megatron.lite.primitive.ckpt.distckpt import save_distopt_checkpoint
+    from megatron.lite.primitive.ckpt.distckpt import save_dist_opt_checkpoint
 
-    save_distopt_checkpoint(
+    save_dist_opt_checkpoint(
         model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
     )
 
 
-def _load_distopt_checkpoint(
+def _load_dist_opt_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer,
     path: str,
@@ -202,9 +217,9 @@ def _load_distopt_checkpoint(
     load_model: bool,
     load_optimizer: bool,
 ) -> int:
-    from megatron.lite.primitive.ckpt.distckpt import load_distopt_checkpoint
+    from megatron.lite.primitive.ckpt.distckpt import load_dist_opt_checkpoint
 
-    return load_distopt_checkpoint(
+    return load_dist_opt_checkpoint(
         model, optimizer, path, load_model=load_model, load_optimizer=load_optimizer
     )
 

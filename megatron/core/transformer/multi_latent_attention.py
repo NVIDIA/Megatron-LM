@@ -728,8 +728,11 @@ class MLASelfAttention(MultiLatentAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_max_seqlen_q = rope_max_seqlen_kv = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -941,6 +944,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_max_seqlen_q,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -951,6 +955,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_max_seqlen_kv,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
@@ -1348,6 +1353,17 @@ class FusedMLASelfAttention(MLASelfAttention):
             dim=-1,
         )
         return q_compressed, kv_combined
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight gradient computation."""
+        self.linear_kv_up_proj.backward_dw()
+        self.linear_qkv_down_proj.backward_dw()
+        self.linear_q_up_proj.backward_dw()
+        self._backward_output_proj()
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
+        set_save_original_input(self.linear_qkv_down_proj)
 
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
         """Return a sharded state dict compatible with pre-fusion checkpoints."""

@@ -449,17 +449,25 @@ class TestMimoModel:
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
 
     def test_forward_with_partition_adapter(self):
-        """Test that partition_adapter.shard() is called and embeddings are transposed correctly."""
+        """shard() receives sequence-first embeddings and returns LM-layout [S/cp, B, H].
+
+        The caller no longer transposes around shard(): it passes the sequence-first
+        ``(S, B, H)`` combined embeddings straight in, and shard()'s LM-layout output
+        flows straight into the language model as ``decoder_input``.
+        """
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
         sharded_seq_len = self.seq_len // 2
+        # shard() returns LM-layout [S/cp, B, H] and a (CP-sharded) loss mask.
         sharded_emb = torch.zeros(
-            self.batch_size, sharded_seq_len, self.hidden_size, device=self.device
+            sharded_seq_len, self.batch_size, self.hidden_size, device=self.device
         )
+        sharded_loss_mask = torch.ones(self.batch_size, sharded_seq_len, device=self.device)
         mock_adapter = MagicMock()
-        mock_adapter.shard.return_value = (sharded_emb, None, None, None, None)
+        mock_adapter.shard.return_value = (sharded_emb, None, sharded_loss_mask, None)
         mimo_model.partition_adapter = mock_adapter
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
@@ -482,16 +490,88 @@ class TestMimoModel:
             ),
             patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward),
         ):
-            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+            _, out_loss_mask = mimo_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
+                modality_inputs=None,
+            )
 
         mock_adapter.shard.assert_called_once()
         shard_kwargs = mock_adapter.shard.call_args[1]
-        assert shard_kwargs['embeddings'].shape == (self.batch_size, self.seq_len, self.hidden_size)
+        # The helper passes sequence-first [S, B, H] embeddings straight to shard().
+        assert shard_kwargs['embeddings'].shape == (self.seq_len, self.batch_size, self.hidden_size)
+        assert shard_kwargs['loss_mask'] is loss_mask
+        # shard()'s LM-layout output flows straight into the LM (no extra transpose).
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
             self.batch_size,
             self.hidden_size,
         )
+        # forward() returns the (possibly sharded) loss mask from shard().
+        assert out_loss_mask is sharded_loss_mask
+
+    def test_get_text_embeddings_raises_when_sp_and_embedding_scatter_enabled(self):
+        """SP must not double-scatter: if the LM embedding still scatters, raise.
+
+        With sequence parallelism active, PartitionAdapter scatters the combined
+        embeddings. If the language embedding also scattered, the flat text tokens
+        would be split across TP ranks before alignment. ``get_text_embeddings``
+        must reject that configuration.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        sp_adapter = MagicMock()
+        sp_adapter.cfg.seq_parallel = True
+        mimo_model.partition_adapter = sp_adapter
+        # Embedding layer reports it would scatter for sequence parallelism.
+        mimo_model.language_model.embedding.scatter_to_sequence_parallel = True
+
+        with pytest.raises(RuntimeError, match="embedding scatter to be disabled"):
+            mimo_model.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+
+    def test_get_text_embeddings_ok_when_sp_and_embedding_scatter_disabled(self):
+        """SP with embedding scatter disabled is the supported configuration."""
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        sp_adapter = MagicMock()
+        sp_adapter.cfg.seq_parallel = True
+        mimo_model.partition_adapter = sp_adapter
+        mimo_model.language_model.embedding.scatter_to_sequence_parallel = False
+
+        text_embeddings = mimo_model.get_text_embeddings(
+            input_ids, position_ids, self.special_token_ids
+        )
+        assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
+
+    def test_forward_language_module_rejects_attention_mask_under_cp(self):
+        """A dense attention_mask is rejected under context parallelism.
+
+        Under CP the hidden states are CP-local, so a dense [B, S] mask cannot line up
+        with the sharded sequence; _forward_language_module must fail fast.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+        attention_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
+
+        cp_adapter = MagicMock()
+        cp_adapter.cfg.use_cp = True
+        mimo_model.partition_adapter = cp_adapter
+
+        with pytest.raises(RuntimeError, match="context parallelism requires attention_mask=None"):
+            mimo_model._forward_language_module(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                loss_mask=None,
+                labels=None,
+                input_tensors=None,
+            )
 
 
 class MockProcessGroup:
@@ -714,10 +794,11 @@ class TestMimoModelNonColocated:
             patch.object(model.role, 'is_last_stage', return_value=True),
             patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
         ):
-            model._forward_language_module(
+            lm_output, _ = model._forward_language_module(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=None,
+                loss_mask=None,
                 labels=None,
                 input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
             )

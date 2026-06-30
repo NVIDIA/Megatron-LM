@@ -21,6 +21,10 @@ class OffloadedStateEntry:
     is_dtensor: bool = False
     device_mesh: Any | None = None
     placements: Any | None = None
+    # Global shape/stride captured so an unevenly-sharded DTensor reconstructs
+    # exactly on reload (from_local would otherwise infer local_shard * mesh).
+    global_shape: Any | None = None
+    global_stride: Any | None = None
 
 
 def move_optimizer_state_to_cpu(
@@ -48,6 +52,8 @@ def move_optimizer_state_to_cpu(
                         is_dtensor=True,
                         device_mesh=value.device_mesh,
                         placements=value.placements,
+                        global_shape=tuple(value.shape),
+                        global_stride=tuple(value.stride()),
                     )
                     param_state[key] = local_value.detach().to("cpu")
                     continue
@@ -80,7 +86,11 @@ def move_offloaded_optimizer_state_to_device(
                     device_value = value.to(entry.device, non_blocking=True)
                     if entry.is_dtensor:
                         param_state[state_key] = dtensor_from_local(
-                            device_value, entry.device_mesh, entry.placements
+                            device_value,
+                            entry.device_mesh,
+                            entry.placements,
+                            shape=entry.global_shape,
+                            stride=entry.global_stride,
                         )
                     else:
                         param_state[state_key] = device_value

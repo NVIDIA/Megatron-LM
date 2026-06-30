@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron Core distributed checkpoint bridge for MLite distopt."""
+"""Megatron Core distributed checkpoint bridge for MLite dist_opt."""
 
 from __future__ import annotations
 
@@ -36,29 +36,29 @@ def attach_model_sharded_state_dict(
     get_placements: PlacementFn = default_placement_fn,
     is_expert: ExpertClassifierFn = default_expert_classifier,
 ) -> None:
-    """Attach an MLite-local mcore sharded_state_dict method to distopt chunks."""
+    """Attach an MLite-local mcore sharded_state_dict method to dist_opt chunks."""
 
     for chunk in model_chunks:
         chunk.sharded_state_dict = MethodType(  # type: ignore[method-assign]
             _build_bound_sharded_state_dict(ps, get_placements, is_expert), chunk
         )
-        chunk._mlite_distopt_sharded_state_dict = True  # type: ignore[attr-defined]
-        chunk._mlite_distopt_parallel_state = ps  # type: ignore[attr-defined]
+        chunk._mlite_dist_opt_sharded_state_dict = True  # type: ignore[attr-defined]
+        chunk._mlite_dist_opt_parallel_state = ps  # type: ignore[attr-defined]
 
 
-def supports_distopt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer: Any) -> bool:
+def supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer: Any) -> bool:
     """Return whether this model/optimizer pair can use mcore dist_checkpointing."""
 
     if optimizer is not None and not callable(getattr(optimizer, "sharded_state_dict", None)):
         return False
     return all(
-        bool(getattr(chunk, "_mlite_distopt_sharded_state_dict", False))
+        bool(getattr(chunk, "_mlite_dist_opt_sharded_state_dict", False))
         and callable(getattr(chunk, "sharded_state_dict", None))
         for chunk in _model_chunks(model)
     )
 
 
-def save_distopt_checkpoint(
+def save_dist_opt_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer: Any,
     step: int,
@@ -91,7 +91,7 @@ def save_distopt_checkpoint(
     )
 
 
-def load_distopt_checkpoint(
+def load_dist_opt_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer: Any,
     checkpoint_dir: str,
@@ -113,7 +113,22 @@ def load_distopt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
-    state_dict = dist_checkpointing.load(load_sd, checkpoint_dir, validate_access_integrity=False)
+    # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
+    # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
+    # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
+    _orig_torch_load = torch.load
+
+    def _trusted_torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_torch_load(*args, **kwargs)
+
+    torch.load = _trusted_torch_load
+    try:
+        state_dict = dist_checkpointing.load(
+            load_sd, checkpoint_dir, validate_access_integrity=False
+        )
+    finally:
+        torch.load = _orig_torch_load
     if load_model:
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
@@ -155,40 +170,40 @@ def _patch_empty_native_optimizer_state_dicts(
     optimizer: Any, *, fallback_step: int
 ) -> list[tuple[Any, Any]]:
     patches: list[tuple[Any, Any]] = []
-    for distopt in _iter_distributed_optimizers(optimizer):
-        inner = getattr(distopt, "optimizer", None)
+    for dist_opt in _iter_distributed_optimizers(optimizer):
+        inner = getattr(dist_opt, "optimizer", None)
         state = getattr(inner, "state", None)
         if not isinstance(state, MutableMapping) or state:
             continue
-        original_state_dict = distopt.state_dict
+        original_state_dict = dist_opt.state_dict
 
         def patched_state_dict(
-            original_state_dict=original_state_dict, distopt=distopt, fallback_step=fallback_step
+            original_state_dict=original_state_dict, dist_opt=dist_opt, fallback_step=fallback_step
         ):
             try:
                 return original_state_dict()
             except AssertionError:
-                return _empty_native_optimizer_state_dict(distopt, fallback_step)
+                return _empty_native_optimizer_state_dict(dist_opt, fallback_step)
 
-        distopt.state_dict = patched_state_dict  # type: ignore[method-assign]
-        patches.append((distopt, original_state_dict))
+        dist_opt.state_dict = patched_state_dict  # type: ignore[method-assign]
+        patches.append((dist_opt, original_state_dict))
     return patches
 
 
 def _restore_state_dict_patches(patches: list[tuple[Any, Any]]) -> None:
-    for distopt, original_state_dict in patches:
-        distopt.state_dict = original_state_dict  # type: ignore[method-assign]
+    for dist_opt, original_state_dict in patches:
+        dist_opt.state_dict = original_state_dict  # type: ignore[method-assign]
 
 
 def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
     patches: list[tuple[Any, Any]] = []
-    for distopt in _iter_distributed_optimizers(optimizer):
-        original_set_state = distopt._set_main_param_and_optimizer_states
+    for dist_opt in _iter_distributed_optimizers(optimizer):
+        original_set_state = dist_opt._set_main_param_and_optimizer_states
 
         def patched_set_state(
-            model_param, tensors, distopt=distopt, original_set_state=original_set_state
+            model_param, tensors, dist_opt=dist_opt, original_set_state=original_set_state
         ):
-            removed_step = _pop_optimizer_step_for_model_param(distopt, model_param, tensors)
+            removed_step = _pop_optimizer_step_for_model_param(dist_opt, model_param, tensors)
             try:
                 return original_set_state(model_param, tensors)
             finally:
@@ -196,25 +211,25 @@ def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
                     state, step = removed_step
                     state["step"] = step
 
-        distopt._set_main_param_and_optimizer_states = patched_set_state  # type: ignore[method-assign]
-        patches.append((distopt, original_set_state))
+        dist_opt._set_main_param_and_optimizer_states = patched_set_state  # type: ignore[method-assign]
+        patches.append((dist_opt, original_set_state))
     return patches
 
 
 def _restore_set_state_patches(patches: list[tuple[Any, Any]]) -> None:
-    for distopt, original_set_state in patches:
-        distopt._set_main_param_and_optimizer_states = original_set_state  # type: ignore[method-assign]
+    for dist_opt, original_set_state in patches:
+        dist_opt._set_main_param_and_optimizer_states = original_set_state  # type: ignore[method-assign]
 
 
 def _pop_optimizer_step_for_model_param(
-    distopt: Any, model_param, tensors: dict[str, Any]
+    dist_opt: Any, model_param, tensors: dict[str, Any]
 ) -> tuple[MutableMapping, Any] | None:
     if "step" in tensors:
         return None
     try:
-        group_index, group_order = distopt.model_param_group_index_map[model_param]
-        main_param = distopt.optimizer.param_groups[group_index]["params"][group_order]
-        state = distopt.optimizer.state[main_param]
+        group_index, group_order = dist_opt.model_param_group_index_map[model_param]
+        main_param = dist_opt.optimizer.param_groups[group_index]["params"][group_order]
+        state = dist_opt.optimizer.state[main_param]
     except (KeyError, IndexError, TypeError):
         return None
     if not isinstance(state, MutableMapping) or "step" not in state:
@@ -269,8 +284,8 @@ def _safe_inner_optimizer(obj: Any) -> Any | None:
     return getattr(obj, "optimizer", None)
 
 
-def _empty_native_optimizer_state_dict(distopt: Any, fallback_step: int) -> dict[str, Any]:
-    inner_state_dict = distopt.optimizer.state_dict()
+def _empty_native_optimizer_state_dict(dist_opt: Any, fallback_step: int) -> dict[str, Any]:
+    inner_state_dict = dist_opt.optimizer.state_dict()
     optimizer_state = {
         key: ([group.copy() for group in value] if key == "param_groups" else value)
         for key, value in inner_state_dict.items()
@@ -280,7 +295,7 @@ def _empty_native_optimizer_state_dict(distopt: Any, fallback_step: int) -> dict
         param_group.pop("params", None)
         param_group["step"] = int(fallback_step)
     state_dict: dict[str, Any] = {"optimizer": optimizer_state}
-    grad_scaler = getattr(distopt, "grad_scaler", None)
+    grad_scaler = getattr(dist_opt, "grad_scaler", None)
     if grad_scaler:
         state_dict["grad_scaler"] = grad_scaler.state_dict()
     return state_dict
@@ -513,11 +528,11 @@ def _load_model_state_dict(
 
 
 def _chunk_parallel_state(chunk: nn.Module) -> ParallelState | None:
-    ps = getattr(chunk, "_mlite_distopt_parallel_state", None)
+    ps = getattr(chunk, "_mlite_dist_opt_parallel_state", None)
     if ps is not None:
         return ps
     wrapped = _wrapped_module(chunk)
-    return getattr(wrapped, "_mlite_distopt_parallel_state", None)
+    return getattr(wrapped, "_mlite_dist_opt_parallel_state", None)
 
 
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
@@ -536,7 +551,7 @@ def _wrapped_module(model: nn.Module) -> nn.Module:
 
 __all__ = [
     "attach_model_sharded_state_dict",
-    "load_distopt_checkpoint",
-    "save_distopt_checkpoint",
-    "supports_distopt_distckpt",
+    "load_dist_opt_checkpoint",
+    "save_dist_opt_checkpoint",
+    "supports_dist_opt_distckpt",
 ]

@@ -7,9 +7,9 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 
 def run_microbatch_loop(
@@ -21,6 +21,7 @@ def run_microbatch_loop(
     dist_opt: bool = False,
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
+    forward_only: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -40,23 +41,32 @@ def run_microbatch_loop(
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
             reading ``out["loss"]`` directly. This enables RLHF policy/value losses.
+        forward_only: When True, run forward without backward (e.g. validation /
+            ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
+            loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
+            pipeline path, which already threads ``forward_only`` to skip backward.
     """
     last_out = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
-        batch = next(data_iter)
+        batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
             scale = torch.tensor(1.0 / num_microbatches, device="cuda")
             pre_forward_hook(scale)
-        out = forward_fn(model, batch)
+        with use_loss_context(loss_context):
+            out = forward_fn(model, batch)
         if dist_opt and optimizer is not None and mb == num_microbatches - 1:
             optimizer.grad_sync_enabled = True
         if loss_fn is not None:
-            loss, metrics = loss_fn(out, batch)
-            (loss / num_microbatches).backward()
+            if loss_context is None:
+                loss, metrics = loss_fn(out, batch)
+            else:
+                loss, metrics = loss_fn(out, batch, loss_context)
+            if not forward_only:
+                (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
-        else:
+        elif not forward_only:
             (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:

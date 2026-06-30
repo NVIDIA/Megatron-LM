@@ -2,6 +2,7 @@
 
 import gc
 import math
+import os
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsv4_hybrid_module_spec_for_backend,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
@@ -21,34 +23,56 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
+
+@pytest.fixture(autouse=True, scope="module")
+def _expandable_segments_env():
+    """Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True for this module only.
+
+    The 8192-seqlen / ratio=4 / pro-variant parametrizations retain ~50 GiB of
+    reserved-but-unallocated blocks after teardown and OOM the next test in the
+    same process.  Expandable segments let the caching allocator extend existing
+    reservations instead of holding many fixed-size blocks.
+
+    Scoped to *this module* so the env var does not leak into unrelated tests
+    (e.g. test_cuda_graphs.py whose SM<10 guard checks this var).
+    """
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    prev = os.environ.get(key)
+    os.environ.setdefault(key, "expandable_segments:True")
+    yield
+    if prev is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prev
+
+
 _SEED = 1234
-# Fused-path eps: in this test ``apply_rope_fusion`` is coupled to
-# ``apply_dsa_kernel_fusion``, so the fused branch exercises BOTH the
-# cudnn DSA kernels AND the Triton fused MLA RoPE kernel. The MLA RoPE
-# kernel's bf16 numerics differ from pytorch eager RoPE by ~2-3e-3 cosine
-# at the input-gradient level after propagating through the layer; that
-# noise dominates the original 1.5e-4 DSA-kernel-only budget. Empirical
-# worst case observed: ``cosine_sim ≈ 0.998`` on hidden_grad / upstream
-# param grads, ``≈ 0.9995`` on the forward output.
-_FUSED_SIMILARITY_EPS = 3e-3
-_UNFUSED_SIMILARITY_EPS = 3e-5
-# ``core_attention.attn_sink`` is a per-head scalar bias whose gradient
-# is just the sum of the sink's softmax probability over all positions
-# (no spatial averaging). Tiny shape + no averaging means the per-element
-# fused-rope drift accumulates directly into the grad rather than washing
-# out, so its parity floor is roughly an order of magnitude looser than
-# the per-token gradients. Empirical worst case ``cosine_sim ≈ 0.984``.
-_FUSED_ATTN_SINK_GRAD_SIMILARITY_EPS = 2e-2
-# Fused dense-loss path: ``dense_indexer_backward_wrapper`` consumes raw
-# scores plus L1-norm/LSE separately (not pre-softmaxed distributions, as
-# the sparse variant does), so the kernel-vs-autograd precision noise is
-# not absorbed by a softmax boundary. Combined with TE-vs-nn linear/RoPE
-# drift on q_indexer/k_indexer/weights, the indexer param-grad cosine sim
-# floors around 1e-3 here. Applied only to ``.indexer.`` params when
-# ``apply_dsa_kernel_fusion=True`` and ``dsa_indexer_use_sparse_loss=False``.
-# Kept distinct from ``_FUSED_SIMILARITY_EPS`` so the per-param branch
-# stays readable, even though both currently sit in the same order.
-_FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS = 3e-3
+# Parity tolerances (cosine / tensor-sim drift = 1 - sim), split on two axes:
+#
+# * fused vs unfused — the fused path exercises the cudnn DSA kernels + Triton
+#   fused MLA RoPE, whose bf16 numerics (and non-deterministic atomic
+#   reductions) drift ~an order of magnitude more than the pytorch-eager
+#   unfused path. ``apply_rope_fusion`` is coupled to ``apply_dsa_kernel_fusion``.
+# * forward (the layer ``out``) vs backward (``hidden_grad`` + every param
+#   grad) — gradients accumulate kernel noise and need looser floors than the
+#   forward output.
+#
+# Each constant covers the worst case across the whole parametrization for its
+# (path, direction) bucket. Values sit ~1.3-2.5x above the measured worst-case
+# drift over the full matrix (variant x ratio x seqlen x segment-layout); the
+# forward buckets have wide headroom (the layer output is a well-averaged
+# quantity), the backward buckets are near their physical floor:
+#   * fused-fwd    worst ~8e-4  (layer ``out``)                       -> 2e-3
+#   * fused-bwd    worst ~1.6e-2 (``core_attention.attn_sink`` — a per-head
+#                  scalar grad with no spatial averaging; the binding param)  -> 2e-2
+#   * unfused-fwd  worst ~7e-4  (layer ``out``)                       -> 1.5e-3
+#   * unfused-bwd  worst ~2e-3  (compressor / indexer grads, ratio > 1) -> 3e-3
+# A real positioning/aggregation regression collapses cosine far below these
+# floors, so the budgets still trip on genuine bugs.
+_FUSED_FWD_SIMILARITY_EPS = 2e-3
+_FUSED_BWD_SIMILARITY_EPS = 2e-2
+_UNFUSED_FWD_SIMILARITY_EPS = 1.5e-3
+_UNFUSED_BWD_SIMILARITY_EPS = 3e-3
 
 
 @torch.compile
@@ -804,6 +828,27 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     return real_params
 
 
+def _make_thd_packed_seq_params(seg_lens, device='cuda'):
+    """Build ``PackedSeqParams(qkv_format='thd', ...)`` for self-attention
+    from a list of per-segment lengths.
+    """
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(seg_lens, dtype=torch.int64).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_len = int(max(seg_lens)) if seg_lens else 0
+    return PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=max_len,
+        max_seqlen_kv=max_len,
+        qkv_format='thd',
+    )
+
+
 def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool = False):
     """Pytest-side gate for real-kernel tests. Raises ``pytest.skip`` if
     any of the runtime dependencies are missing.
@@ -852,10 +897,10 @@ class TestDSv4HybridNativeParity:
     @pytest.mark.parametrize(
         ("seqlen", "calculate_per_token_loss", "dsa_indexer_use_sparse_loss"),
         [
+            (512, True, True),
             (4096, False, False),
             (4096, False, True),
             (4096, True, False),
-            (4096, True, True),
             (8192, True, True),
         ],
     )
@@ -882,8 +927,11 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=calculate_per_token_loss,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        similarity_eps = (
-            _UNFUSED_SIMILARITY_EPS if not apply_dsa_kernel_fusion else _FUSED_SIMILARITY_EPS
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
@@ -915,7 +963,7 @@ class TestDSv4HybridNativeParity:
                 real_out.detach(),
                 native_out.detach(),
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:out",
-                eps=similarity_eps,
+                eps=fwd_eps,
             )
 
             real_out.backward(grad)
@@ -927,25 +975,448 @@ class TestDSv4HybridNativeParity:
                 hidden_states.grad,
                 hidden_states_native.grad,
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:hidden_grad",
-                eps=similarity_eps,
+                eps=bwd_eps,
             )
 
-        is_fused_dense = apply_dsa_kernel_fusion and not dsa_indexer_use_sparse_loss
         for name, native_param in native_layer.named_parameters():
             real_param = real_params[name]
             if compress_ratio != 4 and ".indexer." in name:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
-            if apply_dsa_kernel_fusion and "core_attention.attn_sink" in name:
-                param_eps = _FUSED_ATTN_SINK_GRAD_SIMILARITY_EPS
-            elif is_fused_dense and ".indexer." in name:
-                param_eps = _FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS
-            else:
-                param_eps = similarity_eps
             _assert_similarity(
                 real_param.grad,
                 native_param.grad,
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
-                eps=param_eps,
+                eps=bwd_eps,
             )
+
+        del real_layer, native_layer, real_params
+        del hidden_states, hidden_states_native, real_out, native_out, grad
+        if native_indexer_loss is not None:
+            del native_indexer_loss
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize("variant", ["flash", "pro"])
+    @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+    @pytest.mark.parametrize(
+        ("seqlen", "dsa_indexer_use_sparse_loss"),
+        [(512, False), (4096, False), (4096, True), (8192, True)],
+    )
+    def test_thd_attention_matches_native_reference(
+        self,
+        variant: str,
+        compress_ratio: int,
+        seqlen: int,
+        backend: str,
+        apply_dsa_kernel_fusion: bool,
+        dsa_indexer_use_sparse_loss: bool,
+    ):
+        """THD (packed-sequence) variant of test_attention_matches_native_reference.
+
+        Runs the real layer with a single-segment THD packed_seq_params
+        (equivalent to SBHD B=1) and compares forward output and backward
+        gradients against the native reference.
+        """
+        if apply_dsa_kernel_fusion:
+            _skip_if_real_kernels_unavailable(sm_min=10)
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+            pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
+
+        config = _make_config(
+            variant,
+            compress_ratio,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            calculate_per_token_loss=True,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        )
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+
+        mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
+        real_layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
+        ).cuda()
+        native_layer = NativeDSv4HybridAttention(config, mcore_ratio).cuda()
+        real_params = _copy_real_params_to_native(real_layer, native_layer)
+
+        bsz = 1
+        for _ in range(1):
+            hidden_states = torch.randn(
+                seqlen,
+                bsz,
+                config.hidden_size,
+                dtype=torch.bfloat16,
+                device="cuda",
+                requires_grad=True,
+            )
+            hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
+            grad = torch.randn_like(hidden_states)
+
+            packed = _make_thd_packed_seq_params([seqlen])
+            real_out, _ = real_layer(
+                hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
+            )
+            native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
+
+            _assert_similarity(
+                real_out.detach(),
+                native_out.detach(),
+                f"thd-{backend}-{variant}-{compress_ratio}-{seqlen}:out",
+                eps=fwd_eps,
+            )
+
+            real_out.backward(grad)
+            native_out.backward(grad)
+            if native_indexer_loss is not None:
+                native_indexer_loss.backward()
+
+            _assert_similarity(
+                hidden_states.grad,
+                hidden_states_native.grad,
+                f"thd-{backend}-{variant}-{compress_ratio}-{seqlen}:hidden_grad",
+                eps=bwd_eps,
+            )
+
+        for name, native_param in native_layer.named_parameters():
+            real_param = real_params[name]
+            if compress_ratio != 4 and ".indexer." in name:
+                continue
+            assert native_param.grad is not None, f"Missing native grad for {name}"
+            assert real_param.grad is not None, f"Missing real grad for {name}"
+            _assert_similarity(
+                real_param.grad,
+                native_param.grad,
+                f"thd-{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
+                eps=bwd_eps,
+            )
+
+        del real_layer, native_layer, real_params
+        del hidden_states, hidden_states_native, real_out, native_out, grad, packed
+        if native_indexer_loss is not None:
+            del native_indexer_loss
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize("variant", ["flash"])
+    @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+    @pytest.mark.parametrize(
+        ("seg_lens", "dsa_indexer_use_sparse_loss"),
+        [
+            # pytest.param([152, 1024, 2345], False, id="three-seg-dense"),
+            pytest.param([152, 1024, 2345], True, id="three-seg-sparse")
+        ],
+    )
+    def test_thd_multiseg_attention_matches_native_reference(
+        self,
+        variant: str,
+        compress_ratio: int,
+        seg_lens: list,
+        backend: str,
+        apply_dsa_kernel_fusion: bool,
+        dsa_indexer_use_sparse_loss: bool,
+    ):
+        """Multi-segment THD parity against per-segment native references.
+
+        The single-segment ``test_thd_attention_matches_native_reference``
+        cannot distinguish per-segment RoPE striding from global striding:
+        with one segment starting at offset 0 the two coincide bit-for-bit.
+        Real packed sequences reset RoPE positions *per segment* (the kernel
+        indexes the globally-strided cos/sin table via ``cu_seqlens``), so the
+        correct oracle is the native reference run **independently per
+        segment** — each segment seeing positions ``0..seg_len-1`` — with the
+        outputs concatenated. Comparing the packed real layer against that
+        oracle exercises cross-segment RoPE / compression positioning, the
+        class of bug that single-segment and padding-invariance tests miss.
+
+        Segment lengths are multiples of 128 (== ``csa_window_size`` and the
+        max compress ratio) so compression is exact at every ratio.
+        """
+        if apply_dsa_kernel_fusion:
+            _skip_if_real_kernels_unavailable(sm_min=10)
+        major, _ = torch.cuda.get_device_capability()
+        total_T = sum(seg_lens)
+        if major < 10 and not apply_dsa_kernel_fusion and total_T > 4096:
+            pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
+
+        config = _make_config(
+            variant,
+            compress_ratio,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            calculate_per_token_loss=True,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        )
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+
+        mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
+        real_layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
+        ).cuda()
+        native_layer = NativeDSv4HybridAttention(config, mcore_ratio).cuda()
+        real_params = _copy_real_params_to_native(real_layer, native_layer)
+
+        hidden_states = torch.randn(
+            total_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
+        grad = torch.randn_like(hidden_states)
+
+        # ---- Real packed-sequence (THD) run ----------------------------------
+        packed = _make_thd_packed_seq_params(seg_lens)
+        real_out, _ = real_layer(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
+        )
+
+        # ---- Native oracle: each segment as an independent B=1 sequence ------
+        # Slicing the single ``hidden_states_native`` leaf keeps every segment's
+        # input grad flowing back into one tensor (comparable to the real
+        # layer's packed grad); reusing one ``native_layer`` accumulates param
+        # grads across segments exactly as the packed real layer does.
+        seg_label = "_".join(map(str, seg_lens))
+        seg_outs = []
+        seg_losses = []
+        start = 0
+        for seg_len in seg_lens:
+            seg_in = hidden_states_native[start : start + seg_len]
+            seg_out, seg_loss = native_layer(seg_in, pg_collection)
+            seg_outs.append(seg_out)
+            if seg_loss is not None:
+                seg_losses.append(seg_loss)
+            start += seg_len
+        native_out = torch.cat(seg_outs, dim=0)
+
+        _assert_similarity(
+            real_out.detach(),
+            native_out.detach(),
+            f"thd-multiseg-{backend}-{variant}-{compress_ratio}-{seg_label}:out",
+            eps=fwd_eps,
+        )
+
+        real_out.backward(grad)
+        native_out.backward(grad)
+        if seg_losses:
+            # per_token_loss=True => each segment's loss is a row-sum; summing
+            # across segments equals the packed layer's whole-sequence sum.
+            torch.stack(seg_losses).sum().backward()
+
+        _assert_similarity(
+            hidden_states.grad,
+            hidden_states_native.grad,
+            f"thd-multiseg-{backend}-{variant}-{compress_ratio}-{seg_label}:hidden_grad",
+            eps=bwd_eps,
+        )
+
+        for name, native_param in native_layer.named_parameters():
+            real_param = real_params[name]
+            if compress_ratio != 4 and ".indexer." in name:
+                continue
+            assert native_param.grad is not None, f"Missing native grad for {name}"
+            assert real_param.grad is not None, f"Missing real grad for {name}"
+            _assert_similarity(
+                real_param.grad,
+                native_param.grad,
+                f"thd-multiseg-{backend}-{variant}-{compress_ratio}-{seg_label}:param_grad:{name}",
+                eps=bwd_eps,
+            )
+
+        del real_layer, native_layer, real_params
+        del hidden_states, hidden_states_native, real_out, native_out, grad, packed
+        del seg_outs, seg_losses
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize("variant", ["flash"])
+    @pytest.mark.parametrize("compress_ratio", [4, 128])
+    @pytest.mark.parametrize("dsa_indexer_use_sparse_loss", [True, False])
+    @pytest.mark.parametrize(
+        ("seg_lens", "pad_max_seqlen", "pad_max_num_seqs"),
+        [
+            pytest.param([512], 640, 4, id="single-seg-padded"),
+            pytest.param([256, 256], 640, 4, id="two-seg-padded"),
+            pytest.param([200, 150, 912], 2048, 8, id="three-seg-padded"),
+        ],
+    )
+    def test_thd_padded_attention_matches_unpadded(
+        self,
+        variant: str,
+        compress_ratio: int,
+        seg_lens: list,
+        pad_max_seqlen: int,
+        pad_max_num_seqs: int,
+        backend: str,
+        dsa_indexer_use_sparse_loss: bool,
+        apply_dsa_kernel_fusion: bool,
+    ):
+        """Verify that THD padding does not corrupt real tokens' output.
+
+        Runs the same real layer twice — once with padding (static shapes)
+        and once without — then asserts the forward output and backward
+        gradients for the real (non-padding) token positions are identical
+        within tolerance.
+        """
+        if apply_dsa_kernel_fusion:
+            _skip_if_real_kernels_unavailable(sm_min=10)
+
+        actual_T = sum(seg_lens)
+        assert actual_T <= pad_max_seqlen, "seg_lens must fit within pad_max_seqlen"
+        assert len(seg_lens) <= pad_max_num_seqs, "seg count must fit within pad_max_num_seqs"
+
+        config = _make_config(
+            variant,
+            compress_ratio,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            calculate_per_token_loss=True,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        )
+        fwd_eps = (
+            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
+        )
+        bwd_eps = (
+            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+
+        real_layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
+        ).cuda()
+
+        hidden_states = torch.randn(
+            actual_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+
+        # ---- Unpadded run (reference) ----------------------------------------
+        hidden_unpadded = hidden_states.detach().clone().requires_grad_(True)
+        packed_unpadded = _make_thd_packed_seq_params(seg_lens)
+        out_unpadded, _ = real_layer(
+            hidden_states=hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
+        )
+        grad_unpadded = torch.randn_like(out_unpadded)
+        out_unpadded.backward(grad_unpadded)
+
+        # ---- Padded run ------------------------------------------------------
+        # Per-sequence padding: each segment is padded to the next multiple
+        # of compress_ratio, then the total is extended to pad_max_seqlen
+        # with a dummy tail segment.  This matches the real data_schedule
+        # path where each sequence is individually padded to alignment.
+        from megatron.core.packed_seq_params import _pad_cu_seqlens
+
+        align = max(compress_ratio, 4)
+        padded_seg_lens = [((sl + align - 1) // align) * align for sl in seg_lens]
+        padded_actual_T = sum(padded_seg_lens)
+        total_padded_T = pad_max_seqlen
+        assert padded_actual_T <= total_padded_T
+
+        # Build padded hidden_states with per-segment intra-padding + tail.
+        hidden_padded = torch.zeros(
+            total_padded_T, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        real_offset = 0
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            hidden_padded[pad_offset : pad_offset + rl] = hidden_states[
+                real_offset : real_offset + rl
+            ]
+            real_offset += rl
+            pad_offset += pl
+        hidden_padded = hidden_padded.clone().requires_grad_(True)
+
+        # cu_seqlens_q: unpadded real boundaries (cumsum of real lengths
+        # within the padded physical layout).
+        cu_seqlens_q_vals = [0]
+        offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            cu_seqlens_q_vals.append(offset + rl)
+            offset += pl
+        cu_seqlens_unpadded = torch.tensor(cu_seqlens_q_vals, dtype=torch.int32, device='cuda')
+
+        # cu_seqlens_q_padded: padded boundaries (cumsum of padded lengths
+        # + dummy tail segment to total_padded_T).
+        padded_boundaries = [0]
+        for pl in padded_seg_lens:
+            padded_boundaries.append(padded_boundaries[-1] + pl)
+        if padded_actual_T < total_padded_T:
+            padded_boundaries.append(total_padded_T)
+        cu_seqlens_padded_raw = torch.tensor(padded_boundaries, dtype=torch.int32, device='cuda')
+        # Also extend unpadded with a zero-length dummy for the tail.
+        if padded_actual_T < total_padded_T:
+            cu_seqlens_unpadded = torch.cat(
+                [
+                    cu_seqlens_unpadded,
+                    cu_seqlens_unpadded[-1:],  # repeat last (real total unchanged)
+                ]
+            )
+
+        target_cu = pad_max_num_seqs + 1
+        cu_seqlens_unpadded = _pad_cu_seqlens(cu_seqlens_unpadded, target_cu)
+        cu_seqlens_padded = _pad_cu_seqlens(cu_seqlens_padded_raw, target_cu)
+        max_padded_seg = max(padded_seg_lens + [total_padded_T - padded_actual_T])
+
+        packed_padded = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens_unpadded,
+            cu_seqlens_kv=cu_seqlens_unpadded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_padded_seg,
+            max_seqlen_kv=max_padded_seg,
+        )
+
+        out_padded, _ = real_layer(
+            hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded
+        )
+        # Build grad for padded buffer: scatter unpadded grad into real positions.
+        grad_padded = torch.zeros_like(out_padded)
+        real_offset = 0
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            grad_padded[pad_offset : pad_offset + rl] = grad_unpadded[
+                real_offset : real_offset + rl
+            ]
+            real_offset += rl
+            pad_offset += pl
+        out_padded.backward(grad_padded)
+
+        # ---- Assertions: real tokens must match ------------------------------
+        # Gather real-token positions from the padded output/grad.
+        real_positions = []
+        pad_offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            real_positions.extend(range(pad_offset, pad_offset + rl))
+            pad_offset += pl
+        real_positions = torch.tensor(real_positions, dtype=torch.long, device='cuda')
+
+        label = f"thd-padded-{backend}-{variant}-r{compress_ratio}-segs{len(seg_lens)}"
+        _assert_similarity(
+            out_padded[real_positions].detach(), out_unpadded.detach(), f"{label}:out", eps=fwd_eps
+        )
+        _assert_similarity(
+            hidden_padded.grad[real_positions],
+            hidden_unpadded.grad,
+            f"{label}:hidden_grad",
+            eps=bwd_eps,
+        )
+
+        del real_layer, hidden_states, hidden_unpadded, hidden_padded
+        del out_unpadded, out_padded, grad_unpadded, grad_padded
+        del packed_unpadded, packed_padded
+        gc.collect()
+        torch.cuda.empty_cache()
