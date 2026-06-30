@@ -1369,7 +1369,8 @@ def pretrain(
     one_logger and one_logger.log_metrics(app_metrics)
 
     if args.hybrid_context_parallel:
-        if mpu.get_tensor_model_parallel_rank() == 0:
+        _tp_pg = init_pg_collection.tp if init_pg_collection is not None else mpu.get_tensor_model_parallel_group()
+        if _tp_pg.rank() == 0:
             assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
         train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, model_cfg))
         if isinstance(valid_data_iterator, list):
