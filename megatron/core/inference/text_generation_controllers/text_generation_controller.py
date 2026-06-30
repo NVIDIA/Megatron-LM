@@ -95,10 +95,22 @@ class DecodeForwardPrimer:
 
 
 @dataclass
+class _AsyncScheduleSampleResult:
+    """State produced by async scheduling sampling."""
+
+    active_request_count: int
+    cuda_graph_request_count: Optional[int]
+    sampled_tokens_gpu: Tensor
+    sampled_tokens_cpu_view: Tensor
+    sample_ready_event: Optional[Any]
+
+
+@dataclass
 class _AsyncScheduleSampleAndPrepareResult:
     """State produced by the async scheduling sample/prepare phase."""
 
     active_request_count: int
+    cuda_graph_request_count: Optional[int]
     sampled_tokens_cpu_view: Tensor
     input_ids: Tensor
     position_ids: Tensor
@@ -2080,17 +2092,12 @@ class TextGenerationController:
             ret.update(request_bookkeeping)
             return ret
 
-    def _run_async_sched_sample_and_prepare(
-        self, overlap: bool
-    ) -> _AsyncScheduleSampleAndPrepareResult:
-        """Run the async scheduling sampling and preparation phase.
-
-        Args:
-            overlap (bool): If true, prepare while sampled tokens transfer to CPU.
+    def _run_async_sched_sample(self) -> _AsyncScheduleSampleResult:
+        """Sample active requests and start copying the results to CPU.
 
         Returns:
-            _AsyncScheduleSampleAndPrepareResult: Sample transfer view and prepared
-            forward inputs.
+            _AsyncScheduleSampleResult: Active request and CUDA graph counts,
+                GPU samples, CPU sample view, and copy-completion event.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -2104,22 +2111,104 @@ class TextGenerationController:
         )
         range_pop()
 
-        if not overlap:
-            self._wait_async_sched_event(sample_ready_event)
+        return _AsyncScheduleSampleResult(
+            active_request_count=active_request_count,
+            cuda_graph_request_count=self._decode_forward_primer.cuda_graph_request_count,
+            sampled_tokens_gpu=sampled_tokens_gpu,
+            sampled_tokens_cpu_view=sampled_tokens_cpu_view,
+            sample_ready_event=sample_ready_event,
+        )
 
+    def _run_async_sched_sample_and_prepare(
+        self, overlap: bool
+    ) -> _AsyncScheduleSampleAndPrepareResult:
+        """Run the async scheduling sampling and preparation phase.
+
+        Args:
+            overlap (bool): If true, prepare while sampled tokens transfer to CPU.
+
+        Returns:
+            _AsyncScheduleSampleAndPrepareResult: Sample transfer view and prepared
+            forward inputs.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        # Sample logits.
+        sample_result = self._run_async_sched_sample()
+
+        # Wait on sampling to finish before serial preparation.
+        if not overlap:
+            self._wait_async_sched_event(sample_result.sample_ready_event)
+
+        # Prepare the next forward.
         range_push("prepare_requests")
         input_ids, position_ids = self._run_async_sched_prepare()
         range_pop()
-        context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
+        context.copy_async_sched_input_tokens_to_gpu(sample_result.sampled_tokens_gpu)
 
-        sample_and_prepare_event = self._record_async_sched_event(sampled_tokens_gpu)
+        # Wait on preparation to finish.
+        sample_and_prepare_event = self._record_async_sched_event(sample_result.sampled_tokens_gpu)
         self._wait_async_sched_event(sample_and_prepare_event)
 
+        # Return the completed phase result.
         return _AsyncScheduleSampleAndPrepareResult(
-            active_request_count=active_request_count,
-            sampled_tokens_cpu_view=sampled_tokens_cpu_view,
+            active_request_count=sample_result.active_request_count,
+            cuda_graph_request_count=sample_result.cuda_graph_request_count,
+            sampled_tokens_cpu_view=sample_result.sampled_tokens_cpu_view,
             input_ids=input_ids,
             position_ids=position_ids,
+        )
+
+    def _run_async_sched_resolve(
+        self, sampled_tokens_cpu_view: Tensor, forward_done_event: Optional[Any], overlap: bool
+    ) -> _AsyncScheduleForwardAndResolveResult:
+        """Resolve request state and compact speculative forward logits.
+
+        Args:
+            sampled_tokens_cpu_view (Tensor): View of sampled tokens copied to CPU.
+            forward_done_event (Optional[Any]): Event marking speculative forward completion.
+            overlap (bool): If true, resolve requests before waiting for the forward.
+
+        Returns:
+            _AsyncScheduleForwardAndResolveResult: Sampled tokens and resolved
+                request row sets after logits compaction.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        # Wait on the forward to finish before serial resolution.
+        if not overlap:
+            self._wait_async_sched_event(forward_done_event)
+
+        # Resolve requests.
+        range_push("active_request_mask")
+        sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
+        context.commit_sampled_tokens(sampled_tokens_cpu)
+        (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
+            self._build_async_sched_request_state(sampled_tokens_cpu)
+        )
+        range_pop()
+
+        range_push("resolve_requests")
+        resolved_finished_request_ids = context.resolve_requests(active_request_mask)
+        range_pop()
+
+        assert torch.equal(finished_request_ids, resolved_finished_request_ids)
+
+        # Wait on the forward to finish after overlapped resolution.
+        if overlap:
+            self._wait_async_sched_event(forward_done_event)
+
+        # Compact logits and wait on resolution to finish.
+        self._compact_async_sched_logits(survivor_idxs)
+        compaction_done_event = self._record_async_sched_event(self._all_logits_cuda)
+        self._wait_async_sched_event(compaction_done_event)
+
+        # Return the completed phase result.
+        return _AsyncScheduleForwardAndResolveResult(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            active_request_ids=active_request_ids,
+            finished_request_ids=finished_request_ids,
+            survivor_idxs=survivor_idxs,
         )
 
     def _run_async_sched_forward_and_resolve(
@@ -2136,41 +2225,15 @@ class TextGenerationController:
             _AsyncScheduleForwardAndResolveResult: Sampled tokens and resolved
             request row sets after logits compaction.
         """
-        context = self.inference_wrapped_model.inference_context
-
+        # Forward.
         range_push("async_sched_forward_pass")
         self._run_async_sched_forward(phase_result.input_ids, phase_result.position_ids)
         range_pop()
         forward_done_event = self._record_async_sched_event(self._all_logits_cuda)
 
-        if not overlap:
-            self._wait_async_sched_event(forward_done_event)
-
-        range_push("active_request_mask")
-        sampled_tokens_cpu = phase_result.sampled_tokens_cpu_view.clone()
-        context.commit_sampled_tokens(sampled_tokens_cpu)
-        (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
-            self._build_async_sched_request_state(sampled_tokens_cpu)
-        )
-        range_pop()
-
-        range_push("resolve_requests")
-        resolved_finished_request_ids = context.resolve_requests(active_request_mask)
-        range_pop()
-
-        assert torch.equal(finished_request_ids, resolved_finished_request_ids)
-        if overlap:
-            self._wait_async_sched_event(forward_done_event)
-
-        self._compact_async_sched_logits(survivor_idxs)
-        compaction_done_event = self._record_async_sched_event(self._all_logits_cuda)
-        self._wait_async_sched_event(compaction_done_event)
-
-        return _AsyncScheduleForwardAndResolveResult(
-            sampled_tokens_cpu=sampled_tokens_cpu,
-            active_request_ids=active_request_ids,
-            finished_request_ids=finished_request_ids,
-            survivor_idxs=survivor_idxs,
+        # Resolve requests; the child waits on forward and resolution completion.
+        return self._run_async_sched_resolve(
+            phase_result.sampled_tokens_cpu_view, forward_done_event, overlap
         )
 
     async def _run_async_sched_step(self, *, overlap: bool) -> Optional[Dict]:
@@ -2224,7 +2287,7 @@ class TextGenerationController:
                 "accepted_tokens": None,
                 "log_probs": None,
                 "top_n_logprobs": None,
-                "cuda_graph_request_count": self._decode_forward_primer.cuda_graph_request_count,
+                "cuda_graph_request_count": sample_and_prepare_result.cuda_graph_request_count,
             }
 
     async def async_generate_output_tokens_dynamic_batch(
