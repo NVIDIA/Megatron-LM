@@ -7,7 +7,11 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
-from megatron.core.fp8_utils import _get_custom_recipe, _get_grouped_quantized_recipe
+from megatron.core.fp8_utils import (
+    _get_custom_recipe,
+    _get_grouped_quantized_recipe,
+    _unwrap_parameter_data,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -102,9 +106,7 @@ def modify_grouped_nvfp4_rowwise_storage(
     packed rowwise byte buffer is remapped into the DDP buffer. The grouped
     scale, amax, and columnwise buffers remain owned by the original tensor.
     """
-    tensor = (
-        grouped_tensor.data if isinstance(grouped_tensor, torch.nn.Parameter) else grouped_tensor
-    )
+    tensor = _unwrap_parameter_data(grouped_tensor)
     if not is_grouped_nvfp4tensor(tensor):
         raise ValueError("modify_grouped_nvfp4_rowwise_storage expects grouped NVFP4 storage")
 
