@@ -780,3 +780,16 @@ class VLMInferenceRequest(InferenceRequest):
     imgs: torch.Tensor
     num_tiles: torch.Tensor
     decoder_seq_length: int
+
+
+@dataclass(kw_only=True)
+class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
+    """Dynamic inference request for VLM models.
+
+    Combines DynamicInferenceRequest (for dynamic batching) with VLMInferenceRequest
+    (for multimodal fields). Also stores pre-computed image embeddings and the image
+    token mask produced by expand_image_tokens.
+    """
+
+    image_embeddings: Optional[torch.Tensor] = None  # [seq_img, 1, hidden]
+    image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index

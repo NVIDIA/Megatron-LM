@@ -616,7 +616,27 @@ class TextGenerationController:
         else:
             return context.current_input_and_position_ids()
 
-    def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor):
+    def _sanitize_dummy_input_ids(self, input_ids: Tensor) -> Tensor:
+        """Replace invalid dummy-forward token IDs while preserving token count.
+
+        Expert-parallel dummy forwards are synthetic; they only keep ranks with
+        no local request participating in the same collectives as active ranks.
+        Their logits are discarded, so any out-of-vocabulary placeholder token
+        can be replaced with a stable valid token without affecting user-visible
+        output. This keeps the dummy path independent of how dynamic VLM
+        resolution expands image placeholders for real requests.
+        """
+        invalid_mask = (input_ids < 0) | (input_ids >= self.vocab_size)
+        if not invalid_mask.any():
+            return input_ids
+
+        input_ids = input_ids.clone()
+        input_ids[invalid_mask] = 0
+        return input_ids
+
+    def _dynamic_step_forward_logits(
+        self, input_ids: Tensor, position_ids: Tensor, *, is_dummy_forward: bool = False
+    ):
         """Forward step the model to get logits for dynamic batching.
 
         This also handles logits-broadcasting for pipeline parallelism.
@@ -624,6 +644,8 @@ class TextGenerationController:
         Args:
             input_ids (Tensor): The input token IDs.
             position_ids (Tensor): The position IDs.
+            is_dummy_forward (bool): Whether this is an expert-parallel dummy
+                forward whose logits will be discarded.
         """
         context = self.inference_wrapped_model.inference_context
         if context.config.materialize_only_last_token_logits:
@@ -631,10 +653,29 @@ class TextGenerationController:
         else:
             logits_seq_len = context.padded_active_token_count
 
+        if is_dummy_forward:
+            input_ids = self._sanitize_dummy_input_ids(input_ids)
+
+        # Check for VLM image data in the context.
+        image_token_mask = context.current_image_token_mask()
+        image_embeddings = context.current_image_embeddings()
+        has_images = (
+            image_token_mask is not None
+            and image_embeddings is not None
+            and (image_token_mask >= 0).any()
+        )
+
+        inference_input = {
+            "tokens": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": None,
+        }
+        if has_images:
+            inference_input["image_token_mask"] = image_token_mask
+            inference_input["image_embeddings"] = image_embeddings
+
         with torch.inference_mode():
-            logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
-            )
+            logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
 
         if not context.config.materialize_only_last_token_logits:
@@ -1481,7 +1522,7 @@ class TextGenerationController:
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        self._dynamic_step_forward_logits(input_ids, position_ids, is_dummy_forward=True)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
