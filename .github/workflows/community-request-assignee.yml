@@ -134,7 +134,7 @@ jobs:
         id: claude-analysis
         uses: anthropics/claude-code-action@v1
         env:
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
           GH_TOKEN: ${{ github.token }}
         with:
           anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
