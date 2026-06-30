@@ -7,23 +7,25 @@ This module provides a wrapper around GPTModel that handles Bagel-specific
 input/output formats while leveraging Megatron Core's efficient implementation.
 """
 
+import logging
 from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.models.bagel.bagel_rope import BagelRotaryEmbedding
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
     MoTTransformerLayerSubmodules,
     TransformerMoTBlock,
     TransformerMoTBlockSubmodules,
     get_mot_layer_spec,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 
-from megatron.core.models.bagel.bagel_rope import BagelRotaryEmbedding
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
+logger = logging.getLogger(__name__)
 
 
 class BagelMCoreModel(GPTModel):
@@ -51,9 +53,7 @@ class BagelMCoreModel(GPTModel):
         self.llm_config = llm_config
         self.num_heads = kwargs.get('config').num_attention_heads if 'config' in kwargs else 28
 
-        
-
-        #use bagel rope
+        # use bagel rope
         self.rotary_pos_emb = BagelRotaryEmbedding(
             kv_channels=self.config.kv_channels,
             rotary_percent=self.rotary_percent,
@@ -65,7 +65,6 @@ class BagelMCoreModel(GPTModel):
             use_cpu_initialization=self.config.use_cpu_initialization,
             cp_group=self.pg_collection.cp,
         )
-
 
         # Check if model uses MoT (Mixture of Transformers)
         self.use_mo = False
@@ -98,12 +97,15 @@ class BagelMCoreModel(GPTModel):
             if isinstance(transformer_layer_spec, TransformerMoTBlockSubmodules):
                 mot_spec = transformer_layer_spec
             elif hasattr(transformer_layer_spec, 'submodules') and isinstance(
-                transformer_layer_spec.submodules, (TransformerMoTBlockSubmodules, MoTTransformerLayerSubmodules)
+                transformer_layer_spec.submodules,
+                (TransformerMoTBlockSubmodules, MoTTransformerLayerSubmodules),
             ):
                 mot_spec = transformer_layer_spec
             else:
                 # Convert standard spec to MoT spec using helper function
-                mot_spec = get_mot_layer_spec(use_flex_attention=use_flex_attention, qk_layernorm=True)
+                mot_spec = get_mot_layer_spec(
+                    use_flex_attention=use_flex_attention, qk_layernorm=True
+                )
         else:
             mot_spec = get_mot_layer_spec(use_flex_attention=use_flex_attention, qk_layernorm=True)
 
@@ -118,9 +120,13 @@ class BagelMCoreModel(GPTModel):
             freeze_und=freeze_und,
         )
 
-        print(f"[BagelMCoreModel] Initialized with TransformerMoTBlock (freeze_und={freeze_und})")
+        logger.info(
+            "Initialized BagelMCoreModel with TransformerMoTBlock (freeze_und=%s)", freeze_und
+        )
 
-    def get_word_embeddings(self, input_ids: Tensor, position_ids: Optional[Tensor] = None) -> Tensor:
+    def get_word_embeddings(
+        self, input_ids: Tensor, position_ids: Optional[Tensor] = None
+    ) -> Tensor:
         """Get embeddings for input tokens.
 
         This method provides a consistent interface for getting embeddings,
@@ -188,23 +194,25 @@ class BagelMCoreModel(GPTModel):
         if split_lens is not None and attn_modes is not None:
             from bagel.data.data_utils import create_sparse_mask
             from torch.nn.attention.flex_attention import create_block_mask
+
             sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
             seqlen = sum(sample_lens)
             attention_mask = create_block_mask(
                 sparse_mask,
-                B=1, H=self.num_heads,
+                B=1,
+                H=self.num_heads,
                 Q_LEN=seqlen,
                 KV_LEN=seqlen,
                 device=device,
                 BLOCK_SIZE=128,
-                _compile=True
+                _compile=True,
             )
 
         # Step 5: Prepare position_ids for GPTModel
         # When compact packed_position_ids [Lund+Lgen] is provided, use it directly.
         # Fallback: ascending range over decoder_input length.
         if packed_position_ids is not None:
-            gpt_position_ids = packed_position_ids.unsqueeze(0)   # [1, Lund+Lgen] or [1, S]
+            gpt_position_ids = packed_position_ids.unsqueeze(0)  # [1, Lund+Lgen] or [1, S]
         else:
             seq_len = decoder_input_for_gpt.shape[0]
             gpt_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
@@ -212,8 +220,10 @@ class BagelMCoreModel(GPTModel):
         # Step 6: Use pre-built MoTPackedSeqParams from BagelMimoModel (required).
         packed_seq_params_for_decoder = None
         if self.use_mo:
-            assert packed_seq_params is not None, \
-                "packed_seq_params must be provided by the caller (BagelMimoModel.get_packed_seq_params)"
+            assert packed_seq_params is not None, (
+                "packed_seq_params must be provided by the caller "
+                "(BagelMimoModel.get_packed_seq_params)"
+            )
             packed_seq_params_for_decoder = packed_seq_params
 
         # Step 7: Call decoder directly (bypass parent forward to have control)
@@ -225,7 +235,6 @@ class BagelMCoreModel(GPTModel):
             sample_lens=sample_lens,
             packed_seq_params=packed_seq_params_for_decoder,
         )
-
 
         # Step 8: Process output hidden states
         if isinstance(hidden_states, tuple):
@@ -279,8 +288,11 @@ class BagelMCoreModel(GPTModel):
         else:
             ce = F.cross_entropy(logits, labels[mask], reduction="none")
 
-        return dict(last_hidden_state=last_hidden_state, ce=ce,
-                    packed_seq_params=packed_seq_params_for_decoder)
+        return dict(
+            last_hidden_state=last_hidden_state,
+            ce=ce,
+            packed_seq_params=packed_seq_params_for_decoder,
+        )
 
     def _forward_decoder(
         self,
@@ -323,7 +335,6 @@ class BagelMCoreModel(GPTModel):
             local_und_idx = packed_seq_params.local_und_token_indexes
             local_gen_idx = packed_seq_params.local_gen_token_indexes
 
-
             # Compact decoder_input if it arrives as full [S, 1, H] (e.g. direct test calls).
             # When called via forward() or align_embeddings_by_token_positions, it is
             # already compact [Lund+Lgen, 1, H] and this branch is skipped.
@@ -331,7 +342,10 @@ class BagelMCoreModel(GPTModel):
             # arrives via set_input_tensor inside TransformerMoTBlock; skip the
             # shape check there.
             if decoder_input is not None:
-                assert decoder_input.shape[0] == Lund + Lgen, f"decoder_input shape mismatch, expected {Lund + Lgen}, got {decoder_input.shape[0]}"
+                assert decoder_input.shape[0] == Lund + Lgen, (
+                    f"decoder_input shape mismatch, expected {Lund + Lgen}, "
+                    f"got {decoder_input.shape[0]}"
+                )
 
             # Compute RoPE on compact position IDs.
             if (
@@ -340,7 +354,10 @@ class BagelMCoreModel(GPTModel):
                 and self.rotary_pos_emb is not None
                 and packed_position_ids is not None
             ):
-                assert len(packed_position_ids) == Lund + Lgen, f"packed_position_ids shape mismatch, expected {Lund + Lgen}, got {packed_position_ids.shape}"
+                assert len(packed_position_ids) == Lund + Lgen, (
+                    f"packed_position_ids shape mismatch, expected {Lund + Lgen}, "
+                    f"got {packed_position_ids.shape}"
+                )
                 rotary_pos_emb = self.rotary_pos_emb.forward_with_position_ids(packed_position_ids)
 
         # Call decoder based on type

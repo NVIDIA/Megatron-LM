@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import logging
+
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +18,9 @@ except ImportError:
     Qwen2MoTDecoderLayer = MagicMock()
 
     HAVE_TRANSFORMERS = False
+
+
+logger = logging.getLogger(__name__)
 
 
 class BagelLLMHuggingFaceModel(HuggingFaceModule):
@@ -41,7 +46,9 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
 
         self.num_heads = llm_config.num_attention_heads
         # Check if model uses MoE (Mixture of Transformers)
-        self.use_moe = "Mo" in llm_config.layer_module if hasattr(llm_config, 'layer_module') else False
+        self.use_moe = (
+            "Mo" in llm_config.layer_module if hasattr(llm_config, 'layer_module') else False
+        )
 
     def forward(self, *args, **kwargs):
         """Qwen forward.
@@ -71,11 +78,15 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
 
             # Get text embeddings from input_ids
             # get_input_embeddings() returns embed_tokens layer
-            print("language_model.model.embed_tokens forward")
-            print("packed_text_ids", input_ids.shape, input_ids.sum())
+            logger.debug("language_model.model.embed_tokens forward")
+            logger.debug("packed_text_ids %s %s", input_ids.shape, input_ids.sum())
             text_embeddings = self.model.get_input_embeddings()(input_ids)  # [batch, seq, hidden]
             text_embeddings = text_embeddings.squeeze(0)  # [num_text_tokens, hidden]
-            print("after language model.model.embed_tokens forward, packed_text_embedding", text_embeddings.shape, text_embeddings.sum())
+            logger.debug(
+                "after language_model.model.embed_tokens forward, packed_text_embedding %s %s",
+                text_embeddings.shape,
+                text_embeddings.sum(),
+            )
 
             hidden_size = text_embeddings.shape[-1]
             device = text_embeddings.device
@@ -83,9 +94,7 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
 
             # Create full packed_sequence
             packed_sequence = torch.zeros(
-                (sequence_length, hidden_size),
-                dtype=dtype,
-                device=device
+                (sequence_length, hidden_size), dtype=dtype, device=device
             )
 
             # Place text embeddings at their positions
@@ -97,9 +106,13 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
             packed_vit_token_indexes = kwargs.get("packed_vit_token_indexes")
 
             if packed_vit_token_indexes is not None:
-                print("packed_vit_token_indexes", packed_vit_token_indexes.shape, packed_vit_token_indexes.sum())
+                logger.debug(
+                    "packed_vit_token_indexes %s %s",
+                    packed_vit_token_indexes.shape,
+                    packed_vit_token_indexes.sum(),
+                )
             else:
-                print("packed_vit_token_indexes is None")
+                logger.debug("packed_vit_token_indexes is None")
             if vision_embeddings is not None and packed_vit_token_indexes is not None:
                 packed_vit_token_indexes = packed_vit_token_indexes.to(device)
                 packed_sequence[packed_vit_token_indexes] = vision_embeddings
@@ -121,16 +134,18 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
                 if split_lens is not None and attn_modes is not None:
                     from bagel.data.data_utils import create_sparse_mask
                     from torch.nn.attention.flex_attention import create_block_mask
+
                     sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
                     seqlen = sum(sample_lens)
                     attention_mask = create_block_mask(
                         sparse_mask,
-                        B=1, H=self.num_heads,
+                        B=1,
+                        H=self.num_heads,
                         Q_LEN=seqlen,
                         KV_LEN=seqlen,
                         device=device,
                         BLOCK_SIZE=128,
-                        _compile=True
+                        _compile=True,
                     )
                 else:
                     # Fallback: create a simple causal mask if split_lens/attn_modes not provided
@@ -143,7 +158,9 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
                 # packed_und_token_indexes: understanding tokens (text + vit)
                 packed_und_token_indexes = packed_text_indexes
                 if packed_vit_token_indexes is not None:
-                    packed_und_token_indexes = torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+                    packed_und_token_indexes = torch.cat(
+                        [packed_text_indexes, packed_vit_token_indexes], dim=0
+                    )
 
                 # packed_gen_token_indexes: generation tokens (vae)
                 if packed_vae_token_indexes is not None:
@@ -155,29 +172,44 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
                     packed_und_token_indexes=packed_und_token_indexes,
                     packed_gen_token_indexes=packed_gen_token_indexes,
                 )
-                print("BagelLLMHuggingFaceModel packed_und_token_indexes:", packed_und_token_indexes.shape)
+                logger.debug(
+                    "BagelLLMHuggingFaceModel packed_und_token_indexes: %s",
+                    packed_und_token_indexes.shape,
+                )
                 if packed_gen_token_indexes is not None:
-                    print("BagelLLMHuggingFaceModel packed_gen_token_indexes:", packed_gen_token_indexes.shape)
+                    logger.debug(
+                        "BagelLLMHuggingFaceModel packed_gen_token_indexes: %s",
+                        packed_gen_token_indexes.shape,
+                    )
                 else:
-                    print("BagelLLMHuggingFaceModel packed_gen_token_indexes is None")
-        # else:
-        #     # Legacy path: decoder_input is already the combined embeddings
-        #     decoder_input = kwargs.get("decoder_input")
-        #     if decoder_input is not None:
-        #         combined_embeddings = decoder_input.permute(1, 0, 2)
-        #         packed_sequence = combined_embeddings.squeeze(0)  # [seq_len, hidden]
-        #     else:
-        #         # Fallback: compute embeddings from input_ids
-        #         input_ids = kwargs.get("input_ids")
-        #         text_embeddings = self.model.get_input_embeddings()(input_ids)
-        #         packed_sequence = text_embeddings.squeeze(0)
-        #     attention_mask = kwargs.get("attention_mask")
-        #     extra_inputs = {}
-        # print("language_model forward")
-        # print("packed_sequence", packed_sequence.shape, packed_sequence.to(torch.float32).sum())
-        # print("sample_lens", sample_lens)
-        # print("attention_mask", attention_mask.shape)
-        # print("packed_position_ids", kwargs["packed_position_ids"].shape, kwargs["packed_position_ids"].sum())
+                    logger.debug("BagelLLMHuggingFaceModel packed_gen_token_indexes is None")
+        else:
+            # Legacy path: decoder_input is already the combined embeddings.
+            decoder_input = kwargs.get("decoder_input")
+            if decoder_input is not None:
+                combined_embeddings = decoder_input.permute(1, 0, 2)
+                packed_sequence = combined_embeddings.squeeze(0)  # [seq_len, hidden]
+            else:
+                # Fallback: compute embeddings from input_ids.
+                input_ids = kwargs.get("input_ids")
+                text_embeddings = self.model.get_input_embeddings()(input_ids)
+                packed_sequence = text_embeddings.squeeze(0)
+            sample_lens = kwargs["sample_lens"]
+            attention_mask = kwargs.get("attention_mask")
+            extra_inputs = {}
+
+        logger.debug(
+            "language_model forward: packed_sequence=%s sum=%s sample_lens=%s attention_mask=%s",
+            packed_sequence.shape,
+            packed_sequence.to(torch.float32).sum(),
+            sample_lens,
+            getattr(attention_mask, "shape", None),
+        )
+        logger.debug(
+            "packed_position_ids=%s sum=%s",
+            kwargs["packed_position_ids"].shape,
+            kwargs["packed_position_ids"].sum(),
+        )
         last_hidden_state = self.model.forward_train(
             packed_sequence=packed_sequence,
             sample_lens=sample_lens,
@@ -185,21 +217,27 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
             packed_position_ids=kwargs["packed_position_ids"],
             **extra_inputs,
         )
-        print("after language_model forward, last_hidden_state", last_hidden_state.shape, last_hidden_state.to(torch.float32).sum(), last_hidden_state.flatten()[:10])
-        print("================================================")
+        logger.debug(
+            "after language_model forward, last_hidden_state %s %s %s",
+            last_hidden_state.shape,
+            last_hidden_state.to(torch.float32).sum(),
+            last_hidden_state.flatten()[:10],
+        )
 
         if ce_loss_indexes is not None:
-            print("language_model.lm_head and ce loss")
-            print("ce_loss_indexes", ce_loss_indexes.shape, ce_loss_indexes.sum())
+            logger.debug("language_model.lm_head and ce loss")
+            logger.debug("ce_loss_indexes %s %s", ce_loss_indexes.shape, ce_loss_indexes.sum())
             if packed_label_ids is not None:
-                print("packed_label_ids", packed_label_ids.shape, packed_label_ids.sum())
+                logger.debug(
+                    "packed_label_ids %s %s", packed_label_ids.shape, packed_label_ids.sum()
+                )
             packed_ce_preds = self.model.lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
-            print("after language_model.lm_head forward, ce", ce.shape, ce.sum(), ce)
-            print("================================================")
+            logger.debug(
+                "after language_model.lm_head forward, ce %s %s %s", ce.shape, ce.sum(), ce
+            )
         else:
             ce = None
-        print("****************************************************")
         return dict(last_hidden_state=last_hidden_state, ce=ce)
 
     def embedding(self, input_ids, position_ids=None):

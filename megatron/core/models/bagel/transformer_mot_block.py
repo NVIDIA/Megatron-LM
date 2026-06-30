@@ -14,41 +14,30 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import (
-    get_pg_rank,
-    make_viewless_tensor,
-    WrappedTensor,
-)
-from .transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
+from megatron.core.utils import WrappedTensor, get_pg_rank, make_viewless_tensor
 
 from .attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
-
-from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
+from .transformer_mot_layer import MoTTransformerLayer, MoTTransformerLayerSubmodules
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -65,16 +54,17 @@ except ImportError:
     HAVE_APEX = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TENorm,
-        te_checkpoint,
-    )
+    from megatron.core.extensions.transformer_engine import TENorm, te_checkpoint
 
     LayerNormImpl = TENorm
 else:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     LayerNormImpl = WrappedTorchNorm
+
+    def te_checkpoint(*args, **kwargs):
+        """Raise a clear error when TE checkpointing is requested without TE."""
+        raise ImportError("Transformer Engine is required for fp8/fp4 activation checkpointing.")
 
 
 logger = logging.getLogger(__name__)
@@ -111,7 +101,9 @@ class TransformerMoTBlockSubmodules:
 
     layer_specs: List[ModuleSpec] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
-    layer_norm_gen: Optional[Union[ModuleSpec, torch.nn.Module]] = None  # MoT: separate norm for gen
+    layer_norm_gen: Optional[Union[ModuleSpec, torch.nn.Module]] = (
+        None  # MoT: separate norm for gen
+    )
 
 
 def _get_mot_block_submodules(
@@ -535,16 +527,12 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         # Final layer norm with MoT (separate norms for und/gen)
         if self.final_layernorm is not None:
             hidden_states = self._apply_final_layernorm_mot(
-                hidden_states, packed_seq_params=packed_seq_params,
+                hidden_states, packed_seq_params=packed_seq_params
             )
 
         return hidden_states, context
 
-    def _apply_final_layernorm_mot(
-        self,
-        hidden_states: Tensor,
-        packed_seq_params=None,
-    ) -> Tensor:
+    def _apply_final_layernorm_mot(self, hidden_states: Tensor, packed_seq_params=None) -> Tensor:
         """
         Apply final layer normalization with MoT (separate norms for und/gen tokens).
 
@@ -560,8 +548,9 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         Returns:
             Tensor: Normalized hidden states.
         """
-        assert packed_seq_params is not None and packed_seq_params.padded_und_seqlen is not None, \
-            "MoTPackedSeqParams with padded_und_seqlen is required"
+        assert (
+            packed_seq_params is not None and packed_seq_params.padded_und_seqlen is not None
+        ), "MoTPackedSeqParams with padded_und_seqlen is required"
         Lund = packed_seq_params.padded_und_seqlen
         und_slice = hidden_states[:Lund]
         gen_slice = hidden_states[Lund:]
@@ -570,9 +559,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         hidden_states = torch.cat([und_normed, gen_normed], dim=0)
 
         # Make viewless tensor
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True
-        )
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         return hidden_states
 
     def _checkpointed_forward_train(
@@ -600,11 +587,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
             # through tensor_parallel.checkpoint (which calls ctx.save_for_backward
             # on all positional args and only accepts Tensors).
             # context_mask is likewise captured for consistency.
-            def custom_forward(
-                hidden_states,
-                context,
-                rotary_pos_emb,
-            ):
+            def custom_forward(hidden_states, context, rotary_pos_emb):
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -628,7 +611,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,  # from closure
                             context=context,
-                            context_mask=context_mask,      # from closure
+                            context_mask=context_mask,  # from closure
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
@@ -674,15 +657,14 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                 if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
 
-                if layer_idx >= recompute_skip_num_layers and (
-                    layer_idx - recompute_skip_num_layers
-                ) < self.config.recompute_num_layers:
+                if (
+                    layer_idx >= recompute_skip_num_layers
+                    and (layer_idx - recompute_skip_num_layers) < self.config.recompute_num_layers
+                ):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states,
-                        context,
-                        rotary_pos_emb,
+                        hidden_states, context, rotary_pos_emb
                     )
         else:
             raise ValueError(f"Invalid recompute method: {self.config.recompute_method}")
@@ -803,10 +785,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         return hidden_states, context
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for distributed checkpointing.
@@ -830,31 +809,18 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
             state_dict_prefix = f'{layer_prefix}{global_layer_idx}.'
 
             sharded_state_dict.update(
-                sharded_state_dict_default(
-                    layer,
-                    state_dict_prefix,
-                    sharded_offsets,
-                    metadata,
-                )
+                sharded_state_dict_default(layer, state_dict_prefix, sharded_offsets, metadata)
             )
 
             # Replace local layer index with global layer index for state dict key
-            key_repl = (
-                f'{layer_prefix}{local_layer_idx}.',
-                f'{layer_prefix}{global_layer_idx}.',
-            )
-            sharded_state_dict = {
-                k.replace(*key_repl): v for k, v in sharded_state_dict.items()
-            }
+            key_repl = (f'{layer_prefix}{local_layer_idx}.', f'{layer_prefix}{global_layer_idx}.')
+            sharded_state_dict = {k.replace(*key_repl): v for k, v in sharded_state_dict.items()}
 
         # Final layer norms
         if self.final_layernorm is not None:
             sharded_state_dict.update(
                 sharded_state_dict_default(
-                    self.final_layernorm,
-                    f'{prefix}final_layernorm.',
-                    sharded_offsets,
-                    metadata,
+                    self.final_layernorm, f'{prefix}final_layernorm.', sharded_offsets, metadata
                 )
             )
 
@@ -869,6 +835,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
             )
 
         return sharded_state_dict
+
 
 # copied from Bagel, only for alignment
 # class Qwen2RMSNorm(torch.nn.Module):
@@ -932,10 +899,7 @@ def get_mot_layer_spec(
         else:
             core_attention = TEDotProductAttention
     else:
-        from megatron.core.tensor_parallel.layers import (
-            ColumnParallelLinear,
-            RowParallelLinear,
-        )
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
         linear_qkv = ColumnParallelLinear
         linear_proj = RowParallelLinear
@@ -966,7 +930,7 @@ def get_mot_layer_spec(
         use_te=use_te,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        use_te_op_fuser=False, # TODO: support TE op fuser for MoE
+        use_te_op_fuser=False,  # TODO: support TE op fuser for MoE
     )
 
     # MoT transformer layer submodules

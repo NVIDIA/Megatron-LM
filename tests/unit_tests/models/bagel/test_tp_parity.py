@@ -39,19 +39,14 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _BAGEL_PKG)
 sys.path.insert(0, _BAGEL_SRC)
 
-from megatron.core.models.bagel.attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
-from megatron.core.models.bagel.flex_attention import FlexAttention
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
-
 from torch.nn.attention.flex_attention import create_block_mask
 
+from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
+from megatron.core.models.bagel.flex_attention import FlexAttention
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -69,9 +64,7 @@ class _PGC:
 
 def _block_mask(seq_len: int, device: str):
     return create_block_mask(
-        lambda b, h, q, kv: q >= 0,
-        B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len,
-        device=device,
+        lambda b, h, q, kv: q >= 0, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len, device=device
     )
 
 
@@ -119,9 +112,11 @@ def _make_attention(config: TransformerConfig, tp_group, seed: int) -> SelfAtten
     return attn.cuda().eval()
 
 
-def _shard_copy_weights(src_attn: SelfAttentionMoT, dst_attn: SelfAttentionMoT,
-                        tp_size: int, rank: int) -> None:
+def _shard_copy_weights(
+    src_attn: SelfAttentionMoT, dst_attn: SelfAttentionMoT, tp_size: int, rank: int
+) -> None:
     """Copy ``src_attn`` (TP=1, full weights) into ``dst_attn`` (TP=tp_size, sharded)."""
+
     def _col_shard(full, tp_size, rank):
         # ColumnParallelLinear partitions along dim=0 (output_dim).
         per = full.shape[0] // tp_size
@@ -133,11 +128,11 @@ def _shard_copy_weights(src_attn: SelfAttentionMoT, dst_attn: SelfAttentionMoT,
         return full[:, rank * per : (rank + 1) * per].clone()
 
     pairs_col = [
-        (src_attn.linear_qkv,     dst_attn.linear_qkv),
+        (src_attn.linear_qkv, dst_attn.linear_qkv),
         (src_attn.linear_qkv_gen, dst_attn.linear_qkv_gen),
     ]
     pairs_row = [
-        (src_attn.linear_proj,     dst_attn.linear_proj),
+        (src_attn.linear_proj, dst_attn.linear_proj),
         (src_attn.linear_proj_gen, dst_attn.linear_proj_gen),
     ]
 
@@ -146,7 +141,10 @@ def _shard_copy_weights(src_attn: SelfAttentionMoT, dst_attn: SelfAttentionMoT,
             if src_lin is None or dst_lin is None:
                 continue
             dst_lin.weight.data.copy_(_col_shard(src_lin.weight.data, tp_size, rank))
-            if getattr(src_lin, "bias", None) is not None and getattr(dst_lin, "bias", None) is not None:
+            if (
+                getattr(src_lin, "bias", None) is not None
+                and getattr(dst_lin, "bias", None) is not None
+            ):
                 # Column-parallel bias is also partitioned along dim=0.
                 per = src_lin.bias.shape[0] // tp_size
                 dst_lin.bias.data.copy_(src_lin.bias.data[rank * per : (rank + 1) * per].clone())
@@ -156,7 +154,10 @@ def _shard_copy_weights(src_attn: SelfAttentionMoT, dst_attn: SelfAttentionMoT,
                 continue
             dst_lin.weight.data.copy_(_row_shard(src_lin.weight.data, tp_size, rank))
             # RowParallelLinear bias is full (added after all-reduce); identical on every rank.
-            if getattr(src_lin, "bias", None) is not None and getattr(dst_lin, "bias", None) is not None:
+            if (
+                getattr(src_lin, "bias", None) is not None
+                and getattr(dst_lin, "bias", None) is not None
+            ):
                 dst_lin.bias.data.copy_(src_lin.bias.data.clone())
 
 
@@ -177,8 +178,8 @@ def run_tp_parity_test(u: int, g: int, nh: int, ng: int, hd: int, seed: int = 42
     bm = _block_mask(u + g, device)
 
     # Build process groups.
-    tp1_group = dist.new_group(ranks=[rank])           # singleton — TP=1 view
-    tp2_group = dist.new_group(ranks=[0, 1])           # full pair  — TP=2 view
+    tp1_group = dist.new_group(ranks=[rank])  # singleton — TP=1 view
+    tp2_group = dist.new_group(ranks=[0, 1])  # full pair  — TP=2 view
 
     # Build both attention modules with the same seed so that TP=1 weights
     # are identical on both ranks.
@@ -208,9 +209,9 @@ def run_tp_parity_test(u: int, g: int, nh: int, ng: int, hd: int, seed: int = 42
 
     dist.barrier()
 
-    assert out_tp1.shape == out_tp2.shape, (
-        f"shape mismatch: tp1={out_tp1.shape}  tp2={out_tp2.shape}"
-    )
+    assert (
+        out_tp1.shape == out_tp2.shape
+    ), f"shape mismatch: tp1={out_tp1.shape}  tp2={out_tp2.shape}"
 
     # Both ranks should see equal output (RowParallelLinear's all-reduce
     # produces the same final hidden state on every TP rank).
@@ -219,13 +220,18 @@ def run_tp_parity_test(u: int, g: int, nh: int, ng: int, hd: int, seed: int = 42
 
     atol = rtol = 1e-2
     torch.testing.assert_close(
-        out_tp2, out_tp1, atol=atol, rtol=rtol,
+        out_tp2,
+        out_tp1,
+        atol=atol,
+        rtol=rtol,
         msg=lambda m: f"[TP-parity rank={rank}]: {m}\nmax_abs_err={err:.6f}",
     )
 
-    print(f"  [TP=1 vs TP=2 rank={rank}] PASS  "
-          f"u={u} g={g} nh={nh} ng={ng} hd={hd}  "
-          f"max_abs_err={err:.6f}  max_rel_err={rel:.6f}")
+    print(
+        f"  [TP=1 vs TP=2 rank={rank}] PASS  "
+        f"u={u} g={g} nh={nh} ng={ng} hd={hd}  "
+        f"max_abs_err={err:.6f}  max_rel_err={rel:.6f}"
+    )
 
 
 def main():
@@ -239,14 +245,14 @@ def main():
         sys.exit(1)
 
     # Both branches active.
-    run_tp_parity_test(u=8,  g=4,  nh=4, ng=2, hd=32)   # H=128
-    run_tp_parity_test(u=16, g=8,  nh=4, ng=4, hd=32)   # H=128, MHA (ng=nh)
-    run_tp_parity_test(u=8,  g=4,  nh=8, ng=2, hd=64)   # H=512, larger GQA ratio
+    run_tp_parity_test(u=8, g=4, nh=4, ng=2, hd=32)  # H=128
+    run_tp_parity_test(u=16, g=8, nh=4, ng=4, hd=32)  # H=128, MHA (ng=nh)
+    run_tp_parity_test(u=8, g=4, nh=8, ng=2, hd=64)  # H=512, larger GQA ratio
 
     # Single-branch (und-only).
-    run_tp_parity_test(u=12, g=0,  nh=4, ng=2, hd=32)
+    run_tp_parity_test(u=12, g=0, nh=4, ng=2, hd=32)
     # Single-branch (gen-only).
-    run_tp_parity_test(u=0,  g=12, nh=4, ng=2, hd=32)
+    run_tp_parity_test(u=0, g=12, nh=4, ng=2, hd=32)
 
     if rank == 0:
         print("\nAll TP=2 SelfAttentionMoT parity tests passed.")

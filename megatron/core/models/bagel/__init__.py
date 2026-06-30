@@ -5,10 +5,7 @@ Includes MoT (Mixture of Transformers) transformer layer/block primitives, the
 Bagel-specific RoPE, FlexAttention, packed-sequence parameters, and the LLM /
 MIMO model wrappers used by the Bagel example.
 """
-from .attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
+from .attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
 from .bagel_mimo import BagelMimoModel, gather_pad_to_length
 from .bagel_rope import BagelRotaryEmbedding
 from .flex_attention import FlexAttention
@@ -20,10 +17,7 @@ from .transformer_mot_block import (
     TransformerMoTBlockSubmodules,
     get_mot_layer_spec,
 )
-from .transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
+from .transformer_mot_layer import MoTTransformerLayer, MoTTransformerLayerSubmodules
 
 __all__ = [
     'BagelLLMHuggingFaceModel',

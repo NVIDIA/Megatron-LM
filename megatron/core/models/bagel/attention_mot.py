@@ -1,21 +1,26 @@
-import torch
-import torch.distributed as dist
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
+
+import torch
+from torch import Tensor
+
+from megatron.core import tensor_parallel
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, divide
-from megatron.core.transformer.module import MegatronModule
-from megatron.core import tensor_parallel
-import logging
+from megatron.core.utils import divide, get_pg_size
+
 logger = logging.getLogger(__name__)
 
-from torch import Tensor
-from megatron.core.packed_seq_params import PackedSeqParams
 from .mot_packed_seq_params import MoTPackedSeqParams
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+
 
 @dataclass
 class SelfAttentionMoTSubmodules:
@@ -91,7 +96,7 @@ class SelfAttentionMoT(MegatronModule):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_group = getattr(pg_collection, 'cp', None)
-        self.cp_size  = self.cp_group.size() if self.cp_group is not None else 1
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         # Per attention head and per partition values
         tp_size = get_pg_size(self.pg_collection.tp)
@@ -274,12 +279,12 @@ class SelfAttentionMoT(MegatronModule):
             rotary_pos_cos_sin (Tensor, optional): Combined rotary embedding.
             attention_bias (Tensor, optional): Attention bias.
             packed_seq_params (MoTPackedSeqParams, optional): Packed sequence parameters. contains:
-                - packed_und_token_indexes: global indexes of understanding tokens, needed by cp > 1.
-                - packed_gen_token_indexes: global indexes of generation tokens, needed by cp > 1.
-                - local_und_token_indexes: local indexes of understanding tokens. if cp = 1, global == local.
-                - local_gen_token_indexes: local indexes of generation tokens. if cp = 1, global == local.
-                - padded_und_seqlen: padded sequence length of understanding tokens in hidden_states.
-                - padded_gen_seqlen: padded sequence length of generation tokens in hidden_states.
+                - packed_und_token_indexes: global understanding-token indexes.
+                - packed_gen_token_indexes: global generation-token indexes.
+                - local_und_token_indexes: local understanding-token indexes.
+                - local_gen_token_indexes: local generation-token indexes.
+                - padded_und_seqlen: padded understanding-token length in hidden_states.
+                - padded_gen_seqlen: padded generation-token length in hidden_states.
             sequence_len_offset (Tensor, optional): Sequence length offset.
             mode (str): Processing mode - "und" or "gen".
 
@@ -328,10 +333,11 @@ class SelfAttentionMoT(MegatronModule):
         """
         seq_len, batch_size, hidden_size = hidden_states.shape
         assert batch_size == 1, "batch_size must be 1 for MoT with packed sequence"
-        assert packed_seq_params is not None, "packed_seq_params must be provided for MoT with packed sequence"
+        assert (
+            packed_seq_params is not None
+        ), "packed_seq_params must be provided for MoT with packed sequence"
         Lund = getattr(packed_seq_params, 'padded_und_seqlen', 0)
         Lgen = getattr(packed_seq_params, 'padded_gen_seqlen', 0)
-
 
         # =====================================================================
         # QKV projection with MoT (separate for und/gen)
@@ -348,7 +354,6 @@ class SelfAttentionMoT(MegatronModule):
         if self.freeze_und:
             und_qkv = und_qkv.detach()
 
-
         # Process generation tokens
         gen_qkv = None
         gen_hidden = hidden_states_flat[Lund:]
@@ -357,12 +362,16 @@ class SelfAttentionMoT(MegatronModule):
         else:
             raise ValueError("linear_qkv_gen is None")
 
-        assert und_qkv is not None or gen_qkv is not None, "und_qkv and gen_qkv cannot be None at the same time"
+        assert (
+            und_qkv is not None or gen_qkv is not None
+        ), "und_qkv and gen_qkv cannot be None at the same time"
         parts = [x for x in (und_qkv, gen_qkv) if x is not None]
         qkv_output_flat = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
 
         # Reshape back
-        qkv_output = qkv_output_flat.view(seq_len, batch_size, self.linear_qkv_out_dim_per_partition)
+        qkv_output = qkv_output_flat.view(
+            seq_len, batch_size, self.linear_qkv_out_dim_per_partition
+        )
 
         # =====================================================================
         # Split QKV and apply layernorms
@@ -371,9 +380,7 @@ class SelfAttentionMoT(MegatronModule):
 
         # Apply Q/K layernorms with MoT
         if self.q_layernorm is not None or self.k_layernorm is not None:
-            query, key = self._apply_qk_layernorm_mot(
-                query, key, Lund, Lgen
-            )
+            query, key = self._apply_qk_layernorm_mot(query, key, Lund, Lgen)
 
         # =====================================================================
         # Apply rotary positional embeddings to query and key
@@ -387,32 +394,29 @@ class SelfAttentionMoT(MegatronModule):
                 k_pos_emb = rotary_pos_emb
 
             if q_pos_emb is not None:
-                query = apply_rotary_pos_emb(
-                    query,
-                    q_pos_emb,
-                    config=self.config,
-                )
+                query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config)
             if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key,
-                    k_pos_emb,
-                    config=self.config,
-                )
-
+                key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
 
         # # =====================================================================
         # # Core attention (with flex_attention support)
         # # =====================================================================
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask,
+                query,
+                key,
+                value,
+                attention_mask,
                 attn_mask_type=self.attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
         else:
             core_attn_out = self.core_attention(
-                query, key, value, attention_mask,
+                query,
+                key,
+                value,
+                attention_mask,
                 attn_mask_type=self.attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
@@ -421,9 +425,7 @@ class SelfAttentionMoT(MegatronModule):
         # =====================================================================
         # Output projection with MoT
         # =====================================================================
-        output = self._apply_output_projection_mot(
-            core_attn_out, Lund, Lgen
-        )
+        output = self._apply_output_projection_mot(core_attn_out, Lund, Lgen)
 
         return output
 
@@ -449,9 +451,15 @@ class SelfAttentionMoT(MegatronModule):
         # Choose projections based on mode
         if mode == "gen" and self.linear_qkv_gen is not None:
             linear_qkv = self.linear_qkv_gen
-            linear_proj = self.linear_proj_gen if self.linear_proj_gen is not None else self.linear_proj
-            q_layernorm = self.q_layernorm_gen if self.q_layernorm_gen is not None else self.q_layernorm
-            k_layernorm = self.k_layernorm_gen if self.k_layernorm_gen is not None else self.k_layernorm
+            linear_proj = (
+                self.linear_proj_gen if self.linear_proj_gen is not None else self.linear_proj
+            )
+            q_layernorm = (
+                self.q_layernorm_gen if self.q_layernorm_gen is not None else self.q_layernorm
+            )
+            k_layernorm = (
+                self.k_layernorm_gen if self.k_layernorm_gen is not None else self.k_layernorm
+            )
         else:
             linear_qkv = self.linear_qkv
             linear_proj = self.linear_proj
@@ -480,21 +488,16 @@ class SelfAttentionMoT(MegatronModule):
                 k_pos_emb = rotary_pos_emb
 
             if q_pos_emb is not None:
-                query = apply_rotary_pos_emb(
-                    query,
-                    q_pos_emb,
-                    config=self.config,
-                )
+                query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config)
             if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key,
-                    k_pos_emb,
-                    config=self.config,
-                )
+                key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
 
         # Core attention
         core_attn_out = self.core_attention(
-            query, key, value, attention_mask,
+            query,
+            key,
+            value,
+            attention_mask,
             attn_mask_type=self.attn_mask_type,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
@@ -528,7 +531,8 @@ class SelfAttentionMoT(MegatronModule):
         qkv = qkv.view(*new_tensor_shape)
 
         # Split along the last dimension (dim=3)
-        # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+        # [sq, b, ng, (np/ng + 2) * hn] ->
+        # [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
         split_arg_list = [
             num_query_heads_per_group * self.hidden_size_per_attention_head,
             self.hidden_size_per_attention_head,
@@ -541,11 +545,7 @@ class SelfAttentionMoT(MegatronModule):
         return query, key, value
 
     def _apply_qk_layernorm_mot(
-        self,
-        query: Tensor,
-        key: Tensor,
-        padded_und_seqlen: int,
-        padded_gen_seqlen: int,
+        self, query: Tensor, key: Tensor, padded_und_seqlen: int, padded_gen_seqlen: int
     ) -> Tuple[Tensor, Tensor]:
         """Apply Q/K layernorms with MoT (separate for und/gen tokens)."""
         seq_len, batch_size, num_heads, head_dim = query.shape
@@ -559,13 +559,9 @@ class SelfAttentionMoT(MegatronModule):
 
         # Apply layernorms to understanding tokens
         if self.q_layernorm is not None:
-            query_out[:padded_und_seqlen] = self.q_layernorm(
-                query_flat[:padded_und_seqlen]
-            )
+            query_out[:padded_und_seqlen] = self.q_layernorm(query_flat[:padded_und_seqlen])
         if self.k_layernorm is not None:
-            key_out[:padded_und_seqlen] = self.k_layernorm(
-                key_flat[:padded_und_seqlen]
-            )
+            key_out[:padded_und_seqlen] = self.k_layernorm(key_flat[:padded_und_seqlen])
 
         # Apply layernorms to generation tokens
         q_norm = self.q_layernorm_gen if self.q_layernorm_gen is not None else self.q_layernorm
@@ -583,17 +579,16 @@ class SelfAttentionMoT(MegatronModule):
         return query, key
 
     def _apply_output_projection_mot(
-        self,
-        attn_output: Tensor,
-        padded_und_seqlen: int,
-        padded_gen_seqlen: int,
+        self, attn_output: Tensor, padded_und_seqlen: int, padded_gen_seqlen: int
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Apply output projection with MoT (separate for und/gen tokens)."""
         seq_len, batch_size, hidden_size = attn_output.shape
 
         # Flatten for token-level indexing
         attn_output_flat = attn_output.view(-1, hidden_size)
-        # output_flat = attn_output_flat.new_zeros(attn_output_flat.shape[0], self.config.hidden_size)
+        # output_flat = attn_output_flat.new_zeros(
+        #     attn_output_flat.shape[0], self.config.hidden_size
+        # )
 
         # Process understanding tokens
         und_output = None
@@ -606,7 +601,9 @@ class SelfAttentionMoT(MegatronModule):
         linear_proj = self.linear_proj_gen if self.linear_proj_gen is not None else self.linear_proj
         gen_output, _ = linear_proj(attn_output_flat[padded_und_seqlen:])
 
-        assert und_output is not None or gen_output is not None, "und_output and gen_output cannot be None at the same time"
+        assert (
+            und_output is not None or gen_output is not None
+        ), "und_output and gen_output cannot be None at the same time"
         parts = [x for x in (und_output, gen_output) if x is not None]
         output_flat = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
 
@@ -630,12 +627,13 @@ class SelfAttentionMoT(MegatronModule):
         def custom_forward(*inputs):
             q, k, v, mask = inputs[:4]
             return self.core_attention(
-                q, k, v, mask,
+                q,
+                k,
+                v,
+                mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
 
-        return tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask
-        )
+        return tensor_parallel.checkpoint(custom_forward, False, query, key, value, attention_mask)

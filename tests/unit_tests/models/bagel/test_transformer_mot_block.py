@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 Unit test for TransformerMoTBlock (Megatron Core) vs Qwen2Model (Bagel reference).
 
@@ -33,28 +35,22 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _BAGEL_PKG)
 sys.path.insert(0, _BAGEL_SRC)
 
-from megatron.core.models.bagel.attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
-from megatron.core.models.bagel.transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
+from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
 from megatron.core.models.bagel.flex_attention import FlexAttention
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
     TransformerMoTBlock,
     TransformerMoTBlockSubmodules,
 )
+from megatron.core.models.bagel.transformer_mot_layer import (
+    MoTTransformerLayer,
+    MoTTransformerLayerSubmodules,
+)
 
 # ── Optional bagel-package imports ────────────────────────────────────────────
 try:
-    from bagel.modeling.bagel.qwen2_navit import (
-        Qwen2Model,
-        Qwen2MoTDecoderLayer,
-        Qwen2Config as BagelQwen2Config,
-    )
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Config as BagelQwen2Config
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Model, Qwen2MoTDecoderLayer
 
     HAVE_BAGEL_PKG = True
 except ImportError:
@@ -77,7 +73,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test dimensions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,13 +93,13 @@ ROPE_THETA = 10000.0  # Qwen2 default
 
 def _mot_block_mask(n_und: int, seq_len: int, device: str):
     """BlockMask: causal for und rows, full attention for gen rows."""
+
     def mask_fn(b, h, q_idx, kv_idx):
         is_gen_q = q_idx >= n_und
         causal_ok = kv_idx <= q_idx
         return is_gen_q | causal_ok
-    return create_block_mask(
-        mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
-    )
+
+    return create_block_mask(mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
 
 
 def _make_psp(n_und: int, n_gen: int) -> MoTPackedSeqParams:
@@ -251,10 +246,7 @@ def _make_mcore_layer_spec() -> ModuleSpec:
     )
     mlp_spec = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(
-            linear_fc1=ColumnParallelLinear,
-            linear_fc2=RowParallelLinear,
-        ),
+        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
     )
     layer_submodules = MoTTransformerLayerSubmodules(
         input_layernorm=WrappedTorchNorm,
@@ -303,10 +295,7 @@ def _make_mcore_block_flex(mcore_config: TransformerConfig) -> TransformerMoTBlo
     )
     mlp_spec = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(
-            linear_fc1=ColumnParallelLinear,
-            linear_fc2=RowParallelLinear,
-        ),
+        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
     )
     layer_submodules = MoTTransformerLayerSubmodules(
         input_layernorm=WrappedTorchNorm,
@@ -359,32 +348,40 @@ def _copy_attn_weights(bagel_attn, mcore_attn):
     ng = bagel_attn.num_key_value_heads
     hn = bagel_attn.head_dim
 
-    for (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
-         linear_qkv, linear_proj, qln, kln) in [
+    for q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, linear_qkv, linear_proj, qln, kln in [
         (
-            bagel_attn.q_proj, bagel_attn.k_proj, bagel_attn.v_proj, bagel_attn.o_proj,
-            bagel_attn.q_norm, bagel_attn.k_norm,
-            mcore_attn.linear_qkv, mcore_attn.linear_proj,
-            mcore_attn.q_layernorm, mcore_attn.k_layernorm,
+            bagel_attn.q_proj,
+            bagel_attn.k_proj,
+            bagel_attn.v_proj,
+            bagel_attn.o_proj,
+            bagel_attn.q_norm,
+            bagel_attn.k_norm,
+            mcore_attn.linear_qkv,
+            mcore_attn.linear_proj,
+            mcore_attn.q_layernorm,
+            mcore_attn.k_layernorm,
         ),
         (
-            bagel_attn.q_proj_moe_gen, bagel_attn.k_proj_moe_gen,
-            bagel_attn.v_proj_moe_gen, bagel_attn.o_proj_moe_gen,
-            bagel_attn.q_norm_moe_gen, bagel_attn.k_norm_moe_gen,
-            mcore_attn.linear_qkv_gen, mcore_attn.linear_proj_gen,
-            mcore_attn.q_layernorm_gen, mcore_attn.k_layernorm_gen,
+            bagel_attn.q_proj_moe_gen,
+            bagel_attn.k_proj_moe_gen,
+            bagel_attn.v_proj_moe_gen,
+            bagel_attn.o_proj_moe_gen,
+            bagel_attn.q_norm_moe_gen,
+            bagel_attn.k_norm_moe_gen,
+            mcore_attn.linear_qkv_gen,
+            mcore_attn.linear_proj_gen,
+            mcore_attn.q_layernorm_gen,
+            mcore_attn.k_layernorm_gen,
         ),
     ]:
         linear_qkv.weight.data.copy_(
             _hf_to_mcore_qkv_weight(
-                q_proj.weight.data, k_proj.weight.data, v_proj.weight.data,
-                ng=ng, np=np_, hn=hn,
+                q_proj.weight.data, k_proj.weight.data, v_proj.weight.data, ng=ng, np=np_, hn=hn
             )
         )
         linear_qkv.bias.data.copy_(
             _hf_to_mcore_qkv_bias(
-                q_proj.bias.data, k_proj.bias.data, v_proj.bias.data,
-                ng=ng, np=np_, hn=hn,
+                q_proj.bias.data, k_proj.bias.data, v_proj.bias.data, ng=ng, np=np_, hn=hn
             )
         )
         linear_proj.weight.data.copy_(o_proj.weight.data)
@@ -404,9 +401,7 @@ def _copy_mlp_weights(bagel_mlp, mcore_mlp):
 
 def _copy_layer_weights(bagel_layer, mcore_layer):
     """Copy all weights from a Qwen2MoTDecoderLayer to a MoTTransformerLayer."""
-    mcore_layer.input_layernorm.weight.data.copy_(
-        bagel_layer.input_layernorm.weight.data
-    )
+    mcore_layer.input_layernorm.weight.data.copy_(bagel_layer.input_layernorm.weight.data)
     mcore_layer.input_layernorm_gen.weight.data.copy_(
         bagel_layer.input_layernorm_moe_gen.weight.data
     )
@@ -429,9 +424,7 @@ def _copy_model_weights(bagel_model: "Qwen2Model", mcore_block: TransformerMoTBl
     if mcore_block.final_layernorm is not None:
         mcore_block.final_layernorm.weight.data.copy_(bagel_model.norm.weight.data)
     if mcore_block.final_layernorm_gen is not None:
-        mcore_block.final_layernorm_gen.weight.data.copy_(
-            bagel_model.norm_moe_gen.weight.data
-        )
+        mcore_block.final_layernorm_gen.weight.data.copy_(bagel_model.norm_moe_gen.weight.data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,9 +543,9 @@ class TestTransformerMoTBlockAccuracy:
 
         # Layer numbering starts at 1
         for i, layer in enumerate(mcore_block.layers):
-            assert layer.layer_number == i + 1, (
-                f"layer {i}: expected layer_number={i+1}, got {layer.layer_number}"
-            )
+            assert (
+                layer.layer_number == i + 1
+            ), f"layer {i}: expected layer_number={i+1}, got {layer.layer_number}"
 
         # Spot-check shapes for each layer
         for mcore_layer in mcore_block.layers:
@@ -590,8 +583,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3,
-            msg=lambda m: f"[und-only] {m}",
+            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[und-only] {m}"
         )
 
     def test_forward_train_gen_only(self):
@@ -624,8 +616,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3,
-            msg=lambda m: f"[gen-only] {m}",
+            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[gen-only] {m}"
         )
 
     def test_forward_train_mixed(self):
@@ -656,8 +647,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3,
-            msg=lambda m: f"[mixed] {m}",
+            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[mixed] {m}"
         )
 
     def test_final_layernorm_separate(self):
@@ -709,7 +699,10 @@ class TestTransformerMoTBlockAccuracy:
             mcore_out, _ = mcore_block.layers[0].mlp(x)
 
         torch.testing.assert_close(
-            mcore_out, bagel_out, atol=1e-3, rtol=1e-3,
+            mcore_out,
+            bagel_out,
+            atol=1e-3,
+            rtol=1e-3,
             msg=lambda m: f"[mlp-weight-copy] layer 0: {m}",
         )
 
@@ -749,9 +742,9 @@ class TestTransformerMoTBlockAccuracy:
             )
 
         # Outputs must differ when layer 2 is changed
-        assert not torch.allclose(out_2layer, out_modified, atol=1e-4), (
-            "Zeroing layer-2 MLP should change the output, confirming layer 2 is active"
-        )
+        assert not torch.allclose(
+            out_2layer, out_modified, atol=1e-4
+        ), "Zeroing layer-2 MLP should change the output, confirming layer 2 is active"
 
     def test_compact_ordering_consistency(self):
         """Verify compact ordering: output[:n_und] == hs_flat[und_idx], output[n_und:] == hs_flat[gen_idx].
@@ -874,17 +867,14 @@ class TestTransformerMoTBlockCompact:
                 packed_gen_token_indexes=gen_idx,
             )
             mcore_out, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         out_flat = mcore_out.squeeze(1)
         assert not torch.any(torch.isnan(out_flat)), "MCore NaN in compact und-only"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel NaN in compact und-only"
         torch.testing.assert_close(
-            out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[compact-und-only] {m}",
+            out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[compact-und-only] {m}"
         )
 
     def test_compact_forward_vs_bagel_gen_only(self):
@@ -906,17 +896,14 @@ class TestTransformerMoTBlockCompact:
                 packed_gen_token_indexes=gen_idx,
             )
             mcore_out, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         out_flat = mcore_out.squeeze(1)
         assert not torch.any(torch.isnan(out_flat)), "MCore NaN in compact gen-only"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel NaN in compact gen-only"
         torch.testing.assert_close(
-            out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[compact-gen-only] {m}",
+            out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[compact-gen-only] {m}"
         )
 
     def test_compact_forward_vs_bagel_mixed(self):
@@ -938,17 +925,14 @@ class TestTransformerMoTBlockCompact:
                 packed_gen_token_indexes=gen_idx,
             )
             mcore_out, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         out_flat = mcore_out.squeeze(1)
         assert not torch.any(torch.isnan(out_flat)), "MCore NaN in compact mixed"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel NaN in compact mixed"
         torch.testing.assert_close(
-            out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[compact-mixed] {m}",
+            out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[compact-mixed] {m}"
         )
 
     def test_compact_final_layernorm_separate(self):
@@ -968,9 +952,7 @@ class TestTransformerMoTBlockCompact:
             mcore_block.final_layernorm_gen.weight.data.fill_(2.0)
 
             out, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         out_flat = out.squeeze(1)  # [Lund+Lgen, h]
@@ -993,9 +975,7 @@ class TestTransformerMoTBlockCompact:
 
         with torch.no_grad():
             out_ref, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         with torch.no_grad():
@@ -1004,14 +984,12 @@ class TestTransformerMoTBlockCompact:
 
         with torch.no_grad():
             out_mod, _ = mcore_block.forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
-        assert not torch.allclose(out_ref, out_mod, atol=1e-4), (
-            "Compact mode: zeroing layer-2 MLP should change the output"
-        )
+        assert not torch.allclose(
+            out_ref, out_mod, atol=1e-4
+        ), "Compact mode: zeroing layer-2 MLP should change the output"
 
     def test_compact_freeze_und_detaches_grad(self):
         """freeze_und in compact mode: und tokens [:Lund] are detached between layers.
@@ -1029,38 +1007,53 @@ class TestTransformerMoTBlockCompact:
 
         # Build block with freeze_und=True using the flex layer spec
         attn_sub = SelfAttentionMoTSubmodules(
-            linear_qkv=ColumnParallelLinear, core_attention=FlexAttention,
-            linear_proj=RowParallelLinear, q_layernorm=WrappedTorchNorm,
-            k_layernorm=WrappedTorchNorm, linear_qkv_gen=ColumnParallelLinear,
-            linear_proj_gen=RowParallelLinear, q_layernorm_gen=WrappedTorchNorm,
+            linear_qkv=ColumnParallelLinear,
+            core_attention=FlexAttention,
+            linear_proj=RowParallelLinear,
+            q_layernorm=WrappedTorchNorm,
+            k_layernorm=WrappedTorchNorm,
+            linear_qkv_gen=ColumnParallelLinear,
+            linear_proj_gen=RowParallelLinear,
+            q_layernorm_gen=WrappedTorchNorm,
             k_layernorm_gen=WrappedTorchNorm,
         )
-        mlp_spec = ModuleSpec(module=MLP, submodules=MLPSubmodules(
-            linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
-        ))
-        layer_sub = MoTTransformerLayerSubmodules(
-            input_layernorm=WrappedTorchNorm, input_layernorm_gen=WrappedTorchNorm,
-            self_attention=ModuleSpec(module=SelfAttentionMoT,
-                                      params={"attn_mask_type": AttnMaskType.padding},
-                                      submodules=attn_sub),
-            self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=WrappedTorchNorm, pre_mlp_layernorm_gen=WrappedTorchNorm,
-            mlp=mlp_spec, mlp_gen=mlp_spec, mlp_bda=get_bias_dropout_add,
+        mlp_spec = ModuleSpec(
+            module=MLP,
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
         )
-        frozen_block = TransformerMoTBlock(
-            config=mcore_cfg,
-            spec=TransformerMoTBlockSubmodules(
-                layer_specs=[ModuleSpec(module=MoTTransformerLayer, submodules=layer_sub)] * NUM_LAYERS,
-                layer_norm=WrappedTorchNorm,
-                layer_norm_gen=WrappedTorchNorm,
+        layer_sub = MoTTransformerLayerSubmodules(
+            input_layernorm=WrappedTorchNorm,
+            input_layernorm_gen=WrappedTorchNorm,
+            self_attention=ModuleSpec(
+                module=SelfAttentionMoT,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=attn_sub,
             ),
-            freeze_und=True,
-        ).cuda().half().train()
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=WrappedTorchNorm,
+            pre_mlp_layernorm_gen=WrappedTorchNorm,
+            mlp=mlp_spec,
+            mlp_gen=mlp_spec,
+            mlp_bda=get_bias_dropout_add,
+        )
+        frozen_block = (
+            TransformerMoTBlock(
+                config=mcore_cfg,
+                spec=TransformerMoTBlockSubmodules(
+                    layer_specs=[ModuleSpec(module=MoTTransformerLayer, submodules=layer_sub)]
+                    * NUM_LAYERS,
+                    layer_norm=WrappedTorchNorm,
+                    layer_norm_gen=WrappedTorchNorm,
+                ),
+                freeze_und=True,
+            )
+            .cuda()
+            .half()
+            .train()
+        )
 
         out, _ = frozen_block.forward_train(
-            hidden_states=hidden_states,
-            attention_mask=bm,
-            packed_seq_params=psp,
+            hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
         )
         # Loss on gen slice only; freeze_und should prevent gradients from reaching und MLP
         loss = out[n_und:].float().sum()
@@ -1069,12 +1062,12 @@ class TestTransformerMoTBlockCompact:
         und_grad = frozen_block.layers[0].mlp.linear_fc2.weight.grad
         gen_grad = frozen_block.layers[0].mlp_gen.linear_fc2.weight.grad
 
-        assert und_grad is None or und_grad.abs().max() < 1e-6, (
-            "freeze_und: und MLP grad should be zero/None (detach blocks backprop)"
-        )
-        assert gen_grad is not None and gen_grad.abs().max() > 0, (
-            "freeze_und: gen MLP grad should be non-zero"
-        )
+        assert (
+            und_grad is None or und_grad.abs().max() < 1e-6
+        ), "freeze_und: und MLP grad should be zero/None (detach blocks backprop)"
+        assert (
+            gen_grad is not None and gen_grad.abs().max() > 0
+        ), "freeze_und: gen MLP grad should be non-zero"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1086,24 +1079,30 @@ if __name__ == "__main__":
     model_parallel_cuda_manual_seed(42)
 
     for cls, methods in [
-        (TestTransformerMoTBlockAccuracy, [
-            "test_constructor",
-            "test_weight_sync_correctness",
-            "test_final_layernorm_separate",
-            "test_two_layer_depth",
-            "test_forward_train_und_only",
-            "test_forward_train_gen_only",
-            "test_forward_train_mixed",
-            "test_compact_ordering_consistency",
-        ]),
-        (TestTransformerMoTBlockCompact, [
-            "test_compact_forward_vs_bagel_und_only",
-            "test_compact_forward_vs_bagel_gen_only",
-            "test_compact_forward_vs_bagel_mixed",
-            "test_compact_final_layernorm_separate",
-            "test_compact_two_layer_depth",
-            "test_compact_freeze_und_detaches_grad",
-        ]),
+        (
+            TestTransformerMoTBlockAccuracy,
+            [
+                "test_constructor",
+                "test_weight_sync_correctness",
+                "test_final_layernorm_separate",
+                "test_two_layer_depth",
+                "test_forward_train_und_only",
+                "test_forward_train_gen_only",
+                "test_forward_train_mixed",
+                "test_compact_ordering_consistency",
+            ],
+        ),
+        (
+            TestTransformerMoTBlockCompact,
+            [
+                "test_compact_forward_vs_bagel_und_only",
+                "test_compact_forward_vs_bagel_gen_only",
+                "test_compact_forward_vs_bagel_mixed",
+                "test_compact_final_layernorm_separate",
+                "test_compact_two_layer_depth",
+                "test_compact_freeze_und_detaches_grad",
+            ],
+        ),
     ]:
         print(f"\n{cls.__name__}:")
         t = cls()
@@ -1113,6 +1112,7 @@ if __name__ == "__main__":
                 print(f"  ✓ {method_name}")
             except Exception as e:
                 import traceback
+
                 print(f"  ✗ {method_name}: {e}")
                 traceback.print_exc()
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 Unit test for MoTTransformerLayer with Expert Parallelism (EP=2).
 
@@ -27,39 +29,36 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _BAGEL_PKG)
 sys.path.insert(0, _BAGEL_SRC)
 
-from megatron.core.models.bagel.attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
-from megatron.core.models.bagel.transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
-from megatron.core.models.bagel.transformer_mot_block import get_mot_layer_spec
-
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention as F_sdpa
 
 from megatron.core import parallel_state as mpu
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
+from megatron.core.models.bagel.transformer_mot_block import get_mot_layer_spec
+from megatron.core.models.bagel.transformer_mot_layer import (
+    MoTTransformerLayer,
+    MoTTransformerLayerSubmodules,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.moe.moe_utils import (
-    get_moe_layer_wise_logging_tracker,
-    clear_aux_losses_tracker,
-)
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import Utils
 
 try:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
     HAVE_WRAPPED_NORM = True
 except ImportError:
     HAVE_WRAPPED_NORM = False
@@ -70,15 +69,32 @@ except ImportError:
 # Uses EFFICIENT_ATTENTION to avoid TE packed-sequence shape constraints.
 # ─────────────────────────────────────────────────────────────────────────────
 class _StubCoreAttention(MegatronModule):
-    def __init__(self, config, layer_number, attn_mask_type, attention_type,
-                 softmax_scale=None, cp_comm_type=None, pg_collection=None, **kwargs):
+    def __init__(
+        self,
+        config,
+        layer_number,
+        attn_mask_type,
+        attention_type,
+        softmax_scale=None,
+        cp_comm_type=None,
+        pg_collection=None,
+        **kwargs,
+    ):
         super().__init__(config=config)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_query_groups
         self.head_dim = config.kv_channels
 
-    def forward(self, query, key, value, attention_mask, attn_mask_type=None,
-                attention_bias=None, packed_seq_params=None):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+    ):
         seq_len, batch_size, num_heads, head_dim = query.shape
         num_kv_heads = key.shape[2]
         if num_kv_heads != num_heads:
@@ -103,7 +119,7 @@ FFN_HIDDEN_SIZE = 256
 NUM_HEADS = 4
 NUM_KV_HEADS = 4
 HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
-NUM_EXPERTS = 4     # each EP rank holds 2 experts
+NUM_EXPERTS = 4  # each EP rank holds 2 experts
 MOE_TOPK = 2
 N_UND = 16
 N_GEN = 16
@@ -157,9 +173,7 @@ def test_mot_ep():
 
     # Initialize with EP=2
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=2,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, expert_model_parallel_size=2
     )
 
     model_parallel_cuda_manual_seed(42)
@@ -182,6 +196,7 @@ def test_mot_ep():
     # Use get_mot_layer_spec for MoE mlp spec, then override attention
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.utils import get_linear_layer
+
     mlp_spec = get_mot_layer_spec(
         num_experts=NUM_EXPERTS,
         moe_grouped_gemm=False,
@@ -208,12 +223,11 @@ def test_mot_ep():
     layer_spec = ModuleSpec(module=MoTTransformerLayer, submodules=layer_submodules)
 
     # Build MoTTransformerLayer (layer_number=1 for aux loss tracking)
-    layer = build_module(
-        layer_spec,
-        config=config,
-        layer_number=1,
-        pg_collection=pg_collection,
-    ).cuda().to(torch.bfloat16)
+    layer = (
+        build_module(layer_spec, config=config, layer_number=1, pg_collection=pg_collection)
+        .cuda()
+        .to(torch.bfloat16)
+    )
     layer.train()
 
     # Verify both mlp and mlp_gen are MoELayer instances
@@ -232,17 +246,19 @@ def test_mot_ep():
     output, _ = layer(hidden_states, attention_mask=None, packed_seq_params=psp)
 
     # Verify output shape
-    assert output.shape == (SEQ_LEN, 1, HIDDEN_SIZE), (
-        f"Expected shape ({SEQ_LEN}, 1, {HIDDEN_SIZE}), got {output.shape}"
-    )
+    assert output.shape == (
+        SEQ_LEN,
+        1,
+        HIDDEN_SIZE,
+    ), f"Expected shape ({SEQ_LEN}, 1, {HIDDEN_SIZE}), got {output.shape}"
 
     # Verify aux loss tracker is populated (both mlp and mlp_gen contribute)
     tracker = get_moe_layer_wise_logging_tracker()
     assert "load_balancing_loss" in tracker, "load_balancing_loss should be in aux loss tracker"
     lb_values = tracker["load_balancing_loss"]["values"]
-    assert lb_values[0].item() > 0.0, (
-        f"load_balancing_loss for layer 1 should be > 0, got {lb_values[0].item()}"
-    )
+    assert (
+        lb_values[0].item() > 0.0
+    ), f"load_balancing_loss for layer 1 should be > 0, got {lb_values[0].item()}"
 
     # Backward pass sanity check
     loss = output.sum()
