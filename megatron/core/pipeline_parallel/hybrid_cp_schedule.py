@@ -566,7 +566,6 @@ def hybrid_context_parallel_forward_backward(
 
     # We get data once per global batch and schedule the sub-samples.
     hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    # is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
 
     if data_iterator is not None:
         data = next(data_iterator)
@@ -620,30 +619,6 @@ def hybrid_context_parallel_forward_backward(
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-
-    # For the last group, we need to run the last sub-sample out of the context handler.
-    # with no_sync_func():
-    #     for i in range(num_samples_this_group[-1] - 1):
-    #         # Call forward step for each sub-sample
-    #         output_tensor, num_tokens = forward_step(
-    #             forward_step_func,
-    #             new_data_iterator,
-    #             model,
-    #             num_microbatches,
-    #             input_tensor,
-    #             forward_data_store,
-    #             config,
-    #             pg_collection.cp.size(),
-    #             collect_non_loss_data,
-    #             is_first_microbatch=check_first_val_step(
-    #                 first_val_step, forward_only, current_microbatch == 0
-    #             ),
-    #             current_microbatch=current_microbatch,
-    #         )
-    #         current_microbatch += 1
-    #         total_num_tokens += num_tokens.item()
-    #         if not forward_only:
-    #             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     # The last sub-sample of the last group of the last microbatch is
     # run out of the context handler.
