@@ -613,9 +613,10 @@ class TEGroupedMLP(MegatronModule):
             stash_context = nullcontext()
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
-        with off_interface(
+        fused_group_mlp_manager = off_interface(
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
-        ) as permuted_local_hidden_states:
+        )
+        with fused_group_mlp_manager as permuted_local_hidden_states:
             forced_released_tensors = (
                 [permuted_local_hidden_states] if fine_grained_activation_offloading else []
             )
@@ -627,10 +628,9 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,  # Scaled activation
                     tokens_per_expert,  # FC2
                 )
-        if fine_grained_activation_offloading:
-            output = off_interface.group_commit(
-                output, name=offload_name, forced_released_tensors=forced_released_tensors
-            )
+        output = fused_group_mlp_manager.group_offload(
+            output, forced_released_tensors=forced_released_tensors
+        )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
