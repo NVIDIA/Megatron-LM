@@ -577,9 +577,8 @@ class MegatronFSDP(torch.nn.Module):
                 # in fine_grained_recurse_module_types (e.g. TEGroupedMLP,
                 # SharedExpertMLP) need recurse=True because weights live on
                 # children and the container is the compute entry point.
-                if (
-                    self.fine_grained_recurse_module_types
-                    and isinstance(module, self.fine_grained_recurse_module_types)
+                if self.fine_grained_recurse_module_types and isinstance(
+                    module, self.fine_grained_recurse_module_types
                 ):
                     return list(module.parameters(recurse=True))
                 else:
