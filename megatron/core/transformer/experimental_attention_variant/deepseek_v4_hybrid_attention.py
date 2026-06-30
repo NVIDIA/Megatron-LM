@@ -8,6 +8,10 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -25,16 +29,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version
-
-try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_mla_rope_inplace,
-        fused_mla_rope_out_of_place,
-    )
-except Exception:
-    fused_mla_rope_inplace = None
-    fused_mla_rope_out_of_place = None
-
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -407,7 +401,6 @@ class DSv4HybridAttention(Attention):
                 # Fused DSA backward retains the raw attention output O. Applying
                 # inverse RoPE to its view in-place corrupts the retained O used by
                 # the softmax backward, so this call needs private storage.
-                assert fused_mla_rope_out_of_place is not None
                 core_attn_out = fused_mla_rope_out_of_place(
                     core_attn_out,
                     rotary_pos_cos,
