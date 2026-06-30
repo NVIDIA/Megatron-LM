@@ -633,9 +633,8 @@ class TextGenerationController:
                 token_to_input_ids into GPU bookkeeping. The caller must
                 populate GPU input token IDs before forward.
 
-        Return:
-            input_ids (Tensor): The active input IDs.
-            position_ids (Tensor): The active position IDs.
+        Returns:
+            Tuple[Tensor, Tensor]: The active input IDs and position IDs.
         """
         context = self.inference_wrapped_model.inference_context
 

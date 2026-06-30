@@ -2141,8 +2141,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 Whether this is a dummy expert model parallel step.
             skip_token_input_ids_transfer (bool): If true, leave the GPU
                 token_to_input_ids field unchanged during bookkeeping transfer.
-        Return:
-            None.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
