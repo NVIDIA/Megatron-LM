@@ -105,6 +105,13 @@ class NixlPullRecv:
     peer_meta: Optional[dict] = None
     snapshots: List = field(default_factory=list)
 
+    def poll(self) -> bool:
+        """Non-blocking: ``True`` iff every in-flight READ for this request has
+        drained. Lets the engine admit completed pulls without blocking the loop
+        on a slower one (it just rechecks next step). Empty handles (e.g. a full
+        prefix hit) read as done."""
+        return all(h.poll() for h in self.handles)
+
     def finish(self, engine: Any) -> Optional[dict]:
         """Wait the READ(s), commit the KV (register hashes + bind Mamba slot),
         and pull any Mamba snapshots.
