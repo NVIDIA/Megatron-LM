@@ -15,6 +15,7 @@ import warnings
 import torch.nn.functional as F
 import torch
 
+from megatron.core.models.common.embeddings import RoPEConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 
@@ -427,6 +428,44 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
+def rope_config_from_args(args: Namespace) -> RoPEConfig:
+    """Create a `RoPEConfig` from the appropriate values in the `args` `Namespace`."""
+    rope_config_sig = inspect.signature(RoPEConfig)
+    rope_config_params = rope_config_sig.parameters
+
+    def default_if_none(key: str, arg_value: Any) -> Any:
+        """Return the default from the `RoPEConfig` constructor if `arg_value` is `None`, else
+        `arg_value`.
+        """
+        if arg_value is None:
+            value = rope_config_params[key].default
+            assert value is not inspect.Parameter.empty, \
+                f"Could not obtain a default value for `RoPEConfig` argument {key}."
+        else:
+            value = arg_value
+        return value
+
+    kwargs = dict(
+        rotary_base=args.rotary_base,
+        rotary_percent=args.rotary_percent,
+        rotary_seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+        use_rotary_scaling=args.use_rope_scaling,
+        rotary_scaling_factor=args.rope_scaling_factor,
+        yarn_rotary_scaling_factor=args.rotary_scaling_factor,
+        yarn_original_max_position_embeddings=default_if_none("yarn_original_max_position_embeddings", args.yarn_original_max_position_embeddings),
+        yarn_beta_fast=default_if_none("yarn_beta_fast", args.yarn_beta_fast),
+        yarn_beta_slow=default_if_none("yarn_beta_slow", args.yarn_beta_slow),
+        yarn_correction_range_round_to_int=default_if_none("yarn_correction_range_round_to_int", args.yarn_correction_range_round_to_int),
+        yarn_mscale=args.mscale,
+        yarn_mscale_all_dim=args.mscale_all_dim,
+    )
+
+    # Ensure all constructor arguments are supplied.
+    for arg_name in rope_config_params.keys():
+        assert arg_name in kwargs
+    return RoPEConfig(**kwargs)
+
+
 def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
 
@@ -452,6 +491,7 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
+    kwargs["rope_config"] = rope_config_from_args(args)
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -495,6 +535,7 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+    kwargs["rope_config"] = rope_config_from_args(args)
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings

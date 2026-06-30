@@ -14,6 +14,7 @@ from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     pretrain_cfg_container_from_args,
+    rope_config_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
 
@@ -760,6 +761,66 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(args)
         mock_ddp.assert_called_once_with(args)
         assert result.ddp is mock_ddp_instance
+
+
+class TestRoPEConfigFromArgs:
+    """Test `rope_config_from_args`."""
+
+    def _make_args(self) -> Namespace:
+        return Namespace(
+            rotary_base=100000.0,
+            rotary_percent=0.9,
+            rotary_seq_len_interpolation_factor=1.1,
+            use_rope_scaling=True,
+            rope_scaling_factor=4.0,
+            rotary_scaling_factor=2.0,
+            yarn_original_max_position_embeddings=2048,
+            yarn_beta_fast=16.0,
+            yarn_beta_slow=1.5,
+            yarn_correction_range_round_to_int=False,
+            mscale=1.2,
+            mscale_all_dim=0.2,
+        )
+
+    def test_all_args_supplied(self) -> None:
+        args = self._make_args()
+        config = rope_config_from_args(args)
+
+        assert config.rotary_base == args.rotary_base
+        assert config.rotary_percent == args.rotary_percent
+        assert (
+            config.rotary_seq_len_interpolation_factor == args.rotary_seq_len_interpolation_factor
+        )
+        assert config.use_rotary_scaling == args.use_rope_scaling
+        assert config.rotary_scaling_factor == args.rope_scaling_factor
+        assert config.yarn_rotary_scaling_factor == args.rotary_scaling_factor
+        assert (
+            config.yarn_original_max_position_embeddings
+            == args.yarn_original_max_position_embeddings
+        )
+        assert config.yarn_beta_fast == args.yarn_beta_fast
+        assert config.yarn_beta_slow == args.yarn_beta_slow
+        assert config.yarn_correction_range_round_to_int == args.yarn_correction_range_round_to_int
+        assert config.yarn_mscale == args.mscale
+        assert config.yarn_mscale_all_dim == args.mscale_all_dim
+
+    def test_only_required_args_supplied(self) -> None:
+        args = self._make_args()
+        # Mimic the non-required args not being passed by setting them to `None`.
+        for name in [
+            "yarn_original_max_position_embeddings",
+            "yarn_beta_fast",
+            "yarn_beta_slow",
+            "yarn_correction_range_round_to_int",
+        ]:
+            setattr(args, name, None)
+
+        rope_config_from_args(args)
+
+    def test_no_expected_args_fails(self) -> None:
+        args = Namespace()
+        with pytest.raises(AttributeError, match="no attribute"):
+            rope_config_from_args(args)
 
 
 class TestCheckpointConfigMapping:

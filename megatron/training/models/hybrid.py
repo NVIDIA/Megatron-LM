@@ -6,6 +6,7 @@ from typing import Any, Callable, ClassVar, Literal, override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.common.embeddings import RoPEConfig
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
     hybrid_inference_stack_spec,
@@ -62,6 +63,7 @@ class HybridModelConfig(ModelConfig):
     rotary_percent: float = 1.0
     rotary_base: int = 10000
     seq_len_interpolation_factor: float | None = None
+    rope_config: RoPEConfig
     make_vocab_size_divisible_by: int = 128
     hybrid_stack_spec: ModuleSpec | None = None
     vocab_size: int | None = None
