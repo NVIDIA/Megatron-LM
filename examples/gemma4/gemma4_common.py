@@ -25,21 +25,20 @@ if MLM not in sys.path:
 
 try:
     import nvidia_resiliency_ext as _nvrx  # noqa: E402
-    if not hasattr(_nvrx, "__version__"):
-        v = None
-        try:
-            from importlib.metadata import version
-            v = version("nvidia_resiliency_ext")
-        except Exception:
-            v = None
-        # Guard requires >= 0.6.0; fall back to that if metadata missing/older.
-        try:
-            from packaging.version import Version as _V
-            if v is None or _V(v) < _V("0.6.0"):
-                v = "0.6.0"
-        except Exception:
-            v = v or "0.6.0"
-        _nvrx.__version__ = v
+    # MLM's is_nvrx_min_version() reads _nvrx.__version__ and asserts it is >= 0.6.0.
+    # Two failure modes in containers: (a) __version__ missing entirely (AttributeError),
+    # or (b) __version__ is a dev pre-release of 0.6.0 (e.g. "0.6.0.dev69+..."), which
+    # PEP 440 orders BELOW the final "0.6.0" and so fails the guard. Force a satisfying
+    # value in both cases. These single-device scripts never use async checkpointing.
+    _need = True
+    try:
+        from packaging.version import Version as _V
+        _cur = getattr(_nvrx, "__version__", None)
+        _need = _cur is None or _V(str(_cur)) < _V("0.6.0")
+    except Exception:
+        _need = not hasattr(_nvrx, "__version__")
+    if _need:
+        _nvrx.__version__ = "0.6.0"
 except Exception:
     # nvrx absent entirely -> MLM's HAVE_NVRX=False path handles it fine.
     pass

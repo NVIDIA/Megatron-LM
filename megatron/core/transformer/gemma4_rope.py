@@ -44,6 +44,14 @@ class Gemma4RotaryEmbedding(torch.nn.Module):
         partial_rotary_factor: float = 0.25,
     ):
         super().__init__()
+        # Keep the inv_freq construction args so forward() can rebuild inv_freq in fp32.
+        # The registered buffers below are downcast to bf16 by a model-level
+        # ``.bfloat16()``/``.half()`` (e.g. ``model.bfloat16()`` at build time). A bf16
+        # inv_freq corrupts the rope frequencies -> cos/sin land ~1e-2 off HF (which
+        # keeps inv_freq fp32), which then propagates through q/k RoPE into the whole
+        # forward. Rebuilding from these args in forward keeps the tables fp32-faithful.
+        self._sliding_inv_freq_args = (sliding_head_dim, sliding_base)
+        self._full_inv_freq_args = (full_head_dim, full_base, partial_rotary_factor)
         self.register_buffer(
             "sliding_inv_freq", self._default_inv_freq(sliding_head_dim, sliding_base), persistent=False
         )
@@ -52,6 +60,22 @@ class Gemma4RotaryEmbedding(torch.nn.Module):
             self._proportional_inv_freq(full_head_dim, full_base, partial_rotary_factor),
             persistent=False,
         )
+
+    def _apply(self, fn, *args, **kwargs):
+        """Keep the rope ``inv_freq`` buffers in fp32 across module-wide casts.
+
+        A blanket ``model.bfloat16()``/``.half()`` (e.g. at build time) would otherwise
+        downcast these buffers to bf16, corrupting the rope frequencies (cos/sin land
+        ~1e-2 off vs HF, which keeps inv_freq fp32) and skewing the whole forward. After
+        the default ``_apply`` (which handles device moves), re-materialize inv_freq in
+        fp32 on the current device — upcasting an already-bf16 buffer cannot recover the
+        lost precision, so we rebuild from the construction args.
+        """
+        out = super()._apply(fn, *args, **kwargs)
+        dev = out.sliding_inv_freq.device
+        out.sliding_inv_freq = out._default_inv_freq(*out._sliding_inv_freq_args).to(dev)
+        out.full_inv_freq = out._proportional_inv_freq(*out._full_inv_freq_args).to(dev)
+        return out
 
     @staticmethod
     def _default_inv_freq(head_dim: int, base: float) -> torch.Tensor:
