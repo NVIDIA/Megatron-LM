@@ -2,18 +2,25 @@
 
 """NIXL (one-sided RDMA) KV transfer backend for disaggregated inference.
 
-Unlike the NCCL backend (two-sided ``isend``/``irecv``, post-order matched),
-NIXL is **pull**-based: the prefill rank registers its staged KV with a local
-NIXL agent and exports descriptors; the decode rank ``READ``s those bytes
-directly into its own buffers. The control plane (our in-job coordinator, or
-Dynamo's frontend) only relays the opaque ``handoff_meta`` from the prefill's
-:meth:`publish_descs` to the decode's :meth:`begin_read` -- it never touches
-the KV bytes.
+Pull-based, following the reference NIXL backend
+(github.com/nvcsathe/Megatron-LM dynamo-integration) and vLLM's NIXL connector:
 
-This backend is optional: it imports ``nixl`` lazily and :func:`is_available`
-reports whether the container provides it, so the disaggregation package does
-not hard-depend on NIXL. Selected via ``MEGATRON_KV_TRANSFER_BACKEND=nixl`` (or
-``auto`` when NIXL is importable).
+* each rank registers its paged KV buffers (and, for hybrid models, the Mamba
+  state buffers) **once** with a local NIXL agent and exports the agent metadata
+  **once** -- not per request;
+* the decode rank issues one-sided ``READ``s that copy specific entries (KV
+  blocks, Mamba slots) straight from the prefill's registered buffer into its
+  own, addressed by index via stride math -- no staging copy.
+
+Registering once is what keeps repeated hand-offs working: NIXL's
+``loadRemoteMD`` rejects re-loading an already-known agent
+(``NIXL_ERR_NOT_ALLOWED``), so the exported metadata must be stable across
+requests. The control plane (our in-job coordinator, or Dynamo's frontend) only
+relays the opaque pull meta from the prefill to the decode.
+
+Optional: imports ``nixl`` lazily and :func:`is_available` reports whether the
+container provides it, so the disaggregation package does not hard-depend on it.
+Selected via ``MEGATRON_KV_TRANSFER_BACKEND=nixl`` (or ``auto`` when importable).
 """
 
 from __future__ import annotations
@@ -21,13 +28,13 @@ from __future__ import annotations
 import base64
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
-    TransferHandle,
+    PullRegion,
 )
 
 # UCX transports/config NIXL needs for intra-node GPU<->GPU transfer. The
@@ -44,6 +51,7 @@ _UCX_DEFAULTS = {
 }
 
 _POLL_INTERVAL_S = 0.0005
+_POLL_TIMEOUT_S = 30.0
 
 
 def is_available() -> bool:
@@ -69,40 +77,38 @@ def _apply_ucx_defaults() -> None:
 
 
 class NixlPullHandle:
-    """Pollable handle for one decode-side READ (one or more NIXL transfers)."""
+    """Pollable handle for one decode-side pull (one NIXL READ transfer)."""
 
-    def __init__(self, agent: Any, xfers: List[Any], keepalive: List[Any]):
+    def __init__(self, agent: Any, xfer: Any):
         self._agent = agent
-        self._xfers = xfers
-        self._keepalive = keepalive  # tensors/regs kept alive until the read drains
+        self._xfer = xfer
+        self._done = xfer is None
 
     def poll(self) -> bool:
-        done = True
-        for x in self._xfers:
-            st = self._agent.check_xfer_state(x)
-            if st == "ERR":
-                raise RuntimeError("NIXL transfer entered ERR state")
-            done = done and (st == "DONE")
-        return done
+        if self._done:
+            return True
+        st = self._agent.check_xfer_state(self._xfer)
+        if st == "ERR":
+            raise RuntimeError("NIXL transfer entered ERR state")
+        self._done = st == "DONE"
+        return self._done
 
-    def wait(self, timeout_s: float = 30.0) -> None:
+    def wait(self, timeout_s: float = _POLL_TIMEOUT_S) -> None:
         deadline = time.monotonic() + timeout_s
         while not self.poll():
             if time.monotonic() > deadline:
                 raise TimeoutError("NIXL transfer did not complete within timeout")
             time.sleep(_POLL_INTERVAL_S)
-        # keepalive can drop now; transfers are done.
-        self._keepalive.clear()
 
 
 class NixlTransportBackend(KVTransportBackend):
-    """Per-rank NIXL agent over the disaggregation KV buffers.
+    """Per-rank NIXL agent owning a registration over the paged KV buffers.
 
-    Pull-based, so it implements :meth:`publish_descs` (prefill) and
-    :meth:`begin_read` (decode) rather than ``send``/``recv``. Worker-level
-    agent metadata rides in each request's ``handoff_meta`` and peers are
-    registered lazily on first read (cheap; metadata is exchanged once per
-    (prefill, decode) pair).
+    One-sided: implements :meth:`register_regions` / :meth:`export_regions_meta`
+    (publish the registered buffers' layout) plus :meth:`begin_pull` (remote
+    READ) and :meth:`begin_push` (remote WRITE), so a single rank moves entries
+    by index in either direction. The two-sided ``send``/``recv`` interface is
+    left unimplemented (inherits the base ``NotImplementedError``).
     """
 
     is_pull = True
@@ -110,7 +116,9 @@ class NixlTransportBackend(KVTransportBackend):
     def __init__(self, agent_name: Optional[str] = None) -> None:
         self._agent = None
         self._agent_name = agent_name
-        self._agent_metadata_b64: Optional[str] = None
+        self._agent_meta_b64: Optional[str] = None
+        self._regions: Dict[str, PullRegion] = {}
+        self._reg_handles: list = []
         self._known_peers: Dict[str, str] = {}
         self._init = False
 
@@ -129,107 +137,107 @@ class NixlTransportBackend(KVTransportBackend):
             rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
             self._agent_name = f"megatron-disagg-rank{rank}"
         self._agent = nixl_agent(self._agent_name, nixl_agent_config(backends=["UCX"]))
-        self._agent_metadata_b64 = base64.b64encode(
-            self._agent.get_agent_metadata()
-        ).decode("ascii")
         self._init = True
 
-    # --- push interface: unsupported (this is a pull backend) -------------
-    def send(self, *a, **k):
-        raise NotImplementedError(
-            "NixlTransportBackend is pull-based; use publish_descs()/begin_read()."
-        )
-
-    def recv(self, *a, **k):
-        raise NotImplementedError(
-            "NixlTransportBackend is pull-based; use publish_descs()/begin_read()."
-        )
-
-    # --- prefill side ------------------------------------------------------
-    def publish_descs(self, tensors: List[torch.Tensor]) -> Tuple[dict, list]:
-        """Register ``tensors`` and return ``(handoff_meta, keepalive)``.
-
-        ``handoff_meta`` is JSON/msgpack-safe (this rank's agent metadata + one
-        descriptor per tensor: ``(addr, nbytes, device_id)`` plus shape/dtype so
-        the decode side can build a matching local buffer). ``keepalive`` holds
-        the registrations; the caller must keep it alive until the decode peer
-        has finished reading (the registration must outlive the remote READ).
-        """
+    # --- one-sided family: register once, READ or WRITE entries -----------
+    def register_regions(self, regions: Dict[str, PullRegion]) -> None:
+        """Register each region's buffer with the agent once and export the
+        agent metadata so the regions are reachable for remote READ/WRITE. The
+        registration is for the backend's lifetime; the export is the only one,
+        so peers load it exactly once."""
         assert self._init, "NixlTransportBackend.init() not called"
-        keepalive: list = []
-        descs: List[dict] = []
-        for t in tensors:
-            t = t.contiguous()
-            reg = self._agent.register_memory(t)
-            keepalive.append((t, reg))
-            descs.append(
-                {
-                    "addr": t.data_ptr(),
-                    "nbytes": t.element_size() * t.numel(),
-                    "device_id": t.device.index or 0,
-                    "shape": list(t.shape),
-                    "dtype": str(t.dtype),
-                }
-            )
-        # Re-export AFTER registering: NIXL agent metadata advertises this
-        # rank's registered memory regions, and the decode peer can only READ
-        # regions present in the metadata it imported. Our staging tensors are
-        # allocated per request, so the metadata exported at init() predates
-        # them -- re-export here so the fresh registrations are reachable.
-        meta = {
+        assert not self._regions, "register_regions called more than once"
+        for name, region in regions.items():
+            self._reg_handles.append(self._agent.register_memory(region.tensor))
+            self._regions[name] = region
+        self._agent_meta_b64 = base64.b64encode(
+            self._agent.get_agent_metadata()
+        ).decode("ascii")
+
+    def export_regions_meta(self) -> dict:
+        assert self._regions, "register_regions() not called"
+        return {
             "agent_name": self._agent_name,
-            "agent_metadata_b64": base64.b64encode(
-                self._agent.get_agent_metadata()
-            ).decode("ascii"),
-            "descs": descs,
+            "agent_metadata_b64": self._agent_meta_b64,
+            "regions": {name: r.layout() for name, r in self._regions.items()},
         }
-        return meta, keepalive
 
-    # --- decode side -------------------------------------------------------
-    def begin_read(
-        self,
-        handoff_meta: dict,
-        local_tensors: List[torch.Tensor],
-    ) -> NixlPullHandle:
-        """Issue one-sided READs pulling the prefill's published descriptors
-        into ``local_tensors`` (same count/sizes, in order). Returns a pollable
-        handle; the caller waits it before consuming ``local_tensors``."""
-        assert self._init, "NixlTransportBackend.init() not called"
-        peer_name = self._ensure_peer(handoff_meta)
-        src = handoff_meta["descs"]
-        assert len(src) == len(local_tensors), (
-            f"NIXL begin_read: {len(src)} published descs vs {len(local_tensors)} "
-            "local tensors"
+    def begin_pull(self, peer_meta: dict, transfers: list) -> NixlPullHandle:
+        """Remote READ peer->local. ``transfers``: ``(region, peer_src, local_dst)``."""
+        return self._begin(
+            "READ", peer_meta,
+            [(region, local_dst, peer_src) for region, peer_src, local_dst in transfers],
         )
-        keepalive: list = []
-        xfers: list = []
-        src_tuples, dst_tuples = [], []
-        for sd, lt in zip(src, local_tensors):
-            lt = lt.contiguous()
-            reg = self._agent.register_memory(lt)
-            keepalive.append((lt, reg))
-            nbytes = lt.element_size() * lt.numel()
-            assert nbytes == sd["nbytes"], (
-                f"NIXL begin_read size mismatch: local {nbytes} vs remote {sd['nbytes']}"
-            )
-            src_tuples.append((sd["addr"], sd["nbytes"], sd["device_id"]))
-            dst_tuples.append((lt.data_ptr(), nbytes, lt.device.index or 0))
-        src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
-        dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
-        xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_name)
-        self._agent.transfer(xfer)
-        xfers.append(xfer)
-        return NixlPullHandle(self._agent, xfers, keepalive)
 
-    def _ensure_peer(self, handoff_meta: dict) -> str:
-        # Re-import the peer's metadata each request: the prefill re-exports it
-        # after registering the request's staging tensors, so the advertised
-        # memory regions change request to request. add_remote_agent updates the
-        # peer's known regions; without the refresh the READ targets a region
-        # NIXL hasn't seen and fails with "no potential backend".
-        name = handoff_meta["agent_name"]
-        meta_b64 = handoff_meta["agent_metadata_b64"]
-        peer_id = self._agent.add_remote_agent(base64.b64decode(meta_b64))
+    def begin_push(self, peer_meta: dict, transfers: list) -> NixlPullHandle:
+        """Remote WRITE local->peer. ``transfers``: ``(region, local_src, peer_dst)``."""
+        return self._begin(
+            "WRITE", peer_meta,
+            [(region, local_src, peer_dst) for region, local_src, peer_dst in transfers],
+        )
+
+    def _begin(self, op: str, peer_meta: dict, items: list) -> NixlPullHandle:
+        """Issue one one-sided transfer (``op`` = READ/WRITE) batching every
+        ``(region, local_index, remote_index)`` in ``items``. ``local_descs``
+        always address this rank's registered regions and ``remote_descs`` the
+        peer's; ``op`` sets the data direction. Identity layout only (peer and
+        local region share num_outer / inner_bytes) -- hetero TP is future work."""
+        assert self._init, "NixlTransportBackend.init() not called"
+        if not items:
+            return NixlPullHandle(self._agent, None)
+        peer = self._ensure_peer(peer_meta)
+        peer_regions = peer_meta["regions"]
+
+        local_tuples: list = []
+        remote_tuples: list = []
+        for region_name, local_idx, remote_idx in items:
+            pr = peer_regions[region_name]
+            ld = self._regions[region_name].layout()
+            assert pr["num_outer"] == ld["num_outer"] and pr["inner_bytes"] == ld["inner_bytes"], (
+                f"NIXL region {region_name!r}: peer/local layout mismatch "
+                f"({pr['num_outer']}x{pr['inner_bytes']} vs "
+                f"{ld['num_outer']}x{ld['inner_bytes']}); hetero reshard not supported"
+            )
+            inner = ld["inner_bytes"]
+            for o in range(ld["num_outer"]):
+                local_tuples.append(
+                    (ld["base_addr"] + o * ld["outer_stride_bytes"] + local_idx * inner,
+                     inner, ld["device_id"])
+                )
+                remote_tuples.append(
+                    (pr["base_addr"] + o * pr["outer_stride_bytes"] + remote_idx * inner,
+                     inner, pr["device_id"])
+                )
+        local_descs = self._agent.get_xfer_descs(local_tuples, mem_type="VRAM")
+        remote_descs = self._agent.get_xfer_descs(remote_tuples, mem_type="VRAM")
+        xfer = self._agent.initialize_xfer(op, local_descs, remote_descs, peer)
+        self._agent.transfer(xfer)
+        return NixlPullHandle(self._agent, xfer)
+
+    def _ensure_peer(self, peer_meta: dict) -> str:
+        # Load the peer's metadata exactly once. Registrations are stable, so a
+        # given peer always advertises the same regions; loadRemoteMD rejects
+        # re-loading an already-known agent (NIXL_ERR_NOT_ALLOWED).
+        name = peer_meta["agent_name"]
+        cached = self._known_peers.get(name)
+        if cached is not None:
+            return cached
+        peer_id = self._agent.add_remote_agent(
+            base64.b64decode(peer_meta["agent_metadata_b64"])
+        )
         resolved = peer_id if peer_id else name
         self._known_peers[name] = resolved
         return resolved
+
+    def close(self) -> None:
+        if self._agent is None:
+            return
+        for h in self._reg_handles:
+            try:
+                self._agent.deregister_memory(h)
+            except Exception:
+                pass
+        self._reg_handles.clear()
+        self._regions.clear()
+        self._agent = None
+        self._init = False

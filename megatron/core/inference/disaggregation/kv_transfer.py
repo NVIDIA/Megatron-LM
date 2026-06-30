@@ -108,9 +108,9 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
-# Transfer matching is by POST-ORDER, not by tag. Every transport backend we
-# use matches a recv to a send by the order they are posted on a (src, dst)
-# pair: NCCL and NVSHMEM ignore the P2P tag entirely, and gloo matches same-tag
+# Transfer matching is by POST-ORDER, not by tag. Every two-sided (push)
+# backend we use matches a recv to a send by the order they are posted on a
+# (src, dst) pair: NCCL ignores the P2P tag entirely, and gloo matches same-tag
 # ops FIFO. So correctness rests on a single invariant: the send side and the
 # recv side enumerate the transfers for each (src, dst) pair in the SAME order.
 # They do -- both iterate the deterministic reshard plan (attention transfers,
@@ -404,3 +404,89 @@ def _build_mamba_recvs(recv, meta, my_mamba, src_mamba, dst_mamba, device, recvs
             dt = ssm_dtype
         recvs.append((shape, dt, t.src_rank))
     return mamba_transfers
+
+
+# ==========================================================================
+# One-sided (pull) hand-off: register-once + block-pull, no staging copy.
+#
+# The push path above (send_request_kv_resharded / post_recv_request_kv_resharded)
+# is two-sided: both ranks post matched ops. A one-sided backend (NIXL) instead
+# registers its paged KV (+ Mamba) buffers ONCE and the decode rank READs the
+# prefill's blocks straight into its own freshly-allocated blocks -- no copy,
+# no per-request registration. The prefill publishes only references (block ids
+# + Mamba slot + the static region meta); the coordinator relays them opaque.
+# This mirrors the reference NIXL backend and vLLM's NIXL connector. Identity
+# reshard only (decode pulls its TP counterpart's blocks 1:1); hetero TP remap
+# over a one-sided backend is future work.
+# ==========================================================================
+
+
+def publish_request_kv(backend, ref_payload, my_layout):
+    """(prefill, one-sided) Build this rank's per-request hand-off: the backend's
+    static region meta plus the request's source block ids / Mamba slot. No copy
+    and no per-request registration -- the decode READs these blocks from the
+    already-registered ``memory_buffer``. ``ref_payload`` comes from
+    ``context.export_request_kv_ref``."""
+    return {
+        "transport": "nixl",
+        "shard_key": list(my_layout.kv_shard_key()),
+        "region_meta": backend.export_regions_meta(),
+        "block_ids": ref_payload["block_ids"],
+        "block_hashes": ref_payload["block_hashes"],
+        "block_count": ref_payload["block_count"],
+        "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
+        "layout": ref_payload["layout"],
+    }
+
+
+@dataclass
+class NixlPullRecv:
+    """Decode side: an in-flight one-sided READ of a request's blocks. :meth:`finish`
+    waits the read, then registers block hashes + binds the Mamba slot (the KV
+    already landed directly in the allocated blocks), mirroring DecodeRecv.finish
+    so the engine path is symmetric with the push backend."""
+
+    handle: Any
+    block_ids: List[int]
+    block_hashes: List[int]
+    mamba_dst_slot: int
+
+    def finish(self, engine: Any) -> Optional[dict]:
+        self.handle.wait()
+        with torch.inference_mode():
+            return engine.context.disagg_pull_commit(
+                self.block_ids, self.block_hashes, self.mamba_dst_slot
+            )
+
+
+def post_pull_request_kv(engine, backend, rank_handoffs, my_layout):
+    """(decode, one-sided) Select this rank's counterpart source (identity reshard:
+    match KV shard key), allocate destination blocks (+ a Mamba slot), and issue
+    the one-sided READ pulling the peer's blocks straight into them. Returns a
+    :class:`NixlPullRecv`, or ``None`` if the decode KV cache is full (the caller
+    then admits the request to re-prefill from the prompt)."""
+    my_key = list(my_layout.kv_shard_key())
+    src = next((h for h in rank_handoffs if h.get("shard_key") == my_key), None)
+    if src is None:
+        raise NotImplementedError(
+            f"pull hand-off: no source shard matching key {my_key} "
+            "(non-identity reshard over a one-sided backend is not yet supported)"
+        )
+    want_mamba = int(src.get("mamba_src_slot", -1)) >= 0
+    alloc = engine.context.disagg_pull_alloc(int(src["block_count"]), want_mamba=want_mamba)
+    if alloc is None:
+        return None
+    dst_block_ids = alloc["block_ids"]
+    mamba_dst_slot = alloc["mamba_dst_slot"]
+    transfers = [("kv", s, d) for s, d in zip(src["block_ids"], dst_block_ids)]
+    if want_mamba and mamba_dst_slot >= 0:
+        ms = int(src["mamba_src_slot"])
+        transfers.append(("mamba_conv", ms, mamba_dst_slot))
+        transfers.append(("mamba_ssm", ms, mamba_dst_slot))
+    handle = backend.begin_pull(src["region_meta"], transfers)
+    return NixlPullRecv(
+        handle=handle,
+        block_ids=dst_block_ids,
+        block_hashes=list(src.get("block_hashes") or []),
+        mamba_dst_slot=mamba_dst_slot,
+    )
