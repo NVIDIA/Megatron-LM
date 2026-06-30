@@ -49,23 +49,69 @@ File any bugs you find, keeping the following in mind:
 
 ## Signing Your Work
 
-- We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.
+### What is the DCO?
 
-  - Any contribution which contains commits that are not Signed-Off will not be accepted.
+The Developer Certificate of Origin (DCO) is a lightweight, per-commit
+declaration that you have the right to submit the contribution under the
+project's open source license. It is **not** a copyright assignment and does
+not transfer any rights; it simply certifies the origin of your work. The full
+text is reproduced [below](#full-text-of-the-dco). By signing off on a commit,
+you agree to its terms (a) through (d).
 
-- To sign off on a commit you simply use the `--signoff` (or `-s`) option when committing your changes:
+We require that **every** commit in a pull request is signed off. A pull
+request that contains one or more commits without a valid `Signed-off-by`
+trailer **will not be accepted**, and the automated DCO check will block it
+from merging until all commits are signed.
+
+### How to sign off on a commit
+
+To sign off on a commit, add the `--signoff` (or `-s`) option when committing
+your changes:
+
+```bash
+git commit -s -m "Add cool feature."
+```
+
+This appends a `Signed-off-by` trailer to your commit message:
+
+```
+Signed-off-by: Your Name <your@email.com>
+```
+
+The name and email in the trailer must match the `user.name` and `user.email`
+configured in Git, and the email must be a real address you can be reached at
+(do not use anonymized/no-reply addresses for the sign-off). Configure them
+once with:
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "your@email.com"
+```
+
+### Fixing commits that are missing a sign-off
+
+If the DCO check fails because one or more existing commits are not signed off,
+amend or rebase them to add the trailer:
+
+- To fix the most recent commit:
 
   ```bash
-  git commit -s -m "Add cool feature."
+  git commit --amend --signoff
+  git push --force-with-lease
   ```
 
-  This will append the following to your commit message:
+- To sign off **every** commit on your branch (replace `main` with your base
+  branch as needed):
 
-  ```
-  Signed-off-by: Your Name <your@email.com>
+  ```bash
+  git rebase --signoff main
+  git push --force-with-lease
   ```
 
-- Full text of the DCO:
+After force-pushing, the DCO check re-runs automatically and should pass once
+all commits carry a valid `Signed-off-by` trailer.
+
+### Full text of the DCO
 
   ```
   Developer Certificate of Origin
