@@ -26,8 +26,9 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
     """
     if profiling is None or not profiling.record_memory_history:
         return
-    if safe_get_rank() not in profiling.profile_ranks:
-        return
+    if len(profiling.profile_ranks) != 0:
+        if safe_get_rank() not in profiling.profile_ranks:
+            return
 
     torch.cuda.memory._record_memory_history(
         True,
