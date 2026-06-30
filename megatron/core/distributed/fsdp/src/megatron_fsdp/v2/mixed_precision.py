@@ -409,7 +409,9 @@ class MixedPrecisionPolicy:
         no ``main_weight_buffer`` is allocated — the optimizer mutates the
         model-weight buffer directly.  Set to ``torch.float32`` when the
         model uses quantized weights (FP8 / NVFP4) so the optimizer works on
-        high-precision copies.
+        high-precision copies.  When this equals the model-weight dtype and
+        the sharding layout matches, ``_init_buffers`` skips the separate
+        buffer for the same reason (see ``ParamGroup._init_buffers``).
         """
         return self.main_params_dtype
 

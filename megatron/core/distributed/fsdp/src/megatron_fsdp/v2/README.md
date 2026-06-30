@@ -46,7 +46,7 @@ Controls parameter/gradient dtypes and communication precision.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. |
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
 | `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
@@ -102,7 +102,12 @@ Mixin class added to wrapped modules. Methods:
 > **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
 > feature.  The API and behaviour may change in future releases without notice.
 
-FSDP v2 supports transparent CUDA graph capture for individual FSDP modules.
+**Why MFSDP v2 can support CUDA graphs.**  The [`TracePoolAllocator`](allocator.py)
+pre-plans every parameter/gradient buffer slot at a fixed offset in a
+persistent pool tensor during the first (trace) micro-batch.  Once `plan()`
+has committed those offsets, all buffer addresses become deterministic across
+micro-batches — the stable memory foundation that CUDA graph capture requires.
+
 Enable it per-module with ``enable_cuda_graph=True``:
 
 ```python
@@ -111,23 +116,19 @@ for layer in model.layers:
 fully_shard(model)  # root without CUDA graph
 ```
 
-Capture happens automatically on the first optimized forward pass
-(after the trace pool has been planned).  Subsequent forward passes replay
-the captured graph, bypassing FSDP hooks entirely for that module.
-
 **How it works:**
 
-1. The forward pre-hook detects ``enable_cuda_graph=True`` and creates an
-   ``FSDPCudaGraphRunner`` for the module.
-2. The runner pops FSDP hooks, warms up via ``make_graphed_callables``,
-   and captures the module's ``forward()`` (without FSDP collectives) into a
-   CUDA graph.
-3. After capture, ``install()`` patches ``module.forward`` to a wrapper
-   that replays the graph on subsequent calls.
-4. After capture, ``install()`` patches ``module.forward`` to a wrapper that
-   replays the graph on subsequent calls. During replay, the patched forward
-   calls the graphed callable directly, bypassing FSDP forward hooks entirely.
-   Backward hooks (unshard/reshard/reduce_grad) still fire normally.
+1. The first optimized forward pass records sample arguments for each
+   eligible module.
+2. After the first backward completes, a single batch call to
+   `te-graph-runtime`'s `make_graphed_callables` captures forward + backward
+   graphs for all modules in correct order (fwds in forward-module order,
+   bwds in reverse) using the shared trace pool.
+3. FSDP unshard/reshard hooks run **outside** the CUDA graph capture via
+   `capture_time_hooks` — they are never graphed.  During replay they
+   fire normally around the graphed forward/backward.
+4. Replay runs entirely through the captured graphs — no Python hooks fire
+   inside the graphed region.
 
 **Limitation — nesting:** A parent FSDP module that contains other FSDP
 modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
@@ -135,13 +136,15 @@ FSDP modules (those without FSDP children) are eligible.  Attempting to
 enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
 
 ```python
-# OK — layers are leaf FSDP modules (no FSDP children inside them)
+# OK — layers are leaf FSDP modules
 for layer in model.layers:
     fully_shard(layer, enable_cuda_graph=True)
 
 # NOT OK — model contains FSDP layers as children
 fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
 ```
+
+See [`design/cuda_graph_design.md`](design/cuda_graph_design.md) for the full architecture.
 
 ### DataParallelBuffer
 
@@ -203,14 +206,14 @@ overlap (prefetch/unshard pipelining) is not applicable.
 
 ### CUDA Graph
 
-- **Experimental.** CUDA graph support is experimental. The API and behavior
-  may change in future releases without notice. Enable via
-  ``enable_cuda_graph=True`` on leaf FSDP modules only.
-- **Nesting not supported.** A parent FSDP module that contains other FSDP
-  modules as children cannot use ``enable_cuda_graph=True``.  Only leaf FSDP
-  modules (those without FSDP children) are eligible for CUDA graph capture.
-  Attempting to enable CUDA graph on a nested FSDP module raises a
-  ``RuntimeError``.
+- **Experimental.** Enable via ``enable_cuda_graph=True`` on leaf FSDP modules.
+  Built on vendored [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime)
+  with local modifications. See [`design/cuda_graph_design.md`](design/cuda_graph_design.md).
+- **Requires `TracePoolAllocator`.** CUDA graph capture depends on the
+  deterministic buffer addresses provided by the trace pool; modules must be
+  wrapped with ``enable_trace_pool=True``.
+- **Nesting not supported.** Only leaf FSDP modules (those without FSDP children)
+  are eligible for capture.
 
 ### `fully_shard()` API Parameters
 
@@ -316,8 +319,11 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
   compute operations (all-gather, reduce-scatter) run on side streams
   (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
   allocation and compute, and between compute and free, guarantee ordering
-  without ``record_stream``. Keeping allocations on the default stream avoids
-  non-deterministic caching-allocator behaviour and peak memory regressions.
+  without ``record_stream``.  ``record_stream`` is intentionally avoided
+  because it forces the caching allocator to hold memory blocks until the
+  recorded stream finishes, preventing reuse across iterations and causing
+  significant peak memory regressions
+  ([discussion](https://dev-discuss.pytorch.org/t/1486)).
 
 ## Unit Tests
 

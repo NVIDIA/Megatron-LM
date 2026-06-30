@@ -24,7 +24,7 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
-from .cuda_graph_runner import FSDPCudaGraphRunner
+from .cuda_graph_runner import CudaGraphRunner
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -55,6 +55,7 @@ def _find_fsdp_target(hook_module: nn.Module) -> Optional[FSDPModule]:
     return None
 
 
+@torch.compiler.disable
 def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     """Pre-forward hook for FSDP modules and fine-grained sub-modules.
 
@@ -100,36 +101,24 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     for param_group in target._fsdp_param_groups:
         param_group._maybe_free_grad_data()
 
-    # ---- CUDA graph capture (FSDPModule targets only) ---------------------
-    # Fine-grained hooks fire on sub-modules whose forward args differ from
-    # the FSDPModule's; CG capture is not meaningful there.
+    # ---- CUDA graph: record sample args (first optimized micro-batch) -----
+    # Actual capture happens in mfsdp_post_backward_final_callback via
+    # ctx.cuda_graph_runner.capture_and_install().
     if (
         isinstance(hook_module, FSDPModule)
         and target._fsdp_state.enable_cuda_graph
-        and (not hasattr(target, "_fsdp_cg_runner"))
+        and (not getattr(target, "_fsdp_cg_installed", False))
         and not ctx.backward_phase
         and target.cuda_graph_compatible
     ):
-        if torch.distributed.get_rank() == 0:
-            logger.debug(
-                "Capturing CUDA graph for module %s (id=%s)",
-                target._fsdp_module_name,
-                id(target),
+        if ctx.cuda_graph_runner is None:
+            ctx.cuda_graph_runner = CudaGraphRunner(
+                graph_pool=ctx.cuda_graph_pool,
             )
-        cg_runner = FSDPCudaGraphRunner(
-            target, graph_pool=ctx.cuda_graph_pool
-        )
-        cg_runner.capture_forward(*args, **kwargs)
-        cg_runner.install()
-        target._fsdp_cg_runner = cg_runner
-        if torch.distributed.get_rank() == 0:
-            logger.debug(
-                "Captured CUDA graph for module %s (id=%s)",
-                target._fsdp_module_name,
-                id(target),
-            )
+        ctx.cuda_graph_runner.record_module(target, args, kwargs)
 
 
+@torch.compiler.disable
 def mfsdp_post_forward_hook(module: nn.Module, *unused):
     """Post-forward hook: reshard parameters.
 
@@ -186,11 +175,22 @@ def _register_forward_hook(module: FSDPModule):
     module._mfsdp_forward_hook = module.register_forward_hook(mfsdp_post_forward_hook)
 
 
+
+def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
+    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
+    if ctx.cuda_graph_runner is not None:
+        with torch.enable_grad():
+            ctx.cuda_graph_runner.capture_and_install(
+                root_module, capture_stream=ctx.cuda_graph_stream,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Internal: backward hook helpers
 # ---------------------------------------------------------------------------
 
 
+@torch.compiler.disable
 def mfsdp_pre_backward_setup(
     hook_module: nn.Module, grads: Any = None, skip_final_callback: bool = False
 ):
@@ -222,6 +222,7 @@ def mfsdp_pre_backward_setup(
     target._fsdp_pre_backward_done = True
 
 
+@torch.compiler.disable
 def mfsdp_post_backward_hook(module: nn.Module):
     """Post-backward hook: reshard parameters and reduce gradients.
 
@@ -252,6 +253,7 @@ def mfsdp_post_backward_hook(module: nn.Module):
     ctx._advance_backward_module()
 
 
+@torch.compiler.disable
 def mfsdp_post_backward_final_callback(root_module: nn.Module):
     """Finalise the backward pass: drain skipped modules, reset state,
     clear fine-grained flags, and (on the first micro-batch) transition
@@ -320,6 +322,31 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         elif bucket_alloc.phase != "optimized":
             raise ValueError(
                 f"Unexpected bucket allocator phase: {bucket_alloc.phase}"
+            )
+
+    # ---- CUDA graph: batch capture (after first optimized forward+backward) --
+    _maybe_capture_cuda_graphs(ctx, root_module)
+
+
+
+def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
+    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``.
+
+    Guarded by asserts: TracePoolAllocator must be in use and in
+    ``"optimized"`` phase (stable buffer addresses required for CG).
+    """
+    if ctx.cuda_graph_runner is not None:
+        allocator = ctx.bucket_allocator
+        assert isinstance(allocator, TracePoolAllocator), (
+            "CUDA graph capture requires TracePoolAllocator"
+        )
+        assert allocator.phase == "optimized", (
+            f"CUDA graph capture requires allocator phase='optimized', "
+            f"got '{allocator.phase}'"
+        )
+        with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
+            ctx.cuda_graph_runner.capture_and_install(
+                root_module, capture_stream=ctx.cuda_graph_stream,
             )
 
 

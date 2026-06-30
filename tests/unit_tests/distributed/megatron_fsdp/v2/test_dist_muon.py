@@ -118,7 +118,7 @@ def dist_env():
 
 def _read_full_weight(pg, idx, shape):
     """All-gather this param's full master weight and return it (reshaped, cloned)."""
-    mbuf = pg.main_weight_buffer
+    mbuf = pg.main_weight_buffer or pg.model_weight_buffer
     full = mbuf.unshard(bind_params=False)
     start, end = mbuf.buffer_index._get_item_global_range(idx)
     out = full[start:end].clone().view(shape)
