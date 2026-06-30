@@ -29,7 +29,8 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
     dims) on the decode side with no control message -- computed locally from the
     engine's static config + the prompt tokens, so only KV tensors cross the
     wire. Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
-    Assumes a homogeneous, fresh prefill."""
+    Assumes the whole prompt is handed off (``block_count`` follows from the
+    prompt length) into a uniform KV layout."""
 
     ctx = engine.context
     if getattr(ctx, "cache_mla_latent", False):
