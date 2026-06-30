@@ -647,7 +647,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -694,7 +694,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder, self.model_provider
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -754,7 +754,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
 
         output = gpt_model[0].forward(
@@ -801,8 +801,8 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider,
             ModelType.encoder_or_decoder,
+            self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
         )
@@ -869,8 +869,8 @@ class TestMultiTokenPrediction:
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider,
             ModelType.encoder_or_decoder,
+            self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
         )
@@ -1414,8 +1414,8 @@ class TestMultiTokenPredictionHybrid:
         cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider,
             ModelType.encoder_or_decoder,
+            self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
         )
@@ -1464,8 +1464,8 @@ class TestMultiTokenPredictionHybrid:
             cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider,
                 ModelType.encoder_or_decoder,
+                self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )

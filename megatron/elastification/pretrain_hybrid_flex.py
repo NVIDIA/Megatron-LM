@@ -564,8 +564,8 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(full_config,
              train_valid_test_datasets_provider,
-             model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
+             model_provider,
              store=store,
              )

@@ -263,8 +263,8 @@ class TestFP8Param:
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                self.model_provider,
                 ModelType.encoder_or_decoder,
+                self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )

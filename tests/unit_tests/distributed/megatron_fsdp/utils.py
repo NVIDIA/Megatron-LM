@@ -98,8 +98,8 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
-        model_provider_func=partial(model_provider, hybrid_builder),
         model_type=ModelType.encoder_or_decoder,
+        model_provider_func=partial(model_provider, hybrid_builder),
         cfg_container=cfg_container,
         pg_collection=pg_collection,
     )

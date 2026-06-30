@@ -192,8 +192,8 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider,
             ModelType.encoder_or_decoder,
+            model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
         )
@@ -282,8 +282,8 @@ class TestGPTModel:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider,
             ModelType.encoder_or_decoder,
+            model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
         )

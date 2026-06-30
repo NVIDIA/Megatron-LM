@@ -1223,8 +1223,8 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
         model_type,
+        model_provider_func=model_provider,
         checkpointing_context=checkpointing_context,
         cfg_container=cfg_container,
         pg_collection=pg_collection,
@@ -1996,12 +1996,12 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
+    model_provider_func=None,
     checkpointing_context=None,
     *,
-    cfg_container: PretrainConfigContainer,
-    pg_collection: ProcessGroupCollection,
+    cfg_container: PretrainConfigContainer | None = None,
+    pg_collection: ProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2016,23 +2016,27 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
 
     def _build_model_wrapper(wrap_with_ddp: bool):
-        from megatron.training.utils import start_memory_history_recording
+        if cfg_container is not None and hasattr(cfg_container, "model") and pg_collection is not None:
+            from megatron.training.utils import start_memory_history_recording
 
-        start_memory_history_recording(cfg_container.profiling)
+            start_memory_history_recording(cfg_container.profiling)
 
-        cfg = cfg_container
-        model_config = cfg.model
-        builder_cls = model_config.get_builder_cls()
-        builder = builder_cls(model_config)
-        return builder.build_distributed_models(
-            pg_collection=pg_collection,
-            ddp_config=cfg.ddp,
-            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-            use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
-            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-            wrap_with_ddp=wrap_with_ddp,
-            data_parallel_random_init=cfg.rng.data_parallel_random_init,
-        )
+            cfg = cfg_container
+            model_config = cfg.model
+            builder_cls = model_config.get_builder_cls()
+            builder = builder_cls(model_config)
+            return builder.build_distributed_models(
+                pg_collection=pg_collection,
+                ddp_config=cfg.ddp,
+                overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+                wrap_with_ddp=wrap_with_ddp,
+                data_parallel_random_init=cfg.rng.data_parallel_random_init,
+            )
+        else:
+            assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
+            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
