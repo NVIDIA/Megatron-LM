@@ -835,12 +835,11 @@ class TextGenerationController:
             return sample_slice.cpu(), None
 
         context = self.inference_wrapped_model.inference_context
-        buffer = getattr(self, "_sampled_tokens_cpu_buffer", None)
-        required_size = max(
-            active_request_count, getattr(context, "max_requests", active_request_count)
-        )
-        if buffer is None or buffer.numel() < required_size:
-            buffer = torch.empty(required_size, dtype=torch.int64, device="cpu", pin_memory=True)
+        buffer = self._sampled_tokens_cpu_buffer
+        if buffer is None or buffer.numel() < context.max_requests:
+            buffer = torch.empty(
+                context.max_requests, dtype=torch.int64, device="cpu", pin_memory=True
+            )
             self._sampled_tokens_cpu_buffer = buffer
 
         sample_cpu = buffer[:active_request_count]
