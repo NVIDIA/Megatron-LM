@@ -1278,6 +1278,15 @@ class _ParamAndGradBuffer:
                                 buffer_type=BufferType.PARAM,
                             )
                             modify_grouped_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != rowwise_bytes_view.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap grouped NVFP4 rowwise storage into DDP "
+                                    "param_data."
+                                )
                         # Grouped MXFP8: do not remap grouped quantized storage into param_data.
                         # Use grad-buffer AG reuse and copy gathered values back after AG.
                         elif is_grouped_mxfp8tensor(param):
@@ -1303,6 +1312,15 @@ class _ParamAndGradBuffer:
                                 buffer_type=BufferType.PARAM,
                             )
                             modify_grouped_tensor_rowwise_storage(param, new_param_data)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != new_param_data.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap high-precision TE GroupedTensor parameter "
+                                    "storage into DDP param_data."
+                                )
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
