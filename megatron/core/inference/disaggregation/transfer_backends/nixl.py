@@ -57,9 +57,7 @@ def is_available() -> bool:
 
 def _check_ucx_env() -> None:
     """Warn (never mutate) if the UCX environment looks unfit for GPU KV
-    transfer. A wrong ``UCX_*`` value silently degrades NIXL to host memory and
-    stalls, so we surface a recommendation and leave the decision -- and any
-    explicit override -- to the operator."""
+    transfer, leaving the decision to the operator."""
     issues = []
     tls = os.environ.get("UCX_TLS")
     if not tls or "cuda" not in tls.lower():
