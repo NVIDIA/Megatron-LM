@@ -62,3 +62,4 @@ jobs:
             Do NOT post any comments on the PR. Only apply the label.
           claude_args: |
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr view:*)"
+            --model "${{ vars.CLAUDE_MODEL }}"
