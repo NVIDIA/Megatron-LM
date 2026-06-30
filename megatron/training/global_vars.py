@@ -379,9 +379,36 @@ def _set_telemetry(args):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
+    # The "console" exporter defaults to stdout, which interleaves spans/metrics
+    # with regular training logs. If --otel-json-dir is set, redirect it to a
+    # dedicated per-rank JSONL file instead.
+    span_exporter = None
+    metric_reader = None
+    json_dir = getattr(args, 'otel_json_dir', None)
+    if config.enabled and config.exporter == 'console' and json_dir:
+        os.makedirs(json_dir, exist_ok=True)
+        json_file = open(  # noqa: SIM115 -- kept open for process lifetime, closed on exit.
+            os.path.join(json_dir, f'lens_rank{args.rank}.jsonl'), 'a', buffering=1
+        )
+        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+        if config.traces_enabled:
+            span_exporter = ConsoleSpanExporter(out=json_file)
+        if config.metrics_enabled:
+            from opentelemetry.sdk.metrics.export import (
+                ConsoleMetricExporter,
+                PeriodicExportingMetricReader,
+            )
+
+            export_interval = int(os.environ.get('OTEL_METRIC_EXPORT_INTERVAL', '10000'))
+            metric_reader = PeriodicExportingMetricReader(
+                ConsoleMetricExporter(out=json_file), export_interval_millis=export_interval
+            )
+
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
         config, rank=args.rank, world_size=args.world_size,
         resource_attributes=resource_attrs,
+        span_exporter=span_exporter, metric_reader=metric_reader,
     )
 
     # Bridge Python logging to OTel so logs get exported with trace correlation.

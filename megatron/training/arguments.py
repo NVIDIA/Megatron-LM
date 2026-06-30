@@ -2515,6 +2515,17 @@ def _add_logging_args(parser):
         'Defaults to "default" (coarse job/checkpoint/evaluate spans only).  '
         'Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.',
     )
+    otel_group.add_argument(
+        '--otel-json-dir',
+        type=str,
+        default=None,
+        help='Only used with the "console" exporter (NEMO_LENS_EXPORTER=console '
+        'or MEGATRON_OTEL_EXPORTER=console). Directory to write one '
+        'lens_rank<N>.jsonl file per rank instead of printing spans/metrics to '
+        'stdout, where they would otherwise be interleaved with regular '
+        'training logs. Directory is created if it does not exist. If unset, '
+        'the console exporter falls back to its default of stdout.',
+    )
 
     return parser
 
