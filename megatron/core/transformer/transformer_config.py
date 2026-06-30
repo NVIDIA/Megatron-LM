@@ -307,6 +307,9 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
+
     ####################
     # DSA
     ####################
@@ -1454,6 +1457,21 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.context_parallel_size > 1:
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.cp_partition_mode != "contiguous"
+            ):
+                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+            if (
+                self.experimental_attention_variant != "dsv4_hybrid"
+                and self.cp_partition_mode != "zigzag"
+            ):
+                raise ValueError("cp_partition_mode='contiguous' is only supported with DSv4.")
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1516,6 +1534,19 @@ class TransformerConfig(ModelParallelConfig):
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
+            if (
+                self.context_parallel_size > 1
+                and 4 in self.csa_compress_ratios
+                and not self.csa_dense_mode
+                and (self.dsa_indexer_loss_coeff or 0.0) > 0
+                and not self.dsa_indexer_use_sparse_loss
+            ):
+                # The current cuDNN fused indexer-loss kernel cannot express the
+                # CP-local query-offset semantics required by dense loss.
+                raise ValueError(
+                    "DSv4 CP dense indexer loss is unsupported because the current cuDNN "
+                    "fused kernel lacks CP query-offset semantics."
+                )
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."

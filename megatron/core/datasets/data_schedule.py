@@ -587,8 +587,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
-        config: Model parallel config used for optional THD packed-sequence padding.
-            When None or config.pad_packed_seq_alignment is None, no padding is applied.
+        config: Model config used for CP partitioning and optional THD packed-sequence padding.
+            When None, CP partitioning defaults to zigzag and no padding is applied.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -644,11 +644,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
-    use_contiguous_cp_slice = (
-        config is not None
-        and getattr(config, 'experimental_attention_variant', None) == "dsv4_hybrid"
-        and cp_group.size() > 1
-    )
+    cp_partition_mode = config.cp_partition_mode if config is not None else "zigzag"
     contiguous_cp_local_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
@@ -661,7 +657,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             getattr(config, 'thd_max_packed_sequences', None),
             getattr(config, 'cuda_graph_impl', 'none') != 'none',
         )
-    if is_tp_rank_0 and use_contiguous_cp_slice and pad_alignment is not None:
+    if (
+        is_tp_rank_0
+        and cp_group.size() > 1
+        and cp_partition_mode == "contiguous"
+        and pad_alignment is not None
+    ):
         if target_len is not None:
             contiguous_cp_local_target_len = target_len
         else:
@@ -694,7 +695,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch,
             cp_group,
             keys=cp_slice_keys,
-            use_contiguous_cp_slice=use_contiguous_cp_slice,
+            cp_partition_mode=cp_partition_mode,
             partition_total_tokens=partition_total_tokens,
         )
 
@@ -835,6 +836,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        cp_partition_mode=cp_partition_mode,
         pad_between_seqs=False,
     )
 

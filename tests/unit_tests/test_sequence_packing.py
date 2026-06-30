@@ -196,7 +196,10 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
     }
 
     get_cp_slice_for_thd(
-        batch, _MockCPGroup(size=4, rank=2), use_contiguous_cp_slice=True, partition_total_tokens=16
+        batch,
+        _MockCPGroup(size=4, rank=2),
+        cp_partition_mode="contiguous",
+        partition_total_tokens=16,
     )
 
     assert torch.equal(batch["tokens"], torch.arange(8, 12, dtype=torch.int64))
@@ -223,7 +226,7 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         cp=_MockCPGroup(size=4, rank=cp_rank),
     )
     config = SimpleNamespace(
-        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
         pad_packed_seq_alignment=alignment,
         max_seqlen_per_dp_cp_rank=8,
         thd_max_packed_sequences=None,
@@ -300,6 +303,7 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         torch.arange(global_start, global_start + local_target) >= total_tokens,
     )
     assert packed_seq_params.local_cp_size == local_cp_size
+    assert packed_seq_params.cp_partition_mode == "contiguous"
     assert pad_input_lengths == [local_target]
 
 

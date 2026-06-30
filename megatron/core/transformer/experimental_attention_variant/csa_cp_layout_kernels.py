@@ -17,6 +17,7 @@ try:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    from cutlass import utils
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
     _CUTE_AVAILABLE = True
@@ -388,92 +389,111 @@ if _CUTE_AVAILABLE:
         seq_major_rows: cutlass.Int32,
         compressed_base: cutlass.Int32,
         total_width: cutlass.Int32,
-        index_mode: cutlass.Int32,
+        index_mode: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         linear = bidx * 128 + tidx
 
         # 0: selected top-k, 1: all visible compressed rows, 2: indexer loss.
-        row = linear
-        col = cutlass.Int32(0)
-        if index_mode != 0:
-            if linear < l_local * total_width:
-                row = linear // total_width
-                col = linear - row * total_width
-            else:
-                row = l_local
+        if cutlass.const_expr(index_mode == 0):
+            row = linear
+        else:
+            row = bidx
 
         if row < l_local:
             global_q = global_start + row
             seq_start_found = cutlass.Int32(-1)
             seq_comp_start = cutlass.Int32(0)
             seq_comp_len = cutlass.Int32(0)
-            for seq in range(n_seq):
-                seq_start = cu_seqlens[seq]
-                seq_end = cu_seqlens[seq + 1]
-                if global_q >= seq_start and global_q < seq_end:
-                    seq_start_found = seq_start
-                    if ratio > 1 and compressed_width > 0:
-                        seq_comp_start = cu_seqlens_compressed[seq]
-                        seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+            if cutlass.const_expr(index_mode == 0):
+                for seq in range(n_seq):
+                    seq_start = cu_seqlens[seq]
+                    seq_end = cu_seqlens[seq + 1]
+                    if global_q >= seq_start and global_q < seq_end:
+                        seq_start_found = seq_start
+                        if ratio > 1 and compressed_width > 0:
+                            seq_comp_start = cu_seqlens_compressed[seq]
+                            seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+            else:
+                shared = utils.SmemAllocator().allocate_tensor(cutlass.Int32, cute.make_layout(3))
+                if tidx == 0:
+                    for seq in range(n_seq):
+                        seq_start = cu_seqlens[seq]
+                        seq_end = cu_seqlens[seq + 1]
+                        if global_q >= seq_start and global_q < seq_end:
+                            seq_start_found = seq_start
+                            if ratio > 1 and compressed_width > 0:
+                                seq_comp_start = cu_seqlens_compressed[seq]
+                                seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+                    shared[0] = seq_start_found
+                    shared[1] = seq_comp_start
+                    shared[2] = seq_comp_len
+                cute.arch.sync_threads()
+                seq_start_found = shared[0]
+                seq_comp_start = shared[1]
+                seq_comp_len = shared[2]
 
-            if index_mode != 0:
-                topk_value = cutlass.Int32(-1)
-                rank_major_value = cutlass.Int32(-1)
-                length = cutlass.Int32(0)
-                if seq_start_found >= 0:
-                    window_start = global_q - window_size + 1
-                    if window_start < seq_start_found:
-                        window_start = seq_start_found
-                    window_count = global_q - window_start + 1
-                    if index_mode == 2:
-                        if col < compressed_width:
-                            comp_id = indexer_topk[row, col]
-                            if comp_id >= 0 and comp_id < seq_comp_len:
-                                seq_major_id = seq_comp_start + comp_id
-                                if seq_major_id < seq_major_rows:
-                                    rank_major_value = seq_to_rank_row[seq_major_id]
-                                    if rank_major_value >= 0:
-                                        topk_value = compressed_base + rank_major_value
+            if cutlass.const_expr(index_mode != 0):
+                col = tidx
+                while col < total_width:
+                    topk_value = cutlass.Int32(-1)
+                    rank_major_value = cutlass.Int32(-1)
+                    length = cutlass.Int32(0)
+                    if seq_start_found >= 0:
+                        window_start = global_q - window_size + 1
+                        if window_start < seq_start_found:
+                            window_start = seq_start_found
+                        window_count = global_q - window_start + 1
+                        if cutlass.const_expr(index_mode == 2):
+                            if col < compressed_width:
+                                comp_id = indexer_topk[row, col]
+                                if comp_id >= 0 and comp_id < seq_comp_len:
+                                    seq_major_id = seq_comp_start + comp_id
+                                    if seq_major_id < seq_major_rows:
+                                        rank_major_value = seq_to_rank_row[seq_major_id]
+                                        if rank_major_value >= 0:
+                                            topk_value = compressed_base + rank_major_value
+                            else:
+                                window_col = col - compressed_width
+                                if window_col < window_count:
+                                    pos = window_start + window_col
+                                    if pos < global_start:
+                                        topk_value = pos - (global_start - d_window)
+                                    else:
+                                        topk_value = d_window + pos - global_start
                         else:
-                            window_col = col - compressed_width
-                            if window_col < window_count:
-                                pos = window_start + window_col
+                            comp_count = cutlass.Int32(0)
+                            if ratio > 1 and compressed_width > 0:
+                                comp_count = (global_q - seq_start_found + 1) // ratio
+                                if comp_count > compressed_width:
+                                    comp_count = compressed_width
+                                if comp_count > seq_comp_len:
+                                    comp_count = seq_comp_len
+                            length = window_count + comp_count
+                            if col < window_count:
+                                pos = window_start + col
                                 if pos < global_start:
                                     topk_value = pos - (global_start - d_window)
                                 else:
                                     topk_value = d_window + pos - global_start
-                    else:
-                        comp_count = cutlass.Int32(0)
-                        if ratio > 1 and compressed_width > 0:
-                            comp_count = (global_q - seq_start_found + 1) // ratio
-                            if comp_count > compressed_width:
-                                comp_count = compressed_width
-                            if comp_count > seq_comp_len:
-                                comp_count = seq_comp_len
-                        length = window_count + comp_count
-                        if col < window_count:
-                            pos = window_start + col
-                            if pos < global_start:
-                                topk_value = pos - (global_start - d_window)
-                            else:
-                                topk_value = d_window + pos - global_start
-                        elif col < length:
-                            seq_major_id = seq_comp_start + col - window_count
-                            if seq_major_id < seq_major_rows:
-                                rank_major_id = seq_to_rank_row[seq_major_id]
-                                if rank_major_id >= 0:
-                                    topk_value = compressed_base + rank_major_id
-                elif total_width > 0 and index_mode != 2:
-                    length = 1
-                    if col == 0:
-                        topk_value = 0
-                topk_idxs[row, col] = topk_value
-                if index_mode == 2 and col < compressed_width:
-                    indexer_rank_major[row, col] = rank_major_value
-                elif col == 0:
-                    topk_length[row] = length
+                            elif col < length:
+                                seq_major_id = seq_comp_start + col - window_count
+                                if seq_major_id < seq_major_rows:
+                                    rank_major_id = seq_to_rank_row[seq_major_id]
+                                    if rank_major_id >= 0:
+                                        topk_value = compressed_base + rank_major_id
+                    elif total_width > 0 and cutlass.const_expr(index_mode != 2):
+                        length = 1
+                        if col == 0:
+                            topk_value = 0
+                    topk_idxs[row, col] = topk_value
+                    if cutlass.const_expr(index_mode == 2):
+                        if col < compressed_width:
+                            indexer_rank_major[row, col] = rank_major_value
+                    elif col == 0:
+                        topk_length[row] = length
+                    col = col + 128
             else:
                 for out_col in range(total_width):
                     topk_idxs[row, out_col] = -1
@@ -528,7 +548,7 @@ if _CUTE_AVAILABLE:
         seq_major_rows: cutlass.Int32,
         compressed_base: cutlass.Int32,
         total_width: cutlass.Int32,
-        index_mode: cutlass.Int32,
+        index_mode: cutlass.Constexpr,
         launch_work: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -602,7 +622,10 @@ def _run_compiled_launch(
         cap = torch.cuda.get_device_capability()
         arch = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}.get(cap)
         if arch is None:
-            raise RuntimeError(f"Unsupported GPU compute capability {cap} for CSA CP CuTe kernels.")
+            raise RuntimeError(
+                f"Unsupported GPU compute capability {cap} for CSA CP CuTe kernels; "
+                "supported architectures: sm_90a, sm_100a, sm_103a."
+            )
         cute_tensor_args = []
         for tensor in tensor_args:
             cute_tensor = from_dlpack(tensor.detach(), assumed_align=16, enable_tvm_ffi=True)
@@ -788,7 +811,7 @@ def build_attention_indices(
     else:
         topk_length_kernel = torch.empty((l_local,), dtype=torch.int32, device=cu_seqlens.device)
         indexer_rank_major = torch.empty((1, 1), dtype=torch.int32, device=cu_seqlens.device)
-    launch_work = l_local * total_width if index_mode else l_local
+    launch_work = l_local * 128 if index_mode else l_local
     compressed_base = int(d_window) + l_local
     _run_compiled_launch(
         _build_attention_indices_launch,
@@ -815,6 +838,7 @@ def build_attention_indices(
             index_mode,
             launch_work,
         ),
+        static_arg_indices=(10,),
     )
     if for_indexer_loss:
         return topk_idxs, None, indexer_rank_major

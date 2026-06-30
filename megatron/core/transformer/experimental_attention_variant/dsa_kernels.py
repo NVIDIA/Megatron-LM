@@ -514,7 +514,6 @@ def _indexer_topk_core(
       so the SBHD→BSHD permute can be performed once and reused across
       the indexer forward and the score-recompute backward kernels.
     """
-    _ensure_dsa_namespace()
     is_thd = cu_seqlens_q is not None
     device = q.device
 
@@ -526,7 +525,10 @@ def _indexer_topk_core(
             raise ValueError(f"THD k must be (total_k, idx_hd), got {k.shape}")
         if w.ndim != 2:
             raise ValueError(f"THD w must be (total_q, idx_nh), got {w.shape}")
+        if max_seqlen_kv == 0 or k.shape[0] == 0:
+            raise ValueError("indexer_topk requires at least one K row.")
 
+        _ensure_dsa_namespace()
         # Kernel wants k as 3-D ``(total_k, h_kv, idx_hd)``.
         scores = _DSA.indexer_forward_wrapper(
             q,
@@ -576,6 +578,10 @@ def _indexer_topk_core(
             )
             seq_lens = torch.where(row_valid, seq_lens, torch.zeros_like(seq_lens))
     else:
+        if k.shape[1] == 0:
+            raise ValueError("indexer_topk requires at least one K row.")
+
+        _ensure_dsa_namespace()
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
@@ -605,7 +611,7 @@ def _indexer_topk_core(
     if is_thd:
         row_valid = (topk_indices >= 0) & (topk_indices < seq_lens.unsqueeze(1))
         topk_indices = topk_indices.masked_fill(~row_valid, -1)
-        safe_topk = topk_indices.clamp(min=0, max=max(sk - 1, 0)).to(torch.long)
+        safe_topk = topk_indices.clamp(min=0, max=sk - 1).to(torch.long)
         selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
         selected_valid = (topk_indices >= 0) & (topk_indices < sk) & torch.isfinite(selected_scores)
         topk_indices = topk_indices.masked_fill(~selected_valid, -1)

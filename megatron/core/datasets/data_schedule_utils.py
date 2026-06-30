@@ -3,7 +3,7 @@
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -15,21 +15,20 @@ def get_cp_slice_for_thd(
     batch,
     cp_group,
     keys: Optional[Sequence[str]] = None,
-    use_contiguous_cp_slice: bool = False,
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag",
     partition_total_tokens: Optional[int] = None,
 ):
     """Partition sequence data for context parallelism in THD format.
 
-    Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
-    With ``use_contiguous_cp_slice=True``, the flattened rows are split into ``cp_size`` equal
-    slices, and each rank receives the slice at its rank index.
+    ``zigzag`` uses TE's THD partitioned indices. ``contiguous`` splits the flattened rows into
+    ``cp_size`` equal slices and assigns one slice to each rank.
     Only keys present in the batch are sliced.
 
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
-        use_contiguous_cp_slice: Whether to assign one contiguous row range per CP rank.
+        cp_partition_mode: How to assign packed rows to CP ranks.
         partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
             before slicing. Existing cu_seqlens metadata is left unchanged.
     """
@@ -63,7 +62,7 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
-    if use_contiguous_cp_slice:
+    if cp_partition_mode == "contiguous":
         if total_tokens % cp_size != 0:
             raise RuntimeError(
                 f"Contiguous CP slicing requires total_tokens={total_tokens} to be divisible by "
@@ -76,6 +75,9 @@ def get_cp_slice_for_thd(
             if key in batch and batch[key] is not None:
                 batch[key] = batch[key][row_slice]
         return
+
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
 
     index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
     for key in keys:

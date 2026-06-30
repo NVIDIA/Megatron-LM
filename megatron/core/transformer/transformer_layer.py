@@ -1326,6 +1326,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
+            cp_partition_mode=self.config.cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),

@@ -271,6 +271,8 @@ class TestPadSequenceForThd:
         """Generic THD padding covers tail slots with an independent dummy sequence."""
         seqlens, total_T = [50, 30], 80
         psp = _make_psp(seqlens)
+        # Use the non-default mode so losing it during rebuild cannot silently pass as zigzag.
+        psp.cp_partition_mode = "contiguous"
         orig = psp.cu_seqlens_q.clone()
         p_tok, _, _, _, p, mask = pad_sequence_for_thd(
             torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment=64
@@ -280,6 +282,7 @@ class TestPadSequenceForThd:
         assert torch.equal(p.cu_seqlens_q, expected)
         assert torch.equal(p.cu_seqlens_q_padded, expected)
         assert p.pad_between_seqs is False
+        assert p.cp_partition_mode == "contiguous"
         assert mask.shape == (1, 128)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
 
@@ -570,6 +573,8 @@ class TestDecomposeReconstruct:
             )
         }
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        # Use the non-default mode so losing it during reconstruction is observable.
+        layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
         TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
@@ -577,6 +582,7 @@ class TestDecomposeReconstruct:
         r = kw['packed_seq_params']
         assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
         assert r.pad_between_seqs is False
+        assert r.cp_partition_mode == "contiguous"
         for k, v in orig.items():
             assert torch.equal(getattr(r, k), v)
 

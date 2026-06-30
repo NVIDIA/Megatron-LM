@@ -1703,11 +1703,11 @@ class CompressedSparseAttention(MegatronModule):
         attention_mask: torch.Tensor,
         x: torch.Tensor = None,
         qr: torch.Tensor = None,
-        boundary_hidden: Optional[torch.Tensor] = None,
-        boundary_kv: Optional[torch.Tensor] = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        boundary_hidden: Optional[torch.Tensor] = None,
+        boundary_kv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -2173,8 +2173,8 @@ class CompressedSparseAttention(MegatronModule):
         key: torch.Tensor,
         x: torch.Tensor,
         qr: torch.Tensor,
-        boundary_hidden: torch.Tensor,
-        boundary_kv: torch.Tensor,
+        boundary_hidden: Optional[torch.Tensor],
+        boundary_kv: Optional[torch.Tensor],
         packed_seq_params: PackedSeqParams,
     ) -> torch.Tensor:
         """THD-packed context-parallel branch.

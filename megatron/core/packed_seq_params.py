@@ -27,6 +27,7 @@ class PackedSeqParams:
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -475,6 +476,7 @@ def pad_sequence_for_thd(
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
+        cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,
         pad_between_seqs=False if has_dummy_padding_seq else packed_seq_params.pad_between_seqs,
     )

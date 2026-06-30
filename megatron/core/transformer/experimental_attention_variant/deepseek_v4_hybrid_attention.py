@@ -254,18 +254,21 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
-        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
-        # both QKV RoPE and the post-attention inverse RoPE use
-        # self.pg_collection.cp, which must point at this microbatch's dynamic
-        # CP group. Restored before every return.
+        # Select this microbatch's dynamic CP group. QKV captures it explicitly
+        # for recompute; the rest of this forward reads it from pg_collection.
+        # Restore the static group before returning.
         _orig_cp_group = self.pg_collection.cp
+        cp_group = _orig_cp_group
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+            cp_group = packed_seq_params.cp_group
 
-        cp_size = self.pg_collection.cp.size()
+        cp_size = cp_group.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
+        if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
+            raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+        self.pg_collection.cp = cp_group
 
         boundary_hidden = None
         if use_thd_cp:
@@ -680,7 +683,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # =========================================
 
         def qkv_up_proj_and_rope_apply(
-            q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed=None
+            q_compressed,
+            kv_compressed,
+            k_pos_emb,
+            rotary_pos_emb,
+            cp_group,
+            boundary_kv_compressed=None,
         ):
             """
             Apply the up projection and RoPE to the query and key.
@@ -711,10 +719,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            cp_size = self.pg_collection.cp.size()
+            cp_size = cp_group.size()
             if self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
-                    cp_rank = self.pg_collection.cp.rank()
+                    cp_rank = cp_group.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
                     global_start = cp_rank * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_fused(
@@ -740,7 +748,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         boundary_kv = kv[:boundary_rows]
                         kv = kv[boundary_rows:]
                 else:
-                    cp_rank = self.pg_collection.cp.rank()
+                    cp_rank = cp_group.rank()
                     query = fused_mla_rope_inplace(
                         q,
                         rotary_pos_cos,
@@ -768,7 +776,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 value = kv
             else:
                 if packed_seq and cp_size > 1:
-                    global_start = self.pg_collection.cp.rank() * q.shape[0]
+                    global_start = cp_group.rank() * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_unfused(
                         q,
                         rotary_pos_emb,
@@ -811,7 +819,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         config=self.config,
                         cu_seqlens=cu_seqlens_q,
                         mscale=mscale,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=cp_group,
                         mla_rotary_interleaved=True,
                         mla_output_remove_interleaving=True,
                         max_seqlen=rope_max_seqlen_q,
@@ -829,7 +837,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=mscale,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=cp_group,
                         mla_rotary_interleaved=True,
                         mla_output_remove_interleaving=True,
                         max_seqlen=rope_max_seqlen_kv,
@@ -859,6 +867,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     kv_compressed,
                     k_pos_emb,
                     rotary_pos_emb,
+                    self.pg_collection.cp,
                 )
                 boundary_kv = None
             else:
@@ -868,17 +877,23 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     kv_compressed,
                     k_pos_emb,
                     rotary_pos_emb,
+                    self.pg_collection.cp,
                     boundary_kv_compressed,
                 )
         else:
             if boundary_kv_compressed is None:
                 query, key, value = qkv_up_proj_and_rope_apply(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, self.pg_collection.cp
                 )
                 boundary_kv = None
             else:
                 query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed
+                    q_compressed,
+                    kv_compressed,
+                    k_pos_emb,
+                    rotary_pos_emb,
+                    self.pg_collection.cp,
+                    boundary_kv_compressed,
                 )
 
         result = (query, key, value, q_compressed, kv_compressed)

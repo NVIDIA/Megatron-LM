@@ -123,6 +123,7 @@ def _make_thd_packed_seq_params(seg_lens, padded_seg_lens=None, device='cuda'):
         max_seqlen_q=max_len,
         max_seqlen_kv=max_len,
         qkv_format='thd',
+        cp_partition_mode='contiguous',
     )
 
 
@@ -284,6 +285,7 @@ def _make_dsv4_cp_config(
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         context_parallel_size=context_parallel_size,
+        cp_partition_mode="contiguous" if context_parallel_size > 1 else "zigzag",
         csa_dense_mode=False,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
         layernorm_epsilon=1e-6,
@@ -626,6 +628,65 @@ class TestDSv4HybridAttentionTHDCP:
             )
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        _clear_cuda_test_state()
+
+    @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused", "unfused"])
+    def test_dynamic_cp_mla_up_proj_recompute_matches_eager(self, apply_rope_fusion):
+        """Selective MLA recompute must retain the microbatch's dynamic CP group."""
+        if apply_rope_fusion and not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        packed.local_cp_size = self.cp_size
+        packed.cp_group = self.pg.cp
+
+        torch.manual_seed(_SEED + 1300)
+        model_parallel_cuda_manual_seed(_SEED + 1300)
+        eager_config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=apply_rope_fusion,
+        )
+        recompute_config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=apply_rope_fusion,
+        )
+        recompute_config.recompute_granularity = "selective"
+        recompute_config.recompute_modules = ["mla_up_proj"]
+
+        eager_attn = _build_attention(
+            eager_config, layer_number=1, pg_collection=self.ref_pg
+        ).cuda()
+        recompute_attn = _build_attention(
+            recompute_config, layer_number=1, pg_collection=self.ref_pg
+        ).cuda()
+        eager_attn.train()
+        recompute_attn.train()
+        _copy_module_parameters(eager_attn, recompute_attn)
+
+        full_hidden, full_grad = _make_hidden_and_grad(padded_tokens, eager_config.hidden_size)
+        hidden = full_hidden.index_select(0, local_idx)
+        grad = full_grad.index_select(0, local_idx)
+        eager_result = _run_dsv4_attention_forward_backward(
+            eager_attn, hidden.detach().clone().requires_grad_(True), grad, packed
+        )
+        recompute_result = _run_dsv4_attention_forward_backward(
+            recompute_attn, hidden.detach().clone().requires_grad_(True), grad, packed
+        )
+
+        mode = f"dynamic_cp:rope_fused={apply_rope_fusion}"
+        _assert_cp_tensor_match(recompute_result[0], eager_result[0], f"{mode}:output")
+        _assert_cp_tensor_match(recompute_result[1], eager_result[1], f"{mode}:hidden_grad")
+        assert recompute_result[2].keys() == eager_result[2].keys()
+        for name, recompute_grad in recompute_result[2].items():
+            _assert_cp_tensor_match(
+                recompute_grad, eager_result[2][name], f"{mode}:param_grad:{name}"
+            )
+
+        del eager_attn, recompute_attn, full_hidden, full_grad, hidden, grad
         _clear_cuda_test_state()
 
     def test_thd_cp_ratio4_eval_matches_full_reference(self):

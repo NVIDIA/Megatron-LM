@@ -416,6 +416,77 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
     assert torch.equal(fused[2], expected[1])
 
 
+def test_build_attention_indices_many_short_sequences_match_native():
+    _require_cute_cuda()
+    cu = torch.arange(0, 4097, 32, dtype=torch.int32, device="cuda")
+    ratio = 4
+    cu_comp = _compressed_cu_seqlens(cu, ratio)
+    global_start = 1024
+    l_local = 1024
+    d_window = 128
+    window = 16
+    compressed_width = 128
+    seq_to_rank_row = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
+    compressed_base = d_window + l_local
+
+    actual = csa_cp_layout_kernels.build_attention_indices(
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        compressed_width,
+        cu_seqlens_compressed=cu_comp,
+        seq_to_rank_row=seq_to_rank_row,
+    )
+    expected = _native_attention_indices(
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        compressed_width,
+        seq_to_rank_row,
+        compressed_base,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+    logical_ids = torch.arange(compressed_width, dtype=torch.int32, device="cuda").expand(
+        l_local, -1
+    )
+    actual = csa_cp_layout_kernels.build_attention_indices(
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        compressed_width,
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        seq_to_rank_row=seq_to_rank_row,
+        for_indexer_loss=True,
+    )
+    expected = _native_indexer_loss_indices(
+        cu,
+        cu_comp,
+        global_start,
+        l_local,
+        d_window,
+        window,
+        ratio,
+        logical_ids,
+        seq_to_rank_row,
+        compressed_base,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[2], expected[1])
+
+
 @pytest.mark.parametrize(
     ("ratio", "lengths"),
     [(4, (3, 10, 20, 5, 33, 10, 27, 20)), (128, (3, 130, 170, 5, 260, 129, 200, 127))],
