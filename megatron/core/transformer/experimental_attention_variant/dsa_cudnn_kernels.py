@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_masking
+from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_masking
 from megatron.core.utils import round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
@@ -1410,19 +1410,13 @@ def _kl_loss_from_target_predict(
 
     Invalid top-K slots must already be zeroed in ``target`` and ``predict_log_probs``.
     """
-    eps = _KL_EPS
-    kl_terms = target * (torch.log(target.clamp_min(eps)) - predict_log_probs)
-    kl_per_row = kl_terms.sum(dim=-1)
-    if query_valid_rows is None:
-        loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
-    else:
-        row_mask = query_valid_rows.to(dtype=torch.float32, device=kl_per_row.device)
-        if calculate_per_token_loss:
-            loss = (kl_per_row * row_mask).sum()
-        else:
-            row_count = row_mask.sum().clamp_min(1.0)
-            loss = (kl_per_row * row_mask).sum() / row_count
-    return loss_coeff * loss
+    return dsa_indexer_loss.indexer_loss_from_target(
+        target,
+        predict_log_probs,
+        loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
+    )
 
 
 def _compute_dense_attn_score(
@@ -1565,7 +1559,7 @@ def _compute_sparse_indexer_loss_and_grads(
     # Attention heads are sharded across TP ranks. Match native DSA by
     # combining each rank's attention target before final row normalization.
     _all_reduce_tp_target(target, tp_group)
-    target = target / target.sum(dim=-1, keepdim=True).clamp_min(_KL_EPS)
+    target = dsa_indexer_loss.normalize_indexer_target(target)
     target.masked_fill_(~valid_positions, 0.0)
     indexer_loss = _kl_loss_from_target_predict(
         target, predict_log_probs, loss_coeff, query_valid_rows, calculate_per_token_loss

@@ -18,6 +18,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_indexer_loss,
     dsa_kernels,
     dsa_layout,
     dsa_masking,
@@ -501,37 +502,15 @@ def compute_dsa_indexer_loss(
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
-    # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
-    # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True).clamp_min(
-        1e-10
+    # The target is already non-negative because it is a sum of softmax probabilities.
+    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    return dsa_indexer_loss.indexer_loss_from_target(
+        attention_scores,
+        index_log_scores,
+        loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
-
-    # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
-    # kl_per_element [b, sq, sk]
-    kl_per_element = attention_scores * (
-        torch.log(attention_scores.clamp_min(1e-10)) - index_log_scores
-    )
-
-    # [b, sq, sk] -> [b, sq] -> [1]
-    # Each real token has the same weight in the loss.
-    kl_per_row = kl_per_element.sum(dim=-1)
-    if calculate_per_token_loss:
-        if query_valid_rows is None:
-            kl_div = kl_per_row.sum()
-        else:
-            kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum()
-    elif query_valid_rows is None:
-        kl_div = kl_per_row.mean()
-    else:
-        valid_row_count = query_valid_rows.sum().to(dtype=torch.float32, device=kl_per_row.device)
-        valid_row_count = valid_row_count.clamp_min(1.0)
-        kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum() / valid_row_count
-
-    # Scale by coefficient.
-    indexer_loss = kl_div * loss_coeff
-
-    return indexer_loss
 
 
 def _compute_index_scores(

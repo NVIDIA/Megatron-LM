@@ -17,7 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -1464,6 +1464,70 @@ class TestDSAAbsorbedParityCPU:
         assert query.grad is not None and torch.isfinite(query.grad).all()
         assert key.grad is not None and torch.isfinite(key.grad).all()
         assert up_v_weight.grad is not None and torch.isfinite(up_v_weight.grad).all()
+
+
+class TestDSAIndexerLossHelpersCPU:
+    """CPU tests for backend-neutral DSA indexer-loss helpers."""
+
+    def test_normalize_indexer_target_preserves_zero_rows_and_in_place_contract(self):
+        target = torch.tensor([[1.0, 3.0], [0.0, 0.0]])
+
+        normalized = dsa_indexer_loss.normalize_indexer_target(target)
+
+        assert normalized is not target
+        torch.testing.assert_close(normalized, torch.tensor([[0.25, 0.75], [0.0, 0.0]]))
+        torch.testing.assert_close(target, torch.tensor([[1.0, 3.0], [0.0, 0.0]]))
+
+        normalized_in_place = dsa_indexer_loss.normalize_indexer_target_(target)
+        assert normalized_in_place is target
+        torch.testing.assert_close(target, normalized)
+
+    def test_indexer_kl_per_row_ignores_invalid_slots(self):
+        target = torch.tensor([[0.75, 0.25, 0.0]])
+        predict_log_probs = torch.tensor([[0.5, 0.5, 0.0]]).log()
+        valid_mask = torch.tensor([[True, True, False]])
+
+        actual = dsa_indexer_loss.indexer_kl_per_row(target, predict_log_probs, valid_mask)
+        expected = (target[:, :2] * (target[:, :2].log() - predict_log_probs[:, :2])).sum(dim=-1)
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            dsa_indexer_loss.indexer_kl_sum(target, predict_log_probs, valid_mask), expected.sum()
+        )
+        assert torch.isfinite(actual).all()
+
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    def test_indexer_loss_from_target_matches_log_softmax_gradient(
+        self, calculate_per_token_loss: bool
+    ):
+        logits = torch.tensor(
+            [[[-0.2, 0.4, 0.1], [0.3, -0.1, 0.2], [0.5, 0.2, -0.4]]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        target = torch.tensor([[[0.2, 0.5, 0.3], [0.1, 0.2, 0.7], [0.4, 0.4, 0.2]]])
+        query_valid_rows = torch.tensor([[True, True, False]])
+        loss_coeff = 0.25
+
+        loss = dsa_indexer_loss.indexer_loss_from_target(
+            target,
+            torch.log_softmax(logits, dim=-1),
+            loss_coeff,
+            query_valid_rows=query_valid_rows,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
+        loss.backward()
+
+        log_probs = torch.log_softmax(logits.detach(), dim=-1)
+        expected_kl_sum = (target[:, :2] * (target[:, :2].log() - log_probs[:, :2])).sum()
+        reduction_scale = 1.0 if calculate_per_token_loss else 0.5
+        torch.testing.assert_close(loss, expected_kl_sum * loss_coeff * reduction_scale)
+
+        expected_grad = torch.zeros_like(logits)
+        expected_grad[:, :2] = (torch.softmax(logits.detach(), dim=-1)[:, :2] - target[:, :2]) * (
+            loss_coeff * reduction_scale
+        )
+        torch.testing.assert_close(logits.grad, expected_grad)
 
 
 class TestDSAIndexerLossRowMaskCPU:
