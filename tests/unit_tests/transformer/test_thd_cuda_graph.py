@@ -614,6 +614,23 @@ class TestStaticInputs:
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_hash_router_input_ids_use_per_rank_capacity(self):
+        """Hash routing input IDs must use the fixed [1, local_tokens] THD shape."""
+        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        layer.config.context_parallel_size = 2
+        layer.config.sequence_packing_scheduler = "dp_balanced"
+        layer.config.cuda_graph_impl = "transformer_engine"
+        layer.config.moe_n_hash_layers = 1
+        layer.is_moe_layer = True
+        layer.mlp.router = torch.nn.Identity()
+        layer.mlp.router.is_hash_layer = True
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
+
+        assert static_inputs["input_ids"].shape == (1, 128)
+
 
 class TestDynamicMicrobatchSlots:
 
