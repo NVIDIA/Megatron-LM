@@ -19,6 +19,7 @@ import re
 import tarfile
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
@@ -56,6 +57,11 @@ LOGPROBS_TAR_MEMBER_RE = re.compile(
 
 CACHED_LOGITS_LOGPROB_SENTINEL = -1e3
 CACHED_LOGITS_INDEX_SENTINEL = -1
+
+# On-disk payload format version.  ``1`` is the legacy list-of-microbatches
+# layout (``values: List[Tensor]``); ``2`` is the monolithic per-iter layout
+# (``values: Tensor``) that supports flexible MBS / DP / GBS resharding.
+LOGPROBS_FORMAT_VERSION = 2
 
 # Cache to not have to re-run the glob operation for the same pattern, which is expensive for MSC.
 _STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
@@ -227,21 +233,6 @@ def sorted_batched_tars(paths: List[str]) -> List[str]:
     return [path for _, path in keyed]
 
 
-def pad_topk_dim(tensor: torch.Tensor, target_k: int, pad_value: float) -> torch.Tensor:
-    """Pad the top-K dimension so CP ranks can gather variable top-P widths."""
-    current_k = tensor.size(-1)
-    if current_k == target_k:
-        return tensor
-    pad_shape = (*tensor.shape[:-1], target_k - current_k)
-    padding = torch.full(
-        pad_shape,
-        pad_value,
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    return torch.cat([tensor, padding], dim=-1)
-
-
 def slice_tensor_for_cp_rank(tensor: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
     """Return this CP rank's zigzag sequence slice from a full sequence tensor."""
     if cp_size <= 1:
@@ -328,22 +319,33 @@ def open_logit_file(path: str, mode: str = "rb", **kwargs):
     return open(path, mode, **local_kwargs)
 
 
+def parse_logprobs_metadata(data: bytes) -> Dict[str, Any]:
+    """Parse the JSON metadata stored in the ``_meta.json`` member."""
+    return json.loads(data)
+
+
 def _verify_logprobs_metadata(
     data: bytes,
     *,
     tar_path: str,
     expected_hash: Optional[str],
-) -> None:
-    """Validate the per-tar dataset hash stored in ``_meta.json``."""
-    if expected_hash is None:
-        return
-    saved_hash = json.loads(data).get("hash")
-    if saved_hash != expected_hash:
-        raise RuntimeError(
-            f"Teacher tar {tar_path} was saved with hash {saved_hash} "
-            f"but the current student run has hash {expected_hash}. "
-            "Data does not align!"
-        )
+) -> Dict[str, Any]:
+    """Parse the per-tar ``_meta.json`` and validate its dataset hash.
+
+    Returns the parsed metadata dict regardless of whether hash validation
+    runs; the caller may consume fields like ``format_version`` or the
+    saver-side ``mbs_save`` / ``dp_size_save`` / ``gbs_save`` records.
+    """
+    meta = parse_logprobs_metadata(data)
+    if expected_hash is not None:
+        saved_hash = meta.get("hash")
+        if saved_hash != expected_hash:
+            raise RuntimeError(
+                f"Teacher tar {tar_path} was saved with hash {saved_hash} "
+                f"but the current student run has hash {expected_hash}. "
+                "Data does not align!"
+            )
+    return meta
 
 
 def iter_logprobs_tar_entries(
@@ -351,6 +353,7 @@ def iter_logprobs_tar_entries(
     *,
     start_iteration: int = 0,
     expected_hash: Optional[str] = None,
+    metadata_out: Optional[List[Dict[str, Any]]] = None,
 ) -> Iterator[LogprobsTarEntry]:
     """Stream cached-logits payload members from a batched tar archive.
 
@@ -358,6 +361,10 @@ def iter_logprobs_tar_entries(
     ``_meta.json`` member followed by ``{iteration}.pt.zst`` payloads.
     Members before *start_iteration* are skipped before their payload bytes
     are materialized in Python.
+
+    If *metadata_out* is provided, the parsed ``_meta.json`` dict is appended
+    to it once during the scan so callers can read fields such as
+    ``format_version`` without a second pass through the tar.
     """
     metadata_seen = False
 
@@ -372,11 +379,13 @@ def iter_logprobs_tar_entries(
                     extracted = tar.extractfile(member)
                     if extracted is None:
                         raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
-                    _verify_logprobs_metadata(
+                    meta = _verify_logprobs_metadata(
                         extracted.read(),
                         tar_path=tar_path,
                         expected_hash=expected_hash,
                     )
+                    if metadata_out is not None:
+                        metadata_out.append(meta)
                     metadata_seen = True
                     continue
 
@@ -411,10 +420,84 @@ def iter_logprobs_tar_entries(
         )
 
 
-def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Decode one zstd-compressed cached-logits payload."""
+def peek_logprobs_metadata(tar_path: str) -> Optional[Dict[str, Any]]:
+    """Read the ``_meta.json`` member of *tar_path* without decoding payloads.
+
+    Returns ``None`` when the tar exists but contains no metadata member
+    (e.g. a malformed archive).  Useful for interactive inspection; the
+    loader factory uses :func:`peek_first_logprobs_metadata` instead.
+
+    Deliberately does **not** pass ``prefetch_file=True`` to
+    :func:`open_logit_file`: the metadata member is at the head of the
+    tar (written as the first member by the saver), and the streaming
+    tarfile reader only needs enough bytes to reach it.  On MSC backends
+    that support byte-range reads this turns a full-object download
+    (potentially hundreds of MB) into a small header fetch, avoiding a
+    multi-second stall on the loader's first ``__call__``.
+    """
+    with open_logit_file(tar_path, "rb") as stream:
+        with tarfile.open(fileobj=stream, mode="r|*") as tar:
+            for member in tar:
+                if not member.isreg():
+                    continue
+                if member.name == META_TAR_MEMBER:
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        return None
+                    return parse_logprobs_metadata(extracted.read())
+                break
+    return None
+
+
+def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
+    """Read ``_meta.json`` from any available tar in *logprobs_dir*.
+
+    Rank-0 does the I/O and broadcasts the parsed dict to the rest of the
+    world to keep object-store list/get calls down to one.  Returns
+    ``None`` if no tars are present yet.  Used by the loader factory to
+    discover the on-disk format version before instantiating a dataset.
+    """
+    distributed = (
+        dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    )
+    if distributed and dist.get_rank() != 0:
+        meta: Optional[Dict[str, Any]] = None
+    else:
+        tars = storage_glob(os.path.join(logprobs_dir, "*.tar"))
+        meta = peek_logprobs_metadata(tars[0]) if tars else None
+    if distributed:
+        payload: List[Optional[Dict[str, Any]]] = [meta]
+        dist.broadcast_object_list(payload, src=0)
+        return payload[0]
+    return meta
+
+
+def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
+    """Decode one zstd-compressed cached-logits payload.
+
+    Dispatches on the payload's ``format_version`` field:
+
+    * v2 (``format_version >= 2``): returns ``(values, indices)`` as
+      monolithic per-iteration tensors of shape
+      ``(seq, samples_per_dp_per_iter, K)``.  Slicing along the sample
+      dim is a zero-copy view, which keeps pinned-memory transfers
+      efficient.
+    * v1 (legacy, no ``format_version``): returns
+      ``(values_list, indices_list)`` mirroring the original saved
+      list-of-microbatches structure.  The v1 branch is slated for
+      removal alongside :class:`LegacyTeacherTarDataset`.
+
+    Each caller knows which format its tars are in (the loader factory
+    inspects ``_meta.json`` up-front) and can treat the return type as
+    fixed.
+    """
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
+    if tensors.get("format_version", 1) >= 2:
+        values = tensors["values"]
+        indices = unpack_indices(tensors["indices_low"], tensors["bit_17"])
+        return values, indices
+    # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
     indices_list = [
         unpack_indices(low, bit17)
         for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
@@ -446,11 +529,13 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
 
 
 # NOTE: This function is for interactive debugging purposes
-def load_log_probs_from_tar(
-    tar_path: str,
-    iteration: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Load one iteration from a specific batched tar shard."""
+def load_log_probs_from_tar(tar_path: str, iteration: int):
+    """Load one iteration from a specific batched tar shard.
+
+    Returns ``(values, indices)`` as tensors for v2 tars or as lists of
+    per-microbatch tensors for v1 tars (``decode_logprobs_payload``
+    dispatches internally on ``format_version``).
+    """
     for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
         if entry.iteration == iteration:
             return decode_logprobs_payload(entry.data)
@@ -535,3 +620,144 @@ class TarShardPrefetcher:
         with open_logit_file(url, "rb", prefetch_file=True) as stream:
             stream.read()
         return time.monotonic() - start
+
+
+# ---------------------------------------------------------------------------
+#  Resharding plan (MBS / DP / GBS change between save and load)
+# ---------------------------------------------------------------------------
+
+# Yielded by ``LogprobsReshardPlan.sources_for_microbatch``.
+class _ReshardSource(NamedTuple):
+    iter_save: int
+    d_save: int
+    row_start: int
+    row_end: int
+
+
+@dataclass(frozen=True)
+class LogprobsReshardPlan:
+    """Pure-arithmetic mapping from a load (iter, microbatch, DP rank) tuple to
+    the saved (iter, DP rank, row range) tuples that supply its samples.
+
+    Built once at loader init from the saved ``mbs_save / dp_save / gbs_save``
+    metadata and the current ``mbs_load / dp_load / gbs_load`` settings.  Holds
+    no tensors and no I/O state, so it is cheap to construct and trivial to
+    unit-test.
+
+    Construction validates the "integer multiples in either direction"
+    restriction on each of {MBS, DP, GBS} plus the Megatron
+    ``gbs % (mbs * dp) == 0`` invariant on both sides, raising
+    :class:`ValueError` with a precise diagnostic on failure.
+
+    The math relies on ``MegatronPretrainingSampler``'s mapping: within a
+    saved iteration, the monolith's row ``r`` at saved DP rank ``d_save``
+    corresponds to within-iter sample index
+
+    ``x = ((r // M_save) * D_save + d_save) * M_save + (r % M_save)``.
+
+    Inverting that gives the ``d_save`` / ``row_offset`` for any required
+    within-iter sample index.  Crossing an ``M_save`` boundary changes
+    ``d_save``; crossing a ``gbs_save`` boundary changes ``iter_save``.
+    """
+
+    mbs_save: int
+    dp_save: int
+    gbs_save: int
+    mbs_load: int
+    dp_load: int
+    gbs_load: int
+
+    def __post_init__(self) -> None:
+        if self.gbs_save % self.gbs_load != 0 and self.gbs_load % self.gbs_save != 0:
+            raise ValueError(
+                f"gbs_save ({self.gbs_save}) and gbs_load ({self.gbs_load}) must "
+                "be integer multiples of one another for cached-logits resharding."
+            )
+        if self.mbs_save % self.mbs_load != 0 and self.mbs_load % self.mbs_save != 0:
+            raise ValueError(
+                f"mbs_save ({self.mbs_save}) and mbs_load ({self.mbs_load}) must "
+                "be integer multiples of one another for cached-logits resharding."
+            )
+        if self.dp_save % self.dp_load != 0 and self.dp_load % self.dp_save != 0:
+            raise ValueError(
+                f"dp_save ({self.dp_save}) and dp_load ({self.dp_load}) must "
+                "be integer multiples of one another for cached-logits resharding."
+            )
+        if self.gbs_load % (self.mbs_load * self.dp_load) != 0:
+            raise ValueError(
+                f"gbs_load ({self.gbs_load}) must be divisible by mbs_load * "
+                f"dp_load ({self.mbs_load} * {self.dp_load})."
+            )
+        if self.gbs_save % (self.mbs_save * self.dp_save) != 0:
+            raise ValueError(
+                f"gbs_save ({self.gbs_save}) must be divisible by mbs_save * "
+                f"dp_save ({self.mbs_save} * {self.dp_save})."
+            )
+
+    @property
+    def num_mb_load(self) -> int:
+        """Number of microbatch steps per load iteration."""
+        return self.gbs_load // (self.mbs_load * self.dp_load)
+
+    @property
+    def num_mb_save(self) -> int:
+        """Number of microbatch steps per saved iteration."""
+        return self.gbs_save // (self.mbs_save * self.dp_save)
+
+    @property
+    def samples_per_save_shard(self) -> int:
+        """Sample count along the monolith's batch dim per saved (iter, DP)."""
+        return self.gbs_save // self.dp_save
+
+    def needed_d_saves(self, d_load: int) -> List[int]:
+        """Sorted list of saved DP ranks that this load DP rank ever reads from.
+
+        The pattern is ``gbs_save``-periodic, so a single load iteration
+        (i_load = 0) is enough to enumerate the full set.
+        """
+        needed: set[int] = set()
+        # Step by mbs_save so we observe every d_save value the microbatches
+        # span (only relevant when mbs_load > mbs_save).
+        for m_load in range(self.num_mb_load):
+            base = (m_load * self.dp_load + d_load) * self.mbs_load
+            for o in range(0, self.mbs_load, self.mbs_save):
+                x_save = (base + o) % self.gbs_save
+                needed.add((x_save // self.mbs_save) % self.dp_save)
+            # The last partial M_save block (if any) is captured above because
+            # the step is M_save and o stops at mbs_load - mbs_load % mbs_save.
+            # If mbs_load < mbs_save the loop runs once for o=0 only, which is
+            # correct: the whole microbatch lives in one M_save block.
+        return sorted(needed)
+
+    def sources_for_microbatch(
+        self, i_load: int, m_load: int, d_load: int
+    ) -> Iterator[_ReshardSource]:
+        """Yield the saved (iter, DP rank, row range) tuples that cover one
+        load microbatch's ``mbs_load`` contiguous global samples, in order.
+
+        With the integer-multiples restriction enforced by
+        :meth:`__post_init__` each yielded fragment maps to a contiguous
+        slice of one saved shard's monolith (``tensor[:, a:b, :]``), so the
+        loader's per-step assembly is at worst a small ``torch.cat``.
+        """
+        b = (m_load * self.dp_load + d_load) * self.mbs_load
+        g = i_load * self.gbs_load + b
+        remaining = self.mbs_load
+        while remaining > 0:
+            i_save = g // self.gbs_save
+            x_save = g % self.gbs_save
+            d_save = (x_save // self.mbs_save) % self.dp_save
+            row_offset = (
+                (x_save // self.mbs_save) // self.dp_save * self.mbs_save
+                + (x_save % self.mbs_save)
+            )
+            # Stop the fragment at the nearest M_save boundary (d_save changes
+            # past it) or at the saved-iter boundary (i_save changes past it).
+            chunk = min(
+                remaining,
+                self.mbs_save - (x_save % self.mbs_save),
+                self.gbs_save - x_save,
+            )
+            yield _ReshardSource(i_save, d_save, row_offset, row_offset + chunk)
+            g += chunk
+            remaining -= chunk
