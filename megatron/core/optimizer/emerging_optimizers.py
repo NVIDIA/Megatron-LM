@@ -248,6 +248,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if gtp_remat_group is None or get_pg_size(gtp_remat_group) <= 1:
             return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
 
+        # Parameters with is_gtp_weight_remat=False are not sharded along the
+        # GTP process group, and do not require all-gathering prior to
+        # orthogonalization.
+        if not getattr(p, 'is_gtp_weight_remat', False):
+            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+
         gtp_remat_size = get_pg_size(gtp_remat_group)
         gtp_rank = get_pg_rank(gtp_remat_group)
         shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
