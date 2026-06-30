@@ -100,13 +100,6 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
-# NCCL matches a recv to a send by POST-ORDER (it ignores the P2P tag), so the
-# send and recv sides must enumerate each (src, dst) pair's transfers in the SAME
-# order. They do: both walk the deterministic reshard plan (attention, then
-# Mamba), and the coordinator emits each request's SEND_KV/RECV_KV in a
-# consistent request order, so concurrent in-flight requests stay ordered too.
-
-
 def send_request_kv_resharded(
     engine: Any,
     request_id: int,
