@@ -20,32 +20,39 @@ import torch
 from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, utils
 
 
-def publish_request_kv(backend, ref_payload, my_layout):
-    """(prefill, one-sided) Build this rank's per-request hand-off: the static
-    region meta plus the request's source block ids / Mamba slot. No copy -- the
-    decode READs these from the registered ``memory_buffer``. ``ref_payload``
-    comes from ``context.export_request_kv_ref``."""
+def pull_static_meta(backend, my_layout, kv_dims, mamba_dims=None):
+    """(prefill, one-sided) This rank's **request-invariant** pull metadata:
+    region meta (NIXL agent + buffer layout), KV buffer geometry, Mamba geometry,
+    and shard identity. None of it changes between requests, so it is built once
+    and merged with :func:`pull_request_meta` per request -- keeping the
+    per-request control message down to block references rather than re-shipping
+    this (sizable) blob. ``kv_dims`` is ``{num_layers, total_blocks, block_size,
+    heads, hidden, elem}``; ``mamba_dims`` the hold-ring geometry (or ``None``)."""
     return {
         "transport": "nixl",
         "shard_key": list(my_layout.kv_shard_key()),
         "global_rank": int(my_layout.global_rank),
         "region_meta": backend.export_regions_meta(),
+        "kv_dims": kv_dims,
+        "mamba_dims": mamba_dims,
+    }
+
+
+def pull_request_meta(ref_payload):
+    """(prefill, one-sided) A request's block-level references (from
+    ``context.export_request_kv_ref``): block ids / hashes / count, Mamba slot,
+    snapshots, layout tag. These are **replicated across the MP group** -- every
+    rank schedules identically -- so one rank's copy is authoritative for all.
+    Merged onto each rank's :func:`pull_static_meta` (``{**static, **request}``)
+    to form that rank's hand-off; the decode READs the blocks from the registered
+    ``memory_buffer`` (no copy)."""
+    return {
+        "layout": ref_payload["layout"],
         "block_ids": ref_payload["block_ids"],
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],
         "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
-        "mamba_dims": ref_payload.get("mamba_dims"),
         "snapshots": ref_payload.get("snapshots", []),
-        "layout": ref_payload["layout"],
-        # geometry of the prefill rank's KV buffer, for hetero (fragment) reads
-        "kv_dims": {
-            "num_layers": ref_payload["num_layers"],
-            "total_blocks": ref_payload["total_blocks"],
-            "block_size": ref_payload["block_size_tokens"],
-            "heads": ref_payload["num_heads_per_partition"],
-            "hidden": ref_payload["hidden_per_head"],
-            "elem": ref_payload["elem_size"],
-        },
     }
 
 
@@ -202,10 +209,16 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     want_mamba = any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs)
     if want_mamba and (not src_mamba_layouts or not dst_mamba_layouts or my_mamba_layout is None):
         raise NotImplementedError("Mamba pull requires Mamba shard layouts")
-    alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
+    # Partial transfer: reuse the longest block prefix the decode already has
+    # cached (hashes are TP-independent) and pull only blocks
+    # [match_len, block_count). dst block table = reused (in order) + new.
+    match = engine.context.disagg_pull_match_prefix(rank_handoffs[0].get("block_hashes") or [])
+    reused, match_len = match["reused_block_ids"], match["match_len"]
+    alloc = engine.context.disagg_pull_alloc(block_count - match_len, want_mamba=want_mamba)
     if alloc is None:
+        engine.context.disagg_pull_unmatch(reused)
         return None
-    dst_block_ids = alloc["block_ids"]
+    dst_block_ids = list(reused) + list(alloc["block_ids"])
     mamba_dst_slot = alloc["mamba_dst_slot"]
     dst_dims = _ctx_kv_dims(engine.context)
     handoff_by_rank = {int(h["global_rank"]): h for h in rank_handoffs}
@@ -213,8 +226,8 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     kv_plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
     source_handoffs: dict = {}  # src_rank -> handoff (the ranks this dst reads from)
-    # Attention KV: per source rank, READ its head/layer fragments. Full-head
-    # fragments coalesce to whole blocks.
+    # Attention KV: per source rank, READ its head/layer fragments of the missing
+    # suffix [match_len, block_count). Full-head fragments coalesce to whole blocks.
     for transfer in utils.transfers_for_dst(kv_plan, my_layout.global_rank):
         src_handoff = handoff_by_rank.get(transfer.src_rank)
         src_layout = src_layout_by_rank.get(transfer.src_rank)
@@ -226,7 +239,7 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         dst_layer_slice = transfer.dst_layer_slice(my_layout)
         dst_head_slice = transfer.dst_head_slice(my_layout)
         descriptors = []
-        for block_idx in range(block_count):
+        for block_idx in range(match_len, block_count):
             descriptors += _kv_fragment_descriptors(
                 src_handoff["kv_dims"], dst_dims,
                 int(src_handoff["block_ids"][block_idx]), int(dst_block_ids[block_idx]),
