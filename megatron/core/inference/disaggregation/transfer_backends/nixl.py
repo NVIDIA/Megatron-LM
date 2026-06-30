@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """NIXL (one-sided RDMA) pull-based KV transfer backend for disaggregated
-inference, following the reference NIXL backend and vLLM's NIXL connector.
+inference, following the reference NIXL backend.
 
 Each rank registers its paged KV (and Mamba) buffers once; the decode rank then
 READs specific entries straight from the prefill's buffer by index, with no
@@ -25,17 +25,11 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 
 logger = logging.getLogger(__name__)
 
-# UCX transport/config NIXL needs for intra-node GPU<->GPU transfer. We do NOT
-# mutate the operator's environment -- NIXL reads ``UCX_*`` at agent creation,
-# and silently overriding an explicit setting hides config from whoever set it.
-# We only inspect and warn; the recommended values are:
-#   * UCX_TLS must include a CUDA transport (cuda_ipc/cuda_copy carry GPU
-#     memory; tcp/sm/self cover the agent's own intra-agent setup). Containers
-#     often ship ``UCX_TLS=tcp`` (host-only), which degrades NIXL to host
-#     memory and stalls.
-#   * UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types (torch may have
-#     allocated GPU memory before UCX's hooks installed); with the cache on UCX
-#     can misclassify CUDA pointers as host memory.
+# Recommended UCX env for GPU KV transfer (we only inspect + warn, never set):
+#   * UCX_TLS must include a CUDA transport; ``UCX_TLS=tcp`` (host-only) degrades
+#     NIXL to host memory and stalls.
+#   * UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types instead of
+#     misclassifying CUDA pointers as host memory.
 _UCX_RECOMMENDED = {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self",
     "UCX_MEMTYPE_CACHE": "n",

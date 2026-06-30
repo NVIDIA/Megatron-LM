@@ -386,7 +386,7 @@ def _build_mamba_recvs(recv, meta, my_mamba, src_mamba, dst_mamba, device, recvs
 # prefill's blocks straight into its own freshly-allocated blocks -- no copy,
 # no per-request registration. The prefill publishes only references (block ids
 # + Mamba slot + the static region meta); the coordinator relays them opaque.
-# This mirrors the reference NIXL backend and vLLM's NIXL connector. Identity
+# This mirrors the reference NIXL backend. Identity
 # reshard only (decode pulls its TP counterpart's blocks 1:1); hetero TP remap
 # over a one-sided backend is future work.
 # ==========================================================================
