@@ -776,7 +776,7 @@ class TestMegatronFSDPE2E:
     @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
-        Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
+        Run a small deterministic training loop using a mocked hybrid Mamba+MoE model and optimizer.
         This helper initializes model-parallel state, creates a model and optimizer via
         make_moe_args_model_and_optimizer, constructs a mock GPT data iterator, and runs
         NUM_TRAINING_STEPS iterations of forward/backward/optimization. Losses from each

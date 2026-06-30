@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +10,7 @@ import torch.distributed as dist
 from packaging import version
 from pytest_mock import mocker
 
+import megatron.core.pipeline_parallel.hybrid_cp_schedule as hybrid_cp_schedule
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -15,6 +18,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
@@ -76,6 +80,336 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
+
+@contextmanager
+def _no_sync():
+    yield
+
+
+def _patch_hybrid_cp_parallel_state(monkeypatch, *, is_first_tp_rank):
+    monkeypatch.setattr(
+        hybrid_cp_schedule.parallel_state,
+        "get_data_parallel_rank",
+        lambda with_context_parallel=False: 0,
+    )
+    monkeypatch.setattr(
+        hybrid_cp_schedule.parallel_state,
+        "get_tensor_model_parallel_rank",
+        lambda: 0 if is_first_tp_rank else 1,
+    )
+    monkeypatch.setattr(
+        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_src_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_group", lambda: "tp_group"
+    )
+    monkeypatch.setattr(
+        hybrid_cp_schedule.parallel_state,
+        "get_data_parallel_group",
+        lambda with_context_parallel=False: "dp_cp_group",
+    )
+
+
+def _patch_hybrid_cp_cpu_tensors(monkeypatch):
+    original_tensor = torch.tensor
+
+    def cpu_tensor(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(hybrid_cp_schedule.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(
+        hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
+    )
+
+
+def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypatch):
+    _patch_hybrid_cp_cpu_tensors(monkeypatch)
+    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=True)
+
+    monkeypatch.setattr(
+        hybrid_cp_schedule.torch.distributed, "broadcast", lambda *args, **kwargs: None
+    )
+    barrier_groups = []
+    monkeypatch.setattr(
+        hybrid_cp_schedule.torch.distributed,
+        "barrier",
+        lambda group=None: barrier_groups.append(group),
+    )
+
+    batch = [{"id": 0}, {"id": 1}, {"id": 2}]
+    sample_id_groups = [[[0], [0], []], [[1, 2], [1], [1, 2]]]
+    forward_calls = []
+
+    def fake_forward_step(
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        config,
+        cp_group_size,
+        **kwargs,
+    ):
+        assert isinstance(data_iterator, RerunDataIterator)
+        sample = next(data_iterator)
+        forward_calls.append(
+            {
+                "sample_id": sample["id"],
+                "local_cp_size": int(sample["local_cp_size"].item()),
+                "local_cp_size_dtype": sample["local_cp_size"].dtype,
+                "cp_group_size": cp_group_size,
+                "current_microbatch": kwargs["current_microbatch"],
+                "is_first_microbatch": kwargs["is_first_microbatch"],
+            }
+        )
+        return torch.tensor(float(kwargs["current_microbatch"])), torch.tensor(10)
+
+    backward_calls = []
+
+    def fake_backward_step(input_tensor, output_tensor, output_tensor_grad, config):
+        backward_calls.append((input_tensor, output_tensor.item(), output_tensor_grad, config))
+
+    monkeypatch.setattr(schedule, "forward_step", fake_forward_step)
+    monkeypatch.setattr(schedule, "backward_step", fake_backward_step)
+
+    config = SimpleNamespace()
+    forward_data_store, total_num_tokens = (
+        hybrid_cp_schedule.hybrid_context_parallel_forward_backward(
+            forward_step_func=None,
+            data_iterator=iter([(batch, sample_id_groups)]),
+            model="model",
+            num_microbatches=3,
+            input_tensor="input",
+            output_tensor_grad="grad",
+            forward_data_store=[],
+            config=config,
+            collect_non_loss_data=False,
+            first_val_step=True,
+            forward_only=False,
+            no_sync_func=_no_sync,
+            total_num_tokens=0,
+            check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
+            model_type="unused",
+        )
+    )
+
+    assert forward_data_store == []
+    assert total_num_tokens == 30
+    assert forward_calls == [
+        {
+            "sample_id": 0,
+            "local_cp_size": 2,
+            "local_cp_size_dtype": torch.int32,
+            "cp_group_size": 2,
+            "current_microbatch": 0,
+            "is_first_microbatch": True,
+        },
+        {
+            "sample_id": 1,
+            "local_cp_size": 3,
+            "local_cp_size_dtype": torch.int32,
+            "cp_group_size": 3,
+            "current_microbatch": 1,
+            "is_first_microbatch": False,
+        },
+        {
+            "sample_id": 2,
+            "local_cp_size": 2,
+            "local_cp_size_dtype": torch.int32,
+            "cp_group_size": 2,
+            "current_microbatch": 2,
+            "is_first_microbatch": False,
+        },
+    ]
+    assert [(call[0], call[1], call[2]) for call in backward_calls] == [
+        ("input", 0.0, "grad"),
+        ("input", 1.0, "grad"),
+        ("input", 2.0, "grad"),
+    ]
+    assert all(call[3] is config for call in backward_calls)
+    assert "dp_cp_group" in barrier_groups
+
+
+def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkeypatch):
+    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=False)
+    monkeypatch.setattr(
+        hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(hybrid_cp_schedule.torch.distributed, "barrier", lambda group=None: None)
+
+    broadcast_values = [
+        torch.tensor([1], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([7], dtype=torch.int32),
+    ]
+
+    def fake_broadcast(item, src, group=None):
+        item.copy_(broadcast_values.pop(0))
+
+    monkeypatch.setattr(hybrid_cp_schedule.torch.distributed, "broadcast", fake_broadcast)
+
+    forward_calls = []
+
+    def fake_forward_step(
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        config,
+        cp_group_size,
+        **kwargs,
+    ):
+        forward_calls.append((data_iterator, cp_group_size, kwargs["current_microbatch"]))
+        return torch.tensor(0.0), torch.tensor(4)
+
+    monkeypatch.setattr(schedule, "forward_step", fake_forward_step)
+    monkeypatch.setattr(
+        schedule,
+        "backward_step",
+        lambda input_tensor, output_tensor, output_tensor_grad, config: None,
+    )
+
+    _, total_num_tokens = hybrid_cp_schedule.hybrid_context_parallel_forward_backward(
+        forward_step_func=None,
+        data_iterator=None,
+        model="model",
+        num_microbatches=1,
+        input_tensor="input",
+        output_tensor_grad="grad",
+        forward_data_store=[],
+        config=SimpleNamespace(),
+        collect_non_loss_data=False,
+        first_val_step=True,
+        forward_only=True,
+        no_sync_func=_no_sync,
+        total_num_tokens=0,
+        check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
+        model_type="unused",
+    )
+
+    assert forward_calls == [(None, 7, 0)]
+    assert total_num_tokens == 4
+    assert broadcast_values == []
+
+
+@pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
+def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
+    calculate_per_token_loss, expected_scale
+):
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=calculate_per_token_loss,
+        experimental_attention_variant_loss_scale_func=DSAIndexerLossAutoScaler.set_loss_scale,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 3.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+    forward_data_store = []
+
+    def loss_func(output_tensor):
+        return output_tensor.clone(), torch.tensor(4), {'loss_reduced': output_tensor.detach()}
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=loss_func,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=forward_data_store,
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([expected_scale])
+    )
+
+
+def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        experimental_attention_variant_loss_scale_func=DSAIndexerLossAutoScaler.set_loss_scale,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 5.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    forward_data_store = []
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor={'loss': torch.tensor(8.0)},
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=forward_data_store,
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert len(forward_data_store) == 1
+    torch.testing.assert_close(forward_data_store[0]['loss'], torch.tensor(8.0))
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([5.0])
+    )
+
+
+def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        experimental_attention_variant_loss_scale_func=None,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 7.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=[],
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert config.experimental_attention_variant_loss_scale_func is None
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([7.0])
+    )
 
 
 @pytest.mark.internal
