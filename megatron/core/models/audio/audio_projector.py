@@ -23,7 +23,7 @@ class AudioProjection(MegatronModule):
         submodules: MLPSubmodules,
         projector_type: str,
         input_size: int,
-        stack_factor: int = 2,
+        stack_factor: int = 1,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:

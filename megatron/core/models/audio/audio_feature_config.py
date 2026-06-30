@@ -8,7 +8,7 @@ the NeMo audio frontend:
 
 * ``NemoAudioFeatureConfig`` mirrors the NeMo ``AudioToMelSpectrogramPreprocessor``
   keyword arguments consumed by
-  ``megatron.core.models.audio.nemo_audio_preprocessing_standalone``.
+  ``megatron.core.models.audio.nemo_audio_preprocessing``.
 * ``NemoTransformerAudioTokenEstimator`` is the pure frame-count -> expanded-token
   math implied by the encoder's pre-encode/subsampling configuration.
 
@@ -38,7 +38,7 @@ class NemoAudioFeatureConfig:
     (Slaney mel, ``per_feature`` normalize, 0.97 pre-emphasis, ``log(x + 2**-24)``).
     ``NemoAudioProcessor`` forwards these verbatim (via ``to_nemo_kwargs``) to
     the vendored standalone ``AudioToMelSpectrogramPreprocessor`` in
-    ``megatron.core.models.audio.nemo_audio_preprocessing_standalone``.
+    ``megatron.core.models.audio.nemo_audio_preprocessing``.
     """
 
     sample_rate: int = 16000
@@ -97,7 +97,7 @@ class NemoTransformerAudioTokenEstimator:
     """
 
     encoder_time_stride: int
-    stack_factor: int = 2
+    stack_factor: int = 1
     pre_encode: str = "conv"
 
     def _estimate_encoder_steps(

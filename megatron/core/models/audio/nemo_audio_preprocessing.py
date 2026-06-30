@@ -23,6 +23,19 @@
 #   preprocessor runs inside a forked dataloader worker. See the in-function
 #   comment for details.
 
+"""Pure-PyTorch mel-spectrogram feature extractor for the NeMo audio encoder.
+
+This module exists to avoid taking a dependency on
+https://github.com/NVIDIA-NeMo/Speech (and its transitive deps: Lightning,
+Hydra, librosa, NeMo neural types). The audio model only needs the
+``AudioToMelSpectrogramPreprocessor`` feature extraction, so we reimplement it
+here using only stdlib + PyTorch ops, mirroring the NeMo ASR class behavior.
+
+Feature parity with NeMo/Speech's original feature extractor is demonstrated by
+the companion upstream PR https://github.com/NVIDIA-NeMo/Speech/pull/15692,
+which validates that this pure-torch implementation produces matching outputs.
+"""
+
 import math
 import random
 from typing import Optional, Union

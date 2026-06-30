@@ -2,16 +2,14 @@
 
 """Smoke tests for the vendored NeMo preprocessor wrapper.
 
-The implementation lives in ``nemo_audio_preprocessing_standalone`` and uses
+The implementation lives in ``nemo_audio_preprocessing`` and uses
 only stdlib + PyTorch, so these tests do not require ``nemo_toolkit``.
 """
 
 import torch
 
 from megatron.core.models.audio.audio_feature_config import NemoAudioFeatureConfig
-from megatron.core.models.audio.nemo_audio_preprocessing_standalone import (
-    AudioToMelSpectrogramPreprocessor,
-)
+from megatron.core.models.audio.nemo_audio_preprocessing import AudioToMelSpectrogramPreprocessor
 
 
 def _build(config: NemoAudioFeatureConfig) -> AudioToMelSpectrogramPreprocessor:
