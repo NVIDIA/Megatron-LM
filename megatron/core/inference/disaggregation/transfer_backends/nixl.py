@@ -1,27 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""NIXL (one-sided RDMA) KV transfer backend for disaggregated inference.
+"""NIXL (one-sided RDMA) pull-based KV transfer backend for disaggregated
+inference, following the reference NIXL backend and vLLM's NIXL connector.
 
-Pull-based, following the reference NIXL backend
-(github.com/nvcsathe/Megatron-LM dynamo-integration) and vLLM's NIXL connector:
-
-* each rank registers its paged KV buffers (and, for hybrid models, the Mamba
-  state buffers) **once** with a local NIXL agent and exports the agent metadata
-  **once** -- not per request;
-* the decode rank issues one-sided ``READ``s that copy specific entries (KV
-  blocks, Mamba slots) straight from the prefill's registered buffer into its
-  own, addressed by index via stride math -- no staging copy.
-
-Registering once is what keeps repeated hand-offs working: NIXL's
-``loadRemoteMD`` rejects re-loading an already-known agent
-(``NIXL_ERR_NOT_ALLOWED``), so the exported metadata must be stable across
-requests. The control plane (our in-job coordinator, or Dynamo's frontend) only
-relays the opaque pull meta from the prefill to the decode.
-
-Optional: imports ``nixl`` lazily and :func:`is_available` reports whether the
-container provides it, so the disaggregation package does not hard-depend on it.
-Selected explicitly via ``--disagg-kv-transport-backend nixl`` (threaded to the
-engine's disaggregation config), never an env var.
+Each rank registers its paged KV (and Mamba) buffers once; the decode rank then
+READs specific entries straight from the prefill's buffer by index, with no
+staging copy or per-request registration. ``nixl`` is imported lazily
+(:func:`is_available` reports availability); selected via
+``--disagg-kv-transport-backend nixl``.
 """
 
 from __future__ import annotations
