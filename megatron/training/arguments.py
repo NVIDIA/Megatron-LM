@@ -1252,6 +1252,12 @@ def validate_args(args, defaults={}):
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
 
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -1980,6 +1986,13 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-async-sched-mode',
+                       type=str, default='legacy',
+                       choices=['legacy', 'serial'],
+                       help='Async scheduling mode for dynamic batching. '
+                            '"legacy" (default) preserves the existing resolve-before-prepare '
+                            'path. "serial" speculatively prepares and forwards decode-only '
+                            'steps before resolving finished requests.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
@@ -2036,6 +2049,7 @@ def _add_network_size_args(parser):
         "output_layer_init_method",
         "embedding_init_method",
         "activation_func",
+        "experimental_attention_variant_loss_scale_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -2979,6 +2993,10 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--dataloader-inter-document-masking', action='store_true',
+                       help='Return cu_seqlens marking document boundaries '
+                       'within each sample so that attention is restricted '
+                       'to individual documents.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
