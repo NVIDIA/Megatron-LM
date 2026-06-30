@@ -271,9 +271,9 @@ class MegatronFSDP(torch.nn.Module):
             self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
         )
         recurse_types = fine_grained_pre_backward_recurse_module_types or ()
-        self.fine_grained_pre_backward_recurse_module_types: Tuple[
-            Type[nn.Module], ...
-        ] = recurse_types
+        self.fine_grained_pre_backward_recurse_module_types: Tuple[Type[nn.Module], ...] = (
+            recurse_types
+        )
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
@@ -572,9 +572,8 @@ class MegatronFSDP(torch.nn.Module):
                 # in fine_grained_recurse_module_types (e.g. TEGroupedMLP,
                 # SharedExpertMLP) need recurse=True because weights live on
                 # children and the container is the compute entry point.
-                if (
-                    self.fine_grained_recurse_module_types
-                    and isinstance(module, self.fine_grained_recurse_module_types)
+                if self.fine_grained_recurse_module_types and isinstance(
+                    module, self.fine_grained_recurse_module_types
                 ):
                     return list(module.parameters(recurse=True))
                 else:
