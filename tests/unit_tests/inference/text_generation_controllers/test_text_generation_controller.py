@@ -509,13 +509,57 @@ def test_async_sched_serial_step(
         "prepare",
         "context_init:True",
         "copy_async_sched_input_tokens_to_gpu",
-        "commit_sampled_tokens",
         "forward",
+        "commit_sampled_tokens",
         "resolve",
     ]
 
 
-def test_async_sched_overlap_step_waits_at_phase_barriers():
+@pytest.mark.parametrize(
+    "overlap, expected_call_order",
+    [
+        (
+            False,
+            [
+                "copy_sample_to_cpu",
+                "wait:sample",
+                "prepare",
+                "context_init:True",
+                "copy_async_sched_input_tokens_to_gpu",
+                "record:phase1",
+                "wait:phase1",
+                "forward",
+                "record:forward",
+                "wait:forward",
+                "commit_sampled_tokens",
+                "resolve",
+                "compact",
+                "record:phase2",
+                "wait:phase2",
+            ],
+        ),
+        (
+            True,
+            [
+                "copy_sample_to_cpu",
+                "prepare",
+                "context_init:True",
+                "copy_async_sched_input_tokens_to_gpu",
+                "record:phase1",
+                "wait:phase1",
+                "forward",
+                "record:forward",
+                "commit_sampled_tokens",
+                "resolve",
+                "wait:forward",
+                "compact",
+                "record:phase2",
+                "wait:phase2",
+            ],
+        ),
+    ],
+)
+def test_async_sched_step_phase_order(overlap, expected_call_order):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
@@ -572,27 +616,12 @@ def test_async_sched_overlap_step_waits_at_phase_barriers():
         side_effect=lambda _: call_order.append("compact")
     )
 
-    result = asyncio.run(controller._run_async_sched_step(overlap=True))
+    result = asyncio.run(controller._run_async_sched_step(overlap=overlap))
 
     assert result["sample"].tolist() == sample_tokens.tolist()
     context.prepare_requests.assert_called_once_with()
     context.commit_sampled_tokens.assert_called_once()
-    assert call_order == [
-        "copy_sample_to_cpu",
-        "prepare",
-        "context_init:True",
-        "copy_async_sched_input_tokens_to_gpu",
-        "record:phase1",
-        "wait:phase1",
-        "commit_sampled_tokens",
-        "forward",
-        "record:forward",
-        "resolve",
-        "wait:forward",
-        "compact",
-        "record:phase2",
-        "wait:phase2",
-    ]
+    assert call_order == expected_call_order
 
 
 @pytest.mark.parametrize(
