@@ -191,59 +191,22 @@ class KVTransportBackend(abc.ABC):
         return None
 
 
-# Module-level singleton. Defaults to NCCL (portable / CI-friendly).
-_backend: Optional[KVTransportBackend] = None
-
-
-def _construct_backend(name: str) -> KVTransportBackend:
-    """Build a backend by name. ``auto`` picks the best available given what's
-    installed in the container: NIXL (cross-node RDMA, if importable) > NCCL
-    (always available via torch.distributed).
+def construct_kv_transport_backend(name: str) -> KVTransportBackend:
+    """Build a KV transport backend by explicit name -- ``"nccl"`` (two-sided
+    push) or ``"nixl"`` (one-sided pull). The choice is passed down from the
+    disaggregation config (no env var, no auto-detection): the caller decides.
 
     Lazy imports avoid a base <-> backend import cycle and keep the optional
     NIXL dep from being a hard requirement of the disaggregation package.
     """
-    name = (name or "auto").lower().replace("_", "-")
-
-    def _nccl():
+    if name == "nccl":
         from megatron.core.inference.disaggregation.transfer_backends.nccl import (
             NcclTransportBackend,
         )
         return NcclTransportBackend()
-
-    def _nixl():
+    if name == "nixl":
         from megatron.core.inference.disaggregation.transfer_backends.nixl import (
             NixlTransportBackend,
         )
         return NixlTransportBackend()
-
-    if name == "nccl":
-        return _nccl()
-    if name == "nixl":
-        return _nixl()
-    if name == "auto":
-        from megatron.core.inference.disaggregation.transfer_backends import nixl as _nx
-        if _nx.is_available():
-            return _nixl()
-        return _nccl()
-    raise ValueError(
-        f"Unknown KV transfer backend {name!r}; expected auto|nccl|nixl"
-    )
-
-
-def get_kv_transport_backend() -> KVTransportBackend:
-    """Return the active backend (singleton), selecting on first call from
-    ``MEGATRON_KV_TRANSFER_BACKEND`` (default ``auto``)."""
-    global _backend
-    if _backend is None:
-        import os
-
-        _backend = _construct_backend(os.getenv("MEGATRON_KV_TRANSFER_BACKEND", "auto"))
-    return _backend
-
-
-def set_kv_transport_backend(backend: Optional[KVTransportBackend]) -> None:
-    """Override the active backend. ``None`` resets to the NCCL default
-    on next access. Used by tests, or to select a backend at startup."""
-    global _backend
-    _backend = backend
+    raise ValueError(f"Unknown KV transfer backend {name!r}; expected 'nccl' or 'nixl'")

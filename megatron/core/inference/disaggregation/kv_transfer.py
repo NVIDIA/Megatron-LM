@@ -14,7 +14,6 @@ from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, ut
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     TransferHandle,
-    get_kv_transport_backend,
 )
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 
@@ -27,8 +26,8 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
     Header-free: the metadata (tensor shapes/dtypes, block count, optional
     Mamba dims) is computed locally from the engine's static config + the prompt
     tokens the decode worker already holds, so only KV tensors cross the wire --
-    no descriptor header. Returns ``None`` for the MLA latent cache, which isn't
-    derivable this way; MLA disaggregation is unsupported.
+    no descriptor header. Raises ``NotImplementedError`` for the MLA latent
+    cache, which isn't derivable this way; MLA disaggregation is unsupported.
 
     Assumes a homogeneous, fresh prefill: ``block_count`` and the snapshot count
     follow directly from the prompt length and block size.
@@ -36,7 +35,9 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
 
     ctx = engine.context
     if getattr(ctx, "cache_mla_latent", False):
-        return None
+        raise NotImplementedError(
+            "disaggregated KV transfer does not support the MLA latent KV cache"
+        )
 
     bs = int(ctx.block_size_tokens)
     if isinstance(prompt_token_ids, torch.Tensor):
@@ -49,20 +50,16 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
     block_hashes = list(compute_block_hashes_batched(toks, bs))
 
     mb = ctx.memory_buffer  # (2, num_layers, total_blocks, block_size, heads, hidden)
-    _, num_layers, _, _, heads, hidden = mb.shape
+    # The decode rebuilds its own staging tensor from its KVShardLayout
+    # (local_num_layers/heads), so only the dtype + per-head width are needed here.
     meta: dict = {
-        "layout": "std_attn_v1",
         "block_count": block_count,
         "block_size_tokens": bs,
-        "num_layers": int(num_layers),
-        "num_heads_per_partition": int(heads),
-        "hidden_per_head": int(hidden),
+        "hidden_per_head": int(mb.shape[5]),
         "block_hashes": block_hashes,
-        "attn_shape": (block_count, 2, int(num_layers), bs, int(heads), int(hidden)),
         "attn_dtype": mb.dtype,
         "has_mamba": False,
         "has_snapshots": False,
-        "empty": False,
     }
     if getattr(ctx, "is_hybrid_model", False):
         conv = ctx.mamba_conv_states  # (num_mamba_layers, max_requests, *conv_state)
@@ -150,7 +147,7 @@ def send_request_kv_resharded(
     exports + holds the KV at prefill completion and ships it later on SEND_KV.
     """
 
-    backend = backend or get_kv_transport_backend()
+    assert backend is not None, "send_request_kv_resharded requires an explicit backend"
     if payload is None:
         payload = engine.context.export_request_kv(request_id)
     if payload is None:
@@ -320,7 +317,7 @@ def post_recv_request_kv_resharded(
     sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
     config + prompt). Returns ``None`` if there is no KV to receive."""
 
-    backend = backend or get_kv_transport_backend()
+    assert backend is not None, "post_recv_request_kv_resharded requires an explicit backend"
     meta = derive_decode_schema(engine, prompt_token_ids)
     if meta is None:
         return None

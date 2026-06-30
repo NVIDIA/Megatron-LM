@@ -20,7 +20,8 @@ relays the opaque pull meta from the prefill to the decode.
 
 Optional: imports ``nixl`` lazily and :func:`is_available` reports whether the
 container provides it, so the disaggregation package does not hard-depend on it.
-Selected via ``MEGATRON_KV_TRANSFER_BACKEND=nixl`` (or ``auto`` when importable).
+Selected explicitly via ``--disagg-kv-transport-backend nixl`` (threaded to the
+engine's disaggregation config), never an env var.
 """
 
 from __future__ import annotations
