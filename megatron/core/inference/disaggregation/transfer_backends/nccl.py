@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""``torch.distributed`` point-to-point KV transfer backend (NCCL / gloo)."""
+"""``torch.distributed`` point-to-point (NCCL) KV transfer backend."""
 
 from __future__ import annotations
 
@@ -16,9 +16,8 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 
 
 class NcclTransportBackend(KVTransportBackend):
-    """``torch.distributed`` point-to-point transport via ``isend``/``irecv``,
-    working identically under ``nccl`` (GPU) and ``gloo`` (CPU/CI). The receive
-    side allocates the destination buffer."""
+    """``torch.distributed`` point-to-point transport via ``isend``/``irecv`` over
+    the NCCL backend. The receive side allocates the destination buffer."""
 
     def __init__(self, group: Optional[object] = None) -> None:
         self._group = group

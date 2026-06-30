@@ -100,16 +100,11 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
-# Transfer matching is by POST-ORDER, not by tag. Every two-sided (push)
-# backend we use matches a recv to a send by the order they are posted on a
-# (src, dst) pair: NCCL ignores the P2P tag entirely, and gloo matches same-tag
-# ops FIFO. So correctness rests on a single invariant: the send side and the
-# recv side enumerate the transfers for each (src, dst) pair in the SAME order.
-# They do -- both iterate the deterministic reshard plan (attention transfers,
-# then Mamba), and the coordinator emits each request's SEND_KV/RECV_KV in a
+# NCCL matches a recv to a send by POST-ORDER (it ignores the P2P tag), so the
+# send and recv sides must enumerate each (src, dst) pair's transfers in the SAME
+# order. They do: both walk the deterministic reshard plan (attention, then
+# Mamba), and the coordinator emits each request's SEND_KV/RECV_KV in a
 # consistent request order, so concurrent in-flight requests stay ordered too.
-# No tags are needed; a new state-bearing layer type just extends the ordered
-# enumeration on both sides.
 
 
 def send_request_kv_resharded(
