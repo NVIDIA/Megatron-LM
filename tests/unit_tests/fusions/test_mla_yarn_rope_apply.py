@@ -18,10 +18,12 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
+        fused_mla_rope_out_of_place,
     )
 except Exception:
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
+    fused_mla_rope_out_of_place = None
 
 
 def dtype_tols(dtype):
@@ -41,6 +43,21 @@ class FakeCPGroup:
 
     def rank(self):
         return 0
+
+
+class _SaveOutputForBackward(torch.autograd.Function):
+    """Minimal stand-in for a kernel whose backward consumes its output."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        output = tensor.clone()
+        ctx.save_for_backward(output)
+        return output
+
+    @staticmethod
+    def backward(ctx, _grad_output):
+        (saved_output,) = ctx.saved_tensors
+        return saved_output
 
 
 def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
@@ -283,6 +300,83 @@ class TestFusedApplyMLARope:
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
         _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format):
+    """Post-attention inverse RoPE must not overwrite an output saved for backward."""
+    assert fused_mla_rope_out_of_place is not None
+    seqlen = 32
+    batch_size = 1
+    num_heads = 2
+    nope_dim = 16
+    emb_dim = 64
+    dtype = torch.bfloat16
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    if input_format == "sbhd":
+        shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
+        cu_seqlens = None
+    else:
+        shape = (2 * seqlen, num_heads, nope_dim + emb_dim)
+        cu_seqlens = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device="cuda")
+
+    unsafe_source = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    unsafe_attention_output = _SaveOutputForBackward.apply(unsafe_source)
+    unsafe_reference = unsafe_attention_output.detach().clone()
+    unsafe_inverse_output = fused_mla_rope_inplace(
+        unsafe_attention_output,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+
+    assert unsafe_inverse_output.data_ptr() == unsafe_attention_output.data_ptr()
+    assert not torch.equal(unsafe_attention_output, unsafe_reference)
+
+    source = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    attention_output = _SaveOutputForBackward.apply(source)
+    saved_reference = attention_output.detach().clone()
+
+    inverse_output = fused_mla_rope_out_of_place(
+        attention_output,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+    expected_inverse_output = fused_mla_rope_inplace(
+        saved_reference.clone(),
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+
+    assert inverse_output.data_ptr() != attention_output.data_ptr()
+    torch.testing.assert_close(attention_output, saved_reference, rtol=0, atol=0)
+    torch.testing.assert_close(inverse_output, expected_inverse_output, rtol=0, atol=0)
+
+    inverse_output.backward(torch.randn_like(inverse_output).contiguous())
+    torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
 
 
 class TestApplyRotaryPosEmbMlaFusionConflict:
