@@ -97,6 +97,7 @@ def _graceful_shutdown(signum, frame):
     This handler attempts a best-effort graceful shutdown:
       - Logs a single termination message from rank 0
       - Synchronizes all ranks (barrier)
+      - Flushes and shuts down telemetry
       - Destroys the distributed process group
       - Exits the process cleanly
     """
@@ -113,6 +114,20 @@ def _graceful_shutdown(signum, frame):
                 pass
 
             torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
+    # Without this, any spans/metrics still sitting in the BatchSpanProcessor's
+    # queue (which only flushes on a timer or on shutdown(), never automatically
+    # on process exit) are silently dropped -- including the just-closed
+    # top-level job span on this exit path. sys.exit() below unwinds the call
+    # stack via SystemExit, so any span opened with `with managed_span(...)`/
+    # `@trace_fn` still gets its __exit__ run and end_time set correctly; this
+    # call is what makes sure that data actually reaches the exporter.
+    try:
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
     except Exception:
         pass
 
