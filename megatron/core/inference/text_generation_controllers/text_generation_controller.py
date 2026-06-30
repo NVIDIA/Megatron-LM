@@ -2136,14 +2136,6 @@ class TextGenerationController:
                 "cuda_graph_request_count": cached_cuda_graph_request_count,
             }
 
-    async def _run_async_sched_serial_step(self) -> Optional[Dict]:
-        """Run one decode-only step using serial async scheduling."""
-        return await self._run_async_sched_step(overlap=False)
-
-    async def _run_async_sched_overlap_step(self) -> Optional[Dict]:
-        """Run one decode-only step using overlapped async scheduling."""
-        return await self._run_async_sched_step(overlap=True)
-
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
@@ -2164,10 +2156,10 @@ class TextGenerationController:
             return await self._run_legacy_step(skip_bookkeeping)
         if mode == AsyncScheduleMode.SERIAL:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_serial_step()
+            return await self._run_async_sched_step(overlap=False)
         if mode == AsyncScheduleMode.OVERLAP:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_overlap_step()
+            return await self._run_async_sched_step(overlap=True)
         raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
     @torch.inference_mode()

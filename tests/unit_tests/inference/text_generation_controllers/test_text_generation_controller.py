@@ -426,7 +426,7 @@ def test_async_sched_serial_step_returns_none_without_active_requests():
     )
     controller._validate_async_sched_support_for_step = mock.Mock()
 
-    result = asyncio.run(controller._run_async_sched_serial_step())
+    result = asyncio.run(controller._run_async_sched_step(overlap=False))
 
     assert result is None
     assert not controller._decode_forward_primer.is_primed
@@ -509,7 +509,7 @@ def test_async_sched_serial_step(
 
     controller._compact_async_sched_logits = mock.Mock(side_effect=compact_logits)
 
-    result = asyncio.run(controller._run_async_sched_serial_step())
+    result = asyncio.run(controller._run_async_sched_step(overlap=False))
 
     assert result["finished_request_ids"].tolist() == expected_finished_ids
     assert result["sample"].tolist() == sample_tokens.tolist()
@@ -591,7 +591,7 @@ def test_async_sched_overlap_step_waits_at_phase_barriers():
         side_effect=lambda _: call_order.append("compact")
     )
 
-    result = asyncio.run(controller._run_async_sched_overlap_step())
+    result = asyncio.run(controller._run_async_sched_step(overlap=True))
 
     assert result["sample"].tolist() == sample_tokens.tolist()
     context.prepare_requests.assert_called_once_with(None)
@@ -632,8 +632,9 @@ def test_async_generate_output_tokens_dynamic_batch_routes(
     context.num_prefill_requests = num_prefill_requests
     controller = _make_async_sched_controller(context)
     controller._run_legacy_step = mock.AsyncMock(return_value="legacy")
-    controller._run_async_sched_serial_step = mock.AsyncMock(return_value="async")
-    controller._run_async_sched_overlap_step = mock.AsyncMock(return_value="overlap")
+    controller._run_async_sched_step = mock.AsyncMock(
+        side_effect=lambda *, overlap: "overlap" if overlap else "async"
+    )
 
     result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping))
 
@@ -653,8 +654,7 @@ def test_async_generate_output_tokens_dynamic_batch_assertions(mode, expected_me
     context.config.async_sched_mode = mode
     controller = _make_async_sched_controller(context)
     controller._run_legacy_step = mock.AsyncMock()
-    controller._run_async_sched_serial_step = mock.AsyncMock()
-    controller._run_async_sched_overlap_step = mock.AsyncMock()
+    controller._run_async_sched_step = mock.AsyncMock()
 
     with pytest.raises(AssertionError, match=expected_message):
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
