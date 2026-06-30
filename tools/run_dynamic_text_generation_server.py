@@ -30,6 +30,16 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
+    parser.add_argument(
+        "--dynamic-text-gen-server-force-logprobs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Force full-logit materialization for prompt logprobs/lm-eval compatibility. "
+            "Use --no-dynamic-text-gen-server-force-logprobs when the client will not "
+            "request logprobs and decode throughput is preferred."
+        ),
+    )
     return parser
 
 
@@ -92,10 +102,11 @@ if __name__ == "__main__":
         if args.profile and args.nvtx_ranges:
             configure_nvtx_profiling(True)
 
-        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
+        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests.
         # This sets materialize_only_last_token_logits=False in the inference context,
-        # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
-        args.return_log_probs = True
+        # which is required for lm-eval compatibility (loglikelihood evaluation tasks).
+        if args.dynamic_text_gen_server_force_logprobs:
+            args.return_log_probs = True
 
         engine = get_dynamic_inference_engine()
 

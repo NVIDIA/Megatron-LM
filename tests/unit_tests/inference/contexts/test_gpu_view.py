@@ -28,6 +28,7 @@ REQUEST_VIEWS_INT32 = (
 REQUEST_VIEWS_FLOAT32 = ("temperature", "top_p")
 MAMBA_VIEWS_INT64 = ("mamba_batch_indices_decode",)
 MAMBA_VIEWS_INT32 = (
+    "mamba_batch_indices_decode_write",
     "mamba_batch_indices_prefill",
     "mamba_seq_idx",
     "mamba_cu_seqlens",

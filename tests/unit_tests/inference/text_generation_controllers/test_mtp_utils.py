@@ -603,6 +603,49 @@ class TestMambaStateSelectiveCopy:
 
         torch.testing.assert_close(current_tri, current_ref)
 
+    def test_destination_state_idx_can_differ_from_intermediate_slot(self):
+        """Accepted MTP state can be copied into a different live bank."""
+        N = 3
+        num_layers = 2
+        M = 8
+        S = 4
+        state_shape = (8, 4)
+
+        intermediate = torch.randn(num_layers, M, S, *state_shape, device=DEVICE)
+        current_ref = torch.randn(num_layers, M, *state_shape, device=DEVICE)
+        current_tri = current_ref.clone()
+        current_orig = current_ref.clone()
+
+        prefill_status = torch.tensor([0, 0, 1], dtype=torch.int32, device=DEVICE)
+        state_idx = torch.tensor([1, 4, 6], device=DEVICE, dtype=torch.int64)
+        destination_state_idx = torch.tensor([2, 5, 7], device=DEVICE, dtype=torch.int64)
+        accepted_counts = torch.tensor([3, 1, 2], device=DEVICE, dtype=torch.int64)
+
+        mamba_state_selective_copy_pytorch(
+            intermediate,
+            current_ref,
+            prefill_status,
+            state_idx,
+            accepted_counts,
+            num_layers,
+            destination_state_idx=destination_state_idx,
+        )
+        mamba_state_selective_copy(
+            intermediate,
+            current_tri,
+            prefill_status,
+            state_idx,
+            accepted_counts,
+            num_layers,
+            destination_state_idx=destination_state_idx,
+        )
+
+        torch.testing.assert_close(current_tri, current_ref)
+        for layer in range(num_layers):
+            torch.testing.assert_close(current_tri[layer, 1], current_orig[layer, 1])
+            torch.testing.assert_close(current_tri[layer, 4], current_orig[layer, 4])
+            torch.testing.assert_close(current_tri[layer, 7], current_orig[layer, 7])
+
     def test_empty(self):
         """Zero requests should be a no-op."""
         num_layers = 2

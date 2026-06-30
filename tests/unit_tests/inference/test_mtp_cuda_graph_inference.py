@@ -446,7 +446,8 @@ class TestMTPCudaGraphInference:
                 assert sampled.dtype == torch.int64
                 assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
-            assert context.mtp_decoder_hidden_states is None
+            assert hasattr(unwrapped, '_decoder_hidden_states_cache')
+            assert context.mtp_decoder_hidden_states is not None
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
