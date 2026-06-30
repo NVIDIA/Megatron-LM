@@ -124,6 +124,7 @@ class _AsyncScheduleForwardAndResolveResult:
     active_request_ids: Tensor
     finished_request_ids: Tensor
     survivor_idxs: Tensor
+    resolve_done_event: Optional[Any]
 
 
 # pylint: disable=line-too-long
@@ -890,7 +891,7 @@ class TextGenerationController:
 
         return active_request_ids, finished_request_ids, active_request_mask, survivor_idxs
 
-    def _run_async_sched_forward(self, input_ids: Tensor, position_ids: Tensor) -> Optional[int]:
+    def _run_async_sched_forward(self, input_ids: Tensor, position_ids: Tensor) -> Optional[Any]:
         """Run one dynamic forward pass and cache logits for async scheduling.
 
         Args:
@@ -898,8 +899,8 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
 
         Returns:
-            Optional[int]: CUDA graph request count for the forward pass, or
-            `None` when CUDA graphs were not used.
+            Optional[Any]: Event marking forward completion, or `None` when no
+                CUDA work was recorded.
         """
         context = self.inference_wrapped_model.inference_context
         cuda_graph_request_count = (
@@ -911,7 +912,7 @@ class TextGenerationController:
         range_pop()
 
         self._decode_forward_primer.mark_primed(cuda_graph_request_count)
-        return cuda_graph_request_count
+        return self._record_async_sched_event(self._all_logits_cuda)
 
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -2167,17 +2168,13 @@ class TextGenerationController:
         Args:
             sampled_tokens_cpu_view (Tensor): View of sampled tokens copied to CPU.
             forward_done_event (Optional[Any]): Event marking speculative forward completion.
-            overlap (bool): If true, resolve requests before waiting for the forward.
+            overlap (bool): If true, wait for the forward after resolving requests.
 
         Returns:
             _AsyncScheduleForwardAndResolveResult: Sampled tokens and resolved
-                request row sets after logits compaction.
+                request row sets with the logits-compaction completion event.
         """
         context = self.inference_wrapped_model.inference_context
-
-        # Wait on the forward to finish before serial resolution.
-        if not overlap:
-            self._wait_async_sched_event(forward_done_event)
 
         # Resolve requests.
         range_push("active_request_mask")
@@ -2198,10 +2195,9 @@ class TextGenerationController:
         if overlap:
             self._wait_async_sched_event(forward_done_event)
 
-        # Compact logits and wait on resolution to finish.
+        # Compact logits and record resolution completion.
         self._compact_async_sched_logits(survivor_idxs)
-        compaction_done_event = self._record_async_sched_event(self._all_logits_cuda)
-        self._wait_async_sched_event(compaction_done_event)
+        resolve_done_event = self._record_async_sched_event(self._all_logits_cuda)
 
         # Return the completed phase result.
         return _AsyncScheduleForwardAndResolveResult(
@@ -2209,6 +2205,7 @@ class TextGenerationController:
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
             survivor_idxs=survivor_idxs,
+            resolve_done_event=resolve_done_event,
         )
 
     def _run_async_sched_forward_and_resolve(
@@ -2227,14 +2224,24 @@ class TextGenerationController:
         """
         # Forward.
         range_push("async_sched_forward_pass")
-        self._run_async_sched_forward(phase_result.input_ids, phase_result.position_ids)
+        forward_done_event = self._run_async_sched_forward(
+            phase_result.input_ids, phase_result.position_ids
+        )
         range_pop()
-        forward_done_event = self._record_async_sched_event(self._all_logits_cuda)
 
-        # Resolve requests; the child waits on forward and resolution completion.
-        return self._run_async_sched_resolve(
+        # Wait on the forward to finish before serial resolution.
+        if not overlap:
+            self._wait_async_sched_event(forward_done_event)
+
+        # Resolve requests.
+        resolve_result = self._run_async_sched_resolve(
             phase_result.sampled_tokens_cpu_view, forward_done_event, overlap
         )
+
+        # Wait on resolution to finish.
+        self._wait_async_sched_event(resolve_result.resolve_done_event)
+
+        return resolve_result
 
     async def _run_async_sched_step(self, *, overlap: bool) -> Optional[Dict]:
         """Run one decode-only step using the async scheduling path.

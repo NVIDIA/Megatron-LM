@@ -369,7 +369,7 @@ def test_run_async_sched_prepare_updates_context_before_h2d_init():
 @pytest.mark.parametrize(
     "using_cuda_graph, expected_cuda_graph_request_count", [(False, None), (True, 8)]
 )
-def test_run_async_sched_forward_records_primer(
+def test_run_async_sched_forward_records_primer_and_returns_event(
     using_cuda_graph, expected_cuda_graph_request_count
 ):
     context = _make_async_sched_context()
@@ -378,7 +378,9 @@ def test_run_async_sched_forward_records_primer(
     controller._decode_forward_primer = DecodeForwardPrimer(
         is_primed=False, cuda_graph_request_count=None
     )
+    controller._all_logits_cuda = torch.empty(0)
     controller._dynamic_step_forward_logits = mock.Mock()
+    controller._record_async_sched_event = mock.Mock(return_value="forward_done")
     input_ids = torch.tensor([[10, 11]])
     position_ids = torch.tensor([[0, 1]])
 
@@ -392,10 +394,11 @@ def test_run_async_sched_forward_records_primer(
             "text_generation_controller.range_pop"
         ),
     ):
-        cuda_graph_request_count = controller._run_async_sched_forward(input_ids, position_ids)
+        forward_done_event = controller._run_async_sched_forward(input_ids, position_ids)
 
     controller._dynamic_step_forward_logits.assert_called_once_with(input_ids, position_ids)
-    assert cuda_graph_request_count == expected_cuda_graph_request_count
+    controller._record_async_sched_event.assert_called_once_with(controller._all_logits_cuda)
+    assert forward_done_event == "forward_done"
     assert controller._decode_forward_primer.is_primed
     assert (
         controller._decode_forward_primer.cuda_graph_request_count
@@ -451,7 +454,6 @@ def test_async_sched_serial_step(
         assert torch.equal(forward_input_ids, input_ids)
         assert torch.equal(forward_position_ids, position_ids)
         controller._decode_forward_primer.mark_primed(5)
-        return 5
 
     def prepare_requests():
         call_order.append("prepare")
@@ -580,7 +582,7 @@ def test_async_sched_step_phase_order(overlap, expected_call_order):
         or (sample_tokens, "sample")
     )
 
-    event_names = iter(["phase1", "forward", "phase2"])
+    event_names = iter(["phase1", "phase2"])
 
     def record_event(*_):
         event = next(event_names)
@@ -607,7 +609,7 @@ def test_async_sched_step_phase_order(overlap, expected_call_order):
         side_effect=lambda sampled_tokens_cpu: call_order.append("commit_sampled_tokens")
     )
     controller._run_async_sched_forward = mock.Mock(
-        side_effect=lambda *_: call_order.append("forward") or 5
+        side_effect=lambda *_: call_order.extend(["forward", "record:forward"]) or "forward"
     )
     context.resolve_requests = mock.Mock(
         side_effect=lambda _: call_order.append("resolve") or torch.empty(0, dtype=torch.int32)
