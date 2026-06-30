@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.utils import get_pg_size
 
 __all__ = [
     "build_packed_allgather_cp_local_positions",
@@ -118,7 +119,7 @@ def get_cp_positions_from_layout(
         cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
-        and cp_group.size() == cp_size
+        and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]

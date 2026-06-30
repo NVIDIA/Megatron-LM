@@ -12,7 +12,7 @@ from torch import Tensor
 
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_masking
-from megatron.core.utils import round_up_to_nearest_multiple
+from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -1254,7 +1254,7 @@ def run_fused_qk_topk_with_loss(
 
 def _all_reduce_tp_target(target: Tensor, tp_group) -> Tensor:
     """Sum a local attention target across TP ranks when TP is enabled."""
-    if tp_group is not None and tp_group.size() > 1:
+    if get_pg_size(tp_group) > 1:
         torch.distributed.all_reduce(target, group=tp_group)
     return target
 
@@ -1531,7 +1531,7 @@ def _compute_sparse_indexer_loss_and_grads(
         q_idx_bshd, w_bsh
     )
 
-    if tp_group is not None and tp_group.size() > 1:
+    if get_pg_size(tp_group) > 1:
         # TP ranks own the same query rows but different attention heads. Canonicalize
         # selected-key slots before the positional target all-reduce.
         topk_indices_cmp, indexer_score_payload = _sort_valid_topk_indices_and_scores_by_index(

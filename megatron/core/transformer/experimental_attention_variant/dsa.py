@@ -26,6 +26,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_size
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -229,7 +230,7 @@ def _validate_nonpacked_cp_uniform_length(
         cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
-        and cp_group.size() == cp_size
+        and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
@@ -684,13 +685,13 @@ def bwd_fused_indexer_loss_naive(
     query, _ = dsa_layout.ensure_sbhd(query, "query")
     key, _ = dsa_layout.ensure_sbhd(key, "key")
 
+    index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)  # [B, Sq, Sk]
+
     sq, b, np, hn = query.size()
     sk = key.size(0)
     query_valid_rows = dsa_masking.normalize_query_valid_rows(
         query_valid_rows, b=b, sq=sq, device=query.device
     )
-
-    index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)  # [B, Sq, Sk]
 
     # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
     query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
@@ -1696,10 +1697,10 @@ class DSAttention(MegatronModule):
         local_sequence_rows = x.size(0)
 
         cp_group = getattr(self.pg_collection, "cp", None)
-        cp_size = cp_group.size() if cp_group is not None else 1
+        cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
         tp_group = getattr(self.pg_collection, "tp", None)
-        tp_size = tp_group.size() if tp_group is not None else 1
+        tp_size = get_pg_size(tp_group)
         sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
         sequence_parallel_tp_row_start = 0
         sequence_parallel_tp_full_rows = sq

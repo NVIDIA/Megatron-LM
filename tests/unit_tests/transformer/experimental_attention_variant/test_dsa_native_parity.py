@@ -12,8 +12,6 @@ from megatron.core.transformer.experimental_attention_variant import (
 )
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
-)
-from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     run_absorbed_mla_dsa_parity,
 )
 
