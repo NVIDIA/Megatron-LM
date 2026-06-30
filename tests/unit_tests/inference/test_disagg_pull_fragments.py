@@ -5,7 +5,7 @@ full-head fragment (the same-TP case) to one descriptor per (k, layer) -- the
 same whole-block stride math the old index-based begin_pull produced -- and
 split per token only for a partial head range (a TP remap)."""
 
-from megatron.core.inference.disaggregation.kv_transfer_pull import _kv_fragment_triples
+from megatron.core.inference.disaggregation.kv_transfer_pull import _kv_fragment_descriptors
 
 
 def _kv_dims(L, TB, BS, H, HD, elem=2):
@@ -20,17 +20,17 @@ def test_full_head_fragment_coalesces_to_whole_block_descriptors():
     L, TB, BS, H, HD, elem = 3, 16, 4, 5, 8, 2
     dims = _kv_dims(L, TB, BS, H, HD, elem)
     src_block, dst_block = 7, 2
-    triples = _kv_fragment_triples(
+    descriptors = _kv_fragment_descriptors(
         dims, dims, src_block, dst_block,
         range(0, L), range(0, L), range(0, H), range(0, H),
     )
-    assert len(triples) == 2 * L  # 2 (k) * L, NOT 2*L*BS
+    assert len(descriptors) == 2 * L  # 2 (k) * L, NOT 2*L*BS
     inner = BS * H * HD * elem
     expected = [
         ((o * TB + dst_block) * inner, (o * TB + src_block) * inner, inner)
         for o in range(2 * L)  # o == k*L + layer, flattened outer index
     ]
-    assert triples == expected
+    assert descriptors == expected
 
 
 def test_partial_head_fragment_splits_per_token():
@@ -39,8 +39,8 @@ def test_partial_head_fragment_splits_per_token():
     L, TB, BS, H, HD, elem = 2, 16, 4, 8, 8, 2
     dims = _kv_dims(L, TB, BS, H, HD, elem)
     # Pull heads [0:4) of an 8-head buffer -> partial -> per-token split.
-    triples = _kv_fragment_triples(
+    descriptors = _kv_fragment_descriptors(
         dims, dims, 7, 2, range(0, L), range(0, L), range(0, 4), range(0, 4),
     )
-    assert len(triples) == 2 * L * BS
-    assert all(nb == 4 * HD * elem for _, _, nb in triples)
+    assert len(descriptors) == 2 * L * BS
+    assert all(nb == 4 * HD * elem for _, _, nb in descriptors)
