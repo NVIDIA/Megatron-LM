@@ -242,33 +242,11 @@ def _check_supported_type(meta):
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
-def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
-    """Determine if the given module is the first/last layer of the PP+VPP chunk it belongs to.
-    Returns a tuple of two booleans indicating if the module is the first/last layer of the chunk.
-    """
-
-    # import modules here to avoid a circular import
-    from megatron.core.transformer.transformer_block import get_num_layers_to_build
-    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-
-    if not hasattr(base_module, "layer_number"):
-        return True, True
-
-    # find all first/last layers of this PP stage
-    first_layer_numbers = []
-    last_layer_numbers = []
-    vp_size = base_module.config.virtual_pipeline_model_parallel_size or 1
-    for i in range(vp_size):
-        # layer numbers are 1-indexed
-        layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i)
-        num_layers_to_build = get_num_layers_to_build(base_module.config, vp_stage=i)
-        if num_layers_to_build > 0:
-            first_layer_numbers.append(layer_offset + 1)
-            last_layer_numbers.append(layer_offset + num_layers_to_build)
-    return (
-        base_module.layer_number in first_layer_numbers,
-        base_module.layer_number in last_layer_numbers,
-    )
+def annotate_first_last_layer(layers):
+    """Annotate the first and last modules in an ordered layer collection."""
+    for i, layer in enumerate(layers):
+        layer.is_first_layer = i == 0
+        layer.is_last_layer = i == len(layers) - 1
 
 
 def _clone_nested_tensors(value: Any) -> Any:
@@ -614,14 +592,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         # Copy new data into fwd graph input buffer
         for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
-            if (
-                hasattr(cudagraph_input, "can_skip_replay_copy")
-                and cudagraph_input.can_skip_replay_copy
-            ):
+            can_skip_replay_copy = getattr(
+                cudagraph_input, "can_skip_replay_copy", False
+            ) and getattr(user_input, "can_skip_replay_copy", True)
+            if can_skip_replay_copy:
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
-            else:
-                if user_input.data_ptr() != cudagraph_input.data_ptr():
-                    cudagraph_input.copy_(user_input)
+            elif user_input.data_ptr() != cudagraph_input.data_ptr():
+                cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         if runner.fp8_enabled or runner.fp4_enabled:
@@ -645,6 +622,12 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
+
+        if runner.is_last_layer:
+            outputs = tuple(torch.clone(t) for t in runner.fwd_graph_output_surface)
+            for output in outputs:
+                output.can_skip_replay_copy = False
+            return outputs
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -670,6 +653,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_output_grad.copy_(user_output_grad)
 
         runner.bwd_graph.replay()
+        runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
+        for param in runner.params_to_backprop:
+            param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -711,6 +697,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.fwd_graph = None
         self.bwd_graph = None
+        self.bwd_graph_replay_complete_event = torch.cuda.Event()
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
@@ -727,9 +714,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
-        self.is_first_layer, self.is_last_layer = _determine_if_first_last_layer_of_this_vp_chunk(
-            base_module
-        )
+        self.is_first_layer = getattr(base_module, "is_first_layer", True)
+        self.is_last_layer = getattr(base_module, "is_last_layer", True)
 
         # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph
         # replay so that way we only update the value of this flag in FP8GlobalStateManager when
@@ -1139,10 +1125,6 @@ class _CudaGraphRunner(torch.nn.Module):
         assert len(self.params_to_backprop) == len(grad_inputs)
         self.static_grad_inputs = tuple(self.static_grad_inputs)
         self.static_grad_outputs = tuple(self.static_grad_outputs)
-
-        # Mark every param so the DDP hook knows their wgrad is accumulated inside the CUDA graph
-        for param in self.params_to_backprop:
-            param.is_cudagraph_output = True
 
         # It is safe to weakref static_grad_inputs as any inuse input grads have a strong ref
         # stored in 'bwd_cudagraph_buffer'

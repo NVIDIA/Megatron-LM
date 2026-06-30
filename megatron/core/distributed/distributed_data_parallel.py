@@ -459,8 +459,12 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce and not getattr(
-                    param, 'is_cudagraph_output', False
+                cudagraph_wgrad_ready_event = getattr(
+                    param, '_cudagraph_wgrad_ready_event', None
+                )
+                if (
+                    self.ddp_config.overlap_grad_reduce
+                    and cudagraph_wgrad_ready_event is None
                 ):
                     assert (
                         param.grad is not None

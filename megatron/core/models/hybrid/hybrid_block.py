@@ -187,6 +187,11 @@ class HybridStack(MegatronModule):
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
 
+        if self.config.cuda_graph_impl == "local":
+            from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+
+            annotate_first_last_layer(self.layers)
+
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 

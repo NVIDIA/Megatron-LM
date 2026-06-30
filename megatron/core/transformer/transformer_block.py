@@ -365,6 +365,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        if self.config.cuda_graph_impl == "local":
+            from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+
+            annotate_first_last_layer(self.layers)
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
