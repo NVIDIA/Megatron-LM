@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.utils import round_up_to_nearest_multiple
+
 try:
     import tilelang
     from tilelang import language as T  # pylint: disable=unused-import
@@ -83,7 +85,7 @@ def _ceil_div(x: int, y: int) -> int:
 def _round_up(x: int, multiple: int) -> int:
     if multiple <= 1:
         return x
-    return _ceil_div(x, multiple) * multiple
+    return round_up_to_nearest_multiple(x, multiple)
 
 
 def _next_power_of_two(x: int) -> int:

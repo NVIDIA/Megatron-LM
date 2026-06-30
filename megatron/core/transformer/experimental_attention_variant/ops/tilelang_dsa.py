@@ -219,10 +219,10 @@ def _compute_topk_target_chunk_sum(
 
         # Two-pass online softmax over top-k chunks:
         # 1) compute row-wise max and denominator; 2) recompute and accumulate probabilities.
-        m = _get_scratch_buffer("kl_m", (h_chunk, s_len), torch.float32, device)
-        l = _get_scratch_buffer("kl_l", (h_chunk, s_len), torch.float32, device)
-        m.fill_(float("-inf"))
-        l.zero_()
+        # These accumulators are rebound to fresh tensors each top-k chunk (m = m_new,
+        # l = l * alpha + ...), so they cannot reuse a scratch buffer in place.
+        m = torch.full((h_chunk, s_len), float("-inf"), dtype=torch.float32, device=device)
+        l = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=device)
 
         def _chunk_logits(idx_topk, valid_topk_chunk, k_len):
             if key_shared is not None:
