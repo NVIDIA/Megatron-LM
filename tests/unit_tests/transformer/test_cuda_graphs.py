@@ -644,6 +644,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in self.llava_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         set_current_microbatch(self.llava_model.vision_model, 1)
         set_current_microbatch(self.llava_model.language_model, 1)
