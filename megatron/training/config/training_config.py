@@ -540,13 +540,58 @@ class CheckpointConfig:
     "ep_dp": Expert data parallel process group.
     """
 
+    exit_after_loading_ckpt: bool = False
+    """If set, exit the program after loading from a checkpoint. Useful for testing checkpoint loading."""
+
+    ckpt_fully_parallel_save_replicate_local: bool = False
+    """If True, the fully-parallel save additionally writes a per-rank shadow
+    copy of every replica that this rank holds inside the parallelization
+    group. The metadata records each copy under a ``__shadow_<rank>__<fqn>``
+    key pointing at the rank's own ``__<rank>_*.distcp`` file, so at load
+    time every rank can read its tensors from its own file (no cross-reads).
+    Trades extra checkpoint storage (~``parallelization_group_size`` x for
+    replicated parameters) for read-side locality at scale. Pair with
+    ``ckpt_fully_parallel_load_replicate_local`` to take advantage at load
+    time. Default: False.
+    """
+
+    ckpt_fully_parallel_load_replicate_local: bool = False
+    """If True, the load redirects every requested FQN whose
+    ``__shadow_<rank>__<fqn>`` exists in the metadata to the rank's local
+    shadow entry — eliminating cross-reads at load time. Has no effect when
+    the checkpoint was saved without
+    ``ckpt_fully_parallel_save_replicate_local`` (no shadow keys are
+    present, so there is nothing to redirect). Default: False.
+    """
+
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_pg_tensors_cache_path: Optional[str] = None
+    """Directory of the parallelization-group distribution cache for fully parallel
+    save/load of distributed checkpoints. When set, the expensive
+    ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
+    replaced by a single per-group file read (the load and save distributions are
+    loaded from this directory). Only safe when the config and world size match the
+    run that created the cache (see ``--ckpt-pg-tensors-cache-create``); no
+    existence/validity checks are performed, for the lowest possible latency.
+    Default (None) preserves the original collective-based behaviour."""
+
+    ckpt_pg_tensors_cache_create: bool = False
+    """Create (rather than read) the parallelization-group distribution cache at
+    ``--ckpt-pg-tensors-cache-path``. Set this for a single run with a matching
+    config/world size: the collective runs as usual but both the save and load
+    distributions are derived from that single gather and written to disk, one
+    file per parallelization group. Subsequent runs set only
+    ``--ckpt-pg-tensors-cache-path`` (leave this False) to skip the collective.
+    Default: False."""
+
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""

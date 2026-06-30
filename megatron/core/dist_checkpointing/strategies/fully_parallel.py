@@ -20,9 +20,12 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     ShardDistribution,
     determine_main_replica_uniform_distribution,
     exchange_by_distribution,
-    exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
+from megatron.core.dist_checkpointing.strategies.local_replica import (
+    compute_shadow_shard_ids,
+    rewrite_replicas_to_shadow,
+)
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
@@ -37,6 +40,7 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
+from megatron.core.perfetto_trace import trace_region
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,9 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution: bool = False,
         backend: str = "torch_dist",
         version: int = 1,
+        replicate_local_replicas: bool = False,
+        pg_cache_path: Optional[str] = None,
+        pg_cache_create: bool = False,
     ):
         """ """
         self.base_strategy = strategy
@@ -84,8 +91,26 @@ class FullyParallelSaveStrategyWrapper:
         self.do_cache_distribution = do_cache_distribution
         self.backend = backend
         self.version = version
+        # PG-collective caching (see determine_main_replica_uniform_distribution).
+        # When pg_cache_path is set and pg_cache_create is False, the save
+        # distribution is read from disk and the all_gather_object is skipped.
+        self.pg_cache_path = pg_cache_path
+        self.pg_cache_create = pg_cache_create
+        # When True, after the standard parallelization step has elected a
+        # main saver per shard, every other rank in the parallelization group
+        # that holds a replica also writes its copy under a per-rank shadow
+        # FQN (see strategies/local_replica.py). Trades extra disk for the
+        # ability of every rank to read its tensors from its own
+        # __<rank>_*.distcp file at load time, eliminating cross-rank reads.
+        self.replicate_local_replicas = replicate_local_replicas
 
         self.cached_distribution: Optional[ShardDistribution] = None
+        # Companion cache for the load-mode distribution that is needed by
+        # the algorithmic shadow filter. Only populated when
+        # ``replicate_local_replicas`` is True; mirrors ``cached_distribution``
+        # so that ``do_cache_distribution=True`` continues to skip every
+        # all_gather on subsequent saves.
+        self.cached_load_distribution: Optional[ShardDistribution] = None
 
     def async_save(
         self,
@@ -117,24 +142,79 @@ class FullyParallelSaveStrategyWrapper:
 
         Returns: None
         """
+        from megatron.core.utils import get_pg_rank
+
         start = time()
         if self.do_cache_distribution and self.cached_distribution is not None:
             logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
+            load_distribution = self.cached_load_distribution
         else:
             logger.debug(f'Apply save parallelization')
-            precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group
-            )
+            with trace_region("determine_main_replica_uniform_distribution"):
+                precomputed_distribution = determine_main_replica_uniform_distribution(
+                    sharded_state_dict,
+                    self.parallelization_group,
+                    pg_cache_path=self.pg_cache_path,
+                    pg_cache_create=self.pg_cache_create,
+                )
+            # Local-replica mode needs the load-side picker to decide which
+            # shards actually cross-read at load time. We compute it here,
+            # *before* the save distribution mutates ``replica_id`` values,
+            # so that the picker sees the same input as it will at load
+            # time (the user's ``replica_id`` convention from
+            # ``make_(tp_)sharded_tensor_for_checkpoint``). With matching
+            # inputs the deterministic picker produces the same output at
+            # save and load — which is exactly the alignment the filter
+            # relies on.
+            load_distribution: Optional[ShardDistribution] = None
+            if self.replicate_local_replicas:
+                load_distribution = determine_main_replica_uniform_distribution(
+                    sharded_state_dict,
+                    self.parallelization_group,
+                    True,
+                    pg_cache_path=self.pg_cache_path,
+                    pg_cache_create=self.pg_cache_create,
+                )
 
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
-        if self.cached_distribution is None:
+        # In cache-read mode the user vouches for a matching config/world size,
+        # so we also skip this first-save integrity check — it triggers its own
+        # collective (determine_global_metadata), which would defeat the purpose
+        # of skipping the distribution all_gather.
+        pg_cache_read = self.pg_cache_path is not None and not self.pg_cache_create
+        if self.cached_distribution is None and not pg_cache_read:
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
+            self.cached_load_distribution = load_distribution
+
+        # Local-replica mode: rename only the local replicas that the load
+        # picker would actually pull over the network. The filter
+        # (``compute_shadow_shard_ids``) returns shard ids where this rank
+        # is the load picker AND the save picker did not pick this rank in
+        # this group — exactly the shards that would otherwise cross-read.
+        # This must run *after* validate_sharding_integrity (which expects
+        # the original key topology) and *after* the cached_distribution
+        # snapshot above (so subsequent saves replay the same rename
+        # deterministically).
+        if self.replicate_local_replicas:
+            global_rank = torch.distributed.get_rank()
+            rank_in_group = get_pg_rank(group=self.parallelization_group)
+            shadow_shard_ids = compute_shadow_shard_ids(
+                precomputed_distribution, load_distribution, rank_in_group
+            )
+            n_renamed = rewrite_replicas_to_shadow(
+                sharded_state_dict, global_rank, shadow_shard_ids=shadow_shard_ids
+            )
+            logger.debug(
+                f"replicate_local_replicas: renamed {n_renamed} ShardedTensors "
+                f"to shadow keys on rank {global_rank} "
+                f"(shadow set size: {len(shadow_shard_ids)})"
+            )
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
 
@@ -171,6 +251,8 @@ class FullyParallelLoadStrategyWrapper:
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
+        pg_cache_path: Optional[str] = None,
+        pg_cache_create: bool = False,
     ):
         self.base_strategy = strategy
         if parallelization_group is None:
@@ -180,6 +262,11 @@ class FullyParallelLoadStrategyWrapper:
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
+        # PG-collective caching (see determine_main_replica_uniform_distribution).
+        # When pg_cache_path is set and pg_cache_create is False, the load
+        # distribution is read from disk and the all_gather_object is skipped.
+        self.pg_cache_path = pg_cache_path
+        self.pg_cache_create = pg_cache_create
 
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
@@ -213,11 +300,22 @@ class FullyParallelLoadStrategyWrapper:
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict to load
             checkpoint_dir (Path): checkpoint directory to load from
+            async_strategy (str): which async backend to use for the
+                base-strategy load (``"nvrx"`` or ``"mcore"``). Defaults
+                to ``"mcore"``.
 
         Returns:
             StateDict: loaded state dict. The state dict should be equivalent to
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
+
+        Note:
+            The local-replica redirect (``replicate_local_replicas``) is a
+            *property of the base strategy* — pass it to
+            ``TorchDistLoadShardedStrategy(replicate_local_replicas=True)``
+            at construction time. The wrapper does not need to know about
+            the flag; it just forwards ``.load(...)`` calls to the base
+            strategy, which decides whether to perform the redirect.
         """
         from megatron.core.utils import get_pg_size
 
@@ -226,50 +324,70 @@ class FullyParallelLoadStrategyWrapper:
         if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
-        # Step 1 and 2: exchange load metadata and distribute the load
-        with debug_time("self.apply_loading_parallelization", logger):
-            precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
-                sharded_state_dict
-            )
-            assert (
-                precomputed_distribution is not None
-            ), 'Expecting non-trivial distribution for non-trivial parallelization group'
+        with trace_region("apply_loading_parallelization"):
+            # Step 1 and 2: exchange load metadata and distribute the load
+            with debug_time("self.apply_loading_parallelization", logger):
+                precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
+                    sharded_state_dict
+                )
+                assert (
+                    precomputed_distribution is not None
+                ), 'Expecting non-trivial distribution for non-trivial parallelization group'
 
         # Step 3: load part of the checkpoint.
-        # Load only sharded objects first. ShardedTensors will be loaded separately
-        # so that we can keep track of sharded tensors loaded by this rank
+        # ShardedTensors keep the FullyParallel distribution: each rank reads
+        # only the shards it was assigned (`to_load_shards`) and receives the
+        # rest (`unloaded_shards`) via the cross-rank exchange in step 4.
         (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
             self._defer_loading_sharded_tensors(sharded_state_dict)
         )
 
+        # ShardedObjects are handled differently: every rank loads *all* of its
+        # own objects directly from storage, so no inter-rank object exchange is
+        # needed. This is correct because an object is addressed in the
+        # checkpoint by its `unique_key` (key + global_offset + global_shape),
+        # which excludes `replica_id`; each distinct object position is therefore
+        # written to disk exactly once (by its main replica) and any rank that
+        # needs it can read it locally with `no_dist=True`. We merge both the
+        # main (`to_load_objects`) and non-main (`unloaded_objects`) replica maps
+        # so this rank loads every object in its state dict. This replaces the
+        # former WORLD-wide `all_gather_object` collective with extra (but cheap)
+        # local reads of small artifacts (RNG states, `_extra_state`, ...).
         (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
+        all_objects_to_load = {**to_load_objects, **unloaded_objects}
 
         assert (
             len(sharded_state_dict) == 0
         ), "sharded_state_dict is not empty after deferring tensors and objects"
-        with debug_time("base_load_ShardedObjects", logger):
-            # Load sharded objects first
-            loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
-            )
+        # Load this rank's tensor shards together with all of its objects in a
+        # single base-strategy `.load()` call. `mcore_to_pyt_state_dict` already
+        # supports a mixed tensor/object state dict, and a single call means one
+        # metadata read and one load plan instead of two.
+        with trace_region("base_load_ShardedTensorsAndObjects"):
+            with debug_time("base_load_ShardedTensorsAndObjects", logger):
+                loaded = self.base_strategy.load(
+                    {**to_load_shards, **all_objects_to_load}, checkpoint_dir, async_strategy
+                )
+        # The base strategy returns the loaded values keyed by the same shard
+        # ids we passed in; split them back into tensors and objects. Tensor and
+        # object shard ids never collide (a given key is either a tensor or an
+        # object), so membership in the original maps is an unambiguous split.
+        loaded_tensors = {shard_id: loaded[shard_id] for shard_id in to_load_shards}
+        loaded_objects = {shard_id: loaded[shard_id] for shard_id in all_objects_to_load}
+        with trace_region("exchange_loaded_tensors"):
+            with debug_time("self.exchange_loaded_tensors", logger):
 
-        with debug_time("base_load_ShardedTensors", logger):
-            # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
-
-        with debug_time("self.exchange_loaded_tensors", logger):
-
-            # Step 4: exchange data between ranks
-            logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
-            all_loaded_tensors = exchange_by_distribution(
-                loaded_tensors,
-                unloaded_shards,
-                precomputed_distribution,
-                self.parallelization_group,
-                self.exchange_algo,
-            )
+                # Step 4: exchange data between ranks
+                logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
+                all_loaded_tensors = exchange_by_distribution(
+                    loaded_tensors,
+                    unloaded_shards,
+                    precomputed_distribution,
+                    self.parallelization_group,
+                    self.exchange_algo,
+                )
             if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
                 missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
                 raise CheckpointingException(
@@ -279,20 +397,17 @@ class FullyParallelLoadStrategyWrapper:
             with debug_time("torch.cuda.synchronize", logger):
                 torch.cuda.synchronize()
 
-        all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+        # No object exchange: each rank already loaded every object it needs.
 
-        if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
-            missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
-            raise CheckpointingException(
-                f'Missing object shards after fully parallel loading: {missing_object_shards}'
-            )
-        torch.cuda.synchronize()
+        with trace_region("fill_in_deferred_sharded_tensors"):
+            self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
 
-        self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
-        self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)
+        with trace_region("fill_in_deferred_sharded_objects"):
+            self.fill_in_deferred_sharded_objects(sharded_objects, loaded_objects)
 
-        merge(loaded_state_dict, sharded_objects)
-        merge(loaded_state_dict, sharded_tensors)
+        with trace_region("merge"):
+            merge(loaded_state_dict, sharded_objects)
+            merge(loaded_state_dict, sharded_tensors)
         if hasattr(self.base_strategy, "cached_global_metadata"):
             self.cached_global_metadata = self.base_strategy.cached_global_metadata
         return loaded_state_dict
@@ -385,7 +500,11 @@ class FullyParallelLoadStrategyWrapper:
         else:
             logger.debug(f'Apply load parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group, True
+                sharded_state_dict,
+                self.parallelization_group,
+                True,
+                pg_cache_path=self.pg_cache_path,
+                pg_cache_create=self.pg_cache_create,
             )
 
         distribute_main_replicas_with_precomputed_distribution(

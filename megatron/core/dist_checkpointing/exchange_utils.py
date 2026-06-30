@@ -3,6 +3,8 @@
 """Utilities for exchanging data between ranks."""
 
 import logging
+import os
+import pickle
 from collections import defaultdict
 from functools import reduce
 from itertools import zip_longest
@@ -170,39 +172,50 @@ def distribute_shards_to_ranks(
     return shard_to_saving_rank
 
 
-def determine_main_replica_uniform_distribution(
+# Prefix of the per-parallelization-group cache files written/read by the
+# PG-collective caching feature (see `determine_main_replica_uniform_distribution`).
+PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
+
+# Process-global in-memory cache of the per-group distributions, keyed by the
+# resolved cache file path (which uniquely identifies a (cache dir, group) pair).
+# Each entry holds the full {ignore_groups: ShardDistribution} map, so a single
+# entry serves both the save and load variants. This memoization makes
+# `determine_main_replica_uniform_distribution` idempotent within a job:
+#   * CREATE runs the gather + write at most once per group (subsequent calls,
+#     e.g. later saves or the second `replicate_local_replicas` call, hit memory
+#     and skip the collective and the file write), and
+#   * READ opens each group's file at most once per job.
+# It is checked *before* the collective so every rank of a group hits or misses
+# in lockstep, preserving collective symmetry.
+_PG_DIST_CACHE: Dict[str, Dict[bool, "ShardDistribution"]] = {}
+
+
+def _gather_shards_metadata(
     sharded_state_dict: ShardedStateDict,
     parallelization_group: torch.distributed.ProcessGroup,
-    ignore_groups: bool = False,
-) -> Optional[ShardDistribution]:
-    """Computes the save distribution.
+) -> List[List[ShardedTensor]]:
+    """Runs the single expensive collective behind the load/save distribution.
 
-    Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
-    which applies the computed save distribution.
+    Every rank in the group contributes the metadata (no tensor data) of the
+    ``ShardedTensor``s it holds; the result is the list of every rank's shard
+    metadata, identical on all ranks of the group. This is the
+    ``all_gather_object`` that the caching feature exists to eliminate on
+    subsequent jobs.
 
-    We rely on the fact that the assignment algorithm is deterministic on all ranks,
-    so there is no extra communication needed after metadata exchange.
+    Decision: data is stripped with ``without_data()`` before the gather. Only
+    the metadata (key, offsets, shape, dtype, replica_id) drives the
+    distribution algorithm, and gathering it keeps the pickled payload tiny.
 
     Args:
-        sharded_state_dict (ShardedStateDict): state dict to compute the distribution of
-        parallelization_group (ProcessGroup): distribution will be computed
-            within this process group
-        ignore_groups (bool, optional): whether the distribution defines groups.
-            This option is primarily used during loading, as it ensures that all replicas,
-            including non-main ones, are loaded by this parallelization group
-            Defaults to False.
+        sharded_state_dict (ShardedStateDict): state dict whose local shards
+            are advertised to the group.
+        parallelization_group (ProcessGroup): group to gather within.
 
-    Returns (ShardDistribution, optional): distribution that can be used to apply the
-        parallelization. Returns None if the process_group is trivial (1 rank)
-
+    Returns:
+        List[List[ShardedTensor]]: per-rank lists of data-less ShardedTensors.
     """
     from ..utils import get_pg_size
 
-    if parallelization_group is None:
-        parallelization_group = torch.distributed.group.WORLD
-    group_size = get_pg_size(group=parallelization_group)
-    if group_size <= 1:
-        return
     local_shards = list(
         sh_base
         for sh_base in nested_values(sharded_state_dict)
@@ -210,11 +223,38 @@ def determine_main_replica_uniform_distribution(
     )
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
-    all_shards = [None] * get_pg_size(group=parallelization_group)
+    all_shards: List[Optional[List[ShardedTensor]]] = [None] * get_pg_size(
+        group=parallelization_group
+    )
     torch.distributed.all_gather_object(
         all_shards, local_shards_no_data, group=parallelization_group
     )
+    return cast(List[List[ShardedTensor]], all_shards)
 
+
+def _build_shard_distribution(
+    all_shards: List[List[ShardedTensor]], ignore_groups: bool
+) -> ShardDistribution:
+    """Computes a ShardDistribution from already-gathered shard metadata.
+
+    This is the pure, deterministic post-gather logic of
+    ``determine_main_replica_uniform_distribution`` factored out so that:
+      * it can be run twice (for both ``ignore_groups`` variants) from a single
+        gather when creating the cache, and
+      * it has no dependence on the local rank, which is what makes the result
+        identical on every rank of the group and therefore safe to persist and
+        reload across jobs.
+
+    Args:
+        all_shards (List[List[ShardedTensor]]): gathered per-rank shard metadata
+            (output of ``_gather_shards_metadata``).
+        ignore_groups (bool): if True (load mode) include shards whose main
+            replica lives outside this group; if False (save mode) restrict to
+            shards with a main replica in this group.
+
+    Returns:
+        ShardDistribution: the computed distribution.
+    """
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
     shard_to_metadata = {}
@@ -251,6 +291,193 @@ def determine_main_replica_uniform_distribution(
     return ShardDistribution(
         shard_to_saving_rank, shards_in_this_group, shard_to_metadata, shard_to_ranks
     )
+
+
+def _pg_dist_cache_file_path(
+    cache_path: str, parallelization_group: torch.distributed.ProcessGroup
+) -> str:
+    """Returns the cache file path holding the distributions for a given group.
+
+    The file is keyed by the minimum global rank of the parallelization group.
+    Decision rationale:
+      * Parallelization groups partition the world, so ``min(global ranks)`` is
+        a unique, collision-free identifier of each group.
+      * It is computed from purely local metadata
+        (``get_process_group_ranks``), so the filename is derivable without any
+        collective — essential for the zero-communication read path.
+      * Every member of a group maps to the same file (one file per group rather
+        than one per rank): far fewer files at scale and a single read per rank,
+        with duplicate reads absorbed by the FS page cache.
+
+    Args:
+        cache_path (str): directory holding the cache files.
+        parallelization_group (ProcessGroup): the group to key on.
+
+    Returns:
+        str: absolute-or-relative path of the group's cache file.
+    """
+    ranks = torch.distributed.get_process_group_ranks(parallelization_group)
+    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{min(ranks)}.pkl")
+
+
+def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
+    """Reads both pre-computed ShardDistributions for a group from disk.
+
+    Returns the full ``{ignore_groups: ShardDistribution}`` map (not just one
+    variant) so the caller can memoize both in the process-global cache and serve
+    later save/load calls without re-opening the file.
+
+    Performs no existence/validity checks by design (see the feature docs): the
+    user opts into the cache only when they guarantee the config and world size
+    match the run that created it, trading safety for the lowest possible
+    latency.
+
+    Args:
+        cache_file (str): resolved path of the group's cache file.
+
+    Returns:
+        Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map.
+    """
+    with open(cache_file, "rb") as f:
+        return pickle.load(f)
+
+
+def _create_pg_dist_cache(
+    all_shards: List[List[ShardedTensor]],
+    cache_path: str,
+    parallelization_group: torch.distributed.ProcessGroup,
+) -> Dict[bool, ShardDistribution]:
+    """Builds both distribution variants and persists them for the group.
+
+    Both the save (``ignore_groups=False``) and load (``ignore_groups=True``)
+    distributions are derived from the *same* gathered metadata, so a single
+    collective suffices to populate a cache usable by every later load and save
+    — even if the creating job only ever loads (e.g. ``exit_after_loading_ckpt``).
+
+    Only the group's writer rank (global rank == ``min`` of the group) writes,
+    keeping create-time IO to one file per group. The write is atomic
+    (temp file + ``os.replace``) so a concurrent/interrupted create can never
+    leave a torn file that a reader would later trust blindly.
+
+    Args:
+        all_shards (List[List[ShardedTensor]]): gathered shard metadata.
+        cache_path (str): directory to write the cache file into.
+        parallelization_group (ProcessGroup): group being cached.
+
+    Returns:
+        Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map,
+            so the caller can return the variant it needs without recomputing.
+    """
+    both: Dict[bool, ShardDistribution] = {
+        ignore_groups: _build_shard_distribution(all_shards, ignore_groups)
+        for ignore_groups in (False, True)
+    }
+    ranks = torch.distributed.get_process_group_ranks(parallelization_group)
+    if torch.distributed.get_rank() == min(ranks):
+        os.makedirs(cache_path, exist_ok=True)
+        path = _pg_dist_cache_file_path(cache_path, parallelization_group)
+        tmp_path = f"{path}.tmp.{torch.distributed.get_rank()}"
+        with open(tmp_path, "wb") as f:
+            pickle.dump(both, f)
+        os.replace(tmp_path, path)
+    return both
+
+
+def determine_main_replica_uniform_distribution(
+    sharded_state_dict: ShardedStateDict,
+    parallelization_group: torch.distributed.ProcessGroup,
+    ignore_groups: bool = False,
+    *,
+    pg_cache_path: Optional[str] = None,
+    pg_cache_create: bool = False,
+) -> Optional[ShardDistribution]:
+    """Computes (or loads from cache) the load/save shard distribution.
+
+    Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
+    which applies the computed save distribution.
+
+    We rely on the fact that the assignment algorithm is deterministic on all ranks,
+    so there is no extra communication needed after metadata exchange.
+
+    PG-collective caching
+    ---------------------
+    The metadata exchange (`all_gather_object`) is by far the dominant cost of
+    this function at scale. Its result is a pure deterministic function of the
+    sharded state dict structure and the parallel layout, so for a fixed config
+    and world size it is identical across jobs and can be cached on disk:
+
+      * ``pg_cache_path`` set, ``pg_cache_create=False`` (READ): skip the
+        collective entirely and load the pre-computed distribution for this
+        group and mode from disk.
+      * ``pg_cache_path`` set, ``pg_cache_create=True`` (CREATE): run the
+        collective once, build *both* the save and load distributions from the
+        single gather, persist them, and return the requested one.
+      * both unset (default): the original behaviour, unchanged.
+
+    Results are additionally memoized in a process-global cache (``_PG_DIST_CACHE``)
+    keyed by the group's cache file, so within a single job each group is created
+    (gather + write) or read (file open) at most once — later calls (subsequent
+    saves, the second ``replicate_local_replicas`` pass, or the save wrapper
+    reusing the load wrapper's entry) are served from memory.
+
+    No existence/validity checks are performed on the cache by design — the user
+    opts in only when guaranteeing a matching config and world size.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict to compute the distribution of
+        parallelization_group (ProcessGroup): distribution will be computed
+            within this process group
+        ignore_groups (bool, optional): whether the distribution defines groups.
+            This option is primarily used during loading, as it ensures that all replicas,
+            including non-main ones, are loaded by this parallelization group
+            Defaults to False.
+        pg_cache_path (str, optional): directory of the PG-distribution cache.
+            When set, enables the caching feature. Defaults to None (disabled).
+        pg_cache_create (bool, optional): when True (and ``pg_cache_path`` set),
+            compute the distribution normally and write the cache; when False
+            (and ``pg_cache_path`` set), read the cache and skip the collective.
+            Defaults to False.
+
+    Returns (ShardDistribution, optional): distribution that can be used to apply the
+        parallelization. Returns None if the process_group is trivial (1 rank)
+
+    """
+    from ..utils import get_pg_size
+
+    if parallelization_group is None:
+        parallelization_group = torch.distributed.group.WORLD
+    group_size = get_pg_size(group=parallelization_group)
+    if group_size <= 1:
+        return
+
+    if pg_cache_path is not None:
+        # The resolved file path uniquely identifies this (cache dir, group) and
+        # keys the process-global memo. Checking it *first* makes both READ and
+        # CREATE idempotent within a job: a second call for the same group (a
+        # later save, the second `replicate_local_replicas` call, or the save
+        # wrapper reusing what the load wrapper already cached) returns from
+        # memory with no collective and no file IO. The check is identical on all
+        # ranks of the group, so it never desynchronizes the collective below.
+        cache_file = _pg_dist_cache_file_path(pg_cache_path, parallelization_group)
+        if cache_file in _PG_DIST_CACHE:
+            return _PG_DIST_CACHE[cache_file][bool(ignore_groups)]
+
+        # READ path: no collective; open the file once, then memoize both variants.
+        if not pg_cache_create:
+            both = _load_pg_dist_cache(cache_file)
+            _PG_DIST_CACHE[cache_file] = both
+            return both[bool(ignore_groups)]
+
+        # CREATE path: gather once, build & persist both variants, then memoize
+        # so no subsequent call for this group gathers or writes again.
+        all_shards = _gather_shards_metadata(sharded_state_dict, parallelization_group)
+        both = _create_pg_dist_cache(all_shards, pg_cache_path, parallelization_group)
+        _PG_DIST_CACHE[cache_file] = both
+        return both[bool(ignore_groups)]
+
+    # Default path: unchanged behaviour.
+    all_shards = _gather_shards_metadata(sharded_state_dict, parallelization_group)
+    return _build_shard_distribution(all_shards, ignore_groups)
 
 
 @torch.no_grad()
