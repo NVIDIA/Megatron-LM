@@ -1095,7 +1095,10 @@ class TestMegatronFSDPE2E:
         from megatron.core.rerun_state_machine import destroy_rerun_state_machine
         from megatron.core.transformer.enums import CudaGraphScope
         from megatron.training import pretrain
-        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+        from megatron.training.argument_utils import (
+            gpt_config_from_args,
+            pretrain_cfg_container_from_args,
+        )
         from megatron.training.arguments import add_megatron_arguments, validate_args
         from megatron.training.global_vars import set_global_variables, unset_global_variables
 
@@ -1199,7 +1202,8 @@ class TestMegatronFSDPE2E:
             args.world_size = int(os.getenv("WORLD_SIZE", "1"))
             validate_args(args)
             set_global_variables(args)
-            cfg = pretrain_cfg_container_from_args(args)
+            model_cfg = gpt_config_from_args(args)
+            cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider
@@ -1207,7 +1211,6 @@ class TestMegatronFSDPE2E:
             pretrain(
                 cfg,
                 _pretrain_gpt.train_valid_test_datasets_provider,
-                partial(model_provider, gpt_builder),
                 ModelType.encoder_or_decoder,
                 wrapped_forward_step,
                 get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
