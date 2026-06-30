@@ -27,6 +27,7 @@ engine's disaggregation config), never an env var.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -36,15 +37,20 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
     PullRegion,
 )
 
-# UCX transports/config NIXL needs for intra-node GPU<->GPU transfer. The
-# container often ships ``UCX_TLS=tcp`` (host-only) and leaves the memtype
-# cache on, which makes UCX treat CUDA pointers as host memory and stall. We
-# set sane defaults *before the agent is created* unless the operator already
-# pinned them. cuda_ipc/cuda_copy carry GPU memory; tcp/sm/self are needed for
-# the agent's own intra-agent setup; the memtype cache must be off so UCX
-# re-queries pointer types (torch may have allocated GPU memory before UCX's
-# hooks installed).
-_UCX_DEFAULTS = {
+logger = logging.getLogger(__name__)
+
+# UCX transport/config NIXL needs for intra-node GPU<->GPU transfer. We do NOT
+# mutate the operator's environment -- NIXL reads ``UCX_*`` at agent creation,
+# and silently overriding an explicit setting hides config from whoever set it.
+# We only inspect and warn; the recommended values are:
+#   * UCX_TLS must include a CUDA transport (cuda_ipc/cuda_copy carry GPU
+#     memory; tcp/sm/self cover the agent's own intra-agent setup). Containers
+#     often ship ``UCX_TLS=tcp`` (host-only), which degrades NIXL to host
+#     memory and stalls.
+#   * UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types (torch may have
+#     allocated GPU memory before UCX's hooks installed); with the cache on UCX
+#     can misclassify CUDA pointers as host memory.
+_UCX_RECOMMENDED = {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self",
     "UCX_MEMTYPE_CACHE": "n",
 }
@@ -63,16 +69,31 @@ def is_available() -> bool:
         return False
 
 
-def _apply_ucx_defaults() -> None:
-    # Memtype cache off (safe default; respect an explicit operator setting).
-    os.environ.setdefault("UCX_MEMTYPE_CACHE", _UCX_DEFAULTS["UCX_MEMTYPE_CACHE"])
-    # UCX_TLS must include CUDA transports for GPU KV. Containers frequently
-    # pin ``UCX_TLS=tcp`` (host-only), which silently degrades NIXL to host
-    # memory and stalls; force the GPU-capable set when CUDA transports are
-    # absent, but leave an already-CUDA-capable value untouched.
+def _check_ucx_env() -> None:
+    """Warn (never mutate) if the UCX environment looks unfit for GPU KV
+    transfer. A wrong ``UCX_*`` value silently degrades NIXL to host memory and
+    stalls, so we surface a recommendation and leave the decision -- and any
+    explicit override -- to the operator."""
+    issues = []
     tls = os.environ.get("UCX_TLS")
     if not tls or "cuda" not in tls.lower():
-        os.environ["UCX_TLS"] = _UCX_DEFAULTS["UCX_TLS"]
+        issues.append(
+            f"UCX_TLS={tls!r} has no CUDA transport; GPU KV may degrade to host "
+            f"memory and stall. Recommended: UCX_TLS={_UCX_RECOMMENDED['UCX_TLS']}"
+        )
+    cache = os.environ.get("UCX_MEMTYPE_CACHE")
+    if cache is None or cache.lower() not in ("n", "no"):
+        issues.append(
+            f"UCX_MEMTYPE_CACHE={cache!r}; with the memtype cache on, UCX may "
+            f"misclassify CUDA pointers as host memory. Recommended: "
+            f"UCX_MEMTYPE_CACHE={_UCX_RECOMMENDED['UCX_MEMTYPE_CACHE']}"
+        )
+    if issues:
+        logger.warning(
+            "NIXL KV transport: UCX environment may be unfit for GPU transfer; "
+            "set these before launch to avoid stalls:\n  - %s",
+            "\n  - ".join(issues),
+        )
 
 
 class NixlPullHandle:
@@ -127,7 +148,7 @@ class NixlTransportBackend(KVTransportBackend):
     def init(self, *, group: Optional[object] = None, **kwargs) -> None:
         if self._init:
             return
-        _apply_ucx_defaults()
+        _check_ucx_env()
         from nixl._api import nixl_agent, nixl_agent_config
 
         if self._agent_name is None:
