@@ -18,17 +18,11 @@ from megatron.core.inference.inference_request import compute_block_hashes_batch
 
 
 def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
-    """Reconstruct the KV schema on the decode side with no control message.
-
-    Header-free: the metadata (tensor shapes/dtypes, block count, optional
-    Mamba dims) is computed locally from the engine's static config + the prompt
-    tokens the decode worker already holds, so only KV tensors cross the wire --
-    no descriptor header. Raises ``NotImplementedError`` for the MLA latent
-    cache, which isn't derivable this way; MLA disaggregation is unsupported.
-
-    Assumes a homogeneous, fresh prefill: ``block_count`` and the snapshot count
-    follow directly from the prompt length and block size.
-    """
+    """Reconstruct the KV schema (shapes/dtypes, block count, optional Mamba
+    dims) on the decode side with no control message -- computed locally from the
+    engine's static config + the prompt tokens, so only KV tensors cross the
+    wire. Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
+    Assumes a homogeneous, fresh prefill."""
 
     ctx = engine.context
     if getattr(ctx, "cache_mla_latent", False):
@@ -87,11 +81,8 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
 
 @dataclass
 class PrefillHandoff:
-    """Bookkeeping the prefill side holds until the transfer drains.
-
-    Keeps the staged tensors alive (so the backend's in-flight sends
-    don't reference freed memory) until :meth:`wait` completes.
-    """
+    """Prefill-side bookkeeping held until the transfer drains: keeps the staged
+    tensors alive until :meth:`wait` completes."""
 
     handles: List[TransferHandle]
     keepalive: List[torch.Tensor] = field(default_factory=list)
@@ -128,21 +119,13 @@ def send_request_kv_resharded(
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
 ) -> "PrefillHandoff":
-    """Hetero-layout prefill send: reshard this rank's KV sub-blocks to
-    the decode layout via global-coordinate range intersection.
-
-    ``my_layout`` is this prefill rank's :class:`KVShardLayout`;
-    ``src_layouts`` / ``dst_layouts`` are the full prefill / decode attention
-    layout lists. For hybrid models the analogous Mamba layouts
-    (:class:`MambaShardLayout`) are passed too, and the conv/ssm state is
-    resharded alongside the attention KV. Header-free: the decode side derives
-    shapes from config + prompt.
-
-    ``payload`` may be a previously exported KV staging dict (from
-    ``export_request_kv``); when given it is shipped instead of re-exporting
-    from the live context -- used by the coordinator-native path, which
-    exports + holds the KV at prefill completion and ships it later on SEND_KV.
-    """
+    """Hetero-layout prefill send: reshard this rank's KV sub-blocks to the
+    decode layout and ship them. ``my_layout`` is this rank's
+    :class:`KVShardLayout`; ``src_layouts`` / ``dst_layouts`` are the full
+    prefill / decode layout lists. Hybrid models also pass Mamba layouts, whose
+    conv/ssm state is resharded alongside. ``payload``, if given, is a
+    pre-exported staging dict shipped instead of re-exporting from the live
+    context (the coordinator-native path)."""
 
     assert backend is not None, "send_request_kv_resharded requires an explicit backend"
     if payload is None:
@@ -187,9 +170,8 @@ def send_request_kv_resharded(
 
 def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, sends, keep):
     """Reshard this rank's conv/ssm sub-blocks, appending each ``(tensor, dst)``
-    to ``sends`` (enumerated after the attention sends so the recv side, which
-    posts its Mamba receives after its attention receives, matches them in the
-    same order within the request's coalesced batch)."""
+    to ``sends`` after the attention sends (so the recv side matches them in the
+    same post-order within the coalesced batch)."""
 
     conv = mp["conv_states_tensor"]  # (local_layers, conv_dim_local, d_conv)
     ssm = mp["ssm_states_tensor"]  # (local_layers, nheads_local, headdim, d_state)
@@ -205,10 +187,9 @@ def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, sends, keep):
 
 @dataclass
 class DecodeRecv:
-    """In-flight decode receive: the irecv handles + the staging buffer they
-    fill. :meth:`finish` waits the transfers, assembles the local KV tensor and
-    imports it. Lets the caller post the receive and defer completion (so the
-    transfer overlaps with an engine step) instead of blocking inline."""
+    """In-flight decode receive: the irecv handle + staging buffer it fills.
+    :meth:`finish` waits the transfer, assembles the local KV tensor, and imports
+    it -- letting the caller defer completion so it overlaps an engine step."""
 
     meta: dict
     staging: torch.Tensor
@@ -308,11 +289,10 @@ def post_recv_request_kv_resharded(
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
 ) -> "DecodeRecv":
-    """Hetero-layout decode receive (non-blocking): post the irecv for every
-    KV sub-block covering this rank's (layer x head) rectangle and return a
-    :class:`DecodeRecv` to complete later. For hybrid models the conv/ssm
-    sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
-    config + prompt)."""
+    """Hetero-layout decode receive (non-blocking): post the irecv for every KV
+    sub-block covering this rank's (layer x head) rectangle, plus conv/ssm
+    sub-blocks for hybrid models, and return a :class:`DecodeRecv` to complete
+    later."""
 
     assert backend is not None, "post_recv_request_kv_resharded requires an explicit backend"
     meta = derive_decode_schema(engine, prompt_token_ids)
@@ -370,10 +350,9 @@ def post_recv_request_kv_resharded(
 
 
 def _build_mamba_recvs(recv, meta, my_mamba, src_mamba, dst_mamba, device, recvs):
-    """Allocate the decode conv/ssm buffers and APPEND this request's Mamba
-    recv specs (shape, dtype, src) to ``recvs`` (after the attention recvs, to
-    match the send side's order within the coalesced batch). Returns the Mamba
-    transfer list, in the same order as the appended specs."""
+    """Allocate the decode conv/ssm buffers and append this request's Mamba recv
+    specs to ``recvs`` (after the attention recvs, matching the send order).
+    Returns the Mamba transfer list in the same order."""
 
     ml = my_mamba
     conv_dtype = meta["mamba"]["conv_dtype"]
@@ -414,11 +393,10 @@ def _build_mamba_recvs(recv, meta, my_mamba, src_mamba, dst_mamba, device, recvs
 
 
 def publish_request_kv(backend, ref_payload, my_layout):
-    """(prefill, one-sided) Build this rank's per-request hand-off: the backend's
-    static region meta plus the request's source block ids / Mamba slot. No copy
-    and no per-request registration -- the decode READs these blocks from the
-    already-registered ``memory_buffer``. ``ref_payload`` comes from
-    ``context.export_request_kv_ref``."""
+    """(prefill, one-sided) Build this rank's per-request hand-off: the static
+    region meta plus the request's source block ids / Mamba slot. No copy -- the
+    decode READs these from the registered ``memory_buffer``. ``ref_payload``
+    comes from ``context.export_request_kv_ref``."""
     return {
         "transport": "nixl",
         "shard_key": list(my_layout.kv_shard_key()),
@@ -445,15 +423,12 @@ def publish_request_kv(backend, ref_payload, my_layout):
 
 @dataclass
 class NixlPullRecv:
-    """Decode side: an in-flight one-sided READ of a request's blocks. :meth:`finish`
-    waits the read, then registers block hashes + binds the Mamba slot (the KV
-    already landed directly in the allocated blocks), mirroring DecodeRecv.finish
-    so the engine path is symmetric with the push backend.
-
-    If the prefill published Mamba prefix-cache ``snapshots`` (hybrid), a second
-    one-sided READ pulls them by reference after the KV commit has registered the
-    block hashes -- the snapshot slots are protected from eviction by the KV pin,
-    so no hold-ring is needed."""
+    """Decode side: an in-flight one-sided READ of a request's blocks.
+    :meth:`finish` waits the read, then registers block hashes + binds the Mamba
+    slot (the KV already landed in the allocated blocks), mirroring
+    ``DecodeRecv.finish``. If the prefill published Mamba prefix-cache
+    ``snapshots``, a second READ pulls them after the KV commit (their slots are
+    protected by the KV pin)."""
 
     handles: List[Any]
     block_ids: List[int]
@@ -497,11 +472,10 @@ def _ctx_kv_dims(ctx) -> dict:
 
 def _kv_fragment_triples(src_dims, dst_dims, src_block, dst_block,
                          src_lslice, dst_lslice, src_hslice, dst_hslice):
-    """Byte ``(local_off, remote_off, nbytes)`` triples (relative to each side's
-    ``memory_buffer`` base) to READ a head/layer fragment of one block. In the
-    row-major ``(2, L, total_blocks, BS, heads, hidden)`` buffer, a head range is
-    contiguous only per ``(k, layer, token)``, so we emit one descriptor per
-    ``(k, layer, token)`` of ``head_count*hidden`` elements."""
+    """Byte ``(local_off, remote_off, nbytes)`` triples to READ a head/layer
+    fragment of one block. A head range is contiguous only per ``(k, layer,
+    token)`` in the row-major buffer, so emit one descriptor per ``(k, layer,
+    token)`` of ``head_count*hidden`` elements."""
     HD = dst_dims["hidden"]
     elem = dst_dims["elem"]
     head_n = src_hslice.stop - src_hslice.start
@@ -558,13 +532,9 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
                          src_mamba_layouts=None, dst_mamba_layouts=None, my_mamba_layout=None):
     """(decode, one-sided) Allocate destination blocks and issue the one-sided
     READ(s) pulling the request's KV into them. Returns a :class:`NixlPullRecv`,
-    or ``None`` if the decode KV cache is full (re-prefill).
-
-    Identity reshard (same prefill/decode TP+PP): the decode pulls its 1:1
-    counterpart's whole blocks (+ Mamba slot/snapshots). Hetero reshard (TP
-    remap): the decode assembles its head/layer shard from fragments of one-or-
-    more prefill ranks, driven by ``kv_reshard.plan_kv_reshard`` -- one
-    fragment READ per contributing source rank."""
+    or ``None`` if the decode KV cache is full. Identity reshard pulls the 1:1
+    counterpart's whole blocks (+ Mamba slot/snapshots); hetero reshard (TP remap)
+    assembles this rank's head/layer shard from per-source-rank fragments."""
     if not rank_handoffs:
         return None
     block_count = int(rank_handoffs[0]["block_count"])

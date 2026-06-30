@@ -16,13 +16,9 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 
 
 class NcclTransportBackend(KVTransportBackend):
-    """``torch.distributed`` point-to-point transport.
-
-    Uses ``isend`` / ``irecv`` so it works identically under the
-    ``nccl`` backend (GPU) and ``gloo`` backend (CPU/CI). Tensors are
-    moved on whatever device they live on; the receive side allocates
-    the destination buffer.
-    """
+    """``torch.distributed`` point-to-point transport via ``isend``/``irecv``,
+    working identically under ``nccl`` (GPU) and ``gloo`` (CPU/CI). The receive
+    side allocates the destination buffer."""
 
     def __init__(self, group: Optional[object] = None) -> None:
         self._group = group
@@ -61,20 +57,12 @@ class NcclTransportBackend(KVTransportBackend):
         return TransferHandle(wait_fn=work.wait, tensor=buf)
 
     def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
-        """Issue many point-to-point ops for one request as a SINGLE coalesced
-        NCCL group, returning ``(handle, recv_buffers)``.
-
-        Posting each request's sub-block sends/recvs as separate ``isend`` /
-        ``irecv`` calls races on NCCL: a single rank with dozens of concurrent
-        ungrouped P2P ops to the same peer can corrupt memory (illegal access)
-        because the ops are not issued atomically. ``batch_isend_irecv`` wraps
-        them in one ``ncclGroupStart/End`` so the whole request's transfer is
-        one atomic, correctly-ordered operation -- and it still overlaps the
-        engine step (the returned handle is waited a step later).
-
-        ``sends``: list of ``(tensor, dst)``. ``recvs``: list of
-        ``(shape, dtype, src)`` -- buffers are allocated here and returned in
-        order so the caller can map them back to its transfers.
+        """Issue one request's point-to-point ops as a single coalesced NCCL
+        group (``batch_isend_irecv`` -> one ``ncclGroupStart/End``), returning
+        ``(handle, recv_buffers)``. Grouping is required for correctness: dozens
+        of concurrent ungrouped P2P ops to one peer can corrupt memory. ``sends``:
+        ``(tensor, dst)``; ``recvs``: ``(shape, dtype, src)`` with buffers
+        allocated here and returned in order.
         """
         ops = []
         for tensor, dst in sends:

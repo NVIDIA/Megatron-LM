@@ -106,14 +106,10 @@ class NixlPullHandle:
 
 
 class NixlTransportBackend(KVTransportBackend):
-    """Per-rank NIXL agent owning a registration over the paged KV buffers.
-
-    One-sided: implements :meth:`register_regions` / :meth:`export_regions_meta`
-    (publish the registered buffers' layout) plus :meth:`begin_pull` (remote
-    READ) and :meth:`begin_push` (remote WRITE), so a single rank moves entries
-    by index in either direction. The two-sided ``send``/``recv`` interface is
-    left unimplemented (inherits the base ``NotImplementedError``).
-    """
+    """Per-rank NIXL agent owning one registration over the paged KV buffers.
+    One-sided: register once, then :meth:`begin_pull` (READ) / :meth:`begin_push`
+    (WRITE) move entries by index in either direction. The two-sided send/recv
+    interface is left unimplemented."""
 
     is_pull = True
 
@@ -145,10 +141,8 @@ class NixlTransportBackend(KVTransportBackend):
 
     # --- one-sided family: register once, READ or WRITE entries -----------
     def register_regions(self, regions: Dict[str, PullRegion]) -> None:
-        """Register each region's buffer with the agent once and export the
-        agent metadata so the regions are reachable for remote READ/WRITE. The
-        registration is for the backend's lifetime; the export is the only one,
-        so peers load it exactly once."""
+        """Register each region's buffer with the agent once (for the backend's
+        lifetime) and export the agent metadata, so peers load it exactly once."""
         assert self._init, "NixlTransportBackend.init() not called"
         assert not self._regions, "register_regions called more than once"
         for name, region in regions.items():
@@ -181,11 +175,10 @@ class NixlTransportBackend(KVTransportBackend):
         )
 
     def begin_pull_raw(self, peer_meta: dict, region_name: str, triples: list) -> NixlPullHandle:
-        """Remote READ of arbitrary byte sub-ranges within a single registered
-        region -- used for hetero-TP fragment reads, where a decode rank pulls
-        head/layer sub-ranges of blocks rather than whole entries. ``triples`` is
-        a list of ``(local_byte_off, remote_byte_off, nbytes)`` relative to the
-        region base on each side. All batched into one transfer."""
+        """Remote READ of arbitrary byte sub-ranges of one region -- for hetero-TP
+        fragment reads (head/layer sub-ranges, not whole entries). ``triples``:
+        ``(local_byte_off, remote_byte_off, nbytes)`` relative to each side's
+        region base; all batched into one transfer."""
         assert self._init, "NixlTransportBackend.init() not called"
         if not triples:
             return NixlPullHandle(self._agent, None)
@@ -202,10 +195,8 @@ class NixlTransportBackend(KVTransportBackend):
 
     def _begin(self, op: str, peer_meta: dict, items: list) -> NixlPullHandle:
         """Issue one one-sided transfer (``op`` = READ/WRITE) batching every
-        ``(region, local_index, remote_index)`` in ``items``. ``local_descs``
-        always address this rank's registered regions and ``remote_descs`` the
-        peer's; ``op`` sets the data direction. Identity layout only (peer and
-        local region share num_outer / inner_bytes) -- hetero TP is future work."""
+        ``(region, local_index, remote_index)`` in ``items``. Identity layout
+        only -- peer and local region must share num_outer / inner_bytes."""
         assert self._init, "NixlTransportBackend.init() not called"
         if not items:
             return NixlPullHandle(self._agent, None)
