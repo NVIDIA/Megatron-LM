@@ -8,6 +8,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.profiler import ProfilerActivity, profile
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
@@ -65,18 +66,31 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
 
     def train(use_symm_mem: bool) -> list[torch.Tensor]:
         torch.manual_seed(1234)
-        model = TinyModel().to(device)
+        model = TinyModel().to(device=device, dtype=torch.bfloat16)
+        mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
         fully_shard(
-            model.fc1, mesh=mesh, placements=_flat_placements(), use_symm_mem=use_symm_mem
+            model.fc1,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+            use_symm_mem=use_symm_mem,
         )
         fully_shard(
-            model.fc2, mesh=mesh, placements=_flat_placements(), use_symm_mem=use_symm_mem
+            model.fc2,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+            use_symm_mem=use_symm_mem,
         )
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
 
         micro_batch_size = 2
-        x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
-        target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+        x = torch.randn(
+            num_microbatches, micro_batch_size, 8, device=device, dtype=torch.bfloat16
+        )
+        target = torch.randn(
+            num_microbatches, micro_batch_size, 4, device=device, dtype=torch.bfloat16
+        )
         microbatches = tuple(zip(x.unbind(), target.unbind()))
 
         losses = []
