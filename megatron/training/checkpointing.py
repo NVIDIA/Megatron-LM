@@ -391,7 +391,6 @@ def get_rng_state(
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
     dp_world_size = get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
-    # RNG state is per distinct-data rank (full DP x gtp_remat axis).
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
             dp_world_size > 1:
@@ -626,11 +625,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     dp_rank = 0
     expt_dp_rank = 0
     if torch.distributed.is_initialized():
-        dp_rank = (
-            get_pg_rank(dp_group)
-            if dp_group is not None
-            else mpu.get_data_parallel_rank()
-        )
+        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
         expt_dp_rank = (
             get_pg_rank(expt_dp_group)
             if expt_dp_group is not None
@@ -795,7 +790,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict, algo=algo, cached_metadata=cached_metadata,
-                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
