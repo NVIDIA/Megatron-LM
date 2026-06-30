@@ -36,7 +36,6 @@ _UCX_RECOMMENDED = {
 }
 
 _POLL_INTERVAL_S = 0.0005
-_POLL_TIMEOUT_S = 30.0
 
 
 def is_available() -> bool:
@@ -91,11 +90,8 @@ class NixlPullHandle:
         self._done = st == "DONE"
         return self._done
 
-    def wait(self, timeout_s: float = _POLL_TIMEOUT_S) -> None:
-        deadline = time.monotonic() + timeout_s
+    def wait(self) -> None:
         while not self.poll():
-            if time.monotonic() > deadline:
-                raise TimeoutError("NIXL transfer did not complete within timeout")
             time.sleep(_POLL_INTERVAL_S)
 
 
