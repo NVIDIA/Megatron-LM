@@ -185,7 +185,7 @@ def _nccl_mamba_worker(rank, world, port, q):
     dev = torch.device(f"cuda:{rank}")
     dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
-        from megatron.core.inference.disaggregation.kv_transfer import (
+        from megatron.core.inference.disaggregation.kv_transfer_push import (
             DecodeRecv,
             _build_mamba_recvs,
             _send_mamba_resharded,

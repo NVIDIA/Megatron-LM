@@ -93,7 +93,7 @@ def _worker(rank, world, port, q):
     device = f"cuda:{rank}"
     dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
-        from megatron.core.inference.disaggregation import kv_transfer as H
+        from megatron.core.inference.disaggregation import kv_transfer_push as H
         from megatron.core.inference.disaggregation.transfer_backends.nccl import (
             NcclTransportBackend,
         )
