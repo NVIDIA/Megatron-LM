@@ -103,6 +103,12 @@ except ImportError:
 
 def _unwrap_parameter_data(tensor: torch.Tensor) -> torch.Tensor:
     """Return underlying tensor data when PyTorch wraps a tensor subclass as a Parameter."""
+    if HAVE_TE_GROUPED_TENSOR_CLASS and isinstance(tensor, GroupedTensor):
+        # TE GroupedTensor stores its real payload in Python-side metadata fields
+        # such as rowwise_data/scale_inv. PyTorch marks tensor-subclass parameters
+        # as Parameters, so tensor.data would create a detached wrapper copy. Return
+        # the live wrapper so storage metadata mutations update the module parameter.
+        return tensor
     return tensor.data if isinstance(tensor, torch.nn.Parameter) else tensor
 
 

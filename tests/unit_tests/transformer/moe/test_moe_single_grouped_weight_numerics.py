@@ -253,6 +253,57 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision == "nvfp4":
             assert any(is_grouped_nvfp4tensor(param) for param in grouped_params)
 
+    @staticmethod
+    def iter_distopt_buffers(optimizer):
+        optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
+        for optim_instance in optimizers:
+            for buffer in getattr(optim_instance, "buffers", []):
+                yield buffer
+
+    def assert_grouped_params_remapped_to_ddp_param_data(self, optimizer, precision: str):
+        """Grouped BF16/NVFP4 params must point at the live DDP param_data slice."""
+        num_checked = 0
+        for buffer in self.iter_distopt_buffers(optimizer):
+            for bucket in buffer.buckets:
+                if bucket.param_data is None:
+                    continue
+                for param in bucket.params:
+                    if not is_grouped_tensor(param):
+                        continue
+
+                    rowwise_data = getattr(param, "rowwise_data", None)
+                    assert rowwise_data is not None, "GroupedTensor is missing rowwise_data"
+
+                    if precision == "bf16":
+                        if is_grouped_tensor_with_quantized_storage(param):
+                            continue
+                        start, end = bucket.param_to_index[param]
+                        expected = bucket.param_data.view(-1)[start:end]
+                    elif precision == "nvfp4":
+                        if not is_grouped_nvfp4tensor(param):
+                            continue
+                        packed_start, packed_end, bucket_id = buffer.nvfp4_packed_param_index_map[
+                            param
+                        ]
+                        assert bucket_id == bucket.bucket_id
+                        bucket_start, _ = buffer.nvfp4_packed_bucket_indices[bucket_id]
+                        expected = bucket.param_data.view(-1)[
+                            packed_start - bucket_start : packed_end - bucket_start
+                        ]
+                    else:
+                        raise ValueError(f"Unsupported remap precision: {precision}")
+
+                    rowwise_flat = rowwise_data.view(-1)
+                    assert rowwise_flat.numel() == expected.numel()
+                    assert rowwise_flat.dtype == expected.dtype
+                    assert rowwise_flat.data_ptr() == expected.data_ptr(), (
+                        "Live grouped parameter rowwise_data is not mapped to the DDP "
+                        f"param_data slice for precision={precision}"
+                    )
+                    num_checked += 1
+
+        assert num_checked > 0, f"Did not find any {precision} grouped params to verify"
+
     def assert_execution_path_is_exercised(
         self, model, use_transformer_engine_op_fuser: bool, after_forward: bool = False
     ):
@@ -523,6 +574,45 @@ class TestMoESingleGroupedWeightNumerics:
             local_error = traceback.format_exc()
 
         self.assert_all_ranks_passed(local_passed, local_error)
+
+    def run_remap_case(self, precision: str) -> None:
+        local_passed = True
+        local_error = ""
+        try:
+            primary_param_gather = precision == "nvfp4"
+            args = self.create_test_args(
+                precision=precision,
+                primary_param_gather=primary_param_gather,
+                single_weight=True,
+                gradient_accumulation_fusion=True,
+                use_transformer_engine_op_fuser=True,
+            )
+            set_args(args)
+            torch.manual_seed(_SEED)
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=args.expert_model_parallel_size,
+            )
+
+            model, optimizer, _ = setup_model_and_optimizer(
+                self.model_provider, ModelType.encoder_or_decoder
+            )
+            assert len(model) == 1
+            self.assert_storage_path_is_exercised(
+                model[0], precision, primary_param_gather, single_weight=True
+            )
+            self.assert_grouped_params_remapped_to_ddp_param_data(optimizer, precision)
+        except Exception:
+            local_passed = False
+            local_error = traceback.format_exc()
+
+        self.assert_all_ranks_passed(local_passed, local_error)
+
+    @pytest.mark.parametrize("precision", ["bf16", "nvfp4"])
+    def test_single_grouped_weight_ddp_param_data_remap_data_ptr(self, precision):
+        """BF16/NVFP4 single grouped weights must alias DDP param_data after buffer setup."""
+        _skip_if_unsupported(precision)
+        self.run_remap_case(precision)
 
     def test_single_grouped_mxfp8_train_eval_train_matches_train_only(self):
         """Eval should not change subsequent MXFP8 single grouped weight training losses."""
