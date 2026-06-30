@@ -34,14 +34,8 @@ class _OwnedRange:
     buffer_relative_offset: int
 
 
-def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
-    if not isinstance(axis, int) or isinstance(axis, bool):
-        raise TypeError(f"Mesh axis must be an int, got {type(axis).__name__}.")
-    if axis < 0 or axis >= mesh.ndim:
-        raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-
-
 def _validate_placements(placements: Iterable[Placement]) -> None:
+    """Validate DBuffer placements form a supported contiguous local layout."""
     seen_flat = False
     for placement in placements:
         if not isinstance(placement, (Replicate, Partial, Flat)):
@@ -65,7 +59,7 @@ class DBuffer:
     """
 
     # DBuffer owns only the data-parallel sub-mesh. Higher-level callers, such as
-    # ParameterGroup, should extend returned DTensors with tensor-parallel mesh axes
+    # FsdpParameterGroup, should extend returned DTensors with tensor-parallel mesh axes
     # because TP sharding metadata lives on nn.Parameter in MCore/TransformerEngine.
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
@@ -115,6 +109,20 @@ class DBuffer:
     def device(self) -> torch.device:
         """Device of the local buffer."""
         return self.local_buffer.device
+
+    def reallocate_storage(self) -> None:
+        """Restore the local buffer's backing storage to its logical size."""
+        self._resize_storage(self.local_buffer.numel())
+
+    def release_storage(self) -> None:
+        """Release local buffer storage without replacing the Storage object."""
+        # Autograd may save views that share this Storage object. Resizing the
+        # existing Storage releases the allocation while preserving those aliases
+        # for a later reallocate_storage().
+        self._resize_storage(0)
+
+    def _resize_storage(self, numel: int) -> None:
+        self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
@@ -254,6 +262,21 @@ class DBuffer:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
+    def cast(self, dtype: torch.dtype) -> "DBuffer":
+        """Return this buffer with the same layout and placements in ``dtype``."""
+        if self.dtype == dtype:
+            return self
+
+        destination = DBuffer(
+            mesh=self.mesh,
+            placements=self.placements,
+            tensor_shapes=self.layout.tensor_shapes,
+            dtype=dtype,
+            device=self.device,
+        )
+        destination.local_buffer.copy_(self.local_buffer)
+        return destination
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":
@@ -309,7 +332,6 @@ class DBuffer:
 
     def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a sharded axis into Replicate placement."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         if not isinstance(self.placements[mesh_axis], Flat):
             raise ValueError(
                 f"allgather() currently requires Flat placement on axis {mesh_axis!r}."
@@ -328,7 +350,6 @@ class DBuffer:
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         partial_placement = self.placements[axis]
         if not isinstance(partial_placement, Partial):
@@ -347,7 +368,6 @@ class DBuffer:
         self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Reduce-scatter a Partial axis into ``new_placement``."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
@@ -371,7 +391,6 @@ class DBuffer:
         self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Locally chunk a Replicate axis into ``new_placement``."""
-        _validate_mesh_axis(self.mesh, mesh_axis)
         axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports scatter() to Flat only.")
