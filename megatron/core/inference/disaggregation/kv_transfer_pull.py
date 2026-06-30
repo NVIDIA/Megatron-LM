@@ -155,23 +155,20 @@ def _mamba_dims_from(conv, ssm) -> dict:
 
 def _mamba_band_triple(src_dims, dst_dims, is_conv, t, src_slot, dst_slot):
     """One byte ``(local_off, remote_off, nbytes)`` triple for a Mamba reshard
-    transfer ``t`` (a conv-channel or ssm-head band of one layer). The band is
-    contiguous at fixed ``(layer, slot)``, so it's a single descriptor."""
-    elem = dst_dims["elem"]
+    transfer ``t`` -- a band of one layer in the conv (channel) or ssm (head)
+    buffer. The band is contiguous at fixed ``(layer, slot)``, so it's a single
+    descriptor; conv and ssm share the stride math and differ only in the indexed
+    dim and the contiguous per-unit size."""
     if is_conv:
-        d_conv = dst_dims["d_conv"]
-        s_cd, d_cd = src_dims["conv_dim"], dst_dims["conv_dim"]
-        s_ns, d_ns = src_dims["n_slots"], dst_dims["n_slots"]
-        nbytes = (t.src_hi - t.src_lo) * d_conv * elem
-        soff = ((t.src_layer * s_ns + src_slot) * s_cd + t.src_lo) * d_conv * elem
-        doff = ((t.dst_layer * d_ns + dst_slot) * d_cd + t.dst_lo) * d_conv * elem
+        s_idx, d_idx, unit = src_dims["conv_dim"], dst_dims["conv_dim"], dst_dims["d_conv"]
     else:
-        hd, ds = dst_dims["headdim"], dst_dims["d_state"]
-        s_nh, d_nh = src_dims["nheads"], dst_dims["nheads"]
-        s_ns, d_ns = src_dims["n_slots"], dst_dims["n_slots"]
-        nbytes = (t.src_hi - t.src_lo) * hd * ds * elem
-        soff = ((t.src_layer * s_ns + src_slot) * s_nh + t.src_lo) * hd * ds * elem
-        doff = ((t.dst_layer * d_ns + dst_slot) * d_nh + t.dst_lo) * hd * ds * elem
+        s_idx, d_idx = src_dims["nheads"], dst_dims["nheads"]
+        unit = dst_dims["headdim"] * dst_dims["d_state"]
+    s_ns, d_ns = src_dims["n_slots"], dst_dims["n_slots"]
+    inner = unit * dst_dims["elem"]
+    nbytes = (t.src_hi - t.src_lo) * inner
+    soff = ((t.src_layer * s_ns + src_slot) * s_idx + t.src_lo) * inner
+    doff = ((t.dst_layer * d_ns + dst_slot) * d_idx + t.dst_lo) * inner
     return (doff, soff, nbytes)
 
 

@@ -120,7 +120,6 @@ def send_request_kv_resharded(
     dst_layouts: list,
     *,
     backend: Optional[KVTransportBackend] = None,
-    group: Optional[object] = None,
     payload: Optional[dict] = None,
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
