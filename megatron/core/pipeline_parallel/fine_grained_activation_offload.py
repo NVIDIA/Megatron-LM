@@ -607,23 +607,24 @@ class PipelineOffloadManager:
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
         for chunk in self._cached_chunks_backward:
-            offloaded_groups_count = 0
-            for group in chunk.offload_groups:
-                if group.offload:
-                    offloaded_groups_count += 1
+            eligible_offload_groups = [
+                group
+                for group in chunk.offload_groups
+                if group.offload and group.total_offload_bytes > 0
+            ]
+            offloaded_groups_count = len(eligible_offload_groups)
             disabled_groups_count = int(
                 offloaded_groups_count * (1 - self._activation_offload_fraction)
             )
             debug_rank(f"Disabled {disabled_groups_count}/{offloaded_groups_count} groups")
             # Prefer keeping earlier forward groups offloaded because releasing
             # those activations sooner gives the longest memory-pressure relief.
-            for group in reversed(chunk.offload_groups):
-                if group.offload:
-                    if disabled_groups_count > 0:
-                        disabled_groups_count -= 1
-                        group.offload = False
-                    else:
-                        break
+            for group in reversed(eligible_offload_groups):
+                if disabled_groups_count > 0:
+                    disabled_groups_count -= 1
+                    group.offload = False
+                else:
+                    break
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
