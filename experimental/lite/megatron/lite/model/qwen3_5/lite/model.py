@@ -15,7 +15,6 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
@@ -233,7 +232,7 @@ class Qwen35Layer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         deterministic: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -336,7 +335,7 @@ class Qwen35Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         del attention_backend_override

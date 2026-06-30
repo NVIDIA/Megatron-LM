@@ -66,7 +66,7 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
-    gdn_cp_mode: str = "fla_allgather"
+    gdn_cp_mode: str = "replicated"
 
 
 def _full_attn_module(layer, name: str):
