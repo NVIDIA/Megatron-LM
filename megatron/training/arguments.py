@@ -1997,6 +1997,13 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-async-sched-mode',
+                       type=str, default='legacy',
+                       choices=['legacy', 'serial'],
+                       help='Async scheduling mode for dynamic batching. '
+                            '"legacy" (default) preserves the existing resolve-before-prepare '
+                            'path. "serial" speculatively prepares and forwards decode-only '
+                            'steps before resolving finished requests.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
