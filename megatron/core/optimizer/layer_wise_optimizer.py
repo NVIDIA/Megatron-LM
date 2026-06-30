@@ -2,6 +2,7 @@
 
 import logging
 import math
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -84,6 +85,87 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
+def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
+    """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
+
+    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per gtp_remat peer) WHOLE, so
+    their optimizer-state ShardedTensors share one key+offset across those peers. The DP-coord reset
+    in ``sharded_state_dict`` would then mark all peers the all-zero "main replica" -> DCP sees N
+    writers for one shard and rejects the save.
+
+    FIX: fold the (e)gtp_remat rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
+    params (``GTPShardedParam``) are offset-sharded and excluded -- each shard already has a
+    distinct offset, hence a unique writer.
+
+    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
+    no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
+    collapsed) to match the optimizer-state checkpoint key suffix.
+    """
+    gtp_fold: Dict[str, Tuple[int, int]] = {}
+    try:
+        from megatron.core.tensor_parallel.gtp import HAVE_GTP, GTPShardedParam
+    except ImportError:
+        return gtp_fold
+    if not HAVE_GTP:
+        return gtp_fold
+
+    from megatron.core import parallel_state
+
+    # Source the (e)gtp_remat groups from pg_collection if populated, else from parallel_state
+    # (the default pg_collection leaves gtp_remat/expt_gtp_remat unset). Compatibility point.
+    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    if gtp_remat_group is None:
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
+    if egtp_remat_group is None:
+        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+
+    for model_chunk in model_chunks:
+        for name, p in model_chunk.named_parameters():
+            if isinstance(p, GTPShardedParam):
+                continue
+            grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
+            if grp is None or grp.size() <= 1:
+                continue
+            # Normalize the param name so it matches the optimizer-state checkpoint key suffix,
+            # which is wrapper-free and layer-collapsed. Three transforms, in order:
+            #   1. drop every leading 'module.' (DDP + Float16Module can double-wrap the model),
+            #   2. collapse the layer index (the checkpoint key drops it -- a sharded axis), and
+            #   3. collapse SequentialMLP 'local_experts.<N>' to the grouped key 'experts' (the
+            #      checkpoint groups them, matching TEGroupedMLP), else expert replicas collide.
+            # e.g.  'module.module.decoder.layers.3.mlp.router.weight'
+            #         -> 'decoder.layers.mlp.router.weight'
+            nm = name
+            while nm.startswith('module.'):
+                nm = nm[len('module.') :]
+            nm = re.sub(r'\.layers\.\d+\.', '.layers.', nm)
+            nm = re.sub(r'\.local_experts\.\d+\.', '.experts.', nm)
+            gtp_fold[nm] = (grp.rank(), grp.size())
+    return gtp_fold
+
+
+def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
+    """Compute a ShardedTensor's writer-disambiguating replica_id for fixed-DP checkpointing.
+
+    Base reset: keep (PP, TP), zero DP -- every DP rank holds the same shard, so one writer
+    remains. Correct for normal params.
+
+    For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
+    fold the peer gtp_remat rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
+    gtp_rank`` (rank 0 stays the writer, the others move off the all-zero main replica) -> one
+    writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
+    layer index too, so it matches per-layer and already-collapsed keys.
+    """
+    rid = (*replica_id[:2], 0)
+    if not gtp_fold:
+        return rid
+    key = re.sub(r'\.layers\.\d+\.', '.layers.', key or '')
+    for nm, (gtp_rank, gtp_remat_size) in gtp_fold.items():
+        if key.endswith(nm):
+            return (rid[0], rid[1] * gtp_remat_size + gtp_rank, rid[2])
+    return rid
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -288,6 +370,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=dp_size,
         )
 
     @staticmethod
@@ -478,14 +561,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
                     continue
-                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
                     param_start_index,
                     param_end_index,
                     bucket_id,
                 ) in layout.param_index_map.items():
                     bucket_start_index, bucket_end_index = layout.bucket_indices[bucket_id]
-                    shard_size = (bucket_end_index - bucket_start_index) // dp_size
+                    shard_size = (
+                        bucket_end_index - bucket_start_index
+                    ) // layout.num_optimizer_shards
                     shard_id = (param_start_index - bucket_start_index) // shard_size
                     shard_end_index = bucket_start_index + (shard_id + 1) * shard_size
                     assert param_end_index <= shard_end_index, (
@@ -830,14 +914,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
+        # (E)GTP_remat-replicated -> (gtp_rank, gtp_remat_size), consumed by _fold_replica_id.
+        gtp_fold = _build_gtp_replica_fold(self.pg_collection, self.model_chunks)
+
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if hasattr(sh_base, 'replica_id'):
                 assert (
                     isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
                 ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
-                sh_base.replica_id = (
-                    0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
+                if isinstance(sh_base.replica_id, int):
+                    sh_base.replica_id = 0
+                    continue
+                sh_base.replica_id = _fold_replica_id(
+                    sh_base.replica_id, getattr(sh_base, 'key', ''), gtp_fold
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one

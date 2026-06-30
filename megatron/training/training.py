@@ -114,6 +114,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -293,6 +294,23 @@ def print_datetime(string, override_timestamp=None):
     else:
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
+
+def reset_gtp_quantize_cache_after_load(model):
+    """Invalidate GTP's per-shard low-precision cache after a checkpoint load.
+
+    GTP keeps a per-shard low-precision cache (``self.quantized``) that survives the
+    in-place writes to ``.data`` performed by DCP load. Reset it so the first forward
+    after resume re-quantizes from the freshly-loaded BF16 weight instead of reusing
+    the stale pre-load cast (which otherwise spikes lm-loss for one iteration before
+    normal training overwrites the cache). No-op when GTP is unavailable.
+    """
+    if not HAVE_GTP:
+        return
+    from megatron.core.tensor_parallel.gtp import reset_gtp_quantize_cache
+
+    for m in model:
+        reset_gtp_quantize_cache(m)
 
 
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
@@ -1704,6 +1722,25 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
+    # Configure GTP padding alignment based on quantization recipe before model construction.
+    if (
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
+    ):
+        from megatron.core.tensor_parallel.gtp import update_gtp_config
+
+        # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
+        update_gtp_config(
+            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False)
+        )
+
+        if getattr(args, 'fp4', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+        elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            update_gtp_config(pad_for_alignment=32)
+        elif getattr(args, 'fp8', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+
     # Build model.
     def build_model():
         if (
@@ -1752,6 +1789,38 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
+    # Classify each GTP param into its prefetch chain (GRAPHED vs UNGRAPHED)
+    # from args.cuda_graph_modules + moe_shared_expert_overlap. Must run after
+    # model build, before the first forward (which lazily builds chain links).
+    if (
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
+    ):
+        from megatron.core.tensor_parallel.gtp import (
+            GTP_CONFIG,
+            classify_gtp_chains,
+            reset_gtp_state,
+            set_cuda_graph_modules,
+            tag_gtp_params_with_names,
+        )
+
+        _raw_modules = getattr(args, 'cuda_graph_modules', None) or []
+        _cg_modules = {getattr(s, 'name', str(s)) for s in _raw_modules} if _raw_modules else None
+        _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
+        # cuda_graph_impl lets the classifier tell "CG disabled" from "full-iteration /
+        # graph-every-layer" — both have empty cuda_graph_modules.
+        set_cuda_graph_modules(
+            _cg_modules,
+            moe_shared_expert_overlap=_mse_overlap,
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
+        # Clear stale process-global chain state so a rebuilt model starts fresh.
+        reset_gtp_state()
+        for model_module in model:
+            tag_gtp_params_with_names(model_module)
+            classify_gtp_chains(model_module)
+        print_rank_0(f"GTP enabled. {GTP_CONFIG}")
+
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         for model_module in model:
@@ -1775,9 +1844,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
                 get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp_remat),
                 get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),
@@ -2126,6 +2196,7 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        reset_gtp_quantize_cache_after_load(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -2390,7 +2461,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             f"pg_collection passed to train_step must define {_required}"
         )
     mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
+    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
+    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -2410,7 +2483,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        increment = (
+            get_num_microbatches()
+            * args.micro_batch_size
+            * args.data_parallel_size
+            * args.gtp_weight_remat_size
+        )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
@@ -2542,7 +2620,12 @@ def training_log(
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    batch_size = (
+        args.micro_batch_size
+        * args.data_parallel_size
+        * args.gtp_weight_remat_size
+        * get_num_microbatches()
+    )
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -2935,7 +3018,8 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
@@ -3271,6 +3355,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            reset_gtp_quantize_cache_after_load(model)
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
             # Reload RL training checkpoint weights
@@ -3286,6 +3371,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            reset_gtp_quantize_cache_after_load(model)
 
             args.no_load_optim = no_load_optim
 
@@ -3296,11 +3382,13 @@ def train(
     )
 
     def _dp_world_size():
+        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
+        gtp_remat = args.gtp_weight_remat_size
         if lang_pgc is not None:
-            return lang_pgc.dp.size()
+            return lang_pgc.dp.size() * gtp_remat
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        return args.data_parallel_size
+        return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -4008,7 +4096,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    )
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(

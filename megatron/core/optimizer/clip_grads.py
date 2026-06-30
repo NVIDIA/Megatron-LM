@@ -47,7 +47,7 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
-from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
+from ..tensor_parallel import param_is_not_gtp_duplicate, param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
@@ -206,9 +206,9 @@ def count_zeros_fp32(
 
     The count is performed in FP32. This method filters parameters to ensure
     gradients are not double-counted by checking if the gradient is not None,
-    the parameter is not shared, and the parameter is not a replica due
-    to tensor model parallelism. It also handles parameters managed by
-    Megatron FSDP specifically.
+    the parameter is not shared, and the parameter is not a replica due to
+    tensor model parallelism or (expert) generalized tensor parallelism. It also
+    handles parameters managed by Megatron FSDP specifically.
 
     Args:
         parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
@@ -230,6 +230,7 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
+    #   - should not be a replica due to (expert) generalized tensor parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
@@ -246,7 +247,8 @@ def count_zeros_fp32(
             continue
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
-        if grad_not_none and is_not_shared and is_not_tp_duplicate:
+        is_not_gtp_duplicate = param_is_not_gtp_duplicate(param)
+        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()

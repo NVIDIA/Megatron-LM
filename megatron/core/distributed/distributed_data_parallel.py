@@ -166,6 +166,15 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.full_param_layout = full_param_layout
 
+        # GTP_remat needs average_in_collective=False: the per-bucket collective runs over the
+        # replicate group, so NCCL AVG would miss the 1/gtp_remat factor. arguments.py
+        # guards the training path; this assert covers direct megatron-core users.
+        gtp_active = ProcessGroupCollection.is_gtp_remat_active(process_group_dict)
+        assert not (gtp_active and self.ddp_config.average_in_collective), (
+            "GTP requires average_in_collective=False (the default); averaged collectives reduce "
+            "over the GTP-excluded group and would miss the 1/gtp_remat gradient scaling factor."
+        )
+
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (
@@ -364,6 +373,13 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
+                elif getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                    param, 'register_grad_accum_hook'
+                ):
+                    # GTP_remat defers the main_grad add to a later backward node, so drive the
+                    # post-hook from its manual call (_handle_megatron_grad_accum) rather than
+                    # autograd's AccumulateGrad, which would fire grad-ready on stale main_grad.
+                    param.register_grad_accum_hook(None, self._make_backward_post_hook(param))
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
@@ -460,9 +476,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # GTP_remat params legitimately have grad=None (async RS writes wgrad straight
+                    # into main_grad), so skip the assertion for them.
+                    if not getattr(param, 'is_gtp_weight_remat', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
