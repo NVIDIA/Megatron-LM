@@ -4,6 +4,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from megatron.core.models.common.embeddings import RoPEConfig
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
@@ -19,8 +20,14 @@ def _make_transformer(**kwargs):
     return TransformerConfig(**defaults)
 
 
+def _make_rope_config(**kwargs):
+    return RoPEConfig(**kwargs)
+
+
 def _make_hybrid_config(**kwargs):
-    defaults = dict(transformer=_make_transformer(), vocab_size=32000)
+    defaults = dict(
+        transformer=_make_transformer(), rope_config=_make_rope_config(), vocab_size=32000
+    )
     defaults.update(kwargs)
     return HybridModelConfig(**defaults)
 
@@ -37,7 +44,7 @@ class TestHybridModelConfigInitialization:
         assert HybridModelConfig.builder == "megatron.training.models.hybrid.HybridModelBuilder"
 
     def test_default_values(self):
-        config = HybridModelConfig(transformer=_make_transformer())
+        config = HybridModelConfig(transformer=_make_transformer(), rope_config=_make_rope_config())
         assert config.fp16_lm_cross_entropy is False
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
@@ -60,6 +67,7 @@ class TestHybridModelConfigInitialization:
             hybrid_mlp_ratio=0.1,
             hybrid_layer_pattern="M-M*-",
             seq_length=4096,
+            rope_config=_make_rope_config(),
             vocab_size=50000,
         )
         assert config.fp16_lm_cross_entropy is True
@@ -80,7 +88,9 @@ class TestHybridModelConfigGetAttr:
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256, num_layers=4)
-        self.config = HybridModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = HybridModelConfig(
+            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
 
     def test_own_attribute_not_proxied(self):
         # vocab_size is defined on HybridModelConfig but not on TransformerConfig;
@@ -112,7 +122,9 @@ class TestHybridModelConfigSetAttr:
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256)
-        self.config = HybridModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = HybridModelConfig(
+            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
 
     def test_sets_own_attribute_on_self(self):
         self.config.vocab_size = 50000

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torch
 
 from megatron.core.models.common.embeddings import RoPEConfig
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
@@ -275,7 +275,6 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig
     from megatron.core.transformer.heterogeneous.heterogeneous_config import (
         HeterogeneousTransformerConfig,
     )
@@ -373,42 +372,48 @@ def core_transformer_config_from_args(args, config_class=None):
     # Build config.
     config = config_class(**kw_args)
 
-    _apply_yarn_config_from_args(config, args)
+    rope_config = rope_config_from_args(args)
+    _apply_rope_config(rope_config, config)
 
     # Return config.
     return config
 
 
-def _apply_yarn_config_from_args(config, args) -> None:
-    """Populate ``config.yarn_*`` attributes from args for non-MLA YaRN models.
+def _apply_rope_config(rope_config: RoPEConfig, config: TransformerConfig | HybridModelConfig | GPTModelConfig) -> None:
+    """Populate RoPE-related `config` attributes in-place from `rope_config`."""
+    if isinstance(config, (HybridModelConfig, GPTModelConfig)):
+        transformer_config = config.transformer
 
-    GPTModel's ``yarn`` branch and ``yarn_rotary_pos_embedding`` read these as
-    dynamic attributes off the config (``getattr(config, "yarn_rotary_scaling_factor")``
-    etc.) with no default, so the attributes must exist whenever
-    ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
-    ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
-    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
-    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
-    """
-    if getattr(args, 'position_embedding_type', None) != 'yarn':
-        return
-    if getattr(args, 'multi_latent_attention', False):
-        # MLATransformerConfig declares the unprefixed YaRN fields and its
-        # attention path consumes them directly; do not shadow them here.
-        return
+        config.rope_config = rope_config
+        config.rotary_base = rope_config.rotary_base
+        config.rotary_percent = rope_config.rotary_percent
+        config.seq_len_interpolation_factor = rope_config.rotary_seq_len_interpolation_factor
+        if isinstance(config, GPTModelConfig):
+            config.rope_scaling = rope_config.use_rotary_scaling
+            config.rope_scaling_factor = rope_config.rotary_scaling_factor
+    else:
+        transformer_config = config
 
-    def _set(attr: str, value, default) -> None:
-        if hasattr(config, attr):
-            return
-        setattr(config, attr, value if value is not None else default)
+    # `TransformerConfig` does not contain these fields, but they're set at runtime.
+    transformer_config.yarn_rotary_scaling_factor = rope_config.yarn_rotary_scaling_factor
+    transformer_config.yarn_original_max_position_embeddings = rope_config.yarn_original_max_position_embeddings
+    transformer_config.yarn_beta_fast = rope_config.yarn_beta_fast
+    transformer_config.yarn_beta_slow = rope_config.yarn_beta_slow
+    transformer_config.yarn_correction_range_round_to_int = rope_config.yarn_correction_range_round_to_int
+    transformer_config.yarn_mscale = rope_config.yarn_mscale
+    transformer_config.yarn_mscale_all_dim = rope_config.yarn_mscale_all_dim
 
-    _set('yarn_rotary_scaling_factor', args.rotary_scaling_factor, 1.0)
-    _set('yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings, 4096)
-    _set('yarn_beta_fast', args.yarn_beta_fast, 32.0)
-    _set('yarn_beta_slow', args.yarn_beta_slow, 1.0)
-    _set('yarn_mscale', args.mscale, 1.0)
-    _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
-    _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
+    # `MLATransformerConfig` contains the same settings under a different name. Since only one or
+    # the other attribute name may be checked, we set both.
+    if isinstance(transformer_config, MLATransformerConfig):
+        transformer_config.rotary_base = rope_config.rotary_base
+        transformer_config.rotary_percent = rope_config.rotary_percent
+        transformer_config.rotary_scaling_factor = rope_config.yarn_rotary_scaling_factor
+        transformer_config.original_max_position_embeddings = rope_config.yarn_original_max_position_embeddings
+        transformer_config.beta_fast = rope_config.yarn_beta_fast
+        transformer_config.beta_slow = rope_config.yarn_beta_slow
+        transformer_config.mscale = rope_config.yarn_mscale
+        transformer_config.mscale_all_dim = rope_config.yarn_mscale_all_dim
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
@@ -491,7 +496,9 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
-    kwargs["rope_config"] = rope_config_from_args(args)
+    kwargs["rope_scaling_factor"] = args.rope_scaling_factor
+    rope_config = rope_config_from_args(args)
+    kwargs["rope_config"] = rope_config
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -508,8 +515,18 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return GPTModelConfig(**kwargs)
-    
+    model_config = GPTModelConfig(**kwargs)
+    # These attributes in `GPTModelConfig` will be deprecated in the future. Until then, we make
+    # sure that `GPTModelConfig`'s `RoPEConfig` mirrors them.
+    assert model_config.rotary_base == model_config.rope_config.rotary_base
+    assert model_config.rotary_percent == model_config.rope_config.rotary_percent
+    assert model_config.rope_scaling == model_config.rope_config.use_rotary_scaling
+    assert model_config.rope_scaling_factor == model_config.rope_config.rotary_scaling_factor
+    assert model_config.seq_len_interpolation_factor == model_config.rope_config.rotary_seq_len_interpolation_factor
+    _apply_rope_config(rope_config, model_config)
+
+    return model_config
+
 
 def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
@@ -535,7 +552,8 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
-    kwargs["rope_config"] = rope_config_from_args(args)
+    rope_config = rope_config_from_args(args)
+    kwargs["rope_config"] = rope_config
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -552,7 +570,15 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return HybridModelConfig(**kwargs)
+    model_config = HybridModelConfig(**kwargs)
+    # These attributes in `HybridModelConfig` will be deprecated in the future. Until then, we make
+    # sure that `HybridModelConfig`'s `RoPEConfig` mirrors them.
+    assert model_config.rotary_base == model_config.rope_config.rotary_base
+    assert model_config.rotary_percent == model_config.rope_config.rotary_percent
+    assert model_config.seq_len_interpolation_factor == model_config.rope_config.rotary_seq_len_interpolation_factor
+    _apply_rope_config(rope_config, model_config)
+
+    return model_config
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:

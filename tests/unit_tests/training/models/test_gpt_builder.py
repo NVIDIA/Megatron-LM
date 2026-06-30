@@ -6,6 +6,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.models.common.embeddings import RoPEConfig
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -30,8 +31,14 @@ def _make_transformer(**kwargs):
     return TransformerConfig(**defaults)
 
 
+def _make_rope_config(**kwargs):
+    return RoPEConfig(**kwargs)
+
+
 def _make_gpt_config(**kwargs):
-    defaults = dict(transformer=_make_transformer(), vocab_size=32000)
+    defaults = dict(
+        transformer=_make_transformer(), rope_config=_make_rope_config(), vocab_size=32000
+    )
     defaults.update(kwargs)
     return GPTModelConfig(**defaults)
 
@@ -254,7 +261,7 @@ class TestGPTModelConfigInitialization:
         assert GPTModelConfig.builder == "megatron.training.models.gpt.GPTModelBuilder"
 
     def test_default_values(self):
-        config = GPTModelConfig(transformer=_make_transformer())
+        config = GPTModelConfig(transformer=_make_transformer(), rope_config=_make_rope_config())
         assert config.transformer_layer_spec is None
         assert config.vocab_size is None
         assert config.make_vocab_size_divisible_by == 128
@@ -283,6 +290,7 @@ class TestGPTModelConfigInitialization:
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
             rotary_base=500000,
+            rope_config=_make_rope_config(),
             vocab_size=50000,
         )
         assert config.seq_length == 4096
@@ -299,7 +307,9 @@ class TestGPTModelConfigGetAttr:
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256, num_layers=4)
-        self.config = GPTModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = GPTModelConfig(
+            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
 
     def test_own_attribute_not_proxied(self):
         assert self.config.vocab_size == 32000
@@ -327,7 +337,9 @@ class TestGPTModelConfigSetAttr:
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256)
-        self.config = GPTModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = GPTModelConfig(
+            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
 
     def test_sets_own_attribute_on_self(self):
         self.config.vocab_size = 50000
@@ -402,7 +414,9 @@ class TestGPTModelConfigFinalize:
             virtual_pipeline_model_parallel_size=2,
             pipeline_dtype=torch.bfloat16,
         )
-        config = GPTModelConfig(transformer=transformer, vocab_size=32000)
+        config = GPTModelConfig(
+            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
         with pytest.raises(AssertionError, match="number of model chunks"):
             config.finalize()
 
@@ -414,7 +428,9 @@ class TestGPTModelConfigFinalize:
             virtual_pipeline_model_parallel_size=2,
             pipeline_dtype=torch.bfloat16,
         )
-        config = GPTModelConfig(transformer=transformer, vocab_size=32000)
+        config = GPTModelConfig(
+            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
         # Should not raise
         config.finalize()
 
@@ -430,7 +446,9 @@ class TestGPTModelConfigFinalize:
             account_for_embedding_in_pipeline_split=True,
             pipeline_dtype=torch.bfloat16,
         )
-        config = GPTModelConfig(transformer=transformer, vocab_size=32000)
+        config = GPTModelConfig(
+            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+        )
         # Should not raise
         config.finalize()
 
