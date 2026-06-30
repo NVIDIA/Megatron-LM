@@ -67,6 +67,19 @@ first-iteration gain was relocated into startup, if full wall time regressed,
 if the controls are too far apart, if scale differs, or if printed numerics
 differ.
 
+For settings that can change steady-state throughput, also gate an inclusive
+iteration range. For example, this rejects more than a 2% median iteration-time
+regression over iterations 10 through 20:
+
+```bash
+  --steady-state-start-iteration 10 \
+  --steady-state-end-iteration 20 \
+  --maximum-steady-state-regression-percent 2
+```
+
+The verifier compares the treatment median with the mean of the two control
+medians and fails if any iteration in the requested range is missing.
+
 When the experiment has an absolute service-level target, add, for example,
 `--maximum-treatment-iteration-1-s 5`. This is an additional gate: it does not
 replace the startup-through-iteration-1 or complete-wall checks, so moving work

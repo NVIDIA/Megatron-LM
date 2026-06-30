@@ -18,6 +18,7 @@ def _run_metrics(
     pre_training: float,
     iter_1: float,
     iteration_20_loss: str | None = None,
+    steady_state_elapsed_s: float | None = None,
 ) -> RunMetrics:
     iteration = IterationMetrics(
         iteration=1,
@@ -28,24 +29,44 @@ def _run_metrics(
         nan=0,
         timestamp=datetime(2026, 6, 29),
     )
+    iteration_20 = (
+        IterationMetrics(
+            iteration=20,
+            elapsed_s=0.71 if steady_state_elapsed_s is None else steady_state_elapsed_s,
+            loss=iteration_20_loss,
+            grad_norm="9.284",
+            skipped=0,
+            nan=0,
+            timestamp=datetime(2026, 6, 29),
+        )
+        if iteration_20_loss is not None
+        else None
+    )
+    iterations = {1: iteration}
+    if steady_state_elapsed_s is not None:
+        iterations.update(
+            {
+                index: IterationMetrics(
+                    iteration=index,
+                    elapsed_s=steady_state_elapsed_s,
+                    loss="1.218087E+01",
+                    grad_norm="9.284",
+                    skipped=0,
+                    nan=0,
+                    timestamp=datetime(2026, 6, 29),
+                )
+                for index in range(10, 20)
+            }
+        )
+    if iteration_20 is not None:
+        iterations[20] = iteration_20
     return RunMetrics(
         path=path,
         initialization_s=init,
         pre_training_s=pre_training,
         iteration_1=iteration,
-        iteration_20=(
-            IterationMetrics(
-                iteration=20,
-                elapsed_s=0.71,
-                loss=iteration_20_loss,
-                grad_norm="9.284",
-                skipped=0,
-                nan=0,
-                timestamp=datetime(2026, 6, 29),
-            )
-            if iteration_20_loss is not None
-            else None
-        ),
+        iteration_20=iteration_20,
+        iterations=iterations,
     )
 
 
@@ -407,3 +428,65 @@ def test_verify_aba_rejects_control_order_bias(tmp_path: Path) -> None:
     assert any("control iteration-1 spread" in failure for failure in failures)
     assert any("control startup-through-iteration-1 spread" in failure for failure in failures)
     assert any("control srun-wall spread" in failure for failure in failures)
+
+
+def test_verify_aba_rejects_steady_state_regression(tmp_path: Path) -> None:
+    legs = [
+        AbaLeg(
+            label="control-a",
+            nodes=16,
+            world=64,
+            srun_wall_s=120,
+            metrics=_run_metrics(
+                tmp_path / "a.log",
+                init=14,
+                pre_training=18,
+                iter_1=9.0,
+                iteration_20_loss="1.218087E+01",
+                steady_state_elapsed_s=0.70,
+            ),
+        ),
+        AbaLeg(
+            label="treatment",
+            nodes=16,
+            world=64,
+            srun_wall_s=110,
+            metrics=_run_metrics(
+                tmp_path / "t.log",
+                init=14,
+                pre_training=17,
+                iter_1=8.0,
+                iteration_20_loss="1.218087E+01",
+                steady_state_elapsed_s=0.76,
+            ),
+        ),
+        AbaLeg(
+            label="control-b",
+            nodes=16,
+            world=64,
+            srun_wall_s=120,
+            metrics=_run_metrics(
+                tmp_path / "b.log",
+                init=14,
+                pre_training=18,
+                iter_1=9.0,
+                iteration_20_loss="1.218087E+01",
+                steady_state_elapsed_s=0.70,
+            ),
+        ),
+    ]
+
+    failures = verify_aba(
+        legs,
+        treatment_label="treatment",
+        expected_nodes=16,
+        expected_world=64,
+        phase_tolerance_s=0,
+        wall_tolerance_s=0,
+        require_iteration_20=True,
+        steady_state_start_iteration=10,
+        steady_state_end_iteration=20,
+        maximum_steady_state_regression_percent=2.0,
+    )
+
+    assert any("steady-state iteration time regressed" in failure for failure in failures)

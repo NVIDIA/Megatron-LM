@@ -9,6 +9,7 @@ import dataclasses
 import re
 from datetime import datetime
 from pathlib import Path
+from statistics import median
 
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 _MARKER_RE = re.compile(
@@ -51,12 +52,25 @@ class RunMetrics:
     pre_training_s: float
     iteration_1: IterationMetrics
     iteration_20: IterationMetrics | None
+    iterations: dict[int, IterationMetrics] = dataclasses.field(default_factory=dict)
 
     @property
     def startup_through_iteration_1_s(self) -> float:
         """Library setup through the end of iteration 1, excluding container launch."""
 
         return self.pre_training_s + self.iteration_1.elapsed_s
+
+    def median_iteration_s(self, start: int, end: int) -> float:
+        """Return the median elapsed time for an inclusive iteration range."""
+
+        missing = [
+            iteration for iteration in range(start, end + 1) if iteration not in self.iterations
+        ]
+        if missing:
+            raise ValueError(
+                f"{self.path}: missing iteration(s) {missing} for steady-state range {start}-{end}"
+            )
+        return median(self.iterations[iteration].elapsed_s for iteration in range(start, end + 1))
 
 
 @dataclasses.dataclass
@@ -119,6 +133,7 @@ def parse_run_log(path: Path) -> RunMetrics:
         pre_training_s=pre_training_s,
         iteration_1=iterations[1],
         iteration_20=iterations.get(20),
+        iterations=iterations,
     )
 
 
@@ -181,6 +196,9 @@ def verify_aba(
     max_control_phase_spread_s: float = 5.0,
     max_control_wall_spread_s: float = 10.0,
     maximum_treatment_iteration_1_s: float | None = None,
+    steady_state_start_iteration: int | None = None,
+    steady_state_end_iteration: int | None = None,
+    maximum_steady_state_regression_percent: float | None = None,
 ) -> list[str]:
     """Return gate failures; an empty list means the ABA passes."""
 
@@ -300,6 +318,40 @@ def verify_aba(
             f"control_mean={control_phase_mean:.4f}s tolerance={phase_tolerance_s:.4f}s"
         )
 
+    if maximum_steady_state_regression_percent is not None:
+        if steady_state_start_iteration is None or steady_state_end_iteration is None:
+            failures.append(
+                "steady-state start and end iterations are required when a regression limit is set"
+            )
+        elif steady_state_start_iteration > steady_state_end_iteration:
+            failures.append("steady-state start iteration must not exceed the end iteration")
+        else:
+            try:
+                control_a_steady = control_a.metrics.median_iteration_s(
+                    steady_state_start_iteration, steady_state_end_iteration
+                )
+                treatment_steady = treatment.metrics.median_iteration_s(
+                    steady_state_start_iteration, steady_state_end_iteration
+                )
+                control_b_steady = control_b.metrics.median_iteration_s(
+                    steady_state_start_iteration, steady_state_end_iteration
+                )
+            except ValueError as error:
+                failures.append(str(error))
+            else:
+                control_steady_mean = _mean(control_a_steady, control_b_steady)
+                steady_state_regression_percent = (
+                    (treatment_steady - control_steady_mean) / control_steady_mean * 100.0
+                )
+                if steady_state_regression_percent > maximum_steady_state_regression_percent:
+                    failures.append(
+                        "steady-state iteration time regressed: "
+                        f"treatment_median={treatment_steady:.4f}s "
+                        f"control_mean_median={control_steady_mean:.4f}s "
+                        f"regression={steady_state_regression_percent:.2f}% "
+                        f"maximum={maximum_steady_state_regression_percent:.2f}%"
+                    )
+
     assert (
         control_a.srun_wall_s is not None
         and treatment.srun_wall_s is not None
@@ -338,6 +390,14 @@ def _format_table(legs: list[AbaLeg]) -> str:
     return "\n".join(rows)
 
 
+def _format_steady_state(legs: list[AbaLeg], start: int, end: int) -> str:
+    values = []
+    for leg in legs:
+        assert leg.metrics is not None
+        values.append(f"{leg.label}={leg.metrics.median_iteration_s(start, end):.4f}s")
+    return f"steady-state median iterations {start}-{end}: " + " ".join(values)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aba-log", type=Path, required=True)
@@ -355,11 +415,28 @@ def main() -> None:
     parser.add_argument("--max-control-phase-spread-s", type=float, default=5.0)
     parser.add_argument("--max-control-wall-spread-s", type=float, default=10.0)
     parser.add_argument("--maximum-treatment-iteration-1-s", type=float)
+    parser.add_argument("--steady-state-start-iteration", type=int)
+    parser.add_argument("--steady-state-end-iteration", type=int)
+    parser.add_argument("--maximum-steady-state-regression-percent", type=float)
     parser.add_argument("--require-iteration-20", action="store_true")
     args = parser.parse_args()
 
     legs = parse_aba_log(args.aba_log)
     print(_format_table(legs))
+    if (
+        args.maximum_steady_state_regression_percent is not None
+        and args.steady_state_start_iteration is not None
+        and args.steady_state_end_iteration is not None
+    ):
+        try:
+            print(
+                _format_steady_state(
+                    legs, args.steady_state_start_iteration, args.steady_state_end_iteration
+                )
+            )
+        except ValueError:
+            # verify_aba reports the missing range as a normal gate failure.
+            pass
     failures = verify_aba(
         legs=legs,
         treatment_label=args.treatment_label,
@@ -375,6 +452,9 @@ def main() -> None:
         max_control_phase_spread_s=args.max_control_phase_spread_s,
         max_control_wall_spread_s=args.max_control_wall_spread_s,
         maximum_treatment_iteration_1_s=args.maximum_treatment_iteration_1_s,
+        steady_state_start_iteration=args.steady_state_start_iteration,
+        steady_state_end_iteration=args.steady_state_end_iteration,
+        maximum_steady_state_regression_percent=(args.maximum_steady_state_regression_percent),
     )
     if failures:
         for failure in failures:
