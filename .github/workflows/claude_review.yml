@@ -45,8 +45,10 @@ jobs:
 
       - name: Run Claude Light Review
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           trigger_phrase: "/claude review"
           show_full_output: true
           claude_args: |
@@ -144,8 +146,10 @@ jobs:
 
       - name: Run Claude Strict Review
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           trigger_phrase: "/claude strict-review"
           show_full_output: true
           claude_args: |

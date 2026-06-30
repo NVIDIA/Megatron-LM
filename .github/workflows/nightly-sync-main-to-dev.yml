@@ -184,8 +184,10 @@ jobs:
       - name: Run Claude Code to merge, fix, and iterate
         if: steps.check-sync.outputs.skip != 'true'
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ secrets.PAT }}
           prompt: |
             You are an automated sync bot. Merge `main` into `dev`, create a
