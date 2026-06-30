@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 End-to-end test: BagelMimoModel vs original Bagel (Qwen2Model) accuracy.
 
@@ -48,36 +50,32 @@ for p in [_ROOT, _BAGEL_PKG, _BAGEL_SRC]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from megatron.core.models.bagel.attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
-from megatron.core.models.bagel.transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
+from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
+from megatron.core.models.bagel.bagel_mimo import BagelMimoModel
 from megatron.core.models.bagel.flex_attention import FlexAttention
+from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
     TransformerMoTBlock,
     TransformerMoTBlockSubmodules,
 )
-from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
-from megatron.core.models.bagel.bagel_mimo import BagelMimoModel
+from megatron.core.models.bagel.transformer_mot_layer import (
+    MoTTransformerLayer,
+    MoTTransformerLayerSubmodules,
+)
 
 # ── Optional bagel-package imports ───────────────────────────────────────────
 try:
-    from bagel.modeling.bagel.qwen2_navit import (
-        Qwen2Model,
-        Qwen2MoTDecoderLayer,
-        Qwen2Config as BagelQwen2Config,
-    )
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Config as BagelQwen2Config
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Model, Qwen2MoTDecoderLayer
+
     HAVE_BAGEL_PKG = True
 except ImportError:
     HAVE_BAGEL_PKG = False
 
 try:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
     HAVE_WRAPPED_NORM = True
 except ImportError:
     HAVE_WRAPPED_NORM = False
@@ -95,23 +93,24 @@ from tests.unit_tests.test_utilities import Utils
 # ─────────────────────────────────────────────────────────────────────────────
 # Test dimensions (same as test_mcore_bagel_llm.py)
 # ─────────────────────────────────────────────────────────────────────────────
-HIDDEN_SIZE     = 256
+HIDDEN_SIZE = 256
 FFN_HIDDEN_SIZE = 512
-NUM_HEADS       = 4
-NUM_KV_HEADS    = 4
-HEAD_DIM        = HIDDEN_SIZE // NUM_HEADS
-NUM_LAYERS      = 2
-ROPE_THETA      = 10000.0
-VOCAB_SIZE      = 256
-MAX_SEQ_LEN     = 128
+NUM_HEADS = 4
+NUM_KV_HEADS = 4
+HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
+NUM_LAYERS = 2
+ROPE_THETA = 10000.0
+VOCAB_SIZE = 256
+MAX_SEQ_LEN = 128
 
-T_CLEAN, V_CLEAN, G_CLEAN = 8, 8, 16   # S=32, U=16 (V=0 in this test; ViT bypassed)
-T_PAD,   V_PAD,   G_PAD   = 7, 0, 11   # S=18, U=7  (text-only und branch)
+T_CLEAN, V_CLEAN, G_CLEAN = 8, 8, 16  # S=32, U=16 (V=0 in this test; ViT bypassed)
+T_PAD, V_PAD, G_PAD = 7, 0, 11  # S=18, U=7  (text-only und branch)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_mcore_config() -> TransformerConfig:
     return TransformerConfig(
@@ -139,26 +138,27 @@ def _make_mcore_config() -> TransformerConfig:
 
 def _make_bagel_ref_config() -> "BagelQwen2Config":
     cfg = BagelQwen2Config()
-    cfg.torch_dtype           = torch.float16
-    cfg.hidden_size           = HIDDEN_SIZE
-    cfg.intermediate_size     = FFN_HIDDEN_SIZE
-    cfg.num_hidden_layers     = NUM_LAYERS
-    cfg.num_attention_heads   = NUM_HEADS
-    cfg.num_key_value_heads   = NUM_KV_HEADS
-    cfg.qk_norm               = True
-    cfg.freeze_und            = False
-    cfg.rms_norm_eps          = 1e-6
-    cfg.hidden_act            = "silu"
-    cfg.layer_module          = "Qwen2MoTDecoderLayer"
-    cfg.rope_theta            = ROPE_THETA
-    cfg.vocab_size            = VOCAB_SIZE
+    cfg.torch_dtype = torch.float16
+    cfg.hidden_size = HIDDEN_SIZE
+    cfg.intermediate_size = FFN_HIDDEN_SIZE
+    cfg.num_hidden_layers = NUM_LAYERS
+    cfg.num_attention_heads = NUM_HEADS
+    cfg.num_key_value_heads = NUM_KV_HEADS
+    cfg.qk_norm = True
+    cfg.freeze_und = False
+    cfg.rms_norm_eps = 1e-6
+    cfg.hidden_act = "silu"
+    cfg.layer_module = "Qwen2MoTDecoderLayer"
+    cfg.rope_theta = ROPE_THETA
+    cfg.vocab_size = VOCAB_SIZE
     return cfg
 
 
 def _make_llm_config():
     class _LLMConfig:
         layer_module = "Qwen2MoTDecoderLayer"
-        freeze_und   = False
+        freeze_und = False
+
     return _LLMConfig()
 
 
@@ -169,6 +169,7 @@ def _make_llm_config():
 # the same BagelMCoreModel instances that are already validated in other tests.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _TestBagelMimoModel(BagelMimoModel):
     """BagelMimoModel that accepts a pre-built BagelMCoreModel directly."""
 
@@ -176,7 +177,7 @@ class _TestBagelMimoModel(BagelMimoModel):
         # Call torch.nn.Module init directly — skip MimoModel.__init__ which
         # needs a full MimoModelConfig with ModuleSpec for the language model.
         torch.nn.Module.__init__(self)
-        self.config = language_model.config      # required by MegatronModule
+        self.config = language_model.config  # required by MegatronModule
         self.language_model = language_model
         self.modality_submodules = torch.nn.ModuleDict()
         self.special_token_ids = {}
@@ -239,8 +240,10 @@ class _TestBagelMimoModel(BagelMimoModel):
 # Model builders
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _build_bagel_mcore_model(mcore_cfg: TransformerConfig) -> BagelMCoreModel:
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+
     std_spec = get_gpt_layer_local_spec(normalization="RMSNorm")
     model = BagelMCoreModel(
         config=mcore_cfg,
@@ -262,9 +265,7 @@ def _build_bagel_mcore_model(mcore_cfg: TransformerConfig) -> BagelMCoreModel:
 def _build_packed_seq(model_cp, input_ids, text_idx, vae_idx, gen_emb, S, device):
     """Build packed_sequence [S, H] with text and gen embeddings placed at their indexes."""
     with torch.no_grad():
-        text_emb = model_cp.embedding(
-            input_ids=input_ids, position_ids=None
-        ).squeeze(1)   # [T, H]
+        text_emb = model_cp.embedding(input_ids=input_ids, position_ids=None).squeeze(1)  # [T, H]
     H = text_emb.shape[-1]
     packed_seq = torch.zeros(S, H, dtype=text_emb.dtype, device=device)
     packed_seq[text_idx] = text_emb.detach()
@@ -279,58 +280,78 @@ def _swap_cp_groups(model: BagelMCoreModel, cp_group, cp_size: int):
         fa = layer.self_attention.core_attention
         saved.append((fa, fa.cp_group, fa.cp_size))
         fa.cp_group = cp_group
-        fa.cp_size  = cp_size
+        fa.cp_size = cp_size
     return saved
 
 
 def _restore_cp_groups(saved):
     for fa, cg, cs in saved:
         fa.cp_group = cg
-        fa.cp_size  = cs
+        fa.cp_size = cs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Weight-copy helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _hf_to_mcore_qkv_weight(q_w, k_w, v_w, ng, np_, hn):
-    h  = q_w.shape[1]
+    h = q_w.shape[1]
     nq = np_ // ng
-    q  = q_w.view(ng, nq * hn, h)
-    k  = k_w.view(ng, hn, h)
-    v  = v_w.view(ng, hn, h)
+    q = q_w.view(ng, nq * hn, h)
+    k = k_w.view(ng, hn, h)
+    v = v_w.view(ng, hn, h)
     return torch.cat([q, k, v], dim=1).reshape(ng * (nq + 2) * hn, h)
 
 
 def _hf_to_mcore_qkv_bias(q_b, k_b, v_b, ng, np_, hn):
     nq = np_ // ng
-    q  = q_b.view(ng, nq * hn)
-    k  = k_b.view(ng, hn)
-    v  = v_b.view(ng, hn)
+    q = q_b.view(ng, nq * hn)
+    k = k_b.view(ng, hn)
+    v = v_b.view(ng, hn)
     return torch.cat([q, k, v], dim=1).reshape(ng * (nq + 2) * hn)
 
 
 def _copy_attn_weights(bagel_attn, mcore_attn):
     np_ = bagel_attn.num_heads
-    ng  = bagel_attn.num_key_value_heads
-    hn  = bagel_attn.head_dim
-    for (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
-         lin_qkv, lin_proj, qln, kln) in [
-        (bagel_attn.q_proj,         bagel_attn.k_proj,         bagel_attn.v_proj,
-         bagel_attn.o_proj,         bagel_attn.q_norm,         bagel_attn.k_norm,
-         mcore_attn.linear_qkv,    mcore_attn.linear_proj,
-         mcore_attn.q_layernorm,   mcore_attn.k_layernorm),
-        (bagel_attn.q_proj_moe_gen, bagel_attn.k_proj_moe_gen, bagel_attn.v_proj_moe_gen,
-         bagel_attn.o_proj_moe_gen, bagel_attn.q_norm_moe_gen, bagel_attn.k_norm_moe_gen,
-         mcore_attn.linear_qkv_gen, mcore_attn.linear_proj_gen,
-         mcore_attn.q_layernorm_gen, mcore_attn.k_layernorm_gen),
+    ng = bagel_attn.num_key_value_heads
+    hn = bagel_attn.head_dim
+    for q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, lin_qkv, lin_proj, qln, kln in [
+        (
+            bagel_attn.q_proj,
+            bagel_attn.k_proj,
+            bagel_attn.v_proj,
+            bagel_attn.o_proj,
+            bagel_attn.q_norm,
+            bagel_attn.k_norm,
+            mcore_attn.linear_qkv,
+            mcore_attn.linear_proj,
+            mcore_attn.q_layernorm,
+            mcore_attn.k_layernorm,
+        ),
+        (
+            bagel_attn.q_proj_moe_gen,
+            bagel_attn.k_proj_moe_gen,
+            bagel_attn.v_proj_moe_gen,
+            bagel_attn.o_proj_moe_gen,
+            bagel_attn.q_norm_moe_gen,
+            bagel_attn.k_norm_moe_gen,
+            mcore_attn.linear_qkv_gen,
+            mcore_attn.linear_proj_gen,
+            mcore_attn.q_layernorm_gen,
+            mcore_attn.k_layernorm_gen,
+        ),
     ]:
         lin_qkv.weight.data.copy_(
-            _hf_to_mcore_qkv_weight(q_proj.weight.data, k_proj.weight.data,
-                                     v_proj.weight.data, ng=ng, np_=np_, hn=hn))
+            _hf_to_mcore_qkv_weight(
+                q_proj.weight.data, k_proj.weight.data, v_proj.weight.data, ng=ng, np_=np_, hn=hn
+            )
+        )
         lin_qkv.bias.data.copy_(
-            _hf_to_mcore_qkv_bias(q_proj.bias.data, k_proj.bias.data,
-                                   v_proj.bias.data, ng=ng, np_=np_, hn=hn))
+            _hf_to_mcore_qkv_bias(
+                q_proj.bias.data, k_proj.bias.data, v_proj.bias.data, ng=ng, np_=np_, hn=hn
+            )
+        )
         lin_proj.weight.data.copy_(o_proj.weight.data)
         if qln is not None and hasattr(q_norm, "weight"):
             qln.weight.data.copy_(q_norm.weight.data)
@@ -347,9 +368,15 @@ def _copy_mlp_weights(bagel_mlp, mcore_mlp):
 
 def _copy_layer_weights(bagel_layer, mcore_layer):
     mcore_layer.input_layernorm.weight.data.copy_(bagel_layer.input_layernorm.weight.data)
-    mcore_layer.input_layernorm_gen.weight.data.copy_(bagel_layer.input_layernorm_moe_gen.weight.data)
-    mcore_layer.pre_mlp_layernorm.weight.data.copy_(bagel_layer.post_attention_layernorm.weight.data)
-    mcore_layer.pre_mlp_layernorm_gen.weight.data.copy_(bagel_layer.post_attention_layernorm_moe_gen.weight.data)
+    mcore_layer.input_layernorm_gen.weight.data.copy_(
+        bagel_layer.input_layernorm_moe_gen.weight.data
+    )
+    mcore_layer.pre_mlp_layernorm.weight.data.copy_(
+        bagel_layer.post_attention_layernorm.weight.data
+    )
+    mcore_layer.pre_mlp_layernorm_gen.weight.data.copy_(
+        bagel_layer.post_attention_layernorm_moe_gen.weight.data
+    )
     _copy_attn_weights(bagel_layer.self_attn, mcore_layer.self_attention)
     _copy_mlp_weights(bagel_layer.mlp, mcore_layer.mlp)
     _copy_mlp_weights(bagel_layer.mlp_moe_gen, mcore_layer.mlp_gen)
@@ -367,9 +394,7 @@ def _copy_block_weights(bagel_model: "Qwen2Model", mcore_block: TransformerMoTBl
 def _copy_all_weights(bagel_model: "Qwen2Model", mcore_llm: BagelMCoreModel):
     """Copy all weights: embedding + decoder layers + final norms."""
     # Embedding: bagel embed_tokens → mcore word_embeddings
-    mcore_llm.embedding.word_embeddings.weight.data.copy_(
-        bagel_model.embed_tokens.weight.data
-    )
+    mcore_llm.embedding.word_embeddings.weight.data.copy_(bagel_model.embed_tokens.weight.data)
     # Decoder layers + final norms
     _copy_block_weights(bagel_model, mcore_llm.decoder)
 
@@ -378,9 +403,10 @@ def _copy_all_weights(bagel_model: "Qwen2Model", mcore_llm: BagelMCoreModel):
 # RoPE helpers (identity-RoPE for deterministic comparison)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _identity_rope(seq_len: int):
     """Zero-frequency RoPE → cos=1, sin=0 (identity rotation)."""
-    cos_id = torch.ones (1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
+    cos_id = torch.ones(1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
     sin_id = torch.zeros(1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
     return cos_id, sin_id
 
@@ -389,12 +415,14 @@ def _patch_bagel_rope(bagel_model, cos_id, sin_id):
     class _IdentityRope(torch.nn.Module):
         def forward(self, seq, pos_ids):
             return cos_id, sin_id
+
     object.__setattr__(bagel_model, "rotary_emb", _IdentityRope())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_test_data(T: int, G: int, seed: int = 42):
     """
@@ -414,14 +442,13 @@ def _make_test_data(T: int, G: int, seed: int = 42):
     H = HIDDEN_SIZE
 
     input_ids = torch.randint(0, VOCAB_SIZE, (1, T), device=device)
-    text_idx  = torch.arange(0, T,   device=device)
-    vae_idx   = torch.arange(T, S,   device=device)
-    pos_ids   = torch.arange(0, S,   device=device)
-    gen_emb   = torch.randn(G, H, dtype=torch.float16, device=device)  # mock vae2llm output
+    text_idx = torch.arange(0, T, device=device)
+    vae_idx = torch.arange(T, S, device=device)
+    pos_ids = torch.arange(0, S, device=device)
+    gen_emb = torch.randn(G, H, dtype=torch.float16, device=device)  # mock vae2llm output
 
     block_mask = create_block_mask(
-        lambda b, h, q, kv: q >= 0,
-        B=1, H=1, Q_LEN=S, KV_LEN=S, device=device,
+        lambda b, h, q, kv: q >= 0, B=1, H=1, Q_LEN=S, KV_LEN=S, device=device
     )
     return input_ids, text_idx, vae_idx, pos_ids, block_mask, gen_emb
 
@@ -430,11 +457,12 @@ def _make_test_data(T: int, G: int, seed: int = 42):
 # Test 1 — get_packed_seq_params correctness
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
     """Verify MoTPackedSeqParams fields match manual computation."""
     device = "cuda"
     text_idx = torch.arange(0, T, device=device)
-    vae_idx  = torch.arange(T, T + G, device=device)
+    vae_idx = torch.arange(T, T + G, device=device)
 
     cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -443,7 +471,7 @@ def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
         def __init__(self):
             torch.nn.Module.__init__(self)
             self.modality_submodules = torch.nn.ModuleDict()
-            self.special_token_ids   = {}
+            self.special_token_ids = {}
 
     mimo = _MinimalMimo()
     psp = mimo.get_packed_seq_params(
@@ -456,33 +484,39 @@ def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
     Lund_expected = math.ceil(U / cp_size) if U > 0 else 0
     Lgen_expected = math.ceil(G / cp_size) if G > 0 else 0
 
-    assert psp.padded_und_seqlen == Lund_expected, \
-        f"[{label}] Lund: got {psp.padded_und_seqlen}, expected {Lund_expected}"
-    assert psp.padded_gen_seqlen == Lgen_expected, \
-        f"[{label}] Lgen: got {psp.padded_gen_seqlen}, expected {Lgen_expected}"
-    assert len(psp.packed_und_token_indexes) == U, \
-        f"[{label}] global und length mismatch"
-    assert len(psp.packed_gen_token_indexes) == G, \
-        f"[{label}] global gen length mismatch"
+    assert (
+        psp.padded_und_seqlen == Lund_expected
+    ), f"[{label}] Lund: got {psp.padded_und_seqlen}, expected {Lund_expected}"
+    assert (
+        psp.padded_gen_seqlen == Lgen_expected
+    ), f"[{label}] Lgen: got {psp.padded_gen_seqlen}, expected {Lgen_expected}"
+    assert len(psp.packed_und_token_indexes) == U, f"[{label}] global und length mismatch"
+    assert len(psp.packed_gen_token_indexes) == G, f"[{label}] global gen length mismatch"
 
     # local_*_token_indexes stores the actual (unpadded) slice; len() == real token count
     actual_lund = min(Lund_expected, max(0, U - cp_rank * Lund_expected))
     actual_lgen = min(Lgen_expected, max(0, G - cp_rank * Lgen_expected))
 
     expected_local_und = text_idx[cp_rank * Lund_expected : cp_rank * Lund_expected + actual_lund]
-    expected_local_gen = vae_idx [cp_rank * Lgen_expected : cp_rank * Lgen_expected + actual_lgen]
-    assert len(psp.local_und_token_indexes) == actual_lund, \
-        f"[{label}] local_und length mismatch: got {len(psp.local_und_token_indexes)}, expected {actual_lund}"
-    assert len(psp.local_gen_token_indexes) == actual_lgen, \
-        f"[{label}] local_gen length mismatch: got {len(psp.local_gen_token_indexes)}, expected {actual_lgen}"
-    assert torch.equal(psp.local_und_token_indexes, expected_local_und), \
-        f"[{label}] local_und tokens mismatch"
-    assert torch.equal(psp.local_gen_token_indexes, expected_local_gen), \
-        f"[{label}] local_gen tokens mismatch"
+    expected_local_gen = vae_idx[cp_rank * Lgen_expected : cp_rank * Lgen_expected + actual_lgen]
+    assert (
+        len(psp.local_und_token_indexes) == actual_lund
+    ), f"[{label}] local_und length mismatch: got {len(psp.local_und_token_indexes)}, expected {actual_lund}"
+    assert (
+        len(psp.local_gen_token_indexes) == actual_lgen
+    ), f"[{label}] local_gen length mismatch: got {len(psp.local_gen_token_indexes)}, expected {actual_lgen}"
+    assert torch.equal(
+        psp.local_und_token_indexes, expected_local_und
+    ), f"[{label}] local_und tokens mismatch"
+    assert torch.equal(
+        psp.local_gen_token_indexes, expected_local_gen
+    ), f"[{label}] local_gen tokens mismatch"
 
-    print(f"  [psp {label:12s} cp={cp_size} rank={cp_rank}] PASS  "
-          f"U={U} G={G}  Lund={Lund_expected} Lgen={Lgen_expected}  "
-          f"actual=({actual_lund},{actual_lgen})")
+    print(
+        f"  [psp {label:12s} cp={cp_size} rank={cp_rank}] PASS  "
+        f"U={U} G={G}  Lund={Lund_expected} Lgen={Lgen_expected}  "
+        f"actual=({actual_lund},{actual_lgen})"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,22 +526,22 @@ def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
 # Compares last_hidden_state at all valid (und + gen) token positions.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_forward_vs_qwen2(T: int, G: int, label: str):
-    assert HAVE_BAGEL_PKG,    "skip: bagel-package not available"
+    assert HAVE_BAGEL_PKG, "skip: bagel-package not available"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
     device = "cuda"
 
-    input_ids, text_idx, vae_idx, pos_ids, block_mask, gen_emb = \
-        _make_test_data(T, G)
+    input_ids, text_idx, vae_idx, pos_ids, block_mask, gen_emb = _make_test_data(T, G)
 
     U = T  # no ViT
     S = T + G
 
     # ── Build models ──────────────────────────────────────────────────────────
-    bagel_cfg   = _make_bagel_ref_config()
-    mcore_cfg   = _make_mcore_config()
+    bagel_cfg = _make_bagel_ref_config()
+    mcore_cfg = _make_mcore_config()
     bagel_model = Qwen2Model(bagel_cfg).cuda().half().train()
-    mcore_llm   = _build_bagel_mcore_model(mcore_cfg)
+    mcore_llm = _build_bagel_mcore_model(mcore_cfg)
     mcore_llm.train()
 
     # Copy weights: embedding + transformer layers + final norms
@@ -524,7 +558,7 @@ def test_forward_vs_qwen2(T: int, G: int, label: str):
     # ── Reference: Qwen2Model.forward_train ──────────────────────────────────
     # Build packed_sequence manually: text_emb at text_idx, gen_emb at vae_idx
     with torch.no_grad():
-        text_emb = bagel_model.embed_tokens(input_ids.squeeze(0))   # [T, H]
+        text_emb = bagel_model.embed_tokens(input_ids.squeeze(0))  # [T, H]
     packed_seq = torch.zeros(S, HIDDEN_SIZE, dtype=torch.float16, device=device)
     packed_seq[text_idx] = text_emb.detach()
     if G > 0:
@@ -537,7 +571,7 @@ def test_forward_vs_qwen2(T: int, G: int, label: str):
         ref_out = bagel_model.forward_train(
             packed_sequence=packed_seq,
             sample_lens=[S],
-            attention_mask=block_mask,   # FlexAttention BlockMask (not list → flex path)
+            attention_mask=block_mask,  # FlexAttention BlockMask (not list → flex path)
             packed_position_ids=pos_ids,
             packed_und_token_indexes=und_idx,
             packed_gen_token_indexes=gen_idx,
@@ -557,15 +591,17 @@ def test_forward_vs_qwen2(T: int, G: int, label: str):
             packed_vae_token_indexes=vae_idx if G > 0 else None,
             visual_latents=gen_emb if G > 0 else None,
         )
-    got = lm_output['last_hidden_state']   # [S, H]
+    got = lm_output['last_hidden_state']  # [S, H]
 
     # ── Compare at valid token positions ─────────────────────────────────────
     atol = rtol = 1e-2
     valid_idx = torch.cat([und_idx, gen_idx]) if G > 0 else und_idx
 
     torch.testing.assert_close(
-        got[valid_idx], ref_out[valid_idx],
-        atol=atol, rtol=rtol,
+        got[valid_idx],
+        ref_out[valid_idx],
+        atol=atol,
+        rtol=rtol,
         msg=lambda m: f"[mimo_vs_qwen2/{label}] {m}",
     )
     max_err = (got[valid_idx] - ref_out[valid_idx]).abs().max().item()
@@ -580,19 +616,20 @@ def test_forward_vs_qwen2(T: int, G: int, label: str):
 # Per-rank output is compared against slices of the CP=1 reference.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_cp2_parity_mimo(model_cp: BagelMCoreModel, T: int, G: int,
-                        cp_group, label: str, seed: int = 42):
-    rank    = dist.get_rank()
-    device  = "cuda"
-    S       = T + G
+
+def run_cp2_parity_mimo(
+    model_cp: BagelMCoreModel, T: int, G: int, cp_group, label: str, seed: int = 42
+):
+    rank = dist.get_rank()
+    device = "cuda"
+    S = T + G
     cp_size = cp_group.size()
 
-    input_ids, text_idx, vae_idx, pos_ids, block_mask, gen_emb = \
-        _make_test_data(T, G, seed=seed)
+    input_ids, text_idx, vae_idx, pos_ids, block_mask, gen_emb = _make_test_data(T, G, seed=seed)
 
-    U     = T
-    Lund  = math.ceil(U / cp_size) if U > 0 else 0
-    Lgen  = math.ceil(G / cp_size) if G > 0 else 0
+    U = T
+    Lund = math.ceil(U / cp_size) if U > 0 else 0
+    Lgen = math.ceil(G / cp_size) if G > 0 else 0
     actual_lund = min(Lund, max(0, U - rank * Lund))
     actual_lgen = min(Lgen, max(0, G - rank * Lgen))
 
@@ -621,8 +658,9 @@ def run_cp2_parity_mimo(model_cp: BagelMCoreModel, T: int, G: int,
 
     # ── CP=1 reference: call model directly with psp_cp1, no A2A ─────────────
     # Build the packed_sequence (same as mcore_bagel_llm.forward would build it)
-    packed_seq = _build_packed_seq(model_cp, input_ids, text_idx, vae_idx,
-                                   gen_emb if G > 0 else None, S, device)
+    packed_seq = _build_packed_seq(
+        model_cp, input_ids, text_idx, vae_idx, gen_emb if G > 0 else None, S, device
+    )
     saved = _swap_cp_groups(model_cp, cp_group=None, cp_size=1)
     with torch.no_grad():
         ref_lm = model_cp.forward(
@@ -637,7 +675,7 @@ def run_cp2_parity_mimo(model_cp: BagelMCoreModel, T: int, G: int,
             packed_seq_params=psp_cp1,
         )
     _restore_cp_groups(saved)
-    ref_hs = ref_lm['last_hidden_state']   # [S, H]
+    ref_hs = ref_lm['last_hidden_state']  # [S, H]
 
     # ── CP=N run (A2A active via cp_group) ────────────────────────────────────
     with torch.no_grad():
@@ -652,40 +690,51 @@ def run_cp2_parity_mimo(model_cp: BagelMCoreModel, T: int, G: int,
             attention_mask=block_mask,
             packed_seq_params=psp_cpN,
         )
-    cpN_hs = cpN_lm['last_hidden_state']   # [S, H] — only local positions filled
+    cpN_hs = cpN_lm['last_hidden_state']  # [S, H] — only local positions filled
 
     dist.barrier()
 
     # ── Compare at this rank's local token positions ──────────────────────────
     local_und = text_idx[rank * Lund : rank * Lund + actual_lund]
-    local_gen = gen_idx [rank * Lgen : rank * Lgen + actual_lgen]
+    local_gen = gen_idx[rank * Lgen : rank * Lgen + actual_lgen]
 
     atol = rtol = 1e-2
     und_err = gen_err = 0.0
     if actual_lund > 0:
         torch.testing.assert_close(
-            cpN_hs[local_und], ref_hs[local_und], atol=atol, rtol=rtol,
-            msg=lambda m: f"[cp2_mimo/{label} rank={rank}] UND: {m}")
+            cpN_hs[local_und],
+            ref_hs[local_und],
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[cp2_mimo/{label} rank={rank}] UND: {m}",
+        )
         und_err = (cpN_hs[local_und] - ref_hs[local_und]).abs().max().item()
     if actual_lgen > 0:
         torch.testing.assert_close(
-            cpN_hs[local_gen], ref_hs[local_gen], atol=atol, rtol=rtol,
-            msg=lambda m: f"[cp2_mimo/{label} rank={rank}] GEN: {m}")
+            cpN_hs[local_gen],
+            ref_hs[local_gen],
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[cp2_mimo/{label} rank={rank}] GEN: {m}",
+        )
         gen_err = (cpN_hs[local_gen] - ref_hs[local_gen]).abs().max().item()
 
-    print(f"  [cp2_mimo {label:8s} rank={rank}] PASS  "
-          f"U={U} G={G}  Lund={Lund} Lgen={Lgen}  "
-          f"actual=({actual_lund},{actual_lgen})  "
-          f"und_err={und_err:.4f}  gen_err={gen_err:.4f}")
+    print(
+        f"  [cp2_mimo {label:8s} rank={rank}] PASS  "
+        f"U={U} G={G}  Lund={Lund} Lgen={Lgen}  "
+        f"actual=({actual_lund},{actual_lgen})  "
+        f"und_err={und_err:.4f}  gen_err={gen_err:.4f}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main():
     dist.init_process_group("nccl")
-    rank       = dist.get_rank()
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
 
@@ -698,17 +747,17 @@ def main():
     if rank == 0:
         print("\n=== Test 1: get_packed_seq_params ===")
     test_get_packed_seq_params(cp_size=1, T=T_CLEAN, G=G_CLEAN, label="clean")
-    test_get_packed_seq_params(cp_size=1, T=T_PAD,   G=G_PAD,   label="padding")
-    test_get_packed_seq_params(cp_size=1, T=T_CLEAN, G=0,       label="und-only")
-    test_get_packed_seq_params(cp_size=1, T=0,       G=G_CLEAN, label="gen-only")
+    test_get_packed_seq_params(cp_size=1, T=T_PAD, G=G_PAD, label="padding")
+    test_get_packed_seq_params(cp_size=1, T=T_CLEAN, G=0, label="und-only")
+    test_get_packed_seq_params(cp_size=1, T=0, G=G_CLEAN, label="gen-only")
 
     # ── Test 2: forward accuracy vs Qwen2Model ────────────────────────────────
     if HAVE_BAGEL_PKG and HAVE_WRAPPED_NORM:
         if rank == 0:
             print("\n=== Test 2: BagelMimoModel.forward vs Qwen2Model ===")
         test_forward_vs_qwen2(T=T_CLEAN, G=G_CLEAN, label="mixed")
-        test_forward_vs_qwen2(T=T_CLEAN, G=0,       label="und-only")
-        test_forward_vs_qwen2(T=0,       G=G_CLEAN, label="gen-only")
+        test_forward_vs_qwen2(T=T_CLEAN, G=0, label="und-only")
+        test_forward_vs_qwen2(T=0, G=G_CLEAN, label="gen-only")
     else:
         if rank == 0:
             print("\n=== Test 2: SKIPPED (bagel-package not available) ===")
@@ -724,14 +773,16 @@ def main():
         if rank == 0:
             print("  [psp CP=2 check]")
         test_get_packed_seq_params(cp_size=2, T=T_CLEAN, G=G_CLEAN, label="clean")
-        test_get_packed_seq_params(cp_size=2, T=T_PAD,   G=G_PAD,   label="padding")
+        test_get_packed_seq_params(cp_size=2, T=T_PAD, G=G_PAD, label="padding")
 
-        model_cp  = _build_bagel_mcore_model(mcore_cfg)
+        model_cp = _build_bagel_mcore_model(mcore_cfg)
         model_cp.train()
-        cp_group  = dist.new_group(list(range(world_size)))
+        cp_group = dist.new_group(list(range(world_size)))
 
-        run_cp2_parity_mimo(model_cp, T=T_CLEAN, G=G_CLEAN, cp_group=cp_group, label="clean",   seed=42)
-        run_cp2_parity_mimo(model_cp, T=T_PAD,   G=G_PAD,   cp_group=cp_group, label="padding", seed=77)
+        run_cp2_parity_mimo(
+            model_cp, T=T_CLEAN, G=G_CLEAN, cp_group=cp_group, label="clean", seed=42
+        )
+        run_cp2_parity_mimo(model_cp, T=T_PAD, G=G_PAD, cp_group=cp_group, label="padding", seed=77)
 
         dist.barrier()
         if rank == 0:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import torch
 from .hf_bagel_vae import load_ae
 from typing import List, Tuple

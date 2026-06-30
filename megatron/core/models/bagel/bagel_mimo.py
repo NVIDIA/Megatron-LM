@@ -1,19 +1,17 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import math
-import warnings
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.models.bagel.hf_bagel_llm import BagelLLMHuggingFaceModel
+from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
-from megatron.core.models.bagel.hf_bagel_llm import BagelLLMHuggingFaceModel
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +20,10 @@ def gather_pad_to_length(src: torch.Tensor, idx: torch.Tensor, length: int) -> t
     """Gather rows ``src[idx]`` and zero-pad to ``length`` along dim 0."""
     t = src[idx]
     n = length - len(t)
-    return torch.cat([t, torch.zeros(n, *t.shape[1:], dtype=t.dtype, device=t.device)]) if n > 0 else t
+    if n <= 0:
+        return t
+    padding = torch.zeros(n, *t.shape[1:], dtype=t.dtype, device=t.device)
+    return torch.cat([t, padding])
 
 
 class _AllGatherImageEmbeddings(torch.autograd.Function):
@@ -37,16 +38,23 @@ class _AllGatherImageEmbeddings(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, embeddings: torch.Tensor, vit_tokens_encoded_per_cp: List[int], group) -> torch.Tensor:
+    def forward(
+        ctx, embeddings: torch.Tensor, vit_tokens_encoded_per_cp: List[int], group
+    ) -> torch.Tensor:
+        """Gather variable-length image embeddings across CP ranks."""
 
         all_sizes = vit_tokens_encoded_per_cp
-        print(f"all_sizes: {all_sizes}, group rank: {dist.get_rank(group)}, rank: {dist.get_rank()}")
+        logger.debug(
+            "all_sizes: %s, group rank: %s, rank: %s",
+            all_sizes,
+            dist.get_rank(group),
+            dist.get_rank(),
+        )
 
         # Allocate output and all_gather into pre-split views.
         total = sum(all_sizes)
         output = torch.empty(
-            total, embeddings.shape[1],
-            dtype=embeddings.dtype, device=embeddings.device,
+            total, embeddings.shape[1], dtype=embeddings.dtype, device=embeddings.device
         )
         output_list = list(torch.split(output, all_sizes, dim=0))
         dist.all_gather(output_list, embeddings.contiguous(), group=group)
@@ -57,6 +65,7 @@ class _AllGatherImageEmbeddings(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Return the local slice of the gathered image-embedding gradient."""
         all_sizes = ctx.all_sizes
         cp_rank = dist.get_rank(ctx.group)
 
@@ -66,7 +75,9 @@ class _AllGatherImageEmbeddings(torch.autograd.Function):
         return grad_output[offset : offset + all_sizes[cp_rank]].contiguous(), None, None
 
 
-def all_gather_image_embeddings(embeddings: torch.Tensor, vit_tokens_encoded_per_cp: List[int], group) -> torch.Tensor:
+def all_gather_image_embeddings(
+    embeddings: torch.Tensor, vit_tokens_encoded_per_cp: List[int], group
+) -> torch.Tensor:
     """All-gather ViT embeddings from all CP ranks into [V, H].
 
     Each CP rank runs SigLIP on its assigned images and holds
@@ -143,9 +154,9 @@ def align_bagel_embeddings(
         else:
             text_emb = raw[0]
     else:
-        text_emb = raw   # [T, H]
+        text_emb = raw  # [T, H]
 
-    H    = text_emb.shape[-1]
+    H = text_emb.shape[-1]
     dtype = text_emb.dtype
 
     # ── Step 2: scatter into full [S, H] ────────────────────────────────────
@@ -158,24 +169,27 @@ def align_bagel_embeddings(
         packed_seq[packed_seq_params.packed_vae_token_indexes.to(device)] = visual_latents
 
     # ── Steps 3-5: MoT compaction + CP sharding ─────────────────────────────
-    und_idx = packed_seq_params.local_und_token_indexes   # [actual_lund]
-    gen_idx = packed_seq_params.local_gen_token_indexes   # [actual_lgen]
-    Lund    = packed_seq_params.padded_und_seqlen
-    Lgen    = packed_seq_params.padded_gen_seqlen
+    und_idx = packed_seq_params.local_und_token_indexes  # [actual_lund]
+    gen_idx = packed_seq_params.local_gen_token_indexes  # [actual_lgen]
+    Lund = packed_seq_params.padded_und_seqlen
+    Lgen = packed_seq_params.padded_gen_seqlen
 
     # Step 3: compact [S, H] → [Lund+Lgen, 1, H]
     decoder_input = torch.cat(
-        [gather_pad_to_length(packed_seq, und_idx, Lund),
-         gather_pad_to_length(packed_seq, gen_idx, Lgen)], dim=0
-    ).unsqueeze(1)  # [Lund+Lgen, 1, H]
+        [
+            gather_pad_to_length(packed_seq, und_idx, Lund),
+            gather_pad_to_length(packed_seq, gen_idx, Lgen),
+        ],
+        dim=0,
+    ).unsqueeze(
+        1
+    )  # [Lund+Lgen, 1, H]
 
-
-    return dict(
-        decoder_input=decoder_input,
-    )
+    return dict(decoder_input=decoder_input)
 
 
 class BagelMimoModel(MimoModel):
+    """MIMO wrapper for BAGEL text, vision, and diffusion modules."""
 
     def __init__(
         self,
@@ -219,10 +233,12 @@ class BagelMimoModel(MimoModel):
         else:
             self.share_embeddings_and_output_weights = False
 
-    def _get_language_model_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def _get_language_model_embeddings(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
         """Get embeddings from the language model.
 
-        Handles both HuggingFace (has embedding method) and Megatron Core (has get_word_embeddings method).
+        Handles both HuggingFace and Megatron Core embedding APIs.
 
         Args:
             input_ids: [batch_size, seq_len]
@@ -237,10 +253,14 @@ class BagelMimoModel(MimoModel):
 
         # Check for Megatron Core BagelMCoreModel style
         if hasattr(self.language_model, 'get_word_embeddings'):
-            return self.language_model.get_word_embeddings(input_ids=input_ids, position_ids=position_ids)
+            return self.language_model.get_word_embeddings(
+                input_ids=input_ids, position_ids=position_ids
+            )
 
         # Fallback: Megatron Core GPTModel style - use embedding module directly
-        if hasattr(self.language_model, 'embedding') and hasattr(self.language_model.embedding, 'word_embeddings'):
+        if hasattr(self.language_model, 'embedding') and hasattr(
+            self.language_model.embedding, 'word_embeddings'
+        ):
             embeddings = self.language_model.embedding.word_embeddings(input_ids)
             return embeddings.transpose(0, 1).contiguous()
 
@@ -274,11 +294,15 @@ class BagelMimoModel(MimoModel):
 
         text_embeddings = self._get_language_model_embeddings(
             input_ids=input_ids_text, position_ids=position_ids_text
-        ).squeeze(1)  # Shape: [num_text_tokens, hidden_dim]
+        ).squeeze(
+            1
+        )  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
-    def get_all_text_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Get embeddings for ALL tokens in input_ids (for Bagel-style where input_ids contains only text).
+    def get_all_text_embeddings(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Get embeddings for all input_ids tokens in Bagel text-only batches.
 
         Args:
             input_ids: Input token IDs of shape [batch_size, seq_len]
@@ -289,7 +313,9 @@ class BagelMimoModel(MimoModel):
         """
         text_embeddings = self._get_language_model_embeddings(
             input_ids=input_ids, position_ids=position_ids
-        ).squeeze(1)  # Shape: [num_tokens, hidden_dim]
+        ).squeeze(
+            1
+        )  # Shape: [num_tokens, hidden_dim]
         return text_embeddings
 
     def align_embeddings_by_token_positions(
@@ -318,8 +344,6 @@ class BagelMimoModel(MimoModel):
             packed_seq_params=packed_seq_params,
         )
 
-
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -343,10 +367,6 @@ class BagelMimoModel(MimoModel):
         attn_modes: Optional[List[str]] = None,
         packed_seq_params: Optional[MoTPackedSeqParams] = None,
     ):
-        # if packed_text_indexes is not None:
-        #     print("MimoModel packed_text_indexes:", packed_text_indexes.shape, packed_text_indexes.sum(), packed_text_indexes.flatten()[:10], torch.any(torch.isnan(packed_text_indexes)))
-        # if packed_vit_token_indexes is not None:
-        #     print("MimoModel packed_vit_token_indexes:", packed_vit_token_indexes.shape)
         """Forward pass through the multimodal model.
 
         Args:
@@ -395,22 +415,31 @@ class BagelMimoModel(MimoModel):
                 ):
                     logger.debug(f"Processing {modality_name} modality")
                     embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                    assert embeddings is not None, f"embeddings is None for modality_name: {modality_name}"
+                    assert (
+                        embeddings is not None
+                    ), f"embeddings is None for modality_name: {modality_name}"
                     if embeddings is not None:
                         # All embeddings are now in the format [num_tokens, hidden_dim]
                         modality_embeddings[modality_name] = embeddings
                         if modality_name == "images":
-                            # In Bagel, there wouldn't be much vit images to process during each batch, so here we can not shard it according to the image batch size.
-                            # because FA can not accept a empty input, and FSDP can not accept skip vit fwd path.
-                            # Will not shard the vit seq len shard and packed vit token, and keep same vit input on each rank.
+                            # BAGEL batches have few ViT images, and FlexAttention cannot
+                            # accept an empty input. Keep ViT input replicated on each rank
+                            # instead of sharding by image batch size.
                             # if self.cp_size > 1:
-                            #     # all gather embeddings to all ranks, since different CP ranks process different images
-                            #     embeddings = all_gather_image_embeddings(embeddings, vit_tokens_encoded_per_cp=packed_seq_params.vit_tokens_encoded_per_cp, group=self.cp_group)
+                            #     embeddings = all_gather_image_embeddings(
+                            #         embeddings,
+                            #         vit_tokens_encoded_per_cp=(
+                            #             packed_seq_params.vit_tokens_encoded_per_cp
+                            #         ),
+                            #         group=self.cp_group,
+                            #     )
                             vision_embeddings = embeddings
                         if modality_name == "diffusion":
                             visual_latents = embeddings
                         logger.debug(
-                            f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
+                            "Generated embeddings for %s with shape %s",
+                            modality_name,
+                            embeddings.shape,
                         )
 
         rank = dist.get_rank()
@@ -463,7 +492,8 @@ class BagelMimoModel(MimoModel):
             )
 
             # Step 11: Compute MSE loss at specific indexes.
-            # last_hidden_state is compact [Lund+Lgen, H]; gen tokens are at [Lund:Lund+actual_lgen].
+            # last_hidden_state is compact [Lund+Lgen, H].
+            # Gen tokens are at [Lund:Lund+actual_lgen].
             # Filter mse_loss_indexes to those on this rank via local_gen_token_indexes.
             # Always call llm2vae so it participates in backward (FSDP correctness).
             # gen_loss_mask/vis_gen_target are always tensors from the dataloader;
@@ -473,9 +503,9 @@ class BagelMimoModel(MimoModel):
             # and computes the MSE loss; middle stages skip both.
             if self.post_process:
                 Lund = packed_seq_params.padded_und_seqlen
-                hidden_state = lm_output['last_hidden_state'] #[U+G,H]
+                hidden_state = lm_output['last_hidden_state']  # [U+G,H]
                 vis_gen_target = vis_gen_target.to(hidden_state.device)
-                gen_hidden_state = hidden_state[Lund:] #[G, H]
+                gen_hidden_state = hidden_state[Lund:]  # [G, H]
                 noise_pred = self.modality_submodules['diffusion'].llm2vae(gen_hidden_state)
                 mse = (noise_pred - vis_gen_target) ** 2 * gen_loss_mask.unsqueeze(1)
                 lm_output['mse'] = mse
@@ -483,15 +513,18 @@ class BagelMimoModel(MimoModel):
         elif isinstance(self.language_model, BagelLLMHuggingFaceModel):
             # Standard MIMO-style: combine embeddings based on special token positions
             # Get text embeddings (filtering out special tokens)
-            text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
             logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
             modality_embeddings["text"] = text_embeddings
 
             # 2. Merge embeddings from different modalities (HuggingFace special-token path)
             logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
+            # modality_embeddings values have shape [num_tokens, hidden_dim].
             combined_embeddings = super().align_embeddings_by_token_positions(
-                modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
+                modality_embeddings=modality_embeddings,
                 input_ids=input_ids,  # Pass in batch-first format [b, s]
                 special_token_ids=self.special_token_ids,
             )  # [s, b, h]
@@ -499,20 +532,20 @@ class BagelMimoModel(MimoModel):
 
             # 3. Forward pass through language model
             # Check if language model supports Bagel-style interface
-             # Bagel-style interface (HuggingFace models like BagelLLMHuggingFaceModel)
+            # Bagel-style interface (HuggingFace models like BagelLLMHuggingFaceModel)
             lm_output = self.language_model(
-                 decoder_input=combined_embeddings,
-                 sample_lens=sample_lens,
-                 attention_mask=attention_mask,
-                 packed_position_ids=packed_position_ids,
-                 ce_loss_indexes=ce_loss_indexes,
-                 packed_label_ids=packed_label_ids,
-                 split_lens=split_lens,
-                 attn_modes=attn_modes,
-              )
+                decoder_input=combined_embeddings,
+                sample_lens=sample_lens,
+                attention_mask=attention_mask,
+                packed_position_ids=packed_position_ids,
+                ce_loss_indexes=ce_loss_indexes,
+                packed_label_ids=packed_label_ids,
+                split_lens=split_lens,
+                attn_modes=attn_modes,
+            )
         else:
             raise ValueError(f"Unsupported language model type: {type(self.language_model)}")
-        
+
         logger.debug(f"Language model output: {type(lm_output)}")
         # Non-last PP stage: BagelMCoreModel returned the raw hidden-state tensor
         # so Megatron's pipeline schedule can ship it to the next stage. Return

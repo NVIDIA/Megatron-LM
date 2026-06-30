@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # MoT extension of PackedSeqParams.
 #
 # We intentionally avoid modifying megatron/core/packed_seq_params.py.
@@ -5,13 +7,12 @@
 # a drop-in replacement everywhere PackedSeqParams is accepted.
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.packed_seq_params import PackedSeqParams
-
 
 
 @dataclass
@@ -27,7 +28,8 @@ class MoTPackedSeqParams(PackedSeqParams):
         padded_*_seqlen         — uniform per-rank chunk size for balanced A2A
                                   Lund = ceil(U / cp_size), Lgen = ceil(G / cp_size)
     """
-    packed_vit_token_indexes: Optional[Tensor] = torch.tensor([]) # [V]  global vit token positions
+
+    packed_vit_token_indexes: Optional[Tensor] = torch.tensor([])  # [V]  global vit token positions
     packed_vae_token_indexes: Optional[Tensor] = torch.tensor([])  # [G]  global vae token positions
     packed_text_indexes: Optional[Tensor] = torch.tensor([])  # [T]  global text token positions
 
@@ -37,13 +39,15 @@ class MoTPackedSeqParams(PackedSeqParams):
 
     # local index arrays: actual (unpadded) slice for this CP rank
     # len(local_und_token_indexes) == actual und tokens on this rank (<= Lund)
-    local_und_token_indexes: Optional[Tensor] = torch.tensor([])   # [actual_lund]
-    local_gen_token_indexes: Optional[Tensor] = torch.tensor([])   # [actual_lgen]
+    local_und_token_indexes: Optional[Tensor] = torch.tensor([])  # [actual_lund]
+    local_gen_token_indexes: Optional[Tensor] = torch.tensor([])  # [actual_lgen]
 
     # padded per-rank chunk sizes (uniform across all ranks, required for A2A)
-    padded_und_seqlen: Optional[int] = 0            # Lund = ceil(U / cp_size)
-    padded_gen_seqlen: Optional[int] = 0            # Lgen = ceil(G / cp_size)
+    padded_und_seqlen: Optional[int] = 0  # Lund = ceil(U / cp_size)
+    padded_gen_seqlen: Optional[int] = 0  # Lgen = ceil(G / cp_size)
 
     # vit token seqlens before encoding
     # vit_token_seqlens: Optional[Tensor] = None  # [N_img]  vit token seqlens before encoding
-    vit_tokens_encoded_per_cp: Optional[List[int]] = field(default_factory=list)  # [cp_size]  vit tokens encoded per cp
+    vit_tokens_encoded_per_cp: Optional[List[int]] = field(
+        default_factory=list
+    )  # [cp_size]  vit tokens encoded per cp

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 BagelMCoreModel._forward_decoder accuracy and CP parity tests.
 
@@ -44,29 +46,26 @@ from torch.nn.functional import scaled_dot_product_attention as F_sdpa
 _ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
-_BAGEL_PKG  = os.path.join(_ROOT, "bagel-package")
-_BAGEL_SRC  = os.path.join(_BAGEL_PKG, "bagel")
+_BAGEL_PKG = os.path.join(_ROOT, "bagel-package")
+_BAGEL_SRC = os.path.join(_BAGEL_PKG, "bagel")
 
 for p in [_ROOT, _BAGEL_PKG, _BAGEL_SRC]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from megatron.core.models.bagel.attention_mot import (
-    SelfAttentionMoT,
-    SelfAttentionMoTSubmodules,
-)
-from megatron.core.models.bagel.transformer_mot_layer import (
-    MoTTransformerLayer,
-    MoTTransformerLayerSubmodules,
-)
+from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
+from megatron.core.models.bagel.bagel_mimo import align_bagel_embeddings
 from megatron.core.models.bagel.flex_attention import FlexAttention
+from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
     TransformerMoTBlock,
     TransformerMoTBlockSubmodules,
 )
-from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
-from megatron.core.models.bagel.bagel_mimo import align_bagel_embeddings
+from megatron.core.models.bagel.transformer_mot_layer import (
+    MoTTransformerLayer,
+    MoTTransformerLayerSubmodules,
+)
 
 
 def _align_and_shard(
@@ -85,7 +84,7 @@ def _align_and_shard(
 ) -> dict:
     """Wrapper around align_bagel_embeddings that also computes CP-sharded
     labels, loss_mask, and packed_position_ids for the given psp shard."""
-    psp.packed_text_indexes      = packed_text_indexes
+    psp.packed_text_indexes = packed_text_indexes
     psp.packed_vit_token_indexes = packed_vit_token_indexes
     psp.packed_vae_token_indexes = packed_vae_token_indexes
 
@@ -98,37 +97,38 @@ def _align_and_shard(
         packed_seq_params=psp,
     )
 
-    und  = psp.local_und_token_indexes
-    gen  = psp.local_gen_token_indexes
+    und = psp.local_und_token_indexes
+    gen = psp.local_gen_token_indexes
     Lund = psp.padded_und_seqlen
     Lgen = psp.padded_gen_seqlen
 
     def _gp(src, idx, tlen):
-        g = src[idx]; n = tlen - len(g)
+        g = src[idx]
+        n = tlen - len(g)
         return torch.cat([g, g[-1:].expand(n)]) if n > 0 else g
 
-    aligned['labels']    = labels_full[und]    if labels_full    is not None else None
+    aligned['labels'] = labels_full[und] if labels_full is not None else None
     aligned['loss_mask'] = loss_mask_full[und] if loss_mask_full is not None else None
     aligned['packed_position_ids'] = (
-        torch.cat([_gp(packed_position_ids, und, Lund),
-                   _gp(packed_position_ids, gen, Lgen)])
-        if packed_position_ids is not None else None
+        torch.cat([_gp(packed_position_ids, und, Lund), _gp(packed_position_ids, gen, Lgen)])
+        if packed_position_ids is not None
+        else None
     )
     return aligned
 
+
 # ── Optional bagel-package imports ───────────────────────────────────────────
 try:
-    from bagel.modeling.bagel.qwen2_navit import (
-        Qwen2Model,
-        Qwen2MoTDecoderLayer,
-        Qwen2Config as BagelQwen2Config,
-    )
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Config as BagelQwen2Config
+    from bagel.modeling.bagel.qwen2_navit import Qwen2Model, Qwen2MoTDecoderLayer
+
     HAVE_BAGEL_PKG = True
 except ImportError:
     HAVE_BAGEL_PKG = False
 
 try:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
     HAVE_WRAPPED_NORM = True
 except ImportError:
     HAVE_WRAPPED_NORM = False
@@ -146,31 +146,32 @@ from tests.unit_tests.test_utilities import Utils
 # ─────────────────────────────────────────────────────────────────────────────
 # Test dimensions
 # ─────────────────────────────────────────────────────────────────────────────
-HIDDEN_SIZE     = 256
+HIDDEN_SIZE = 256
 FFN_HIDDEN_SIZE = 512
-NUM_HEADS       = 4
-NUM_KV_HEADS    = 4
-HEAD_DIM        = HIDDEN_SIZE // NUM_HEADS   # 64
-NUM_LAYERS      = 2
-ROPE_THETA      = 10000.0
-VOCAB_SIZE      = 256
-MAX_SEQ_LEN     = 128
+NUM_HEADS = 4
+NUM_KV_HEADS = 4
+HEAD_DIM = HIDDEN_SIZE // NUM_HEADS  # 64
+NUM_LAYERS = 2
+ROPE_THETA = 10000.0
+VOCAB_SIZE = 256
+MAX_SEQ_LEN = 128
 
 # For CP=2 clean split: U=16 (div by 2), G=16 (div by 2)
-T_CLEAN, V_CLEAN, G_CLEAN = 8, 8, 16   # S=32, U=16
+T_CLEAN, V_CLEAN, G_CLEAN = 8, 8, 16  # S=32, U=16
 
 # For CP=2 padding: U=13 (not div by 2), G=11 (not div by 2)
-T_PAD, V_PAD, G_PAD = 7, 6, 11         # S=24, U=13
+T_PAD, V_PAD, G_PAD = 7, 6, 11  # S=24, U=13
 
 # For CE tests: no ViT tokens so CE positions are unambiguously within text_idx
 T_CE = 8
-G_CE_MIX, L_CE_MIX = 16, 4   # mixed:    S=24, U=8, 4 CE positions
-G_CE_UND, L_CE_UND =  0, 3   # und-only: S=8,  U=8, 3 CE positions
+G_CE_MIX, L_CE_MIX = 16, 4  # mixed:    S=24, U=8, 4 CE positions
+G_CE_UND, L_CE_UND = 0, 3  # und-only: S=8,  U=8, 3 CE positions
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_mcore_config() -> TransformerConfig:
     return TransformerConfig(
@@ -198,27 +199,29 @@ def _make_mcore_config() -> TransformerConfig:
 
 def _make_bagel_ref_config() -> "BagelQwen2Config":
     cfg = BagelQwen2Config()
-    cfg.torch_dtype      = torch.float16
-    cfg.hidden_size      = HIDDEN_SIZE
+    cfg.torch_dtype = torch.float16
+    cfg.hidden_size = HIDDEN_SIZE
     cfg.intermediate_size = FFN_HIDDEN_SIZE
     cfg.num_hidden_layers = NUM_LAYERS
     cfg.num_attention_heads = NUM_HEADS
     cfg.num_key_value_heads = NUM_KV_HEADS
-    cfg.qk_norm          = True
-    cfg.freeze_und       = False
-    cfg.rms_norm_eps     = 1e-6
-    cfg.hidden_act       = "silu"
-    cfg.layer_module     = "Qwen2MoTDecoderLayer"
-    cfg.rope_theta       = ROPE_THETA
-    cfg.vocab_size       = VOCAB_SIZE
+    cfg.qk_norm = True
+    cfg.freeze_und = False
+    cfg.rms_norm_eps = 1e-6
+    cfg.hidden_act = "silu"
+    cfg.layer_module = "Qwen2MoTDecoderLayer"
+    cfg.rope_theta = ROPE_THETA
+    cfg.vocab_size = VOCAB_SIZE
     return cfg
 
 
 def _make_llm_config():
     """Minimal llm_config to enable use_mo=True in BagelMCoreModel."""
+
     class _LLMConfig:
         layer_module = "Qwen2MoTDecoderLayer"
-        freeze_und   = False
+        freeze_und = False
+
     return _LLMConfig()
 
 
@@ -226,11 +229,13 @@ def _make_llm_config():
 # Model builders
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _build_bagel_mcore_model(mcore_cfg: TransformerConfig) -> BagelMCoreModel:
     """Build a small BagelMCoreModel (FlexAttention, cp picked from parallel state)."""
     # Standard GPTModel layer spec — will be replaced by MoT spec in _setup_mot_decoder.
     # Pass normalization="RMSNorm" so WrappedTorchNorm is used (compatible with RMSNorm config).
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+
     std_spec = get_gpt_layer_local_spec(normalization="RMSNorm")
 
     model = BagelMCoreModel(
@@ -260,7 +265,7 @@ def _swap_cp_groups(model: BagelMCoreModel, cp_group, cp_size: int):
         fa = layer.self_attention.core_attention
         saved.append((fa, fa.cp_group, fa.cp_size))
         fa.cp_group = cp_group
-        fa.cp_size  = cp_size
+        fa.cp_size = cp_size
     return saved
 
 
@@ -268,7 +273,7 @@ def _restore_cp_groups(saved):
     """Restore cp_group / cp_size saved by _swap_cp_groups."""
     for fa, cg, cs in saved:
         fa.cp_group = cg
-        fa.cp_size  = cs
+        fa.cp_size = cs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,21 +281,39 @@ def _restore_cp_groups(saved):
 # Used for accurate Qwen2 comparison (SDPA-based, fp16).
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BagelMatchingAttention(MegatronModule):
-    def __init__(self, config, layer_number, attn_mask_type, attention_type,
-                 softmax_scale=None, cp_comm_type=None, pg_collection=None, **kwargs):
-        super().__init__(config=config)
-        self.num_heads    = config.num_attention_heads
-        self.num_kv_heads = config.num_query_groups
-        self.head_dim     = config.kv_channels
 
-    def forward(self, query, key, value, attention_mask,
-                attn_mask_type=None, attention_bias=None, packed_seq_params=None):
+class BagelMatchingAttention(MegatronModule):
+    def __init__(
+        self,
+        config,
+        layer_number,
+        attn_mask_type,
+        attention_type,
+        softmax_scale=None,
+        cp_comm_type=None,
+        pg_collection=None,
+        **kwargs,
+    ):
+        super().__init__(config=config)
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_query_groups
+        self.head_dim = config.kv_channels
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+    ):
         seq_len, batch_size, num_heads, head_dim = query.shape
         num_kv_heads = key.shape[2]
         if num_kv_heads != num_heads:
             n_groups = num_heads // num_kv_heads
-            key   = key.repeat_interleave(n_groups, dim=2)
+            key = key.repeat_interleave(n_groups, dim=2)
             value = value.repeat_interleave(n_groups, dim=2)
         q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
         k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
@@ -318,19 +341,21 @@ def _make_sdpa_block(mcore_cfg: TransformerConfig) -> TransformerMoTBlock:
     )
     mlp_spec = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear,
-                                 linear_fc2=RowParallelLinear),
+        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
     )
     layer_sub = MoTTransformerLayerSubmodules(
         input_layernorm=WrappedTorchNorm,
         input_layernorm_gen=WrappedTorchNorm,
-        self_attention=ModuleSpec(module=SelfAttentionMoT,
-                                  params={"attn_mask_type": AttnMaskType.padding},
-                                  submodules=attn_sub),
+        self_attention=ModuleSpec(
+            module=SelfAttentionMoT,
+            params={"attn_mask_type": AttnMaskType.padding},
+            submodules=attn_sub,
+        ),
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=WrappedTorchNorm,
         pre_mlp_layernorm_gen=WrappedTorchNorm,
-        mlp=mlp_spec, mlp_gen=mlp_spec,
+        mlp=mlp_spec,
+        mlp_gen=mlp_spec,
         mlp_bda=get_bias_dropout_add,
     )
     block_sub = TransformerMoTBlockSubmodules(
@@ -345,44 +370,64 @@ def _make_sdpa_block(mcore_cfg: TransformerConfig) -> TransformerMoTBlock:
 # Weight copy helpers (reused from test_transformer_mot_block.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _hf_to_mcore_qkv_weight(q_w, k_w, v_w, ng, np_, hn):
-    h  = q_w.shape[1]
+    h = q_w.shape[1]
     nq = np_ // ng
-    q  = q_w.view(ng, nq * hn, h)
-    k  = k_w.view(ng, hn, h)
-    v  = v_w.view(ng, hn, h)
+    q = q_w.view(ng, nq * hn, h)
+    k = k_w.view(ng, hn, h)
+    v = v_w.view(ng, hn, h)
     return torch.cat([q, k, v], dim=1).reshape(ng * (nq + 2) * hn, h)
 
 
 def _hf_to_mcore_qkv_bias(q_b, k_b, v_b, ng, np_, hn):
     nq = np_ // ng
-    q  = q_b.view(ng, nq * hn)
-    k  = k_b.view(ng, hn)
-    v  = v_b.view(ng, hn)
+    q = q_b.view(ng, nq * hn)
+    k = k_b.view(ng, hn)
+    v = v_b.view(ng, hn)
     return torch.cat([q, k, v], dim=1).reshape(ng * (nq + 2) * hn)
 
 
 def _copy_attn_weights(bagel_attn, mcore_attn):
     np_ = bagel_attn.num_heads
-    ng  = bagel_attn.num_key_value_heads
-    hn  = bagel_attn.head_dim
-    for (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
-         lin_qkv, lin_proj, qln, kln) in [
-        (bagel_attn.q_proj,        bagel_attn.k_proj,        bagel_attn.v_proj,
-         bagel_attn.o_proj,        bagel_attn.q_norm,        bagel_attn.k_norm,
-         mcore_attn.linear_qkv,   mcore_attn.linear_proj,
-         mcore_attn.q_layernorm,  mcore_attn.k_layernorm),
-        (bagel_attn.q_proj_moe_gen, bagel_attn.k_proj_moe_gen, bagel_attn.v_proj_moe_gen,
-         bagel_attn.o_proj_moe_gen, bagel_attn.q_norm_moe_gen, bagel_attn.k_norm_moe_gen,
-         mcore_attn.linear_qkv_gen, mcore_attn.linear_proj_gen,
-         mcore_attn.q_layernorm_gen, mcore_attn.k_layernorm_gen),
+    ng = bagel_attn.num_key_value_heads
+    hn = bagel_attn.head_dim
+    for q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, lin_qkv, lin_proj, qln, kln in [
+        (
+            bagel_attn.q_proj,
+            bagel_attn.k_proj,
+            bagel_attn.v_proj,
+            bagel_attn.o_proj,
+            bagel_attn.q_norm,
+            bagel_attn.k_norm,
+            mcore_attn.linear_qkv,
+            mcore_attn.linear_proj,
+            mcore_attn.q_layernorm,
+            mcore_attn.k_layernorm,
+        ),
+        (
+            bagel_attn.q_proj_moe_gen,
+            bagel_attn.k_proj_moe_gen,
+            bagel_attn.v_proj_moe_gen,
+            bagel_attn.o_proj_moe_gen,
+            bagel_attn.q_norm_moe_gen,
+            bagel_attn.k_norm_moe_gen,
+            mcore_attn.linear_qkv_gen,
+            mcore_attn.linear_proj_gen,
+            mcore_attn.q_layernorm_gen,
+            mcore_attn.k_layernorm_gen,
+        ),
     ]:
         lin_qkv.weight.data.copy_(
-            _hf_to_mcore_qkv_weight(q_proj.weight.data, k_proj.weight.data,
-                                     v_proj.weight.data, ng=ng, np_=np_, hn=hn))
+            _hf_to_mcore_qkv_weight(
+                q_proj.weight.data, k_proj.weight.data, v_proj.weight.data, ng=ng, np_=np_, hn=hn
+            )
+        )
         lin_qkv.bias.data.copy_(
-            _hf_to_mcore_qkv_bias(q_proj.bias.data, k_proj.bias.data,
-                                   v_proj.bias.data, ng=ng, np_=np_, hn=hn))
+            _hf_to_mcore_qkv_bias(
+                q_proj.bias.data, k_proj.bias.data, v_proj.bias.data, ng=ng, np_=np_, hn=hn
+            )
+        )
         lin_proj.weight.data.copy_(o_proj.weight.data)
         if qln is not None and hasattr(q_norm, "weight"):
             qln.weight.data.copy_(q_norm.weight.data)
@@ -399,9 +444,15 @@ def _copy_mlp_weights(bagel_mlp, mcore_mlp):
 
 def _copy_layer_weights(bagel_layer, mcore_layer):
     mcore_layer.input_layernorm.weight.data.copy_(bagel_layer.input_layernorm.weight.data)
-    mcore_layer.input_layernorm_gen.weight.data.copy_(bagel_layer.input_layernorm_moe_gen.weight.data)
-    mcore_layer.pre_mlp_layernorm.weight.data.copy_(bagel_layer.post_attention_layernorm.weight.data)
-    mcore_layer.pre_mlp_layernorm_gen.weight.data.copy_(bagel_layer.post_attention_layernorm_moe_gen.weight.data)
+    mcore_layer.input_layernorm_gen.weight.data.copy_(
+        bagel_layer.input_layernorm_moe_gen.weight.data
+    )
+    mcore_layer.pre_mlp_layernorm.weight.data.copy_(
+        bagel_layer.post_attention_layernorm.weight.data
+    )
+    mcore_layer.pre_mlp_layernorm_gen.weight.data.copy_(
+        bagel_layer.post_attention_layernorm_moe_gen.weight.data
+    )
     _copy_attn_weights(bagel_layer.self_attn, mcore_layer.self_attention)
     _copy_mlp_weights(bagel_layer.mlp, mcore_layer.mlp)
     _copy_mlp_weights(bagel_layer.mlp_moe_gen, mcore_layer.mlp_gen)
@@ -420,12 +471,13 @@ def _copy_model_weights(bagel_model: "Qwen2Model", mcore_block: TransformerMoTBl
 # RoPE helpers (identity-RoPE for deterministic Qwen2 comparison)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _identity_rope(seq_len: int):
     """Zero-frequency RoPE → cos=1, sin=0 (identity rotation)."""
     mcore_rope = torch.zeros(seq_len, 1, 1, HEAD_DIM, dtype=torch.float32, device="cuda")
-    pos_ids    = torch.arange(seq_len, dtype=torch.long, device="cuda")
-    cos_id     = torch.ones (1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
-    sin_id     = torch.zeros(1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
+    pos_ids = torch.arange(seq_len, dtype=torch.long, device="cuda")
+    cos_id = torch.ones(1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
+    sin_id = torch.zeros(1, seq_len, HEAD_DIM, dtype=torch.float16, device="cuda")
     return pos_ids, mcore_rope, (cos_id, sin_id)
 
 
@@ -443,6 +495,7 @@ def _patch_bagel_rope(bagel_model, cos_sin):
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _make_packed_data(T, V, G, H, device, seed=42):
     """
     Build a random full packed sequence and index arrays.
@@ -458,21 +511,20 @@ def _make_packed_data(T, V, G, H, device, seed=42):
     torch.manual_seed(seed)
     S = T + V + G
     packed_seq = torch.randn(S, H, dtype=torch.float16, device=device)
-    pos_ids    = torch.arange(S, dtype=torch.long, device=device)
-    text_idx   = torch.arange(0,     T,   device=device)
-    vit_idx    = torch.arange(T,     T+V, device=device)
-    vae_idx    = torch.arange(T+V,   S,   device=device)
+    pos_ids = torch.arange(S, dtype=torch.long, device=device)
+    text_idx = torch.arange(0, T, device=device)
+    vit_idx = torch.arange(T, T + V, device=device)
+    vae_idx = torch.arange(T + V, S, device=device)
     # Full attention over all S tokens (simplest mask)
     block_mask = create_block_mask(
-        lambda b, h, q, kv: q >= 0,
-        B=1, H=1, Q_LEN=S, KV_LEN=S, device=device,
+        lambda b, h, q, kv: q >= 0, B=1, H=1, Q_LEN=S, KV_LEN=S, device=device
     )
     return packed_seq, pos_ids, block_mask, text_idx, vit_idx, vae_idx
 
 
-def _make_psp(und_idx, gen_idx,
-              local_und_idx=None, local_gen_idx=None,
-              Lund=None, Lgen=None) -> MoTPackedSeqParams:
+def _make_psp(
+    und_idx, gen_idx, local_und_idx=None, local_gen_idx=None, Lund=None, Lgen=None
+) -> MoTPackedSeqParams:
     if local_und_idx is None:
         local_und_idx = und_idx
     if local_gen_idx is None:
@@ -500,13 +552,15 @@ def _make_psp(und_idx, gen_idx,
 # [U+G, 1, H] input with the same RoPE.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, label: str):
     device = "cuda"
-    H  = HIDDEN_SIZE
-    S  = T + V + G
+    H = HIDDEN_SIZE
+    S = T + V + G
 
-    packed_seq, pos_ids, block_mask, text_idx, vit_idx, vae_idx = \
-        _make_packed_data(T, V, G, H, device)
+    packed_seq, pos_ids, block_mask, text_idx, vit_idx, vae_idx = _make_packed_data(
+        T, V, G, H, device
+    )
 
     und_idx = torch.cat([text_idx, vit_idx])
     gen_idx = vae_idx
@@ -541,11 +595,13 @@ def test_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, lab
         dec_out = dec_out[0]
 
     # Must be exactly equal (same model, same computation path)
-    assert dec_out.shape == ref_out.shape, \
-        f"[{label}] shape mismatch: {dec_out.shape} vs {ref_out.shape}"
-    assert torch.equal(dec_out, ref_out), \
-        (f"[{label}] _forward_decoder != manual compact+decoder. "
-         f"max_err={( dec_out - ref_out).abs().max().item():.3e}")
+    assert (
+        dec_out.shape == ref_out.shape
+    ), f"[{label}] shape mismatch: {dec_out.shape} vs {ref_out.shape}"
+    assert torch.equal(dec_out, ref_out), (
+        f"[{label}] _forward_decoder != manual compact+decoder. "
+        f"max_err={( dec_out - ref_out).abs().max().item():.3e}"
+    )
 
     print(f"  [scatter {label:12s}] PASS  S={S} U={U} G={Gsize}  shape={dec_out.shape}")
 
@@ -558,23 +614,23 @@ def test_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, lab
 # identity-RoPE and asserts < 1e-3 error.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_vs_qwen2(T: int, V: int, G: int, label: str):
-    assert HAVE_BAGEL_PKG,   "skip: bagel-package not available"
+    assert HAVE_BAGEL_PKG, "skip: bagel-package not available"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
     device = "cuda"
     H = HIDDEN_SIZE
     S = T + V + G
 
-    packed_seq, _, _, text_idx, vit_idx, vae_idx = \
-        _make_packed_data(T, V, G, H, device)
+    packed_seq, _, _, text_idx, vit_idx, vae_idx = _make_packed_data(T, V, G, H, device)
 
     und_idx = torch.cat([text_idx, vit_idx])
     gen_idx = vae_idx
     U, Gsize = len(und_idx), len(gen_idx)
 
     # Build models
-    bagel_cfg  = _make_bagel_ref_config()
-    mcore_cfg  = _make_mcore_config()
+    bagel_cfg = _make_bagel_ref_config()
+    mcore_cfg = _make_mcore_config()
     bagel_model = Qwen2Model(bagel_cfg).cuda().half().train()
     mcore_block = _make_sdpa_block(mcore_cfg)
     _copy_model_weights(bagel_model, mcore_block)
@@ -603,11 +659,10 @@ def test_vs_qwen2(T: int, V: int, G: int, label: str):
         )
 
     mcore_flat = mcore_out.squeeze(1)
-    assert not torch.any(torch.isnan(mcore_flat)),  f"[{label}] MCore has NaN"
-    assert not torch.any(torch.isnan(bagel_out)),   f"[{label}] Bagel has NaN"
+    assert not torch.any(torch.isnan(mcore_flat)), f"[{label}] MCore has NaN"
+    assert not torch.any(torch.isnan(bagel_out)), f"[{label}] Bagel has NaN"
     torch.testing.assert_close(
-        mcore_flat, bagel_out, atol=1e-3, rtol=1e-3,
-        msg=lambda m: f"[vs_qwen2/{label}] {m}",
+        mcore_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[vs_qwen2/{label}] {m}"
     )
     max_err = (mcore_flat - bagel_out).abs().max().item()
     print(f"  [qwen2   {label:12s}] PASS  U={U} G={Gsize}  max_err={max_err:.4f}")
@@ -621,25 +676,28 @@ def test_vs_qwen2(T: int, V: int, G: int, label: str):
 # cp_group nulled out in FlexAttention layers via deepcopy).
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
-                   cp_group, label: str, seed: int = 42):
-    rank    = dist.get_rank()
-    device  = "cuda"
-    H       = HIDDEN_SIZE
-    S       = T + V + G
+
+def run_cp2_parity(
+    model_cpN: BagelMCoreModel, T: int, V: int, G: int, cp_group, label: str, seed: int = 42
+):
+    rank = dist.get_rank()
+    device = "cuda"
+    H = HIDDEN_SIZE
+    S = T + V + G
     cp_size = cp_group.size()  # 2
 
-    packed_seq, pos_ids, block_mask, text_idx, vit_idx, vae_idx = \
-        _make_packed_data(T, V, G, H, device, seed=seed)
+    packed_seq, pos_ids, block_mask, text_idx, vit_idx, vae_idx = _make_packed_data(
+        T, V, G, H, device, seed=seed
+    )
 
-    und_idx = torch.cat([text_idx, vit_idx])   # [U]
-    gen_idx = vae_idx                           # [G]
+    und_idx = torch.cat([text_idx, vit_idx])  # [U]
+    gen_idx = vae_idx  # [G]
     U = len(und_idx)
     Gsize = len(gen_idx)
 
-    Lund = math.ceil(U      / cp_size)
-    Lgen = math.ceil(Gsize  / cp_size)
-    actual_lund = min(Lund, max(0, U     - rank * Lund))
+    Lund = math.ceil(U / cp_size)
+    Lgen = math.ceil(Gsize / cp_size)
+    actual_lund = min(Lund, max(0, U - rank * Lund))
     actual_lgen = min(Lgen, max(0, Gsize - rank * Lgen))
 
     local_und_idx = und_idx[rank * Lund : rank * Lund + actual_lund]
@@ -657,10 +715,12 @@ def run_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
 
     psp_cp1 = _make_psp(und_idx, gen_idx)
     psp_cpN = _make_psp(
-        und_idx, gen_idx,
+        und_idx,
+        gen_idx,
         local_und_idx=local_und_idx_pad,
         local_gen_idx=local_gen_idx_pad,
-        Lund=Lund, Lgen=Lgen,
+        Lund=Lund,
+        Lgen=Lgen,
     )
 
     full_3d = packed_seq.unsqueeze(1)  # [S, 1, H]
@@ -696,26 +756,38 @@ def run_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
     dist.barrier()
 
     # ── Compare real-token slices ─────────────────────────────────────────────
-    und_ref = ref_out[rank * Lund : rank * Lund + actual_lund]       # [actual_lund, 1, H]
+    und_ref = ref_out[rank * Lund : rank * Lund + actual_lund]  # [actual_lund, 1, H]
     gen_ref = ref_out[U + rank * Lgen : U + rank * Lgen + actual_lgen]  # [actual_lgen, 1, H]
 
-    und_got = cpN_out[:actual_lund]           # [actual_lund, 1, H]
+    und_got = cpN_out[:actual_lund]  # [actual_lund, 1, H]
     gen_got = cpN_out[Lund : Lund + actual_lgen]  # [actual_lgen, 1, H]
 
     atol = rtol = 1e-2
     if actual_lund > 0:
-        torch.testing.assert_close(und_got, und_ref, atol=atol, rtol=rtol,
-            msg=lambda m: f"[cp={cp_size}/{label} rank={rank}] UND: {m}")
+        torch.testing.assert_close(
+            und_got,
+            und_ref,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[cp={cp_size}/{label} rank={rank}] UND: {m}",
+        )
     if actual_lgen > 0:
-        torch.testing.assert_close(gen_got, gen_ref, atol=atol, rtol=rtol,
-            msg=lambda m: f"[cp={cp_size}/{label} rank={rank}] GEN: {m}")
+        torch.testing.assert_close(
+            gen_got,
+            gen_ref,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[cp={cp_size}/{label} rank={rank}] GEN: {m}",
+        )
 
     und_err = (und_got - und_ref).abs().max().item() if actual_lund > 0 else 0.0
     gen_err = (gen_got - gen_ref).abs().max().item() if actual_lgen > 0 else 0.0
-    print(f"  [cp={cp_size} {label:8s} rank={rank}] PASS  "
-          f"U={U} G={Gsize}  Lund={Lund} Lgen={Lgen}  "
-          f"actual=({actual_lund},{actual_lgen})  "
-          f"und_err={und_err:.4f}  gen_err={gen_err:.4f}")
+    print(
+        f"  [cp={cp_size} {label:8s} rank={rank}] PASS  "
+        f"U={U} G={Gsize}  Lund={Lund} Lgen={Lgen}  "
+        f"actual=({actual_lund},{actual_lgen})  "
+        f"und_err={und_err:.4f}  gen_err={gen_err:.4f}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -731,6 +803,7 @@ def run_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
 #   c. Zero CE when loss_mask is all-zero.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, label: str):
     """CE loss test.  V should be 0 so that ce_loss_indexes ⊆ text_idx is unambiguous."""
     device = "cuda"
@@ -738,33 +811,35 @@ def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, labe
     S = T + V + G
 
     torch.manual_seed(7)
-    _, pos_ids, block_mask, text_idx, vit_idx, vae_idx = \
-        _make_packed_data(T, V, G, H, device)
+    _, pos_ids, block_mask, text_idx, vit_idx, vae_idx = _make_packed_data(T, V, G, H, device)
 
     und_idx = torch.cat([text_idx, vit_idx])
     gen_idx = vae_idx
-    psp     = _make_psp(und_idx, gen_idx)
-    U       = len(psp.local_und_token_indexes)  # = T+V (CP=1)
+    psp = _make_psp(und_idx, gen_idx)
+    U = len(psp.local_und_token_indexes)  # = T+V (CP=1)
 
     # CE-active positions: sparse subset of text tokens only
-    ce_loss_indexes  = text_idx[:L_ce]                                      # [L_ce] ⊆ text_idx
+    ce_loss_indexes = text_idx[:L_ce]  # [L_ce] ⊆ text_idx
     packed_label_ids = torch.randint(0, VOCAB_SIZE, (L_ce,), device=device, dtype=torch.long)
 
     # Full-sequence label tensors (0 / 0.0 at non-CE positions)
-    labels_full    = torch.zeros(S, dtype=torch.long,    device=device)
+    labels_full = torch.zeros(S, dtype=torch.long, device=device)
     loss_mask_full = torch.zeros(S, dtype=torch.float16, device=device)
     if L_ce > 0:
-        labels_full[ce_loss_indexes]    = packed_label_ids
+        labels_full[ce_loss_indexes] = packed_label_ids
         loss_mask_full[ce_loss_indexes] = 1.0
 
-    input_ids   = torch.randint(0, VOCAB_SIZE, (1, T), device=device) if T > 0 else \
-                  torch.zeros(1, 0, device=device, dtype=torch.long)
-    vision_emb  = torch.randn(V, H, dtype=torch.float16, device=device) if V > 0 else None
+    input_ids = (
+        torch.randint(0, VOCAB_SIZE, (1, T), device=device)
+        if T > 0
+        else torch.zeros(1, 0, device=device, dtype=torch.long)
+    )
+    vision_emb = torch.randn(V, H, dtype=torch.float16, device=device) if V > 0 else None
     visual_lats = torch.randn(G, H, dtype=torch.float16, device=device) if G > 0 else None
 
     # Use align_bagel_embeddings to assemble compact decoder_input and pre-shard
     # CP-sensitive tensors before calling BagelMCoreModel.forward().
-    und_idx = psp.local_und_token_indexes   # [U] when CP=1 == packed_und_token_indexes
+    und_idx = psp.local_und_token_indexes  # [U] when CP=1 == packed_und_token_indexes
 
     def _run(labels_arg, lm_arg):
         aligned = _align_and_shard(
@@ -792,8 +867,8 @@ def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, labe
             )
 
     # ── (a) Value correctness ────────────────────────────────────────────────
-    out      = _run(labels_full, loss_mask_full)
-    ce_got   = out["ce"]
+    out = _run(labels_full, loss_mask_full)
+    ce_got = out["ce"]
     last_hid = out["last_hidden_state"]
 
     assert ce_got is not None, f"[{label}] ce should not be None when labels provided"
@@ -802,24 +877,32 @@ def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, labe
 
     # Local slices (what align_embeddings_by_token_positions selects for this rank)
     local_labels = labels_full[und_idx]
-    local_lm     = loss_mask_full[und_idx]
-    ce_mask      = local_lm > 0                               # [U] bool, True at CE positions
+    local_lm = loss_mask_full[und_idx]
+    ce_mask = local_lm > 0  # [U] bool, True at CE positions
 
     # CE at active positions must match manual recompute from last_hidden_state
     output_weight = model.shared_embedding_or_output_weight()
-    und_hid    = last_hid[:U].to(output_weight.dtype)
+    und_hid = last_hid[:U].to(output_weight.dtype)
     logits_all = F.linear(und_hid, output_weight)
-    expected_active = (F.cross_entropy(logits_all[ce_mask], local_labels[ce_mask],
-                                        reduction="none") * local_lm[ce_mask])
+    expected_active = (
+        F.cross_entropy(logits_all[ce_mask], local_labels[ce_mask], reduction="none")
+        * local_lm[ce_mask]
+    )
     torch.testing.assert_close(
-        ce_got.float(), expected_active.float(), atol=1e-4, rtol=1e-4,
+        ce_got.float(),
+        expected_active.float(),
+        atol=1e-4,
+        rtol=1e-4,
         msg=lambda m: f"[ce_loss/{label}] value mismatch: {m}",
     )
     if L_ce > 0:
         ref_logits = F.linear(und_hid[ce_mask].to(output_weight.dtype), output_weight)
         ref_ce = F.cross_entropy(ref_logits, packed_label_ids, reduction="none")
         torch.testing.assert_close(
-            ce_got.float(), ref_ce.float(), atol=1e-4, rtol=1e-4,
+            ce_got.float(),
+            ref_ce.float(),
+            atol=1e-4,
+            rtol=1e-4,
             msg=lambda m: f"[ce_loss/{label}] CE at active positions: {m}",
         )
 
@@ -828,11 +911,14 @@ def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, labe
 
     # ── (c) All-zero CE when loss_mask is all zeros ───────────────────────────
     zero_lm = torch.zeros(S, dtype=torch.float16, device=device)
-    assert torch.all(_run(labels_full, zero_lm)["ce"] == 0), \
-        f"[{label}] ce should be zero when loss_mask=0"
+    assert torch.all(
+        _run(labels_full, zero_lm)["ce"] == 0
+    ), f"[{label}] ce should be zero when loss_mask=0"
 
-    print(f"  [ce_loss  {label:12s}] PASS  U={U} G={len(gen_idx)} L_ce={L_ce}"
-          f"  sum_ce={ce_got.float().sum().item():.4f}")
+    print(
+        f"  [ce_loss  {label:12s}] PASS  U={U} G={len(gen_idx)} L_ce={L_ce}"
+        f"  sum_ce={ce_got.float().sum().item():.4f}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -846,26 +932,36 @@ def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, labe
 #   ii. AllReduce(sum of per-rank CE) == CP=1 reference total.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_ce_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
-                      L_ce: int, cp_group, label: str, seed: int = 42):
-    rank    = dist.get_rank()
-    device  = "cuda"
-    H       = HIDDEN_SIZE
-    S       = T + V + G
+
+def run_ce_cp2_parity(
+    model_cpN: BagelMCoreModel,
+    T: int,
+    V: int,
+    G: int,
+    L_ce: int,
+    cp_group,
+    label: str,
+    seed: int = 42,
+):
+    rank = dist.get_rank()
+    device = "cuda"
+    H = HIDDEN_SIZE
+    S = T + V + G
     cp_size = cp_group.size()
 
     torch.manual_seed(seed)
-    _, pos_ids, block_mask, text_idx, vit_idx, vae_idx = \
-        _make_packed_data(T, V, G, H, device, seed=seed)
+    _, pos_ids, block_mask, text_idx, vit_idx, vae_idx = _make_packed_data(
+        T, V, G, H, device, seed=seed
+    )
 
     und_idx = torch.cat([text_idx, vit_idx])
     gen_idx = vae_idx
     U = len(und_idx)
     Gsize = len(gen_idx)
 
-    Lund = math.ceil(U     / cp_size)
+    Lund = math.ceil(U / cp_size)
     Lgen = math.ceil(Gsize / cp_size)
-    actual_lund = min(Lund, max(0, U     - rank * Lund))
+    actual_lund = min(Lund, max(0, U - rank * Lund))
     actual_lgen = min(Lgen, max(0, Gsize - rank * Lgen))
 
     def _pad_idx(idx, tlen):
@@ -874,26 +970,31 @@ def run_ce_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
 
     psp_cp1 = _make_psp(und_idx, gen_idx)
     psp_cpN = _make_psp(
-        und_idx, gen_idx,
+        und_idx,
+        gen_idx,
         local_und_idx=_pad_idx(und_idx[rank * Lund : rank * Lund + actual_lund], Lund),
         local_gen_idx=_pad_idx(gen_idx[rank * Lgen : rank * Lgen + actual_lgen], Lgen),
-        Lund=Lund, Lgen=Lgen,
+        Lund=Lund,
+        Lgen=Lgen,
     )
 
     # CE data: sparse subset of first L_ce text tokens
     # Ensure the last und token (text_idx[-1]) is NOT a CE position so padding
     # slots (which repeat the last entry) carry loss_mask=0 and don't affect CE.
-    ce_loss_indexes  = text_idx[:L_ce]
+    ce_loss_indexes = text_idx[:L_ce]
     packed_label_ids = torch.randint(0, VOCAB_SIZE, (L_ce,), device=device, dtype=torch.long)
-    labels_full    = torch.zeros(S, dtype=torch.long,    device=device)
+    labels_full = torch.zeros(S, dtype=torch.long, device=device)
     loss_mask_full = torch.zeros(S, dtype=torch.float16, device=device)
     if L_ce > 0:
-        labels_full[ce_loss_indexes]    = packed_label_ids
+        labels_full[ce_loss_indexes] = packed_label_ids
         loss_mask_full[ce_loss_indexes] = 1.0
 
-    input_ids   = torch.randint(0, VOCAB_SIZE, (1, T), device=device) if T > 0 else \
-                  torch.zeros(1, 0, device=device, dtype=torch.long)
-    vision_emb  = torch.randn(V, H, dtype=torch.float16, device=device) if V > 0 else None
+    input_ids = (
+        torch.randint(0, VOCAB_SIZE, (1, T), device=device)
+        if T > 0
+        else torch.zeros(1, 0, device=device, dtype=torch.long)
+    )
+    vision_emb = torch.randn(V, H, dtype=torch.float16, device=device) if V > 0 else None
     visual_lats = torch.randn(G, H, dtype=torch.float16, device=device) if G > 0 else None
 
     embed_kwargs = dict(
@@ -926,7 +1027,7 @@ def run_ce_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
             loss_mask=aligned_cp1['loss_mask'],
         )
     _restore_cp_groups(saved)
-    ref_ce = ref_out["ce"]   # [U]: non-zero only at CE positions
+    ref_ce = ref_out["ce"]  # [U]: non-zero only at CE positions
 
     # ── CP=N run ─────────────────────────────────────────────────────────────
     aligned_cpN = _align_and_shard(psp=psp_cpN, **embed_kwargs)
@@ -939,16 +1040,19 @@ def run_ce_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
             labels=aligned_cpN['labels'],
             loss_mask=aligned_cpN['loss_mask'],
         )
-    local_ce = cpN_out["ce"]   # [actual_lund]: this rank's CE slice
+    local_ce = cpN_out["ce"]  # [actual_lund]: this rank's CE slice
 
     dist.barrier()
 
     # ── Check i: per-rank CE matches the same slice of the CP=1 reference ────
     # ref_ce[r*Lund : r*Lund + actual_lund] corresponds to this rank's real tokens.
-    ref_slice   = ref_ce[rank * Lund : rank * Lund + actual_lund]   # [actual_lund]
-    local_slice = local_ce[:actual_lund]                             # [actual_lund]
+    ref_slice = ref_ce[rank * Lund : rank * Lund + actual_lund]  # [actual_lund]
+    local_slice = local_ce[:actual_lund]  # [actual_lund]
     torch.testing.assert_close(
-        local_slice.float(), ref_slice.float(), atol=1e-2, rtol=1e-2,
+        local_slice.float(),
+        ref_slice.float(),
+        atol=1e-2,
+        rtol=1e-2,
         msg=lambda m: f"[ce_cp2/{label} rank={rank}] per-rank CE: {m}",
     )
 
@@ -957,25 +1061,31 @@ def run_ce_cp2_parity(model_cpN: BagelMCoreModel, T: int, V: int, G: int,
     dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=cp_group)
     ref_sum = ref_ce.float().sum()
     torch.testing.assert_close(
-        local_sum, ref_sum, atol=1e-2, rtol=1e-2,
+        local_sum,
+        ref_sum,
+        atol=1e-2,
+        rtol=1e-2,
         msg=lambda m: f"[ce_cp2/{label} rank={rank}] total CE: {m}",
     )
 
     err = (local_slice - ref_slice).abs().max().item()
-    print(f"  [ce_cp2   {label:8s} rank={rank}] PASS  "
-          f"U={U} G={Gsize} L_ce={L_ce}  Lund={Lund}  "
-          f"actual_lund={actual_lund}  err={err:.4f}  sum={local_sum.item():.4f}")
+    print(
+        f"  [ce_cp2   {label:8s} rank={rank}] PASS  "
+        f"U={U} G={Gsize} L_ce={L_ce}  Lund={Lund}  "
+        f"actual_lund={actual_lund}  err={err:.4f}  sum={local_sum.item():.4f}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main():
     dist.init_process_group("nccl")
-    rank       = dist.get_rank()
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    cp_size    = min(world_size, 2)
+    cp_size = min(world_size, 2)
     torch.cuda.set_device(rank)
 
     # Initialize Megatron parallel state (CP group is registered here)
@@ -995,15 +1105,15 @@ def main():
     model_acc.train()
 
     test_scatter_correctness(model_acc, T_CLEAN, V_CLEAN, G_CLEAN, "clean")
-    test_scatter_correctness(model_acc, T_PAD,   V_PAD,   G_PAD,   "padding")
+    test_scatter_correctness(model_acc, T_PAD, V_PAD, G_PAD, "padding")
 
     # ── Test 2: vs Qwen2 reference ────────────────────────────────────────────
     if HAVE_BAGEL_PKG and HAVE_WRAPPED_NORM:
         if rank == 0:
             print("\n=== Test 2: Qwen2 accuracy ===")
         test_vs_qwen2(T_CLEAN, V_CLEAN, G_CLEAN, "clean")
-        test_vs_qwen2(0,       0,       G_CLEAN, "gen-only")
-        test_vs_qwen2(T_CLEAN, V_CLEAN, 0,       "und-only")
+        test_vs_qwen2(0, 0, G_CLEAN, "gen-only")
+        test_vs_qwen2(T_CLEAN, V_CLEAN, 0, "und-only")
     else:
         if rank == 0:
             print("\n=== Test 2: Qwen2 accuracy — SKIPPED (bagel-package not available) ===")
@@ -1013,7 +1123,7 @@ def main():
         print("\n=== Test 4a: CE loss correctness (CP=1) ===")
     test_ce_loss(model_acc, T_CE, 0, G_CE_MIX, L_CE_MIX, "mixed")
     test_ce_loss(model_acc, T_CE, 0, G_CE_UND, L_CE_UND, "und-only")
-    test_ce_loss(model_acc, T_CE, 0, G_CE_MIX, 0,        "no-CE")
+    test_ce_loss(model_acc, T_CE, 0, G_CE_MIX, 0, "no-CE")
 
     # ── Test 3: CP=2 parity ──────────────────────────────────────────────────
     if world_size >= 2:
@@ -1028,7 +1138,7 @@ def main():
         cp_group = dist.new_group(list(range(world_size)))
 
         run_cp2_parity(model_cp, T_CLEAN, V_CLEAN, G_CLEAN, cp_group, "clean", seed=42)
-        run_cp2_parity(model_cp, T_PAD,   V_PAD,   G_PAD,   cp_group, "padding", seed=77)
+        run_cp2_parity(model_cp, T_PAD, V_PAD, G_PAD, cp_group, "padding", seed=77)
 
         dist.barrier()
         if rank == 0:
@@ -1037,7 +1147,7 @@ def main():
         # ── Test 4b: CE loss CP=2 parity ─────────────────────────────────────
         if rank == 0:
             print("\n=== Test 4b: CE loss CP=2 parity ===")
-        run_ce_cp2_parity(model_cp, T_CE, 0, G_CE_MIX, L_CE_MIX, cp_group, "mixed",    seed=42)
+        run_ce_cp2_parity(model_cp, T_CE, 0, G_CE_MIX, L_CE_MIX, cp_group, "mixed", seed=42)
         run_ce_cp2_parity(model_cp, T_CE, 0, G_CE_UND, L_CE_UND, cp_group, "und-only", seed=77)
 
         dist.barrier()

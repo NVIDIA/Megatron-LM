@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 Combined unit test for SelfAttentionMoT.
 
@@ -43,25 +45,22 @@ sys.path.insert(0, _BAGEL_PKG)
 sys.path.insert(0, _BAGEL_SRC)
 
 
-
 from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
-from megatron.core.models.bagel.flex_attention import FlexAttention               # noqa: E402
-from megatron.core.models.bagel.attention_mot import (                            # noqa: E402
+import megatron.core.parallel_state as mpu  # noqa: E402
+from megatron.core.models.bagel.attention_mot import (  # noqa: E402
     SelfAttentionMoT,
     SelfAttentionMoTSubmodules,
 )
-
-import megatron.core.parallel_state as mpu                              # noqa: E402
-from megatron.core.tensor_parallel.layers import (                      # noqa: E402
+from megatron.core.models.bagel.flex_attention import FlexAttention  # noqa: E402
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
+from megatron.core.tensor_parallel.layers import (  # noqa: E402
     ColumnParallelLinear,
     RowParallelLinear,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
-from megatron.core.transformer.enums import AttnMaskType                # noqa: E402
+from megatron.core.transformer.enums import AttnMaskType  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
-
 from tests.unit_tests.test_utilities import Utils  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,8 +88,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIGS = {
-    2: SimpleNamespace(u=8,  g=4,  u_und=8,  u_gen=4,  nh=4, hd=32),  # H=128
-    4: SimpleNamespace(u=8,  g=8,  u_und=8,  u_gen=8,  nh=4, hd=32),  # H=128
+    2: SimpleNamespace(u=8, g=4, u_und=8, u_gen=4, nh=4, hd=32),  # H=128
+    4: SimpleNamespace(u=8, g=8, u_und=8, u_gen=8, nh=4, hd=32),  # H=128
     8: SimpleNamespace(u=16, g=16, u_und=16, u_gen=16, nh=8, hd=32),  # H=256
 }
 
@@ -115,9 +114,7 @@ class _PGC:
 def _block_mask(seq_len: int, device: str):
     """Full-attention BlockMask over seq_len tokens."""
     return create_block_mask(
-        lambda b, h, q, kv: q >= 0,
-        B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len,
-        device=device,
+        lambda b, h, q, kv: q >= 0, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len, device=device
     )
 
 
@@ -242,8 +239,8 @@ def _hf_to_mcore_qkv_weight(q_w, k_w, v_w, ng: int, np: int, hn: int):
     h = q_w.shape[1]
     nq = np // ng  # query heads per group
     q = q_w.view(ng, nq * hn, h)  # [ng, nq*hn, h]
-    k = k_w.view(ng, hn, h)       # [ng, hn,    h]
-    v = v_w.view(ng, hn, h)       # [ng, hn,    h]
+    k = k_w.view(ng, hn, h)  # [ng, hn,    h]
+    v = v_w.view(ng, hn, h)  # [ng, hn,    h]
     qkv = torch.cat([q, k, v], dim=1)  # [ng, (nq+2)*hn, h]
     return qkv.reshape(ng * (nq + 2) * hn, h)
 
@@ -259,8 +256,7 @@ def _hf_to_mcore_qkv_bias(q_b, k_b, v_b, ng: int, np: int, hn: int):
 
 
 def _copy_weights_bagel_to_mcore(
-    bagel_attn: "PackedAttentionMoT",
-    mcore_attn: SelfAttentionMoT,
+    bagel_attn: "PackedAttentionMoT", mcore_attn: SelfAttentionMoT
 ) -> None:
     """
     Copy weights from PackedAttentionMoT to SelfAttentionMoT,
@@ -270,32 +266,41 @@ def _copy_weights_bagel_to_mcore(
     ng = bagel_attn.num_key_value_heads
     hn = bagel_attn.head_dim
 
-    for (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, linear_qkv, linear_proj, qln, kln) in [
+    for q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, linear_qkv, linear_proj, qln, kln in [
         (
-            bagel_attn.q_proj, bagel_attn.k_proj, bagel_attn.v_proj, bagel_attn.o_proj,
-            bagel_attn.q_norm, bagel_attn.k_norm,
-            mcore_attn.linear_qkv, mcore_attn.linear_proj,
-            mcore_attn.q_layernorm, mcore_attn.k_layernorm,
+            bagel_attn.q_proj,
+            bagel_attn.k_proj,
+            bagel_attn.v_proj,
+            bagel_attn.o_proj,
+            bagel_attn.q_norm,
+            bagel_attn.k_norm,
+            mcore_attn.linear_qkv,
+            mcore_attn.linear_proj,
+            mcore_attn.q_layernorm,
+            mcore_attn.k_layernorm,
         ),
         (
-            bagel_attn.q_proj_moe_gen, bagel_attn.k_proj_moe_gen,
-            bagel_attn.v_proj_moe_gen, bagel_attn.o_proj_moe_gen,
-            bagel_attn.q_norm_moe_gen, bagel_attn.k_norm_moe_gen,
-            mcore_attn.linear_qkv_gen, mcore_attn.linear_proj_gen,
-            mcore_attn.q_layernorm_gen, mcore_attn.k_layernorm_gen,
+            bagel_attn.q_proj_moe_gen,
+            bagel_attn.k_proj_moe_gen,
+            bagel_attn.v_proj_moe_gen,
+            bagel_attn.o_proj_moe_gen,
+            bagel_attn.q_norm_moe_gen,
+            bagel_attn.k_norm_moe_gen,
+            mcore_attn.linear_qkv_gen,
+            mcore_attn.linear_proj_gen,
+            mcore_attn.q_layernorm_gen,
+            mcore_attn.k_layernorm_gen,
         ),
     ]:
         # QKV weights → interleaved Megatron layout
         qkv_w = _hf_to_mcore_qkv_weight(
-            q_proj.weight.data, k_proj.weight.data, v_proj.weight.data,
-            ng=ng, np=np, hn=hn,
+            q_proj.weight.data, k_proj.weight.data, v_proj.weight.data, ng=ng, np=np, hn=hn
         )
         linear_qkv.weight.data.copy_(qkv_w)
 
         # QKV biases
         qkv_b = _hf_to_mcore_qkv_bias(
-            q_proj.bias.data, k_proj.bias.data, v_proj.bias.data,
-            ng=ng, np=np, hn=hn,
+            q_proj.bias.data, k_proj.bias.data, v_proj.bias.data, ng=ng, np=np, hn=hn
         )
         linear_qkv.bias.data.copy_(qkv_b)
 
@@ -438,15 +443,16 @@ class TestSelfAttentionMoTAccuracy:
 
         with torch.no_grad():
             mcore_out, _ = mcore_attn._forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         mcore_out_flat = mcore_out.squeeze(1)  # [s, 1, h] → [s, h]
 
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-2, rtol=1e-2,
+            mcore_out_flat,
+            bagel_out,
+            atol=1e-2,
+            rtol=1e-2,
             msg=lambda msg: f"[und-only] Mismatch: {msg}",
         )
 
@@ -476,15 +482,16 @@ class TestSelfAttentionMoTAccuracy:
 
         with torch.no_grad():
             mcore_out, _ = mcore_attn._forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         mcore_out_flat = mcore_out.squeeze(1)
 
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-2, rtol=1e-2,
+            mcore_out_flat,
+            bagel_out,
+            atol=1e-2,
+            rtol=1e-2,
             msg=lambda msg: f"[gen-only] Mismatch: {msg}",
         )
 
@@ -512,9 +519,7 @@ class TestSelfAttentionMoTAccuracy:
 
         with torch.no_grad():
             mcore_out, _ = mcore_attn._forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         mcore_out_flat = mcore_out.squeeze(1)
@@ -523,7 +528,10 @@ class TestSelfAttentionMoTAccuracy:
         assert torch.all(~torch.isnan(bagel_out)), "bagel output contains NaN"
 
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-2, rtol=1e-2,
+            mcore_out_flat,
+            bagel_out,
+            atol=1e-2,
+            rtol=1e-2,
             msg=lambda msg: f"[mixed] Mismatch: {msg}",
         )
 
@@ -542,9 +550,7 @@ class TestSelfAttentionMoTAccuracy:
 
         with torch.no_grad():
             out_mixed, _ = mcore_attn._forward_train(
-                hidden_states=hidden_states,
-                attention_mask=bm,
-                packed_seq_params=psp,
+                hidden_states=hidden_states, attention_mask=bm, packed_seq_params=psp
             )
 
         out_flat = out_mixed.squeeze(1)  # [s, h]
@@ -602,15 +608,24 @@ class TestSelfAttentionMoTAccuracy:
             mcore_v = mcore_v.squeeze(1).reshape(seq_len, ng * hn)
 
         torch.testing.assert_close(
-            mcore_q, bagel_q, atol=1e-3, rtol=1e-3,
+            mcore_q,
+            bagel_q,
+            atol=1e-3,
+            rtol=1e-3,
             msg=lambda msg: f"Query projection mismatch: {msg}",
         )
         torch.testing.assert_close(
-            mcore_k, bagel_k, atol=1e-3, rtol=1e-3,
+            mcore_k,
+            bagel_k,
+            atol=1e-3,
+            rtol=1e-3,
             msg=lambda msg: f"Key projection mismatch: {msg}",
         )
         torch.testing.assert_close(
-            mcore_v, bagel_v, atol=1e-3, rtol=1e-3,
+            mcore_v,
+            bagel_v,
+            atol=1e-3,
+            rtol=1e-3,
             msg=lambda msg: f"Value projection mismatch: {msg}",
         )
 
@@ -631,12 +646,12 @@ def run_cp_parity_test(u, g, nh, hd, tp_group, cp_group, seed=42):
       - Output shape: [Lund+Lgen, 1, hidden]
       - Forward parity: real und and gen token outputs match cp=1 within atol=1e-2
     """
-    rank    = dist.get_rank()
-    device  = "cuda"
+    rank = dist.get_rank()
+    device = "cuda"
     cp_size = cp_group.size()
-    hidden  = nh * hd
-    config  = _make_config_bf16(nh, hd)
-    bm      = _block_mask(u + g, device)
+    hidden = nh * hd
+    config = _make_config_bf16(nh, hd)
+    bm = _block_mask(u + g, device)
 
     torch.manual_seed(seed)
     hs_full = torch.randn(u + g, 1, hidden, dtype=torch.bfloat16, device=device)
@@ -658,37 +673,48 @@ def run_cp_parity_test(u, g, nh, hd, tp_group, cp_group, seed=42):
             chunk = torch.cat([chunk, hs.new_zeros(padded - actual, 1, hidden)], dim=0)
         return chunk
 
-    hs_local = torch.cat([
-        _pad_slice(hs_full, rank * Lund,   actual_lund, Lund),
-        _pad_slice(hs_full, u + rank*Lgen, actual_lgen, Lgen),
-    ], dim=0)  # [Lund+Lgen, 1, H]
+    hs_local = torch.cat(
+        [
+            _pad_slice(hs_full, rank * Lund, actual_lund, Lund),
+            _pad_slice(hs_full, u + rank * Lgen, actual_lgen, Lgen),
+        ],
+        dim=0,
+    )  # [Lund+Lgen, 1, H]
 
     psp_cp1 = MoTPackedSeqParams(
         qkv_format="thd",
-        packed_und_token_indexes=und_idx, packed_gen_token_indexes=gen_idx,
-        local_und_token_indexes=und_idx,  local_gen_token_indexes=gen_idx,
-        padded_und_seqlen=u, padded_gen_seqlen=g,
+        packed_und_token_indexes=und_idx,
+        packed_gen_token_indexes=gen_idx,
+        local_und_token_indexes=und_idx,
+        local_gen_token_indexes=gen_idx,
+        padded_und_seqlen=u,
+        padded_gen_seqlen=g,
     )
     psp_cpN = MoTPackedSeqParams(
         qkv_format="thd",
-        packed_und_token_indexes=und_idx, packed_gen_token_indexes=gen_idx,
-        local_und_token_indexes=local_und_idx, local_gen_token_indexes=local_gen_idx,
-        padded_und_seqlen=Lund, padded_gen_seqlen=Lgen,
+        packed_und_token_indexes=und_idx,
+        packed_gen_token_indexes=gen_idx,
+        local_und_token_indexes=local_und_idx,
+        local_gen_token_indexes=local_gen_idx,
+        padded_und_seqlen=Lund,
+        padded_gen_seqlen=Lgen,
     )
 
     model_seed = seed + 100
-    attn_cp1 = _make_attention(config, tp_group, None,     seed=model_seed)
+    attn_cp1 = _make_attention(config, tp_group, None, seed=model_seed)
     attn_cpN = _make_attention(config, tp_group, cp_group, seed=model_seed)
 
     with torch.no_grad():
-        out_cp1, _ = attn_cp1._forward_train(hs_full,  attention_mask=bm, packed_seq_params=psp_cp1)
+        out_cp1, _ = attn_cp1._forward_train(hs_full, attention_mask=bm, packed_seq_params=psp_cp1)
         out_cpN, _ = attn_cpN._forward_train(hs_local, attention_mask=bm, packed_seq_params=psp_cpN)
 
     dist.barrier()
 
-    assert out_cpN.shape == (Lund + Lgen, 1, hidden), (
-        f"cp={cp_size} rank={rank}: shape {out_cpN.shape} != ({Lund+Lgen},1,{hidden})"
-    )
+    assert out_cpN.shape == (
+        Lund + Lgen,
+        1,
+        hidden,
+    ), f"cp={cp_size} rank={rank}: shape {out_cpN.shape} != ({Lund+Lgen},1,{hidden})"
 
     und_ref = out_cp1[rank * Lund : rank * Lund + actual_lund]
     gen_ref = out_cp1[u + rank * Lgen : u + rank * Lgen + actual_lgen]
@@ -697,16 +723,28 @@ def run_cp_parity_test(u, g, nh, hd, tp_group, cp_group, seed=42):
 
     atol = rtol = 1e-2
     if actual_lund > 0:
-        torch.testing.assert_close(und_got, und_ref, atol=atol, rtol=rtol,
-            msg=lambda m: f"[SelfAttentionMoT cp={cp_size} rank={rank} UND]: {m}")
+        torch.testing.assert_close(
+            und_got,
+            und_ref,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[SelfAttentionMoT cp={cp_size} rank={rank} UND]: {m}",
+        )
     if actual_lgen > 0:
-        torch.testing.assert_close(gen_got, gen_ref, atol=atol, rtol=rtol,
-            msg=lambda m: f"[SelfAttentionMoT cp={cp_size} rank={rank} GEN]: {m}")
+        torch.testing.assert_close(
+            gen_got,
+            gen_ref,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m: f"[SelfAttentionMoT cp={cp_size} rank={rank} GEN]: {m}",
+        )
 
     und_err = (und_got - und_ref).abs().max().item() if actual_lund > 0 else 0.0
     gen_err = (gen_got - gen_ref).abs().max().item() if actual_lgen > 0 else 0.0
-    print(f"  [cp={cp_size} SelfAttentionMoT rank={rank:2d}] PASS  "
-          f"Lund={Lund} Lgen={Lgen}  und_err={und_err:.4f}  gen_err={gen_err:.4f}")
+    print(
+        f"  [cp={cp_size} SelfAttentionMoT rank={rank:2d}] PASS  "
+        f"Lund={Lund} Lgen={Lgen}  und_err={und_err:.4f}  gen_err={gen_err:.4f}"
+    )
 
 
 def run_single_branch_test(branch, u, g, nh, hd, tp_group, cp_group, seed=99):
@@ -721,14 +759,14 @@ def run_single_branch_test(branch, u, g, nh, hd, tp_group, cp_group, seed=99):
       C — Gradient flow: backward through real-token outputs gives non-zero grad
     """
     assert branch in ("und", "gen")
-    rank    = dist.get_rank()
-    device  = "cuda"
+    rank = dist.get_rank()
+    device = "cuda"
     cp_size = cp_group.size()
-    hidden  = nh * hd
-    config  = _make_config_bf16(nh, hd)
+    hidden = nh * hd
+    config = _make_config_bf16(nh, hd)
 
     total = u + g
-    bm    = _block_mask(total, device)
+    bm = _block_mask(total, device)
 
     torch.manual_seed(seed)
     hs_full = torch.randn(total, 1, hidden, dtype=torch.bfloat16, device=device)
@@ -749,60 +787,87 @@ def run_single_branch_test(branch, u, g, nh, hd, tp_group, cp_group, seed=99):
             chunk = torch.cat([chunk, hs.new_zeros(padded - actual, 1, hidden)], dim=0)
         return chunk
 
-    hs_local = torch.cat([
-        _pad_slice(hs_full, rank * Lund,   actual_lund, Lund),
-        _pad_slice(hs_full, u + rank*Lgen, actual_lgen, Lgen),
-    ], dim=0)
+    hs_local = torch.cat(
+        [
+            _pad_slice(hs_full, rank * Lund, actual_lund, Lund),
+            _pad_slice(hs_full, u + rank * Lgen, actual_lgen, Lgen),
+        ],
+        dim=0,
+    )
 
     psp_cp1 = MoTPackedSeqParams(
         qkv_format="thd",
-        packed_und_token_indexes=und_idx, packed_gen_token_indexes=gen_idx,
-        local_und_token_indexes=und_idx,  local_gen_token_indexes=gen_idx,
-        padded_und_seqlen=u, padded_gen_seqlen=g,
+        packed_und_token_indexes=und_idx,
+        packed_gen_token_indexes=gen_idx,
+        local_und_token_indexes=und_idx,
+        local_gen_token_indexes=gen_idx,
+        padded_und_seqlen=u,
+        padded_gen_seqlen=g,
     )
     psp_cpN = MoTPackedSeqParams(
         qkv_format="thd",
-        packed_und_token_indexes=und_idx, packed_gen_token_indexes=gen_idx,
-        local_und_token_indexes=local_und_idx, local_gen_token_indexes=local_gen_idx,
-        padded_und_seqlen=Lund, padded_gen_seqlen=Lgen,
+        packed_und_token_indexes=und_idx,
+        packed_gen_token_indexes=gen_idx,
+        local_und_token_indexes=local_und_idx,
+        local_gen_token_indexes=local_gen_idx,
+        padded_und_seqlen=Lund,
+        padded_gen_seqlen=Lgen,
     )
 
     model_seed = seed + 100
-    attn_cp1 = _make_attention(config, tp_group, None,     seed=model_seed)
+    attn_cp1 = _make_attention(config, tp_group, None, seed=model_seed)
     attn_cpN = _make_attention(config, tp_group, cp_group, seed=model_seed)
 
     # ── Check A+B: shape and forward parity ───────────────────────────────────
     with torch.no_grad():
-        out_cp1, _ = attn_cp1._forward_train(hs_full,  attention_mask=bm, packed_seq_params=psp_cp1)
+        out_cp1, _ = attn_cp1._forward_train(hs_full, attention_mask=bm, packed_seq_params=psp_cp1)
         out_cpN, _ = attn_cpN._forward_train(hs_local, attention_mask=bm, packed_seq_params=psp_cpN)
 
     dist.barrier()
 
     if branch == "und":
-        assert out_cpN.shape == (Lund, 1, hidden), \
-            f"[und-only] shape {out_cpN.shape} != ({Lund},1,{hidden})"
+        assert out_cpN.shape == (
+            Lund,
+            1,
+            hidden,
+        ), f"[und-only] shape {out_cpN.shape} != ({Lund},1,{hidden})"
         if actual_lund > 0:
             ref = out_cp1[rank * Lund : rank * Lund + actual_lund]
             got = out_cpN[:actual_lund]
-            torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2,
-                msg=lambda m: f"[und-only cp={cp_size} rank={rank}]: {m}")
+            torch.testing.assert_close(
+                got,
+                ref,
+                atol=1e-2,
+                rtol=1e-2,
+                msg=lambda m: f"[und-only cp={cp_size} rank={rank}]: {m}",
+            )
             err = (got - ref).abs().max().item()
         else:
             err = 0.0
     else:
-        assert out_cpN.shape == (Lgen, 1, hidden), \
-            f"[gen-only] shape {out_cpN.shape} != ({Lgen},1,{hidden})"
+        assert out_cpN.shape == (
+            Lgen,
+            1,
+            hidden,
+        ), f"[gen-only] shape {out_cpN.shape} != ({Lgen},1,{hidden})"
         if actual_lgen > 0:
             ref = out_cp1[rank * Lgen : rank * Lgen + actual_lgen]
             got = out_cpN[:actual_lgen]
-            torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2,
-                msg=lambda m: f"[gen-only cp={cp_size} rank={rank}]: {m}")
+            torch.testing.assert_close(
+                got,
+                ref,
+                atol=1e-2,
+                rtol=1e-2,
+                msg=lambda m: f"[gen-only cp={cp_size} rank={rank}]: {m}",
+            )
             err = (got - ref).abs().max().item()
         else:
             err = 0.0
 
-    print(f"  [cp={cp_size} {branch}-only fwd  rank={rank:2d}] PASS  "
-          f"Lund={Lund} Lgen={Lgen}  err={err:.4f}")
+    print(
+        f"  [cp={cp_size} {branch}-only fwd  rank={rank:2d}] PASS  "
+        f"Lund={Lund} Lgen={Lgen}  err={err:.4f}"
+    )
 
     # ── Check C: gradient flows into the active branch ────────────────────────
     hs_leaf = hs_local.detach().requires_grad_(True)
@@ -811,19 +876,16 @@ def run_single_branch_test(branch, u, g, nh, hd, tp_group, cp_group, seed=99):
     if branch == "und" and actual_lund > 0:
         out_g[:actual_lund].sum().backward()
         grad_sum = hs_leaf.grad[:actual_lund].abs().sum().item()
-        assert grad_sum > 0, \
-            f"[und-only cp={cp_size} rank={rank}]: und grad is zero"
+        assert grad_sum > 0, f"[und-only cp={cp_size} rank={rank}]: und grad is zero"
     elif branch == "gen" and actual_lgen > 0:
         out_g[:actual_lgen].sum().backward()
         grad_sum = hs_leaf.grad[:actual_lgen].abs().sum().item()
-        assert grad_sum > 0, \
-            f"[gen-only cp={cp_size} rank={rank}]: gen grad is zero"
+        assert grad_sum > 0, f"[gen-only cp={cp_size} rank={rank}]: gen grad is zero"
     else:
         grad_sum = 0.0
 
     dist.barrier()
-    print(f"  [cp={cp_size} {branch}-only grad rank={rank:2d}] PASS  "
-          f"grad_sum={grad_sum:.4f}")
+    print(f"  [cp={cp_size} {branch}-only grad rank={rank:2d}] PASS  " f"grad_sum={grad_sum:.4f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,23 +895,20 @@ def run_single_branch_test(branch, u, g, nh, hd, tp_group, cp_group, seed=99):
 
 def main():
     dist.init_process_group("nccl")
-    rank       = dist.get_rank()
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
 
-    mpu.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-    )
+    mpu.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
-    assert world_size in CONFIGS, (
-        f"No config for world_size={world_size}. Supported: {sorted(CONFIGS.keys())}"
-    )
+    assert (
+        world_size in CONFIGS
+    ), f"No config for world_size={world_size}. Supported: {sorted(CONFIGS.keys())}"
     cfg = CONFIGS[world_size]
 
     # Per-rank trivial tp group — ALL ranks must call new_group for every group.
     tp_groups = [dist.new_group(ranks=[r]) for r in range(world_size)]
-    tp_group  = tp_groups[rank]
+    tp_group = tp_groups[rank]
 
     # CP group spanning all ranks
     cp_group = dist.new_group(ranks=list(range(world_size)))
@@ -858,13 +917,13 @@ def main():
         print(f"\n{'='*60}")
         print(f"  SelfAttentionMoT CP parity test")
         print(f"  cp={world_size}  nh={cfg.nh}  hd={cfg.hd}  HIDDEN={cfg.nh*cfg.hd}")
-        print(f"  Mixed      : U={cfg.u}   G={cfg.g}"
-              f"  (Lund={math.ceil(cfg.u/world_size)}"
-              f"  Lgen={math.ceil(cfg.g/world_size)})")
-        print(f"  und-only   : U={cfg.u_und}  G=0"
-              f"  (Lund={math.ceil(cfg.u_und/world_size)})")
-        print(f"  gen-only   : U=0   G={cfg.u_gen}"
-              f"  (Lgen={math.ceil(cfg.u_gen/world_size)})")
+        print(
+            f"  Mixed      : U={cfg.u}   G={cfg.g}"
+            f"  (Lund={math.ceil(cfg.u/world_size)}"
+            f"  Lgen={math.ceil(cfg.g/world_size)})"
+        )
+        print(f"  und-only   : U={cfg.u_und}  G=0" f"  (Lund={math.ceil(cfg.u_und/world_size)})")
+        print(f"  gen-only   : U=0   G={cfg.u_gen}" f"  (Lgen={math.ceil(cfg.u_gen/world_size)})")
         print(f"{'='*60}")
 
     dist.barrier()

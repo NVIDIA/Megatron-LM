@@ -50,7 +50,6 @@ sys.path.insert(0, _BAGEL_SRC)
 
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
-
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 # Tiny config — keeps the model construction cheap. Same scale as
@@ -83,15 +82,15 @@ def _init_dist():
         dist.init_process_group(backend="nccl", world_size=1, rank=0)
         torch.cuda.set_device(0)
     from megatron.core import parallel_state as mpu
+
     if not mpu.model_parallel_is_initialized():
         mpu.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
         )
     # Required by ColumnParallelLinear's init under tensor-parallel — the
     # 'model-parallel-rng' tracker must be set up even at TP=1.
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
     model_parallel_cuda_manual_seed(42)
     yield
     # Leave the process group up — tearing down here breaks pytest's
@@ -130,14 +129,16 @@ def _make_llm_config():
     return cfg
 
 
-def _build_mcore_model(*, post_process: bool, vp_stage=None,
-                       virtual_pipeline_model_parallel_size=None) -> BagelMCoreModel:
+def _build_mcore_model(
+    *, post_process: bool, vp_stage=None, virtual_pipeline_model_parallel_size=None
+) -> BagelMCoreModel:
     """Build a tiny BagelMCoreModel exercising the requested stage flags.
 
     Uses the standard (non-MoT) GPT layer spec so we don't need to thread
     MoT-specific machinery just to validate the shape contract.
     """
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+
     cfg = _make_mcore_config()
     if virtual_pipeline_model_parallel_size is not None:
         cfg.virtual_pipeline_model_parallel_size = virtual_pipeline_model_parallel_size
@@ -206,9 +207,9 @@ def test_post_process_true_returns_dict():
     with torch.no_grad():
         out = model(**inputs)
     assert isinstance(out, dict), f"expected dict at post_process=True, got {type(out).__name__}"
-    assert "last_hidden_state" in out and "ce" in out, (
-        f"expected keys 'last_hidden_state','ce' in dict, got {list(out.keys())}"
-    )
+    assert (
+        "last_hidden_state" in out and "ce" in out
+    ), f"expected keys 'last_hidden_state','ce' in dict, got {list(out.keys())}"
     assert out["last_hidden_state"].dim() == 2, (
         f"last_hidden_state should be compacted [seq, hidden] (2-D), got "
         f"shape {tuple(out['last_hidden_state'].shape)}"
@@ -238,17 +239,20 @@ def test_post_process_false_returns_3d_tensor():
         f"int64 shape buffer (p2p_communication.py:194); a 2-D return causes "
         f"a (2,) vs (3,) mismatch and an indefinite NCCL hang."
     )
-    assert out.shape == (seq_len, 1, HIDDEN_SIZE), (
-        f"expected shape ({seq_len}, 1, {HIDDEN_SIZE}); got {tuple(out.shape)}"
-    )
+    assert out.shape == (
+        seq_len,
+        1,
+        HIDDEN_SIZE,
+    ), f"expected shape ({seq_len}, 1, {HIDDEN_SIZE}); got {tuple(out.shape)}"
 
 
 def test_vp_stage_propagation():
     """Phase D plumbing: vp_stage passed to BagelMCoreModel must reach
     GPTModel.vp_stage (and thus its inner TransformerMoTBlock).
     """
-    model = _build_mcore_model(post_process=False, vp_stage=1,
-                               virtual_pipeline_model_parallel_size=2)
+    model = _build_mcore_model(
+        post_process=False, vp_stage=1, virtual_pipeline_model_parallel_size=2
+    )
     assert hasattr(model, "vp_stage"), "GPTModel.vp_stage attribute should exist"
     assert model.vp_stage == 1, f"expected vp_stage=1, got {model.vp_stage!r}"
 
@@ -256,6 +260,6 @@ def test_vp_stage_propagation():
 def test_vp_stage_default_is_none():
     """Default vp_stage is None when no VP is configured (PP=1 or PP=2/VP=1)."""
     model = _build_mcore_model(post_process=True)
-    assert getattr(model, "vp_stage", "MISSING") is None, (
-        f"expected vp_stage to default to None, got {model.vp_stage!r}"
-    )
+    assert (
+        getattr(model, "vp_stage", "MISSING") is None
+    ), f"expected vp_stage to default to None, got {model.vp_stage!r}"

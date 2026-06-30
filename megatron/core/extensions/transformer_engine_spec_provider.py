@@ -39,9 +39,9 @@ class TESpecProvider(BackendSpecProvider):
 
     def __init__(self, fallback_to_eager_attn: bool = False, use_flex_attention: bool = False):
         super().__init__()
-        self.fallback_to_eager_attn = fallback_to_eager_attn    
+        self.fallback_to_eager_attn = fallback_to_eager_attn
         self.use_flex_attention = use_flex_attention
-        
+
     def linear(self) -> type:
         """Which linear module TE backend uses"""
         return TELinear

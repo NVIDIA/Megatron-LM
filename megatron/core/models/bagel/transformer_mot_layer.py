@@ -7,48 +7,34 @@ following the MoT architecture. It aligns with megatron.core.transformer.transfo
 """
 
 import logging
-from abc import ABC
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.utils import (
-    deprecate_inference_params,
-    get_pg_rank,
-    get_pg_size,
-    divide,
-    log_single_rank,
-    nvtx_range_pop,
-    nvtx_range_push,
-)
+from megatron.core.utils import get_pg_rank, nvtx_range_pop, nvtx_range_push
 
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from .mot_streams import mot_overlap_region
 
 # Import flex_attention for BlockMask support
 try:
     from torch.nn.attention.flex_attention import flex_attention
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    from torch.nn.functional import scaled_dot_product_attention
+
     torch._dynamo.config.cache_size_limit = 512
     torch._dynamo.config.accumulated_cache_size_limit = 4096
     flex_attention = torch.compile(flex_attention)
@@ -57,22 +43,7 @@ except ImportError:
     HAVE_FLEX_ATTENTION = False
     flex_attention = None
 
-try:
-    from megatron.core.extensions.transformer_engine import (
-        TELinear,
-        is_te_min_version,
-        set_save_original_input,
-    )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-    TELinear = None
-    is_te_min_version = lambda version: False
-    set_save_original_input = lambda module: None
-
 logger = logging.getLogger(__name__)
-
 
 
 # =============================================================================
@@ -235,7 +206,9 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.mlp.set_layer_number(self.layer_number)
 
         additional_mlp_gen_kwargs = self._get_mlp_kwargs(submodules.mlp_gen, pg_collection)
-        self.mlp_gen = build_module(submodules.mlp_gen, config=self.config, **additional_mlp_gen_kwargs)
+        self.mlp_gen = build_module(
+            submodules.mlp_gen, config=self.config, **additional_mlp_gen_kwargs
+        )
         if hasattr(self.mlp_gen, 'set_layer_number'):
             self.mlp_gen.set_layer_number(self.layer_number)
 
@@ -260,6 +233,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Check if this is a MoE layer (either und or gen path may be MoE)
         try:
             from megatron.core.transformer.moe.moe_layer import MoELayer
+
             self.is_moe_layer = isinstance(self.mlp, MoELayer) or isinstance(self.mlp_gen, MoELayer)
         except ImportError:
             self.is_moe_layer = False
@@ -279,8 +253,13 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             TEFusedMLP = None
 
         try:
-            from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+            from megatron.core.transformer.moe.experts import (
+                GroupedMLP,
+                SequentialMLP,
+                TEGroupedMLP,
+            )
             from megatron.core.transformer.moe.moe_layer import MoELayer
+
             moe_classes = (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP)
         except ImportError:
             moe_classes = ()
@@ -412,7 +391,10 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attn_out = torch.cat([attn_out[:Lund].detach(), attn_out[Lund:]], dim=0)
                 attention_output_with_bias = (attn_out, attn_bias)
             else:
-                attention_output_with_bias = torch.cat([attention_output_with_bias[:Lund].detach(), attention_output_with_bias[Lund:]], dim=0)
+                attention_output_with_bias = torch.cat(
+                    [attention_output_with_bias[:Lund].detach(), attention_output_with_bias[Lund:]],
+                    dim=0,
+                )
 
         # Bias-dropout-add
         nvtx_range_push(suffix="self_attn_bda")
@@ -473,8 +455,16 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Choose modules based on mode
         if mode == "gen":
-            input_layernorm = self.input_layernorm_gen if not isinstance(self.input_layernorm_gen, IdentityOp) else self.input_layernorm
-            pre_mlp_layernorm = self.pre_mlp_layernorm_gen if not isinstance(self.pre_mlp_layernorm_gen, IdentityOp) else self.pre_mlp_layernorm
+            input_layernorm = (
+                self.input_layernorm_gen
+                if not isinstance(self.input_layernorm_gen, IdentityOp)
+                else self.input_layernorm
+            )
+            pre_mlp_layernorm = (
+                self.pre_mlp_layernorm_gen
+                if not isinstance(self.pre_mlp_layernorm_gen, IdentityOp)
+                else self.pre_mlp_layernorm
+            )
             mlp = self.mlp_gen if not isinstance(self.mlp_gen, IdentityOp) else self.mlp
         else:
             input_layernorm = self.input_layernorm
@@ -531,8 +521,8 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Slices hidden_states[:Lund] for und and hidden_states[Lund:] for gen;
         applies separate layernorms and concatenates back.
         """
-        local_und_h = hidden_states[:Lund]    # [Lund, 1, h]
-        local_gen_h = hidden_states[Lund:]    # [Lgen, 1, h]
+        local_und_h = hidden_states[:Lund]  # [Lund, 1, h]
+        local_gen_h = hidden_states[Lund:]  # [Lgen, 1, h]
         ln_gen = (
             self.input_layernorm_gen
             if not isinstance(self.input_layernorm_gen, IdentityOp)
@@ -551,8 +541,8 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns compact [Lund+Lgen, 1, h].
         """
         residual = hidden_states
-        und_h = hidden_states[:Lund]    # [Lund, 1, h]
-        gen_h = hidden_states[Lund:]    # [Lgen, 1, h]
+        und_h = hidden_states[:Lund]  # [Lund, 1, h]
+        gen_h = hidden_states[Lund:]  # [Lgen, 1, h]
 
         pre_mlp_ln_gen = (
             self.pre_mlp_layernorm_gen
@@ -601,10 +591,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return nullcontext()
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Generate a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
@@ -613,9 +600,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         for name, module in self.named_children():
             if hasattr(module, 'sharded_state_dict'):
                 module_sharded_state_dict = module.sharded_state_dict(
-                    prefix=f'{prefix}{name}.',
-                    sharded_offsets=sharded_offsets,
-                    metadata=metadata,
+                    prefix=f'{prefix}{name}.', sharded_offsets=sharded_offsets, metadata=metadata
                 )
                 sharded_state_dict.update(module_sharded_state_dict)
 
@@ -626,4 +611,3 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         return sharded_state_dict
-

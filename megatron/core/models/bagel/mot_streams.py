@@ -11,7 +11,6 @@ from typing import Dict, Tuple
 
 import torch
 
-
 _DEVICE_STREAMS: Dict[int, Tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
 
 

@@ -8,7 +8,6 @@ import torch
 from torch import Tensor
 
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 
 __all__ = ['BagelRotaryEmbedding']
 
@@ -47,16 +46,17 @@ class BagelRotaryEmbedding(RotaryEmbedding):
         use_cpu_initialization: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
-        super().__init__(kv_channels, 
-                         rotary_percent, 
-                         rotary_interleaved, 
-                         seq_len_interpolation_factor, 
-                         rotary_base, 
-                         rope_scaling, 
-                         rope_scaling_factor, 
-                         use_cpu_initialization, 
-                         cp_group,
-                         )
+        super().__init__(
+            kv_channels,
+            rotary_percent,
+            rotary_interleaved,
+            seq_len_interpolation_factor,
+            rotary_base,
+            rope_scaling,
+            rope_scaling_factor,
+            use_cpu_initialization,
+            cp_group,
+        )
 
     def get_freqs_from_position_ids(self, position_ids: Tensor) -> Tensor:
         """Generates matrix of frequencies based on actual position_ids.
@@ -81,10 +81,7 @@ class BagelRotaryEmbedding(RotaryEmbedding):
         freqs = torch.outer(position_ids, self.inv_freq)  # [seq_len, dim/2]
         return freqs
 
-    def forward_with_position_ids(
-        self,
-        position_ids: Tensor,
-    ) -> Tensor:
+    def forward_with_position_ids(self, position_ids: Tensor) -> Tensor:
         """Forward pass with actual position_ids.
 
         Args:

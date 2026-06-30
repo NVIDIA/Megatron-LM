@@ -11,6 +11,7 @@ from torch import Tensor
 # Import flex_attention for BlockMask support
 try:
     from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention
+
     torch._dynamo.config.cache_size_limit = 512
     torch._dynamo.config.accumulated_cache_size_limit = 4096
     compiled_flex_attention = torch.compile(torch_flex_attention)
@@ -28,10 +29,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
-
 # =============================================================================
 # Ulysses Context Parallel A2A helpers
 # =============================================================================
+
 
 class _UlyssesA2AFunction(torch.autograd.Function):
     """
@@ -46,14 +47,15 @@ class _UlyssesA2AFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, und_idx, gen_idx, Lund, Lgen, cp_group):
+        """Run Ulysses all-to-all and restore compact MoT tensors to global token order."""
         ctx.save_for_backward(und_idx, gen_idx)
         ctx.Lund, ctx.Lgen = Lund, Lgen
         ctx.cp_group = cp_group
         cp_size = cp_group.size() if cp_group is not None else 1
         ctx.cp_size = cp_size
 
-        local_seq = q.shape[0]   # Lund + Lgen
-        nh_tp    = q.shape[2]
+        local_seq = q.shape[0]  # Lund + Lgen
+        nh_tp = q.shape[2]
         head_dim = q.shape[3]
         H_cp = nh_tp // cp_size
         ctx.nh_tp, ctx.H_cp, ctx.head_dim = nh_tp, H_cp, head_dim
@@ -73,8 +75,9 @@ class _UlyssesA2AFunction(torch.autograd.Function):
                 # -> view [cp*local_seq, H_cp_x, dim]  (one contiguous chunk per destination rank)
                 x_send = (
                     x.reshape(local_seq, cp_size, H_cp_x, head_dim)
-                     .permute(1, 0, 2, 3).contiguous()
-                     .view(cp_size * local_seq, H_cp_x, head_dim)
+                    .permute(1, 0, 2, 3)
+                    .contiguous()
+                    .view(cp_size * local_seq, H_cp_x, head_dim)
                 )
                 x_recv = torch.empty_like(x_send)
                 dist.all_to_all_single(x_recv, x_send, group=cp_group)
@@ -102,13 +105,14 @@ class _UlyssesA2AFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dq_full, dk_full, dv_full):
+        """Map global-order gradients back to the local compact MoT layout."""
         und_idx, gen_idx = ctx.saved_tensors
-        Lund, Lgen   = ctx.Lund, ctx.Lgen
-        cp_group     = ctx.cp_group
-        cp_size      = ctx.cp_size
+        Lund, Lgen = ctx.Lund, ctx.Lgen
+        cp_group = ctx.cp_group
+        cp_size = ctx.cp_size
         nh_tp, H_cp, head_dim = ctx.nh_tp, ctx.H_cp, ctx.head_dim
-        U, G         = ctx.U, ctx.G
-        local_seq    = Lund + Lgen
+        U, G = ctx.U, ctx.G
+        local_seq = Lund + Lgen
 
         def _unrestore_and_a2a(dx):
             # dx: [U+G, 1, H_cp_x, head_dim]  (H_cp_x may differ for k/v in GQA)
@@ -133,8 +137,9 @@ class _UlyssesA2AFunction(torch.autograd.Function):
                 dist.all_to_all_single(dx_out, dx_ri.contiguous(), group=cp_group)
                 dx_local = (
                     dx_out.view(cp_size, local_seq, H_cp_x, head_dim)
-                          .permute(1, 0, 2, 3).contiguous()
-                          .reshape(local_seq, nh_x, head_dim)
+                    .permute(1, 0, 2, 3)
+                    .contiguous()
+                    .reshape(local_seq, nh_x, head_dim)
                 )
             else:
                 dx_local = dx_ri.view(local_seq, nh_x, head_dim)
@@ -145,7 +150,11 @@ class _UlyssesA2AFunction(torch.autograd.Function):
             _unrestore_and_a2a(dq_full),
             _unrestore_and_a2a(dk_full),
             _unrestore_and_a2a(dv_full),
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -159,22 +168,22 @@ class _UlyssesA2AInvFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, ctx_attn, und_idx, gen_idx, Lund, Lgen,
-                actual_lund, actual_lgen, cp_group):
+    def forward(ctx, ctx_attn, und_idx, gen_idx, Lund, Lgen, actual_lund, actual_lgen, cp_group):
+        """Undo restore, run inverse all-to-all, and split attention outputs by token type."""
         ctx.save_for_backward(und_idx, gen_idx)
-        ctx.Lund, ctx.Lgen         = Lund, Lgen
-        ctx.actual_lund            = actual_lund
-        ctx.actual_lgen            = actual_lgen
-        ctx.cp_group               = cp_group
+        ctx.Lund, ctx.Lgen = Lund, Lgen
+        ctx.actual_lund = actual_lund
+        ctx.actual_lgen = actual_lgen
+        ctx.cp_group = cp_group
         cp_size = cp_group.size() if cp_group is not None else 1
         ctx.cp_size = cp_size
 
         U = und_idx.shape[0]
         G = gen_idx.shape[0]
-        ctx.U, ctx.G               = U, G
-        H_cp     = ctx_attn.shape[2]
+        ctx.U, ctx.G = U, G
+        H_cp = ctx_attn.shape[2]
         head_dim = ctx_attn.shape[3]
-        nh_tp    = H_cp * cp_size
+        nh_tp = H_cp * cp_size
         ctx.H_cp, ctx.head_dim, ctx.nh_tp = H_cp, head_dim, nh_tp
 
         local_seq = Lund + Lgen
@@ -197,16 +206,17 @@ class _UlyssesA2AInvFunction(torch.autograd.Function):
             dist.all_to_all_single(x_out, x_ri.contiguous(), group=cp_group)
             x_local = (
                 x_out.view(cp_size, local_seq, H_cp, head_dim)
-                     .permute(1, 0, 2, 3).contiguous()
-                     .reshape(local_seq, nh_tp, head_dim)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .reshape(local_seq, nh_tp, head_dim)
             )
         else:
             x_local = x_ri.view(local_seq, nh_tp, head_dim)
 
         # x_local layout after A2A_inv: [und_real | und_pad | gen_real | gen_pad]
         # gen tokens start at Lund (not actual_lund)
-        attn_und = x_local[:actual_lund]                 # [actual_lund, nh_tp, head_dim]
-        attn_gen = x_local[Lund : Lund + actual_lgen]    # [actual_lgen, nh_tp, head_dim]
+        attn_und = x_local[:actual_lund]  # [actual_lund, nh_tp, head_dim]
+        attn_gen = x_local[Lund : Lund + actual_lgen]  # [actual_lgen, nh_tp, head_dim]
 
         if actual_lund < Lund:
             attn_und = torch.cat(
@@ -222,31 +232,33 @@ class _UlyssesA2AInvFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_attn_und, d_attn_gen):
+        """Recombine und/gen gradients and restore them to global token order."""
         und_idx, gen_idx = ctx.saved_tensors
-        Lund, Lgen         = ctx.Lund, ctx.Lgen
-        actual_lund        = ctx.actual_lund
-        actual_lgen        = ctx.actual_lgen
-        cp_group           = ctx.cp_group
-        cp_size            = ctx.cp_size
+        Lund, Lgen = ctx.Lund, ctx.Lgen
+        actual_lund = ctx.actual_lund
+        actual_lgen = ctx.actual_lgen
+        cp_group = ctx.cp_group
+        cp_size = ctx.cp_size
         H_cp, head_dim, nh_tp = ctx.H_cp, ctx.head_dim, ctx.nh_tp
-        U, G               = ctx.U, ctx.G
-        local_seq          = Lund + Lgen
+        U, G = ctx.U, ctx.G
+        local_seq = Lund + Lgen
 
-        d_und = d_attn_und.squeeze(1)   # [Lund, nh_tp, head_dim]
-        d_gen = d_attn_gen.squeeze(1)   # [Lgen, nh_tp, head_dim]
+        d_und = d_attn_und.squeeze(1)  # [Lund, nh_tp, head_dim]
+        d_gen = d_attn_gen.squeeze(1)  # [Lgen, nh_tp, head_dim]
 
         # Gradient through re-pad: only real-token slots carry gradient.
         # x_local layout: [und_real | und_pad | gen_real | gen_pad]; gen starts at Lund
         d_x_local = d_und.new_zeros(local_seq, nh_tp, head_dim)
-        d_x_local[:actual_lund]              = d_und[:actual_lund]
+        d_x_local[:actual_lund] = d_und[:actual_lund]
         d_x_local[Lund : Lund + actual_lgen] = d_gen[:actual_lgen]
 
         if cp_size > 1:
             # Forward A2A is the backward of A2A_inv
             d_send = (
                 d_x_local.reshape(local_seq, cp_size, H_cp, head_dim)
-                          .permute(1, 0, 2, 3).contiguous()
-                          .view(cp_size * local_seq, H_cp, head_dim)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(cp_size * local_seq, H_cp, head_dim)
             )
             d_recv = torch.empty_like(d_send)
             dist.all_to_all_single(d_recv, d_send, group=cp_group)
@@ -272,6 +284,7 @@ class _UlyssesA2AInvFunction(torch.autograd.Function):
 # =============================================================================
 # FlexAttention module
 # =============================================================================
+
 
 class FlexAttention(MegatronModule):
     """
@@ -344,7 +357,7 @@ class FlexAttention(MegatronModule):
         self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp
         self.cp_group = getattr(pg_collection, 'cp', None)
-        self.cp_size  = self.cp_group.size() if self.cp_group is not None else 1
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
@@ -406,7 +419,7 @@ class FlexAttention(MegatronModule):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        packed_seq_params,   # MoTPackedSeqParams
+        packed_seq_params,  # MoTPackedSeqParams
         block_mask,
     ) -> Tensor:
         """
@@ -423,10 +436,10 @@ class FlexAttention(MegatronModule):
         Returns:
             Tensor: [Lund+Lgen, 1, hidden_size_per_partition]
         """
-        und_idx    = packed_seq_params.packed_und_token_indexes   # [U]
-        gen_idx    = packed_seq_params.packed_gen_token_indexes   # [G]
-        Lund       = packed_seq_params.padded_und_seqlen
-        Lgen       = packed_seq_params.padded_gen_seqlen
+        und_idx = packed_seq_params.packed_und_token_indexes  # [U]
+        gen_idx = packed_seq_params.packed_gen_token_indexes  # [G]
+        Lund = packed_seq_params.padded_und_seqlen
+        Lgen = packed_seq_params.padded_gen_seqlen
         actual_lund = len(packed_seq_params.local_und_token_indexes)
         actual_lgen = len(packed_seq_params.local_gen_token_indexes)
 
@@ -437,10 +450,10 @@ class FlexAttention(MegatronModule):
         # q/k/v_full: [U+G, 1, H_cp, head_dim] in original global token order
 
         # ── Attention kernel ──────────────────────────────────────────────────
-        seq_len_full  = q_full.shape[0]      # U + G
-        H_cp          = q_full.shape[2]
-        head_dim      = q_full.shape[3]
-        num_kv_H_cp   = k_full.shape[2]
+        seq_len_full = q_full.shape[0]  # U + G
+        H_cp = q_full.shape[2]
+        head_dim = q_full.shape[3]
+        num_kv_H_cp = k_full.shape[2]
 
         padded_seq_len = block_mask.shape[2]
         pad_size = padded_seq_len - seq_len_full
@@ -450,12 +463,12 @@ class FlexAttention(MegatronModule):
         v_f = v_full.squeeze(1).permute(1, 0, 2)
 
         if pad_size > 0:
-            q_f = torch.cat([q_f, q_full.new_zeros(H_cp,        pad_size, head_dim)], dim=1)
+            q_f = torch.cat([q_f, q_full.new_zeros(H_cp, pad_size, head_dim)], dim=1)
             k_f = torch.cat([k_f, k_full.new_zeros(num_kv_H_cp, pad_size, head_dim)], dim=1)
             v_f = torch.cat([v_f, v_full.new_zeros(num_kv_H_cp, pad_size, head_dim)], dim=1)
 
         ctx_raw = compiled_flex_attention(
-            q_f.unsqueeze(0),   # [1, H_cp, padded_seq_len, head_dim]
+            q_f.unsqueeze(0),  # [1, H_cp, padded_seq_len, head_dim]
             k_f.unsqueeze(0),
             v_f.unsqueeze(0),
             enable_gqa=True,
@@ -463,8 +476,8 @@ class FlexAttention(MegatronModule):
             scale=self.softmax_scale,
         )
         # ctx_raw: [1, H_cp, padded_seq_len, head_dim]
-        ctx_attn = ctx_raw[0, :, :seq_len_full, :]          # [H_cp, U+G, head_dim]
-        ctx_attn = ctx_attn.permute(1, 0, 2).unsqueeze(1)   # [U+G, 1, H_cp, head_dim]
+        ctx_attn = ctx_raw[0, :, :seq_len_full, :]  # [H_cp, U+G, head_dim]
+        ctx_attn = ctx_attn.permute(1, 0, 2).unsqueeze(1)  # [U+G, 1, H_cp, head_dim]
 
         if self.training and self.config.attention_dropout > 0:
             ctx_attn = self.attention_dropout(ctx_attn)
@@ -476,10 +489,13 @@ class FlexAttention(MegatronModule):
         # attn_und: [Lund, 1, nh/tp, head_dim]   attn_gen: [Lgen, 1, nh/tp, head_dim]
 
         # Reshape and cat -> [Lund+Lgen, 1, hidden_size_per_partition]
-        return torch.cat([
-            attn_und.reshape(Lund, 1, self.hidden_size_per_partition),
-            attn_gen.reshape(Lgen, 1, self.hidden_size_per_partition),
-        ], dim=0)
+        return torch.cat(
+            [
+                attn_und.reshape(Lund, 1, self.hidden_size_per_partition),
+                attn_gen.reshape(Lgen, 1, self.hidden_size_per_partition),
+            ],
+            dim=0,
+        )
 
     def sharded_state_dict(
         self,

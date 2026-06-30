@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 Unit test for MoTTransformerLayer (Megatron Core) vs Qwen2MoTDecoderLayer (Bagel reference).
 
@@ -32,21 +34,18 @@ sys.path.insert(0, _BAGEL_PKG)
 sys.path.insert(0, _BAGEL_SRC)
 
 
-
-import megatron.core.parallel_state as mpu                              # noqa: E402
-
-from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
-from megatron.core.models.bagel.flex_attention import FlexAttention               # noqa: E402
-from megatron.core.models.bagel.attention_mot import (                            # noqa: E402
+import megatron.core.parallel_state as mpu  # noqa: E402
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.bagel.attention_mot import (  # noqa: E402
     SelfAttentionMoT,
     SelfAttentionMoTSubmodules,
 )
-from megatron.core.models.bagel.transformer_mot_layer import (                    # noqa: E402
+from megatron.core.models.bagel.flex_attention import FlexAttention  # noqa: E402
+from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
+from megatron.core.models.bagel.transformer_mot_layer import (  # noqa: E402
     MoTTransformerLayer,
     MoTTransformerLayerSubmodules,
 )
-
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -91,13 +90,13 @@ class _PGC:
 
 def _mot_block_mask(n_und: int, seq_len: int, device: str):
     """BlockMask: causal mask for und-token rows, full attention for gen-token rows."""
+
     def mask_fn(b, h, q_idx, kv_idx):
         is_gen_q = q_idx >= n_und
         causal_ok = kv_idx <= q_idx
         return is_gen_q | causal_ok
-    return create_block_mask(
-        mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
-    )
+
+    return create_block_mask(mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,10 +170,7 @@ def _make_mcore_layer(mcore_config: TransformerConfig) -> MoTTransformerLayer:
         q_layernorm_gen=WrappedTorchNorm,
         k_layernorm_gen=WrappedTorchNorm,
     )
-    mlp_submodules = MLPSubmodules(
-        linear_fc1=ColumnParallelLinear,
-        linear_fc2=RowParallelLinear,
-    )
+    mlp_submodules = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear)
     mlp_spec = ModuleSpec(module=MLP, submodules=mlp_submodules)
 
     layer_submodules = MoTTransformerLayerSubmodules(
@@ -192,11 +188,7 @@ def _make_mcore_layer(mcore_config: TransformerConfig) -> MoTTransformerLayer:
         mlp_gen=mlp_spec,
         mlp_bda=get_bias_dropout_add,
     )
-    return MoTTransformerLayer(
-        config=mcore_config,
-        submodules=layer_submodules,
-        layer_number=1,
-    )
+    return MoTTransformerLayer(config=mcore_config, submodules=layer_submodules, layer_number=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,32 +221,40 @@ def _copy_attn_weights(bagel_attn: "PackedAttentionMoT", mcore_attn: SelfAttenti
     ng = bagel_attn.num_key_value_heads
     hn = bagel_attn.head_dim
 
-    for (q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
-         linear_qkv, linear_proj, qln, kln) in [
+    for q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, linear_qkv, linear_proj, qln, kln in [
         # understanding-token projection weights
         (
-            bagel_attn.q_proj, bagel_attn.k_proj, bagel_attn.v_proj, bagel_attn.o_proj,
-            bagel_attn.q_norm, bagel_attn.k_norm,
-            mcore_attn.linear_qkv, mcore_attn.linear_proj,
-            mcore_attn.q_layernorm, mcore_attn.k_layernorm,
+            bagel_attn.q_proj,
+            bagel_attn.k_proj,
+            bagel_attn.v_proj,
+            bagel_attn.o_proj,
+            bagel_attn.q_norm,
+            bagel_attn.k_norm,
+            mcore_attn.linear_qkv,
+            mcore_attn.linear_proj,
+            mcore_attn.q_layernorm,
+            mcore_attn.k_layernorm,
         ),
         # generation-token projection weights
         (
-            bagel_attn.q_proj_moe_gen, bagel_attn.k_proj_moe_gen,
-            bagel_attn.v_proj_moe_gen, bagel_attn.o_proj_moe_gen,
-            bagel_attn.q_norm_moe_gen, bagel_attn.k_norm_moe_gen,
-            mcore_attn.linear_qkv_gen, mcore_attn.linear_proj_gen,
-            mcore_attn.q_layernorm_gen, mcore_attn.k_layernorm_gen,
+            bagel_attn.q_proj_moe_gen,
+            bagel_attn.k_proj_moe_gen,
+            bagel_attn.v_proj_moe_gen,
+            bagel_attn.o_proj_moe_gen,
+            bagel_attn.q_norm_moe_gen,
+            bagel_attn.k_norm_moe_gen,
+            mcore_attn.linear_qkv_gen,
+            mcore_attn.linear_proj_gen,
+            mcore_attn.q_layernorm_gen,
+            mcore_attn.k_layernorm_gen,
         ),
     ]:
         qkv_w = _hf_to_mcore_qkv_weight(
-            q_proj.weight.data, k_proj.weight.data, v_proj.weight.data,
-            ng=ng, np=np, hn=hn,
+            q_proj.weight.data, k_proj.weight.data, v_proj.weight.data, ng=ng, np=np, hn=hn
         )
         linear_qkv.weight.data.copy_(qkv_w)
         qkv_b = _hf_to_mcore_qkv_bias(
-            q_proj.bias.data, k_proj.bias.data, v_proj.bias.data,
-            ng=ng, np=np, hn=hn,
+            q_proj.bias.data, k_proj.bias.data, v_proj.bias.data, ng=ng, np=np, hn=hn
         )
         linear_qkv.bias.data.copy_(qkv_b)
         linear_proj.weight.data.copy_(o_proj.weight.data)
@@ -278,15 +278,10 @@ def _copy_mlp_weights(bagel_mlp, mcore_mlp: MLP):
     mcore_mlp.linear_fc2.weight.data.copy_(bagel_mlp.down_proj.weight.data)
 
 
-def _copy_layer_weights(
-    bagel_layer: "Qwen2MoTDecoderLayer",
-    mcore_layer: MoTTransformerLayer,
-):
+def _copy_layer_weights(bagel_layer: "Qwen2MoTDecoderLayer", mcore_layer: MoTTransformerLayer):
     """Copy all weights from Qwen2MoTDecoderLayer to MoTTransformerLayer."""
     # Input layer norms (und / gen)
-    mcore_layer.input_layernorm.weight.data.copy_(
-        bagel_layer.input_layernorm.weight.data
-    )
+    mcore_layer.input_layernorm.weight.data.copy_(bagel_layer.input_layernorm.weight.data)
     mcore_layer.input_layernorm_gen.weight.data.copy_(
         bagel_layer.input_layernorm_moe_gen.weight.data
     )
@@ -347,15 +342,12 @@ class TestMoTTransformerLayerAccuracy:
         hidden_states = packed_seq.unsqueeze(1)  # [s, 1, h]
         return packed_seq, hidden_states, und_idx, gen_idx, n_und, n_gen
 
-
-
     def _identity_pos_emb(self):
         """cos=1, sin=0 → identity rotation (no-op)."""
         head_dim = HIDDEN_SIZE // NUM_HEADS
         cos = torch.ones(SEQ_LEN, head_dim, dtype=torch.float16, device="cuda")
         sin = torch.zeros(SEQ_LEN, head_dim, dtype=torch.float16, device="cuda")
         return cos, sin
-    
 
     def _make_psp(self, n_und: int, n_gen: int) -> MoTPackedSeqParams:
         """Build a full MoTPackedSeqParams with index arrays (cp_size==1)."""
@@ -410,8 +402,7 @@ class TestMoTTransformerLayerAccuracy:
         assert torch.all(~torch.isnan(mcore_out_flat)), "MCore output has NaN"
         assert torch.all(~torch.isnan(bagel_out)), "Bagel output has NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[und-only] {m}",
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[und-only] {m}"
         )
 
     def test_forward_train_gen_only(self):
@@ -442,8 +433,7 @@ class TestMoTTransformerLayerAccuracy:
         assert torch.all(~torch.isnan(mcore_out_flat)), "MCore output has NaN"
         assert torch.all(~torch.isnan(bagel_out)), "Bagel output has NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[gen-only] {m}",
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[gen-only] {m}"
         )
 
     def test_forward_train_mixed(self):
@@ -474,8 +464,7 @@ class TestMoTTransformerLayerAccuracy:
         assert torch.all(~torch.isnan(mcore_out_flat)), "MCore output has NaN"
         assert torch.all(~torch.isnan(bagel_out)), "Bagel output has NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3,
-            msg=lambda m: f"[mixed] {m}",
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=1e-3, msg=lambda m: f"[mixed] {m}"
         )
 
     def test_und_gen_use_separate_mlps(self):
@@ -521,18 +510,21 @@ class TestMoTTransformerLayerAccuracy:
                 rotary_pos_emb=None,
             )
 
-        out_flat = out.squeeze(1)           # [SEQ_LEN, h]; und at [:n_und], gen at [n_und:]
+        out_flat = out.squeeze(1)  # [SEQ_LEN, h]; und at [:n_und], gen at [n_und:]
         post_attn_flat = captured["hidden_post_attn"].squeeze(1)
 
         # gen tokens: zero mlp_gen → MLP adds 0 → output == post-attention residual
         torch.testing.assert_close(
-            out_flat[n_und:], post_attn_flat[n_und:], atol=5e-3, rtol=5e-3,
+            out_flat[n_und:],
+            post_attn_flat[n_und:],
+            atol=5e-3,
+            rtol=5e-3,
             msg=lambda m: f"[sep-mlp] gen output should equal hidden_post_attn when mlp_gen is zeroed: {m}",
         )
         # und tokens: non-zero mlp → output != post-attention residual
-        assert not torch.allclose(out_flat[:n_und], post_attn_flat[:n_und], atol=1e-3), (
-            "und tokens should differ from hidden_post_attn — they use a non-zero mlp"
-        )
+        assert not torch.allclose(
+            out_flat[:n_und], post_attn_flat[:n_und], atol=1e-3
+        ), "und tokens should differ from hidden_post_attn — they use a non-zero mlp"
 
     def test_und_gen_use_separate_layernorms(self):
         """Verify und/gen tokens go through different input layernorms.
@@ -549,7 +541,7 @@ class TestMoTTransformerLayerAccuracy:
 
             ln_out = mcore_layer._apply_input_layernorm_mot(hidden_states, n_und)
 
-        ln_flat = ln_out.squeeze(1)   # [SEQ_LEN, h]; und at [:n_und], gen at [n_und:]
+        ln_flat = ln_out.squeeze(1)  # [SEQ_LEN, h]; und at [:n_und], gen at [n_und:]
         und_mean_abs = ln_flat[:n_und].abs().mean().item()
         gen_mean_abs = ln_flat[n_und:].abs().mean().item()
         assert gen_mean_abs > und_mean_abs, (
@@ -557,10 +549,13 @@ class TestMoTTransformerLayerAccuracy:
             f"gen={gen_mean_abs:.4f}, und={und_mean_abs:.4f}"
         )
 
-    @pytest.mark.parametrize("und_ratio,zeroed_mlp", [
-        (1.0, "mlp"),      # und-only: zero the und MLP; output must equal post-attn residual
-        (0.0, "mlp_gen"),  # gen-only: zero the gen MLP; output must equal post-attn residual
-    ])
+    @pytest.mark.parametrize(
+        "und_ratio,zeroed_mlp",
+        [
+            (1.0, "mlp"),  # und-only: zero the und MLP; output must equal post-attn residual
+            (0.0, "mlp_gen"),  # gen-only: zero the gen MLP; output must equal post-attn residual
+        ],
+    )
     def test_single_branch_mlp_zero_contribution(self, und_ratio, zeroed_mlp):
         """Edge case: und-only and gen-only MLP routing.
 
@@ -597,7 +592,10 @@ class TestMoTTransformerLayerAccuracy:
 
         label = "und-only" if und_ratio == 1.0 else "gen-only"
         torch.testing.assert_close(
-            out.squeeze(1), captured["post_attn"].squeeze(1), atol=1e-3, rtol=1e-3,
+            out.squeeze(1),
+            captured["post_attn"].squeeze(1),
+            atol=1e-3,
+            rtol=1e-3,
             msg=lambda m: f"[{label}] output should equal post-attn when active MLP is zeroed: {m}",
         )
 
@@ -651,8 +649,7 @@ class TestMoTTransformerLayerAccuracy:
             mcore_out, _ = mcore_layer.mlp(x)
 
         torch.testing.assert_close(
-            mcore_out, bagel_out, atol=5e-3, rtol=5e-3,
-            msg=lambda m: f"[mlp-weight-copy] {m}",
+            mcore_out, bagel_out, atol=5e-3, rtol=5e-3, msg=lambda m: f"[mlp-weight-copy] {m}"
         )
 
 
@@ -679,6 +676,7 @@ if __name__ == "__main__":
             print(f"  ✓ {method_name}")
         except Exception as e:
             import traceback
+
             print(f"  ✗ {method_name}: {e}")
             traceback.print_exc()
 
