@@ -174,7 +174,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+            supported_fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MambaLayer,
+                HybridStack,
+            ]
             assert self.fsdp_unit_modules and all(
                 module in supported_fsdp_unit_modules for module in self.fsdp_unit_modules
             ), (
@@ -183,6 +190,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 f"{supported_fsdp_unit_modules}, "
                 f"got {self.fsdp_unit_modules}."
             )
+
+        # HybridStack-specific filter: when bracketed hybrid patterns are used,
+        # the model has a nested layout -- an outer HybridStack root
+        # (``is_layer_group_stack=False``) whose ``layers`` are inner
+        # bracket-group HybridStacks (``is_layer_group_stack=True``).
+        # ``named_modules()`` walks root-first, so with ``[HybridStack]`` the
+        # outer matches first, the inner ones get skipped as its submodules,
+        # and the whole decoder becomes a single FSDP unit. We exclude the
+        # outer so each bracket group is its own unit. Modules without the
+        # attribute (TransformerLayer, etc.) keep the default ``True``.
+        def _fsdp_unit_filter(m):
+            return getattr(m, "is_layer_group_stack", True)
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -190,6 +210,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
+                fsdp_unit_filter=_fsdp_unit_filter,
                 disable_bucketing=disable_bucketing,
                 device=self.device,
                 dist_index=self.megatron_fsdp_dist_index,
