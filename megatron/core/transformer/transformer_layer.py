@@ -1382,16 +1382,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
                 self.pre_mlp_layernorm, IdentityOp
             )
-            self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
-            self.offload_moe_act = "moe_act" in self.config.offload_modules
         else:
             self.offload_attn_norm = False
             self.offload_qkv_linear = False
             self.offload_core_attn = False
             self.offload_attn_proj = False
             self.offload_mlp_norm = False
-            self.offload_expert_fc1 = False
-            self.offload_moe_act = False
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
             cuda_graph_modules = self.config.cuda_graph_modules or []
