@@ -1541,7 +1541,6 @@ class MoETransformerLayer(TransformerLayer):
 
         return out
 
-
     def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
