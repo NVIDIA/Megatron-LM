@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -35,25 +35,6 @@ class NcclTransportBackend(KVTransportBackend):
         if group is not None:
             self._group = group
         self._init = True
-
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        t = tensor.contiguous()
-        work = dist.isend(t, dst=dst, tag=tag, group=self._group)
-        # Keep a reference to ``t`` so it isn't freed before the send drains.
-        return TransferHandle(wait_fn=lambda _t=t, _w=work: _w.wait())
-
-    def recv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> TransferHandle:
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        work = dist.irecv(buf, src=src, tag=tag, group=self._group)
-        return TransferHandle(wait_fn=work.wait, tensor=buf)
 
     def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
         """Issue one request's point-to-point ops as a single coalesced NCCL

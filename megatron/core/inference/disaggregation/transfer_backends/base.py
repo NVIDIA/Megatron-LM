@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -63,9 +63,9 @@ class KVTransportBackend(abc.ABC):
     """Interface for moving KV-cache blobs between workers. Two families,
     distinguished by :attr:`is_pull`:
 
-    * **Push** (two-sided: NCCL). Both peers post matched ``send``/``recv``;
-      transfers on a ``(src, dst)`` pair match by POST-ORDER, so both sides must
-      enumerate them in the same order (``tag`` is not used for matching).
+    * **Push** (two-sided: NCCL). Both peers post one coalesced group of
+      point-to-point ops (:meth:`batch`); transfers on a ``(src, dst)`` pair
+      match by POST-ORDER, so both sides must enumerate them in the same order.
     * **One-sided** (RDMA: NIXL). Each rank registers its buffers once
       (:meth:`register_regions` / :meth:`export_regions_meta`); one rank then
       moves entries with no peer action, either direction -- :meth:`begin_pull`
@@ -76,7 +76,7 @@ class KVTransportBackend(abc.ABC):
     ``NotImplementedError``; callers branch on :attr:`is_pull`.
     """
 
-    # True for one-sided (pull/push) backends, False for two-sided send/recv.
+    # True for one-sided (pull/push) backends, False for the two-sided batch.
     is_pull: bool = False
 
     @abc.abstractmethod
@@ -89,22 +89,12 @@ class KVTransportBackend(abc.ABC):
         for backends that need it (NCCL); ignored otherwise."""
 
     # --- push family (two-sided) ------------------------------------------
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        """(push) Non-blocking send to ``dst``; ``wait()`` drains it and the
-        caller must keep ``tensor`` alive until then."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement the push interface")
-
-    def recv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> TransferHandle:
-        """(push) Non-blocking receive from ``src``; ``wait()`` returns the
-        received tensor."""
+    def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
+        """(push) Issue one request's point-to-point ops as a single coalesced
+        group, returning ``(handle, recv_buffers)``. ``sends``: ``(tensor, dst)``;
+        ``recvs``: ``(shape, dtype, src)`` -- buffers are allocated here and
+        returned in order. One group, never per-op send/recv: dozens of concurrent
+        ungrouped P2P ops to one peer race on NCCL (illegal access)."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the push interface")
 
     # --- one-sided family (RDMA, either direction) ------------------------
@@ -130,27 +120,6 @@ class KVTransportBackend(abc.ABC):
         ``(region_name, local_src_index, peer_dst_index)``. Returns a handle."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the one-sided interface")
 
-    def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
-        """Issue one request's point-to-point ops as a group, returning
-        ``(handle, recv_buffers)``. ``sends``: ``(tensor, dst)``; ``recvs``:
-        ``(shape, dtype, src)`` with buffers allocated here and returned in order.
-        The default runs them sequentially via :meth:`send`/:meth:`recv`; NCCL
-        overrides this with a grouped primitive to avoid the concurrent-P2P hazard.
-        """
-        handles = []
-        for tensor, dst in sends:
-            handles.append(self.send(tensor, dst))
-        bufs = []
-        for shape, dtype, src in recvs:
-            h = self.recv(shape, dtype, src, device=device)
-            bufs.append(h.tensor)
-            handles.append(h)
-
-        def _wait(_hs=handles):
-            for h in _hs:
-                h.wait()
-
-        return TransferHandle(wait_fn=_wait), bufs
 
 
 def construct_kv_transport_backend(name: str) -> KVTransportBackend:
