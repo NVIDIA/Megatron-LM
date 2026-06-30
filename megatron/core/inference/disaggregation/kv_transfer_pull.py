@@ -101,24 +101,44 @@ def _ctx_kv_dims(ctx) -> dict:
 def _kv_fragment_triples(src_dims, dst_dims, src_block, dst_block,
                          src_lslice, dst_lslice, src_hslice, dst_hslice):
     """Byte ``(local_off, remote_off, nbytes)`` triples to READ a head/layer
-    fragment of one block. A head range is contiguous only per ``(k, layer,
-    token)`` in the row-major buffer, so emit one descriptor per ``(k, layer,
-    token)`` of ``head_count*hidden`` elements."""
+    fragment of one block, coalesced to the contiguous minimum.
+
+    In the row-major ``(2, L, total_blocks, BS, heads, hidden)`` buffer a head
+    range is contiguous across tokens only when it spans *all* heads. So when the
+    fragment takes the full head dim on both sides (the same-TP case), the whole
+    ``(BS, heads, hidden)`` block region is one contiguous run per ``(k, layer)``
+    -> one descriptor. A partial head range (a TP remap) is contiguous only per
+    ``(k, layer, token)`` -> one descriptor each. The full-head form reproduces
+    exactly the whole-block stride math, so the same-TP case moves blocks at the
+    minimal descriptor count without a separate code path."""
     HD = dst_dims["hidden"]
     elem = dst_dims["elem"]
-    head_n = src_hslice.stop - src_hslice.start
-    nbytes = head_n * HD * elem
     sL, sTB, sBS, sH = src_dims["num_layers"], src_dims["total_blocks"], src_dims["block_size"], src_dims["heads"]
     dL, dTB, dBS, dH = dst_dims["num_layers"], dst_dims["total_blocks"], dst_dims["block_size"], dst_dims["heads"]
     src_layers = range(src_lslice.start, src_lslice.stop)
     dst_layers = range(dst_lslice.start, dst_lslice.stop)
+    full_heads = (
+        src_hslice.start == 0 and src_hslice.stop == sH
+        and dst_hslice.start == 0 and dst_hslice.stop == dH
+        and sH == dH
+    )
     triples = []
+    if full_heads:
+        nbytes = sBS * sH * HD * elem
+        for k in (0, 1):
+            for sl, dl in zip(src_layers, dst_layers):
+                soff = (((k * sL + sl) * sTB + src_block) * sBS) * sH * HD * elem
+                doff = (((k * dL + dl) * dTB + dst_block) * dBS) * dH * HD * elem
+                triples.append((doff, soff, nbytes))  # (local=dst, remote=src, nbytes)
+        return triples
+    head_n = src_hslice.stop - src_hslice.start
+    nbytes = head_n * HD * elem
     for k in (0, 1):
         for sl, dl in zip(src_layers, dst_layers):
             for t in range(sBS):
                 soff = ((((k * sL + sl) * sTB + src_block) * sBS + t) * sH + src_hslice.start) * HD * elem
                 doff = ((((k * dL + dl) * dTB + dst_block) * dBS + t) * dH + dst_hslice.start) * HD * elem
-                triples.append((doff, soff, nbytes))  # (local=dst, remote=src, nbytes)
+                triples.append((doff, soff, nbytes))
     return triples
 
 
@@ -160,49 +180,25 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
                          src_mamba_layouts=None, dst_mamba_layouts=None, my_mamba_layout=None):
     """(decode, one-sided) Allocate destination blocks and issue the one-sided
     READ(s) pulling the request's KV into them. Returns a :class:`NixlPullRecv`,
-    or ``None`` if the decode KV cache is full. Identity reshard pulls the 1:1
-    counterpart's whole blocks (+ Mamba slot/snapshots); hetero reshard (TP remap)
-    assembles this rank's head/layer shard from per-source-rank fragments."""
+    or ``None`` if the decode KV cache is full.
+
+    One path, driven by ``kv_reshard.plan_kv_reshard``: each decode rank reads its
+    ``(layer x head)`` shard as byte fragments from the prefill ranks that hold
+    it. ``_kv_fragment_triples`` coalesces a full-head fragment to one descriptor
+    per ``(k, layer)``, so the same-TP case moves whole blocks at the minimal
+    descriptor count while a TP remap splits per token -- no separate fast path.
+    Mamba state is pulled as conv/ssm bands. Mamba prefix-cache snapshots are
+    carried only when a single prefill rank holds this request's shard (so the
+    second, snapshot READ resolves against one peer); a multi-source TP remap
+    skips them."""
     if not rank_handoffs:
         return None
-    block_count = int(rank_handoffs[0]["block_count"])
-    identity = True
-    if src_layouts:
-        identity = (
-            src_layouts[0].tp_size == my_layout.tp_size
-            and src_layouts[0].pp_size == my_layout.pp_size
-        )
-
-    if identity:
-        my_key = list(my_layout.kv_shard_key())
-        src = next((h for h in rank_handoffs if h.get("shard_key") == my_key), None)
-        if src is None:
-            raise NotImplementedError(f"pull hand-off: no source shard matching key {my_key}")
-        want_mamba = int(src.get("mamba_src_slot", -1)) >= 0
-        alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
-        if alloc is None:
-            return None
-        dst_block_ids = alloc["block_ids"]
-        mamba_dst_slot = alloc["mamba_dst_slot"]
-        transfers = [("kv", s, d) for s, d in zip(src["block_ids"], dst_block_ids)]
-        if want_mamba and mamba_dst_slot >= 0:
-            ms = int(src["mamba_src_slot"])
-            transfers.append(("mamba_conv", ms, mamba_dst_slot))
-            transfers.append(("mamba_ssm", ms, mamba_dst_slot))
-        handle = backend.begin_pull(src["region_meta"], transfers)
-        return NixlPullRecv(
-            handles=[handle], block_ids=dst_block_ids,
-            block_hashes=list(src.get("block_hashes") or []), mamba_dst_slot=mamba_dst_slot,
-            backend=backend, peer_meta=src["region_meta"],
-            snapshots=list(src.get("snapshots") or []),
-        )
-
-    # --- hetero (TP-remap) fragment pull ---
     if not src_layouts or not dst_layouts:
-        raise NotImplementedError("hetero pull requires src/dst layouts")
+        raise NotImplementedError("pull hand-off requires src/dst layouts")
+    block_count = int(rank_handoffs[0]["block_count"])
     want_mamba = any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs)
     if want_mamba and (not src_mamba_layouts or not dst_mamba_layouts or my_mamba_layout is None):
-        raise NotImplementedError("hetero Mamba pull requires Mamba shard layouts")
+        raise NotImplementedError("Mamba pull requires Mamba shard layouts")
     alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
     if alloc is None:
         return None
@@ -213,12 +209,15 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     src_by_rank = {l.global_rank: l for l in src_layouts}
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
-    # Attention KV: head/layer fragments, one fragment READ per source rank.
+    contributing: dict = {}  # src_rank -> handoff (the ranks this dst reads from)
+    # Attention KV: per source rank, READ its head/layer fragments. Full-head
+    # fragments coalesce to whole blocks.
     for t in utils.transfers_for_dst(plan, my_layout.global_rank):
         h = by_rank.get(t.src_rank)
         src_layout = src_by_rank.get(t.src_rank)
         if h is None or src_layout is None:
             continue
+        contributing[t.src_rank] = h
         sl, sh = t.src_layer_slice(src_layout), t.src_head_slice(src_layout)
         dl, dh = t.dst_layer_slice(my_layout), t.dst_head_slice(my_layout)
         triples = []
@@ -248,8 +247,16 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         for (region, src_rank), triples in banded.items():
             handles.append(backend.begin_pull_raw(by_rank[src_rank]["region_meta"], region, triples))
 
+    # Snapshots: only when a single prefill rank holds this request's shard, so
+    # the second snapshot READ in finish() resolves against one peer.
+    peer_meta, snapshots = None, []
+    if len(contributing) == 1:
+        only = next(iter(contributing.values()))
+        peer_meta = only["region_meta"]
+        snapshots = list(only.get("snapshots") or [])
     return NixlPullRecv(
         handles=handles, block_ids=dst_block_ids,
         block_hashes=list(rank_handoffs[0].get("block_hashes") or []),
-        mamba_dst_slot=mamba_dst_slot, backend=backend, peer_meta=None, snapshots=[],
+        mamba_dst_slot=mamba_dst_slot, backend=backend, peer_meta=peer_meta,
+        snapshots=snapshots,
     )
