@@ -23,6 +23,7 @@ __all__ = [
     "generate_varlen_mask_params_for_positions",
     "masked_softmax",
     "masked_softmax_inplace",
+    "masked_log_softmax",
     "normalize_query_valid_rows",
     "normalize_varlen_bounds",
     "prepare_additive_mask",
@@ -121,7 +122,12 @@ def normalize_varlen_bounds(
     sk: int,
     device: torch.device,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Validate mask/varlen exclusivity and normalize varlen bounds to int64 tensors."""
+    """Validate mask/varlen exclusivity and normalize varlen bounds to int64 tensors.
+
+    ``key_positions is None`` is the caller convention for identity key positions. Helpers that
+    need a materialized position tensor build the arange locally; fused dispatchers can test
+    ``key_positions is not None`` to detect explicit non-identity positions without a GPU sync.
+    """
     if mask is not None and varlen_starts is not None:
         raise ValueError("mask and varlen_starts are mutually exclusive")
     if varlen_starts is None:
@@ -283,15 +289,14 @@ def scatter_topk_into_index_mask(
         idx_chunk = topk_indices[:, s0:s1]
         if idx_chunk.dtype != torch.int64 or idx_chunk.device != device:
             idx_chunk = idx_chunk.to(dtype=torch.int64, device=device)
-        if torch.any(idx_chunk < 0):
-            valid_topk = idx_chunk >= 0
-            if valid_topk.any():
-                b_idx, q_rel_idx, t_idx = torch.where(valid_topk)
-                q_idx = q_rel_idx + s0
-                k_idx = idx_chunk[b_idx, q_rel_idx, t_idx]
-                index_mask[b_idx, q_idx, k_idx] = 0.0
-        else:
-            index_mask[:, s0:s1].scatter_(-1, idx_chunk, 0.0)
+        valid_topk = idx_chunk >= 0
+        safe_idx = idx_chunk.clamp_min(0)
+        src = torch.where(
+            valid_topk,
+            torch.zeros((), dtype=index_mask.dtype, device=device),
+            torch.full((), float("-inf"), dtype=index_mask.dtype, device=device),
+        )
+        index_mask[:, s0:s1].scatter_reduce_(-1, safe_idx, src, reduce="amax", include_self=True)
 
 
 def masked_softmax_inplace(
@@ -334,6 +339,22 @@ def masked_softmax(
     probs = probs.masked_fill(~valid_mask, 0.0)
     probs = probs / probs.sum(dim=dim, keepdim=True).clamp_min(eps)
     return probs.masked_fill(~valid_mask, 0.0)
+
+
+def masked_log_softmax(
+    logits: torch.Tensor, valid_mask: torch.Tensor, *, dim: int = -1
+) -> torch.Tensor:
+    """Convert logits to log probabilities while zeroing invalid entries."""
+    if not logits.is_floating_point():
+        raise TypeError("masked_log_softmax expects a floating-point tensor")
+    if logits.shape != valid_mask.shape:
+        raise ValueError("logits and valid_mask must have the same shape")
+
+    masked_logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+    row_has_valid = valid_mask.any(dim=dim, keepdim=True)
+    safe_logits = torch.where(row_has_valid, masked_logits, torch.zeros_like(masked_logits))
+    log_probs = torch.log_softmax(safe_logits, dim=dim)
+    return log_probs.masked_fill(~valid_mask, 0.0)
 
 
 def normalize_query_valid_rows(
@@ -389,12 +410,16 @@ def build_dsattention_forward_mask(
     position_ids: Optional[torch.Tensor],
     packed_seq_params: Optional[PackedSeqParams],
     packed_query_positions: Optional[torch.Tensor] = None,
-) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    nonpacked_query_positions: Optional[torch.Tensor] = None,
+) -> Tuple[
+    Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
+]:
     """Build DSAttention mask.
 
     Returns:
         float_mask: Optional additive mask [sq, skv] or [b, sq, skv].
-        varlen_params: Optional (starts, ends, key_positions), each int64 tensor.
+        varlen_params: Optional (starts, ends, key_positions). ``key_positions`` is ``None`` for
+            identity key positions.
     """
     packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
     if attn_mask_type is not None:
@@ -405,9 +430,8 @@ def build_dsattention_forward_mask(
             if cp_size > 1:
                 if packed_query_positions is not None:
                     query_idx = packed_query_positions.to(device=device, dtype=torch.int64)
-                    key_idx = torch.arange(skv, dtype=torch.int64, device=device)
                 else:
-                    query_idx, key_idx = dsa_layout.get_cp_positions_from_layout(
+                    query_idx, _key_idx = dsa_layout.get_cp_positions_from_layout(
                         sq=sq,
                         skv=skv,
                         cp_size=cp_size,
@@ -418,18 +442,23 @@ def build_dsattention_forward_mask(
                     )
             else:
                 query_idx = torch.arange(sq, dtype=torch.int64, device=device)
-                key_idx = torch.arange(skv, dtype=torch.int64, device=device)
             varlen_starts, varlen_ends = generate_varlen_mask_params_for_positions(
                 cu_seqlens_q, query_idx
             )
-            return None, (varlen_starts, varlen_ends, key_idx)
+            return None, (varlen_starts, varlen_ends, None)
+
+        if nonpacked_query_positions is not None:
+            query_pos = nonpacked_query_positions.to(device=device, dtype=torch.int64)
+            varlen_starts = torch.zeros_like(query_pos, dtype=torch.int64, device=device)
+            varlen_ends = (query_pos + 1).clamp(max=skv)
+            return None, (varlen_starts, varlen_ends, None)
 
         if cp_size > 1:
             query_pos = dsa_layout.extract_query_positions_from_position_ids(
                 position_ids, sq, device
             )
             if query_pos is None:
-                query_pos, key_pos = dsa_layout.get_cp_positions_from_layout(
+                query_pos, _key_pos = dsa_layout.get_cp_positions_from_layout(
                     sq=sq,
                     skv=skv,
                     cp_size=cp_size,
@@ -438,11 +467,13 @@ def build_dsattention_forward_mask(
                     device=device,
                     cp_group=cp_group,
                 )
-            else:
-                key_pos = torch.arange(skv, dtype=torch.int64, device=device)
-            return build_causal_mask_from_positions(query_pos, key_pos), None
+            varlen_starts = torch.zeros_like(query_pos, dtype=torch.int64, device=device)
+            varlen_ends = (query_pos.to(dtype=torch.int64) + 1).clamp(max=skv)
+            return None, (varlen_starts, varlen_ends, None)
 
-        return _build_default_causal_mask(sq, skv, device=device), None
+        varlen_starts = torch.zeros(sq, dtype=torch.int64, device=device)
+        varlen_ends = torch.arange(1, sq + 1, dtype=torch.int64, device=device).clamp(max=skv)
+        return None, (varlen_starts, varlen_ends, None)
 
     assert attention_mask is not None, "attention_mask is required when attn_mask_type is None"
     assert attention_mask.shape == (b, 1, sq, skv), "attention_mask shape mismatch"
@@ -462,6 +493,10 @@ def build_fused_indexer_varlen_bounds(
     key_positions: Optional[torch.Tensor],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Build row-wise contiguous [start, end) key bounds for optional fused indexer kernels."""
+    explicit_key_positions = key_positions is not None
+    if varlen_starts is not None and explicit_key_positions:
+        return None
+
     varlen_starts, varlen_ends, key_positions = normalize_varlen_bounds(
         mask=mask,
         varlen_starts=varlen_starts,
@@ -471,9 +506,6 @@ def build_fused_indexer_varlen_bounds(
         device=device,
     )
     if varlen_starts is not None:
-        expected_key_pos = torch.arange(skv, dtype=torch.int64, device=device)
-        if not torch.equal(key_positions, expected_key_pos):
-            return None
         return (
             varlen_starts.to(dtype=torch.int32, device=device),
             varlen_ends.to(dtype=torch.int32, device=device),
@@ -484,26 +516,4 @@ def build_fused_indexer_varlen_bounds(
         starts = torch.zeros_like(ends)
         return starts.to(dtype=torch.int32), ends.to(dtype=torch.int32)
 
-    if mask.ndim == 3:
-        # Fused indexers generally use one shared bounds schedule. For batched masks, only
-        # enable a fused path when all batch masks are identical.
-        if mask.size(0) > 1:
-            ref_mask = mask[0]
-            for bi in range(1, mask.size(0)):
-                if not torch.equal(mask[bi], ref_mask):
-                    return None
-        row_mask = mask[0]
-    else:
-        row_mask = mask
-    if row_mask.ndim != 2 or row_mask.shape != (sq, skv):
-        return None
-
-    finite = torch.isfinite(row_mask)
-    ends = finite.sum(dim=-1, dtype=torch.int64)
-    key_ids = torch.arange(skv, dtype=torch.int64, device=device).unsqueeze(0)
-    expected = key_ids < ends.unsqueeze(-1)
-    if not torch.equal(finite, expected):
-        return None
-
-    starts = torch.zeros_like(ends)
-    return starts.to(dtype=torch.int32), ends.to(dtype=torch.int32)
+    return None

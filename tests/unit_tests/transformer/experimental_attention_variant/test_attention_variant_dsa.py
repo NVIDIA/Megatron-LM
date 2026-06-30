@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -46,6 +47,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_causal_mask_from_positions,
     build_fused_indexer_varlen_bounds,
     generate_varlen_mask_params_for_positions,
+    masked_log_softmax,
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -452,6 +454,75 @@ def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
     )
 
 
+def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "tilelang"
+
+    q = torch.zeros((1, 1, 1, 1))
+    starts = torch.tensor([0], dtype=torch.int32)
+    ends = torch.tensor([1], dtype=torch.int32)
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_qk_topk=lambda **_kwargs: None,
+            run_fused_qk_topk_with_loss=lambda **_kwargs: None,
+            run_fused_absorbed_sparse_attention=lambda *_args: None,
+            run_fused_dsa_attention=lambda **_kwargs: None,
+        ),
+    )
+    caplog.set_level(logging.DEBUG, logger=dsa_kernels.__name__)
+
+    assert dsa_kernels.run_fused_qk_topk(Config, q, q, q[..., 0], 1, starts, ends, 128) is None
+    assert (
+        dsa_kernels.run_fused_qk_topk_with_loss(
+            Config, q, q, q[..., 0], 1, starts, ends, 128, q, q, 1.0, 0.01, object()
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=q,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=q[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+    for hook_name in (
+        "run_fused_qk_topk",
+        "run_fused_qk_topk_with_loss",
+        "run_fused_absorbed_sparse_attention",
+        "run_fused_dsa_attention",
+    ):
+        assert f"DSA fused backend tilelang {hook_name} declined" in caplog.text
+    assert "backend returned None" in caplog.text
+
+
 def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     class Config:
         attention_backend = "auto"
@@ -468,8 +539,8 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     expected_full = (expected_sparse, torch.tensor(0.0))
     seen = {}
 
-    def run_fused_qk_topk(*args):
-        seen["topk_args"] = args
+    def run_fused_qk_topk(**kwargs):
+        seen["topk_kwargs"] = kwargs
         return expected_topk
 
     def run_fused_qk_topk_with_loss(**kwargs):
@@ -496,10 +567,23 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     )
 
     assert (
-        dsa_kernels.run_fused_qk_topk(Config, q, k, q[..., 0], 1, starts, ends, 128)
+        dsa_kernels.run_fused_qk_topk(
+            Config,
+            q,
+            k,
+            q[..., 0],
+            1,
+            starts,
+            ends,
+            128,
+            single_packed_thd_sequence=True,
+            local_packed_cp_rank=3,
+        )
         is expected_topk
     )
-    assert seen["topk_args"][-1] is False
+    assert seen["topk_kwargs"]["use_local_indexer_varlen"] is False
+    assert seen["topk_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["topk_kwargs"]["local_packed_cp_rank"] == 3
     assert (
         dsa_kernels.run_fused_qk_topk_with_loss(
             Config,
@@ -517,12 +601,16 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
             object(),
             calculate_per_token_loss=True,
             use_local_indexer_varlen=True,
+            single_packed_thd_sequence=True,
+            local_packed_cp_rank=2,
         )
         is expected_topk_loss
     )
     assert seen["loss_kwargs"]["config"] is Config
     assert seen["loss_kwargs"]["calculate_per_token_loss"] is True
     assert seen["loss_kwargs"]["use_local_indexer_varlen"] is True
+    assert seen["loss_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["loss_kwargs"]["local_packed_cp_rank"] == 2
 
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
@@ -642,6 +730,38 @@ class TestDSACPPositionHelpers:
                 cp_group=fake_cp_group,
                 device=torch.device("cpu"),
             )
+
+    def test_nonpacked_allgather_cp_checks_cuda_lengths(self, monkeypatch):
+        """Non-packed CP length validation should not skip CUDA/NCCL-style groups."""
+        local_lengths = [3, 5]
+        fake_cp_group = _FakeCPGroup(len(local_lengths))
+        seen_devices = []
+        real_tensor = torch.tensor
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def _fake_tensor(data, *, device=None, dtype=None, **kwargs):
+            seen_devices.append(torch.device(device) if device is not None else None)
+            return real_tensor(data, dtype=dtype, **kwargs)
+
+        def _fake_all_gather(out, local_len, group=None):
+            del local_len, group
+            for i, tensor in enumerate(out):
+                tensor.fill_(local_lengths[i])
+
+        monkeypatch.setattr(torch, "tensor", _fake_tensor)
+        monkeypatch.setattr(torch.distributed, "all_gather", _fake_all_gather)
+
+        with pytest.raises(RuntimeError, match="uniform per-rank sequence lengths"):
+            _validate_nonpacked_cp_uniform_length(
+                sq=local_lengths[1],
+                skv=local_lengths[1],
+                cp_size=len(local_lengths),
+                cp_group=fake_cp_group,
+                device=torch.device("cuda"),
+            )
+        assert seen_devices == [torch.device("cuda")]
 
     def test_position_based_causal_mask(self):
         """Position-based causal mask should mask keys with strictly larger positions."""
@@ -1042,36 +1162,55 @@ class TestDSACPPositionHelpers:
         assert key.grad is not None and torch.isfinite(key.grad).all()
         assert value.grad is not None and torch.isfinite(value.grad).all()
 
-    def test_fused_bounds_disable_on_per_batch_mask_mismatch(self):
-        """Fused bounds should disable when batched masks are not identical."""
+    def test_fused_bounds_use_identity_varlen_without_key_positions(self):
+        """Identity key positions are represented by key_positions=None for fused bounds."""
+        sq, skv = 5, 7
+        starts = torch.zeros(sq, dtype=torch.int64)
+        ends = torch.arange(1, sq + 1, dtype=torch.int64)
+        out = build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=starts.device,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=None,
+        )
+        assert out is not None
+        starts_i32, ends_i32 = out
+        torch.testing.assert_close(starts_i32, starts.to(dtype=torch.int32))
+        torch.testing.assert_close(ends_i32, ends.to(dtype=torch.int32))
+
+        explicit_identity = build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=starts.device,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=torch.arange(skv, dtype=torch.int64),
+        )
+        assert explicit_identity is None
+
+    def test_fused_bounds_decline_explicit_additive_mask(self):
+        """Explicit additive masks avoid GPU equality checks by declining fused bounds."""
         sq, skv, bsz = 5, 7, 2
         base_mask = torch.triu(
             torch.full((sq, skv), float("-inf"), dtype=torch.float32), diagonal=1
         )
         mask = base_mask.unsqueeze(0).expand(bsz, -1, -1).clone()
-        out = build_fused_indexer_varlen_bounds(
-            sq=sq,
-            skv=skv,
-            device=mask.device,
-            mask=mask,
-            varlen_starts=None,
-            varlen_ends=None,
-            key_positions=None,
+        assert (
+            build_fused_indexer_varlen_bounds(
+                sq=sq,
+                skv=skv,
+                device=mask.device,
+                mask=mask,
+                varlen_starts=None,
+                varlen_ends=None,
+                key_positions=None,
+            )
+            is None
         )
-        assert out is not None
-
-        # Change one batch mask so masks are no longer identical.
-        mask[1, 0, 0] = float("-inf")
-        out_mismatch = build_fused_indexer_varlen_bounds(
-            sq=sq,
-            skv=skv,
-            device=mask.device,
-            mask=mask,
-            varlen_starts=None,
-            varlen_ends=None,
-            key_positions=None,
-        )
-        assert out_mismatch is None
 
     def test_scatter_topk_chunked_matches_manual_with_negative_indices(self):
         """Chunked top-k scatter should match manual behavior for -1 invalid indices."""
@@ -1243,6 +1382,15 @@ class TestDSAIndexerLossRowMaskCPU:
             tp = _FakeTP()
 
         return _FakeCollection()
+
+    def test_masked_log_softmax_handles_fully_masked_rows(self):
+        logits = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+        valid = torch.tensor([[True, False], [False, False]])
+
+        log_probs = masked_log_softmax(logits, valid)
+
+        torch.testing.assert_close(log_probs, torch.zeros_like(log_probs))
+        assert torch.isfinite(log_probs).all()
 
     def test_dense_indexer_loss_ignores_padded_rows(self):
         index_scores = torch.tensor([[[2.0, float("-inf")], [0.1, 0.9]]], dtype=torch.float32)
@@ -2255,8 +2403,15 @@ class TestDSAttention:
 
         assert output is expected_output
 
-    def test_disabled_indexer_loss_can_use_full_fused_attention(self, monkeypatch):
-        """Full fused DSA attention forward can run when indexer loss is disabled."""
+    @pytest.mark.parametrize(
+        ("training", "configured_loss_coeff"),
+        [(True, 0.0), (False, 1.0)],
+        ids=["disabled-loss", "eval"],
+    )
+    def test_inactive_indexer_loss_can_use_full_fused_attention(
+        self, monkeypatch, training, configured_loss_coeff
+    ):
+        """Full fused DSA attention skips indexer loss when it is inactive."""
         seq_len = 4
         batch_size = 1
         num_heads = self.config.num_attention_heads
@@ -2277,7 +2432,7 @@ class TestDSAttention:
 
         monkeypatch.setattr(self.config, "attention_backend", "auto")
         monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
-        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", configured_loss_coeff)
         monkeypatch.setattr(
             "megatron.core.transformer.experimental_attention_variant.dsa."
             "dsa_kernels.run_fused_dsa_attention",
@@ -2288,7 +2443,7 @@ class TestDSAttention:
         )
 
         was_training = self.sparse_attention.training
-        self.sparse_attention.train()
+        self.sparse_attention.train(training)
         try:
             output = self.sparse_attention(
                 query=torch.randn(seq_len, batch_size, num_heads, head_dim),
@@ -2326,13 +2481,15 @@ class TestDSAttention:
             seen["fused_loss_coeff"] = kwargs["loss_coeff"]
             seen["fused_sparse_loss"] = kwargs["sparse_loss"]
             seen["use_local_indexer_varlen"] = kwargs["use_local_indexer_varlen"]
+            seen["single_packed_thd_sequence"] = kwargs["single_packed_thd_sequence"]
+            seen["local_packed_cp_rank"] = kwargs["local_packed_cp_rank"]
             return expected_output, torch.zeros((), dtype=torch.float32)
 
         monkeypatch.setattr(self.config, "attention_backend", "auto")
         monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
         monkeypatch.setattr(self.config, "dsa_indexer_use_sparse_loss", False)
         monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
-        monkeypatch.setattr(self.sparse_attention.indexer.pg_collection, "cp", _FakeCPGroup(2))
+        monkeypatch.setattr(self.sparse_attention.indexer.pg_collection, "cp", _FakeCPGroup(2, 1))
         monkeypatch.setattr(
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
@@ -2349,6 +2506,8 @@ class TestDSAttention:
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
             max_seqlen_q=key_seq_len,
             max_seqlen_kv=key_seq_len,
         )
@@ -2370,6 +2529,187 @@ class TestDSAttention:
         assert seen["fused_loss_coeff"] == self.config.dsa_indexer_loss_coeff
         assert seen["fused_sparse_loss"] is False
         assert seen["use_local_indexer_varlen"] is True
+        assert seen["single_packed_thd_sequence"] is True
+        assert seen["local_packed_cp_rank"] == 1
+
+    def test_packed_tp_sequence_parallel_uses_full_query_rows_for_single_sequence(
+        self, monkeypatch
+    ):
+        """TP+SP packed THD should preserve AbsorbedMLA's full query-row layout."""
+        seq_len = 4
+        tp_size = 2
+        cp_size = 2
+        tp_rank = 1
+        cp_rank = 1
+        key_seq_len = seq_len * tp_size
+        global_seq_len = key_seq_len * cp_size
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        seen = {}
+        cp_group = _FakeCPGroup(cp_size, cp_rank)
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            q_indexer = torch.randn(key_seq_len, batch_size, 2, 4)
+            k_indexer = torch.randn(key_seq_len, batch_size, 4)
+            weights = torch.ones(key_seq_len, batch_size, 2)
+            return q_indexer, k_indexer, weights
+
+        expected_output = torch.randn(key_seq_len, batch_size, self.config.hidden_size)
+
+        def _fake_run_fused_attention(**kwargs):
+            seen["loss_coeff"] = kwargs["loss_coeff"]
+            seen["q_indexer_len"] = kwargs["q_indexer"].size(0)
+            seen["k_indexer_len"] = kwargs["k_indexer"].size(0)
+            seen["key_len"] = kwargs["key"].size(0)
+            seen["varlen_starts"] = kwargs["varlen_starts"].detach().clone()
+            seen["varlen_ends"] = kwargs["varlen_ends"].detach().clone()
+            seen["use_local_indexer_varlen"] = kwargs["use_local_indexer_varlen"]
+            seen["single_packed_thd_sequence"] = kwargs["single_packed_thd_sequence"]
+            seen["local_packed_cp_rank"] = kwargs["local_packed_cp_rank"]
+            return expected_output, torch.zeros((), dtype=torch.float32)
+
+        def _fake_gather_from_sequence_parallel_region(tensor, group):
+            if group is cp_group:
+                return torch.cat([tensor, tensor], dim=0)
+            return tensor
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", True)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(
+            self.sparse_attention.pg_collection, "tp", _FakeCPGroup(tp_size, tp_rank)
+        )
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_dsa_attention",
+            _fake_run_fused_attention,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "gather_from_sequence_parallel_region",
+            _fake_gather_from_sequence_parallel_region,
+        )
+
+        was_training = self.sparse_attention.training
+        self.sparse_attention.train()
+        cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+            max_seqlen_q=global_seq_len,
+            max_seqlen_kv=global_seq_len,
+        )
+        try:
+            output = self.sparse_attention(
+                query=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                value=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+            )
+        finally:
+            self.sparse_attention.train(was_training)
+
+        torch.testing.assert_close(output, expected_output)
+        assert seen["loss_coeff"] == 0.0
+        assert seen["q_indexer_len"] == key_seq_len
+        assert seen["k_indexer_len"] == global_seq_len
+        assert seen["key_len"] == global_seq_len
+        torch.testing.assert_close(
+            seen["varlen_starts"], torch.zeros(key_seq_len, dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            seen["varlen_ends"],
+            torch.cat((torch.arange(5, 9), torch.arange(9, 13))).to(torch.int64),
+        )
+        assert seen["use_local_indexer_varlen"] is True
+        assert seen["single_packed_thd_sequence"] is True
+        assert seen["local_packed_cp_rank"] == cp_rank
+
+    def test_nonpacked_tp_sequence_parallel_uses_global_causal_rows(self, monkeypatch):
+        """A sequence-local TP rank should use its global rows for causal bounds."""
+        seq_len = 4
+        tp_size = 2
+        tp_rank = 1
+        full_seq_len = seq_len * tp_size
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        tp_group = _FakeCPGroup(tp_size, tp_rank)
+        seen = {}
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            q_indexer = torch.randn(full_seq_len, batch_size, 2, 4)
+            k_indexer = torch.randn(full_seq_len, batch_size, 4)
+            weights = torch.ones(full_seq_len, batch_size, 2)
+            return q_indexer, k_indexer, weights
+
+        expected_output = torch.randn(seq_len, batch_size, self.config.hidden_size)
+
+        def _fake_run_fused_attention(**kwargs):
+            seen["query_len"] = kwargs["query"].size(0)
+            seen["key_len"] = kwargs["key"].size(0)
+            seen["q_indexer_len"] = kwargs["q_indexer"].size(0)
+            seen["varlen_ends"] = kwargs["varlen_ends"].detach().clone()
+            return expected_output, None
+
+        def _fake_gather_from_sequence_parallel_region(tensor, group):
+            if group is tp_group:
+                return torch.cat([tensor, tensor], dim=0)
+            return tensor
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", True)
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "tp", tp_group)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_dsa_attention",
+            _fake_run_fused_attention,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "gather_from_sequence_parallel_region",
+            _fake_gather_from_sequence_parallel_region,
+        )
+
+        was_training = self.sparse_attention.training
+        self.sparse_attention.train()
+        try:
+            output = self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                value=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+            )
+        finally:
+            self.sparse_attention.train(was_training)
+
+        torch.testing.assert_close(output, expected_output)
+        assert seen["query_len"] == seq_len
+        assert seen["key_len"] == full_seq_len
+        assert seen["q_indexer_len"] == seq_len
+        torch.testing.assert_close(seen["varlen_ends"], torch.arange(5, 9, dtype=torch.int64))
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_forward(self):
