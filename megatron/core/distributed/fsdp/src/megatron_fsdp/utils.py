@@ -865,5 +865,7 @@ def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
     """
     Check if tensor parallelism is being used based on the distributed index.
     """
+    if dist_index.tp_dim is None:
+        return False
     tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
     return tp_mesh.mesh.numel() > 1

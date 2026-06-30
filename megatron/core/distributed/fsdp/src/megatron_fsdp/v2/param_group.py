@@ -149,6 +149,8 @@ class ParameterGroup:
         Buffer creation logic:
         - model_weight_buffer: always created; replicated unless "optim_grads_params"
         - main_weight_buffer: created if mp_policy.main_params_dtype is specified
+          AND it differs from the model-weight dtype or requires a different
+          sharding layout; otherwise the optimizer mutates model_weight_buffer
         - main_grad_buffer: created if requires_grad
         """
         s = self.sharding_strategy
@@ -172,9 +174,19 @@ class ParameterGroup:
                 tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
             self.transpose_weight_buffer = tbuf
 
-        # Create main weight buffer for mixed precision
+        # Create main weight buffer for mixed precision. Skip the redundant
+        # copy when the optimizer dtype matches the model-weight dtype AND the
+        # sharding layout is identical — in that case the optimizer mutates
+        # ``model_weight_buffer`` directly via the dist_param views (which the
+        # code below already binds to ``model_weight_buffer`` when
+        # ``main_weight_buffer`` is None). Quantized params (FP8/NVFP4) always
+        # need a separate main buffer because their model-weight dtype (uint8)
+        # differs from the optimizer dtype (fp32), so the dtype guard below
+        # already prevents skipping them.
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
-        if main_params_dtype is not None:
+        if main_params_dtype is not None and (
+            main_params_dtype != model_weight_dtype or shard_main_weights != shard_weights
+        ):
             mbuf = self._create_buffer(main_params_dtype, shard_main_weights, "main_weight")
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
@@ -207,7 +219,12 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
+    def unshard(
+        self,
+        bwd_pass: bool = False,
+        bind_params: bool = True,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -220,7 +237,7 @@ class ParameterGroup:
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=bind_params)
+                weight_buffer.unshard(bind_params=bind_params, stream=stream)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
@@ -255,7 +272,7 @@ class ParameterGroup:
             self.transpose_weight_buffer,
         )
 
-    def reduce_grad(self):
+    def reduce_grad(self, stream: Optional[torch.cuda.Stream] = None):
         """
         Reduce gradients across DP ranks.
 
@@ -269,6 +286,7 @@ class ParameterGroup:
         # accumulating — no stale data from uninitialised or zeroed buffers.
         self.main_grad_buffer.reduce_grad(
             overwrite_grad=self._grad_buffer_is_fresh,
+            stream=stream,
         )
         self._grad_buffer_is_fresh = False
 

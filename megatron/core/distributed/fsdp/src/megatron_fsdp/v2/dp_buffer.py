@@ -586,6 +586,7 @@ class DataParallelBuffer:
     def unshard(
         self,
         bind_params: bool = False,
+        stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
@@ -602,15 +603,14 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        torch.distributed.all_gather_into_tensor(
-            output_tensor=full_buffer,
-            input_tensor=shard_buffer,
-            group=self.dp_group,
-        )
-        if full_buffer.is_cuda:
-            # Temporary all-gather buckets may be released from another stream before
-            # the collective finishes; record the producer stream for allocator safety.
-            full_buffer.record_stream(torch.cuda.current_stream())
+        stream = stream or torch.cuda.current_stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.distributed.all_gather_into_tensor(
+                output_tensor=full_buffer,
+                input_tensor=shard_buffer,
+                group=self.dp_group,
+            )
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
@@ -674,7 +674,10 @@ class DataParallelBuffer:
     @torch.no_grad()
     def reduce_grad(
         self,
+        *,
         overwrite_grad: bool = False,
+        grad_comm_dtype: Optional[torch.dtype] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         """Reduce gradients into the optimizer-facing local shard.
 
@@ -689,7 +692,7 @@ class DataParallelBuffer:
         if self.sharding_strategy in ("no_shard", "optim"):
             overwrite_grad = True
 
-        grad_comm_dtype = self.mp_policy.grad_comm_dtype or self.dtype
+        grad_comm_dtype = grad_comm_dtype or self.mp_policy.grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
             op = torch.distributed.ReduceOp.SUM
@@ -705,15 +708,18 @@ class DataParallelBuffer:
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
         if not self.is_distributed and self.sharding_strategy == "no_shard":
-            comm_input = (
-                self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
-            )
-            if prescale:
-                comm_input.mul_(self.gradient_scaling_factor)
-            torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
-            if grad_comm_dtype != self.dtype:
-                self.data.copy_(comm_input.to(self.dtype))
-            return
+            stream = stream or torch.cuda.current_stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                comm_input = (
+                    self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+                )
+                if prescale:
+                    comm_input.mul_(self.gradient_scaling_factor)
+                torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
+                if grad_comm_dtype != self.dtype:
+                    self.data.copy_(comm_input.to(self.dtype))
+                return
 
         if self.is_distributed:
             # ZeRO-2/3 (optim_grads/optim_grads_params): ``self.data`` is the
@@ -722,9 +728,6 @@ class DataParallelBuffer:
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
-            if input_buffer.is_cuda:
-                # Keep temporary reduce-scatter buffers tied to the stream that uses them.
-                input_buffer.record_stream(torch.cuda.current_stream())
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
@@ -733,23 +736,26 @@ class DataParallelBuffer:
             input_buffer = self.fetch_buffer()
             output_offset = sm.local_data_index
 
-        comm_input = input_buffer.to(grad_comm_dtype)
-        if prescale:
-            comm_input.mul_(self.gradient_scaling_factor)
-        reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
+        stream = stream or torch.cuda.current_stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            comm_input = input_buffer.to(grad_comm_dtype)
+            if prescale:
+                comm_input.mul_(self.gradient_scaling_factor)
+            reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
 
-        torch.distributed.reduce_scatter_tensor(
-            output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
-        )
+            torch.distributed.reduce_scatter_tensor(
+                output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
+            )
 
-        # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
-        if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
-            return
+            # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
+            if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
+                return
 
-        if overwrite_grad:
-            local_grad_shard.copy_(reduced_grad_shard)
-        else:
-            local_grad_shard += reduced_grad_shard
+            if overwrite_grad:
+                local_grad_shard.copy_(reduced_grad_shard)
+            else:
+                local_grad_shard += reduced_grad_shard
 
 
 def check_all_fsdp_buffers(module) -> bool:

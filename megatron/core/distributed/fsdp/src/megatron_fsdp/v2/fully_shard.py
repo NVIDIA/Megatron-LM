@@ -39,6 +39,7 @@ from .mixed_precision import MixedPrecisionPolicy
 from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
+_fsdp_class_cache = {}  # module-level cache
 
 
 def fully_shard(
@@ -99,7 +100,9 @@ def fully_shard(
         mp_policy = MixedPrecisionPolicy()
 
     cls = module.__class__
-    new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    if cls not in _fsdp_class_cache:
+        _fsdp_class_cache[cls] = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
     use_trace_pool = (
