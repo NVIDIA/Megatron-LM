@@ -8,7 +8,7 @@ deprecated — new work should target the dynamic path described here.
 ---
 
 ## Table of Contents
-
+F
 1. [What Megatron Inference Is For](#1-what-megatron-inference-is-for)
 2. [Rollout Performance](#2-rollout-performance)
 3. [Supported Features](#3-supported-features)
@@ -36,12 +36,12 @@ deprecated — new work should target the dynamic path described here.
 
 ## 1. What Megatron Inference Is For
 
-Megatron Inference is built **primarily as the rollout engine for
-reinforcement learning (RL)**, not as a standalone serving engine. While it
-*can* be used as a general-purpose inference server (see
-[Section 5](#5-online-serving-openai-compatible-server)), its design center is
-the RL loop, where a model alternates between **training** and **generation
-(rollout)** phases inside the same process.
+Megatron Inference is built **primarily as the generation engine for
+reinforcement learning (RL)**, not as a standalone serving engine. Its design
+center is the RL loop, where a model alternates between **training** and
+**rollout** phases inside the same process. (A rollout is typically generation
+plus sandboxing / environment infrastructure; Megatron Inference provides the
+**generation** portion.)
 
 This focus drives the major design benefits:
 
@@ -50,10 +50,11 @@ This focus drives the major design benefits:
   that *generates* rollouts. Running both in MCore removes the cross-framework
   portion of this gap and makes the remaining numerical mismatch far easier to
   control (see batch-invariant kernels below).
-- **No model conversion.** Because rollouts run on the same MCore model, there
-  is **no Hugging Face ↔ MCore conversion** step between training and
-  generation, and **day-0 inference** for any model trainable in Megatron Core.
-- **Cheap training ↔ inference transitions.** Tight coupling enables
+- **No model conversion.** Because generation runs on the same MCore model,
+  there is **no Hugging Face ↔ MCore conversion** step between training and
+  generation, providing **day-0 inference** for any model trainable in Megatron
+  Core.
+- **Inexpensive training ↔ inference transitions.** Tight coupling enables
   in-place weight refit and shared memory management, drastically cutting
   re-initialization cost relative to standing up an external inference engine
   each rollout.
@@ -64,12 +65,8 @@ This focus drives the major design benefits:
   the same GPUs) and **non-colocated** setups (training and inference run on
   separate resources), with the engine resharding weights to the inference-time
   parallel configuration during the swap.
-- **First-class parallelism reuse.** Rollouts reuse Megatron-LM's existing TP /
-  EP / PP parallelism infrastructure directly.
-
-This work is developed in tight collaboration with the Megatron-RL team. If you
-just need a quick offline generation or an OpenAI-style endpoint, that works too
-— but keep in mind the engine's priorities are set by the RL use case.
+- **First-class parallelism reuse.** Inference reuses Megatron Core's existing
+  TP / EP / PP parallelism infrastructure directly.
 
 ---
 
