@@ -1063,13 +1063,9 @@ class ChunkOffloadHandler:
             # Reload the last group (last layer) early
             self.bulk_reload_group()
 
-    def should_bulk_offload(self, name):
+    def should_bulk_offload(self, group):
         """Determine if the current group should be offloaded."""
-        assert len(self._groups_to_offload) > 0, "No groups to offload"
-        # CUDA graph scoped modules can create several pending groups before a
-        # commit runs, so match by name instead of assuming LIFO order.
-        group = self.find_group_with_name(self._groups_to_offload, name)
-        assert group is not None, f"Group {name} not found in {self._groups_to_offload}"
+        assert group in self._groups_to_offload, f"Group {group} is not pending offload"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
         # Don't offload if the chunk is not in warmup stage
         if self.is_warmup:
@@ -1093,14 +1089,15 @@ class ChunkOffloadHandler:
     def bulk_offload(self, name, forced_released_tensors):
         """Offload a group of tensors and optionally release their GPU memory."""
         debug_rank("----bulk_offload")
-        if self.should_bulk_offload(name):
-            group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
-            assert (
-                group_to_offload is not None
-            ), f"Group {name} not found in {self._groups_to_offload}"
+        # CUDA graph scoped modules can create several pending groups before a
+        # commit runs, so match by name instead of assuming LIFO order.
+        group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
+        assert (
+            group_to_offload is not None
+        ), f"Group {name} not found in {self._groups_to_offload}"
+        if self.should_bulk_offload(group_to_offload):
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
-            self._groups_to_offload.remove(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
@@ -1109,6 +1106,8 @@ class ChunkOffloadHandler:
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
+        # A group commit is consumed even when policy keeps its tensors on GPU.
+        self._groups_to_offload.remove(group_to_offload)
 
     def _drain_offload_pending(self, group_name: str) -> None:
         """For ``group_name``, have the main stream wait on older D2H events
