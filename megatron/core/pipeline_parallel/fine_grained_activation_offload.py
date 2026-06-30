@@ -1092,9 +1092,7 @@ class ChunkOffloadHandler:
         # CUDA graph scoped modules can create several pending groups before a
         # commit runs, so match by name instead of assuming LIFO order.
         group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
-        assert (
-            group_to_offload is not None
-        ), f"Group {name} not found in {self._groups_to_offload}"
+        assert group_to_offload is not None, f"Group {name} not found in {self._groups_to_offload}"
         if self.should_bulk_offload(group_to_offload):
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
