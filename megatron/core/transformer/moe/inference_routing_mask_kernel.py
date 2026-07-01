@@ -32,13 +32,6 @@ except ImportError:
     HAVE_TRITON = False
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 8}),
-        triton.Config({"BLOCK_M": 128})
-    ],
-    key=["total_rows", "TOPK"],
-)
 @triton.jit
 def _mask_routing_padding_kernel(
     routing_map_ptr,          # int64* [total_rows, topk]
@@ -46,7 +39,7 @@ def _mask_routing_padding_kernel(
     total_rows: tl.int32,
     tp_rank: tl.int32,        # SP/TP rank — local row r maps to global row r + tp_rank*total_rows
     TOPK: tl.constexpr,       # actual topk
-    BLOCK_M: tl.constexpr,    # rows per program (autotuned)
+    BLOCK_M: tl.constexpr,    # rows per program
     BLOCK_TOPK: tl.constexpr, # next_power_of_2(TOPK), column block
 ):
     """Fill `routing_map[real_token_count:, :]` with -1, BLOCK_M rows per program."""
@@ -93,8 +86,9 @@ def mask_routing_padding(
     if total_rows == 0:
         return
 
+    BLOCK_M = 8 if total_rows < 64 else 128
     BLOCK_TOPK = triton.next_power_of_2(topk)
-    grid = lambda META: (triton.cdiv(total_rows, META["BLOCK_M"]),)  # noqa: E731
+    grid = (triton.cdiv(total_rows, BLOCK_M),)
 
     _mask_routing_padding_kernel[grid](
         routing_map,
@@ -102,5 +96,6 @@ def mask_routing_padding(
         total_rows=total_rows,
         tp_rank=tp_rank,
         TOPK=topk,
+        BLOCK_M=BLOCK_M,
         BLOCK_TOPK=BLOCK_TOPK,
     )
