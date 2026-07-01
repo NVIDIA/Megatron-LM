@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for MIMO per-rank runtime setup (RNG seeding, bucket sizing, DDP wrapping)."""
+"""Tests for MIMO per-rank runtime setup (RNG seeding, DDP wrapping)."""
 
 import argparse
 
@@ -9,14 +9,13 @@ import torch
 
 from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import unwrap_model
-from megatron.training.training import resolve_ddp_bucket_size
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     get_language_model_spec,
     get_vision_submodules_spec,
@@ -74,24 +73,6 @@ def _eight_gpu_topology():
     )
 
 
-@pytest.mark.parametrize(
-    "config, overlap, num_params, expected",
-    [
-        # num_buckets divides the param count.
-        (DistributedDataParallelConfig(num_buckets=4), True, 128, 128 // 4),
-        # explicit bucket_size passes through.
-        (DistributedDataParallelConfig(bucket_size=4096), True, 256, 4096),
-        # overlap off -> None, regardless of bucket_size.
-        (DistributedDataParallelConfig(bucket_size=4096), False, 256, None),
-        # no explicit size with group=None (dp size 1) -> the sane default.
-        (DistributedDataParallelConfig(), True, 256, max(40_000_000, 1_000_000)),
-    ],
-)
-def test_resolve_ddp_bucket_size(config, overlap, num_params, expected):
-    """The MIMO wrap delegates bucket sizing to this shared get_model helper."""
-    assert resolve_ddp_bucket_size(config, None, overlap, num_params) == expected
-
-
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
 class TestRuntimeDistributed:
     def setup_method(self, method):
@@ -114,9 +95,9 @@ class TestRuntimeDistributed:
         try:
             module = MIMO_LANGUAGE_MODULE_KEY if torch.distributed.get_rank() >= 4 else ENCODER
             pgc = topo.module_pgs[module]
-            configure_module_rng(_args(), pgc, role_seed_offset=10)
+            configure_module_rng(_args(), pgc, role_seed_offset=10, data_parallel_random_init=True)
             states_a = get_cuda_rng_tracker().get_states()
-            configure_module_rng(_args(), pgc, role_seed_offset=20)
+            configure_module_rng(_args(), pgc, role_seed_offset=20, data_parallel_random_init=True)
             states_b = get_cuda_rng_tracker().get_states()
             assert set(states_a) == set(states_b)
             for name in states_a:
