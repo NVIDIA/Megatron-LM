@@ -34,13 +34,13 @@ except ImportError:
 
 @triton.jit
 def _mask_routing_padding_kernel(
-    routing_map_ptr,          # int64* [total_rows, topk]
-    real_token_count_ptr,     # int32* [1]
+    routing_map_ptr,  # int64* [total_rows, topk]
+    real_token_count_ptr,  # int32* [1]
     total_rows: tl.int32,
-    tp_rank: tl.int32,        # SP/TP rank — local row r maps to global row r + tp_rank*total_rows
-    TOPK: tl.constexpr,       # actual topk
-    BLOCK_M: tl.constexpr,    # rows per program
-    BLOCK_TOPK: tl.constexpr, # next_power_of_2(TOPK), column block
+    tp_rank: tl.int32,  # SP/TP rank — local row r maps to global row r + tp_rank*total_rows
+    TOPK: tl.constexpr,  # actual topk
+    BLOCK_M: tl.constexpr,  # rows per program
+    BLOCK_TOPK: tl.constexpr,  # next_power_of_2(TOPK), column block
 ):
     """Fill `routing_map[real_token_count:, :]` with -1, BLOCK_M rows per program."""
     pid = tl.program_id(0)

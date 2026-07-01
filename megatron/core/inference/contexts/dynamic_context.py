@@ -724,9 +724,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
         # dispatcher requires equal token counts across ranks already.
         if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(
-                self.gpu_view.real_token_count
-            )
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
