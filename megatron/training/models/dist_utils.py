@@ -107,7 +107,6 @@ def unimodal_build_distributed_models(
         model_list,
         transformer_config,
         pg_collection,
-        built_with_meta_device=init_model_with_meta_device,
         ddp_config=ddp_config,
         overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
         use_megatron_fsdp=use_megatron_fsdp,
@@ -122,7 +121,6 @@ def prepare_existing_model_chunks_for_distributed_training(
     model_list: list[MegatronModule],
     transformer_config: TransformerConfig,
     pg_collection: ProcessGroupCollection,
-    built_with_meta_device: bool,
     ddp_config: DistributedDataParallelConfig | None = None,
     overlap_param_gather_with_optimizer_step: bool = False,
     use_megatron_fsdp: bool = False,
@@ -140,7 +138,6 @@ def prepare_existing_model_chunks_for_distributed_training(
         model_list: Already-built model chunks.
         transformer_config: TransformerConfig; used for precision and device placement.
         pg_collection: Model communication process groups.
-        built_with_meta_device: Whether the chunks were built on meta device.
         ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
         overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step.
         use_megatron_fsdp: Whether to use Megatron FSDP.
@@ -155,10 +152,8 @@ def prepare_existing_model_chunks_for_distributed_training(
     """
     if wrap_with_ddp and not ddp_config:
         raise ValueError("ddp_config is required when wrap_with_ddp is True")
-    if transformer_config.init_model_with_meta_device != built_with_meta_device:
-        raise ValueError(
-            "Transformer config init_model_with_meta_device must match the model construction context"
-        )
+
+    init_model_with_meta_device = transformer_config.init_model_with_meta_device
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -174,14 +169,14 @@ def prepare_existing_model_chunks_for_distributed_training(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not built_with_meta_device:
+    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if built_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
+    if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
             to_empty_if_meta_device(model_module, device=torch.device("cuda"))
             for model_module in model_list

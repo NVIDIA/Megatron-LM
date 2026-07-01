@@ -22,6 +22,16 @@ _LANGUAGE_SEED_OFFSET = 20_000
 _SPLIT_SEED_OFFSETS = (0, 100_000, 200_000)
 
 
+def add_mock_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register the mock-dataset arguments consumed by this module's loaders."""
+    group = parser.add_argument_group("mimo mock data")
+    group.add_argument("--dataset-provider", choices=("mock",), default="mock")
+    group.add_argument("--image-token-id", type=int, default=511)
+    group.add_argument("--image-seq-length", type=int, default=None)
+    group.add_argument("--mock-dataset-size", type=int, default=10_000)
+    return parser
+
+
 def _dynamic_patch_grid(num_patches: int, require_even: bool) -> tuple[int, int]:
     """Factor a patch budget into the nearest-to-square valid grid."""
     for rows in range(isqrt(num_patches), 0, -1):

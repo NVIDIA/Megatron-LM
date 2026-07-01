@@ -876,7 +876,6 @@ class TestUnimodalBuildDistributedModels:
                 prebuilt_chunks,
                 self.transformer_config,
                 self.pg,
-                built_with_meta_device=False,
                 wrap_with_ddp=False,
             )
 
@@ -888,20 +887,6 @@ class TestUnimodalBuildDistributedModels:
             mocks["mp_wrap"].assert_called_once_with(
                 prebuilt_chunks, self.transformer_config, Float16Module
             )
-        finally:
-            self._stop_patches()
-
-    def test_prepare_existing_chunks_rejects_meta_context_mismatch(self):
-        self._standard_patches()
-        try:
-            with pytest.raises(ValueError, match="construction context"):
-                prepare_existing_model_chunks_for_distributed_training(
-                    [self.mock_model],
-                    _make_transformer_config(init_model_with_meta_device=True),
-                    self.pg,
-                    built_with_meta_device=False,
-                    wrap_with_ddp=False,
-                )
         finally:
             self._stop_patches()
 

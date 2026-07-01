@@ -175,8 +175,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
 
         wrap_active_modules_with_ddp(args, mimo_model, topology, data_parallel_random_init)
         configure_grad_sync(args, mimo_model, topology)
-        # Load-bearing contract read by training.py for checkpoint save/load, per-module
-        # reductions, and optimizer construction (see Increments 2 and 4).
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix
 

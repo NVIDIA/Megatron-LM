@@ -17,7 +17,7 @@ from examples.mimo.training.args import (
     validate_hetero_grid_args,
 )
 from examples.mimo.training.builder import MimoBuildConfig
-from examples.mimo.training.data import build_train_valid_test_data_loaders
+from examples.mimo.training.data import add_mock_data_args, build_train_valid_test_data_loaders
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
 from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
@@ -35,11 +35,7 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     """Register model-provider, heterogeneous-grid, and mock-data arguments."""
     parser = add_model_provider_args(parser)
     parser = add_hetero_grid_args(parser)
-    data = parser.add_argument_group("mimo mock data")
-    data.add_argument("--dataset-provider", choices=("mock",), default="mock")
-    data.add_argument("--image-token-id", type=int, default=511)
-    data.add_argument("--image-seq-length", type=int, default=None)
-    data.add_argument("--mock-dataset-size", type=int, default=10_000)
+    parser = add_mock_data_args(parser)
     return parser
 
 
