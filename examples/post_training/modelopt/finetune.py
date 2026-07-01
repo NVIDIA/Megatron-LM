@@ -492,8 +492,8 @@ if __name__ == "__main__":
     pretrain(
         pretrain_cfg_container_from_args(args),
         train_valid_test_sft_datasets_provider,
-        partial(model_provider, modelopt_gpt_hybrid_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
     )
