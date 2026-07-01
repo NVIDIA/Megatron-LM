@@ -1004,9 +1004,9 @@ def preprocess_common_state_dict(common_state_dict):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
-    model_provider,
     model_type,
     forward_step_func,
+    model_provider=None,
     process_non_loss_data_func=None,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
@@ -1094,6 +1094,8 @@ def pretrain(
         seed_ep_group=getattr(init_pg_collection, "ep", None),
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1221,7 +1223,11 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_type,
+        model_provider_func=model_provider,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        pg_collection=pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1990,10 +1996,12 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
+    model_provider_func=None,
     checkpointing_context=None,
-    pg_collection=None,
+    *,
+    cfg_container: PretrainConfigContainer | None = None,
+    pg_collection: ProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2006,9 +2014,31 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(
-        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
-    )
+
+    def _build_model_wrapper(wrap_with_ddp: bool):
+        if cfg_container is not None and hasattr(cfg_container, "model") and pg_collection is not None:
+            from megatron.training.utils import start_memory_history_recording
+
+            start_memory_history_recording(cfg_container.profiling)
+
+            cfg = cfg_container
+            model_config = cfg.model
+            builder_cls = model_config.get_builder_cls()
+            builder = builder_cls(model_config)
+            return builder.build_distributed_models(
+                pg_collection=pg_collection,
+                ddp_config=cfg.ddp,
+                overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+                wrap_with_ddp=wrap_with_ddp,
+                data_parallel_random_init=cfg.rng.data_parallel_random_init,
+            )
+        else:
+            assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
+            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:
@@ -2081,7 +2111,7 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
@@ -2191,7 +2221,7 @@ def dummy_train_step(data_iterator):
     """Single dummy training step."""
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = getattr(args, 'sft', False)
+    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
     is_hybrid_cp = args.hybrid_context_parallel
 
     BATCH_KEYS = [
@@ -2214,7 +2244,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
-                is_sft=is_sft,
+                has_cu_seqlens=has_cu_seqlens,
                 is_hybrid_cp=is_hybrid_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
                 cp_size=args.context_parallel_size,
@@ -2870,13 +2900,17 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model_chunks, param_sync=True):
+def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
+    if param_sync and optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP]) -> None:
+def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+    if optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
@@ -2898,7 +2932,7 @@ def save_checkpoint_and_time(
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+        force_param_sync(model, optimizer=optimizer)
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
@@ -3031,7 +3065,7 @@ def post_training_step_callbacks(
         and iteration % args.check_weight_hash_across_dp_replicas_interval == 0
     ):
         if should_disable_forward_pre_hook(args):
-            disable_forward_pre_hook(model)
+            disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
@@ -3836,16 +3870,8 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
-                # Copy the main params to param buffer before the forced AllGather.
-                for model_chunk in model:
-                    model_chunk.zero_grad_buffer()
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model)
+                disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
@@ -3940,7 +3966,7 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
     # This will finalize all unfinalized async request and terminate
