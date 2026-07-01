@@ -108,7 +108,7 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
-        # Random seeds for reproducibility; a disjoint-grid caller seeds each module itself.
+        # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
             print_rank_0("> setting random seeds to {} ...".format(args.seed))
             _set_random_seed(

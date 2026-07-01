@@ -1074,9 +1074,8 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    # A multi-module carrier defers all RNG seeding to the per-module builder; a plain collection seeds stock.
+    # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
-    init_pg_collection = pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1085,17 +1084,11 @@ def pretrain(
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
         skip_random_seed=skip_random_seed,
-        seed_pp_group=getattr(init_pg_collection, "pp", None),
-        seed_dp_group=getattr(init_pg_collection, "dp", None),
-        seed_tp_group=getattr(init_pg_collection, "tp", None),
-        seed_ep_group=getattr(init_pg_collection, "ep", None),
-        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
-    )
-    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    mpu_pg_collection = (
-        ProcessGroupCollection.use_mpu_process_groups()
-        if mpu.model_parallel_is_initialized()
-        else None
+        seed_pp_group=getattr(pg_collection, "pp", None),
+        seed_dp_group=getattr(pg_collection, "dp", None),
+        seed_tp_group=getattr(pg_collection, "tp", None),
+        seed_ep_group=getattr(pg_collection, "ep", None),
+        seed_etp_group=getattr(pg_collection, "expt_tp", None),
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1111,8 +1104,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
-    set_jit_fusion_options(tp_size=_jit_tp_size)
+    set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1228,7 +1220,12 @@ def pretrain(
         model_provider_func=model_provider,
         checkpointing_context=checkpointing_context,
         cfg_container=cfg_container,
-        pg_collection=mpu_pg_collection,
+        # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
+        pg_collection=(
+            pg_collection
+            if pg_collection is not None
+            else ProcessGroupCollection.use_mpu_process_groups()
+        ),
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -2002,7 +1999,7 @@ def setup_model_and_optimizer(
     checkpointing_context=None,
     *,
     cfg_container: PretrainConfigContainer | None = None,
-    pg_collection: ProcessGroupCollection | None = None,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2148,8 +2145,6 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        # Resolve checkpoint groups from this rank's module PGC; None falls back
-        # to the mpu groups inside load_checkpoint (byte-identical for stock).
         ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
@@ -2159,11 +2154,11 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
-            tp_group=getattr(ckpt_pgc, "tp", None),
-            pp_group=getattr(ckpt_pgc, "pp", None),
-            dp_cp_group=getattr(ckpt_pgc, "dp_cp", None),
-            dp_group=getattr(ckpt_pgc, "dp", None),
-            expt_dp_group=getattr(ckpt_pgc, "expt_dp", None),
+            tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
+            pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
+            dp_cp_group=ckpt_pgc.dp_cp if ckpt_pgc is not None else None,
+            dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
+            expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
         )
         timers('load-checkpoint').stop(barrier=True)
@@ -2426,16 +2421,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    reduction_pgc = get_attr_wrapped_model(model[0], "pg_collection")
-    if reduction_pgc is None:
-        reduction_pgc = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     for _required in ("mp", "pp", "dp_cp"):
-        assert getattr(reduction_pgc, _required, None) is not None, (
+        assert getattr(pg_collection, _required, None) is not None, (
             f"model pg_collection used by train_step must define {_required}"
         )
-    mp_group = reduction_pgc.mp
-    dp_cp_group = reduction_pgc.dp_cp
-    is_last_stage = is_pp_last_stage(reduction_pgc.pp)
+    mp_group = pg_collection.mp
+    dp_cp_group = pg_collection.dp_cp
+    is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
