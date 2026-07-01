@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Static and CPU smoke tests for native GLM-5 lite."""
 
 from __future__ import annotations
