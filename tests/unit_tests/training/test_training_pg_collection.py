@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""pretrain resolves LM-global seed/jit groups from the language collection or None."""
+"""pretrain skips the coarse seed for a multi-module carrier; a plain collection or None seeds stock."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -51,7 +51,8 @@ def _drive_pretrain(pg_collection):
 
 def test_pretrain_stock_none_seeds_defaults():
     captured = _drive_pretrain(None)
-    # No carrier -> every seed group falls back to None (stock defaults).
+    # No carrier -> stock seeds normally (not skipped) with mpu-default groups.
+    assert captured["seed"]["skip_random_seed"] is False
     for key in (
         "seed_pp_group",
         "seed_dp_group",
@@ -65,6 +66,7 @@ def test_pretrain_stock_none_seeds_defaults():
 def test_pretrain_plain_collection_seeds_that_collection():
     pgc = _make_collection(pp="pp", dp="dp", tp="tp", ep="ep", expt_tp="etp")
     captured = _drive_pretrain(pgc)
+    assert captured["seed"]["skip_random_seed"] is False
     assert captured["seed"]["seed_pp_group"] == "pp"
     assert captured["seed"]["seed_dp_group"] == "dp"
     assert captured["seed"]["seed_tp_group"] == "tp"
@@ -72,16 +74,23 @@ def test_pretrain_plain_collection_seeds_that_collection():
     assert captured["seed"]["seed_etp_group"] == "etp"
 
 
-def test_pretrain_multi_module_seeds_language_collection():
+def test_pretrain_multi_module_defers_seed_to_builder():
     language = _make_collection(pp="lpp", dp="ldp", tp="ltp", ep="lep", expt_tp="letp")
     encoder = _make_collection(pp="epp", dp="edp", tp="etp", ep="eep", expt_tp="eetp")
     carrier = MultiModuleProcessGroupCollection(
         module_pgs={"encoder": encoder, "language": language}, language_model_module_name="language"
     )
     captured = _drive_pretrain(carrier)
-    # Language collection wins; the encoder collection is never used to seed.
-    assert captured["seed"]["seed_pp_group"] == "lpp"
-    assert captured["seed"]["seed_tp_group"] == "ltp"
+    # A multi-module carrier skips the coarse seed entirely; the builder seeds each module (no pick).
+    assert captured["seed"]["skip_random_seed"] is True
+    for key in (
+        "seed_pp_group",
+        "seed_dp_group",
+        "seed_tp_group",
+        "seed_ep_group",
+        "seed_etp_group",
+    ):
+        assert captured["seed"][key] is None
 
 
 def test_pretrain_multi_module_without_language_seeds_none():
@@ -90,7 +99,8 @@ def test_pretrain_multi_module_without_language_seeds_none():
         module_pgs={"encoder": encoder}, language_model_module_name=None
     )
     captured = _drive_pretrain(carrier)
-    # Encoder-only ranks get None here (no next(iter) representative); the builder seeds them.
+    # Encoder-only carrier also skips the coarse seed; the builder seeds each module.
+    assert captured["seed"]["skip_random_seed"] is True
     for key in (
         "seed_pp_group",
         "seed_dp_group",

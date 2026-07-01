@@ -1074,13 +1074,9 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    # LM-global concerns use the language collection or None (encoder ranks seed via the builder).
-    init_pg_collection = (
-        pg_collection.get_language_model_collection()
-        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
-        and pg_collection.has_language_model()
-        else (pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None)
-    )
+    # A multi-module carrier defers all RNG seeding to the per-module builder; a plain collection seeds stock.
+    skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+    init_pg_collection = pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1088,6 +1084,7 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
+        skip_random_seed=skip_random_seed,
         seed_pp_group=getattr(init_pg_collection, "pp", None),
         seed_dp_group=getattr(init_pg_collection, "dp", None),
         seed_tp_group=getattr(init_pg_collection, "tp", None),
