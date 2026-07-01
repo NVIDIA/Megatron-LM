@@ -4,7 +4,7 @@ description: CI/CD reference for Megatron-LM. Covers CI pipeline structure, PR s
 license: Apache-2.0
 when_to_use: Investigating a CI failure; understanding the pipeline structure; which CI label to attach; triggering internal GitLab CI; 'CI is red', 'how do I trigger CI', 'PR labels', 'where are the logs', 'pull-request branch'.
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # CI/CD Guide
