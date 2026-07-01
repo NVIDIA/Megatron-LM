@@ -387,9 +387,15 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     def _stream_decoded(
         self,
         pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        prefetcher: TarShardPrefetcher,
         d_save: int,
     ) -> Iterator[_StreamCacheEntry]:
         """Yield decoded ``(i_save, values, indices)`` entries for one ``d_save``.
+
+        Uses *prefetcher* to overlap the download of the next tar object
+        (on MSC paths) with the decode of the current tar, keeping
+        remote-storage tar-boundary stalls out of the training critical
+        path.  Local paths make the prefetcher a no-op.
 
         Re-globs the directory after each batch of tars is exhausted so a
         concurrent writer can publish more shards.  Raises
@@ -407,7 +413,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                         f"in '{self.logprobs_dir}'"
                     )
                 return
-            for url in urls:
+            # One URL per prefetch "group": iter_prefetched schedules
+            # msc_prefetch_depth URLs ahead per stream and yields each
+            # after its download completes.  Multiple d_save streams
+            # share the same prefetcher; their URL sets are disjoint
+            # (different ``dp{d}__*.tar`` prefixes) so no scheduling
+            # collision occurs.
+            for (url,) in prefetcher.iter_prefetched([(u,) for u in urls]):
                 processed.add(url)
                 yield from self._iter_decoded_entries(pool, url)
 
@@ -495,9 +507,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     def __iter__(self):
-        def run(pool):
+        def run(pool, prefetcher):
             streams = {
-                d_save: self._stream_decoded(pool, d_save)
+                d_save: self._stream_decoded(pool, prefetcher, d_save)
                 for d_save in self._needed_d_saves
             }
             cache: Dict[int, Optional[_StreamCacheEntry]] = {
@@ -517,14 +529,23 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 yield values_list, indices_list
                 i_load += 1
 
-        if self._decode_threads == 1:
-            yield from run(None)
-        else:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self._decode_threads,
-                thread_name_prefix="teacher-decode",
-            ) as pool:
-                yield from run(pool)
+        # One prefetcher shared across all needed d_save streams: each
+        # stream requests msc_prefetch_depth URLs ahead, so total
+        # in-flight download workers = msc_prefetch_depth * |d_saves|.
+        # Local paths make TarShardPrefetcher a no-op (enabled=False).
+        with TarShardPrefetcher(
+            enabled=self._remote_logprobs,
+            depth=self._msc_prefetch_depth,
+            max_workers=max(1, self._msc_prefetch_depth * len(self._needed_d_saves)),
+        ) as prefetcher:
+            if self._decode_threads == 1:
+                yield from run(None, prefetcher)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._decode_threads,
+                    thread_name_prefix="teacher-decode",
+                ) as pool:
+                    yield from run(pool, prefetcher)
 
 
 # ---------------------------------------------------------------------------
