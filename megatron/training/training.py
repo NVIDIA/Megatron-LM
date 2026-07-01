@@ -138,6 +138,7 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training.callbacks import Callback, CallbackContext, CallbackManager, should_fire, normalize_callbacks
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -1512,6 +1513,7 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    callbacks: list[Callback] | CallbackManager | None = None,
 ):
     """Main training program.
 
@@ -1558,6 +1560,8 @@ def pretrain(
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+
+    callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1927,6 +1931,15 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
+    if should_fire(callback_manager, "on_data_init_start"):
+        context = CallbackContext(
+            model=model,
+            optimizer=optimizer,
+            scheduler=opt_param_scheduler,
+            user_state=callback_manager.user_state,
+        )
+        callback_manager.fire("on_data_init_start", context)
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
@@ -2038,6 +2051,7 @@ def pretrain(
                     inference_model,
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
+                    callback_manager=callback_manager,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2102,7 +2116,9 @@ def pretrain(
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection, p2p_communicator=p2p_communicator
+                pg_collection=pg_collection, p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=False,
             )
 
     if args.do_test:
@@ -2120,6 +2136,8 @@ def pretrain(
             non_loss_data_func=non_loss_data_func,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=True,
         )
 
     wandb_writer = get_wandb_writer()
@@ -4125,6 +4143,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4508,6 +4527,17 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    if should_fire(callback_manager, "on_train_start"):
+        callback_manager.fire(
+            "on_train_start",
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                optimizer=optimizer,
+                scheduler=opt_param_scheduler,
+            ),
+        )
+
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
@@ -4653,6 +4683,18 @@ def train(
             max_attention_logit = None
             _step_span = None
         else:
+
+            if should_fire(callback_manager, "on_train_step_start"):
+                callback_manager.fire(
+                    "on_train_step_start",
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                        optimizer=optimizer,
+                        scheduler=opt_param_scheduler,
+                    ),
+                )
+
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
             # just the first one that runs. Kept separate from the per-step span below
@@ -4697,6 +4739,21 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+
+            if should_fire(callback_manager, "on_train_step_end"):
+                callback_manager.fire(
+                    "on_train_step_end",
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                        optimizer=optimizer,
+                        scheduler=opt_param_scheduler,
+                        loss_dict=loss_dict,
+                        grad_norm=grad_norm,
+                        skipped_iter=bool(skipped_iter),
+                    ),
+                )
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -4912,7 +4969,8 @@ def train(
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
-                                       p2p_communicator=p2p_communicator)
+                                       p2p_communicator=p2p_communicator,
+                                       callback_manager=callback_manager, is_test=False)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -5041,6 +5099,17 @@ def train(
     # ends the block via _end_otel_job_spans() instead.
     _end_otel_train_span()
 
+    if should_fire(callback_manager, "on_train_end"):
+        callback_manager.fire(
+            "on_train_end",
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                optimizer=optimizer,
+                scheduler=opt_param_scheduler,
+            ),
+        )
+
     return iteration, num_floating_point_operations_so_far
 
 
@@ -5056,10 +5125,15 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+
+    step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
+    step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -5131,6 +5205,16 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+
+            if should_fire(callback_manager, step_start_event):
+                callback_manager.fire(
+                    step_start_event,
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                    ),
+                )
+
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
                 loss_dicts = forward_backward_func(
@@ -5146,6 +5230,16 @@ def evaluate(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
+
+            if should_fire(callback_manager, step_end_event):
+                callback_manager.fire(
+                    step_end_event,
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                    ),
+                )
+
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
@@ -5254,6 +5348,8 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
@@ -5261,6 +5357,9 @@ def evaluate_and_print_results(
         writer = get_tensorboard_writer()
     else:
         writer = None
+
+    start_event = "on_test_start" if is_test else "on_eval_start"
+    end_event = "on_test_end" if is_test else "on_eval_end"
 
     wandb_writer = get_wandb_writer()
 
@@ -5294,6 +5393,15 @@ def evaluate_and_print_results(
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
+    if should_fire(callback_manager, start_event):
+        callback_manager.fire(
+            start_event,
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+            ),
+        )
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -5301,6 +5409,7 @@ def evaluate_and_print_results(
                 suffix = f"-{args.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -5312,6 +5421,8 @@ def evaluate_and_print_results(
             eval_iters=iterations,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=is_test,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -5345,6 +5456,16 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+    if should_fire(callback_manager, end_event):
+        callback_manager.fire(
+            end_event,
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                total_loss_dict=total_loss_dict,
+            ),
+        )
 
 
 def cyclic_iter(iterable):
