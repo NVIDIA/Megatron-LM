@@ -401,5 +401,5 @@ def _encoder_name(topology: HeteroTopology) -> Optional[str]:
     """Return the example's optional single encoder module name."""
     names = [name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY]
     if len(names) > 1:
-        raise ValueError("the heterogeneous MIMO example supports at most one encoder module")
+        raise ValueError("this example's mock data supports at most one encoder module")
     return names[0] if names else None
