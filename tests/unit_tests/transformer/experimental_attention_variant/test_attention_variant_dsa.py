@@ -957,6 +957,8 @@ class TestDSACPPositionHelpers:
             cp_size=2,
             cp_rank=0,
             device=torch.device("cpu"),
+            query_cu_seqlens_cover_output=True,
+            key_cu_seqlens_cover_output=True,
         )
 
         assert query_pos.tolist() == [0, 3, 4, 5, 6, 13, 14, 15]

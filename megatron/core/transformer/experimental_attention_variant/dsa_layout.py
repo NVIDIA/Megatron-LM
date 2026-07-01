@@ -137,6 +137,8 @@ def build_packed_allgather_cp_local_positions(
     cp_rank: int,
     device: torch.device,
     output_size: Optional[int] = None,
+    *,
+    cu_seqlens_cover_output: bool = False,
 ) -> torch.Tensor:
     """Build local packed-token positions for one CP rank under zigzag THD sharding.
 
@@ -190,15 +192,16 @@ def build_packed_allgather_cp_local_positions(
         output_size = int(segment_lens.sum().item())
     if output_size == 0:
         return torch.empty(0, dtype=torch.int64, device=device)
-    # Packed tensors may carry padded rows not represented by unpadded cu_seqlens.
-    # Give those rows deterministic positions after all real tokens so KV reorder
-    # keeps valid packed tokens ordered and moves padding to the suffix.
-    pad_len = (
-        torch.tensor(output_size, dtype=torch.int64, device=device) - segment_lens.sum()
-    ).clamp_min(0)
-    pad_start = cu_seqlens_i64[-1] + cp_rank * output_size
-    segment_starts = torch.cat((segment_starts, pad_start.view(1)), dim=0)
-    segment_lens = torch.cat((segment_lens, pad_len.view(1)), dim=0)
+    if not cu_seqlens_cover_output:
+        # Packed tensors may carry padded rows not represented by unpadded cu_seqlens.
+        # Give those rows deterministic positions after all real tokens so KV reorder
+        # keeps valid packed tokens ordered and moves padding to the suffix.
+        pad_len = (
+            torch.tensor(output_size, dtype=torch.int64, device=device) - segment_lens.sum()
+        ).clamp_min(0)
+        pad_start = cu_seqlens_i64[-1] + cp_rank * output_size
+        segment_starts = torch.cat((segment_starts, pad_start.view(1)), dim=0)
+        segment_lens = torch.cat((segment_lens, pad_len.view(1)), dim=0)
 
     segment_ids = torch.repeat_interleave(
         torch.arange(segment_lens.numel(), dtype=torch.int64, device=device),
@@ -221,6 +224,9 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     local_output_size: Optional[int] = None,
     key_local_output_size: Optional[int] = None,
     global_output_size: Optional[int] = None,
+    *,
+    query_cu_seqlens_cover_output: bool = False,
+    key_cu_seqlens_cover_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build packed-query positions and gathered-KV reorder index for allgather CP.
 
@@ -231,13 +237,23 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     to global packed order, matching the Slime GLM5 implementation semantics.
     """
     query_positions = build_packed_allgather_cp_local_positions(
-        cu_seqlens_q, cp_size, cp_rank, device, output_size=local_output_size
+        cu_seqlens_q,
+        cp_size,
+        cp_rank,
+        device,
+        output_size=local_output_size,
+        cu_seqlens_cover_output=query_cu_seqlens_cover_output,
     )
     if key_local_output_size is None:
         key_local_output_size = local_output_size
     gathered_key_positions = [
         build_packed_allgather_cp_local_positions(
-            cu_seqlens_kv, cp_size, rank, device, output_size=key_local_output_size
+            cu_seqlens_kv,
+            cp_size,
+            rank,
+            device,
+            output_size=key_local_output_size,
+            cu_seqlens_cover_output=key_cu_seqlens_cover_output,
         )
         for rank in range(cp_size)
     ]

@@ -1726,14 +1726,47 @@ class DSAttention(MegatronModule):
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
-            packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                cu_seqlens_q, cp_size, cp_rank, query.device, output_size=packed_query_output_size
-            )
-            if sequence_parallel_query_is_local:
-                row_start = sequence_parallel_tp_row_start
-                packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
+            packed_global_output_size = packed_query_output_size * cp_size
+            if sequence_parallel_tp:
+                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
+                    cu_seqlens_q,
+                    cp_size,
+                    cp_rank,
+                    query.device,
+                    output_size=packed_query_output_size,
+                )
+                if sequence_parallel_query_is_local:
+                    row_start = sequence_parallel_tp_row_start
+                    packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
+                else:
+                    packed_query_positions = packed_query_positions_full
             else:
-                packed_query_positions = packed_query_positions_full
+                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
+                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
+                query_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_q, int)
+                    and packed_seq_params.max_seqlen_q == packed_global_output_size
+                )
+                key_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_kv, int)
+                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
+                )
+                packed_query_positions, kv_reorder_idx = (
+                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=packed_query_output_size,
+                        key_local_output_size=packed_query_output_size,
+                        global_output_size=packed_global_output_size,
+                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    )
+                )
             packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
             _validate_nonpacked_cp_uniform_length(
@@ -1791,13 +1824,15 @@ class DSAttention(MegatronModule):
             gathered_cp_value = False
             if key.size(0) in local_cp_kv_lens:
                 local_cp_kv_len = key.size(0)
-                kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                if kv_reorder_idx is None:
+                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
                 gathered_cp_key = True
             if value is not None and value.size(0) in local_cp_kv_lens:
                 if local_cp_kv_len is None:
                     local_cp_kv_len = value.size(0)
-                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 elif value.size(0) != local_cp_kv_len:
                     raise RuntimeError(
                         "DSA local key/value sequence length mismatch before CP gather: "
