@@ -65,9 +65,9 @@ class DataParallelInferenceCoordinator:
     5.  **Control Signal Broadcasting**: It relays control signals (e.g., PAUSE, STOP)
         from a client to all connected data parallel ranks.
 
-    Message handling is split out into :mod:`handlers`: the event loop in
-    :meth:`start` dispatches each message to the handler registered for its
-    header, so supporting a new message type requires no changes here.
+    Message handling is split out into handlers.py: the event loop in start()
+    dispatches each message to the handler registered for its header, so
+    supporting a new message type requires no changes here.
 
     Attributes:
         router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
@@ -82,7 +82,7 @@ class DataParallelInferenceCoordinator:
     """
 
     # Exposed as a class attribute for backwards compatibility; the canonical
-    # definition lives in :mod:`state`.
+    # definition lives in state.py.
     CoordinatorState = CoordinatorState
 
     def __init__(
@@ -393,7 +393,7 @@ class DataParallelInferenceCoordinator:
 
         This method runs an infinite loop, continuously listening for incoming
         messages on the ZMQ ROUTER socket. It reads the message header and
-        dispatches to the handler registered for it (see :mod:`handlers`).
+        dispatches to the handler registered for it (see handlers.py).
         A handler that returns a truthy value stops the loop.
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.

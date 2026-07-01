@@ -2,9 +2,9 @@
 
 """Data parallel inference coordinator package.
 
-The coordinator class itself lives in :mod:`coordinator`; message handlers are
-in :mod:`handlers` and the control-signal state machine in :mod:`state`. This
-module re-exports the public names so existing imports of
+The coordinator class itself lives in coordinator.py; message handlers are in
+handlers.py and the control-signal state machine in state.py. This module
+re-exports the public names so existing imports of
 ``megatron.core.inference.data_parallel_inference_coordinator`` keep working.
 """
 

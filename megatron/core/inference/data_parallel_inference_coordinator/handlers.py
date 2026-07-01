@@ -2,11 +2,11 @@
 
 """Message handlers for the data parallel inference coordinator.
 
-Each handler is a free function decorated with :func:`message_handler`, which
-records it in the module-level :data:`HANDLERS` registry keyed by message
-header. The coordinator builds its dispatch table from this registry, so a new
-message type is supported simply by adding a decorated function here -- the
-coordinator's event loop never changes.
+Each handler is a free function decorated with @message_handler, which records
+it in the module-level HANDLERS registry keyed by message header. The
+coordinator builds its dispatch table from this registry, so a new message type
+is supported simply by adding a decorated function here; the coordinator's event
+loop never changes.
 
 Handlers have the signature ``(coordinator, sender_identity, payload) -> bool | None``
 where ``payload`` is the already-deserialized message. Returning a truthy value
@@ -28,7 +28,7 @@ except ImportError:
     msgpack = None
 
 
-# Maps a message Headers value to the function that handles it. Populated by the
+# Maps a message header value to the function that handles it. Populated by the
 # @message_handler decorator at import time.
 HANDLERS = {}
 
@@ -37,7 +37,7 @@ def message_handler(*headers):
     """Register a function as the handler for one or more message headers.
 
     A new message type is supported by writing a handler function and decorating
-    it with the header(s) it serves; it is added to :data:`HANDLERS`, which the
+    it with the header(s) it serves; it is added to HANDLERS, which the
     coordinator turns into its dispatch table. The event loop never needs to
     change when a header is added.
     """

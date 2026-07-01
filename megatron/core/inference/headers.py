@@ -2,14 +2,14 @@
 
 """Message headers for inference coordinator/engine/client communication.
 
-Headers are grouped into category :class:`~enum.IntEnum` classes by concern.
-Each category occupies a distinct numeric range so that wire values never
-collide across categories. Adding a new class of headers means adding a new
-category enum in its own range and listing it in :data:`HEADER_ENUMS` -- the
-existing categories are left untouched.
+Headers are grouped into category IntEnum classes by concern. Each category
+occupies a distinct numeric range so that wire values never collide across
+categories. Adding a new class of headers means adding a new category enum in
+its own range and listing it in HEADER_ENUMS; the existing categories are left
+untouched.
 
-On the wire a header travels as its integer ``.value``; :func:`decode_header`
-maps an integer back to the originating category member.
+On the wire a header travels as its integer value. decode_header maps an
+integer back to the originating category member.
 """
 
 from enum import IntEnum
@@ -54,7 +54,7 @@ class Transport(IntEnum):
 
 
 # All header categories. To add a new class of headers, define a new IntEnum in
-# its own (disjoint) numeric range and append it here -- nothing else needs to
+# its own (disjoint) numeric range and append it here; nothing else needs to
 # change. Ranges are spaced out to leave room for growth within each category.
 HEADER_ENUMS = (Connection, Request, Control, Lifecycle, Transport)
 
@@ -114,8 +114,8 @@ class _Headers:
     Lets callers use a single name without caring which category a header lives
     in: attribute access (``Headers.PAUSE``) resolves to the underlying category
     member (``Control.PAUSE``), and calling it (``Headers(value)``) decodes a
-    wire value via :func:`decode_header`. Because both return the canonical
-    category members, equality and dict-key lookups against the categories work
+    wire value via decode_header. Because both return the canonical category
+    members, equality and dict-key lookups against the categories work
     unchanged.
     """
 
