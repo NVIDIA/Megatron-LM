@@ -67,26 +67,6 @@ name: Claude Fix PR
 on: # zizmor: ignore[concurrency-limits] queued commands must not replace a run
   issue_comment:
     types: [created]
-  # TEMPORARY: ref-only PR #5262 canary entrypoint. The registered
-  # auto-reminder workflow calls this revision from pull-request/4862.
-  workflow_call:
-    inputs:
-      test_mode:
-        required: true
-        type: boolean
-      test_pr_number:
-        required: true
-        type: number
-      test_requester:
-        required: true
-        type: string
-    secrets:
-      NVIDIA_INFERENCE_URL:
-        required: true
-      NVIDIA_INFERENCE_KEY:
-        required: true
-      PAT:
-        required: true
 
 permissions: {}
 
@@ -96,18 +76,10 @@ jobs:
     if: |
       github.repository == 'NVIDIA/Megatron-LM' &&
       github.run_attempt == 1 &&
-      ((github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        github.event.comment.user.type == 'User' &&
-        github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
-        startsWith(github.event.comment.body, '/claude fix')) ||
-       (github.event_name == 'workflow_dispatch' &&
-        inputs.test_mode &&
-        inputs.test_pr_number == 5262 &&
-        inputs.test_requester == 'Phlip79' &&
-        github.ref == 'refs/heads/pull-request/4862' &&
-        github.actor == 'Phlip79' &&
-        github.triggering_actor == 'Phlip79'))
+      github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
+      startsWith(github.event.comment.body, '/claude fix')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -129,11 +101,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ inputs.test_mode && inputs.test_pr_number || github.event.issue.number }}
-      COMMENT_BODY: ${{ inputs.test_mode && '/claude fix' || github.event.comment.body }}
-      REQUESTER: ${{ inputs.test_mode && inputs.test_requester || github.event.comment.user.login }}
-      COMMENT_ID: ${{ github.event.comment.id }}
-      TEST_MODE: ${{ inputs.test_mode }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+      REQUESTER: ${{ github.event.comment.user.login }}
     steps:
       - name: Validate command, maintainer, and pull request
         id: gate
@@ -141,24 +111,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "should_run=false" >> "$GITHUB_OUTPUT"
-          if [[ "$TEST_MODE" == true ]]; then
-            test "$GITHUB_REPOSITORY" = NVIDIA/Megatron-LM
-            test "$GITHUB_EVENT_NAME" = workflow_dispatch
-            test "$GITHUB_REF" = refs/heads/pull-request/4862
-            test "$GITHUB_ACTOR" = Phlip79
-            test "$GITHUB_TRIGGERING_ACTOR" = Phlip79
-            test "$PR_NUMBER" = 5262
-            test "$REQUESTER" = Phlip79
-            carrier=$(gh api "repos/$REPO/pulls/4862")
-            test "$(jq -r '.state' <<<"$carrier")" = open
-            test "$(jq -r '.merged' <<<"$carrier")" = false
-            test "$(jq -r '.head.repo.full_name' <<<"$carrier")" = \
-              Phlip79/Megatron-LM
-            test "$(jq -r '.head.ref' <<<"$carrier")" = add-claude-fix-action
-            test "$(jq -r '.head.sha' <<<"$carrier")" = "$GITHUB_SHA"
-            test "$(gh api "repos/$REPO/git/ref/heads/pull-request/4862" \
-              --jq '.object.sha')" = "$GITHUB_SHA"
-          fi
           case "$COMMENT_BODY" in
             "/claude fix"|"/claude fix "*|$'/claude fix\n'*) ;;
             *) exit 0 ;;
@@ -178,19 +130,6 @@ jobs:
           esac
 
           pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
-          if [[ "$TEST_MODE" == true ]]; then
-            test "$(jq -r '.user.login' <<<"$pr")" = JavaZeroo
-            test "$(jq -r '.head.repo.full_name' <<<"$pr")" = \
-              JavaZeroo/Megatron-LM
-            test "$(jq -r '.head.ref' <<<"$pr")" = \
-              fix/flashinfer-min-version-nameerror
-            test "$(jq -r '.head.sha' <<<"$pr")" = \
-              beffafd41a33ad4d46a3ee8d52397be833d44598
-            test "$(jq -r '.base.repo.full_name' <<<"$pr")" = \
-              NVIDIA/Megatron-LM
-            test "$(jq -r '.base.ref' <<<"$pr")" = main
-            test "$(jq -r '.maintainer_can_modify' <<<"$pr")" = true
-          fi
           test "$(jq -r '.state' <<<"$pr")" = open
           test "$(jq -r '.merged' <<<"$pr")" = false
           test "$(jq -r '.base.repo.full_name' <<<"$pr")" = "$REPO"
@@ -217,9 +156,6 @@ jobs:
           encoded_base_ref=$(jq -rn --arg v "$base_ref" '$v | @uri')
           base_sha=$(gh api "repos/$REPO/commits/$encoded_base_ref" --jq '.sha')
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
-          if [[ "$TEST_MODE" == true ]]; then
-            test "$base_sha" = 8b3d8a5d9719c201efa7add2a8a112b0d095e846
-          fi
 
           changed_files=$(jq -r '.changed_files' <<<"$pr")
           [[ "$changed_files" =~ ^[0-9]+$ ]] && (( changed_files < 3000 ))
@@ -261,10 +197,9 @@ jobs:
             echo "steer_b64=$steer_b64"
             echo "previous_ci_run_id=$previous_ci_run_id"
           } >>"$GITHUB_OUTPUT"
-          if [[ -n "$COMMENT_ID" ]]; then
-            gh api --method POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
-              -f content=eyes >/dev/null
-          fi
+          gh api --method POST \
+            "repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes >/dev/null
 
   attempt_1:
     name: Claude Fix Attempt 1
