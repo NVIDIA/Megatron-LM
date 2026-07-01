@@ -41,16 +41,18 @@
 #   issue comment
 #       -> authorize  (validate actor/PR/branch; pin head and live base SHAs)
 #       -> prepare    (read-only Claude produces a raw patch artifact)
-#       -> validate   (a clean runner checks scope and binds the result tree)
+#       -> validate   (check the patch and sanitize Claude's explanation)
 #       -> publish    (trusted code commits the validated tree and pushes it)
-#       -> trigger CI (a fixed PAT-only step posts `/ok to test <sha>`)
-#       -> monitor    (read-only polling pins the exact CICD run and SHA)
-#       -> report or self-dispatch the next bounded attempt
+#           |-> explain    (service account posts the bounded explanation)
+#           `-> trigger CI (fixed PAT-only step posts `/ok to test <sha>`)
+#                 -> monitor (read-only polling pins exact CICD run and SHA)
+#                 -> report or self-dispatch the next bounded attempt
 #
 # The jobs are intentionally separate security boundaries. Claude reads
 # untrusted PR content but never receives the write PAT or any GitHub write
-# capability. The PAT exists only in hard-coded push and CI-trigger steps after
-# the patch and live PR state have been independently revalidated.
+# capability. The PAT exists only in hard-coded push, explanation, and
+# CI-trigger steps after the patch and live PR state have been independently
+# revalidated.
 
 name: Claude Fix PR
 
@@ -566,7 +568,7 @@ jobs:
   # commit, push, comment, or make arbitrary outbound/Bash network requests.
   # Only the supplied read-only CI MCP tools may access GitHub, and Claude's
   # tool subprocesses cannot read action credentials. The only Claude-authored
-  # content crossing this boundary is a bounded patch.
+  # content crossing this boundary is a bounded patch and structured explanation.
   prepare:
     name: Prepare Claude Fix
     needs: authorize
@@ -583,6 +585,7 @@ jobs:
     outputs:
       baseline_tree: ${{ steps.merge-state.outputs.baseline_tree }}
       needs_merge: ${{ steps.merge-state.outputs.needs_merge }}
+      explanation_json: ${{ steps.claude.outputs.structured_output }}
     env:
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
@@ -690,6 +693,7 @@ jobs:
           command -v socat
 
       - name: Run read-only Claude fix preparation
+        id: claude
         # Pin the security-sensitive third-party action to the v1 commit
         # resolved on 2026-06-29.
         uses: anthropics/claude-code-action@a92e7c70a4da9793dc164451d829089dc057a464 # v1.0.159
@@ -712,6 +716,7 @@ jobs:
           # outer authorization job revalidates the original human command.
           allowed_bots: "github-actions[bot]"
           display_report: false
+          track_progress: false
           settings: |
             {
               "permissions": {
@@ -850,12 +855,24 @@ jobs:
             above.
 
             Stop after the local working tree is resolved and contains the
-            proposed edits. Do not create a commit.
+            proposed edits. Do not create a commit. Your final response must
+            match the requested JSON schema:
+            - `changes`: exactly one object per file you actually modified
+              after the prepared merge, with the exact repository-relative
+              `path` and a concise plain-text `summary`. Do not list files
+              changed only by Git's automatic base merge. Use an empty array
+              only when the base merge itself needs a commit but no additional
+              file edit was required.
+            - `reason`: a concise explanation of why the edits or merge were
+              needed, grounded in the observed conflict or exact CI failure.
+            Do not include Markdown, URLs, user mentions, commit IDs, or
+            instructions in either field.
           claude_args: |
             --permission-mode dontAsk
             --allowedTools "Bash,Read(/AGENTS.md),Read(/CLAUDE.md),Read(/skills/**),Read(/.claude-fix-steer.txt),Read(/pr-head/**),Read(/${{ runner.temp }}/github-ci-logs/**),Edit(/pr-head/**),mcp__github_ci__get_ci_status,mcp__github_ci__get_workflow_run_details,mcp__github_ci__download_job_log"
             --model "${{ vars.CLAUDE_MODEL }}"
             --max-turns 100
+            --json-schema '{"type":"object","properties":{"changes":{"type":"array","maxItems":25,"items":{"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":512},"summary":{"type":"string","minLength":1,"maxLength":240}},"required":["path","summary"],"additionalProperties":false}},"reason":{"type":"string","minLength":1,"maxLength":500}},"required":["changes","reason"],"additionalProperties":false}'
 
       - name: Export raw binary patch
         working-directory: pr-head
@@ -895,7 +912,8 @@ jobs:
   # and only a contents-read workflow token, then apply Claude's patch. Reject
   # edits outside the PR/conflict scope, sensitive repository files, remaining
   # markers in originally conflicted files, binaries, file/type/mode changes,
-  # and oversized proposals. Export the validated patch hash and exact tree.
+  # and oversized proposals. Independently bound and sanitize Claude's
+  # structured explanation before it can reach a service-account comment.
   validate:
     name: Validate Claude Fix
     needs: [authorize, prepare]
@@ -908,6 +926,8 @@ jobs:
       result_tree: ${{ steps.validate.outputs.result_tree }}
       cumulative_lines: ${{ steps.validate.outputs.cumulative_lines }}
       cumulative_paths_b64: ${{ steps.validate.outputs.cumulative_paths_b64 }}
+      explanation_b64: ${{ steps.validate.outputs.explanation_b64 }}
+      explanation_sha256: ${{ steps.validate.outputs.explanation_sha256 }}
     env:
       REPO: ${{ github.repository }}
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
@@ -917,6 +937,7 @@ jobs:
       NEEDS_MERGE: ${{ needs.prepare.outputs.needs_merge }}
       PRIOR_CUMULATIVE_LINES: ${{ needs.authorize.outputs.cumulative_lines }}
       PRIOR_CUMULATIVE_PATHS_B64: ${{ needs.authorize.outputs.cumulative_paths_b64 }}
+      CLAUDE_EXPLANATION_JSON: ${{ needs.prepare.outputs.explanation_json }}
     steps:
       - name: Checkout immutable PR head without credentials
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -1108,11 +1129,93 @@ jobs:
             cumulative_paths_b64=""
           fi
 
+          # Treat the model's prose as untrusted data. Require the small schema
+          # requested from Claude and require exactly one entry for every path
+          # in Claude's validated delta. The path comparison happens before
+          # display sanitization, so the model cannot invent or omit a file.
+          test "$(printf '%s' "$CLAUDE_EXPLANATION_JSON" | wc -c)" -le 32768
+          changed_paths="$RUNNER_TEMP/claude-fix-changed-paths"
+          git diff --name-only -z "$baseline_tree" "$result_tree" \
+            > "$changed_paths"
+          # jq replaces malformed UTF-8 with U+FFFD, which would weaken the
+          # exact path comparison. Reject such Git filenames before parsing.
+          iconv -f UTF-8 -t UTF-8 "$changed_paths" > /dev/null
+          actual_paths_json=$(jq -Rsc \
+            'split("\u0000") | map(select(length > 0)) | sort' \
+            < "$changed_paths")
+          test "$(jq 'length' <<< "$actual_paths_json")" = "$changed_count"
+          jq -e --argjson actual_paths "$actual_paths_json" '
+            def valid_text($max):
+              type == "string" and length >= 1 and length <= $max and
+              (explode | all(.[]; . >= 32 and (. < 127 or . > 159))) and
+              (test("[\\p{Zl}\\p{Zp}\\p{Cf}]") | not);
+            def valid_path:
+              valid_text(512) and (contains("`") | not);
+            def valid_prose($max):
+              valid_text($max) and
+              (test("https?://|www\\."; "i") | not) and
+              (test("(^|[[:space:]])/(claude|ok)([[:space:]]|$)"; "i") |
+                not) and
+              (contains("<!-- claude-fix-summary:") | not) and
+              (contains("```") | not);
+            type == "object" and
+            keys == ["changes", "reason"] and
+            (.changes | type == "array" and length <= 25) and
+            all(.changes[];
+              type == "object" and keys == ["path", "summary"] and
+              (.path | valid_path) and
+              (.summary | valid_prose(240))) and
+            ([.changes[].path] | sort) == $actual_paths and
+            (.reason | valid_prose(500))' \
+            <<< "$CLAUDE_EXPLANATION_JSON" > /dev/null
+
+          # Remove bidirectional/zero-width formatting and neutralize syntax
+          # that could create mentions, HTML, links, or unexpected Markdown in
+          # the service-account comment. Export canonical JSON plus its digest.
+          explanation_json=$(jq -cSe '
+            def clean:
+              gsub("[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]"; "") |
+              gsub("@"; "＠") |
+              gsub("&"; "＆") |
+              gsub("<"; "‹") |
+              gsub(">"; "›") |
+              gsub("`"; "’") |
+              gsub("\\["; "(") |
+              gsub("\\]"; ")") |
+              gsub("\\\\"; "/") |
+              gsub("\\*"; "＊") |
+              gsub("_"; "＿") |
+              gsub("#"; "＃") |
+              gsub("~"; "～") |
+              gsub("\\|"; "｜") |
+              gsub("^\\s+|\\s+$"; "");
+            {
+              changes: [.changes[] | {
+                # Paths have already been bound to the Git tree and are shown
+                # literally inside a Markdown code span. Preserve them exactly.
+                path: .path,
+                summary: (.summary | clean)
+              }],
+              reason: (.reason | clean)
+            }' <<< "$CLAUDE_EXPLANATION_JSON")
+          jq -e '
+            (.reason | length) > 0 and
+            all(.changes[]; (.path | length) > 0 and
+                            (.summary | length) > 0) and
+            ([.changes[].path] | unique | length) == (.changes | length)' \
+            <<< "$explanation_json" > /dev/null
+          test "$(printf '%s' "$explanation_json" | wc -c)" -le 24576
+          explanation_sha256=$(printf '%s' "$explanation_json" | \
+            sha256sum | awk '{print $1}')
+          explanation_b64=$(printf '%s' "$explanation_json" | base64 -w 0)
+
           patch_sha256=$(sha256sum "$patch" | awk '{print $1}')
           echo "patch_sha256=$patch_sha256" >> "$GITHUB_OUTPUT"
           echo "result_tree=$result_tree" >> "$GITHUB_OUTPUT"
           echo "cumulative_lines=$cumulative_lines" >> "$GITHUB_OUTPUT"
           echo "cumulative_paths_b64=$cumulative_paths_b64" >> "$GITHUB_OUTPUT"
+          echo "explanation_b64=$explanation_b64" >> "$GITHUB_OUTPUT"
+          echo "explanation_sha256=$explanation_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload validated fix proposal
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1338,6 +1441,272 @@ jobs:
             -c http.extraHeader="AUTHORIZATION: basic $auth" \
             push "https://github.com/$HEAD_REPO.git" \
               "$NEW_SHA:refs/heads/$HEAD_REF"
+
+  # After a generated commit is successfully pushed, a separate clean job
+  # revalidates that exact commit and posts Claude's already-sanitized
+  # explanation with the service-account PAT. Claude never receives the PAT or
+  # issues:write. An invisible SHA marker makes reruns idempotent.
+  report-commit:
+    name: Explain Claude Fix Commit
+    needs: [authorize, prepare, validate, publish]
+    if: |
+      needs.publish.result == 'success' &&
+      needs.publish.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Explanations must never block CI monitoring or a continuation attempt.
+    continue-on-error: true
+    permissions: {}
+    concurrency:
+      group: claude-fix-summary-${{ github.repository_id }}-${{ needs.publish.outputs.sha }}
+      cancel-in-progress: false
+    env:
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+      HEAD_REPO: ${{ needs.authorize.outputs.head_repo }}
+      HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+      BASE_REF: ${{ needs.authorize.outputs.base_ref }}
+      BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+      EXPECTED_OLD_SHA: ${{ needs.authorize.outputs.head_sha }}
+      EXPECTED_RESULT_TREE: ${{ needs.validate.outputs.result_tree }}
+      TARGET_SHA: ${{ needs.publish.outputs.sha }}
+      NEEDS_MERGE: ${{ needs.prepare.outputs.needs_merge }}
+      ATTEMPT: ${{ needs.authorize.outputs.attempt }}
+      EXPLANATION_B64: ${{ needs.validate.outputs.explanation_b64 }}
+      EXPLANATION_SHA256: ${{ needs.validate.outputs.explanation_sha256 }}
+      SERVER_URL: ${{ github.server_url }}
+      SERVICE_ACCOUNT_ID: "245956830"
+    steps:
+      - name: Post idempotent service-account explanation
+        id: comment
+        # Comment delivery must not make the trusted parent run unsuccessful
+        # and thereby block a later CI-driven repair attempt.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -euo pipefail
+
+          api_get() {
+            local endpoint=$1
+            local result
+            local api_attempt
+            for api_attempt in 1 2 3; do
+              if result=$(gh api "$endpoint"); then
+                printf '%s' "$result"
+                return 0
+              fi
+              if (( api_attempt == 3 )); then
+                return 1
+              fi
+              sleep $((api_attempt * 2))
+            done
+          }
+
+          get_comments() {
+            local result
+            local api_attempt
+            for api_attempt in 1 2 3; do
+              if result=$(gh api --paginate \
+                "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" | \
+                jq -cs '[.[][]]'); then
+                printf '%s' "$result"
+                return 0
+              fi
+              if (( api_attempt == 3 )); then
+                return 1
+              fi
+              sleep $((api_attempt * 2))
+            done
+          }
+
+          has_marker() {
+            local comments=$1
+            local marker=$2
+            jq -e --arg marker "$marker" \
+              --argjson account_id "$SERVICE_ACCOUNT_ID" '
+              any(.[];
+                .user.id == $account_id and
+                .user.login == "svcnvidia-nemo-ci" and
+                ((.body // "") | contains($marker)))' \
+              <<< "$comments" > /dev/null
+          }
+
+          target_still_active() {
+            local pr_json
+            local branch_json
+            local current_head
+            local ancestry
+            pr_json=$(api_get "repos/$REPO/pulls/$PR_NUMBER")
+            test "$(jq -r '.state' <<< "$pr_json")" = "open"
+            test "$(jq -r '.merged' <<< "$pr_json")" = "false"
+            test "$(jq -r '.head.repo.full_name // empty' \
+              <<< "$pr_json")" = "$HEAD_REPO"
+            test "$(jq -r '.head.ref // empty' <<< "$pr_json")" = \
+              "$HEAD_REF"
+            test "$(jq -r '.base.ref // empty' <<< "$pr_json")" = \
+              "$BASE_REF"
+            current_head=$(jq -r '.head.sha // empty' <<< "$pr_json")
+            [[ "$current_head" =~ ^[0-9a-f]{40}$ ]]
+
+            branch_json=$(api_get \
+              "repos/$HEAD_REPO/branches/$encoded_head_ref")
+            test "$(jq -r '.commit.sha // empty' <<< "$branch_json")" = \
+              "$current_head"
+            if [[ "$current_head" != "$TARGET_SHA" ]]; then
+              ancestry=$(api_get \
+                "repos/$HEAD_REPO/compare/$TARGET_SHA...$current_head")
+              test "$(jq -r '.status // empty' <<< "$ancestry")" = "ahead"
+            fi
+          }
+
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_OLD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_RESULT_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPLANATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          case "$NEEDS_MERGE" in true|false) ;; *) exit 1 ;; esac
+
+          account_json=$(api_get user)
+          test "$(jq -r '.login' <<< "$account_json")" = \
+            "svcnvidia-nemo-ci"
+          test "$(jq -r '.id' <<< "$account_json")" = \
+            "$SERVICE_ACCOUNT_ID"
+          test "$(jq -r '.type' <<< "$account_json")" = "User"
+
+          explanation_json=$(printf '%s' "$EXPLANATION_B64" | base64 --decode)
+          test "$(printf '%s' "$explanation_json" | wc -c)" -le 24576
+          test "$(printf '%s' "$explanation_json" | sha256sum | \
+            awk '{print $1}')" = "$EXPLANATION_SHA256"
+          test "$(jq -cS . <<< "$explanation_json")" = "$explanation_json"
+          jq -e '
+            def printable_text($max):
+              type == "string" and length >= 1 and length <= $max and
+              (explode | all(.[]; . >= 32 and (. < 127 or . > 159))) and
+              (test("[\\p{Zl}\\p{Zp}\\p{Cf}]") | not);
+            def safe_path:
+              printable_text(512) and (contains("`") | not);
+            def safe_prose($max):
+              printable_text($max) and
+              (contains("@") | not) and (contains("<") | not) and
+              (contains(">") | not) and (contains("&") | not) and
+              (contains("`") | not) and
+              (contains("[") | not) and (contains("]") | not) and
+              (contains("\\") | not) and (contains("*") | not) and
+              (contains("_") | not) and (contains("#") | not) and
+              (contains("~") | not) and (contains("|") | not) and
+              (test("https?://|www\\."; "i") | not) and
+              (test("(^|[[:space:]])/(claude|ok)([[:space:]]|$)"; "i") |
+                not) and
+              (contains("claude-fix-summary:") | not);
+            type == "object" and keys == ["changes", "reason"] and
+            (.changes | type == "array" and length <= 25) and
+            all(.changes[];
+              type == "object" and keys == ["path", "summary"] and
+              (.path | safe_path) and
+              (.summary | safe_prose(240))) and
+            ([.changes[].path] | unique | length) == (.changes | length) and
+            (.reason | safe_prose(500)) and
+            (if (.changes | length) == 0 then
+               $ENV.NEEDS_MERGE == "true"
+             else
+               true
+             end)' <<< "$explanation_json" > /dev/null
+
+          head_repo_json=$(api_get "repos/$HEAD_REPO")
+          test "$(jq -r '.fork' <<< "$head_repo_json")" = "true"
+          test "$(jq -r '.source.full_name // empty' <<< "$head_repo_json")" = \
+            "$REPO"
+          encoded_head_ref=$(jq -rn --arg value "$HEAD_REF" '$value | @uri')
+          target_still_active
+
+          commit_json=$(api_get "repos/$HEAD_REPO/commits/$TARGET_SHA")
+          test "$(jq -r '.commit.tree.sha // empty' <<< "$commit_json")" = \
+            "$EXPECTED_RESULT_TREE"
+          if [[ "$NEEDS_MERGE" == "true" ]]; then
+            jq -e --arg old "$EXPECTED_OLD_SHA" --arg base "$BASE_SHA" \
+              '[.parents[].sha] == [$old, $base]' \
+              <<< "$commit_json" > /dev/null
+          else
+            jq -e --arg old "$EXPECTED_OLD_SHA" \
+              '[.parents[].sha] == [$old]' <<< "$commit_json" > /dev/null
+          fi
+          test "$(jq -r '.commit.author.name' <<< "$commit_json")" = \
+            "svcnvidia-nemo-ci"
+          test "$(jq -r '.commit.author.email' <<< "$commit_json")" = \
+            "svcnvidia-nemo-ci@nvidia.com"
+          test "$(jq -r '.commit.committer.name' <<< "$commit_json")" = \
+            "svcnvidia-nemo-ci"
+          test "$(jq -r '.commit.committer.email' <<< "$commit_json")" = \
+            "svcnvidia-nemo-ci@nvidia.com"
+          jq -er --arg trailer \
+            'Signed-off-by: svcnvidia-nemo-ci <svcnvidia-nemo-ci@nvidia.com>' \
+            '.commit.message | split("\n") | any(.[]; . == $trailer)' \
+            <<< "$commit_json" > /dev/null
+
+          marker="<!-- claude-fix-summary:v1:$TARGET_SHA -->"
+          if [[ "$(jq '.changes | length' <<< "$explanation_json")" == "0" ]]; then
+            changes="- Merged the pinned base branch into the fork branch; no additional file edit was required."
+          else
+            changes=$(jq -r \
+              '.changes[] | "- `" + .path + "` — " + .summary' \
+              <<< "$explanation_json")
+          fi
+          reason=$(jq -r '.reason' <<< "$explanation_json")
+          short_sha=${TARGET_SHA:0:12}
+          commit_url="$SERVER_URL/$HEAD_REPO/commit/$TARGET_SHA"
+          printf -v body \
+            '🛠️ **Claude fix commit `%s` (attempt %s)**\n\n> ⚠️ **Unverified AI-generated explanation.** It is derived from untrusted PR and CI data, is not an approval, and may be inaccurate. Inspect the exact commit before relying on it.\n\n**Claude report — what changed**\n%s\n\n**Claude report — why**\n> %s\n\n[View exact commit](%s)\n\n_Sanitized and posted by `svcnvidia-nemo-ci`._\n\n%s' \
+            "$short_sha" "$ATTEMPT" "$changes" "$reason" "$commit_url" \
+            "$marker"
+          payload="$RUNNER_TEMP/claude-fix-comment.json"
+          jq -n --arg body "$body" '{body: $body}' > "$payload"
+
+          # Recheck the live PR/ref and marker immediately before every write.
+          # If a response is lost after GitHub accepted the comment, poll for
+          # visibility before retrying to avoid duplicate explanations.
+          for post_attempt in 1 2 3; do
+            target_still_active
+            comments=$(get_comments)
+            if has_marker "$comments" "$marker"; then
+              echo "Service-account explanation already exists for $TARGET_SHA."
+              exit 0
+            fi
+
+            if response=$(gh api --method POST \
+              "repos/$REPO/issues/$PR_NUMBER/comments" --input "$payload"); then
+              test "$(jq -r '.user.id' <<< "$response")" = \
+                "$SERVICE_ACCOUNT_ID"
+              test "$(jq -r '.user.login' <<< "$response")" = \
+                "svcnvidia-nemo-ci"
+              jq -e --arg marker "$marker" \
+                '(.body // "") | contains($marker)' \
+                <<< "$response" > /dev/null
+              echo "Posted service-account explanation for $TARGET_SHA."
+              exit 0
+            fi
+
+            for visibility_check in 1 2 3; do
+              sleep $((visibility_check * 2))
+              comments=$(get_comments)
+              if has_marker "$comments" "$marker"; then
+                echo "Explanation exists after an ambiguous POST response."
+                exit 0
+              fi
+            done
+            if (( post_attempt == 3 )); then
+              echo "Unable to post the service-account explanation."
+              exit 1
+            fi
+            sleep $((post_attempt * 2))
+          done
+
+      - name: Warn when the explanation could not be posted
+        if: steps.comment.outcome == 'failure'
+        run: |
+          echo "::warning::The generated commit was pushed, but its service-account explanation could not be posted after bounded retries. CI continues independently."
 
   # This clean job never checks out or executes PR content. The PAT is exposed
   # only to fixed metadata checks and one exact `/ok to test <40-char SHA>`
@@ -1752,10 +2121,13 @@ jobs:
   # A failed exact-SHA lint/unit run starts a new clean workflow run. The
   # built-in token receives only actions:write and dispatches the trusted
   # default-branch workflow; it never reaches Claude or the fork publisher.
+  # Wait for the optional commenter to become terminal before dispatch so the
+  # child never starts while its attested parent run is still completing.
   continue-fix:
     name: Dispatch Next Claude Fix Attempt
-    needs: [authorize, validate, publish, monitor-ci]
+    needs: [authorize, validate, publish, report-commit, monitor-ci]
     if: |
+      always() &&
       needs.monitor-ci.outputs.outcome == 'actionable' &&
       (needs.authorize.outputs.attempt == '1' ||
        needs.authorize.outputs.attempt == '2') &&
@@ -1844,9 +2216,9 @@ jobs:
             -f "inputs[state_run_id]=$STATE_RUN_ID" \
             -f "inputs[state_run_attempt]=$STATE_RUN_ATTEMPT"
 
-  # Only authorization and reporting receive `issues: write`, and every
-  # comment uses a fixed template. Claude, monitors, and publishers cannot
-  # author arbitrary PR comments.
+  # Only authorization and fixed status reporters receive `issues: write`.
+  # Claude, monitors, and publishers cannot author PR comments; the separate
+  # service-account explanation above accepts only sanitized structured prose.
   report-success:
     name: Report Green Claude Fix CI
     needs: [authorize, publish, monitor-ci]
