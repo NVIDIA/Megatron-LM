@@ -83,23 +83,28 @@ def build_no_sync_func(mimo_model):
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    """Create a HyperCommGrid with specified parallelism."""
+    """Create a HyperCommGrid (base view) plus a dense expert view, matching the topology builder.
+
+    These tests are dense (ep=1); the expert view relabels the base axes over the same ranks
+    (expt_tp=tp, ep=cp=1, expt_dp=dp), so the optimizer's expert groups resolve to the dense
+    collapse (tp_ep_pp = tp x pp, expt_dp = dp) without changing the base rank layout.
+    """
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        shape=[tp, cp, pp, dp],
+        dim_names=["tp", "cp", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
-    grid.create_pg(["tp"])
-    grid.create_pg(["cp"])
-    grid.create_pg(["pp"])
-    grid.create_pg(["dp"])
-    grid.create_pg(["dp", "cp"])
-    grid.create_pg(["ep"])
-    grid.create_pg(["expt_dp"])
-    # Required by the optimizer pg_collection (mp/tp_ep_pp = tp x pp, intra_dist_opt).
-    grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "cp", "dp", "pp"])
+    grid.register_view(
+        "expert",
+        shape=[tp, cp, pp, dp],
+        dim_names=["expt_tp", "ep", "pp", "expt_dp"],
+        shared_dims=["pp"],
+    )
+    for dims in (["tp"], ["cp"], ["pp"], ["dp"], ["dp", "cp"], ["tp", "pp"], ["tp", "cp", "dp", "pp"]):
+        grid.create_pg(dims)
+    for dims in (["ep"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
+        grid.create_pg(dims, view="expert")
     _active_grids.append(grid)
     return grid
 
@@ -120,14 +125,13 @@ def get_pg_collection(grid):
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
     pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
+    pg_collection.ep = grid.get_pg("ep", view="expert")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
-    # Optimizer groups. mp/intra_dist_opt match production; these grids are dense (ep=1),
-    # so the expert-model-parallel group tp_ep_pp coincides with mp (tp x pp).
+    pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
+    # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
     pg_collection.mp = grid.get_pg(["tp", "pp"])
-    pg_collection.tp_ep_pp = grid.get_pg(["tp", "pp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
     pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg_collection
 
