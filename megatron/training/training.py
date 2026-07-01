@@ -1092,7 +1092,11 @@ def pretrain(
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    mpu_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    mpu_pg_collection = (
+        ProcessGroupCollection.use_mpu_process_groups()
+        if mpu.model_parallel_is_initialized()
+        else None
+    )
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -2013,7 +2017,7 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
 
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and hasattr(cfg_container, "model") and pg_collection is not None:
+        if cfg_container is not None and hasattr(cfg_container, "model"):
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
