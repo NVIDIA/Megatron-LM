@@ -273,6 +273,33 @@ def prepare_cp_compressor_input(
     return hidden_compact, compressed_group_ids, seq_to_rank_row
 
 
+@torch.compile
+def _build_cp_indexer_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    local_rows: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the indexer's packed local-Q/full-K metadata."""
+    # Each real Q segment intersects its sequence with this rank's row interval,
+    # while K keeps the sequence's full compressed segment. The final synthetic
+    # segment holds CP capacity padding and has zero K rows. Causal offsets
+    # restore each non-empty local Q segment's position in the original sequence.
+    global_end = global_start + local_rows
+    zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+    local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
+    local_ends = cu_seqlens_q[1:].clamp_max(global_end)
+    q_lens = (local_ends - local_starts).clamp_min(0)
+    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+    padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
+    cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
+    cu_k_topk = torch.cat((cu_seqlens_compressed, cu_seqlens_compressed[-1:]))
+    q_causal_offsets = torch.cat(
+        (torch.where(q_lens > 0, local_starts - cu_seqlens_q[:-1], 0), zero)
+    )
+    return cu_q_topk, cu_k_topk, q_causal_offsets
+
+
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -285,11 +312,11 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
-) -> Optional[torch.Tensor]:
-    """Run indexer top-k for this rank's query block."""
+) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
-        return None
+        return None, None
 
     global_start = int(global_start)
     l_local = q_indexer_local.shape[0]
@@ -298,6 +325,10 @@ def compute_cp_indexer_topk(
             "DSv4 CP indexer top-k expects weights rows to be "
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
+
+    cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
+        cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
+    )
 
     if not use_fused:
         global_rows = torch.arange(
@@ -347,50 +378,11 @@ def compute_cp_indexer_topk(
             values, rows = torch.topk(scores, selected_width, dim=-1)
             local_rows = k_positions[rows].to(torch.int32)
             output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
-        return output
+        return output, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
-    # The fused kernel derives a bottom-right causal mask from each Q/K
-    # segment. Copy only the prefix visible to this rank so that mask starts
-    # at the rank's true position in the global sequence. For example:
-
-    # 1 1 1 0 0 0 0 0
-    # 1 1 1 1 0 0 0 0
-    # 1 1 1 1 1 0 0 0
-
-    global_end = global_start + l_local
-    zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
-    k_rows = torch.arange(
-        k_indexer_seq_major.shape[0],
-        dtype=cu_seqlens_compressed.dtype,
-        device=cu_seqlens_compressed.device,
-    )
-    local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
-    local_ends = cu_seqlens_q[1:].clamp_max(global_end)
-    q_lens = (local_ends - local_starts).clamp_min(0)
-    k_lens = torch.minimum(
-        torch.div((local_ends - cu_seqlens_q[:-1]).clamp_min(0), int(ratio), rounding_mode="floor"),
-        cu_seqlens_compressed[1:] - cu_seqlens_compressed[:-1],
-    )
-    k_lens = torch.where(q_lens > 0, k_lens, 0)
-    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
-    k_prefix = torch.cumsum(k_lens, dim=0, dtype=torch.int32)
-    padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
-    cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
-    cu_k_topk = torch.cat((zero, k_prefix, k_prefix[-1:]))
-
-    k_seq_ids = torch.bucketize(k_rows, cu_k_topk[1:-1], out_int32=True, right=True).clamp_max(
-        cu_seqlens_q.shape[0] - 2
-    )
-    valid_k = k_rows < k_prefix[-1]
-    source_rows = cu_seqlens_compressed[k_seq_ids] + k_rows - cu_k_topk[k_seq_ids]
-    k_for_topk = torch.index_select(k_indexer_seq_major, 0, torch.where(valid_k, source_rows, 0))
-    k_for_topk = k_for_topk * valid_k.view((-1,) + (1,) * (k_for_topk.ndim - 1))
-    valid_k_lengths = torch.repeat_interleave(
-        torch.cat((k_lens, zero)), torch.cat((q_lens, padding_q.view(1))), output_size=l_local
-    )
     topk, _ = indexer_topk(
         q_indexer_local,
-        k_for_topk,
+        k_indexer_seq_major,
         weights_indexer_local,
         topk=topk_width,
         ratio=ratio,
@@ -399,6 +391,6 @@ def compute_cp_indexer_topk(
         cu_seqlens_kv=cu_k_topk,
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_q) // int(ratio),
-        valid_k_lengths=valid_k_lengths,
+        q_causal_offsets=q_causal_offsets,
     )
-    return topk
+    return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)

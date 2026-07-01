@@ -635,17 +635,91 @@ def _unfused_indexer_sparse_attn_from_topk(
     indexer_softmax_scale: float,
     loss_coeff: float,
     loss_divisor: float,
+    sparse_loss: bool,
+    ratio: int,
+    _max_seqlen_q: int,
+    indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch sparse attention plus caller-supplied top-k indexer loss for THD CP.
+    """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
     This mirrors the fused CP top-k path at the tensor-contract level:
     ``topk_indices`` indexes ``kv_full`` for sparse attention, and
-    ``indexer_topk_indices`` indexes rank-major compressed K for indexer loss.
+    ``indexer_topk_indices`` indexes compressed K for sparse indexer loss.
+    ``_max_seqlen_q`` is unused here; it is retained to match the fused
+    callable's signature, with the leading underscore marking it as unused.
     """
     output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
 
     total_q, np_, hn = query.shape
+    cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+
+    if not sparse_loss:
+        q_rows = torch.arange(total_q, dtype=cu_seqlens_q.dtype, device=query.device)
+        q_sequence_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+        q_positions = q_rows - cu_seqlens_q[q_sequence_ids] + q_causal_offsets[q_sequence_ids]
+        visible_k = torch.minimum(
+            torch.div(q_positions + 1, ratio, rounding_mode="floor"),
+            (cu_seqlens_k[1:] - cu_seqlens_k[:-1])[q_sequence_ids],
+        )
+        q_valid = q_rows < cu_seqlens_q[-1]
+        if q_padding_mask is not None:
+            q_valid = q_valid & ~q_padding_mask
+
+        k_rows = torch.arange(k_indexer.shape[0], dtype=cu_seqlens_k.dtype, device=k_indexer.device)
+        k_sequence_ids = torch.bucketize(
+            k_rows, cu_seqlens_k[1:], out_int32=True, right=True
+        ).clamp_max(cu_seqlens_k.shape[0] - 2)
+        k_positions = k_rows - cu_seqlens_k[k_sequence_ids]
+
+        k_indexer_float = k_indexer.float()
+        compressed_kv_float = compressed_kv.detach().float()
+        weights_scaled = weights.float() * float(indexer_softmax_scale)
+        raw_local_loss = query.new_zeros((), dtype=torch.float32)
+        for start in range(0, total_q, 512):
+            end = min(start + 512, total_q)
+            valid = (
+                (q_sequence_ids[start:end].unsqueeze(1) == k_sequence_ids.unsqueeze(0))
+                & (k_positions.unsqueeze(0) < visible_k[start:end].unsqueeze(1))
+                & q_valid[start:end].unsqueeze(1)
+            )
+            row_valid = valid.any(dim=-1, keepdim=True)
+
+            predict_logits = torch.einsum(
+                "rhd,kd->rhk", q_indexer[start:end].float(), k_indexer_float
+            )
+            predict_logits = torch.relu(predict_logits) * weights_scaled[start:end].unsqueeze(-1)
+            predict_logits = predict_logits.sum(dim=1).masked_fill(~valid, float("-inf"))
+            predict_logits = torch.where(row_valid, predict_logits, 0.0)
+            predict = torch.softmax(predict_logits, dim=-1, dtype=torch.float32)
+            predict = predict * row_valid.float()
+
+            target_logits = torch.einsum(
+                "rhd,kd->rhk", query[start:end].detach().float(), compressed_kv_float
+            )
+            target_logits = (target_logits * softmax_scale).masked_fill(
+                ~valid.unsqueeze(1), float("-inf")
+            )
+            target_logits = torch.where(row_valid.unsqueeze(1), target_logits, 0.0)
+            sink = attn_sink.view(1, np_, 1).float()
+            scores_max = torch.maximum(target_logits.max(dim=-1, keepdim=True).values, sink)
+            exp_scores = torch.exp(target_logits - scores_max)
+            exp_sink = torch.exp(sink - scores_max)
+            target = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
+            target = (target * row_valid.unsqueeze(1).float()).sum(dim=1)
+            eps = torch.finfo(torch.float32).tiny
+            target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
+            target = target.clamp(min=eps)
+            predict = predict.clamp(min=eps)
+
+            kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
+            kl_per_row = torch.where(
+                row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row)
+            )
+            raw_local_loss = raw_local_loss + kl_per_row.sum()
+
+        return output, raw_local_loss * float(loss_coeff) / float(loss_divisor)
+
     indexer_topk = indexer_topk_indices.shape[-1]
 
     if q_padding_mask is not None:
@@ -2219,7 +2293,7 @@ class CompressedSparseAttention(MegatronModule):
         indexer = self.indexer
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         training_with_grad = self.training and torch.is_grad_enabled()
-
+        sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         if self.compressor is not None and ratio > 1:
             # ---- Step 3: build fixed-capacity compressor input ----------------
 
@@ -2251,17 +2325,6 @@ class CompressedSparseAttention(MegatronModule):
 
             if indexer is not None:
                 # ---- Step 4: optional indexer compressed path -----------------
-                if (
-                    training_with_grad
-                    and indexer_loss_coeff > 0
-                    and not self.config.dsa_indexer_use_sparse_loss
-                ):
-                    raise RuntimeError(
-                        "DSv4 THD CP path currently supports sparse indexer loss only. "
-                        "The current dense score and backward APIs cannot express the "
-                        "sequence position where this rank's local queries begin."
-                    )
-
                 indexer_x, indexer_qr = x.detach(), qr.detach()
                 if indexer_x.shape[1] != 1:
                     raise RuntimeError(
@@ -2320,7 +2383,7 @@ class CompressedSparseAttention(MegatronModule):
                 )
                 # Each top-k entry is still a logical compressed id within that
                 # query's sequence here.
-                compressed_topk = cp_utils.compute_cp_indexer_topk(
+                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
                     k_indexer_seq_major,
@@ -2378,6 +2441,13 @@ class CompressedSparseAttention(MegatronModule):
         )
         if use_indexer_loss:
             # ---- Step 7a: indexer-loss path ----------------------------------
+            k_indexer_for_loss = k_indexer_rank_major
+            compressed_kv_for_loss = compressed_kv_rank_major
+            if not sparse_indexer_loss:
+                k_indexer_for_loss = k_indexer_seq_major
+                compressed_kv_for_loss = torch.index_select(
+                    compressed_kv_rank_major, 0, seq_to_rank_row.clamp_min(0)
+                )
             cu_seqlens_q_unpadded = None
             if (
                 packed_seq_params.cu_seqlens_q is not None
@@ -2410,14 +2480,18 @@ class CompressedSparseAttention(MegatronModule):
                 self.attn_sink.float(),
                 topk_idxs,
                 q_indexer_cp,
-                k_indexer_rank_major,
+                k_indexer_for_loss,
                 weights_indexer_cp,
                 indexer_topk_rank_major,
-                compressed_kv_rank_major,
+                compressed_kv_for_loss,
                 self.softmax_scale,
                 indexer.softmax_scale,
                 indexer_loss_coeff,
                 1 if self.config.calculate_per_token_loss else l_local * cp_size,
+                sparse_indexer_loss,
+                ratio,
+                max_seqlen_q,
+                indexer_layout,
                 q_padding_mask,
             )
             if indexer_loss_coeff > 0:

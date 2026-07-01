@@ -25,7 +25,7 @@ def _require_cute_cuda():
 
 
 def _make_e2e_like_cu_seqlens(device: str = "cuda") -> torch.Tensor:
-    """Return the ragged THD prefix pattern used by DSv4 CP e2e tests.
+    """Return a representative ragged THD prefix pattern.
 
     The lengths sum to 4096, so CP4 owns 1024 local rows. They contain
     short, long, boundary-crossing, and padded-tail sequences without allocating

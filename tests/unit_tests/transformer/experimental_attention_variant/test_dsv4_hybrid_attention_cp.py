@@ -57,10 +57,12 @@ _DSV4_CP_GRAPH_TIMING_WARMUP_REPLAYS = 2
 _DSV4_CP_GRAPH_TIMING_MEASURE_REPLAYS = 5
 _DSV4_CP_TEST_VARIANT = "flash"
 
-# Padded total is 4096, divisible by CP2/CP4. Only the final segment has tail
-# padding, so the intermediate sequence boundaries match the unpadded layout.
-_DSV4_CP_RAGGED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 148)
-_DSV4_CP_RAGGED_PADDED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 200)
+# Keep every segment at least as long as the smallest compression ratio (4).
+# The cuDNN dense-indexer backward kernel does not yet support a THD segment
+# with Q rows but no compressed K rows. Padded total remains 4096, divisible
+# by CP2/CP4, and only the final segment has tail padding.
+_DSV4_CP_RAGGED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 148)
+_DSV4_CP_RAGGED_PADDED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 196)
 # Same shape, padded total, and max padded sequence length as
 # _DSV4_CP_RAGGED_PADDED_SEG_LENS, but the padding is distributed across many
 # sequences instead of only the tail. CUDA graph replay must tolerate this value
@@ -546,12 +548,19 @@ class TestDSv4HybridAttentionTHDCP:
         return measured
 
     @pytest.mark.parametrize(
-        "layer_number",
-        [1, 2, 3],
-        ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
+        ("layer_number", "sparse_loss"),
+        [(1, True), (2, True), (2, False), (3, True)],
+        ids=[
+            "ratio_0_window_only",
+            "ratio_4_indexer_sparse",
+            "ratio_4_indexer_dense",
+            "ratio_128_compressor",
+        ],
     )
     @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused_rope", "unfused_rope"])
-    def test_thd_cp_matches_full_reference_forward_backward(self, layer_number, apply_rope_fusion):
+    def test_thd_cp_matches_full_reference_forward_backward(
+        self, layer_number, sparse_loss, apply_rope_fusion
+    ):
         """CP path matches the full-sequence THD reference on ragged
         packed inputs using the DSv4 layer configuration.
 
@@ -566,18 +575,16 @@ class TestDSv4HybridAttentionTHDCP:
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
-            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_use_sparse_loss=sparse_loss,
             apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
             apply_rope_fusion=apply_rope_fusion,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
             dsa_indexer_loss_coeff=1.0,
-            dsa_indexer_use_sparse_loss=True,
-            # Numerical parity uses the unfused CP1 reference so failures point
-            # at the CP path instead of non-CP fused RoPE behavior.
+            dsa_indexer_use_sparse_loss=sparse_loss,
             apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
-            apply_rope_fusion=False,
+            apply_rope_fusion=apply_rope_fusion,
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg

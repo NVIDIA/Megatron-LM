@@ -1544,19 +1544,6 @@ class TransformerConfig(ModelParallelConfig):
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
-            if (
-                self.context_parallel_size > 1
-                and 4 in self.csa_compress_ratios
-                and not self.csa_dense_mode
-                and (self.dsa_indexer_loss_coeff or 0.0) > 0
-                and not self.dsa_indexer_use_sparse_loss
-            ):
-                # The current cuDNN fused indexer-loss kernel cannot express the
-                # CP-local query-offset semantics required by dense loss.
-                raise ValueError(
-                    "DSv4 CP dense indexer loss is unsupported because the current cuDNN "
-                    "fused kernel lacks CP query-offset semantics."
-                )
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."

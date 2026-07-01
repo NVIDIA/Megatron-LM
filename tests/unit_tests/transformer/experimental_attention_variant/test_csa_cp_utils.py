@@ -201,49 +201,51 @@ def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
     assert torch.equal(rank_rows, torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.int32))
 
 
-def test_compute_cp_indexer_topk_passes_valid_lengths(monkeypatch):
+def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch):
     topk_calls = []
 
     def fake_indexer_topk(
-        q, k, _weights, *, topk, cu_seqlens_q, cu_seqlens_kv, valid_k_lengths, **_
+        q, k, _weights, *, topk, cu_seqlens_q, cu_seqlens_kv, q_causal_offsets, **_
     ):
         topk_calls.append(
-            (k.clone(), cu_seqlens_q.clone(), cu_seqlens_kv.clone(), valid_k_lengths.clone())
+            (k.clone(), cu_seqlens_q.clone(), cu_seqlens_kv.clone(), q_causal_offsets.clone())
         )
         return torch.full((q.shape[0], int(topk)), len(topk_calls), dtype=torch.int32), None
 
     monkeypatch.setattr(csa_cp_utils, "indexer_topk", fake_indexer_topk)
 
-    q = torch.randn(5, 2)
-    weights = torch.randn(5, 1)
+    q = torch.randn(8, 2)
+    weights = torch.randn(8, 1)
     k_seq = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    cu_q = torch.tensor([0, 10], dtype=torch.int32)
-    cu_comp = torch.tensor([0, 3], dtype=torch.int32)
+    cu_q = torch.tensor([0, 5, 13, 20], dtype=torch.int32)
+    cu_comp = torch.tensor([0, 1, 3, 4], dtype=torch.int32)
 
-    out = compute_cp_indexer_topk(
+    out, metadata = compute_cp_indexer_topk(
         q,
         weights,
         k_seq,
         cu_q,
         cu_comp,
-        8,
+        7,
         ratio=4,
         topk_width=2,
         indexer_softmax_scale=0.5,
-        max_seqlen_q=10,
+        max_seqlen_q=8,
         use_fused=True,
     )
 
-    assert torch.equal(out, torch.ones(5, 2, dtype=torch.int32))
-    assert torch.equal(topk_calls[0][0][:2], k_seq[:2])
-    assert torch.count_nonzero(topk_calls[0][0][2:]) == 0
-    assert torch.equal(topk_calls[0][1], torch.tensor([0, 2, 5], dtype=torch.int32))
-    assert torch.equal(topk_calls[0][2], torch.tensor([0, 2, 2], dtype=torch.int32))
-    assert torch.equal(topk_calls[0][3], torch.tensor([2, 2, 0, 0, 0], dtype=torch.int32))
-    assert (
-        compute_cp_indexer_topk(q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10, True)
-        is None
-    )
+    assert torch.equal(out, torch.ones(8, 2, dtype=torch.int32))
+    assert torch.equal(topk_calls[0][0], k_seq)
+    assert torch.equal(topk_calls[0][1], torch.tensor([0, 0, 6, 8, 8], dtype=torch.int32))
+    assert torch.equal(topk_calls[0][2], torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32))
+    assert torch.equal(topk_calls[0][3], torch.tensor([0, 2, 0, 0], dtype=torch.int32))
+    metadata_q, metadata_k, metadata_offsets = metadata
+    assert torch.equal(metadata_q, topk_calls[0][1])
+    assert torch.equal(metadata_k, topk_calls[0][2])
+    assert torch.equal(metadata_offsets, topk_calls[0][3])
+    assert compute_cp_indexer_topk(
+        q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10, True
+    ) == (None, None)
 
 
 def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch):
@@ -261,7 +263,7 @@ def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch
     topk_width = 3
     scale = 0.7
 
-    actual = compute_cp_indexer_topk(
+    actual, _ = compute_cp_indexer_topk(
         q,
         weights,
         k,
