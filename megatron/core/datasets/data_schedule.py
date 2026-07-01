@@ -823,12 +823,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=False,
+        pad_between_seqs=(True if not torch.equal(cu_seqlens, cu_seqlens_padded) else None),
     )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    if pad_alignment is not None and packed_seq_params is not None:
+    # Pad token-like tensors after CP slicing. In non-dummy mode the tail is
+    # deliberately absent from cu_seqlens metadata; dummy mode appends an
+    # ordinary sequence boundary that covers the tail.
+    if pad_alignment is not None:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,

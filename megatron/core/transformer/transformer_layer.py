@@ -1320,6 +1320,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         individual cu_seqlens tensor kwargs. This method reassembles them into a
         PackedSeqParams. max_seqlen_q/kv are taken from config since they are always
         the padded static value and cannot be read from CUDA tensors during graph capture.
+        pad_between_seqs is conservatively enabled because its Python value is not a
+        graph input and inferring it from CUDA tensors would synchronize during capture.
         """
         if 'cu_seqlens_q' not in kwargs:
             return
@@ -1333,7 +1335,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
-            pad_between_seqs=False,
+            # CUDA graph inputs do not carry this Python bool. Sequence-packing
+            # metadata may contain valid/physical gaps, so use the conservative
+            # graph-static value instead of asking TE to infer it with a CUDA
+            # tensor comparison during capture.
+            pad_between_seqs=True,
         )
         kwargs['packed_seq_params'] = packed_seq_params
 
