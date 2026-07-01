@@ -1327,7 +1327,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
-            pad_between_seqs=False,
         )
         kwargs['packed_seq_params'] = packed_seq_params
 

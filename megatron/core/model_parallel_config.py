@@ -118,13 +118,13 @@ class ModelParallelConfig:
     tensors are padded to a multiple of N.
     """
 
-    pad_packed_seq_by_appending_dummy_seq: bool = True
+    pad_packed_seq_by_appending_dummy_seq: bool = False
     """Represent a THD packed-sequence padding tail by appending a dummy sequence.
 
-    When disabled, token-like tensors are still padded according to
-    pad_packed_seq_alignment, but cu_seqlens sequence boundaries are not extended
-    for the padding tail. CUDA Graph static-input padding may still pad the
-    cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    By default, token-like tensors are padded according to
+    pad_packed_seq_alignment, cu_seqlens is unchanged, and the last
+    cu_seqlens_padded endpoint is extended over the padding tail. When enabled,
+    the tail is represented as a separate zero-valid-token dummy sequence.
     """
 
     expert_model_parallel_size: int = 1

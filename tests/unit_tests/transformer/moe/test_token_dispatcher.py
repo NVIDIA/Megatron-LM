@@ -502,14 +502,15 @@ def _to_cu_seqlens(seqlens):
 
 def _make_thd_packed_seq_params(seqlens, cp_size, tp_size):
     padded_seqlens = _get_thd_padded_seqlens(seqlens, cp_size, tp_size)
+    cu_seqlens = _to_cu_seqlens(seqlens)
     cu_seqlens_padded = _to_cu_seqlens(padded_seqlens)
     max_seqlen = max(padded_seqlens)
-    # Match get_batch_on_this_rank_for_sequence_packing(): TE consumes padded
-    # cumulative lengths as both cu_seqlens and cu_seqlens_padded for THD.
+    # Match the runtime contract: original boundaries count valid tokens while
+    # padded boundaries describe physical THD storage consumed by attention.
     return PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
