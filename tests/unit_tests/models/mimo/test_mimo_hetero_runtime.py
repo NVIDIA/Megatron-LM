@@ -87,10 +87,11 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     groups = mocker.Mock()
     model = SimpleNamespace(language_model=mocker.Mock(), modality_submodules={})
     topology = mocker.Mock()
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology, _args=args))
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology))
+    mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
         "examples.mimo.training.builder._resolve_role",
-        return_value=(None, True, False, groups, None),
+        return_value=(MIMO_LANGUAGE_MODULE_KEY, True, groups),
     )
     mocker.patch.object(builder, "build_model", return_value=model)
     wrap = mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
@@ -124,10 +125,11 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     args = _args(init_model_with_meta_device=False)
     encoder_pg = mocker.Mock()
     model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: mocker.Mock()})
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), _args=args))
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
         "examples.mimo.training.builder._resolve_role",
-        return_value=(ENCODER, False, True, None, encoder_pg),
+        return_value=(ENCODER, False, encoder_pg),
     )
     mocker.patch.object(builder, "build_model", return_value=model)
     mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
@@ -141,17 +143,22 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     assert model.rng_state_key_prefix == "encoder."
 
 
-def test_builder_rejects_colocated_or_zero_active_roles(mocker):
+def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):
     """Colocated (both) or zero active roles are not supported (non-colocated only)."""
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import _resolve_role
 
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), _args=_args()))
-    mocker.patch(
-        "examples.mimo.training.builder._resolve_role",
-        return_value=(ENCODER, True, True, mocker.Mock(), mocker.Mock()),
-    )
+    def _topology(active_modules):
+        grids = {}
+        for name in (MIMO_LANGUAGE_MODULE_KEY, ENCODER):
+            grid = mocker.Mock()
+            grid.is_current_rank_in_grid.return_value = name in active_modules
+            grids[name] = grid
+        return SimpleNamespace(grids=grids, module_pgs={})
+
     with pytest.raises(ValueError, match="exactly one active language or encoder role"):
-        builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+        _resolve_role(_topology({MIMO_LANGUAGE_MODULE_KEY, ENCODER}))
+    with pytest.raises(ValueError, match="exactly one active language or encoder role"):
+        _resolve_role(_topology(set()))
 
 
 def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
@@ -177,14 +184,17 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     groups = mocker.Mock()
     config = MimoBuildConfig(
         _topology=mocker.Mock(),
-        _args=_args(init_model_with_meta_device=False),
         pre_wrap_hooks=[pre_hook],
         post_wrap_hooks=[post_hook],
     )
     builder = MimoModelBuilder(config)
     mocker.patch(
+        "examples.mimo.training.builder.get_args",
+        return_value=_args(init_model_with_meta_device=False),
+    )
+    mocker.patch(
         "examples.mimo.training.builder._resolve_role",
-        return_value=(None, True, False, groups, None),
+        return_value=(MIMO_LANGUAGE_MODULE_KEY, True, groups),
     )
     mocker.patch("examples.mimo.training.builder.configure_module_rng")
     mocker.patch.object(builder, "build_model", return_value=original_model)
@@ -215,14 +225,14 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
     replacement_models = [SimpleNamespace() for _ in range(model_count)]
     hook_kwargs = {"pre_wrap_hooks": [], "post_wrap_hooks": []}
     hook_kwargs[f"{hook_stage}_wrap_hooks"] = [lambda _models: replacement_models]
-    builder = MimoModelBuilder(
-        MimoBuildConfig(
-            _topology=mocker.Mock(), _args=_args(init_model_with_meta_device=False), **hook_kwargs
-        )
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), **hook_kwargs))
+    mocker.patch(
+        "examples.mimo.training.builder.get_args",
+        return_value=_args(init_model_with_meta_device=False),
     )
     mocker.patch(
         "examples.mimo.training.builder._resolve_role",
-        return_value=(None, True, False, mocker.Mock(), None),
+        return_value=(MIMO_LANGUAGE_MODULE_KEY, True, mocker.Mock()),
     )
     mocker.patch("examples.mimo.training.builder.configure_module_rng")
     mocker.patch.object(builder, "build_model", return_value=SimpleNamespace())

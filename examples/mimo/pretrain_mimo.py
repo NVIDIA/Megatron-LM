@@ -6,11 +6,8 @@ from __future__ import annotations
 
 import argparse
 
-from examples.mimo.model_providers.nemotron_moe_vlm import (
-    add_model_provider_args,
-    language_model_spec,
-)
-from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
+from examples.mimo.model_providers import resolve_provider
+from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import (
     add_hetero_grid_args,
     build_module_grid_specs,
@@ -22,8 +19,6 @@ from examples.mimo.training.distributed import initialize_distributed, shutdown_
 from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
 from megatron.core.enums import ModelType
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_global_variables
@@ -69,27 +64,23 @@ def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
     set_global_variables(args, build_tokenizer=False)
+    provider = resolve_provider(args)
 
     topology = None
     try:
         initialize_distributed()
-        specs = build_module_grid_specs(args, args.world_size, RADIO_ENCODER_MODULE_NAME)
+        # The grid/rank-layout args model a single encoder region; the builder itself is
+        # generic over any number of encoder grids in the topology.
+        encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
+        specs = build_module_grid_specs(args, args.world_size, encoder_name)
         topology = create_topology(specs)
 
-        language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
-        language_config = language_model_spec(args, None, language_grid).params["config"]
-        communicator = MultiModulePipelineCommunicator(
-            topology.grids,
-            {RADIO_ENCODER_MODULE_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []},
-            language_config,
-            dim_mapping={"s": 0, "h": 2, "b": 1},
-            module_output_ndim={RADIO_ENCODER_MODULE_NAME: 2},
-        )
+        communicator = provider.build_communicator(args, topology)
 
         loaders = build_train_valid_test_data_loaders(args, topology)
         iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
 
-        model_cfg = MimoBuildConfig(_topology=topology, _args=args)
+        model_cfg = MimoBuildConfig(_topology=topology)
         cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
         def train_valid_test_data_provider(_train_val_test_num_samples):
