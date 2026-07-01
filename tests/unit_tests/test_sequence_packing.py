@@ -90,6 +90,7 @@ class MockVariableLengthSequencePackingDataIterator:
         self,
         total_seq_length: int,
         sequence_lengths: list,
+        padded_sequence_lengths: list = None,
         local_cp_size: int = None,
         device: str = "cuda",
         seed: int = 42,
@@ -99,17 +100,25 @@ class MockVariableLengthSequencePackingDataIterator:
             total_seq_length: Total length of packed sequences
             sequence_lengths: List of individual sequence lengths (variable-length).
                               If None, generates random variable lengths.
+            padded_sequence_lengths: Physical storage length for each sequence.
             device: Device to create tensors on
             seed: Random seed for reproducibility
         """
         self.total_seq_length = total_seq_length
         self.sequence_lengths = sequence_lengths
+        self.padded_sequence_lengths = padded_sequence_lengths or sequence_lengths
         self.local_cp_size = local_cp_size
         self.device = device
         self.seed = seed
-        assert (
-            sum(self.sequence_lengths) == total_seq_length
-        ), f"Sequence lengths sum {sum(self.sequence_lengths)} != total {total_seq_length}"
+        assert len(self.sequence_lengths) == len(self.padded_sequence_lengths)
+        assert all(
+            real <= padded
+            for real, padded in zip(self.sequence_lengths, self.padded_sequence_lengths)
+        )
+        assert sum(self.padded_sequence_lengths) == total_seq_length, (
+            f"Padded sequence lengths sum {sum(self.padded_sequence_lengths)} "
+            f"!= total {total_seq_length}"
+        )
 
     def __iter__(self):
         """Interface for the data iterator."""
@@ -125,24 +134,34 @@ class MockVariableLengthSequencePackingDataIterator:
 
         # Create position_ids that reset for each sequence (THD format)
         position_ids = []
-        for seq_len in self.sequence_lengths:
+        for seq_len, padded_seq_len in zip(self.sequence_lengths, self.padded_sequence_lengths):
             position_ids.extend(range(seq_len))
+            position_ids.extend([0] * (padded_seq_len - seq_len))
         position_ids = torch.tensor(position_ids, dtype=torch.int64, device=dev)
 
         # Labels are tokens shifted by 1 for easy verification
         labels = tokens + 1
 
-        # Loss mask: 1.0 for all positions except padding (none here)
-        loss_mask = torch.ones(self.total_seq_length, dtype=torch.float32, device=dev)
+        # Loss mask: 1.0 for valid tokens and 0.0 for physical padding.
+        loss_mask = []
+        for seq_len, padded_seq_len in zip(self.sequence_lengths, self.padded_sequence_lengths):
+            loss_mask.extend([1.0] * seq_len)
+            loss_mask.extend([0.0] * (padded_seq_len - seq_len))
+        loss_mask = torch.tensor(loss_mask, dtype=torch.float32, device=dev)
 
         # Create cu_seqlens for variable-length packed sequences
         cu_seqlens = [0]
         for seq_len in self.sequence_lengths:
             cu_seqlens.append(cu_seqlens[-1] + seq_len)
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=dev)
-        cu_seqlens_padded = cu_seqlens.clone()
+        cu_seqlens_padded = [0]
+        for seq_len in self.padded_sequence_lengths:
+            cu_seqlens_padded.append(cu_seqlens_padded[-1] + seq_len)
+        cu_seqlens_padded = torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=dev)
 
-        max_seqlen = torch.tensor([max(self.sequence_lengths)], dtype=torch.int32, device=dev)
+        max_seqlen = torch.tensor(
+            [max(self.padded_sequence_lengths)], dtype=torch.int32, device=dev
+        )
 
         batch = {
             "tokens": tokens,
@@ -283,14 +302,14 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         if tp_rank == 0:
             # Use deterministic seed based on DP rank so same data within TP/PP/CP group
             dp_rank = parallel_state.get_data_parallel_rank()
-            sequence_lengths = [1024, 2048, 512, 1536, 3072]
-            assert (
-                sum(sequence_lengths) == args.seq_length
-            ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
+            sequence_lengths = [1000, 2040, 500, 1500, 3000]
+            padded_sequence_lengths = [1024, 2048, 512, 1536, 3072]
+            assert sum(padded_sequence_lengths) == args.seq_length
             data_iterator = iter(
                 MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,
+                    padded_sequence_lengths=padded_sequence_lengths,
                     local_cp_size=local_cp_size,
                     seed=42 + dp_rank,
                 )
@@ -313,7 +332,17 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         assert padding_mask is not None
         assert padding_mask.dtype == torch.bool
         assert padding_mask.dim() == 2
-        assert not padding_mask.any(), "Mock data has no per-sequence padding."
+        assert packed_seq_params is not None
+        has_padding = padding_mask.any().to(torch.int32)
+        effective_cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params.cp_group is not None
+            else parallel_state.get_context_parallel_group()
+        )
+        torch.distributed.all_reduce(
+            has_padding, op=torch.distributed.ReduceOp.MAX, group=effective_cp_group
+        )
+        assert has_padding.item(), "Mock data intentionally has padding in each CP group."
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -350,8 +379,12 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         # =====================================================================
         # TEST 2: Verify packed_seq_params consistency
         # =====================================================================
-        assert packed_seq_params is not None
         assert packed_seq_params.qkv_format == "thd"
+        assert packed_seq_params.pad_between_seqs is True
+        assert not torch.equal(
+            packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_q_padded
+        )
+        assert packed_seq_params.cu_seqlens_q[-1] < packed_seq_params.cu_seqlens_q_padded[-1]
 
         test_keys = [
             "cu_seqlens_q",
