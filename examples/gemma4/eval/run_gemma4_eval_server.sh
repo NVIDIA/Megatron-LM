@@ -109,7 +109,7 @@ server_opts="\
     --no-load-rng \
     --tokenizer-type NullTokenizer \
     --vocab-size ${VOCAB} \
-    --distributed-timeout-minutes 30 \
+    --distributed-timeout-minutes 2880 \
     --disable-gloo-process-groups \
     --num-workers 1 \
     --logging-level 20 \

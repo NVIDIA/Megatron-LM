@@ -59,7 +59,7 @@ nohup python -m torch.distributed.run --nproc-per-node="$NPROC" --master-port="$
     --ckpt-format torch_dist --ckpt-fully-parallel-load \
     --no-load-optim --no-load-rng \
     --tokenizer-type NullTokenizer --vocab-size 262144 \
-    --distributed-timeout-minutes 30 --disable-gloo-process-groups \
+    --distributed-timeout-minutes 2880 --disable-gloo-process-groups \
     --num-workers 1 --logging-level 20 \
     --port "$PORT" --host 0.0.0.0 \
     --gemma4-hf-tokenizer "$GEMMA4_HF" \
