@@ -107,6 +107,6 @@ def test_launcher_always_configures_unique_per_rank_logs():
     assert 'mkdir -p "${TORCHRUN_LOG_DIR}"' in launcher
     assert '--log-dir "${TORCHRUN_LOG_DIR}"' in launcher
     assert "--redirects 3" in launcher
-    assert "--tee 0:3" in launcher
+    assert "--tee 3" in launcher
     assert 'if [[ -n "${TORCHRUN_LOG_DIR:-}" ]]' not in launcher
     assert "--moe-flex-dispatcher-backend" not in launcher

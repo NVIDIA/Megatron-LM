@@ -21,7 +21,7 @@ TORCHRUN_ARGS=(
   --nproc-per-node 8
   --log-dir "${TORCHRUN_LOG_DIR}"
   --redirects 3
-  --tee 0:3
+  --tee 3
 )
 
 uv run --extra ssm python -m torch.distributed.run \
