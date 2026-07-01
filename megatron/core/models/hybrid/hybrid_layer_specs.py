@@ -26,6 +26,10 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -135,9 +139,9 @@ hybrid_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
-                    module=MLASelfAttention,
+                    module=AbsorbedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
+                    submodules=AbsorbedMLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
                         linear_q_up_proj=TEColumnParallelLinear,
