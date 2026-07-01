@@ -7,7 +7,7 @@ ENV_VARS:
   MODEL_BF16_CKPT: "${DATA_PATH}/model/nemotron_v3_pico_7b-a1b/3T-token_deeparch"
   PTQ_QUANTIZED_CKPT: "${DATA_CACHE_PATH}/ptq_quantized_ckpt"
   TOKENIZER: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-  HF_HOME: "${DATA_PATH}/.hf_cache"
+  HF_HOME: "${DATA_PATH}/hf_home"
 BEFORE_SCRIPT: |
   # Stage 1: PTQ quantization via quantize.py directly
   echo -e "\n=== Stage 1: Running PTQ (NVFP4) ===\n"
