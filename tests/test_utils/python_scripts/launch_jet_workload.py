@@ -172,6 +172,7 @@ def launch_and_wait_for_completion(
     run_name: Optional[str],
     wandb_experiment: Optional[str],
     enable_lightweight_mode: bool,
+    workload_local_image_path: Optional[str],
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
@@ -193,6 +194,7 @@ def launch_and_wait_for_completion(
                         scope=scope,
                         container_image=container_image,
                         container_tag=container_tag,
+                        workload_local_image_path=workload_local_image_path,
                         platform=platform,
                         environment=environment,
                         record_checkpoints=record_checkpoints,
@@ -227,6 +229,9 @@ def launch_and_wait_for_completion(
                                         "CLUSTER": cluster,
                                         "RUN_ID": str(uuid.uuid4()),
                                         "CLEANUP_PATHS": os.getenv("CLEANUP_PATHS") or "",
+                                        "MCORE_WORKLOAD_LOCAL_IMAGE_PATH": (
+                                            workload_local_image_path or ""
+                                        ),
                                     }
                                 }
                             }
@@ -438,6 +443,16 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--platform", required=True, type=str, help="Platform to select")
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
+@click.option(
+    "--workload-local-image-path",
+    required=False,
+    type=str,
+    help=(
+        "Local SquashFS image path/template to use via JET spec.image_source.local_path. "
+        "Skips the JET build workload. Template fields can reference workload spec fields "
+        "and {container_tag}."
+    ),
+)
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
 @click.option("--record-checkpoints", required=False, type=str, help="Values are 'true' or 'false'")
 @click.option(
@@ -473,6 +488,7 @@ def main(
     record_checkpoints: str,
     tag: Optional[str] = None,
     container_image: Optional[str] = None,
+    workload_local_image_path: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
     enable_lightweight_mode: bool = False,
@@ -529,6 +545,7 @@ def main(
             wandb_experiment=wandb_experiment,
             record_checkpoints=record_checkpoints,
             enable_lightweight_mode=enable_lightweight_mode,
+            workload_local_image_path=workload_local_image_path,
         )
 
         n_download_attempt = 0
