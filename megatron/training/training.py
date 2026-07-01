@@ -2147,6 +2147,9 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        # Resolve checkpoint groups from this rank's module PGC; None falls back
+        # to the mpu groups inside load_checkpoint (byte-identical for stock).
+        ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -2155,6 +2158,12 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
+            tp_group=getattr(ckpt_pgc, "tp", None),
+            pp_group=getattr(ckpt_pgc, "pp", None),
+            dp_cp_group=getattr(ckpt_pgc, "dp_cp", None),
+            dp_group=getattr(ckpt_pgc, "dp", None),
+            expt_dp_group=getattr(ckpt_pgc, "expt_dp", None),
+            rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -2174,7 +2183,11 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size()
+    data_parallel_size = (
+        mpu.get_data_parallel_world_size()
+        if mpu.model_parallel_is_initialized()
+        else args.data_parallel_size
+    )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
@@ -2952,13 +2965,6 @@ def save_checkpoint_and_time(
             model_chunk.free_overlap_buffers()
     torch.cuda.empty_cache()
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
     ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
@@ -2969,6 +2975,13 @@ def save_checkpoint_and_time(
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+
+    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+
+    if should_report_memory:
+        # Track memory before checkpoint save.
+        report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
 
     # Save checkpoint.
     save_checkpoint(
@@ -2995,7 +3008,7 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
@@ -3427,7 +3440,9 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    # Preserve a builder-installed finalize hook; only default it when unset.
+    if config.finalize_model_grads_func is None:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
