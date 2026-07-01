@@ -31,6 +31,10 @@ def _run_launcher(base, train_iters, extra_args, name):
         "TRAIN_ITERS": str(train_iters),
         "TORCHRUN_LOG_DIR": str(base / f"torchrun-{name}"),
     }
+    # conftest's autouse set_env fixture disables TE flash/fused attention; the 20L model
+    # at seq 8192 needs them (unfused attention OOMs), so let the launcher use TE defaults.
+    env.pop("NVTE_FLASH_ATTN", None)
+    env.pop("NVTE_FUSED_ATTN", None)
     cmd = [
         "bash",
         str(_LAUNCHER),
