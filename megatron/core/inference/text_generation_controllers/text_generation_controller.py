@@ -1920,6 +1920,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # Sample.
         range_push("sampling")
         sampled_tokens_gpu = torch.argmax(
             self._all_logits_cuda.squeeze(0)[:active_request_count].float(), dim=-1
@@ -1929,6 +1930,7 @@ class TextGenerationController:
         )
         range_pop()
 
+        # Return the sampling result.
         return _AsyncScheduleSampleResult(
             active_request_count=active_request_count,
             cuda_graph_request_count=self._decode_forward_primer.cuda_graph_request_count,
@@ -1963,11 +1965,15 @@ class TextGenerationController:
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
 
+        # Forward.
         range_push("forward_pass")
         self._dynamic_step_forward_logits(input_ids, position_ids)
         range_pop()
 
+        # Mark the primer.
         self._decode_forward_primer.mark_primed(cuda_graph_request_count)
+
+        # Return the forward-done event.
         return self._record_async_sched_event(self._all_logits_cuda)
 
     def _run_async_sched_forward_primer(self) -> bool:
@@ -1979,10 +1985,12 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # Clear the primer when there is no active work.
         if context.active_token_count == 0 and active_request_count == 0:
             self._decode_forward_primer.clear()
             return False
 
+        # Forward and mark the primer.
         with torch.inference_mode():
             if not self._decode_forward_primer.is_primed:
                 input_ids, position_ids = self._dynamic_step_context_init()
@@ -2111,6 +2119,7 @@ class TextGenerationController:
         # Wait on resolution to finish.
         self._wait_async_sched_event(resolve_result.resolve_done_event)
 
+        # Return the completed phase result.
         return resolve_result
 
     async def _run_async_sched_step(self, *, overlap: bool) -> Optional[Dict]:
@@ -2127,18 +2136,26 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
 
+        # Validate async scheduling support.
         self._validate_async_sched_support_for_step()
+
+        # Run the forward primer if necessary.
         if not self._run_async_sched_forward_primer():
             return None
 
         await asyncio.sleep(0)
 
         with torch.inference_mode():
+
+            # Phase 1: Sample and prepare.
             sample_and_prepare_result = self._run_async_sched_sample_and_prepare(overlap)
+
+            # Phase 2: Forward and resolve.
             forward_and_resolve_result = self._run_async_sched_forward_and_resolve(
                 sample_and_prepare_result, overlap
             )
 
+            # Increment async scheduling counters.
             context.async_sched_step_count += 1
             if (
                 forward_and_resolve_result.survivor_idxs.numel()
@@ -2146,6 +2163,7 @@ class TextGenerationController:
             ):
                 context.async_sched_compaction_step_count += 1
 
+            # Return the completed step result.
             return {
                 "active_request_ids": forward_and_resolve_result.active_request_ids,
                 "finished_request_ids": forward_and_resolve_result.finished_request_ids,
