@@ -20,20 +20,18 @@ class TestCallbackContext:
     """Unit tests for CallbackContext."""
 
     def test_required_fields_are_accessible(self):
-        """Required fields (state, model, user_state) are accessible."""
-        mock_state = Mock()
+        """Required fields (model, user_state) are accessible."""
         mock_model = [Mock()]
         user_state = {"key": "value"}
 
-        ctx = CallbackContext(state=mock_state, model=mock_model, user_state=user_state)
+        ctx = CallbackContext(model=mock_model, user_state=user_state)
 
-        assert ctx.state is mock_state
         assert ctx.model is mock_model
         assert ctx.user_state == {"key": "value"}
 
     def test_optional_fields_default_to_none(self):
         """Optional fields default to None when not provided."""
-        ctx = CallbackContext(state=Mock(), model=[Mock()], user_state={})
+        ctx = CallbackContext(model=[Mock()], user_state={})
 
         assert ctx.optimizer is None
         assert ctx.scheduler is None
@@ -49,7 +47,6 @@ class TestCallbackContext:
         mock_loss_dict = {"loss": Mock()}
 
         ctx = CallbackContext(
-            state=Mock(),
             model=[Mock()],
             user_state={},
             optimizer=mock_optimizer,
@@ -67,12 +64,12 @@ class TestCallbackContext:
 
     def test_user_state_defaults_to_empty_dict(self):
         """user_state defaults to empty dict if not provided."""
-        ctx = CallbackContext(state=Mock(), model=[Mock()])
+        ctx = CallbackContext(model=[Mock()])
         assert ctx.user_state == {}
 
     def test_user_state_is_mutable(self):
         """user_state can be modified by callbacks."""
-        ctx = CallbackContext(state=Mock(), model=[Mock()], user_state={})
+        ctx = CallbackContext(model=[Mock()], user_state={})
 
         ctx.user_state["new_key"] = "new_value"
         assert ctx.user_state["new_key"] == "new_value"
@@ -100,7 +97,6 @@ class TestCallback:
         callback.on_test_step_start(mock_context)
         callback.on_test_step_end(mock_context)
         callback.on_test_end(mock_context)
-        callback.on_checkpoint_save(mock_context)
 
     def test_subclass_can_override_methods(self):
         """Subclasses can override specific methods."""
@@ -396,7 +392,7 @@ class TestUserStatePersistence:
         # Simulate what framework does - same user_state dict each time
         persistent_state = {}
         for _ in range(5):
-            ctx = CallbackContext(state=Mock(), model=[Mock()], user_state=persistent_state)
+            ctx = CallbackContext(model=[Mock()], user_state=persistent_state)
             manager.fire("on_train_step_end", ctx)
 
         assert persistent_state["counter"] == 5
@@ -416,10 +412,10 @@ class TestUserStatePersistence:
 
         persistent_state = {}
 
-        ctx1 = CallbackContext(state=Mock(), model=[Mock()], user_state=persistent_state)
+        ctx1 = CallbackContext(model=[Mock()], user_state=persistent_state)
         manager.fire("on_train_start", ctx1)
 
-        ctx2 = CallbackContext(state=Mock(), model=[Mock()], user_state=persistent_state)
+        ctx2 = CallbackContext(model=[Mock()], user_state=persistent_state)
         manager.fire("on_train_end", ctx2)
 
         assert persistent_state["start_time"] == 100
@@ -499,7 +495,6 @@ class TestValidEvents:
             "on_test_step_start",
             "on_test_step_end",
             "on_test_end",
-            "on_checkpoint_save",
         }
         assert VALID_EVENTS == expected
 
