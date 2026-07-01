@@ -666,175 +666,35 @@ def nccl_ep_finalize():
         te_ep.ep_finalize()
 
 
-class NcclEpContext:
-    """Per-MoE-layer NCCL EP routing context: one TE ``EpBuffer`` (routing handle_mem + payload slots).
+if HAVE_TE_EP:
 
-    Holds a single buffer, which a forward overwrites in place. Under pipeline
-    parallelism (1F1B) several microbatches are in flight at once, so each in-flight execution
-    must use its own context -- a second forward on the same buffer before the first's
-    backward consumes it would corrupt that backward. Concurrent contexts are managed by
-    :class:`NcclEpContextPool`; do not share one context across in-flight executions.
-
-    Args:
-        top_k (int): Routing fan-out per token (TP-folded router_topk at the call site).
-        max_tokens_per_rank (int): Upper bound on local input tokens per forward.
-        recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens.
-        hidden_dim (int): Token hidden size.
-        num_local_experts (int): Experts owned by this rank (``num_experts // ep_size``).
-        alignment (int): Per-expert packing alignment for ``recv_tokens`` (grouped-GEMM
-            tile; 0 = packed contiguously by actual count).
-        payload_dtype (torch.dtype): Token dtype carried through dispatch/combine.
-    """
-
-    def __init__(
-        self,
+    def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
         recv_capacity_per_rank,
         hidden_dim,
         num_local_experts,
         alignment=0,
-        payload_dtype=torch.bfloat16,
     ):
-        if not HAVE_TE_EP:
-            raise RuntimeError(_TE_EP_MISSING_MSG)
-        self.buffer = te_ep.EpBuffer(
+        """Build a fresh TE EpBuffer for one dispatch/combine pair.
+
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads) and
+        the receive buffers; a new one is built per dispatch and dropped after combine.
+        """
+        return te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
             recv_capacity_per_rank=recv_capacity_per_rank,
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
-            payload_dtype=payload_dtype,
         )
-        self.state = "free"
-        self.generation = 0
 
-
-class _EpLease:
-    """A leased :class:`NcclEpContext` bound to one forward(->backward) execution.
-
-    The pool hands out one lease per dispatch. ``generation`` is the context's generation
-    stamped at lease time; the release path asserts the context has not been re-leased
-    (generation bumped) before this execution's backward consumed it -- a loud tripwire for an
-    EP-buffer override. See :class:`NcclEpContextPool`.
-
-    Args:
-        ctx (NcclEpContext): The leased routing context.
-        generation (int): ``ctx.generation`` captured at lease time.
-        dispatch_id (int): Monotonic id of the dispatch that took this lease (for diagnostics).
-    """
-
-    __slots__ = ("ctx", "generation", "dispatch_id", "released", "release_at_combine")
-
-    def __init__(self, ctx: "NcclEpContext", generation: int, dispatch_id: int):
-        self.ctx = ctx
-        self.generation = generation
-        self.dispatch_id = dispatch_id
-        self.released = False
-        # Set when the dispatch ran under no_grad, so no backward will consume the context
-        # (e.g. the discarded original pass of an activation-checkpointed layer): release at
-        # combine instead of waiting for a backward that never comes.
-        self.release_at_combine = False
-
-
-class NcclEpContextPool:
-    """A lazily-growing pool of :class:`NcclEpContext` for one MoE layer.
-
-    Under pipeline parallelism (1F1B) several microbatches are in flight at once, so a
-    microbatch's forward must not overwrite the EP handle/buffer that an earlier microbatch's
-    pending backward still reads. Each in-flight execution leases its own context; the lease is
-    returned when that execution's last consumer finishes (its backward, or its forward
-    ``combine`` when running under ``no_grad``). The pool grows on demand to the high-water-mark
-    of concurrent leases (~ the pipeline warmup depth) and recycles contexts thereafter.
-
-    The pool self-sizes via lazy growth, settling at one context per in-flight microbatch (the
-    pipeline schedule's warmup depth + 1). ``max_size_fn`` is only a leak backstop: a microbatch
-    can never have more peers in flight than the total microbatch count, so that count is a
-    ceiling that never false-triggers a correct run. It is a callable (evaluated per growth) so
-    batch-size rampup, which raises the microbatch count over the run, cannot make a frozen cap
-    reject a legitimately deeper pipeline later.
-
-    Args:
-        context_factory (Callable[[], NcclEpContext]): Builds a fresh context. TE bootstrap and
-            sizing are fixed by the caller, which the factory captures.
-        max_size_fn (Callable[[], int]): Returns the current leak-backstop ceiling (the
-            microbatch count). Growth past it raises -- signalling leaked leases (a release bug)
-            or an unexpectedly deep schedule.
-        layer_name (str): Identifier used in diagnostics.
-    """
-
-    def __init__(self, context_factory, max_size_fn, layer_name: str = ""):
-        self._factory = context_factory
-        self._max_size_fn = max_size_fn
-        self._layer_name = layer_name
-        self._free: list = []
-        self._all: list = []
-        self._next_dispatch_id = 0
-
-    @property
-    def high_water_mark(self) -> int:
-        """Number of contexts ever allocated (the peak of concurrent leases)."""
-        return len(self._all)
-
-    def lease(self) -> _EpLease:
-        """Lease a free context, allocating a new one if all are in use."""
-        ctx = self._free.pop() if self._free else self._acquire()
-        if ctx.state != "free":
-            raise RuntimeError(
-                f"ncclep[{self._layer_name}]: pool handed out a context in state "
-                f"'{ctx.state}' (expected 'free') -- pool bookkeeping bug."
-            )
-        ctx.state = "leased"
-        ctx.generation += 1
-        lease = _EpLease(ctx, ctx.generation, self._next_dispatch_id)
-        self._next_dispatch_id += 1
-        return lease
-
-    def release(self, lease: _EpLease) -> None:
-        """Return a lease's context to the pool, loudly rejecting an out-of-order reuse."""
-        if lease.released:
-            return
-        ctx = lease.ctx
-        # Loud tripwire: A mismatch means the ctx is incorrectly returned to _free early
-        # and used by a different lease, i.e. context was leased
-        # again (its buffer overwritten) before this execution's backward
-        # consumed it -- concurrent in-flight microbatches exceeded safe reuse.
-        # Basically: the same ctx cannot be shared by 2 different leases.
-        if ctx.generation != lease.generation:
-            raise RuntimeError(
-                f"ncclep[{self._layer_name}]: EP context for dispatch #{lease.dispatch_id} "
-                f"(generation {lease.generation}) was re-leased (now generation "
-                f"{ctx.generation}) before its backward ran -- a concurrent microbatch "
-                f"overwrote the EP buffer this backward needs. Buffer-override bug."
-            )
-        ctx.state = "free"
-        lease.released = True
-        self._retire(ctx)
-
-    def _acquire(self) -> "NcclEpContext":
-        max_size = self._max_size_fn()
-        if len(self._all) >= max_size:
-            raise RuntimeError(
-                f"ncclep[{self._layer_name}]: EP context pool would exceed the microbatch-count "
-                f"ceiling ({max_size}); in-flight microbatches cannot exceed it, so leases are "
-                f"not being released (a release bug) or the schedule is unexpectedly deep."
-            )
-        ctx = self._factory()
-        self._all.append(ctx)
-        return ctx
-
-    def _retire(self, ctx: "NcclEpContext") -> None:
-        self._free.append(ctx)
-
-
-if HAVE_TE_EP:
-
-    def nccl_ep_dispatch(context, tokens, topk_idx, topk_weights):
+    def nccl_ep_dispatch(buffer, tokens, topk_idx, topk_weights):
         """Autograd-aware prepare + dispatch via TransformerEngine NCCL EP.
 
         Args:
-            context (NcclEpContext): The per-layer EP routing context.
+            buffer (te_ep.EpBuffer): The TE EP buffer for this dispatch.
             tokens (torch.Tensor): Local input tokens ``[num_local_tokens, hidden]``
                 (leading dims flattened by TE), ``payload_dtype``.
             topk_idx (torch.Tensor): ``int64`` ``[num_local_tokens, top_k]`` global expert
@@ -851,20 +711,18 @@ if HAVE_TE_EP:
               * ``dispatched_probs``: ``float32`` ``[recv_capacity_per_rank]`` per-slot
                 weights; apply them in the expert MLP (combine is called unweighted).
 
-            All three are views into ``context.buffer``'s persistent slots — consume them
-            before the next dispatch on the same context. ``tokens_per_expert`` is
-            non-differentiable.
+            ``tokens_per_expert`` is non-differentiable.
         """
         recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
-            context.buffer, tokens, topk_idx, topk_weights
+            buffer, tokens, topk_idx, topk_weights
         )
         return recv_tokens, tokens_per_expert, dispatched_probs
 
-    def nccl_ep_combine(context, expert_out, num_local_tokens=None):
+    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None):
         """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
 
         Args:
-            context (NcclEpContext): The per-layer EP routing context.
+            buffer (te_ep.EpBuffer): The TE EP buffer for this combine.
             expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
                 already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
@@ -874,8 +732,9 @@ if HAVE_TE_EP:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
-        return te_ep.ep_combine(context.buffer, expert_out, num_local_tokens=num_local_tokens)
+        return te_ep.ep_combine(buffer, expert_out, num_local_tokens=num_local_tokens)
 
 else:
+    new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None
