@@ -9,7 +9,13 @@ import os
 import re
 import torch
 import types
-import yaml
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 from itertools import chain, starmap
 from types import SimpleNamespace
@@ -28,8 +34,9 @@ def env_constructor(loader, node):
         assert os.environ.get(group) is not None, f"environment variable {group} in yaml not found"
         value = value.replace(f"${{{group}}}", os.environ.get(group))
     return value
-yaml.add_implicit_resolver("!pathex", env_pattern)
-yaml.add_constructor("!pathex", env_constructor)
+if HAVE_YAML:
+    yaml.add_implicit_resolver("!pathex", env_pattern)
+    yaml.add_constructor("!pathex", env_constructor)
 
 
 str_dtype_to_torch = {
@@ -326,7 +333,6 @@ def validate_yaml(args, defaults={}):
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
         if args.model_parallel.tensor_model_parallel_size > 1:
             assert args.model_parallel.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
@@ -429,6 +435,11 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to load YAML arguments. "
+            "Install via `pip install pyyaml`."
+        )
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace

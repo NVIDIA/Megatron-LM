@@ -52,6 +52,7 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 
+    @pytest.mark.parametrize("persistent", [False, True])
     @pytest.mark.parametrize("num_tokens", [1, 4, 16, 64, 128, 256, 512])
     @pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
     @pytest.mark.parametrize(
@@ -69,34 +70,41 @@ class TestComputeLocalTokensPerExpert:
             (128, 32, 96),  # 128 experts, last 32 local (EP=4, rank 3)
         ],
     )
-    def test_matches_reference(self, num_tokens, topk, num_experts, num_local, start):
+    def test_matches_reference(self, num_tokens, topk, num_experts, num_local, start, persistent):
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
 
         routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
-        result = compute_local_tokens_per_expert(routing_map, start, num_local, _vt(num_tokens))
+        result = compute_local_tokens_per_expert(
+            routing_map, start, num_local, _vt(num_tokens), persistent=persistent
+        )
         expected = _ref_tokens_per_expert(routing_map, start, num_local)
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
-    def test_no_local_tokens(self):
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_no_local_tokens(self, persistent):
         """All tokens routed to non-local experts -> all zeros."""
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
 
         routing_map = torch.full((16, 4), 99, dtype=torch.int64, device="cuda")
-        result = compute_local_tokens_per_expert(routing_map, 0, 8, _vt(16))
+        result = compute_local_tokens_per_expert(routing_map, 0, 8, _vt(16), persistent=persistent)
         assert result.sum().item() == 0
 
-    def test_single_expert_all_tokens(self):
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_single_expert_all_tokens(self, persistent):
         """All token-topk pairs route to a single local expert."""
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
 
         num_tokens, topk, num_local = 32, 4, 8
         routing_map = torch.full((num_tokens, topk), 3, dtype=torch.int64, device="cuda")
-        result = compute_local_tokens_per_expert(routing_map, 0, num_local, _vt(num_tokens))
+        result = compute_local_tokens_per_expert(
+            routing_map, 0, num_local, _vt(num_tokens), persistent=persistent
+        )
         assert result[3].item() == num_tokens * topk
         assert result.sum().item() == num_tokens * topk
 
+    @pytest.mark.parametrize("persistent", [False, True])
     @pytest.mark.parametrize("seed", [0, 7, 42, 123, 999])
-    def test_total_count_equals_local_pairs(self, seed):
+    def test_total_count_equals_local_pairs(self, seed, persistent):
         """Sum of tokens_per_expert equals total routing pairs hitting local experts."""
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
 
@@ -105,7 +113,7 @@ class TestComputeLocalTokensPerExpert:
         local_start, num_local = 4, 4
         routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
         result = compute_local_tokens_per_expert(
-            routing_map, local_start, num_local, _vt(num_tokens)
+            routing_map, local_start, num_local, _vt(num_tokens), persistent=persistent
         )
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         assert result.sum().item() == local_mask.sum().item()

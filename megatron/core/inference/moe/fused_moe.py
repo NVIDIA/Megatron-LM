@@ -26,7 +26,9 @@ try:
 
     HAVE_GROUPED_MM = True
 except ImportError:
-    HAVE_GROUPED_MM = False
+    # Fallback to the private symbol for torch versions < 2.10.
+    grouped_mm = getattr(torch, "_grouped_mm", None)
+    HAVE_GROUPED_MM = grouped_mm is not None
 
 try:
     from torch.nn.functional import ScalingType, SwizzleType, scaled_grouped_mm

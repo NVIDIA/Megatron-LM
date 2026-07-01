@@ -1,19 +1,39 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import os
-from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
-import yaml
-from omegaconf import OmegaConf
-from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
-from megatron.training.config.training_config import TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
-from megatron.core.optimizer import OptimizerConfig
-from megatron.core.msc_utils import MultiStorageClientFeature
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.training.config.resilience_config import RerunStateMachineConfig, StragglerDetectionConfig
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.optimizer import OptimizerConfig
+from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.resilience_config import (
+    RerunStateMachineConfig,
+    StragglerDetectionConfig,
+)
+from megatron.training.config.training_config import (
+    CheckpointConfig,
+    LoggerConfig,
+    SchedulerConfig,
+    TokenizerConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
+from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -80,6 +100,14 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to load a config from YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
+        from omegaconf import OmegaConf
+
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
             yaml_path_exists = msc.os.path.exists(yaml_path)
@@ -146,8 +174,8 @@ class ConfigContainerBase:
         """
         if isinstance(value, ConfigContainerBase):
             return value.to_dict()
-        # elif isinstance(value, Serializable): # TODO (@maanug): re-enable after upstreaming ModelConfig+Serializable
-        #     return value.as_dict()
+        elif isinstance(value, Serializable):
+            return value.as_dict()
         elif hasattr(value, "to_cfg_dict"):
             # Allow non-Container classes to implement own custom method
             return value.to_cfg_dict()
@@ -181,6 +209,12 @@ class ConfigContainerBase:
         Args:
             yaml_path: Path where to save the YAML file.
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to save a config to YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
         config_dict = self.to_dict()
 
         with safe_yaml_representers():
@@ -196,6 +230,12 @@ class ConfigContainerBase:
         """
         Print the config container to the console in YAML format.
         """
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to print a config as YAML. "
+                "Install via `pip install pyyaml`."
+            )
+
         config_dict = self.to_dict()
         with safe_yaml_representers():
             print(yaml.safe_dump(config_dict, default_flow_style=False))
@@ -217,17 +257,49 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    # model: GPTModelConfig | MambaModelConfig  # TODO (@maanug): add support
+    model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
-    # tokenizer: TokenizerConfig # TODO (@maanug): add support
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
     logger: LoggerConfig
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+
+@dataclass(kw_only=True)
+class InferenceConfigContainer(ConfigContainerBase):
+    """Top-level container for inference entry points.
+
+    This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
+    configs that inference actually needs and is intentionally shaped differently from the
+    training container: there is no optimizer, LR schedule, train/validation loop, DDP, rerun
+    state machine, or straggler detection.
+
+    Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
+    ``OptimizerConfig``, ``SchedulerConfig``, ``ValidationConfig``,
+    ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
+    """
+
+    model: HybridModelConfig | GPTModelConfig
+    """Which model to load for inference."""
+
+    checkpoint: CheckpointConfig
+    """Checkpoint configuration used to load model weights."""
+
+    inference: InferenceSetupConfig
+    """Declarative inference settings (the serializable, args-shaped layer). Use
+    ``InferenceSetupConfig.to_inference_config(model, ...)`` to build the runtime
+    ``megatron.core.inference.config.InferenceConfig`` consumed by the engine."""
+
+    dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
+    rng: RNGConfig = field(default_factory=RNGConfig)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    logger: LoggerConfig = field(default_factory=LoggerConfig)
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
