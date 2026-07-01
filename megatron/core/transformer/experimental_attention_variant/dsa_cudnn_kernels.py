@@ -481,17 +481,18 @@ def _compute_indexer_scores_chunk_with_global_rows(
     if k_bshd.size(2) != 1:
         raise RuntimeError(f"cuDNN DSA indexer expects one key head, got {k_bshd.size(2)}.")
 
-    _b, sq, _idx_nh, _idx_hd = q_chunk_bshd.shape
+    b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
     sk = k_bshd.size(1)
+    scores_chunk = torch.zeros((b, sq, sk), dtype=torch.float32, device=q_chunk_bshd.device)
     if k_bdk is None:
         k_bdk = k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
 
-    # Batched over the indexer-head axis (equivalent to the previous per-head bmm loop):
-    # relu(Q.K^T) weighted by the per-head indexer weight, summed over heads, in one matmul.
-    head_scores = torch.einsum("bshd,bdk->bshk", q_chunk_bshd.to(dtype=torch.float32), k_bdk)
-    head_scores.relu_()
-    head_scores.mul_(w_chunk_bsh.to(dtype=torch.float32).unsqueeze(-1))
-    scores_chunk = head_scores.sum(dim=2)
+    # Accumulate one head at a time to avoid materializing a [b, sq, idx_nh, sk] tensor.
+    for head_idx in range(idx_nh):
+        head_scores = torch.bmm(q_chunk_bshd[:, :, head_idx, :].to(dtype=torch.float32), k_bdk)
+        head_scores.relu_()
+        head_scores.mul_(w_chunk_bsh[:, :, head_idx].to(dtype=torch.float32).unsqueeze(-1))
+        scores_chunk.add_(head_scores)
 
     if sm_scale != 1.0:
         scores_chunk.mul_(sm_scale)
@@ -524,9 +525,18 @@ def _indexer_topk_from_score_chunks(
     key_positions_i64: Optional[Tensor] = None,
     indexer_ratio: int = _INDEXER_RATIO,
     score_seq_lens: Optional[Tensor] = None,
+    bottom_right_key_start: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
+    if bottom_right_key_start is not None:
+        if bottom_right_key_start < 0:
+            raise RuntimeError("cuDNN DSA bottom-right key start must be non-negative.")
+        if score_seq_lens is not None:
+            raise RuntimeError(
+                "cuDNN DSA score chunks cannot combine bottom-right key cropping "
+                "with explicit score sequence lengths."
+            )
     chunk_rows = _indexer_score_chunk_rows(b, sq, sk)
     seq_lens_b = seq_lens.view(b, sq)
     indices_chunks = []
@@ -539,10 +549,21 @@ def _indexer_topk_from_score_chunks(
         row_end = min(row_start + chunk_rows, sq)
         q_chunk = q_bshd[:, row_start:row_end].contiguous()
         w_chunk = w_bsh[:, row_start:row_end].contiguous()
+        score_k_bshd = k_bshd
+        score_sk = sk
+        chunk_topk_k = topk_k
+        if bottom_right_key_start is not None:
+            score_sk = min(sk, bottom_right_key_start + row_end)
+            score_k_bshd = k_bshd[:, :score_sk].contiguous()
+            chunk_topk_k = min(topk_k, score_sk)
         score_chunk_seq_lens = (
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
-        if score_seq_lens is None and row_start == 0 and row_end == sq:
+        if bottom_right_key_start is not None:
+            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
+            )["scores"]
+        elif score_seq_lens is None and row_start == 0 and row_end == sq:
             scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
@@ -567,25 +588,31 @@ def _indexer_topk_from_score_chunks(
             scores_chunk = dsa_masking.apply_starts_ends_mask_to_scores(
                 scores_chunk, starts[row_start:row_end], ends[row_start:row_end], key_positions_i64
             )
-        scores_flat = scores_chunk.reshape(b * (row_end - row_start), sk).contiguous()
-        use_tie_break = _use_dense_indexer_topk_tie_break(scores_flat, topk_k)
+        scores_flat = scores_chunk.reshape(b * (row_end - row_start), score_sk).contiguous()
+        use_tie_break = _use_dense_indexer_topk_tie_break(scores_flat, chunk_topk_k)
         scores_for_topk = (
             _add_indexer_topk_tie_break(scores_flat, inplace=True) if use_tie_break else scores_flat
         )
         chunk_seq_lens = seq_lens_b[:, row_start:row_end].reshape(-1).contiguous()
         tk_result = _indexer_top_k_wrapper_chunked(
-            scores_for_topk, chunk_seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
+            scores_for_topk,
+            chunk_seq_lens,
+            topk_k=chunk_topk_k,
+            return_topk_scores=return_topk_scores,
         )
-        topk_indices = tk_result["indices"].view(b, row_end - row_start, topk_k)
+        topk_indices = tk_result["indices"].view(b, row_end - row_start, chunk_topk_k)
+        topk_values = None
+        if return_topk_scores:
+            topk_values = tk_result["values"]
+            if topk_values is None:
+                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
+            topk_values = topk_values.view(b, row_end - row_start, chunk_topk_k)
+            if use_tie_break:
+                topk_values = _remove_indexer_topk_tie_break(topk_values, topk_indices, score_sk)
+        topk_indices, topk_values = _pad_topk_result(topk_indices, topk_values, topk_k)
         indices_chunks.append(topk_indices)
         if return_topk_scores:
-            values = tk_result["values"]
-            if values is None:
-                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
-            values = values.view(b, row_end - row_start, topk_k)
-            if use_tie_break:
-                values = _remove_indexer_topk_tie_break(values, topk_indices, sk)
-            values_chunks.append(values)
+            values_chunks.append(topk_values)
         del scores_for_topk, scores_flat, scores_chunk
 
     return (
@@ -666,7 +693,6 @@ def _indexer_topk_single_packed_cp_segments(
             )
         segment_topk = min(topk_k, key_end)
         key_start = key_end - (segment_end - segment_start)
-        use_offset_score = local_query_start != 0 or key_start != 0
         rel_start = row_start_global - segment_start
         rel_end = row_end_global - segment_start
         seq_lens = torch.arange(
@@ -675,10 +701,8 @@ def _indexer_topk_single_packed_cp_segments(
             dtype=torch.int32,
             device=q_bshd.device,
         )
-        # The cuDNN indexer score wrapper masks rows as if both the query slice
-        # and the valid key window start at zero. Segments with an absolute key
-        # offset need explicit row lengths to avoid hiding valid prefix keys.
-        score_seq_lens = seq_lens if use_offset_score else None
+        # Crop each score chunk's key prefix so cuDNN bottom-right masking matches
+        # these absolute row lengths without materializing scores in PyTorch.
         topk_indices, topk_scores = _indexer_topk_from_score_chunks(
             q_bshd[:, row_start:row_end].contiguous(),
             k_bshd[:, :key_end].contiguous(),
@@ -686,7 +710,7 @@ def _indexer_topk_single_packed_cp_segments(
             seq_lens,
             segment_topk,
             return_topk_scores,
-            score_seq_lens=score_seq_lens,
+            bottom_right_key_start=key_start + rel_start,
         )
         valid = (topk_indices >= 0) & (topk_indices < seq_lens.view(1, -1, 1))
         topk_indices = torch.where(valid, topk_indices, torch.full_like(topk_indices, -1))
