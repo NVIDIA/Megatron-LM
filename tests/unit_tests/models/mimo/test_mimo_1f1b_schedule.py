@@ -97,9 +97,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["dp", "cp"])
     grid.create_pg(["ep"])
     grid.create_pg(["expt_dp"])
-    # Required by the optimizer pg_collection (mp, tp_ep_pp, intra_dist_opt).
+    # Required by the optimizer pg_collection (mp/tp_ep_pp = tp x pp, intra_dist_opt).
     grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
     grid.create_pg(["tp", "cp", "dp", "pp"])
     _active_grids.append(grid)
     return grid
@@ -125,9 +124,10 @@ def get_pg_collection(grid):
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp")
-    # Optimizer groups; mp/intra_dist_opt match production, tp_ep_pp is a dense-only stand-in.
+    # Optimizer groups. mp/intra_dist_opt match production; these grids are dense (ep=1),
+    # so the expert-model-parallel group tp_ep_pp coincides with mp (tp x pp).
     pg_collection.mp = grid.get_pg(["tp", "pp"])
-    pg_collection.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["tp", "pp"])
     pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg_collection
 
