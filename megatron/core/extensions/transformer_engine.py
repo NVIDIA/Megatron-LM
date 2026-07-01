@@ -22,6 +22,9 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.transformer_engine_int4_fake_qat import (
+    maybe_fake_quantize_int4_weight_tensors,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -2280,6 +2283,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if self.te_return_bias:
                 return out
             return out, None
+
+        def _get_weight_tensors(self):
+            """Get the weight tensors of the module."""
+            weight_tensors = super()._get_weight_tensors()
+            return maybe_fake_quantize_int4_weight_tensors(
+                self.config, self.delay_wgrad_compute, weight_tensors
+            )
 
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
