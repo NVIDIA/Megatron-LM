@@ -46,12 +46,12 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     store=None,
     skip_model_parallel_init=False,
-    skip_random_seed=False,
     seed_pp_group=None,
     seed_dp_group=None,
     seed_tp_group=None,
     seed_ep_group=None,
     seed_etp_group=None,
+    skip_random_seed=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
