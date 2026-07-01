@@ -105,13 +105,15 @@ class Gemma4TransformerLayer(TransformerLayer):
         per_layer_input: Optional[Tensor] = None,
         rotary_cos_sin: Optional[tuple] = None,
         kv_bus: Optional[dict] = None,
+        inference_context=None,
         **kwargs,
     ):
         """Decoder-layer forward. ``hidden_states`` is [s, b, h] (MLM seq-first).
 
         Mirrors the base attention/MLP residual structure but threads the gemma4
-        side-inputs (per-layer-type rope cos/sin and the cross-layer kv_bus) into the
-        attention, then appends the PLE sub-block and the ``layer_scalar`` multiply.
+        side-inputs (per-layer-type rope cos/sin and the cross-layer kv_bus or
+        :class:`Gemma4InferenceContext`) into the attention, then appends the PLE
+        sub-block and the ``layer_scalar`` multiply.
         """
         # HF gemma4 uses explicit sandwich residuals: ``h = residual + post_norm(
         # sublayer(pre_norm(h)))`` (modeling_gemma4.py:1409-1443). We add the residual
@@ -125,6 +127,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             attention_mask=attention_mask,
             rotary_cos_sin=rotary_cos_sin,
             kv_bus=kv_bus,
+            inference_context=inference_context,
         )
         attn_output = apply_module(self.post_self_attn_layernorm)(attn_output)
         hidden_states = residual + attn_output

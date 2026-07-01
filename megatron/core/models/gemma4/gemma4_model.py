@@ -7,6 +7,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.models.gemma4.gemma4_block import Gemma4TransformerBlock
+from megatron.core.models.gemma4.gemma4_inference_context import Gemma4InferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.gemma4_mask import (
     build_causal_mask,
@@ -86,14 +87,31 @@ class Gemma4Model(GPTModel):
         position_ids: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
+        *,
+        inference_context: Optional[Gemma4InferenceContext] = None,
         **kwargs,
     ) -> Tensor:
-        """Gemma4 forward. Returns logits [b, s, V] (labels=None) or loss [b, s]."""
+        """Gemma4 forward. Returns logits [b, s, V] (labels=None) or loss [b, s].
+
+        Passing ``inference_context`` switches the attention path to KV-cache mode:
+        prefill (``inference_context.step == 0``) populates the cache from the full
+        prompt; decode (``inference_context.step > 0``, ``s == 1``) appends one new
+        token's K/V per layer. The caller is responsible for advancing
+        ``inference_context.step`` after each forward.
+        """
         b, s = input_ids.shape
         device = input_ids.device
 
         if position_ids is None:
-            position_ids = torch.arange(s, device=device).unsqueeze(0).expand(b, -1)
+            if inference_context is not None and inference_context.is_decode():
+                # Decode step: positions continue from the cache offset.
+                position_ids = torch.arange(
+                    inference_context.step,
+                    inference_context.step + s,
+                    device=device,
+                ).unsqueeze(0).expand(b, -1)
+            else:
+                position_ids = torch.arange(s, device=device).unsqueeze(0).expand(b, -1)
 
         # Embedding [s, b, h] (MLM seq-first) with bf16-rounded sqrt(H) scaling.
         decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
@@ -135,18 +153,25 @@ class Gemma4Model(GPTModel):
             "sliding": self.rotary_emb(decoder_input, position_ids, "sliding"),
             "full": self.rotary_emb(decoder_input, position_ids, "full"),
         }
-        attention_mask_by_type = {
-            "full": build_causal_mask(s, dtype, device),
-            "sliding": build_sliding_window_causal_mask(
-                s, self.config.sliding_window, dtype, device
-            ),
-        }
+        if inference_context is not None and inference_context.is_decode():
+            # Decode-step (s_q == 1): attention path attends over the full cached K/V
+            # for full layers and clips the cache to the sliding window for sliding
+            # layers -- no precomputed mask is needed.
+            attention_mask_by_type = {"full": None, "sliding": None}
+        else:
+            attention_mask_by_type = {
+                "full": build_causal_mask(s, dtype, device),
+                "sliding": build_sliding_window_causal_mask(
+                    s, self.config.sliding_window, dtype, device
+                ),
+            }
 
         hidden_states = self.decoder(
             decoder_input,
             per_layer_inputs=per_layer_inputs,
             rotary_cos_sin_by_type=rotary_cos_sin_by_type,
             attention_mask_by_type=attention_mask_by_type,
+            inference_context=inference_context,
         )
 
         # LM head (tied) -> final logit softcap -> loss/return.

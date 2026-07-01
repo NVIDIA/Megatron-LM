@@ -18,7 +18,9 @@ class Gemma4TransformerBlock(TransformerBlock):
     ``cos/sin`` and additive attention mask. This keeps all KV-share / PLE / mask
     plumbing out of the base block (R1: no base-block kwarg churn).
 
-    Recompute=full and inference paths are out of scope for this training-only port.
+    Recompute=full is out of scope as of now. Inference is supported via the optional
+    ``inference_context`` kwarg (:class:`Gemma4InferenceContext`), which replaces
+    the per-forward ``kv_bus`` with a persistent per-layer KV cache.
     """
 
     def forward(
@@ -29,6 +31,7 @@ class Gemma4TransformerBlock(TransformerBlock):
         per_layer_inputs: Tensor = None,
         rotary_cos_sin_by_type: dict = None,
         attention_mask_by_type: dict = None,
+        inference_context=None,
         **kwargs,
     ):
         """Run the gemma4 decoder layers. ``hidden_states`` is [s, b, h]."""
@@ -36,8 +39,10 @@ class Gemma4TransformerBlock(TransformerBlock):
             inp=hidden_states, requires_grad=True, keep_graph=True
         )
 
-        # Fresh KV bus per forward (plain dict; single device, no CP/TP interaction).
-        kv_bus: dict = {}
+        # Training path uses a fresh per-forward KV bus (cross-layer K/V sharing
+        # within one forward). Inference path uses the persistent
+        # ``inference_context`` cache instead; kv_bus stays None and is ignored.
+        kv_bus: Optional[dict] = None if inference_context is not None else {}
 
         for i, layer in enumerate(self.layers):
             layer_type = layer.self_attention.layer_type
@@ -47,6 +52,7 @@ class Gemma4TransformerBlock(TransformerBlock):
                 per_layer_input=per_layer_inputs[:, :, i, :],
                 rotary_cos_sin=rotary_cos_sin_by_type[layer_type],
                 kv_bus=kv_bus,
+                inference_context=inference_context,
             )
 
         if self.final_layernorm is not None:

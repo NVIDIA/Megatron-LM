@@ -1,8 +1,9 @@
 #!/bin/bash
 # Boot the Gemma4 E4B KV-cache eval server in the background on this node.
 #
-# Reads the MLM checkpoint via TP=2 (the Gemma4SelfAttention port is
-# parallelism<=2), serves OpenAI-compatible /v1/chat/completions on PORT.
+# Reads the MLM checkpoint via TP=1 by default (the Gemma4SelfAttention port
+# supports parallelism<=2; set TP=2 NPROC=2 CUDA_VISIBLE_DEVICES=0,1 to shard).
+# Serves OpenAI-compatible /v1/chat/completions on PORT.
 # Logs to /tmp/g4_eval/server.log.
 #
 # Usage:
@@ -23,8 +24,8 @@ GEMMA4_HF="${GEMMA4_HF:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_gen
 PORT="${PORT:-5082}"
 MASTER_PORT="${MASTER_PORT:-12410}"
 LOG="${LOG:-/tmp/g4_eval/server.log}"
-NPROC="${NPROC:-2}"          # = TP. Don't change unless you also change TP below.
-TP="${TP:-2}"                # Gemma4SelfAttention is a parallelism<=2 port.
+NPROC="${NPROC:-1}"          # = TP. Don't change unless you also change TP below.
+TP="${TP:-1}"                # Gemma4SelfAttention is a parallelism<=2 port (set TP=2 to shard).
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 SEQLEN="${SEQLEN:-4096}"
 
@@ -39,7 +40,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONUNBUFFERED=1
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="$MLM_ROOT:${PYTHONPATH:-}"
 
 nohup python -m torch.distributed.run --nproc-per-node="$NPROC" --master-port="$MASTER_PORT" \
