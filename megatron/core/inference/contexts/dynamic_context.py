@@ -2879,10 +2879,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits.
+        # Track prefix cache hits. num_cached_tokens accumulates across prefill
+        # chunks: each chunk matches a disjoint block range (start advances with
+        # finished_chunk_token_count), so a long cached prefix is discovered
+        # incrementally and must be summed, not overwritten.
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
