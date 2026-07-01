@@ -2349,6 +2349,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
+            elif header == Headers.START_CUDA_PROFILER:
+                # Side-effect, not a state transition: apply immediately on every
+                # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
+                torch.cuda.cudart().cudaProfilerStart()
+            elif header == Headers.STOP_CUDA_PROFILER:
+                torch.cuda.cudart().cudaProfilerStop()
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
