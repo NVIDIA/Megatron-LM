@@ -1014,7 +1014,7 @@ def pretrain(
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
 ):
     """Main training program.
@@ -1074,13 +1074,13 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    init_pg_collection = None
-    if schedule_pg_collection is not None:
-        init_pg_collection = (
-            schedule_pg_collection.get_language_model_collection()
-            if schedule_pg_collection.has_language_model()
-            else next(iter(schedule_pg_collection.module_pgs.values()))
-        )
+    # LM-global concerns use the language collection or None (encoder ranks seed via the builder).
+    init_pg_collection = (
+        pg_collection.get_language_model_collection()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        and pg_collection.has_language_model()
+        else (pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None)
+    )
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1095,7 +1095,7 @@ def pretrain(
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    mpu_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1227,7 +1227,7 @@ def pretrain(
         model_provider_func=model_provider,
         checkpointing_context=checkpointing_context,
         cfg_container=cfg_container,
-        pg_collection=pg_collection,
+        pg_collection=mpu_pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1425,7 +1425,7 @@ def pretrain(
                 non_loss_data_func,
                 inference_model,
                 p2p_communicator=p2p_communicator,
-                schedule_pg_collection=schedule_pg_collection,
+                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -2277,15 +2277,13 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
-    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
-        otherwise it must define mp, pp, and dp_cp.
+    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
+        preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
@@ -2362,7 +2360,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
             p2p_communicator=p2p_communicator,
-            pg_collection=schedule_pg_collection,
+            pg_collection=pg_collection,
         )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
@@ -2426,15 +2424,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if save_params_in_this_iteration:
         _save_state_dict(attr_name="data", label="params")
 
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
+    reduction_pgc = get_attr_wrapped_model(model[0], "pg_collection")
+    if reduction_pgc is None:
+        reduction_pgc = ProcessGroupCollection.use_mpu_process_groups()
     for _required in ("mp", "pp", "dp_cp"):
-        assert getattr(pg_collection, _required, None) is not None, (
-            f"pg_collection passed to train_step must define {_required}"
+        assert getattr(reduction_pgc, _required, None) is not None, (
+            f"model pg_collection used by train_step must define {_required}"
         )
-    mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
-    is_last_stage = is_pp_last_stage(pg_collection.pp)
+    mp_group = reduction_pgc.mp
+    dp_cp_group = reduction_pgc.dp_cp
+    is_last_stage = is_pp_last_stage(reduction_pgc.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
@@ -3252,14 +3252,14 @@ def train(
     non_loss_data_func,
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
+    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
+        preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
@@ -3333,8 +3333,9 @@ def train(
             args.no_load_optim = no_load_optim
 
     lang_pgc = (
-        schedule_pg_collection.get_language_model_collection()
-        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
+        pg_collection.get_language_model_collection()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        and pg_collection.has_language_model()
         else None
     )
 
@@ -3343,6 +3344,7 @@ def train(
             return lang_pgc.dp.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
+        # args.data_parallel_size equals the language (llm) dp on all ranks (entry validate_args).
         return args.data_parallel_size
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
@@ -3490,7 +3492,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(
-        schedule_pg_collection=schedule_pg_collection
+        schedule_pg_collection=pg_collection
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
@@ -3733,8 +3735,8 @@ def train(
                 max_attention_logit,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                pg_collection=model_pg_collection,
-                p2p_communicator=p2p_communicator, schedule_pg_collection=schedule_pg_collection
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
