@@ -247,6 +247,25 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         bucket_id = 0
         shard_imbalance_padding_numel = 0
 
+        # Persistent compute loads across buckets so LPT spreads expensive
+        # (GTP-sharded) params evenly instead of clustering them per bucket.
+        shard_compute_loads = [0] * dp_size
+
+        def _ns_compute_cost(param):
+            """Estimate Newton-Schulz compute cost for a 2D parameter.
+
+            For GTP-sharded params, reconstructs the full post-AllGather shape
+            (GTP always shards along dim 0). Cost ~ max(M,N) * min(M,N)^2,
+            which is the dominant term in the NS orthogonalization.
+            """
+            if param.dim() != 2:
+                return param.data.nelement()
+            m, n = param.data.shape
+            if getattr(param, 'is_gtp_weight_remat', False):
+                m = m * getattr(param, 'gtp_remat_size', 1)
+            big, small = max(m, n), min(m, n)
+            return big * small * small
+
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
         ) -> None:
@@ -276,17 +295,28 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_assignments[shard_id].append((None, numel))
                     shard_cursors[shard_id] = numel
             else:
-                # Greedy LPT: largest first, assign to the least-loaded shard.
-                # The within-shard order is sorted-by-numel, not backprop —
-                # that is fine because all params in the chunk share the same
-                # bucket_id, so DDP's backprop-order iteration still sees
-                # monotonic bucket_ids across the chunk boundary.
-                for param in sorted(chunk_params, key=lambda p: -p.data.nelement()):
+                # Compute-balanced LPT: sort by Newton-Schulz compute cost
+                # (accounts for full post-AllGather shape under GTP), assign to
+                # the shard with least accumulated compute load. Compute loads
+                # persist across buckets; numel cursors reset per bucket.
+                # A per-bucket numel cap prevents excessive padding.
+                _NUMEL_EPSILON = 0.3
+                total_chunk_numel = sum(p.data.nelement() for p in chunk_params)
+                max_shard_numel = total_chunk_numel / dp_size * (1 + _NUMEL_EPSILON)
+                for param in sorted(chunk_params, key=lambda p: -_ns_compute_cost(p)):
                     numel = param.data.nelement()
-                    min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
+                    candidates = [
+                        s for s in range(dp_size)
+                        if pad_param_start(shard_cursors[s]) + numel <= max_shard_numel
+                    ]
+                    if candidates:
+                        min_shard = min(candidates, key=lambda s: shard_compute_loads[s])
+                    else:
+                        min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
                     placement = pad_param_start(shard_cursors[min_shard])
                     shard_assignments[min_shard].append((param, numel))
                     shard_cursors[min_shard] = placement + numel
+                    shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
             bucket_start_index = buffer_cursor
