@@ -37,7 +37,7 @@ def _make_rope_config(**kwargs):
 
 def _make_gpt_config(**kwargs):
     defaults = dict(
-        transformer=_make_transformer(), rope_config=_make_rope_config(), vocab_size=32000
+        transformer=_make_transformer(), vocab_size=32000
     )
     defaults.update(kwargs)
     return GPTModelConfig(**defaults)
@@ -261,7 +261,7 @@ class TestGPTModelConfigInitialization:
         assert GPTModelConfig.builder == "megatron.training.models.gpt.GPTModelBuilder"
 
     def test_default_values(self):
-        config = GPTModelConfig(transformer=_make_transformer(), rope_config=_make_rope_config())
+        config = GPTModelConfig(transformer=_make_transformer())
         assert config.transformer_layer_spec is None
         assert config.vocab_size is None
         assert config.make_vocab_size_divisible_by == 128
@@ -277,11 +277,13 @@ class TestGPTModelConfigInitialization:
         assert config.rope_scaling_factor == 8.0
         assert config.scatter_embedding_sequence_parallel is True
         assert config.seq_len_interpolation_factor is None
+        assert config.rope_config == RoPEConfig()
         assert config.tp_comm_overlap_cfg is None
         assert config.use_transformer_engine_op_fuser is False
         assert config.use_arbitrary_attention_mask is None
 
     def test_custom_initialization(self):
+        rotary_base = 500000
         config = GPTModelConfig(
             transformer=_make_transformer(),
             seq_length=4096,
@@ -289,8 +291,8 @@ class TestGPTModelConfigInitialization:
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
-            rotary_base=500000,
-            rope_config=_make_rope_config(),
+            rotary_base=rotary_base,
+            rope_config=_make_rope_config(rotary_base=rotary_base),
             vocab_size=50000,
         )
         assert config.seq_length == 4096
@@ -298,7 +300,8 @@ class TestGPTModelConfigInitialization:
         assert config.parallel_output is False
         assert config.share_embeddings_and_output_weights is True
         assert config.position_embedding_type == "rope"
-        assert config.rotary_base == 500000
+        assert config.rotary_base == rotary_base
+        assert config.rope_config.rotary_base == rotary_base
         assert config.vocab_size == 50000
 
 
@@ -308,7 +311,7 @@ class TestGPTModelConfigGetAttr:
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256, num_layers=4)
         self.config = GPTModelConfig(
-            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=self.transformer, vocab_size=32000
         )
 
     def test_own_attribute_not_proxied(self):
@@ -338,7 +341,7 @@ class TestGPTModelConfigSetAttr:
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256)
         self.config = GPTModelConfig(
-            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=self.transformer, vocab_size=32000
         )
 
     def test_sets_own_attribute_on_self(self):
@@ -415,7 +418,7 @@ class TestGPTModelConfigFinalize:
             pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(
-            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=transformer, vocab_size=32000
         )
         with pytest.raises(AssertionError, match="number of model chunks"):
             config.finalize()
@@ -429,7 +432,7 @@ class TestGPTModelConfigFinalize:
             pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(
-            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=transformer, vocab_size=32000
         )
         # Should not raise
         config.finalize()
@@ -447,7 +450,7 @@ class TestGPTModelConfigFinalize:
             pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(
-            transformer=transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=transformer, vocab_size=32000
         )
         # Should not raise
         config.finalize()

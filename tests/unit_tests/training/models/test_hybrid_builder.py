@@ -26,7 +26,7 @@ def _make_rope_config(**kwargs):
 
 def _make_hybrid_config(**kwargs):
     defaults = dict(
-        transformer=_make_transformer(), rope_config=_make_rope_config(), vocab_size=32000
+        transformer=_make_transformer(), vocab_size=32000
     )
     defaults.update(kwargs)
     return HybridModelConfig(**defaults)
@@ -44,7 +44,7 @@ class TestHybridModelConfigInitialization:
         assert HybridModelConfig.builder == "megatron.training.models.hybrid.HybridModelBuilder"
 
     def test_default_values(self):
-        config = HybridModelConfig(transformer=_make_transformer(), rope_config=_make_rope_config())
+        config = HybridModelConfig(transformer=_make_transformer())
         assert config.fp16_lm_cross_entropy is False
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
@@ -54,6 +54,7 @@ class TestHybridModelConfigInitialization:
         assert config.rotary_percent == 1.0
         assert config.rotary_base == 10000
         assert config.seq_len_interpolation_factor is None
+        assert config.rope_config == RoPEConfig()
         assert config.make_vocab_size_divisible_by == 128
         assert config.vocab_size is None
         assert config.should_pad_vocab is False
@@ -67,7 +68,7 @@ class TestHybridModelConfigInitialization:
             hybrid_mlp_ratio=0.1,
             hybrid_layer_pattern="M-M*-",
             seq_length=4096,
-            rope_config=_make_rope_config(),
+            rope_config=_make_rope_config(rotary_base=500000),
             vocab_size=50000,
         )
         assert config.fp16_lm_cross_entropy is True
@@ -76,6 +77,7 @@ class TestHybridModelConfigInitialization:
         assert config.hybrid_mlp_ratio == 0.1
         assert config.hybrid_layer_pattern == "M-M*-"
         assert config.seq_length == 4096
+        assert config.rope_config.rotary_base == 500000
         assert config.vocab_size == 50000
 
     def test_hybrid_stack_spec_default_is_none(self):
@@ -89,7 +91,7 @@ class TestHybridModelConfigGetAttr:
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256, num_layers=4)
         self.config = HybridModelConfig(
-            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=self.transformer, vocab_size=32000
         )
 
     def test_own_attribute_not_proxied(self):
@@ -123,7 +125,7 @@ class TestHybridModelConfigSetAttr:
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256)
         self.config = HybridModelConfig(
-            transformer=self.transformer, rope_config=_make_rope_config(), vocab_size=32000
+            transformer=self.transformer, vocab_size=32000
         )
 
     def test_sets_own_attribute_on_self(self):

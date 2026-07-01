@@ -37,7 +37,7 @@ from megatron.core.transformer.transformer_config import  TransformerConfig
 logger = logging.getLogger(__name__)
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -165,7 +165,7 @@ class GPTModelConfig(ModelConfig):
     rope_scaling_factor: float = 8.0
     scatter_embedding_sequence_parallel: bool = True
     seq_len_interpolation_factor: float | None = None
-    rope_config: RoPEConfig
+    rope_config: RoPEConfig = field(default_factory=RoPEConfig)
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Config file when tp_comm_overlap is enabled."""
