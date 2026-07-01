@@ -12,20 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# A maintainer comment starts one run containing at most three repair attempts:
+# OVERVIEW
+# --------
+# This is the comment-facing orchestrator for `/claude fix [optional steer]`.
+# GitHub evaluates `issue_comment` workflows from the default branch, so this
+# command becomes available only after the workflow is merged. One accepted
+# comment starts one bounded session; it does not run in response to a push.
 #
-#   authorize -> attempt 1 -> optional attempt 2 -> optional attempt 3 -> report
+#   issue comment
+#       |
+#       v
+#   authorize -> attempt 1 -> optional attempt 2 -> optional attempt 3
+#       |                                                    |
+#       +---------------------> final report <---------------+
 #
-# Each attempt calls the reusable workflow from the same trusted commit. That
-# workflow keeps Claude read-only, publishes through fixed service-account
-# steps, and monitors CI for the exact generated SHA.
-# If CI needs another repair, the next attempt may amend only the bot commit
-# created by this run. An exact force-with-lease leaves one bot commit in the
-# PR branch history without allowing contributor history or a concurrent branch
-# update to be replaced. A full manual rerun is ignored; post a new command to
-# start a new session with a new immutable original-head snapshot.
-# The command is explicit maintainer authorization to run that generated SHA
-# in internal CI, so maintainers must invoke it only on PRs they already trust.
+# 1. `authorize` freezes the original PR head and current base SHA. It also
+#    verifies the exact command, requester write access, open fork PR, enabled
+#    maintainer edits, and a non-default/non-protected fork branch. It checks
+#    the complete PR file list for forbidden control or security-policy files.
+#    Optional text after `/claude fix` becomes steering; a bare command relies
+#    on the merge conflict or supported CI failure.
+#
+# 2. Each attempt calls `_claude-fix-attempt.yml` from this trusted revision.
+#    That reusable workflow prepares a read-only Claude patch, validates and
+#    publishes it from a fresh runner, ensures CI exists for the exact SHA, and
+#    waits for the NVIDIA `pull-request/<PR>` CI run to finish.
+#
+# 3. Attempt 1 also tests an unchanged head when Claude has nothing to publish.
+#    A supported lint or non-GB200 unit-test failure enables the next attempt.
+#    Unsupported, stale, timed-out, green, and no-progress results stop early.
+#    Attempt 3 is the hard limit.
+#
+# 4. A session leaves at most one service-account commit in the PR branch
+#    history. The first change is an ordinary fast-forward push. A later attempt
+#    may amend only the exact bot commit returned by the preceding attempt, with
+#    an exact force-with-lease. Contributor history and concurrent branch
+#    updates cannot be replaced. Every new SHA is checked by DCO and CI again.
+#
+# 5. The final job posts a fixed terminal result. Detailed per-published-SHA
+#    what/why comments are posted separately by `svcnvidia-nemo-ci` in the
+#    reusable workflow. A full manual rerun is ignored; another command starts
+#    a new session with a new immutable original-head snapshot.
+#
+# SECURITY MODEL
+# --------------
+# Permissions default to none and are granted per job. Claude never receives
+# the service PAT or GitHub write access. The command is nevertheless explicit
+# maintainer authorization to execute the generated SHA in credentialed
+# internal CI, so maintainers must use it only on PRs they already trust.
 name: Claude Fix PR
 
 on: # zizmor: ignore[concurrency-limits] queued commands must not replace a run

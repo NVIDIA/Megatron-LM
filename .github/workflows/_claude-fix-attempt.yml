@@ -12,8 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# One isolated repair attempt: Claude proposes, trusted code publishes, and a
-# read-only job monitors CI for the exact generated commit.
+# OVERVIEW
+# --------
+# This reusable workflow performs one isolated repair attempt for the trusted
+# orchestrator in `claude-fix.yml`:
+#
+#   prepare (read-only Claude) -> publish (fixed trusted code) -> monitor (read-only)
+#
+# PREPARE
+# -------
+# `prepare` checks out immutable base/head inputs, reconstructs the pinned base
+# merge, and downloads logs only from the prior exact-SHA CI run. Claude works
+# in a sandbox with no service PAT, GitHub write permission, OIDC token, or
+# general network access. It may edit only the untrusted `pr-head/` worktree and
+# exports a bounded patch plus a structured what/why report as a short-lived
+# artifact. It never commits, pushes, comments, or authorizes CI.
+#
+# PUBLISH
+# -------
+# `publish` starts on a fresh runner and treats the artifact as untrusted. Fixed
+# shell code reconstructs the same baseline and rejects out-of-scope paths,
+# control files, binary/create/delete/rename/mode changes, unsafe path/report
+# text, large patches, unresolved conflicts, and unexpected result trees.
+#
+# If this is the first change in the session, fixed code creates one signed-off
+# `svcnvidia-nemo-ci` commit and uses an ordinary push to the contributor's fork
+# branch. If an earlier attempt already created that commit, fixed code verifies
+# its exact SHA, bot identity, message, DCO trailer, and original parent list,
+# then preserves its author date while amending. The only non-fast-forward
+# operation is an exact `--force-with-lease=<fork-ref>:<prior-bot-sha>` with no
+# fallback, so it cannot replace contributor work or a concurrent update.
+#
+# After publication, PAT-scoped fixed steps post the sanitized service-account
+# explanation, wait for DCO on the new SHA, and ensure exact-SHA CI exists. When
+# a new mirror/run is needed, they post `/ok to test <full-sha>`; copy-pr-bot
+# then mirrors the current PR head to NVIDIA's `pull-request/<PR>` branch, which
+# triggers `cicd-main.yml` in the NVIDIA repo.
+#
+# MONITOR AND OUTPUTS
+# -------------------
+# `monitor` has read-only permissions. It accepts only the matching workflow,
+# synthetic branch, event, and exact SHA. Green CI ends the session; only lint
+# and ordinary non-GB200 unit failures return `actionable`; all other failures
+# stop for manual handling. Outputs pass the current head, the session's bot
+# commit SHA, CI run, and outcome to the next orchestrated attempt.
+#
+# TRUST BOUNDARY
+# --------------
+# Secrets are mapped explicitly and the service PAT exists only in the fixed
+# push, explanation, and CI-authorization steps. Structural validation cannot
+# prove model-generated source or test code is semantically safe; the initiating
+# maintainer command is the authorization to run that exact generated SHA.
 name: Claude Fix Attempt
 
 on:
