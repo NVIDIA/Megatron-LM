@@ -1125,6 +1125,7 @@ class TestMegatronFSDPE2E:
             vocab_size=256,
             bf16=True,
             use_megatron_fsdp=True,
+            overlap_grad_reduce=True,
             ckpt_format="fsdp_dtensor",
             use_precision_aware_optimizer=True,
             cuda_graph_impl="full_iteration",
