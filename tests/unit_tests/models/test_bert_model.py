@@ -12,6 +12,7 @@ from megatron.core.models.bert.bert_layer_specs import (
     get_bert_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -91,6 +92,132 @@ class TestBertModel:
         assert logits[0].shape[0] == micro_batch_size
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
+
+    @pytest.mark.internal
+    def test_packed_forward_uses_cu_seqlens_positions_and_no_attention_mask(self, mocker):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            attention_backend=AttnBackend.unfused,
+        )
+        bert_model = BertModel(
+            config=config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            position_embedding_type='rope',
+            post_process=False,
+        )
+        sequence_length = 6
+        input_ids = torch.arange(sequence_length, dtype=torch.int64).unsqueeze(0)
+        cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=2,
+            max_seqlen_kv=4,
+        )
+        encoder_input = torch.ones(sequence_length, 1, config.hidden_size)
+        hidden_states = torch.zeros_like(encoder_input)
+        rotary_pos_emb = torch.ones(4, 1, 1, config.hidden_size // config.num_attention_heads)
+
+        extended_attention_mask = mocker.patch.object(bert_model, 'bert_extended_attention_mask')
+        embedding_forward = mocker.patch.object(
+            bert_model.embedding, 'forward', return_value=encoder_input
+        )
+        rotary_forward = mocker.patch.object(
+            bert_model.rotary_pos_emb, 'forward', return_value=rotary_pos_emb
+        )
+        encoder_forward = mocker.patch.object(
+            bert_model.encoder, 'forward', return_value=hidden_states
+        )
+
+        output = bert_model.forward(
+            input_ids=input_ids, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+
+        extended_attention_mask.assert_not_called()
+        assert torch.equal(
+            embedding_forward.call_args.kwargs['position_ids'],
+            torch.tensor([[0, 1, 0, 1, 2, 3]], dtype=torch.int64),
+        )
+        rotary_forward.assert_called_once_with(
+            4, packed_seq=True, cp_group=packed_seq_params.cp_group
+        )
+        assert encoder_forward.call_args.kwargs['attention_mask'] is None
+        assert encoder_forward.call_args.kwargs['packed_seq_params'] is packed_seq_params
+        assert encoder_forward.call_args.kwargs['rotary_pos_emb'] is rotary_pos_emb
+        assert output is hidden_states
+
+    @pytest.mark.internal
+    def test_forward_validates_dense_attention_mask_and_packed_format(self):
+        sequence_length = self.bert_model.max_sequence_length
+        input_ids = torch.arange(sequence_length, dtype=torch.int64).unsqueeze(0)
+        attention_mask = torch.ones((1, sequence_length), dtype=bool)
+        cu_seqlens = torch.tensor([0, sequence_length], dtype=torch.int32)
+
+        with pytest.raises(ValueError, match='attention_mask must be provided'):
+            self.bert_model.forward(input_ids=input_ids, attention_mask=None)
+
+        with pytest.raises(ValueError, match='qkv_format'):
+            self.bert_model.forward(
+                input_ids=input_ids,
+                attention_mask=None,
+                packed_seq_params=PackedSeqParams(
+                    qkv_format='sbhd',
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=sequence_length,
+                    max_seqlen_kv=sequence_length,
+                ),
+            )
+
+        with pytest.raises(ValueError, match='attention_mask must be None'):
+            self.bert_model.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=PackedSeqParams(
+                    qkv_format='thd',
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=sequence_length,
+                    max_seqlen_kv=sequence_length,
+                ),
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ('token_ids', 'cu_seqlens', 'error_match'),
+        [
+            (
+                torch.arange(4, dtype=torch.int64).repeat((2, 1)),
+                torch.tensor([0, 4]),
+                'dummy batch',
+            ),
+            (
+                torch.arange(4, dtype=torch.int64).unsqueeze(0),
+                None,
+                'cu_seqlens_q must be provided',
+            ),
+            (torch.arange(4, dtype=torch.int64).unsqueeze(0), torch.tensor([1, 4]), 'start at 0'),
+            (torch.arange(4, dtype=torch.int64).unsqueeze(0), torch.tensor([0, 3]), 'end at'),
+            (
+                torch.arange(4, dtype=torch.int64).unsqueeze(0),
+                torch.tensor([0, 3, 2, 4]),
+                'monotonically',
+            ),
+        ],
+    )
+    def test_packed_position_ids_validate_cu_seqlens(self, token_ids, cu_seqlens, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            self.bert_model.bert_position_ids(
+                token_ids, PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu_seqlens)
+            )
 
 
 class TestBertModelAttentionDimensions:

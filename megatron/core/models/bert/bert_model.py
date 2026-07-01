@@ -14,6 +14,7 @@ from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
@@ -269,8 +270,35 @@ class BertModel(LanguageModule):
 
         return extended_attention_mask
 
-    def bert_position_ids(self, token_ids):
+    def bert_position_ids(
+        self, token_ids: Tensor, packed_seq_params: PackedSeqParams | None = None
+    ) -> Tensor:
         """Position ids for bert model"""
+        if packed_seq_params is not None:
+            if token_ids.size(0) != 1:
+                raise ValueError('Packed BERT input should use dummy batch size 1')
+            if packed_seq_params.cu_seqlens_q is None:
+                raise ValueError(
+                    'packed_seq_params.cu_seqlens_q must be provided for packed BERT input'
+                )
+            cu_seqlens = packed_seq_params.cu_seqlens_q.to(device=token_ids.device)
+            if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+                raise ValueError('packed_seq_params.cu_seqlens_q must be a 1D tensor')
+            if cu_seqlens[0].item() != 0:
+                raise ValueError('packed_seq_params.cu_seqlens_q must start at 0')
+            if cu_seqlens[-1].item() != token_ids.size(1):
+                raise ValueError(
+                    'packed_seq_params.cu_seqlens_q must end at the packed sequence length'
+                )
+            seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+            if torch.any(seq_lengths < 0):
+                raise ValueError('packed_seq_params.cu_seqlens_q must be monotonically increasing')
+            seq_starts = torch.repeat_interleave(cu_seqlens[:-1].to(torch.long), seq_lengths)
+            token_positions = torch.arange(
+                token_ids.size(1), dtype=torch.long, device=token_ids.device
+            )
+            return (token_positions - seq_starts).unsqueeze(0)
+
         # Create position ids
         seq_length = token_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
@@ -297,10 +325,11 @@ class BertModel(LanguageModule):
     def forward(
         self,
         input_ids: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Tensor | None,
         tokentype_ids: Tensor = None,
         lm_labels: Tensor = None,
         inference_context=None,
+        packed_seq_params: PackedSeqParams | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -315,11 +344,20 @@ class BertModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
+        if packed_seq_params is None:
+            if attention_mask is None:
+                raise ValueError('attention_mask must be provided when packed_seq_params is None')
+            extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
+        else:
+            if packed_seq_params.qkv_format != 'thd':
+                raise ValueError("BERT packed sequence support requires qkv_format='thd'")
+            if attention_mask is not None:
+                raise ValueError('attention_mask must be None when using packed BERT input')
+            extended_attention_mask = None
 
         if parallel_state.is_pipeline_first_stage():
             input_ids = input_ids
-            position_ids = self.bert_position_ids(input_ids)
+            position_ids = self.bert_position_ids(input_ids, packed_seq_params)
         else:
             position_ids = None
             input_ids = None
@@ -338,9 +376,13 @@ class BertModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.encoder, encoder_input, self.config
+                inference_context, self.encoder, encoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+            )
 
         # Run encoder.
         hidden_states = self.encoder(
@@ -348,6 +390,7 @@ class BertModel(LanguageModule):
             attention_mask=extended_attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
         if not self.post_process:
             return hidden_states
