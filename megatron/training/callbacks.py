@@ -151,7 +151,7 @@ class Callback:
         pass
 
     def on_eval_start(self, context: CallbackContext) -> None:
-        """Called after model.eval(), before evaluation loop begins."""
+        """Called before the evaluation loop begins."""
         pass
 
     def on_eval_step_start(self, context: CallbackContext) -> None:
@@ -163,11 +163,11 @@ class Callback:
         pass
 
     def on_eval_end(self, context: CallbackContext) -> None:
-        """Called after evaluation completes, before model.train()."""
+        """Called after evaluation completes."""
         pass
 
     def on_test_start(self, context: CallbackContext) -> None:
-        """Called after model.eval(), before test loop begins."""
+        """Called before the test loop begins."""
         pass
 
     def on_test_step_start(self, context: CallbackContext) -> None:
@@ -179,7 +179,7 @@ class Callback:
         pass
 
     def on_test_end(self, context: CallbackContext) -> None:
-        """Called after test completes, before model.train()."""
+        """Called after the test loop completes."""
         pass
 
 
