@@ -24,7 +24,7 @@ TORCHRUN_ARGS=(
   --tee 0:3
 )
 
-uv run python -m torch.distributed.run \
+uv run --extra ssm python -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
   -m examples.mimo.pretrain_mimo \
   --model-provider nemotron-moe-vlm \
