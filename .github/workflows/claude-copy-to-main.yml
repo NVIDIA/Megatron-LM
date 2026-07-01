@@ -5,8 +5,8 @@ on:
     types: [created]
 
 jobs:
-  copy-to-main:
-    name: Copy PR to Main
+  authorize_copy:
+    name: Authorize Copy to Main
     if: |
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
@@ -14,14 +14,14 @@ jobs:
       contains(github.event.comment.body, '/claude copy')
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
       issues: write
-      id-token: write
+      pull-requests: read
     env:
       GH_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.issue.number }}
+    outputs:
+      base_ref: ${{ steps.pr-info.outputs.base_ref }}
     steps:
       - name: Check commenter has write access
         env:
@@ -34,10 +34,12 @@ jobs:
           fi
 
       - name: Check PR is merged and targets non-main
+        id: pr-info
         run: |
           PR_JSON=$(gh pr view $PR_NUMBER --repo $REPO --json baseRefName,mergedAt)
           PR_BASE=$(echo "$PR_JSON" | jq -r .baseRefName)
           PR_MERGED=$(echo "$PR_JSON" | jq -r .mergedAt)
+          echo "base_ref=$PR_BASE" >> "$GITHUB_OUTPUT"
 
           if [ "$PR_BASE" = "main" ]; then
             gh pr comment $PR_NUMBER --repo $REPO --body "❌ This PR already targets \`main\`. The Claude copy command only works on PRs targeting non-main branches."
@@ -49,27 +51,47 @@ jobs:
             exit 1
           fi
 
+  prepare_copy:
+    name: Prepare Copy Patch
+    runs-on: ubuntu-latest
+    needs: authorize_copy
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COPY_BRANCH: copy-pr-${{ github.event.issue.number }}-to-main
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
 
       - name: Fetch PR head ref from fork
         run: |
           git fetch origin pull/$PR_NUMBER/head:pr-$PR_NUMBER-head
+
+      - name: Configure Git
+        run: |
+          git config user.name "svcnvidia-nemo-ci"
+          git config user.email "svcnvidia-nemo-ci@nvidia.com"
 
       - name: Run Claude Copy to Main
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "/claude copy"
-          github_token: ${{ secrets.PAT }}
+          github_token: ${{ github.token }}
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
+            SOURCE BASE REF: ${{ needs.authorize_copy.outputs.base_ref }}
+            COPY BRANCH: ${{ env.COPY_BRANCH }}
 
-            You are a PR copy assistant. Your job is to apply the final changes from a merged PR onto a new branch based on `main` and create a new PR targeting `main`.
+            You are a PR copy assistant. Your job is to apply the final changes from a merged PR onto a local branch based on `main`.
 
             The PR's commits originated from a fork and have been fetched locally as the branch: pr-${PR_NUMBER}-head
 
@@ -77,19 +99,15 @@ jobs:
             1. Get the PR details (title, body, and base branch):
                gh pr view $PR_NUMBER --repo $REPO --json title,body,baseRefName
 
-            2. Configure git for committing (use the svcnvidia-nemo-ci service account since secrets.PAT belongs to it):
-               git config user.name "svcnvidia-nemo-ci"
-               git config user.email "svcnvidia-nemo-ci@nvidia.com"
-
-            3. Create a new branch from `main`:
+            2. Create a new local branch from `main`:
                git checkout main
                git pull origin main
-               git checkout -b copy-pr-${PR_NUMBER}-to-main
+               git checkout -b $COPY_BRANCH
 
-            4. Generate a patch of the PR's final changes and apply it:
+            3. Generate a patch of the PR's final changes and apply it:
                MERGE_BASE=$(git merge-base origin/<baseRefName> pr-${PR_NUMBER}-head)
                git diff $MERGE_BASE pr-${PR_NUMBER}-head | git apply --3way
-               (Replace <baseRefName> with the actual base branch name from step 1.)
+               (Replace <baseRefName> with SOURCE BASE REF unless step 1 shows a different base branch.)
 
                If the apply fails due to merge conflicts:
                a. Identify conflicted files: git diff --name-only --diff-filter=U
@@ -99,25 +117,101 @@ jobs:
                   without overriding what is already on main.
                d. Stage the resolved files: git add <file>
 
-            5. Commit the changes:
+            4. Commit the changes locally:
                git add -A
-               git commit -m "Copy PR #${PR_NUMBER} to main"
-
-            6. Push the new branch:
-               git push origin copy-pr-${PR_NUMBER}-to-main
-
-            7. Create a new PR targeting `main`:
-               gh pr create --repo $REPO \
-                 --base main \
-                 --head copy-pr-${PR_NUMBER}-to-main \
-                 --title "[Copy to main] <original PR title>" \
-                 --body "🤖 **This PR was auto-generated by Claude** via the Claude copy workflow.\n\nCherry-picked from #${PR_NUMBER}.\n\n---\n\n<original PR body>"
-
-            8. Comment on the original PR with a link to the newly created PR.
+               git commit -s -m "Copy PR #${PR_NUMBER} to main"
 
             IMPORTANT:
+            - Do NOT push.
+            - Do NOT create a pull request.
+            - Do NOT comment on the original PR.
+            - Do NOT use gh for any operation except reading PR metadata.
             - When resolving merge conflicts, favor `main` over the non-main branch. Do not override changes already on main.
-            - Do NOT force push.
           claude_args: |
-            --allowedTools "Bash(git:*),Bash(gh:*),Read,Edit"
+            --allowedTools "Bash(git:*),Bash(gh pr view:*),Read,Edit"
             --model "claude-opus-4-6"
+
+      - name: Export copy patch
+        run: |
+          set -euo pipefail
+
+          git status --short
+          test "$(git rev-parse --abbrev-ref HEAD)" = "$COPY_BRANCH"
+          test -z "$(git status --porcelain)"
+          test "$(git rev-list --count origin/main..HEAD)" -gt 0
+
+          git diff --binary origin/main..HEAD > "$RUNNER_TEMP/copy-pr.patch"
+          test -s "$RUNNER_TEMP/copy-pr.patch"
+
+      - name: Upload copy patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: copy-pr-${{ github.event.issue.number }}-patch
+          path: ${{ runner.temp }}/copy-pr.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  publish_copy:
+    name: Publish Copy PR
+    runs-on: ubuntu-latest
+    needs: [authorize_copy, prepare_copy]
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COPY_BRANCH: copy-pr-${{ github.event.issue.number }}-to-main
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Download copy patch
+        uses: actions/download-artifact@v4
+        with:
+          name: copy-pr-${{ github.event.issue.number }}-patch
+          path: ${{ runner.temp }}
+
+      - name: Create branch, commit, and PR
+        run: |
+          set -euo pipefail
+
+          git config user.name "svcnvidia-nemo-ci"
+          git config user.email "svcnvidia-nemo-ci@nvidia.com"
+
+          git fetch origin main
+          git checkout -b "$COPY_BRANCH" origin/main
+          git apply --3way "$RUNNER_TEMP/copy-pr.patch"
+          git diff --check
+          git add -A
+          git commit -s -m "Copy PR #${PR_NUMBER} to main"
+          git push origin "$COPY_BRANCH"
+
+          PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body)
+          ORIGINAL_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          echo "$PR_JSON" | jq -r '.body // ""' > "$RUNNER_TEMP/original-pr-body.md"
+          {
+            echo "🤖 **This PR was auto-generated by Claude** via the Claude copy workflow."
+            echo
+            echo "Cherry-picked from #${PR_NUMBER}."
+            echo
+            echo "---"
+            echo
+            cat "$RUNNER_TEMP/original-pr-body.md"
+          } > "$RUNNER_TEMP/copy-pr-body.md"
+
+          NEW_PR_URL=$(gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$COPY_BRANCH" \
+            --title "[Copy to main] $ORIGINAL_TITLE" \
+            --body-file "$RUNNER_TEMP/copy-pr-body.md")
+
+          gh pr comment "$PR_NUMBER" \
+            --repo "$REPO" \
+            --body "✅ Created copy-to-main PR: $NEW_PR_URL"

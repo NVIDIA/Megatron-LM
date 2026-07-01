@@ -27,10 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  id-token: write
+  contents: read
 
 jobs:
   # Re-dispatch scheduled runs as workflow_dispatch via a PAT so the heavy
@@ -297,7 +294,6 @@ jobs:
             `Nemo_CICD_Test`, `copyright-check`, `pre-flight`, wheel
             builds, etc. — is NOT exempt and must reach a terminal
             green conclusion.
-          show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
             --model "opus[1m]"
