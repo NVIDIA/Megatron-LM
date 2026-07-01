@@ -217,10 +217,12 @@ class FsdpParameterGroup:
         gather_axis = changed_mesh_axis(
             self.model_weight.placements, self._unsharded_model_weight.placements
         )
+        if gather_axis is None:
+            raise RuntimeError("FSDP parameter unshard requires a changed placement axis.")
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
-            if self._symm_mem_pool is not None and gather_axis is not None:
+            if self._symm_mem_pool is not None:
                 self._unsharded_model_weight.rendezvous(gather_axis)
             self.model_weight.redistribute(
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
