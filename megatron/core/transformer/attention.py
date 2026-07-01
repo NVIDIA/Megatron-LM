@@ -89,7 +89,6 @@ try:
 except ImportError:
     HAVE_FA4 = False
 
-
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 

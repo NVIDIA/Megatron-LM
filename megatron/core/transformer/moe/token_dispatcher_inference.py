@@ -344,6 +344,21 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._real_token_count_tensor = tensor
 
     @classmethod
+    def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
+        """Override the routing-mask token count for an MTP forward.
+
+        Each step the context publishes batch_dimensions.token_count into the
+        bound tensor. MTP forwards are request-count shaped, so the controller
+        calls this before an MTP forward to point the mask at the MTP row count
+        instead.
+        """
+        assert cls._real_token_count_tensor is not None, (
+            "real-token-count tensor not wired; DynamicInferenceContext must "
+            "call set_real_token_count_tensor first"
+        )
+        cls._real_token_count_tensor.fill_(mtp_token_count)
+
+    @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
         return cls._step_metadata[1:2]
 
@@ -550,10 +565,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # propagates -1 into agv_r for those slots; padding tokens then route
         # to no expert. _real_token_count_tensor is wired by the context and
         # holds the *global* unpadded token count, so we pass self.sp_rank to
-        # shift local rows into the global frame for the comparison.
-        mask_routing_padding(
-            self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
-        )
+        # shift local rows into the global frame for the comparison. When unset
+        # (standalone dispatcher use without a context) all rows are real, so
+        # skip the mask.
+        if self.__class__._real_token_count_tensor is not None:
+            mask_routing_padding(
+                self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+            )
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
