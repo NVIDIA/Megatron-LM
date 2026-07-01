@@ -14,6 +14,8 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+import dataclasses
+from collections import deque
 from collections.abc import Callable
 from typing import cast
 
@@ -26,10 +28,56 @@ from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
+@dataclasses.dataclass(frozen=True)
+class DelayedRelease:
+    """A module whose unsharded storage can be released after its consumer event."""
+
+    consumer_event: torch.cuda.Event | None
+    module: "FsdpModule"
+
+
+class FsdpContext:
+    """Runtime stream and release scheduler shared by one FSDP subtree."""
+
+    allgather_stream: torch.cuda.Stream
+    delayed_releases: deque[DelayedRelease]
+    root_module: "FsdpModule"
+
+    def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
+        """Create rank-local stream state for a root FSDP subtree.
+
+        Args:
+            device: Device on which this context schedules communication.
+            root_module: Outermost module that owns this context.
+        """
+        self.root_module = root_module
+        self.delayed_releases = deque()
+        with torch.cuda.device(device):
+            self.allgather_stream = torch.cuda.Stream()
+
+    def enqueue_release(self, module: "FsdpModule") -> None:
+        """Queue a module's unsharded storage for delayed release."""
+        consumer_event = torch.cuda.current_stream(self.allgather_stream.device).record_event()
+        self.delayed_releases.append(DelayedRelease(consumer_event=consumer_event, module=module))
+
+    def drain_delayed_releases(self, target_length: int) -> None:
+        """Release queued module storages FIFO until the queue reaches ``target_length``."""
+        if target_length < 0:
+            raise ValueError(f"target_length must be non-negative, got {target_length}.")
+
+        while len(self.delayed_releases) > target_length:
+            delayed_release = self.delayed_releases.popleft()
+            with torch.cuda.stream(self.allgather_stream):
+                if delayed_release.consumer_event is not None:
+                    self.allgather_stream.wait_event(delayed_release.consumer_event)
+                delayed_release.module.release_unsharded_storage()
+
+
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
     _parameter_groups: tuple[FsdpParameterGroup, ...]
+    _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
     _num_training_parameters: int
 
@@ -37,6 +85,7 @@ class FsdpModule:
         self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
+        self._context = None
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -58,6 +107,34 @@ class FsdpModule:
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
+
+    def _lazy_init_context(self) -> None:
+        """Initialize the shared runtime context for this FSDP root subtree."""
+        if self._context is not None:
+            return
+
+        fsdp_context = FsdpContext(
+            device=self._parameter_groups[0].main_weight.device, root_module=self
+        )
+        for submodule in cast(nn.Module, self).modules():
+            if not isinstance(submodule, FsdpModule):
+                continue
+            if submodule._context is not None:
+                raise RuntimeError(
+                    "FSDP context is already initialized for a descendant module. "
+                    "Run forward through the root FSDP module first."
+                )
+            submodule._context = fsdp_context
+
+    @property
+    def context(self) -> FsdpContext:
+        """Return the initialized runtime context."""
+        assert self._context is not None
+        return self._context
+
+    def is_root(self) -> bool:
+        """Return whether this module is the outermost FSDP unit in its context."""
+        return self.context.root_module is self
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
@@ -84,31 +161,63 @@ class FsdpModule:
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
+        self._lazy_init_context()
         self._ready_grad_parameters.clear()
-        for group in self._parameter_groups:
-            group.sync_model_weight_from_main_weight()
-            group.unshard_parameters()
+        if self.is_root():
+            allgather_stream = self.context.allgather_stream
+            allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        self._unshard_parameter_groups(sync_model_weight=True)
+
+    def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
+        """Materialize full parameters for this FSDP unit."""
+        self.context.drain_delayed_releases(target_length=1)
+
+        allgather_stream = self.context.allgather_stream
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+
+        with torch.cuda.stream(allgather_stream):
+            for group in self._parameter_groups:
+                if sync_model_weight:
+                    # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
+                    # optimizer post-step hook instead of running it every microbatch.
+                    group.sync_model_weight_from_main_weight()
+                group.unshard_parameters()
+        current_stream.wait_stream(allgather_stream)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        self._reshard_parameter_groups()
+        self.context.enqueue_release(self)
+        if self.is_root():
+            self.context.drain_delayed_releases(target_length=0)
+
+    def _reshard_parameter_groups(self) -> None:
         for group in self._parameter_groups:
             group.reshard_parameters()
 
     def pre_backward(self) -> None:
         """Prepare full parameters for backward compute."""
-        for group in self._parameter_groups:
-            group.unshard_parameters()
+        self._unshard_parameter_groups(sync_model_weight=False)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         for group in self._parameter_groups:
             if group.requires_grad:
                 group.reduce_gradients()
-            group.reshard_parameters()
+        self._reshard_parameter_groups()
+        self.context.enqueue_release(self)
+        if self.is_root():
+            self.context.drain_delayed_releases(target_length=0)
         self._ready_grad_parameters.clear()
 
+    def release_unsharded_storage(self) -> None:
+        """Release unsharded storage owned by this FSDP unit."""
+        for group in self._parameter_groups:
+            group.release_unsharded_storage()
+
+    @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
-        """Return parameter groups owned by this FSDP unit."""
+        """Parameter groups owned by this FSDP unit."""
         return self._parameter_groups
 
 
