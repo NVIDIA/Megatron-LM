@@ -321,9 +321,9 @@ _DEEPEP_V2_DEBUG_SEEN = set()
 # dispatch. Capture-safe: written by the dispatch forward inside captured
 # graphs; readable from outside via host sync. See the probe code in
 # DeepEPV2Dispatch.forward for the read recipe.
-_DEEPEP_V2_BALANCE_MAX_RATIO_SUM = None   # cumulative sum of per-dispatch ratios
+_DEEPEP_V2_BALANCE_MAX_RATIO_SUM = None  # cumulative sum of per-dispatch ratios
 _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = None  # running peak ratio observed
-_DEEPEP_V2_BALANCE_COUNT = None           # number of dispatches accumulated
+_DEEPEP_V2_BALANCE_COUNT = None  # number of dispatches accumulated
 
 
 def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
@@ -340,10 +340,7 @@ def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
     _deepep_v2_active_dispatch_size = num_max_tokens_per_rank
 
 
-def _select_deepep_v2_buffer(
-    group: torch.distributed.ProcessGroup,
-    requested_size: int,
-):
+def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_size: int):
     """Select the smallest pinned buffer in the pool that holds `requested_size`.
 
     Asserts that at least one buffer in the pool is large enough and tied to
@@ -354,7 +351,8 @@ def _select_deepep_v2_buffer(
     `dispatch_copy_epilogue.cuh:106`.
     """
     matching = [
-        ((g, sz), buf) for (g, sz), buf in _deepep_v2_buffer_pool.items()
+        ((g, sz), buf)
+        for (g, sz), buf in _deepep_v2_buffer_pool.items()
         if g is group and sz >= requested_size
     ]
     if not matching:
@@ -370,10 +368,7 @@ def _select_deepep_v2_buffer(
 
 
 def _get_deepep_v2_buffer(
-    group: torch.distributed.ProcessGroup,
-    num_max_tokens_per_rank: int,
-    hidden: int,
-    num_topk: int,
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ):
     """Return the pinned ElasticBuffer matching the requested per-rank size.
 
@@ -386,10 +381,7 @@ def _get_deepep_v2_buffer(
 
 
 def prepare_deepep_v2_buffer(
-    group: torch.distributed.ProcessGroup,
-    num_max_tokens_per_rank: int,
-    hidden: int,
-    num_topk: int,
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ) -> None:
     """Pin an ElasticBuffer of the given per-rank size in the global pool.
 
@@ -427,10 +419,7 @@ def _tokens_per_expert_from_psum(psum: torch.Tensor) -> torch.Tensor:
 
 
 def _get_deepep_v2_num_sms(
-    buffer,
-    group: torch.distributed.ProcessGroup,
-    num_experts: int,
-    num_topk: int,
+    buffer, group: torch.distributed.ProcessGroup, num_experts: int, num_topk: int
 ) -> int:
     """Get or calculate the SM count for the current DeepEP V2 layout.
 
@@ -444,6 +433,7 @@ def _get_deepep_v2_num_sms(
     ``EP_JIT_CACHE_DIR`` if sweeping.
     """
     import os as _os
+
     _override = _os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
     if _override is not None:
         return int(_override)
@@ -470,19 +460,35 @@ class DeepEPV2Dispatch(torch.autograd.Function):
     """Fused dispatch operation using DeepEP V2 ElasticBuffer."""
 
     @staticmethod
-    def forward(ctx, x, token_indices, token_probs, num_experts, group, async_finish=False, allocate_on_comm_stream=False,use_expanded_layout=False):
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        use_expanded_layout=False,
+    ):
         # PASSTHROUGH for graph-capture diagnostic
         fake_recv = torch.zeros(
             x.shape[0] * num_experts // group.size() * token_indices.shape[1],
-            x.shape[1], dtype=x.dtype, device=x.device,
+            x.shape[1],
+            dtype=x.dtype,
+            device=x.device,
         )
         fake_tpe = torch.zeros(num_experts // group.size(), dtype=torch.int64, device=x.device)
-        fake_handle = type('FakeHandle', (), {
-            'topk_idx': token_indices,
-            'num_max_tokens_per_rank': x.shape[0],
-            'num_sms': 0,
-            'psum_num_recv_tokens_per_expert': torch.zeros_like(fake_tpe).cumsum(0).int(),
-        })()
+        fake_handle = type(
+            'FakeHandle',
+            (),
+            {
+                'topk_idx': token_indices,
+                'num_max_tokens_per_rank': x.shape[0],
+                'num_sms': 0,
+                'psum_num_recv_tokens_per_expert': torch.zeros_like(fake_tpe).cumsum(0).int(),
+            },
+        )()
         ctx.handle = fake_handle
         ctx.group = group
         return fake_recv, None, token_probs[:, 0:1], fake_tpe, fake_handle
@@ -513,8 +519,7 @@ class DeepEPV2Dispatch(torch.autograd.Function):
             # Fallback: largest pinned buffer for this group. Same behaviour
             # as the previous single-buffer design.
             requested_size = max(
-                (sz for (g, sz) in _deepep_v2_buffer_pool if g is group),
-                default=local_num_tokens,
+                (sz for (g, sz) in _deepep_v2_buffer_pool if g is group), default=local_num_tokens
             )
         buffer = _get_deepep_v2_buffer(group, requested_size, hidden, num_topk)
         # Use the buffer's allocated per-rank capacity rather than the local
@@ -537,9 +542,18 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         # main decoder layers may differ). Enable with
         # MCORE_DEEPEP_V2_DEBUG_DISPATCH=1.
         import os as _os
+
         global _DEEPEP_V2_DEBUG_SEEN
         if _os.environ.get("MCORE_DEEPEP_V2_DEBUG_DISPATCH", "0") == "1":
-            _key = (group.size(), num_experts, num_topk, local_num_tokens, num_max_tokens_per_rank, hidden, use_expanded_layout)
+            _key = (
+                group.size(),
+                num_experts,
+                num_topk,
+                local_num_tokens,
+                num_max_tokens_per_rank,
+                hidden,
+                use_expanded_layout,
+            )
             if _key not in _DEEPEP_V2_DEBUG_SEEN:
                 _DEEPEP_V2_DEBUG_SEEN.add(_key)
                 _rank = torch.distributed.get_rank()
@@ -569,11 +583,12 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         # from outside the graph via `_DEEPEP_V2_DUP_COUNTER`. Enable with
         # MCORE_DEEPEP_V2_DEBUG_TOPK_GRAPH=1.
         import os as _os
+
         if _os.environ.get("MCORE_DEEPEP_V2_DEBUG_TOPK_GRAPH", "0") == "1":
             _idx = token_indices
             _safe = _idx.clamp(min=0)
             _sorted, _ = _safe.sort(dim=-1)
-            _dup_mask = (_sorted[:, 1:] == _sorted[:, :-1])
+            _dup_mask = _sorted[:, 1:] == _sorted[:, :-1]
             _dup_count = _dup_mask.any(dim=-1).to(torch.int64).sum()
             global _DEEPEP_V2_DUP_COUNTER
             if _DEEPEP_V2_DUP_COUNTER is None or _DEEPEP_V2_DUP_COUNTER.device != _idx.device:
@@ -622,8 +637,12 @@ class DeepEPV2Dispatch(torch.autograd.Function):
                 _DEEPEP_V2_BALANCE_MAX_RATIO_SUM is None
                 or _DEEPEP_V2_BALANCE_MAX_RATIO_SUM.device != _idx.device
             ):
-                _DEEPEP_V2_BALANCE_MAX_RATIO_SUM = torch.zeros(1, dtype=torch.float32, device=_idx.device)
-                _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = torch.zeros(1, dtype=torch.float32, device=_idx.device)
+                _DEEPEP_V2_BALANCE_MAX_RATIO_SUM = torch.zeros(
+                    1, dtype=torch.float32, device=_idx.device
+                )
+                _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = torch.zeros(
+                    1, dtype=torch.float32, device=_idx.device
+                )
                 _DEEPEP_V2_BALANCE_COUNT = torch.zeros(1, dtype=torch.int64, device=_idx.device)
             _DEEPEP_V2_BALANCE_MAX_RATIO_SUM += _ratio
             _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = torch.maximum(
@@ -635,7 +654,8 @@ class DeepEPV2Dispatch(torch.autograd.Function):
             if not torch.cuda.is_current_stream_capturing():
                 _n_int = int(_DEEPEP_V2_BALANCE_COUNT.item())
                 if (
-                    _n_int > 0 and _n_int % 50 == 0
+                    _n_int > 0
+                    and _n_int % 50 == 0
                     and torch.distributed.is_initialized()
                     and torch.distributed.get_rank() == 0
                 ):
@@ -707,12 +727,19 @@ class DeepEPV2Combine(torch.autograd.Function):
     """Fused combine operation using DeepEP V2 ElasticBuffer."""
 
     @staticmethod
-    def forward(ctx, x, group, handle, async_finish=False,
+    def forward(
+        ctx,
+        x,
+        group,
+        handle,
+        async_finish=False,
         allocate_on_comm_stream=False,
-        use_expanded_layout=False):
+        use_expanded_layout=False,
+    ):
         # PASSTHROUGH
-        out = torch.zeros(handle.num_max_tokens_per_rank, x.shape[1], dtype=x.dtype,
-                          device=x.device)
+        out = torch.zeros(
+            handle.num_max_tokens_per_rank, x.shape[1], dtype=x.dtype, device=x.device
+        )
         ctx.handle = handle
         ctx.group = group
         return out, None
@@ -729,9 +756,7 @@ class DeepEPV2Combine(torch.autograd.Function):
     ):
         num_topk = handle.topk_idx.shape[1]
         hidden = x.shape[1]
-        buffer = _get_deepep_v2_buffer(
-            group, handle.num_max_tokens_per_rank, hidden, num_topk
-        )
+        buffer = _get_deepep_v2_buffer(group, handle.num_max_tokens_per_rank, hidden, num_topk)
         num_sms = handle.num_sms
         combined_x, _, event = buffer.combine(
             x,

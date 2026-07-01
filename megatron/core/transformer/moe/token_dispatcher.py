@@ -1238,6 +1238,7 @@ class _DeepepManager(_DispatchManager):
         # debugging correctness it routes through the same tested permute →
         # grouped_gemm → combine flow used by training.
         import os as _os
+
         _disable_expand = _os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
         self.enable_expanded_layout_for_inference = (
             self.use_deepep_v2
