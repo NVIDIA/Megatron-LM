@@ -106,7 +106,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
 
     torch_device.assert_called_once_with("meta")
     seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
-    wrap.assert_called_once_with(args, model, topology)
+    wrap.assert_called_once_with(args, model, topology, True)
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
     assert model.pg_collection is groups
@@ -271,8 +271,9 @@ class TestRuntimeDistributed:
     def test_active_module_is_ddp_over_its_own_grid(self):
         topo = _eight_gpu_topology()
         try:
-            mimo_model = _build_unwrapped_mimo_model(topo)
-            wrap_active_modules_with_ddp(_args(), mimo_model, topo)
+            # bf16 = production precision; a bare fp32 modality container has no config for get_model_config.
+            mimo_model = _build_unwrapped_mimo_model(topo, bf16=True)
+            wrap_active_modules_with_ddp(_args(fp32=False), mimo_model, topo)
             # Non-colocated: each rank owns exactly one active module (language XOR encoder).
             if torch.distributed.get_rank() < 4:
                 active = mimo_model.modality_submodules[ENCODER]
