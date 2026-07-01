@@ -4,11 +4,14 @@ import pytest
 import torch
 
 from megatron.core import config
+from megatron.core.transformer.moe.token_dispatcher import _ChunkedAllToAllAndUnpermute
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import (
     MoEModelTestContainer,
     permute_fusion_params,
+    token_permutation,
 )
 
 
@@ -52,6 +55,57 @@ class TestAlltoAllDispatcher:
             moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    def test_chunked_combine_unpermute_matches_reference(self, monkeypatch):
+        """Compare chunked EP combine/unpermute to the existing unfused reference path."""
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=8,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=False,
+            hidden_size=16,
+        )
+        moe_layer = container.moe_layer
+        token_dispatcher = moe_layer.token_dispatcher
+        hidden_states = torch.randn(
+            (16, 4, moe_layer.config.hidden_size), dtype=container.test_dtype, device="cuda"
+        )
+        probs, routing_map = apply_module(moe_layer.router)(hidden_states)
+        probs = torch.ones_like(probs) / moe_layer.router.topk
+
+        permuted_tokens, _, permuted_probs = token_permutation(
+            token_dispatcher, hidden_states, probs, routing_map
+        )
+        routed_output = permuted_tokens * permuted_probs.unsqueeze(-1)
+        combine_input = token_dispatcher.combine_preprocess(
+            routed_output.to(dtype=container.test_dtype)
+        )
+
+        ref_input = combine_input.detach().clone().requires_grad_(True)
+        chunk_input = combine_input.detach().clone().requires_grad_(True)
+
+        monkeypatch.setattr(token_dispatcher, "_can_chunk_ep_combine_unpermute", lambda: False)
+        ref_output = token_dispatcher.combine_postprocess(token_dispatcher.token_combine(ref_input))
+
+        monkeypatch.setattr(token_dispatcher, "_can_chunk_ep_combine_unpermute", lambda: True)
+        monkeypatch.setattr(_ChunkedAllToAllAndUnpermute, "_MAX_CHUNK_BYTES", 1)
+        chunk_output = token_dispatcher.combine_postprocess(
+            token_dispatcher.token_combine(chunk_input)
+        )
+
+        torch.testing.assert_close(chunk_output, ref_output)
+
+        grad_output = torch.randn_like(ref_output)
+        torch.autograd.backward(ref_output, grad_output)
+        torch.autograd.backward(chunk_output, grad_output)
+        torch.testing.assert_close(chunk_input.grad, ref_input.grad)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
