@@ -123,3 +123,110 @@ def test_assign_reviewer_requests_oncall_when_needed(oncall_manager, monkeypatch
             "json": {"team_reviewers": ["mcore-oncall"]},
         }
     ]
+
+
+def test_get_headers_rejects_invalid_token(oncall_manager, monkeypatch, capsys):
+    monkeypatch.setenv("GH_TOKEN", "not a token\nwith newline")
+
+    with pytest.raises(SystemExit) as error:
+        oncall_manager.get_headers()
+
+    assert error.value.code == 1
+    assert "GH_TOKEN or GITHUB_TOKEN is invalid" in capsys.readouterr().out
+
+
+def test_get_rotation_order_uses_alphabetical_rotation_team(oncall_manager, monkeypatch):
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"charlie", "Alice", "bob", "svcnvidia-nemo-ci"},
+    )
+
+    assert oncall_manager.get_rotation_order("NVIDIA") == ["Alice", "bob", "charlie"]
+
+
+def test_ensure_schedule_filled_uses_rotation_team_order(oncall_manager, monkeypatch):
+    schedule = [{"user": "bob", "date": "2026-01-07"}]
+    rotation_order = ["Alice", "bob", "charlie"]
+    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 5)
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda *_args, **_kwargs: pytest.fail("team members should not determine oncall order"),
+    )
+
+    oncall_manager.ensure_schedule_filled(schedule, rotation_order)
+
+    assert [entry["user"] for entry in schedule] == ["bob", "charlie", "Alice", "bob", "charlie"]
+    assert [entry["date"] for entry in schedule[-4:]] == [
+        "2026-01-14",
+        "2026-01-21",
+        "2026-01-28",
+        "2026-02-04",
+    ]
+
+
+def test_validate_schedule_users_in_rotation_team_accepts_all_users(
+    oncall_manager, monkeypatch, capsys
+):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+        {"user": "bob", "date": "2026-01-21"},
+        {"user": "alice", "date": "2026-01-28"},
+    ]
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_team_members",
+        lambda org, team_slug: {"alice", "bob", "charlie", "dana"},
+    )
+
+    rotation_order = ["alice", "bob", "charlie", "dana"]
+
+    oncall_manager.validate_schedule_users_in_rotation_team(schedule, rotation_order)
+
+    assert "Validated 3 scheduled user(s) in mcore-oncall-rotation" in capsys.readouterr().out
+
+
+def test_validate_schedule_users_in_rotation_team_rejects_missing_user(
+    oncall_manager, monkeypatch, capsys
+):
+    schedule = [{"user": "charlie", "date": "2026-01-07"}, {"user": "alice", "date": "2026-01-14"}]
+    with pytest.raises(SystemExit) as error:
+        oncall_manager.validate_schedule_users_in_rotation_team(schedule, ["alice"])
+
+    assert error.value.code == 1
+    assert "charlie" in capsys.readouterr().out
+
+
+def test_rotate_schedule_keeps_popped_user_in_rotation_order(oncall_manager, monkeypatch):
+    schedule = [
+        {"user": "charlie", "date": "2026-01-07"},
+        {"user": "alice", "date": "2026-01-14"},
+        {"user": "bob", "date": "2026-01-21"},
+    ]
+    saved_schedule = []
+    real_datetime = oncall_manager.datetime
+
+    class FakeDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 1, 14, tzinfo=tz)
+
+    monkeypatch.setattr(oncall_manager, "TARGET_WEEKS", 3)
+    monkeypatch.setattr(oncall_manager, "datetime", FakeDateTime)
+    monkeypatch.setattr(
+        oncall_manager, "load_schedule", lambda: [entry.copy() for entry in schedule]
+    )
+    monkeypatch.setattr(
+        oncall_manager, "save_schedule", lambda new_schedule: saved_schedule.extend(new_schedule)
+    )
+    monkeypatch.setattr(
+        oncall_manager, "get_team_members", lambda org, team_slug: {"alice", "bob", "charlie"}
+    )
+    monkeypatch.setattr(oncall_manager, "update_active_oncall_team", lambda *_args, **_kwargs: None)
+
+    oncall_manager.rotate_schedule("NVIDIA")
+
+    assert [entry["user"] for entry in saved_schedule] == ["alice", "bob", "charlie"]
+    assert saved_schedule[-1]["date"] == "2026-01-28"
