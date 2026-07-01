@@ -32,8 +32,9 @@
 # -------
 # `publish` starts on a fresh runner and treats the artifact as untrusted. Fixed
 # shell code reconstructs the same baseline and rejects out-of-scope paths,
-# control files, binary/create/delete/rename/mode changes, unsafe path/report
-# text, large patches, unresolved conflicts, and unexpected result trees.
+# control files, modify/delete or other non-three-stage conflicts,
+# binary/create/delete/rename/mode changes, unsafe path/report text, large
+# patches, unresolved conflicts, and unexpected result trees.
 #
 # If this is the first change in the session, fixed code creates one signed-off
 # `svcnvidia-nemo-ci` commit and uses an ordinary push to the contributor's fork
@@ -200,6 +201,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          require_three_way_file_conflict() {
+            local path=$1 record metadata entry_mode entry_sha entry_stage
+            local common_mode='' count=0 blob_file stripped_file stage
+            local -A stages=() blobs=()
+            while IFS= read -r -d '' record; do
+              [[ "$record" == *$'\t'* ]] || return 1
+              metadata=${record%%$'\t'*}
+              read -r entry_mode entry_sha entry_stage <<<"$metadata"
+              [[ "$entry_mode" =~ ^100(644|755)$ ]] || return 1
+              [[ "$entry_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+              [[ "$entry_stage" =~ ^[123]$ ]] || return 1
+              [[ -z "${stages[$entry_stage]+x}" ]] || return 1
+              stages[$entry_stage]=1
+              blobs[$entry_stage]=$entry_sha
+              if [[ -z "$common_mode" ]]; then
+                common_mode=$entry_mode
+              else
+                test "$entry_mode" = "$common_mode" || return 1
+              fi
+              count=$((count + 1))
+            done < <(GIT_LITERAL_PATHSPECS=1 git ls-files -u -z -- "$path")
+            (( count == 3 )) || return 1
+            [[ -n "${stages[1]+x}" && -n "${stages[2]+x}" &&
+               -n "${stages[3]+x}" ]] || return 1
+
+            blob_file=$(mktemp "$RUNNER_TEMP/claude-fix-blob.XXXXXX") || return 1
+            stripped_file=$(mktemp "$RUNNER_TEMP/claude-fix-text.XXXXXX") || {
+              rm -f "$blob_file"
+              return 1
+            }
+            for stage in 1 2 3; do
+              if ! git cat-file blob "${blobs[$stage]}" >"$blob_file" ||
+                 ! LC_ALL=C tr -d '\000' <"$blob_file" >"$stripped_file" ||
+                 ! cmp -s "$blob_file" "$stripped_file"; then
+                rm -f "$blob_file" "$stripped_file"
+                return 1
+              fi
+            done
+            rm -f "$blob_file" "$stripped_file"
+            return 0
+          }
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           git remote add upstream "https://github.com/$REPO.git"
           git fetch --no-tags upstream "refs/heads/$BASE_REF"
@@ -220,6 +262,10 @@ jobs:
               case "$path" in
                 .github/*|*/CODEOWNERS|CODEOWNERS|*/SECURITY.md|SECURITY.md) exit 1 ;;
               esac
+              if ! require_three_way_file_conflict "$path"; then
+                printf 'Unsupported conflict type or mode: %q\n' "$path"
+                exit 1
+              fi
             done < <(git diff --name-only -z --diff-filter=U)
             if (( conflicts > 0 )); then
               index=$(git rev-parse --git-path index)
@@ -396,6 +442,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          require_three_way_file_conflict() {
+            local path=$1 record metadata entry_mode entry_sha entry_stage
+            local common_mode='' count=0 blob_file stripped_file stage
+            local -A stages=() blobs=()
+            while IFS= read -r -d '' record; do
+              [[ "$record" == *$'\t'* ]] || return 1
+              metadata=${record%%$'\t'*}
+              read -r entry_mode entry_sha entry_stage <<<"$metadata"
+              [[ "$entry_mode" =~ ^100(644|755)$ ]] || return 1
+              [[ "$entry_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+              [[ "$entry_stage" =~ ^[123]$ ]] || return 1
+              [[ -z "${stages[$entry_stage]+x}" ]] || return 1
+              stages[$entry_stage]=1
+              blobs[$entry_stage]=$entry_sha
+              if [[ -z "$common_mode" ]]; then
+                common_mode=$entry_mode
+              else
+                test "$entry_mode" = "$common_mode" || return 1
+              fi
+              count=$((count + 1))
+            done < <(GIT_LITERAL_PATHSPECS=1 git ls-files -u -z -- "$path")
+            (( count == 3 )) || return 1
+            [[ -n "${stages[1]+x}" && -n "${stages[2]+x}" &&
+               -n "${stages[3]+x}" ]] || return 1
+
+            blob_file=$(mktemp "$RUNNER_TEMP/claude-fix-blob.XXXXXX") || return 1
+            stripped_file=$(mktemp "$RUNNER_TEMP/claude-fix-text.XXXXXX") || {
+              rm -f "$blob_file"
+              return 1
+            }
+            for stage in 1 2 3; do
+              if ! git cat-file blob "${blobs[$stage]}" >"$blob_file" ||
+                 ! LC_ALL=C tr -d '\000' <"$blob_file" >"$stripped_file" ||
+                 ! cmp -s "$blob_file" "$stripped_file"; then
+                rm -f "$blob_file" "$stripped_file"
+                return 1
+              fi
+            done
+            rm -f "$blob_file" "$stripped_file"
+            return 0
+          }
           patch="$PROPOSAL/fix.patch"; report="$PROPOSAL/report.json"
           test -f "$patch" && test -f "$report"
           test "$(wc -c <"$patch")" -le 10485760
@@ -456,6 +543,10 @@ jobs:
             set -e
             conflicts=0
             while IFS= read -r -d '' path; do
+              if ! require_three_way_file_conflict "$path"; then
+                printf 'Unsupported conflict type or mode: %q\n' "$path"
+                exit 1
+              fi
               allowed["$path"]=1; conflicted["$path"]=1; conflicts=$((conflicts + 1))
             done < <(git diff --name-only -z --diff-filter=U)
             (( status == 0 || conflicts > 0 ))
