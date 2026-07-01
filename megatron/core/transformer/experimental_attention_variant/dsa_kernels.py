@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -23,6 +24,7 @@ _BACKEND_MODULE_NAME_BY_BACKEND = {
 }
 _BACKEND: Optional[ModuleType] = None
 _BACKEND_SELECTION: Optional[str] = None
+_LOGGER = logging.getLogger(__name__)
 
 
 def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
@@ -60,6 +62,33 @@ def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:
     return _BACKEND
 
 
+def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -> None:
+    """Emit one debug breadcrumb when a selected fused hook falls back."""
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    _LOGGER.debug(
+        "DSA fused backend %s %s declined; falling back (%s).",
+        _get_dsa_kernel_backend(config),
+        hook_name,
+        reason,
+    )
+
+
+def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
+    """Return the selected backend's ``hook_name`` callable, or None if unavailable.
+
+    Returns None when no backend is configured, or (logging a decline breadcrumb) when
+    the configured backend does not implement the hook.
+    """
+    backend = _load_backend(config)
+    if backend is None:
+        return None
+    fn = getattr(backend, hook_name, None)
+    if fn is None:
+        _log_declined_hook(config, hook_name, "hook is not implemented")
+    return fn
+
+
 def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
     """Return whether DSA should attempt optional fused kernels before falling back."""
     backend = config.attention_backend
@@ -79,17 +108,33 @@ def run_fused_qk_topk(
     block_size: int,
     use_relu: bool = True,
     use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
-    backend = _load_backend(config)
-    if backend is None:
-        return None
-    fn = getattr(backend, "run_fused_qk_topk", None)
+    fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
-    return fn(
-        q, k, weights, index_topk, starts, ends, block_size, use_relu, use_local_indexer_varlen
+    result = fn(
+        q=q,
+        k=k,
+        weights=weights,
+        index_topk=index_topk,
+        starts=starts,
+        ends=ends,
+        block_size=block_size,
+        use_relu=use_relu,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
+    return result
 
 
 def run_fused_qk_topk_with_loss(
@@ -110,15 +155,16 @@ def run_fused_qk_topk_with_loss(
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
     use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
-    backend = _load_backend(config)
-    if backend is None:
-        return None
-    fn = getattr(backend, "run_fused_qk_topk_with_loss", None)
+    fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
-    return fn(
+    result = fn(
         config=config,
         q=q,
         k=k,
@@ -136,7 +182,14 @@ def run_fused_qk_topk_with_loss(
         calculate_per_token_loss=calculate_per_token_loss,
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
+    return result
 
 
 def run_fused_absorbed_sparse_attention(
@@ -149,13 +202,13 @@ def run_fused_absorbed_sparse_attention(
     topk_length: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
-    backend = _load_backend(config)
-    if backend is None:
-        return None
-    fn = getattr(backend, "run_fused_absorbed_sparse_attention", None)
+    fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    return fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    if result is None:
+        _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
+    return result
 
 
 def run_fused_dsa_attention(
@@ -181,18 +234,20 @@ def run_fused_dsa_attention(
     varlen_ends: Optional[Tensor],
     key_positions: Optional[Tensor],
     query_valid_rows: Optional[Tensor],
+    varlen_is_plain_causal: bool = False,
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
-    backend = _load_backend(config)
-    if backend is None:
-        return None
-    fn = getattr(backend, "run_fused_dsa_attention", None)
+    fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None
-    return fn(
+    result = fn(
         config=config,
         query=query,
         key=key,
@@ -214,10 +269,18 @@ def run_fused_dsa_attention(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
+        varlen_is_plain_causal=varlen_is_plain_causal,
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
         pg_collection=pg_collection,
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")
+    return result
 
 
 __all__ = [
