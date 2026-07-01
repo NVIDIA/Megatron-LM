@@ -2,12 +2,12 @@
 
 import logging
 
+
 logger = logging.getLogger(__name__)
 
 from typing import Any, Callable
 
 import torch
-
 from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
@@ -28,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config
+
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -87,13 +88,9 @@ def unimodal_build_distributed_models(
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
     if init_model_with_meta_device:
         with torch.device("meta"):
-            model_list = build_virtual_pipeline_stages(
-                build_model_func, pg_collection, vp_size, model_type
-            )
+            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
     else:
-        model_list = build_virtual_pipeline_stages(
-            build_model_func, pg_collection, vp_size, model_type
-        )
+        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:
