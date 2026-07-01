@@ -19,6 +19,11 @@
 # Each attempt calls the reusable workflow from the same trusted commit. That
 # workflow keeps Claude read-only, publishes through fixed service-account
 # steps, and monitors CI for the exact generated SHA.
+# If CI needs another repair, the next attempt may amend only the bot commit
+# created by this run. An exact force-with-lease leaves one bot commit in the
+# PR branch history without allowing contributor history or a concurrent branch
+# update to be replaced. A full manual rerun is ignored; post a new command to
+# start a new session with a new immutable original-head snapshot.
 # The command is explicit maintainer authorization to run that generated SHA
 # in internal CI, so maintainers must invoke it only on PRs they already trust.
 name: Claude Fix PR
@@ -34,6 +39,7 @@ jobs:
     name: Authorize Claude Fix
     if: |
       github.repository == 'NVIDIA/Megatron-LM' &&
+      github.run_attempt == 1 &&
       github.event.issue.pull_request &&
       github.event.comment.user.type == 'User' &&
       github.event.comment.user.login != 'svcnvidia-nemo-ci' &&
@@ -175,6 +181,7 @@ jobs:
       head_repo: ${{ needs.authorize.outputs.head_repo }}
       head_ref: ${{ needs.authorize.outputs.head_ref }}
       expected_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
       base_ref: ${{ needs.authorize.outputs.base_ref }}
       base_sha: ${{ needs.authorize.outputs.base_sha }}
       steer_b64: ${{ needs.authorize.outputs.steer_b64 }}
@@ -204,6 +211,8 @@ jobs:
       head_repo: ${{ needs.authorize.outputs.head_repo }}
       head_ref: ${{ needs.authorize.outputs.head_ref }}
       expected_head_sha: ${{ needs.attempt_1.outputs.sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      service_commit_sha: ${{ needs.attempt_1.outputs.service_commit_sha }}
       base_ref: ${{ needs.authorize.outputs.base_ref }}
       base_sha: ${{ needs.authorize.outputs.base_sha }}
       steer_b64: ${{ needs.authorize.outputs.steer_b64 }}
@@ -234,6 +243,8 @@ jobs:
       head_repo: ${{ needs.authorize.outputs.head_repo }}
       head_ref: ${{ needs.authorize.outputs.head_ref }}
       expected_head_sha: ${{ needs.attempt_2.outputs.sha }}
+      original_head_sha: ${{ needs.authorize.outputs.head_sha }}
+      service_commit_sha: ${{ needs.attempt_2.outputs.service_commit_sha }}
       base_ref: ${{ needs.authorize.outputs.base_ref }}
       base_sha: ${{ needs.authorize.outputs.base_sha }}
       steer_b64: ${{ needs.authorize.outputs.steer_b64 }}

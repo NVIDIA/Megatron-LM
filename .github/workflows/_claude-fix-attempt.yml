@@ -34,6 +34,13 @@ on:
       expected_head_sha:
         required: true
         type: string
+      original_head_sha:
+        required: true
+        type: string
+      service_commit_sha:
+        required: false
+        type: string
+        default: ""
       base_ref:
         required: true
         type: string
@@ -66,6 +73,8 @@ on:
         value: ${{ jobs.publish.outputs.created }}
       sha:
         value: ${{ jobs.publish.outputs.sha }}
+      service_commit_sha:
+        value: ${{ jobs.publish.outputs.service_commit_sha }}
       outcome:
         value: ${{ jobs.monitor.outputs.outcome }}
       ci_run_id:
@@ -299,6 +308,7 @@ jobs:
     outputs:
       created: ${{ steps.build.outputs.created }}
       sha: ${{ steps.build.outputs.sha }}
+      service_commit_sha: ${{ steps.build.outputs.service_commit_sha }}
       trigger_after: ${{ steps.ci.outputs.trigger_after }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -308,8 +318,11 @@ jobs:
       HEAD_REPO: ${{ inputs.head_repo }}
       HEAD_REF: ${{ inputs.head_ref }}
       HEAD_SHA: ${{ inputs.expected_head_sha }}
+      ORIGINAL_HEAD_SHA: ${{ inputs.original_head_sha }}
+      SERVICE_COMMIT_SHA: ${{ inputs.service_commit_sha }}
       BASE_REF: ${{ inputs.base_ref }}
       BASE_SHA: ${{ inputs.base_sha }}
+      ATTEMPT: ${{ inputs.attempt }}
       NEEDS_MERGE: ${{ needs.prepare.outputs.needs_merge }}
       BASELINE_TREE: ${{ needs.prepare.outputs.baseline_tree }}
     steps:
@@ -327,7 +340,7 @@ jobs:
           name: ${{ needs.prepare.outputs.artifact_name }}
           path: ${{ runner.temp }}/claude-fix-${{ inputs.attempt }}
 
-      - name: Validate patch and create signed-off commit
+      - name: Validate patch and create or amend signed-off commit
         id: build
         env:
           PROPOSAL: ${{ runner.temp }}/claude-fix-${{ inputs.attempt }}
@@ -338,9 +351,49 @@ jobs:
           test -f "$patch" && test -f "$report"
           test "$(wc -c <"$patch")" -le 10485760
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ORIGINAL_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ATTEMPT" =~ ^[123]$ ]]
           git remote add upstream "https://github.com/$REPO.git"
           git fetch --no-tags upstream "refs/heads/$BASE_REF"
           test "$(git rev-parse FETCH_HEAD)" = "$BASE_SHA"
+          git cat-file -e "$ORIGINAL_HEAD_SHA^{commit}"
+
+          # A later attempt may replace only the service commit created by an
+          # earlier attempt in this workflow run. The original PR commit and
+          # pinned base determine its complete, immutable parent list.
+          amend=false
+          expected_message=$(printf \
+            'Apply Claude fix for PR #%s\n\nSigned-off-by: svcnvidia-nemo-ci <svcnvidia-nemo-ci@nvidia.com>' \
+            "$PR_NUMBER")
+          if [[ -n "$SERVICE_COMMIT_SHA" ]]; then
+            [[ "$SERVICE_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$ATTEMPT" -gt 1
+            test "$SERVICE_COMMIT_SHA" = "$HEAD_SHA"
+            test "$SERVICE_COMMIT_SHA" != "$ORIGINAL_HEAD_SHA"
+            expected_parents=$ORIGINAL_HEAD_SHA
+            if ! git merge-base --is-ancestor "$BASE_SHA" "$ORIGINAL_HEAD_SHA"; then
+              expected_parents="$ORIGINAL_HEAD_SHA $BASE_SHA"
+            fi
+            test "$(git show -s --format=%P "$SERVICE_COMMIT_SHA")" = \
+              "$expected_parents"
+            test "$(git show -s --format=%an "$SERVICE_COMMIT_SHA")" = \
+              svcnvidia-nemo-ci
+            test "$(git show -s --format=%ae "$SERVICE_COMMIT_SHA")" = \
+              svcnvidia-nemo-ci@nvidia.com
+            test "$(git show -s --format=%cn "$SERVICE_COMMIT_SHA")" = \
+              svcnvidia-nemo-ci
+            test "$(git show -s --format=%ce "$SERVICE_COMMIT_SHA")" = \
+              svcnvidia-nemo-ci@nvidia.com
+            test "$(git show -s --format=%B "$SERVICE_COMMIT_SHA")" = \
+              "$expected_message"
+            git cat-file commit "$SERVICE_COMMIT_SHA" |
+              sed '1,/^$/d' >"$PROPOSAL/prior-message"
+            prior_author_date=$(git show -s --format=%aI "$SERVICE_COMMIT_SHA")
+            amend=true
+          else
+            test "$HEAD_SHA" = "$ORIGINAL_HEAD_SHA"
+          fi
 
           declare -A allowed=() conflicted=()
           merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
@@ -449,27 +502,48 @@ jobs:
             {
               echo "created=false"
               echo "sha=$HEAD_SHA"
+              echo "service_commit_sha=$SERVICE_COMMIT_SHA"
+              echo "amended=false"
             } >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          git -c core.hooksPath=/dev/null -c commit.gpgSign=false \
-            -c user.name=svcnvidia-nemo-ci \
-            -c user.email=svcnvidia-nemo-ci@nvidia.com \
-            commit -s -m "Apply Claude fix for PR #$PR_NUMBER"
+          if [[ "$amend" == true ]]; then
+            git -c core.hooksPath=/dev/null -c commit.gpgSign=false \
+              -c user.name=svcnvidia-nemo-ci \
+              -c user.email=svcnvidia-nemo-ci@nvidia.com \
+              commit --amend --no-edit
+          else
+            git -c core.hooksPath=/dev/null -c commit.gpgSign=false \
+              -c user.name=svcnvidia-nemo-ci \
+              -c user.email=svcnvidia-nemo-ci@nvidia.com \
+              commit -s -m "Apply Claude fix for PR #$PR_NUMBER"
+          fi
           sha=$(git rev-parse HEAD)
+          test "$sha" != "$HEAD_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$result_tree"
           test "$(git show -s --format=%an HEAD)" = svcnvidia-nemo-ci
           test "$(git show -s --format=%ae HEAD)" = svcnvidia-nemo-ci@nvidia.com
           test "$(git show -s --format=%cn HEAD)" = svcnvidia-nemo-ci
           test "$(git show -s --format=%ce HEAD)" = svcnvidia-nemo-ci@nvidia.com
+          test "$(git show -s --format=%B HEAD)" = "$expected_message"
           git show -s --format=%B HEAD | grep -Fx \
             'Signed-off-by: svcnvidia-nemo-ci <svcnvidia-nemo-ci@nvidia.com>' >/dev/null
           parents=$(git show -s --format=%P HEAD)
-          if [[ "$NEEDS_MERGE" == true ]]; then test "$parents" = "$HEAD_SHA $BASE_SHA";
-          else test "$parents" = "$HEAD_SHA"; fi
+          expected_parents=$ORIGINAL_HEAD_SHA
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$ORIGINAL_HEAD_SHA"; then
+            expected_parents="$ORIGINAL_HEAD_SHA $BASE_SHA"
+          fi
+          test "$parents" = "$expected_parents"
+          if [[ "$amend" == true ]]; then
+            git cat-file commit HEAD | sed '1,/^$/d' >"$PROPOSAL/new-message"
+            cmp "$PROPOSAL/prior-message" "$PROPOSAL/new-message"
+            test "$(git show -s --format=%aI HEAD)" = "$prior_author_date"
+          fi
           {
             echo "created=true"
             echo "sha=$sha"
+            echo "service_commit_sha=$sha"
+            echo "amended=$amend"
           } >>"$GITHUB_OUTPUT"
 
       - name: Recheck live authorization
@@ -500,20 +574,34 @@ jobs:
           test "$(jq -r '.protected' <<<"$branch")" = false
           test "$(jq -r '.commit.sha' <<<"$branch")" = "$HEAD_SHA"
 
-      - name: Push ordinary fast-forward update
+      - name: Push guarded branch update
         if: steps.build.outputs.created == 'true'
         env:
           PUSH_TOKEN: ${{ secrets.service_pat }}
           NEW_SHA: ${{ steps.build.outputs.sha }}
+          AMENDED: ${{ steps.build.outputs.amended }}
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$NEW_SHA"
           auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w 0)
-          git -c core.hooksPath=/dev/null \
-            -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
-            push "https://github.com/$HEAD_REPO.git" \
-              "$NEW_SHA:refs/heads/$HEAD_REF"
+          if [[ "$AMENDED" == true ]]; then
+            # This is the sole force-push exception: replace exactly the
+            # validated service commit from this run, and fail if the fork ref
+            # moved since the live authorization check.
+            test "$SERVICE_COMMIT_SHA" = "$HEAD_SHA"
+            git -c core.hooksPath=/dev/null \
+              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+              push "https://github.com/$HEAD_REPO.git" \
+                --force-with-lease="refs/heads/$HEAD_REF:$SERVICE_COMMIT_SHA" \
+                "$NEW_SHA:refs/heads/$HEAD_REF"
+          else
+            test -z "$SERVICE_COMMIT_SHA"
+            git -c core.hooksPath=/dev/null \
+              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+              push "https://github.com/$HEAD_REPO.git" \
+                "$NEW_SHA:refs/heads/$HEAD_REF"
+          fi
 
       - name: Post service-account explanation
         id: explain
@@ -589,6 +677,28 @@ jobs:
           test "$(jq -r '.base.ref' <<<"$pr")" = "$BASE_REF"
           encoded_base=$(jq -rn --arg v "$BASE_REF" '$v | @uri')
           test "$(gh api "repos/$REPO/commits/$encoded_base" --jq '.sha')" = "$BASE_SHA"
+          # The copy bot reads the PR commit list. After a lease-guarded
+          # replacement, wait until that API agrees with the live PR head.
+          visible_sha=
+          for _ in $(seq 1 24); do
+            commits=$(gh api --paginate \
+              "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" |
+              jq -cs '[.[][]]')
+            visible_sha=$(jq -r 'last.sha // empty' <<<"$commits")
+            [[ "$visible_sha" == "$TARGET_SHA" ]] && break
+            sleep 5
+          done
+          test "$visible_sha" = "$TARGET_SHA"
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          test "$(jq -r '.state' <<<"$pr")" = open
+          test "$(jq -r '.merged' <<<"$pr")" = false
+          test "$(jq -r '.head.sha' <<<"$pr")" = "$TARGET_SHA"
+          test "$(jq -r '.head.repo.full_name' <<<"$pr")" = "$HEAD_REPO"
+          test "$(jq -r '.head.ref' <<<"$pr")" = "$HEAD_REF"
+          test "$(jq -r '.base.ref' <<<"$pr")" = "$BASE_REF"
+          encoded_base=$(jq -rn --arg v "$BASE_REF" '$v | @uri')
+          test "$(gh api "repos/$REPO/commits/$encoded_base" --jq '.sha')" = \
+            "$BASE_SHA"
           mirror=$(gh api "repos/$REPO/git/ref/heads/pull-request/$PR_NUMBER" \
             --jq '.object.sha' 2>/dev/null || true)
           runs=$(gh api --method GET \
