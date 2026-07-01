@@ -1018,6 +1018,7 @@ class MegatronFSDP(torch.nn.Module):
         self.post_backward_release_module = _post_backward_release_module
         self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
         self.post_backward = _root_post_backward
+        self.pre_backward_param_unshard = _pre_backward_param_unshard
 
         fsdp_modules = []
         for name, module in root_module.named_modules():
