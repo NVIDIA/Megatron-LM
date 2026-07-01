@@ -177,6 +177,42 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hybridep_router_masks_padding_tokens_from_dispatch(self):
+        """Test that HybridEP dispatch metadata excludes padding tokens."""
+        self.router = self.router.cuda()
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "hybridep"
+        seq_len = 32
+        batch_size = 2
+        hidden_size = self.router.config.hidden_size
+
+        hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
+
+        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+        padding_mask[seq_len // 2 :, :] = True
+
+        with torch.no_grad():
+            probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
+            probs_without_mask, routing_map_without_mask = self.router(
+                hidden_states[: seq_len // 2, :, :]
+            )
+
+        probs = probs.reshape(seq_len, batch_size, -1)
+        routing_map = routing_map.reshape(seq_len, batch_size, -1)
+
+        assert torch.count_nonzero(probs[seq_len // 2 :, :, :]) == 0
+        assert not routing_map[seq_len // 2 :, :, :].any()
+        assert (routing_map[: seq_len // 2, :, :].sum(dim=-1) == self.router.topk).all()
+        assert torch.equal(
+            probs[: seq_len // 2, :, :].reshape(-1, probs.shape[-1]), probs_without_mask
+        )
+        assert torch.equal(
+            routing_map[: seq_len // 2, :, :].reshape(-1, routing_map.shape[-1]),
+            routing_map_without_mask,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_dtype(self):
         self.router = self.router.cuda()
         self.sequential_mlp = self.sequential_mlp.cuda()
