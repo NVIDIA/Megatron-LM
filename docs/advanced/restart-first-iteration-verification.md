@@ -82,6 +82,16 @@ regression over iterations 10 through 20:
 The verifier compares the treatment median with the mean of the two control
 medians and fails if any iteration in the requested range is missing.
 
+If logging every iteration changes the production numerical schedule, use two
+same-scale ABAs instead of weakening either gate. Run the production logging
+cadence for at least 20 iterations with `--require-iteration-20` as the exact
+correctness gate. Then run a separate every-iteration ABA for the steady-state
+range without `--require-iteration-20`; it must still match iteration-1
+numerics, report zero skipped or NaN iterations, and pass the startup and full
+wall gates. Keep the recipe, image, rank topology, cache, and treatment fixed
+between the two ABAs. A diagnostic performance run never overrides a failed or
+missing production-cadence exactness run.
+
 When the experiment has an absolute service-level target, add, for example,
 `--maximum-treatment-iteration-1-s 5`. This is an additional gate: it does not
 replace the startup-through-iteration-1 or complete-wall checks, so moving work
