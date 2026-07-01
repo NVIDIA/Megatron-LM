@@ -10,6 +10,14 @@ from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
 HAVE_TILELANG_SPARSE_MLA = HAVE_TILELANG_SPARSE_MLA_BWD and HAVE_TILELANG_SPARSE_MLA_FWD
 
 
+def _canonicalize_batch_stride(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize a size-one batch stride without copying tensor data."""
+    tensor = tensor.contiguous()
+    if tensor.ndim == 4 and tensor.size(0) == 1:
+        tensor = tensor.squeeze(0).unsqueeze(0)
+    return tensor
+
+
 def _valid_head_mask(indices, num_heads):
     valid_groups = indices.ge(0).any(dim=-1)
     kv_group = valid_groups.size(-1)
@@ -45,8 +53,9 @@ class SparseMLA(torch.autograd.Function):  # pragma: no cover
         Returns:
             out: Output tensor (seq_len, heads, dim) or (batch, seq_len, heads, dim)
         """
-        indices = indices.contiguous()
-        q, kv = q.contiguous(), kv.contiguous()
+        indices = _canonicalize_batch_stride(indices)
+        q = _canonicalize_batch_stride(q)
+        kv = _canonicalize_batch_stride(kv)
         ctx.scaling = scaling
         valid_heads = _valid_head_mask(indices, q.size(-2))
         tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)

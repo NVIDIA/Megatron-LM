@@ -357,6 +357,19 @@ def test_tilelang_kernel_helper_caches_and_env_parsing(monkeypatch):
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(96, kv_group=2)
 
 
+def test_sparse_mla_canonicalizes_size_one_batch_stride_without_copy():
+    tensor_sbhd = torch.empty(256, 1, 1, 4)
+    tensor_bshd = tensor_sbhd.permute(1, 0, 2, 3)
+
+    assert tensor_bshd.is_contiguous()
+    assert tensor_bshd.stride(0) != tensor_bshd.numel()
+
+    normalized = sparse_mla._canonicalize_batch_stride(tensor_bshd)
+
+    assert normalized.stride(0) == normalized.numel()
+    assert normalized.data_ptr() == tensor_bshd.data_ptr()
+
+
 def test_indexer_bwd_returns_grad_k_in_index_k_dtype(monkeypatch):
     captured = {}
 
@@ -898,7 +911,9 @@ def test_fused_sparse_mla_absorbed_accepts_thd_sentinels():
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
 
-    seqlen = 64
+    # Match the sequence bucket so the kernel receives the original B=1 tensor views.
+    # This exercises the canonical batch-stride handling rather than hiding it with padding.
+    seqlen = 256
     num_heads = 64
     dim = 576
     v_channels = 512
