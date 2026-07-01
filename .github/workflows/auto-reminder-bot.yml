@@ -7,43 +7,11 @@ on:
   schedule:
     - cron: "0 12 * * *"
 
-permissions: {}
-
 jobs:
-  # TEMPORARY: API-dispatched PR #3370 canary. The path is registered on the
-  # default branch, but this job runs only from NVIDIA's pull-request/4862 ref.
-  claude-fix-pr-3370:
-    name: Claude Fix PR 3370 Canary
-    if: |
-      github.repository == 'NVIDIA/Megatron-LM' &&
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/pull-request/4862' &&
-      github.actor == 'Phlip79' &&
-      github.triggering_actor == 'Phlip79'
-    permissions:
-      actions: read
-      contents: read
-      issues: write
-      pull-requests: read
-    uses: ./.github/workflows/claude-fix.yml
-    with:
-      test_mode: true
-      test_pr_number: 3370
-      test_requester: Phlip79
-    secrets:
-      NVIDIA_INFERENCE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
-      NVIDIA_INFERENCE_KEY: ${{ secrets.NVIDIA_INFERENCE_KEY }}
-      PAT: ${{ secrets.PAT }}
-
   run-script:
     name: Run Auto Reminder Bot
     runs-on: ubuntu-latest
-    if: |
-      github.repository == 'NVIDIA/Megatron-LM' &&
-      !(github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/pull-request/4862')
-    permissions:
-      contents: read
+    if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Check out repository code
         uses: actions/checkout@v6
