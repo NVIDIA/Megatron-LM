@@ -258,6 +258,14 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
+    log_per_layer_resource_usage: bool = False
+    """If set, log measured per-transformer-layer activation memory and forward/backward time."""
+
+    log_per_layer_resource_usage_interval: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"type": int}}
+    )
+    """Iteration interval for per-layer resource logging. Defaults to log-memory-interval when unset."""
+
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 

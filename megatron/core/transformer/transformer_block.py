@@ -23,6 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.per_layer_profiling import PerLayerProfiler
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -319,6 +320,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        self.per_layer_profiler = (
+            PerLayerProfiler(
+                self.layers,
+                layer_offset=get_transformer_layer_offset(
+                    self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+                ),
+            )
+            if self.config.log_per_layer_resource_usage
+            else None
+        )
 
     def _build_layers(self):
         # Transformer layers.

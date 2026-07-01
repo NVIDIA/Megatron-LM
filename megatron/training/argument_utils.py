@@ -346,6 +346,13 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
+    if (
+        kw_args.get('log_per_layer_resource_usage')
+        and kw_args.get('log_per_layer_resource_usage_interval') is None
+    ):
+        kw_args['log_per_layer_resource_usage_interval'] = (
+            args.log_memory_interval if args.log_memory_interval is not None else args.log_interval
+        )
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
