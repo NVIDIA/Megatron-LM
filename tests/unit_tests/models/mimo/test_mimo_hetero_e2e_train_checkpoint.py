@@ -35,6 +35,9 @@ def _run_launcher(base, train_iters, extra_args, name):
     # at seq 8192 needs them (unfused attention OOMs), so let the launcher use TE defaults.
     env.pop("NVTE_FLASH_ATTN", None)
     env.pop("NVTE_FUSED_ATTN", None)
+    # Shrink the MoE for the round-trip: the full 128-expert config trains but its
+    # optimizer-state load on resume exceeds 80 GiB; fewer experts exercises the same
+    # save/load path (grouped-GEMM experts, mamba, attention, Float16Module wrap) within memory.
     cmd = [
         "bash",
         str(_LAUNCHER),
@@ -42,6 +45,8 @@ def _run_launcher(base, train_iters, extra_args, name):
         str(base / "ckpt"),
         "--save-interval",
         "10",
+        "--num-experts",
+        "8",
         *extra_args,
     ]
     return subprocess.run(
