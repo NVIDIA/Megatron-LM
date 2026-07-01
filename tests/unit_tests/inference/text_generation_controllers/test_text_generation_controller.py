@@ -264,6 +264,8 @@ def _set_nested_attr(obj, attr_path, value):
 def test_validate_async_sched_support_for_step_success(total_request_count):
     context = _make_async_sched_context(total_request_count=total_request_count)
     controller = _make_async_sched_controller(context)
+    if total_request_count == 0:
+        context.config.materialize_only_last_token_logits = False
 
     controller._validate_async_sched_support_for_step()
 
@@ -406,6 +408,33 @@ def test_run_async_sched_forward_records_primer_and_returns_event(
     )
 
 
+@pytest.mark.parametrize(
+    "total_request_count, is_primed, expected_result, expected_forward_count",
+    [(0, True, False, 0), (2, True, True, 0), (2, False, True, 1)],
+)
+def test_run_async_sched_forward_primer(
+    total_request_count, is_primed, expected_result, expected_forward_count
+):
+    context = _make_async_sched_context(total_request_count=total_request_count)
+    controller = _make_async_sched_controller(context)
+    controller._decode_forward_primer = DecodeForwardPrimer(is_primed=is_primed)
+    input_ids = torch.tensor([[10, 11]])
+    position_ids = torch.tensor([[0, 1]])
+    controller._dynamic_step_context_init = mock.Mock(return_value=(input_ids, position_ids))
+    controller._run_async_sched_forward = mock.Mock()
+
+    result = controller._run_async_sched_forward_primer()
+
+    assert result is expected_result
+    assert controller._run_async_sched_forward.call_count == expected_forward_count
+    if expected_forward_count:
+        controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
+    else:
+        controller._dynamic_step_context_init.assert_not_called()
+    if total_request_count == 0:
+        assert not controller._decode_forward_primer.is_primed
+
+
 def test_async_sched_serial_step_returns_none_without_active_requests():
     context = _make_async_sched_context(total_request_count=0)
     context.active_token_count = 0
@@ -419,7 +448,7 @@ def test_async_sched_serial_step_returns_none_without_active_requests():
 
     assert result is None
     assert not controller._decode_forward_primer.is_primed
-    controller._validate_async_sched_support_for_step.assert_not_called()
+    controller._validate_async_sched_support_for_step.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

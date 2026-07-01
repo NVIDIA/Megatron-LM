@@ -299,6 +299,10 @@ class TextGenerationController:
         Raises if the current step does not support async scheduling.
         """
         context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if context.active_token_count == 0 and active_request_count == 0:
+            return
+
         if not context.config.materialize_only_last_token_logits:
             raise RuntimeError("Async scheduling requires materialize_only_last_token_logits=True.")
         if self.num_speculative_tokens != 0:
@@ -318,10 +322,7 @@ class TextGenerationController:
         if self.model_config.moe_enable_routing_replay:
             raise RuntimeError("Async scheduling does not support routing replay.")
 
-        active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
-        if active_request_count == 0:
-            return
         if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
             raise RuntimeError(
                 "Async scheduling only supports greedy sampling " "(SamplingParams.top_k == 1)."
@@ -1969,6 +1970,26 @@ class TextGenerationController:
         self._decode_forward_primer.mark_primed(cuda_graph_request_count)
         return self._record_async_sched_event(self._all_logits_cuda)
 
+    def _run_async_sched_forward_primer(self) -> bool:
+        """Ensure logits are available for async scheduling sampling.
+
+        Returns:
+            bool: Whether the async scheduling step should continue.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if context.active_token_count == 0 and active_request_count == 0:
+            self._decode_forward_primer.clear()
+            return False
+
+        with torch.inference_mode():
+            if not self._decode_forward_primer.is_primed:
+                input_ids, position_ids = self._dynamic_step_context_init()
+                self._run_async_sched_forward(input_ids, position_ids)
+
+        return True
+
     def _run_async_sched_resolve(
         self, sampled_tokens_cpu_view: Tensor, forward_done_event: Optional[Any], overlap: bool
     ) -> _AsyncScheduleForwardAndResolveResult:
@@ -2105,18 +2126,10 @@ class TextGenerationController:
             `None` when no requests are active.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-
-        if context.active_token_count == 0 and active_request_count == 0:
-            self._decode_forward_primer.clear()
-            return None
 
         self._validate_async_sched_support_for_step()
-
-        with torch.inference_mode():
-            if not self._decode_forward_primer.is_primed:
-                input_ids, position_ids = self._dynamic_step_context_init()
-                self._run_async_sched_forward(input_ids, position_ids)
+        if not self._run_async_sched_forward_primer():
+            return None
 
         await asyncio.sleep(0)
 
