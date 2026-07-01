@@ -5,11 +5,18 @@
 Layout under test: encoder grid tp=2,dp=2 at ranks 0-3, language grid tp=2,pp=2 at ranks 4-7.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.distributed as dist
 
-from examples.mimo.training.topology import ModuleGridSpec, _validate_grid_layout, create_topology
+from examples.mimo.training.topology import (
+    ModuleGridSpec,
+    _validate_grid_layout,
+    create_topology,
+    pg_collection_from_grid,
+)
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.parallel_state import default_embedding_ranks
@@ -23,6 +30,20 @@ def _specs():
         ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
         ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, pp=2, rank_offset=4),
     ]
+
+
+def test_pg_collection_uses_full_base_group_for_intra_dist_opt():
+    full_group = mock.sentinel.full_group
+    full_dims = ["tp", "cp", "dp", "pp"]
+    grid = mock.Mock()
+    grid.get_pg.side_effect = lambda dims, view=None: (
+        full_group if dims == full_dims and view is None else mock.sentinel.other_group
+    )
+
+    pg_collection = pg_collection_from_grid(grid)
+
+    assert pg_collection.intra_dist_opt is full_group
+    grid.get_pg.assert_any_call(full_dims)
 
 
 class TestModuleGridSpecResolution:
@@ -65,6 +86,14 @@ class TestHeteroTopology:
             assert encoder_ranks | llm_ranks == set(range(dist.get_world_size()))
             assert topo.grids[ENCODER].rank_offset == 0
             assert topo.grids[MIMO_LANGUAGE_MODULE_KEY].rank_offset == 4
+            local_module_name = ENCODER if dist.get_rank() < 4 else MIMO_LANGUAGE_MODULE_KEY
+            expected_language_name = MIMO_LANGUAGE_MODULE_KEY if dist.get_rank() >= 4 else None
+            assert len(topo.schedule_pg_collection.module_pgs) == 1
+            assert (
+                topo.schedule_pg_collection.module_pgs[local_module_name]
+                is topo.module_pgs[local_module_name]
+            )
+            assert topo.schedule_pg_collection.language_model_module_name == expected_language_name
         finally:
             topo.destroy()
 
