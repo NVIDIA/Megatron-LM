@@ -6,8 +6,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 
-# Set up cache dir for HF to avoid out of space error
-export HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
+# Set up cache dir for HF to avoid out of space error (overridable from caller).
+: "${HF_DATASETS_CACHE:=/tmp/hf_datasets_cache}"
+export HF_DATASETS_CACHE
 
 # Extra arguments of this script
 MLM_DEFAULT_ARGS=" \
