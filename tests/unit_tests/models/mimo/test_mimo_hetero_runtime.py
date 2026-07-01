@@ -3,13 +3,15 @@
 """Tests for MIMO per-rank runtime setup (RNG seeding, DDP wrapping)."""
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
-from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
@@ -71,6 +73,167 @@ def _eight_gpu_topology():
             ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, rank_offset=4),
         ]
     )
+
+
+def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
+    """The non-colocated builder seeds the one active role and sets the model contract."""
+    from examples.mimo.training.builder import (
+        _LANGUAGE_SEED_OFFSET,
+        MimoBuildConfig,
+        MimoModelBuilder,
+    )
+
+    args = _args(init_model_with_meta_device=True)
+    groups = mocker.Mock()
+    model = SimpleNamespace(language_model=mocker.Mock(), modality_submodules={})
+    topology = mocker.Mock()
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology, _args=args))
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, groups, None),
+    )
+    mocker.patch.object(builder, "build_model", return_value=model)
+    wrap = mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
+    grad_sync = mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+    torch_device = mocker.patch(
+        "examples.mimo.training.builder.torch.device", return_value=mocker.MagicMock()
+    )
+    seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
+
+    assert builder.build_distributed_models(
+        mocker.Mock(), ddp_config=DistributedDataParallelConfig(), data_parallel_random_init=True
+    ) == [model]
+
+    torch_device.assert_called_once_with("meta")
+    seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
+    wrap.assert_called_once_with(args, model, topology)
+    grad_sync.assert_called_once_with(args, model, topology)
+    # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
+    assert model.pg_collection is groups
+    assert model.rng_state_key_prefix == "language."
+
+
+def test_builder_encoder_role_sets_encoder_contract(mocker):
+    """On an encoder-only rank the builder seeds/labels with the encoder role."""
+    from examples.mimo.training.builder import (
+        _ENCODER_SEED_OFFSET,
+        MimoBuildConfig,
+        MimoModelBuilder,
+    )
+
+    args = _args(init_model_with_meta_device=False)
+    encoder_pg = mocker.Mock()
+    model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: mocker.Mock()})
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), _args=args))
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(ENCODER, False, True, None, encoder_pg),
+    )
+    mocker.patch.object(builder, "build_model", return_value=model)
+    mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
+    mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+    seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
+
+    builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+
+    seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
+    assert model.pg_collection is encoder_pg
+    assert model.rng_state_key_prefix == "encoder."
+
+
+def test_builder_rejects_colocated_or_zero_active_roles(mocker):
+    """Colocated (both) or zero active roles are not supported (non-colocated only)."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), _args=_args()))
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(ENCODER, True, True, mocker.Mock(), mocker.Mock()),
+    )
+    with pytest.raises(ValueError, match="exactly one active language or encoder role"):
+        builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+
+
+def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
+    """Outer MIMO hooks surround preparation (pre -> wrap -> configure -> post) with replacement."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    events = []
+    original_model = SimpleNamespace()
+    pre_replacement = SimpleNamespace()
+    post_replacement = SimpleNamespace()
+
+    def pre_hook(model_list):
+        assert model_list == [original_model]
+        assert original_model.model_type == ModelType.encoder_or_decoder
+        events.append("pre")
+        return [pre_replacement]
+
+    def post_hook(model_list):
+        assert model_list == [pre_replacement]
+        events.append("post")
+        return [post_replacement]
+
+    groups = mocker.Mock()
+    config = MimoBuildConfig(
+        _topology=mocker.Mock(),
+        _args=_args(init_model_with_meta_device=False),
+        pre_wrap_hooks=[pre_hook],
+        post_wrap_hooks=[post_hook],
+    )
+    builder = MimoModelBuilder(config)
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, groups, None),
+    )
+    mocker.patch("examples.mimo.training.builder.configure_module_rng")
+    mocker.patch.object(builder, "build_model", return_value=original_model)
+    mocker.patch(
+        "examples.mimo.training.builder.wrap_active_modules_with_ddp",
+        side_effect=lambda *_: events.append("wrap"),
+    )
+    mocker.patch(
+        "examples.mimo.training.builder.configure_grad_sync",
+        side_effect=lambda *_: events.append("configure"),
+    )
+
+    result = builder.build_distributed_models(
+        mocker.Mock(), ddp_config=DistributedDataParallelConfig()
+    )
+
+    assert events == ["pre", "wrap", "configure", "post"]
+    assert result == [post_replacement]
+
+
+@pytest.mark.parametrize(
+    ("hook_stage", "model_count"), [("pre", 0), ("pre", 2), ("post", 0), ("post", 2)]
+)
+def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, model_count):
+    """MIMO outer hooks must preserve the builder's single-model contract."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    replacement_models = [SimpleNamespace() for _ in range(model_count)]
+    hook_kwargs = {"pre_wrap_hooks": [], "post_wrap_hooks": []}
+    hook_kwargs[f"{hook_stage}_wrap_hooks"] = [lambda _models: replacement_models]
+    builder = MimoModelBuilder(
+        MimoBuildConfig(
+            _topology=mocker.Mock(), _args=_args(init_model_with_meta_device=False), **hook_kwargs
+        )
+    )
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, mocker.Mock(), None),
+    )
+    mocker.patch("examples.mimo.training.builder.configure_module_rng")
+    mocker.patch.object(builder, "build_model", return_value=SimpleNamespace())
+    mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
+    mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+
+    with pytest.raises(
+        ValueError,
+        match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
+    ):
+        builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")

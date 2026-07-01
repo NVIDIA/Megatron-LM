@@ -92,7 +92,10 @@ def _ddp_config_from_args(
 
 
 def wrap_active_modules_with_ddp(
-    args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
+    args: argparse.Namespace,
+    mimo_model: MimoModel,
+    topology: HeteroTopology,
+    data_parallel_random_init: bool = False,
 ) -> None:
     """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     if mimo_model.language_model is not None:
@@ -106,6 +109,7 @@ def wrap_active_modules_with_ddp(
             topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
             built_with_meta_device=lm_config.init_model_with_meta_device,
             ddp_config=_ddp_config_from_args(args, enable_overlap=True),
+            data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=Float16Module,
         )[0]
 
@@ -122,6 +126,7 @@ def wrap_active_modules_with_ddp(
                 topology.module_pgs[name],
                 built_with_meta_device=enc_config.init_model_with_meta_device,
                 ddp_config=_ddp_config_from_args(args, enable_overlap=False),
+                data_parallel_random_init=data_parallel_random_init,
                 mixed_precision_wrapper=_EncoderFloat16Module,
             )[0]
         )
