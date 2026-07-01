@@ -60,7 +60,7 @@ from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
