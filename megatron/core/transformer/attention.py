@@ -35,6 +35,13 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.swa_context_parallel import (
+    SwaP2PSegment,
+    build_swa_p2p_nonpacked_segments,
+    build_swa_p2p_packed_segments,
+    get_swa_p2p_halos,
+    is_swa_p2p_cp_comm_type,
+)
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
@@ -306,6 +313,7 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.swa_p2p = is_swa_p2p_cp_comm_type(cp_comm_type)
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -366,12 +374,19 @@ class Attention(MegatronModule, ABC):
             tmp_config.num_query_groups = world_size
         else:
             tmp_config = self.config
+        core_attention_cp_comm_type = cp_comm_type
+        if self.swa_p2p:
+            if tmp_config is self.config:
+                tmp_config = copy.deepcopy(self.config)
+            tmp_config.context_parallel_size = 1
+            tmp_config.cp_comm_type = None
+            core_attention_cp_comm_type = None
         self.core_attention = submodules.core_attention(
             config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
-            cp_comm_type=cp_comm_type,
+            cp_comm_type=core_attention_cp_comm_type,
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
         )
@@ -460,7 +475,10 @@ class Attention(MegatronModule, ABC):
             extra_kwargs = dict(core_attention_extra_kwargs)
             for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
                 extra_kwargs[name] = kwarg_value
-            output_ = self._run_core_attention(
+            run_core_attention = (
+                self._run_swa_p2p_core_attention if self.swa_p2p else self._run_core_attention
+            )
+            output_ = run_core_attention(
                 query,
                 key,
                 value,
@@ -504,6 +522,183 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             **extra_kwargs,
         )
+
+    def _get_swa_p2p_left_window(self) -> int:
+        """Return the causal SWA left-window size for this layer."""
+        if not is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            raise ValueError(
+                "cp_comm_type='swa_p2p' can only be used on layers with sliding-window attention. "
+                "Use a different cp_comm_type for full-attention layers."
+            )
+        if self.config.window_size is None:
+            raise ValueError("cp_comm_type='swa_p2p' requires config.window_size to be set.")
+
+        left_window, right_window = self.config.window_size
+        if left_window < 0 or right_window != 0:
+            raise ValueError(
+                "cp_comm_type='swa_p2p' currently supports causal SWA only, "
+                f"got window_size={self.config.window_size}."
+            )
+        return left_window
+
+    def _run_swa_p2p_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+    ):
+        """Run causal SWA attention with P2P K/V halo exchanges under CP sharding."""
+        if attention_bias is not None:
+            raise NotImplementedError("cp_comm_type='swa_p2p' does not support attention bias.")
+        if attn_mask_type not in (
+            None,
+            AttnMaskType.causal,
+            AttnMaskType.causal_bottom_right,
+            AttnMaskType.arbitrary,
+        ):
+            raise ValueError(
+                "cp_comm_type='swa_p2p' currently supports causal attention only, "
+                f"got attn_mask_type={attn_mask_type}."
+            )
+        if query.size(0) != key.size(0) or key.size(0) != value.size(0):
+            raise ValueError("cp_comm_type='swa_p2p' expects local self-attention Q/K/V lengths.")
+
+        left_window = self._get_swa_p2p_left_window()
+        cp_group = self.pg_collection.cp
+        if packed_seq_params is not None:
+            if attention_mask is not None:
+                raise NotImplementedError(
+                    "cp_comm_type='swa_p2p' packed path does not support an explicit "
+                    "attention_mask."
+                )
+            if packed_seq_params.cp_group is not None:
+                cp_group = packed_seq_params.cp_group
+            if packed_seq_params.local_cp_size is not None:
+                raise NotImplementedError("cp_comm_type='swa_p2p' does not support dynamic CP.")
+            cu_seqlens_padded = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            if cu_seqlens_padded is None:
+                raise ValueError("cp_comm_type='swa_p2p' packed path requires cu_seqlens.")
+        cp_size = cp_group.size()
+
+        if cp_size == 1:
+            return self._run_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=None,
+                packed_seq_params=packed_seq_params,
+            )
+
+        if packed_seq_params is not None:
+            segments_by_rank = build_swa_p2p_packed_segments(cu_seqlens_padded, cp_size)
+        else:
+            segments_by_rank = build_swa_p2p_nonpacked_segments(query.size(0), cp_size)
+
+        local_segments = segments_by_rank[cp_group.rank()]
+
+        if key.shape[1:-1] != value.shape[1:-1]:
+            raise NotImplementedError(
+                "cp_comm_type='swa_p2p' expects K/V tensors with matching non-channel "
+                f"dimensions, got key.shape={key.shape} and value.shape={value.shape}."
+            )
+        key_value = torch.cat((key, value), dim=-1)
+        key_value_halos = get_swa_p2p_halos(key_value, left_window, cp_group, segments_by_rank)
+
+        outputs = []
+        for segment, key_value_halo in zip(local_segments, key_value_halos):
+            key_halo, value_halo = torch.split(
+                key_value_halo, (key.size(-1), value.size(-1)), dim=-1
+            )
+            query_segment = query.narrow(0, segment.local_offset, segment.length)
+            key_segment = key.narrow(0, segment.local_offset, segment.length)
+            value_segment = value.narrow(0, segment.local_offset, segment.length)
+            key_segment = torch.cat((key_halo, key_segment), dim=0)
+            value_segment = torch.cat((value_halo, value_segment), dim=0)
+
+            if packed_seq_params is None:
+                segment_attention_mask = self._get_swa_p2p_segment_attention_mask(
+                    attention_mask, segment, key_halo.size(0), left_window
+                )
+                segment_attn_mask_type = (
+                    AttnMaskType.arbitrary
+                    if segment_attention_mask is not None
+                    else AttnMaskType.causal_bottom_right
+                )
+                segment_packed_seq_params = None
+            else:
+                segment_attention_mask = None
+                segment_attn_mask_type = AttnMaskType.causal_bottom_right
+                segment_packed_seq_params = None
+                query_segment = query_segment.unsqueeze(1)
+                key_segment = key_segment.unsqueeze(1)
+                value_segment = value_segment.unsqueeze(1)
+
+            segment_output = self._run_core_attention(
+                query_segment,
+                key_segment,
+                value_segment,
+                segment_attention_mask,
+                attn_mask_type=segment_attn_mask_type,
+                attention_bias=None,
+                packed_seq_params=segment_packed_seq_params,
+            )
+            if packed_seq_params is not None:
+                segment_output = segment_output.squeeze(1)
+            outputs.append(segment_output)
+
+        return torch.cat(outputs, dim=0)
+
+    def _get_swa_p2p_segment_attention_mask(
+        self,
+        attention_mask: Tensor | None,
+        segment: SwaP2PSegment,
+        halo_len: int,
+        left_window: int,
+    ) -> Tensor | None:
+        """Slice a dense reset attention mask for one SWA P2P segment."""
+        if attention_mask is None:
+            return None
+        if attention_mask.size(-2) < segment.local_offset + segment.length:
+            raise ValueError(
+                "cp_comm_type='swa_p2p' attention_mask query dimension is smaller than "
+                "the local CP sequence length."
+            )
+
+        key_start = segment.global_start - halo_len
+        key_end = segment.global_start + segment.length
+        if attention_mask.size(-1) < key_end:
+            raise ValueError(
+                "cp_comm_type='swa_p2p' attention_mask key dimension is smaller than "
+                "the global CP sequence length."
+            )
+        key_positions = torch.arange(key_start, key_end, device=attention_mask.device)
+        segment_mask = attention_mask[
+            :, :, segment.local_offset : segment.local_offset + segment.length, :
+        ].index_select(-1, key_positions)
+
+        query_positions = torch.arange(
+            segment.global_start,
+            segment.global_start + segment.length,
+            device=attention_mask.device,
+        )
+        key_positions = key_positions.view(1, 1, 1, -1)
+        query_positions = query_positions.view(1, 1, -1, 1)
+        swa_mask = (key_positions > query_positions) | (
+            key_positions < query_positions - left_window
+        )
+        return segment_mask | swa_mask
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -1518,15 +1713,26 @@ class Attention(MegatronModule, ABC):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = apply_module(self.core_attention)(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
-                    )
+                    if self.swa_p2p:
+                        core_attn_out = self._run_swa_p2p_core_attention(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=attention_bias,
+                            packed_seq_params=packed_seq_params,
+                        )
+                    else:
+                        core_attn_out = apply_module(self.core_attention)(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=attention_bias,
+                            packed_seq_params=packed_seq_params,
+                        )
 
             else:
                 # Dynamic batching attention kernel.

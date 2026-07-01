@@ -2890,10 +2890,10 @@ def _add_distributed_args(parser):
                        'Set to enable FSDP ZeRO-2.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
-                       'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
-                       'all layers will share the same communication type. Users can also '
-                       'specify separated types for each layer like '
-                       '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+                       'p2p, a2a, allgather, a2a+p2p, or swa_p2p. If a single string is '
+                       'provided, all layers will share the same communication type. Users can '
+                       'also specify separated types for each layer like '
+                       '--cp-comm-type swa_p2p swa_p2p a2a+p2p a2a+p2p')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
