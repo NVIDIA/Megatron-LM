@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 import warnings
 from copy import deepcopy
 from enum import Enum
@@ -25,15 +26,21 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    get_pg_size,
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
 
 if HAVE_TE:
+    import transformer_engine as te
+
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 else:
+    te = None
     TELinear, set_save_original_input = None, None
+    get_cuda_rng_tracker = None
 
 
 class SharedExpertState(Enum):
@@ -122,6 +129,12 @@ class SharedExpertMLP(MLP):
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
 
+        self._fused_grouped_swiglu_ops = None
+        self._fused_grouped_swiglu_recipe = None
+        self._use_fused_grouped_swiglu = self.config.use_grouped_gemm_for_shared_expert
+        if self._use_fused_grouped_swiglu:
+            self._validate_fused_grouped_swiglu()
+
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
             # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -186,9 +199,157 @@ class SharedExpertMLP(MLP):
                 self.__class__.stream = torch.cuda.Stream()
             self.stream = self.__class__.stream
 
+    def _validate_fused_grouped_swiglu(self) -> None:
+        """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
+        if not HAVE_TE:
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine when "
+                "use_grouped_gemm_for_shared_expert=True."
+            )
+        if not is_te_min_version("2.14.0"):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
+                "(needs pytorch.ops.GroupedLinear and pytorch.ops.ScaledSwiGLU)."
+            )
+        if self.config.add_bias_linear:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support add_bias_linear=True; "
+                "the CuTeGEMM fused kernel requires bias-free linear layers."
+            )
+        if not self.config.gated_linear_unit or self.config.activation_func != F.silu:
+            raise ValueError(
+                f"{self.__class__.__name__} requires SwiGLU activation "
+                "(activation_func=F.silu, gated_linear_unit=True) for the CuTeGEMM "
+                f"fused kernel, but got activation_func={self.config.activation_func}, "
+                f"gated_linear_unit={self.config.gated_linear_unit}."
+            )
+        if self.config.moe_shared_expert_glu_interleave_size is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires "
+                "moe_shared_expert_glu_interleave_size to be set when "
+                "use_grouped_gemm_for_shared_expert=True."
+            )
+        if not isinstance(self.linear_fc1, te.pytorch.Linear):
+            raise ValueError(
+                f"{self.__class__.__name__} expects FC1 to be Transformer Engine Linear, "
+                f"but found {self.linear_fc1.__class__.__name__}."
+            )
+        if not isinstance(self.linear_fc2, te.pytorch.Linear):
+            raise ValueError(
+                f"{self.__class__.__name__} expects FC2 to be Transformer Engine Linear, "
+                f"but found {self.linear_fc2.__class__.__name__}."
+            )
+
+    def _get_fused_grouped_swiglu_recipe(self):
+        """Create the TE recipe used to select the fused grouped MLP kernel."""
+        if self._fused_grouped_swiglu_recipe is None:
+            if os.getenv("FP4_RECIPE", "") == "nvfp4":
+                self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
+            else:
+                self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+        return self._fused_grouped_swiglu_recipe
+
+    def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
+        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        ops = te.pytorch.ops.Sequential()
+        tp_world_size = get_pg_size(self.tp_group)
+        rng_state_tracker_function = None
+        if get_cuda_rng_tracker().is_initialized():
+            rng_state_tracker_function = get_cuda_rng_tracker
+
+        glu_interleave_size = self.config.moe_shared_expert_glu_interleave_size
+        fc1_weight = self.linear_fc1.weight
+        op = te.pytorch.ops.GroupedLinear(
+            num_groups=1,
+            in_features=fc1_weight.size(1),
+            out_features=fc1_weight.size(0) * tp_world_size,
+            device="meta",
+            dtype=fc1_weight.dtype,
+            bias=False,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+        )
+        op.weight0 = fc1_weight
+        op._glu_interleave_size = glu_interleave_size
+        ops.append(op)
+
+        ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+
+        fc2_weight = self.linear_fc2.weight
+        op = te.pytorch.ops.GroupedLinear(
+            num_groups=1,
+            in_features=fc2_weight.size(1),
+            out_features=fc2_weight.size(0),
+            device="meta",
+            dtype=fc2_weight.dtype,
+            bias=False,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+        )
+        op.weight0 = fc2_weight
+        ops.append(op)
+
+        def forward_pre_hook(_module, *_) -> None:
+            for source in (self.linear_fc1, self.linear_fc2):
+                for hook_id, hook in list(source._forward_pre_hooks.items()):
+                    if hook_id in source._forward_pre_hooks_with_kwargs:
+                        ret = hook(source, (), {})
+                    else:
+                        ret = hook(source, ())
+                    if ret is not None:
+                        raise RuntimeError(
+                            f"{self.__class__.__name__} cannot replay a pre-forward hook "
+                            f"on {source.__class__.__name__} that modifies inputs."
+                        )
+
+        ops.register_forward_pre_hook(forward_pre_hook)
+        return ops
+
+    def _fused_grouped_swiglu_no_comm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the fused shared expert MLP on tensor-parallel prepared input."""
+        orig_shape = hidden_states.shape
+        hidden_size = hidden_states.size(-1)
+        hidden_states_2d = hidden_states.view(-1, hidden_size)
+        total_tokens = hidden_states_2d.size(0)
+        tokens_per_expert = torch.full(
+            (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+        )
+        scales = torch.ones(total_tokens, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        recipe = self._get_fused_grouped_swiglu_recipe()
+        if self._fused_grouped_swiglu_ops is None:
+            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                self._fused_grouped_swiglu_ops = (self._make_fused_grouped_swiglu_ops(),)
+
+        with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            output = self._fused_grouped_swiglu_ops[0](
+                hidden_states_2d, tokens_per_expert, scales, tokens_per_expert
+            )
+        return output.view(*orig_shape[:-1], output.size(-1))
+
+    def _fused_grouped_swiglu_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
+        if self.config.sequence_parallel:
+            fc1_input = gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=True
+            )
+        else:
+            fc1_input = copy_to_tensor_model_parallel_region(hidden_states)
+
+        fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
+
+        if self.config.sequence_parallel:
+            output = reduce_scatter_to_sequence_parallel_region(fc2_output)
+        else:
+            output = reduce_from_tensor_model_parallel_region(fc2_output)
+        return output
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
-        output, _ = super().forward(hidden_states)
+        if self._use_fused_grouped_swiglu:
+            output = self._fused_grouped_swiglu_forward(hidden_states)
+        else:
+            output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
@@ -252,6 +413,11 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         with torch.cuda.stream(self.stream):
+            if self._use_fused_grouped_swiglu:
+                self.cached_fc2_output = self._fused_grouped_swiglu_no_comm(self.cached_fc1_input)
+                self.cached_fc1_input = None
+                return
+
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
                 self.cached_fc1_input
@@ -311,6 +477,9 @@ class SharedExpertMLP(MLP):
         """
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
+        if self._use_fused_grouped_swiglu and self.cached_fc2_output is not None:
+            return
+        assert self.cached_fc2_input is not None
         with torch.cuda.stream(self.stream):
             # [s, b, h]
             self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
@@ -354,6 +523,22 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
         torch.cuda.current_stream().wait_stream(self.stream)
         return output
+
+    def backward_dw(self):
+        """Compute delayed weight gradients for fused or unfused shared experts."""
+        if self._use_fused_grouped_swiglu and self.config.delay_wgrad_compute:
+            if self._fused_grouped_swiglu_ops is not None:
+                (seq,) = self._fused_grouped_swiglu_ops
+                fused_children = list(seq.children())
+                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
+                if hasattr(self.linear_fc2, "_trigger_wgrad_accumulation_and_reduce_hooks"):
+                    self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
+                if hasattr(self.linear_fc1, "_trigger_wgrad_accumulation_and_reduce_hooks"):
+                    self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
+            return
+        super().backward_dw()
 
 
 def set_tensor_grad_fn_sequence_sr(tensor, value):
