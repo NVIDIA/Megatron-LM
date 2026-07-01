@@ -74,9 +74,12 @@ class TestFSDP1F1BOverlap:
         [[], ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]],
     )
     def test_fsdp_1f1b_memory_opt(self, recompute_modules, offload_modules):
+        # Configure shared experts so recompute_modules=[..., "shared_experts"] actually
+        # exercises the shared-experts discard-output recompute (a no-op without them).
         self._run_test_helper(
             dispatcher_type="alltoall",
             sharding_strategy="optim_grads_params",
+            shared_expert_intermediate_size=512,
             recompute_modules=recompute_modules,
             offload_modules=offload_modules,
         )
