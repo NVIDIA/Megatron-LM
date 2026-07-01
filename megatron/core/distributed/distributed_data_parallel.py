@@ -126,7 +126,13 @@ class DistributedDataParallel(_BaseDataParallel):
         # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). fp8 params key to
         # uint8 (own buffer); partition_buckets later merges the small non-fp8 bucket groups into
         # the fp8 group to aggregate their communication.
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not getattr(
+                self.ddp_config, 'use_layer_wise_param_layout', True
+            ),
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
