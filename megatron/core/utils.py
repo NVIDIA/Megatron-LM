@@ -40,6 +40,8 @@ try:
     HAVE_DTENSOR = True
 except ImportError:
     HAVE_DTENSOR = False
+    DTensor = None
+    Shard = None
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -1111,15 +1113,39 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
         return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
 
 
+def is_same_process_group(
+    group: torch.distributed.ProcessGroup | None, other: torch.distributed.ProcessGroup | None
+) -> bool:
+    """Returns whether two process groups contain the same ranks."""
+    if group is None or other is None:
+        return False
+    if group is other:
+        return True
+    try:
+        return torch.distributed.get_process_group_ranks(
+            group
+        ) == torch.distributed.get_process_group_ranks(other)
+    except (RuntimeError, ValueError):
+        return False
+
+
 def get_data_parallel_group_if_dtensor(
     tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
 ) -> Optional["ProcessGroup"]:
     """Gets the data parallel group of the given tensor if it is a DTensor."""
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        current_group = tensor.device_mesh.get_group()
-        assert data_parallel_group is None or current_group == data_parallel_group
+        dist_index = getattr(tensor, "megatron_fsdp_dist_index", None)
+        if dist_index is not None:
+            current_group = dist_index.get_dp_group(
+                is_expert_parallel=getattr(tensor, "megatron_fsdp_is_expert_param", False)
+            )
+        else:
+            current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or is_same_process_group(
+            current_group, data_parallel_group
+        )
         return current_group
-    return None
+    return data_parallel_group
 
 
 def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
