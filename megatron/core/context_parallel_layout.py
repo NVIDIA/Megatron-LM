@@ -139,6 +139,9 @@ def _zigzag_contiguous_thd_swap(
     x = x.contiguous()
 
     cu = cu_seqlens.to(device=x.device, dtype=torch.long)
+    # TODO: Let a future CP layout scheduler precompute this routing once per
+    # microbatch from immutable cu_seqlens and pass it through both THD swaps.
+    # Do not cache it across microbatches because packed sequence boundaries change.
     source_by_rank = [
         get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_layout)
         for rank in range(cp_size)
