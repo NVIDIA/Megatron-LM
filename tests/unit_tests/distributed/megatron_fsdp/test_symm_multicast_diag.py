@@ -9,10 +9,10 @@ import ctypes
 import subprocess
 
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.profiler import ProfilerActivity, profile
 
-import torch.distributed as dist
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
@@ -54,7 +54,9 @@ def test_symm_multicast_diagnostic(distributed_setup):
         try:
             mig = subprocess.run(
                 ["nvidia-smi", "--query-gpu=mig.mode.current", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True,
+                text=True,
+                timeout=60,
             ).stdout.strip()
             print(f"[SYMMDIAG] mig.mode.current: {mig!r}")
         except Exception as e:  # noqa: BLE001
@@ -67,9 +69,7 @@ def test_symm_multicast_diagnostic(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(0)
     model = torch.nn.Linear(1024, 1024, bias=False).to(device=device, dtype=torch.bfloat16)
-    placements = Placements(
-        dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-    )
+    placements = Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
     fully_shard(model, mesh=mesh, placements=placements, use_symm_mem=True)
     opt = torch.optim.SGD(model.parameters(), lr=0.0, foreach=False)
     x = torch.randn(64, 1024, device=device, dtype=torch.bfloat16)
