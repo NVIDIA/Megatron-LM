@@ -60,7 +60,9 @@ def _tail(result):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
-@pytest.mark.skipif(_UNDER_TORCHRUN, reason="launcher spawns its own torchrun; run as a plain process")
+@pytest.mark.skipif(
+    _UNDER_TORCHRUN, reason="launcher spawns its own torchrun; run as a plain process"
+)
 def test_hetero_mimo_20l_trains_and_checkpoint_round_trips():
     # The 128-expert MoE checkpoint is large; save under the repo workspace (a roomy
     # shared filesystem on the cluster) rather than pytest's node-local /tmp tmp_path.
@@ -74,7 +76,9 @@ def test_hetero_mimo_20l_trains_and_checkpoint_round_trips():
         assert (ckpt / "iter_0000010").is_dir(), "iter_0000010 checkpoint dir missing"
 
         # Resume from the checkpoint and train two more iterations.
-        resume = _run_launcher(scratch, train_iters=12, extra_args=["--load", str(ckpt)], name="resume")
+        resume = _run_launcher(
+            scratch, train_iters=12, extra_args=["--load", str(ckpt)], name="resume"
+        )
         assert resume.returncode == 0, f"resume run failed:\n{_tail(resume)}"
         assert (
             "successfully loaded checkpoint" in (resume.stdout + resume.stderr).lower()

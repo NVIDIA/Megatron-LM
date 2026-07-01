@@ -873,10 +873,7 @@ class TestUnimodalBuildDistributedModels:
         prebuilt_chunks = [self.mock_model]
         try:
             result = prepare_existing_model_chunks_for_distributed_training(
-                prebuilt_chunks,
-                self.transformer_config,
-                self.pg,
-                wrap_with_ddp=False,
+                prebuilt_chunks, self.transformer_config, self.pg, wrap_with_ddp=False
             )
 
             assert result is prebuilt_chunks

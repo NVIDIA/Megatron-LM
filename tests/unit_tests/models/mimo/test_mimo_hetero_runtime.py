@@ -128,8 +128,7 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
     mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
-        "examples.mimo.training.builder._resolve_role",
-        return_value=(ENCODER, False, encoder_pg),
+        "examples.mimo.training.builder._resolve_role", return_value=(ENCODER, False, encoder_pg)
     )
     mocker.patch.object(builder, "build_model", return_value=model)
     mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
@@ -183,9 +182,7 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
 
     groups = mocker.Mock()
     config = MimoBuildConfig(
-        _topology=mocker.Mock(),
-        pre_wrap_hooks=[pre_hook],
-        post_wrap_hooks=[post_hook],
+        _topology=mocker.Mock(), pre_wrap_hooks=[pre_hook], post_wrap_hooks=[post_hook]
     )
     builder = MimoModelBuilder(config)
     mocker.patch(
