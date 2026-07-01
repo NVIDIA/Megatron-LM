@@ -40,8 +40,6 @@ if TYPE_CHECKING:
     from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
     from megatron.core.transformer import MegatronModule
 
-    from megatron.training.state import GlobalState
-
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -69,7 +67,7 @@ VALID_EVENTS: frozenset[str] = frozenset(
 class CallbackContext:
     """Context passed to callbacks.
 
-    Contains framework state and a persistent user_state dict.
+    Contains framework objects and a persistent user_state dict.
     Modifying framework objects is at the user's own risk.
 
     Attributes:
@@ -83,7 +81,7 @@ class CallbackContext:
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
 
     Field Availability by Event:
-        All events: state, model, user_state
+        All events: model, user_state
         Training events: optimizer, scheduler
         on_data_init_start: optimizer, scheduler
         on_train_step_end: loss_dict, grad_norm, skipped_iter
