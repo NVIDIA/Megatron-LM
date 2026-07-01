@@ -2,12 +2,12 @@
 
 import logging
 
-
 logger = logging.getLogger(__name__)
 
 from typing import Any, Callable
 
 import torch
+
 from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
@@ -29,12 +29,10 @@ from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config
 
-
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
 except ImportError:
     correct_amax_history_if_needed = None
-
 
 
 def unimodal_build_distributed_models(
@@ -89,9 +87,13 @@ def unimodal_build_distributed_models(
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
     if init_model_with_meta_device:
         with torch.device("meta"):
-            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
+            model_list = build_virtual_pipeline_stages(
+                build_model_func, pg_collection, vp_size, model_type
+            )
     else:
-        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
+        model_list = build_virtual_pipeline_stages(
+            build_model_func, pg_collection, vp_size, model_type
+        )
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:
@@ -102,6 +104,63 @@ def unimodal_build_distributed_models(
             model_list = _model
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
+
+    return prepare_existing_model_chunks_for_distributed_training(
+        model_list,
+        transformer_config,
+        pg_collection,
+        built_with_meta_device=init_model_with_meta_device,
+        ddp_config=ddp_config,
+        overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=use_megatron_fsdp,
+        use_torch_fsdp2=use_torch_fsdp2,
+        wrap_with_ddp=wrap_with_ddp,
+        data_parallel_random_init=data_parallel_random_init,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+    )
+
+
+def prepare_existing_model_chunks_for_distributed_training(
+    model_list: list[MegatronModule],
+    transformer_config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    built_with_meta_device: bool,
+    ddp_config: DistributedDataParallelConfig | None = None,
+    overlap_param_gather_with_optimizer_step: bool = False,
+    use_megatron_fsdp: bool = False,
+    use_torch_fsdp2: bool = False,
+    wrap_with_ddp: bool = True,
+    data_parallel_random_init: bool = False,
+    mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+) -> list[MegatronModule]:
+    """Apply the shared post-build distributed lifecycle to already-built model chunks.
+
+    Applies default TP attrs, print-num-params, cuda placement, mixed-precision wrap,
+    meta-device materialize, and DDP/FSDP wrap. Does not build pipeline stages.
+
+    Args:
+        model_list: Already-built model chunks.
+        transformer_config: TransformerConfig; used for precision and device placement.
+        pg_collection: Model communication process groups.
+        built_with_meta_device: Whether the chunks were built on meta device.
+        ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
+        overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step.
+        use_megatron_fsdp: Whether to use Megatron FSDP.
+        use_torch_fsdp2: Whether to use Torch FSDP 2.0.
+        wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
+        data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
+            Pass ``None`` to skip.
+
+    Returns:
+        List of model chunks, wrapped and ready for distributed training.
+    """
+    if wrap_with_ddp and not ddp_config:
+        raise ValueError("ddp_config is required when wrap_with_ddp is True")
+    if transformer_config.init_model_with_meta_device != built_with_meta_device:
+        raise ValueError(
+            "Transformer config init_model_with_meta_device must match the model construction context"
+        )
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -117,16 +176,17 @@ def unimodal_build_distributed_models(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
+    if not use_torch_fsdp2 and not use_cpu_initialization and not built_with_meta_device:
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
+    if built_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model_list
+            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            for model_module in model_list
         ]
 
     if correct_amax_history_if_needed is not None:
@@ -161,7 +221,12 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
             " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
                 pg_collection.tp.rank(),
                 pg_collection.pp.rank(),
-                sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model]),
+                sum(
+                    [
+                        sum([p.nelement() for p in model_module.parameters()])
+                        for model_module in model
+                    ]
+                ),
             ),
             flush=True,
         )
@@ -175,7 +240,9 @@ def _wrap_with_mp_wrapper(
     fp16 = transformer_config.fp16
     bf16 = transformer_config.bf16
     if (fp16 or bf16) and mixed_precision_wrapper is not None:
-        model_list = [mixed_precision_wrapper(transformer_config, model_module) for model_module in model_list]
+        model_list = [
+            mixed_precision_wrapper(transformer_config, model_module) for model_module in model_list
+        ]
 
         # Maintain expert bias in float32 wrapped in Float16Module
         for model_module in model_list:
@@ -214,13 +281,14 @@ def _ddp_wrap(
     if use_megatron_fsdp:
         DP = FullyShardedDataParallel
         if use_torch_fsdp2:
-            raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
+            raise ValueError(
+                "Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported."
+            )
     elif use_torch_fsdp2:
         assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
         DP = TorchFullyShardedDataParallel
     else:
         DP = DistributedDataParallel
-
 
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
@@ -253,31 +321,22 @@ def _ddp_wrap(
         wrapped_model = []
         for model_chunk_idx, model_chunk in enumerate(model):
             chunk_kwargs = dict(dp_init_kwargs)
-            disable_bucketing = (
-                (model_chunk_idx > 0)
-                or overlap_param_gather_with_optimizer_step
-            )
+            disable_bucketing = (model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step
 
             # Pre-compute parameter layouts for the distributed optimizer.
             # Only pass to DDP; FSDP variants don't accept full_param_layout.
             if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
-                all_params = [
-                    p for p in model_chunk.parameters() if p.requires_grad
-                ]
+                all_params = [p for p in model_chunk.parameters() if p.requires_grad]
                 pp_rank = pg_collection.pp.rank()
                 effective_bucket_size = (
-                    None
-                    if disable_bucketing or pp_rank > 0
-                    else ddp_config.bucket_size
+                    None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                 )
-                chunk_kwargs["full_param_layout"] = (
-                    DistributedOptimizer.compute_full_param_layout(
-                        all_params,
-                        effective_bucket_size,
-                        pg_collection.dp_cp.size(),
-                        ddp_config,
-                        expert_data_parallel_world_size=pg_collection.expt_dp.size(),
-                    )
+                chunk_kwargs["full_param_layout"] = DistributedOptimizer.compute_full_param_layout(
+                    all_params,
+                    effective_bucket_size,
+                    pg_collection.dp_cp.size(),
+                    ddp_config,
+                    expert_data_parallel_world_size=pg_collection.expt_dp.size(),
                 )
 
             wrapped_chunk = DP(
@@ -330,13 +389,14 @@ def build_virtual_pipeline_stages(
         # Create multiple model stages for virtual pipeline
         model_list = []
         for i in range(vp_size):
-            pre_process = is_vp_first_stage(vp_stage=i, vp_size=vp_size) and is_pp_first_stage(pp_group)
-            post_process = is_vp_last_stage(vp_stage=i, vp_size=vp_size) and is_pp_last_stage(pp_group)
+            pre_process = is_vp_first_stage(vp_stage=i, vp_size=vp_size) and is_pp_first_stage(
+                pp_group
+            )
+            post_process = is_vp_last_stage(vp_stage=i, vp_size=vp_size) and is_pp_last_stage(
+                pp_group
+            )
             model = build_model_func(
-                pg_collection,
-                pre_process=pre_process,
-                post_process=post_process,
-                vp_stage=i,
+                pg_collection, pre_process=pre_process, post_process=post_process, vp_stage=i
             )
             model.model_type = model_type
             model_list.append(model)
