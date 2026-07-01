@@ -76,6 +76,8 @@ def test_hetero_mimo_20l_trains_and_checkpoint_round_trips():
         # Resume from the checkpoint and train two more iterations.
         resume = _run_launcher(scratch, train_iters=12, extra_args=["--load", str(ckpt)], name="resume")
         assert resume.returncode == 0, f"resume run failed:\n{_tail(resume)}"
-        assert "loading checkpoint from" in (resume.stdout + resume.stderr).lower(), "resume did not load"
+        assert (
+            "successfully loaded checkpoint" in (resume.stdout + resume.stderr).lower()
+        ), f"resume did not load the checkpoint:\n{_tail(resume)}"
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
