@@ -589,8 +589,8 @@ jobs:
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
       BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
       BASE_REF: ${{ needs.authorize.outputs.base_ref }}
-      # Fail closed: Bash/test subprocesses must not inherit the Anthropic key,
-      # GitHub token, or other action secrets.
+      # Fail closed: Bash/test subprocesses must not inherit the NVIDIA
+      # inference key, GitHub token, or other action secrets.
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
     steps:
       # Keep trusted repository instructions at the workspace root. The
@@ -693,8 +693,14 @@ jobs:
         # Pin the security-sensitive third-party action to the v1 commit
         # resolved on 2026-06-29.
         uses: anthropics/claude-code-action@a92e7c70a4da9793dc164451d829089dc057a464 # v1.0.159
+        # Match the repository-wide NVIDIA inference configuration introduced
+        # by #5589 while keeping proxy-only features disabled.
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ github.token }}
           trigger_phrase: "/claude fix"
           base_branch: ${{ needs.authorize.outputs.base_ref }}
@@ -768,6 +774,7 @@ jobs:
                   ],
                   "envVars": [
                     {"name": "ANTHROPIC_API_KEY", "mode": "deny"},
+                    {"name": "ANTHROPIC_BASE_URL", "mode": "deny"},
                     {"name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny"},
                     {"name": "GITHUB_TOKEN", "mode": "deny"},
                     {"name": "GH_TOKEN", "mode": "deny"},
@@ -847,7 +854,7 @@ jobs:
           claude_args: |
             --permission-mode dontAsk
             --allowedTools "Bash,Read(/AGENTS.md),Read(/CLAUDE.md),Read(/skills/**),Read(/.claude-fix-steer.txt),Read(/pr-head/**),Read(/${{ runner.temp }}/github-ci-logs/**),Edit(/pr-head/**),mcp__github_ci__get_ci_status,mcp__github_ci__get_workflow_run_details,mcp__github_ci__download_job_log"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
             --max-turns 100
 
       - name: Export raw binary patch
