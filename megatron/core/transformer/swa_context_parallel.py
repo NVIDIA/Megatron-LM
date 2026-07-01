@@ -246,6 +246,7 @@ class _SwaP2PHaloExchange(torch.autograd.Function):
         cp_group: torch.distributed.ProcessGroup,
         segments_by_rank: list[list[SwaP2PSegment]],
     ) -> tuple[torch.Tensor, ...]:
+        """Exchange previous-token halos needed by each local CP segment."""
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
         local_segments = segments_by_rank[cp_rank]
@@ -332,6 +333,7 @@ class _SwaP2PHaloExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_halos: torch.Tensor):
+        """Send halo gradients back to source ranks and accumulate local gradients."""
         cp_group = ctx.cp_group
         cp_rank = ctx.cp_rank
         cp_size = ctx.cp_size

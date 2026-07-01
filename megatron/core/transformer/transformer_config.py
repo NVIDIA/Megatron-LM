@@ -935,7 +935,8 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     "swa_p2p": A causal sliding-window-attention implementation that keeps Q/K/V sequence-sharded
     and exchanges only the previous-token K/V borders required by the local SWA window.
-    In layer-wise CP configurations, use `swa_p2p` for SWA layers and  `p2p` or `a2a+p2p` for full-attention layers.
+    In layer-wise CP configurations, use `swa_p2p` for SWA layers and `p2p` or
+    `a2a+p2p` for full-attention layers.
     """
 
     ##################

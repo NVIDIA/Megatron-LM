@@ -661,11 +661,7 @@ class Attention(MegatronModule, ABC):
         return torch.cat(outputs, dim=0)
 
     def _get_swa_p2p_segment_attention_mask(
-        self,
-        attention_mask: Tensor | None,
-        segment: SwaP2PSegment,
-        halo_len: int,
-        left_window: int,
+        self, attention_mask: Tensor | None, segment: SwaP2PSegment, halo_len: int, left_window: int
     ) -> Tensor | None:
         """Slice a dense reset attention mask for one SWA P2P segment."""
         if attention_mask is None:
