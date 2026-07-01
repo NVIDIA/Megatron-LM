@@ -20,8 +20,9 @@ def get_thd_context_parallel_rank_indices(
         cp_rank: Context-parallel rank.
         layout: Either ``"zigzag"`` or ``"contiguous"``.
 
-    The returned indices are ordered exactly as the rank-local THD tensor is stored:
-    each packed sequence contributes its two local chunks in rank-local slot order.
+    The returned indices are ordered exactly as the rank-local THD tensor is stored.
+    ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
+    partitions the flattened packed THD buffer into rank-contiguous spans.
     """
     if layout not in ("zigzag", "contiguous"):
         raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
@@ -57,6 +58,11 @@ def get_thd_context_parallel_rank_indices(
             f"got {seq_lens}."
         )
 
+    if layout == "contiguous":
+        part_len = total_tokens // cp_size
+        rank_start = cp_rank * part_len
+        return positions[rank_start : rank_start + part_len]
+
     seq_idx = torch.bucketize(positions, cu[1:], right=True)
     global_starts = cu[:-1]
     pos_in_seq = positions - global_starts[seq_idx]
@@ -64,12 +70,8 @@ def get_thd_context_parallel_rank_indices(
     chunk = pos_in_seq // chunk_lens
     offset = pos_in_seq - chunk * chunk_lens
 
-    if layout == "zigzag":
-        owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
-        local_slot = torch.where(chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk))
-    else:
-        owner = chunk // 2
-        local_slot = chunk % 2
+    owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
+    local_slot = torch.where(chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk))
 
     local_starts = (global_starts // cp_size)[seq_idx]
     local_pos = local_starts + local_slot * chunk_lens + offset

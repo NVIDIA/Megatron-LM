@@ -1131,6 +1131,9 @@ def test_parallel_gated_delta_net_correctness(
         atol, rtol = 2e-4, 2e-3
         cosine_similarity_threshold = 0.99999
 
+    is_chunkwise_cp = linear_cp_mode == "chunkwise" and cp > 1
+    micro_batch_size = 1 if is_chunkwise_cp and not sequence_packing else 4
+
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
         transformer_layer_spec=transformer_layer_spec,
@@ -1143,7 +1146,7 @@ def test_parallel_gated_delta_net_correctness(
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=1 if (linear_cp_mode == "chunkwise" and cp > 1) else 4,
+        micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
     )
 

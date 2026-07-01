@@ -19,12 +19,12 @@ def test_thd_context_parallel_rank_indices_match_per_sequence_chunk_order():
     assert get_thd_context_parallel_rank_indices(
         cu_seqlens, 2, 1, "zigzag"
     ).tolist() == _token_ranges((4, 12), (22, 34))
-    assert get_thd_context_parallel_rank_indices(
-        cu_seqlens, 2, 0, "contiguous"
-    ).tolist() == _token_ranges((0, 8), (16, 28))
-    assert get_thd_context_parallel_rank_indices(
-        cu_seqlens, 2, 1, "contiguous"
-    ).tolist() == _token_ranges((8, 16), (28, 40))
+    assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 0, "contiguous").tolist() == list(
+        range(0, 20)
+    )
+    assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 1, "contiguous").tolist() == list(
+        range(20, 40)
+    )
 
 
 @pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
