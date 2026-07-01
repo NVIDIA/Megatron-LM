@@ -49,17 +49,19 @@
 #    an exact force-with-lease. Contributor history and concurrent branch
 #    updates cannot be replaced. Every new SHA is checked by DCO and CI again.
 #
-# 5. The final job posts a fixed terminal result. Detailed per-published-SHA
-#    what/why comments are posted separately by `svcnvidia-nemo-ci` in the
-#    reusable workflow. A full manual rerun is ignored; another command starts
-#    a new session with a new immutable original-head snapshot.
+# 5. The service account posts a fixed terminal result. Detailed
+#    per-published-SHA what/why comments are posted separately by that account
+#    in the reusable workflow. A full manual rerun is ignored; another command
+#    starts a new session with a new immutable original-head snapshot.
 #
 # SECURITY MODEL
 # --------------
 # Permissions default to none and are granted per job. Claude never receives
-# the service PAT or GitHub write access. The command is nevertheless explicit
-# maintainer authorization to execute the generated SHA in credentialed
-# internal CI, so maintainers must use it only on PRs they already trust.
+# the service PAT or GitHub write access. Fixed publish, CI-authorization, and
+# reporting steps receive the PAT explicitly. The command is nevertheless
+# explicit maintainer authorization to execute the generated SHA in
+# credentialed internal CI, so maintainers must use it only on PRs they already
+# trust.
 name: Claude Fix PR
 
 on: # zizmor: ignore[concurrency-limits] queued commands must not replace a run
@@ -358,10 +360,9 @@ jobs:
     if: always() && !cancelled() && needs.authorize.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      issues: write
+    permissions: {}
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -379,6 +380,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          account=$(gh api user)
+          test "$(jq -r '.login' <<<"$account")" = svcnvidia-nemo-ci
+          test "$(jq -r '.id' <<<"$account")" = 245956830
           outcome=$A1_OUTCOME; attempt=1; ci_url=$A1_CI_URL
           if [[ -n "$A2_OUTCOME" ]]; then outcome=$A2_OUTCOME; attempt=2; ci_url=$A2_CI_URL; fi
           if [[ -n "$A3_OUTCOME" ]]; then outcome=$A3_OUTCOME; attempt=3; ci_url=$A3_CI_URL; fi

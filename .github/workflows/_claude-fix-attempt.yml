@@ -190,8 +190,18 @@ jobs:
             test "$(jq -r '.path' <<<"$run")" = ".github/workflows/cicd-main.yml"
             test "$(jq -r '.status' <<<"$run")" = completed
             test "$(jq -r '.conclusion' <<<"$run")" = failure
-            gh run view "$PREVIOUS_RUN" --repo "$REPO" --log-failed \
-              >"$RUNNER_TEMP/claude-fix-ci/failed.log"
+            log_error="$RUNNER_TEMP/claude-fix-ci/failed.error"
+            if ! gh run view "$PREVIOUS_RUN" --repo "$REPO" --log-failed \
+              >"$RUNNER_TEMP/claude-fix-ci/failed.log" 2>"$log_error"; then
+              if grep -Fq 'HTTP 410' "$log_error"; then
+                printf '%s\n' 'The prior CI failure logs have expired.' \
+                  >"$RUNNER_TEMP/claude-fix-ci/failed.log"
+              else
+                cat "$log_error" >&2
+                exit 1
+              fi
+            fi
+            rm -f "$log_error"
             test "$(wc -c <"$RUNNER_TEMP/claude-fix-ci/failed.log")" -le 10000000
           fi
 
