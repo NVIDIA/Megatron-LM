@@ -379,8 +379,11 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          test -z "$(git diff --name-only --diff-filter=U)"
+          # Editing a conflicted worktree does not clear its unmerged index
+          # stages. Fixed code stages Claude's local edits before checking that
+          # every path is resolved; publish still revalidates the untrusted patch.
           git add -A
+          test -z "$(git diff --name-only --diff-filter=U)"
           mkdir -p "$RUNNER_TEMP/claude-fix-${{ inputs.attempt }}"
           git diff --cached --binary --full-index "$BASELINE_TREE" -- \
             >"$RUNNER_TEMP/claude-fix-${{ inputs.attempt }}/fix.patch"
