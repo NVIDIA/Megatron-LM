@@ -514,6 +514,8 @@ class GatedDeltaNet(MegatronModule):
         # feeds us the zigzag attention-load-balanced layout (rank r holds
         # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
         # all-to-all — no full-sequence gather required.
+        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
+        # enter contiguous layout before GDN regions instead of paying module-local conversions.
         if cp_size_chunkwise > 1:
             nvtx_range_push(suffix="zigzag_to_contiguous")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -604,6 +606,8 @@ class GatedDeltaNet(MegatronModule):
         # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
         # Restores the Megatron attention-load-balanced layout that downstream
         # layers and loss computation expect.
+        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
+        # restore zigzag only at SDPA/canonical-layout boundaries.
         if cp_size_chunkwise > 1:
             nvtx_range_push(suffix="contiguous_to_zigzag")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':

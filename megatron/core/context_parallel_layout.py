@@ -36,21 +36,26 @@ def get_thd_context_parallel_rank_indices(
     if cu.numel() == 0 or cu[0].item() != 0:
         raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
 
+    if torch.any(torch.diff(cu) < 0):
+        raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
+
+    nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+    nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+    cu = cu[nonduplicate_boundaries]
+
+    total_tokens = int(cu[-1].item())
+    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
+    if total_tokens == 0:
+        return positions
+
     seq_lens = torch.diff(cu)
     chunk_divisor = 2 * cp_size
-    if torch.any(seq_lens <= 0):
-        raise ValueError(f"All packed sequence lengths must be positive, got {seq_lens}.")
     if torch.any(seq_lens % chunk_divisor != 0):
         raise ValueError(
             "All packed sequence lengths must be divisible by "
             f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
             f"got {seq_lens}."
         )
-
-    total_tokens = int(cu[-1].item())
-    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
-    if total_tokens == 0:
-        return positions
 
     seq_idx = torch.bucketize(positions, cu[1:], right=True)
     global_starts = cu[:-1]

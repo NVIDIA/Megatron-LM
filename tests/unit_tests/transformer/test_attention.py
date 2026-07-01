@@ -707,6 +707,7 @@ def _test_parallel_attention_correctness(
     atol,
     rtol,
     cosine_similarity_threshold=None,
+    relative_l2_threshold=0.1,
     tp=1,
     sp=False,
     cp=1,
@@ -881,9 +882,17 @@ def _test_parallel_attention_correctness(
                 cosine_sim = torch.nn.functional.cosine_similarity(
                     baseline_flat.unsqueeze(0), parallel_flat.unsqueeze(0)
                 ).item()
+                diff_norm = torch.linalg.vector_norm((parallel_flat - baseline_flat).float())
+                baseline_norm = torch.linalg.vector_norm(baseline_flat.float()).clamp_min(1e-12)
+                relative_l2 = (diff_norm / baseline_norm).item()
                 assert cosine_sim >= cosine_similarity_threshold, (
                     f"Mismatch in {tensor_name}: cosine similarity "
                     f"{cosine_sim} < {cosine_similarity_threshold}, "
+                    f"while assert_close failed: {close_error}"
+                )
+                assert relative_l2 <= relative_l2_threshold, (
+                    f"Mismatch in {tensor_name}: relative L2 "
+                    f"{relative_l2} > {relative_l2_threshold}, "
                     f"while assert_close failed: {close_error}"
                 )
 

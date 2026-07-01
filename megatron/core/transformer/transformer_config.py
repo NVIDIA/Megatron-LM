@@ -1515,16 +1515,6 @@ class TransformerConfig(ModelParallelConfig):
                         f"got {self.gdn_conv_pad_alignment}."
                     )
 
-            # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-            assert self.linear_num_key_heads % tp_cp_size == 0, (
-                f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-            )
-            assert self.linear_num_value_heads % tp_cp_size == 0, (
-                f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-            )
             if self.context_parallel_size > 1:
                 assert self.linear_cp_mode in ("headwise", "chunkwise"), (
                     f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
@@ -1537,6 +1527,19 @@ class TransformerConfig(ModelParallelConfig):
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
+            # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            linear_head_parallel_size = self.tensor_model_parallel_size
+            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
+                linear_head_parallel_size *= self.context_parallel_size
+            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
+                f"{self.linear_num_key_heads=} must be a multiple of "
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+            )
+            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+            )
         elif self.experimental_attention_variant == "dsa":
             pass
         elif self.experimental_attention_variant == "dsv4_hybrid":

@@ -126,6 +126,28 @@ def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():
         )
 
 
+def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
+    config = _make_gdn_config(
+        tensor_model_parallel_size=2,
+        context_parallel_size=4,
+        linear_cp_mode="chunkwise",
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    )
+    assert config.linear_cp_mode == "chunkwise"
+
+
+def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
+    with pytest.raises(AssertionError, match="linear_head_parallel_size"):
+        _make_gdn_config(
+            tensor_model_parallel_size=2,
+            context_parallel_size=4,
+            linear_cp_mode="headwise",
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+
+
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size", "linear_cp_mode"),
     [

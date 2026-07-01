@@ -41,9 +41,26 @@ def test_thd_context_parallel_rank_indices_cover_all_tokens_once(layout):
     assert torch.cat(rank_indices).sort().values.tolist() == list(range(128))
 
 
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_thd_context_parallel_rank_indices_ignore_duplicate_boundaries(layout):
+    compact_cu_seqlens = torch.tensor([0, 16, 40])
+    padded_cu_seqlens = torch.tensor([0, 16, 40, 40, 40])
+
+    for rank in range(2):
+        assert torch.equal(
+            get_thd_context_parallel_rank_indices(padded_cu_seqlens, 2, rank, layout),
+            get_thd_context_parallel_rank_indices(compact_cu_seqlens, 2, rank, layout),
+        )
+
+
 def test_thd_context_parallel_rank_indices_reject_uneven_chunks():
     with pytest.raises(ValueError, match="divisible"):
         get_thd_context_parallel_rank_indices(torch.tensor([0, 10]), 2, 0, "zigzag")
+
+
+def test_thd_context_parallel_rank_indices_reject_decreasing_boundaries():
+    with pytest.raises(ValueError, match="nondecreasing"):
+        get_thd_context_parallel_rank_indices(torch.tensor([0, 16, 8]), 2, 0, "zigzag")
 
 
 def test_thd_context_parallel_rank_indices_reject_unknown_layout():
