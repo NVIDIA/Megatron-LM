@@ -198,6 +198,7 @@ def pg_collection_from_grid(
     pgc.tp_dp = grid.get_pg(["tp", "dp"])
     pgc.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
     pgc.mp = grid.get_pg(["tp", "pp"])
+    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pgc.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)

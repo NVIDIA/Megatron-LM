@@ -103,6 +103,58 @@ def unimodal_build_distributed_models(
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
 
+    return prepare_existing_model_chunks_for_distributed_training(
+        model_list,
+        transformer_config,
+        pg_collection,
+        ddp_config=ddp_config,
+        overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=use_megatron_fsdp,
+        use_torch_fsdp2=use_torch_fsdp2,
+        wrap_with_ddp=wrap_with_ddp,
+        data_parallel_random_init=data_parallel_random_init,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+    )
+
+
+def prepare_existing_model_chunks_for_distributed_training(
+    model_list: list[MegatronModule],
+    transformer_config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    ddp_config: DistributedDataParallelConfig | None = None,
+    overlap_param_gather_with_optimizer_step: bool = False,
+    use_megatron_fsdp: bool = False,
+    use_torch_fsdp2: bool = False,
+    wrap_with_ddp: bool = True,
+    data_parallel_random_init: bool = False,
+    mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+) -> list[MegatronModule]:
+    """Apply the shared post-build distributed lifecycle to already-built model chunks.
+
+    Applies default TP attrs, print-num-params, cuda placement, mixed-precision wrap,
+    meta-device materialize, and DDP/FSDP wrap. Does not build pipeline stages.
+
+    Args:
+        model_list: Already-built model chunks.
+        transformer_config: TransformerConfig; used for precision and device placement.
+        pg_collection: Model communication process groups.
+        ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
+        overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step.
+        use_megatron_fsdp: Whether to use Megatron FSDP.
+        use_torch_fsdp2: Whether to use Torch FSDP 2.0.
+        wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
+        data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
+            Pass ``None`` to skip.
+
+    Returns:
+        List of model chunks, wrapped and ready for distributed training.
+    """
+    if wrap_with_ddp and not ddp_config:
+        raise ValueError("ddp_config is required when wrap_with_ddp is True")
+
+    init_model_with_meta_device = transformer_config.init_model_with_meta_device
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
@@ -126,7 +178,8 @@ def unimodal_build_distributed_models(
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model_list
+            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            for model_module in model_list
         ]
 
     if correct_amax_history_if_needed is not None:
