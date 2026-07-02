@@ -119,10 +119,10 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         --calculate-per-token-loss
         --init-model-with-meta-device
         --ckpt-format fsdp_dtensor
-        --grad-reduce-in-bf16   # Will be deprecated soon!
         --use-nccl-ub
         --fsdp-double-buffer
         --fsdp-manual-registration
+        # --fsdp-db-use-persist-buf-on-alloc-fail
         # To enable HFSDP, DP full-sharding of the optimizer state with
         # hierarchical data parallelism (DP-Outer=2, DP-Inner=DP//2)...
         # --num-distributed-optimizer-instances 2
@@ -135,6 +135,9 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         # --use-precision-aware-optimizer
         # To use full-iteration CUDA graphs with Megatron-FSDP...
         # --cuda-graph-impl full_iteration
+        # To support double-buffering for hybrid architectures
+        # like Nemotron (Mamba + Attention + MoE)...
+        # --megatron-fsdp-max-pool-double-buffer
     )
 fi
 
@@ -202,6 +205,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save-interval 1000
     --log-throughput
+    --logging-level 20
     --distributed-timeout-minutes 60
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
@@ -215,6 +219,9 @@ if [ "${NSYS_PROFILE}" = 1 ]; then
         --profile-step-start 8
         --profile-step-end 12
         --profile-ranks 0
+        --record-memory-history
+        # To produce a PyTorch memory profile...
+        # --memory-snapshot-path "${NSYS_PROFILE_PATH}/torch_memprof_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
     )
     PROFILE_CMD=(
         nsys profile

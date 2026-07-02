@@ -290,6 +290,7 @@ class TestMegatronFsdpFullyShard:
                 "preserve_fp32_weights": True,
                 "init_model_with_meta_device": True,
                 "torch_compile": True,
+                "maxpool_double_buffer": True,
             },
             {
                 "preserve_fp32_weights": False,
@@ -313,6 +314,7 @@ class TestMegatronFsdpFullyShard:
         preserve_fp32_weights = common_args["preserve_fp32_weights"]
         init_model_with_meta_device = common_args["init_model_with_meta_device"]
         torch_compile = common_args["torch_compile"]
+        maxpool_double_buffer = common_args.get("maxpool_double_buffer", False)
 
         # Skip due to lack of functionality.
         if init_model_with_meta_device and dp_shard_strategy == NO_SHARD:
@@ -356,6 +358,7 @@ class TestMegatronFsdpFullyShard:
             ),
             init_model_with_meta_device=init_model_with_meta_device,
             report_nan_in_param_grad=True,
+            maxpool_double_buffer=maxpool_double_buffer,
         )
         model = torch.compile(model) if torch_compile else model
 

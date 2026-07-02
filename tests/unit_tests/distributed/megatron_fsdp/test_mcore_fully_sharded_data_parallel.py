@@ -92,11 +92,7 @@ class TestFullyShardedDataParallel:
         Utils.destroy_model_parallel()
 
     def _build_fsdp_model(
-        self,
-        grad_reduce_in_fp32=False,
-        main_params_dtype=torch.float32,
-        main_grads_dtype=None,
-        grad_comm_dtype=None,
+        self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
     ):
         """Helper to construct a FullyShardedDataParallel with the given dtype args."""
         fsdp_config = DistributedDataParallelConfig(
@@ -105,7 +101,6 @@ class TestFullyShardedDataParallel:
             overlap_param_gather=True,
             bucket_size=10000,
             use_megatron_fsdp=True,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
             megatron_fsdp_main_params_dtype=main_params_dtype,
             megatron_fsdp_main_grads_dtype=main_grads_dtype,
             megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
@@ -156,36 +151,6 @@ class TestFullyShardedDataParallel:
         assert fsdp_model.mp_policy.main_params_dtype == main_params_dtype
         assert fsdp_model.mp_policy.main_grads_dtype == main_grads_dtype
         assert fsdp_model.mp_policy.grad_comm_dtype == grad_comm_dtype
-
-    def test_fsdp_mp_policy_grad_reduce_in_fp32_overrides_dtypes(self):
-        """Test that grad_reduce_in_fp32=True forces main_grads and grad_comm to fp32."""
-        if not is_torch_min_version("2.4.0"):
-            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
-
-        fsdp_model = self._build_fsdp_model(
-            grad_reduce_in_fp32=True,
-            main_params_dtype=torch.bfloat16,
-            main_grads_dtype=torch.bfloat16,
-            grad_comm_dtype=torch.float16,
-        )
-        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.main_grads_dtype == torch.float32
-        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float32
-
-    def test_fsdp_mp_policy_grad_reduce_in_fp32_disabled_preserves_dtypes(self):
-        """Test that grad_reduce_in_fp32=False preserves the user-specified grads/comm dtypes."""
-        if not is_torch_min_version("2.4.0"):
-            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
-
-        fsdp_model = self._build_fsdp_model(
-            grad_reduce_in_fp32=False,
-            main_params_dtype=torch.bfloat16,
-            main_grads_dtype=torch.bfloat16,
-            grad_comm_dtype=torch.float16,
-        )
-        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.main_grads_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float16
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -483,11 +448,22 @@ class TestFullyShardedDataParallel:
 
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
-        ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
-        [(8, False, True, False), (8, True, True, False), (8, True, True, True)],
+        (
+            "dp_size",
+            "nccl_ub",
+            "fsdp_double_buffer",
+            "fsdp_manual_registration",
+            "megatron_fsdp_max_pool_double_buffer",
+        ),
+        [(8, False, True, False, True), (8, True, True, False, False), (8, True, True, True, True)],
     )
     def test_fsdp_user_buffer_registration(
-        self, dp_size, nccl_ub, fsdp_double_buffer, fsdp_manual_registration
+        self,
+        dp_size,
+        nccl_ub,
+        fsdp_double_buffer,
+        fsdp_manual_registration,
+        megatron_fsdp_max_pool_double_buffer,
     ):
         """Test that FSDP works correctly with user buffer registration.
         This test compares the training results of the baseline fsdp with the target fsdp config.
@@ -531,6 +507,7 @@ class TestFullyShardedDataParallel:
             nccl_ub=False,
             fsdp_double_buffer=False,
             fsdp_manual_registration=False,
+            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Setup FSDP config - target fsdp config
@@ -543,6 +520,7 @@ class TestFullyShardedDataParallel:
             nccl_ub=nccl_ub,
             fsdp_double_buffer=fsdp_double_buffer,
             fsdp_manual_registration=fsdp_manual_registration,
+            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Create two identical models
@@ -928,6 +906,7 @@ class TestMegatronFSDPE2E:
                 dict(
                     data_parallel_sharding_strategy="optim_grads_params",
                     fsdp_double_buffer=True,
+                    megatron_fsdp_max_pool_double_buffer=True,
                     fp8_recipe="mxfp8",
                     fp8="e4m3",
                     fp8_param_gather=True,
@@ -1599,6 +1578,7 @@ class TestFsdpHybridModelDoubleBuffer:
                 bucket_size=4096,
                 use_megatron_fsdp=True,
                 fsdp_double_buffer=True,
+                megatron_fsdp_max_pool_double_buffer=True,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer, MambaLayer],
