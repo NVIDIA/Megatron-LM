@@ -48,7 +48,8 @@
 # the author's responsibility.
 #
 # After publication, PAT-scoped fixed steps post the sanitized service-account
-# explanation, verify the live PR head, and ensure exact-SHA CI exists. When
+# explanation with an author-directed DCO reminder, verify the live PR head,
+# and ensure exact-SHA CI exists. When
 # a new mirror/run is needed, they post `/ok to test <full-sha>`; copy-pr-bot
 # then mirrors the current PR head to NVIDIA's `pull-request/<PR>` branch, which
 # triggers `cicd-main.yml` in the NVIDIA repo.
@@ -778,6 +779,13 @@ jobs:
             jq -cs '[.[][]]')
           if jq -e --arg marker "$marker" 'any(.[]; .user.id == 245956830 and
             ((.body // "") | contains($marker)))' <<<"$comments" >/dev/null; then exit 0; fi
+          author=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '.user.login // empty' 2>/dev/null || true)
+          dco_owner="PR author"
+          author_pattern='^[A-Za-z0-9][A-Za-z0-9_-]{0,99}(\[bot\])?$'
+          if [[ "$author" =~ $author_pattern ]]; then
+            dco_owner="@$author"
+          fi
           summary=$(jq -r '.summary' "$PROPOSAL/report.safe.json")
           reason=$(jq -r '.reason' "$PROPOSAL/report.safe.json")
           paths=$(jq -r '
@@ -786,8 +794,9 @@ jobs:
           short=${TARGET_SHA:0:12}
           url="${{ github.server_url }}/$HEAD_REPO/commit/$TARGET_SHA"
           # shellcheck disable=SC2016
-          printf -v body '🛠️ **Claude fix commit `%s` (attempt %s)**\n\n> ⚠️ This explanation is AI-generated and may be inaccurate; the exact commit is authoritative.\n\n**What changed**\n%s\n\n**Files changed by Claude**\n%s\n\n**Why**\n%s\n\n[View exact commit](%s)\n\n_Sanitized and posted by `svcnvidia-nemo-ci`._\n\n%s' \
-            "$short" "$ATTEMPT" "$summary" "$paths" "$reason" "$url" "$marker"
+          printf -v body '🛠️ **Claude fix commit `%s` (attempt %s)**\n\n> ⚠️ This explanation is AI-generated and may be inaccurate; the exact commit is authoritative.\n\n**What changed**\n%s\n\n**Files changed by Claude**\n%s\n\n**Why**\n%s\n\n**DCO**\n%s, please fix any DCO failures on your commits before merge. DCO does not block this workflow.\n\n[View exact commit](%s)\n\n_Sanitized and posted by `svcnvidia-nemo-ci`._\n\n%s' \
+            "$short" "$ATTEMPT" "$summary" "$paths" "$reason" "$dco_owner" \
+            "$url" "$marker"
           for delay in 0 2 5; do
             (( delay == 0 )) || sleep "$delay"
             if gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
