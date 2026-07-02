@@ -253,6 +253,11 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         assert sin.is_contiguous()
         assert headdim == qk_head_dim + emb_dim
         assert emb_dim % 4 == 0
+        assert cos.shape[-1] == emb_dim and sin.shape[-1] == emb_dim, (
+            f"cos/sin last dim must equal emb_dim={emb_dim} "
+            f"(got cos={cos.shape[-1]}, sin={sin.shape[-1]}); a narrower rotary cache "
+            f"(e.g. rotary_percent < 1) makes the fused MLA kernel read past the buffer."
+        )
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         rotary_fwd_q_kernel[grid](
@@ -629,6 +634,11 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         assert cos.is_contiguous()
         assert sin.is_contiguous()
         assert emb_dim % 4 == 0
+        assert cos.shape[-1] == emb_dim and sin.shape[-1] == emb_dim, (
+            f"cos/sin last dim must equal emb_dim={emb_dim} "
+            f"(got cos={cos.shape[-1]}, sin={sin.shape[-1]}); a narrower rotary cache "
+            f"(e.g. rotary_percent < 1) makes the fused MLA kernel read past the buffer."
+        )
 
         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
         o_value = kv.new_empty(total_seqlen, nheads, v_dim)
