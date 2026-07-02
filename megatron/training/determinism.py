@@ -4,7 +4,7 @@
 
 Mirrors the split that ``megatron-bridge`` uses for the same purpose:
 
-* :func:`set_determinism_env_vars` — env-var setdefaults that must happen
+* :func:`set_determinism_env_var_defaults` — env-var setdefaults that must happen
   BEFORE the first cuBLAS / Transformer Engine kernel invocation in the
   process. Equivalent to bridge's
   ``PerfEnvPlugin._set_determinism_env_vars`` (``scripts/performance/perf_plugins.py``).
@@ -19,7 +19,7 @@ Callers:
   calls :func:`apply_determinism_to_args` when ``--deterministic-mode`` is
   passed.
 * Test suite (``tests/unit_tests/determinism/``) and standalone profiling
-  scripts call :func:`set_determinism_env_vars` directly at import time —
+  scripts call :func:`set_determinism_env_var_defaults` directly at import time —
   they don't have an ``args`` Namespace.
 """
 
@@ -29,9 +29,16 @@ import os
 
 import torch
 
+# Maps each arg name to the value it must hold for bit-exact execution;
+# verified by :func:`apply_determinism_to_args`.
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
 
-def set_determinism_env_vars() -> None:
-    """Populate env vars required for bit-exact reproducibility.
+
+def set_determinism_env_var_defaults() -> None:
+    """Set defaults for the env vars required for bit-exact reproducibility.
+
+    Only fills in values the launcher has not already exported (``setdefault``);
+    an env var that is already set is left untouched.
 
     These env vars are captured by their respective libraries at first use
     (NCCL at communicator init, cuBLAS at handle creation, TE at first
@@ -48,28 +55,37 @@ def set_determinism_env_vars() -> None:
 
 
 def apply_determinism_to_args(args) -> None:
-    """Apply deterministic-mode overrides to a parsed-args Namespace.
+    """Apply deterministic-mode requirements to a parsed-args Namespace.
 
     Idempotent. Performs (in this order):
 
-    1. Asserts ``cross_entropy_loss_fusion`` is off (fused CE is non-deterministic).
-    2. Sets env vars via :func:`set_determinism_env_vars` — a user-supplied
+    1. Asserts every option in ``ARG_VALUES_REQUIRED_FOR_DETERMINISM`` holds
+       its required value. This is a verification-only check — it never
+       mutates ``args``.
+    2. Sets env-var defaults via :func:`set_determinism_env_var_defaults` — a user-supplied
        value (e.g. an ``NCCL_ALGO`` exported by the launcher) survives the
        setdefault, so this step does not second-guess the user's choice of
        deterministic algo.
-    3. Forces ``tp_comm_overlap=False`` (non-deterministic NCCL collectives).
-    4. Calls ``torch.use_deterministic_algorithms(True)``.
+    3. Calls ``torch.use_deterministic_algorithms(True)``.
 
-    The argument assertion runs FIRST so a malformed args Namespace fails
-    fast without leaving the process in a half-deterministic state (env
-    vars set but torch global state untouched).
+    Incompatible options are rejected with an explicit error rather than
+    silently overridden: the user must turn them off themselves so the
+    deterministic run matches the config they asked for. The assertion runs
+    FIRST so a malformed or incompatible args Namespace fails fast without
+    leaving the process in a half-deterministic state (env vars set but
+    torch global state untouched).
     """
-    # 1. Validate args first — direct attribute access so a malformed
-    #    Namespace (missing the field entirely) fails loudly rather than
-    #    silently passing the check.
+    # Verification only — read each option's effective value and never flip it,
+    # so a default that drifts to a bad value breaks the run instead of silently
+    # running non-deterministically.
+    mismatched = [
+        f"{name}={required!r} (got {actual!r})"
+        for name, required in ARG_VALUES_REQUIRED_FOR_DETERMINISM.items()
+        if (actual := getattr(args, name)) != required
+    ]
     assert (
-        not args.cross_entropy_loss_fusion
-    ), "Cross Entropy Fusion is currently not deterministic."
+        not mismatched
+    ), f"--deterministic-mode requires: {', '.join(mismatched)}. Adjust these options to continue."
 
     # NB: ``--use-flash-attn`` is intentionally NOT rejected under
     # --deterministic-mode. FlashAttention is deterministic on supported
@@ -79,14 +95,20 @@ def apply_determinism_to_args(args) -> None:
     # and the bf16 parallelism matrix). Backend choice is left to TE's
     # default selection or to the launcher via ``NVTE_*_ATTN`` env vars.
 
-    # 2. NCCL_ALGO sanity check on a launcher-supplied value. Tree is
-    #    intentionally excluded: its intra-node chain reduction order is not
-    #    user-controllable and multi-node inter-tree topology can vary
-    #    across runs without a pinned topology file, so we cannot vouch
-    #    for it as deterministic. ``^NVLS`` is kept because banning NVLS
-    #    on hardware that exposes it is a legitimate user choice; the user
-    #    is responsible for picking a fallback that's deterministic on
-    #    their stack. Comma-separated lists are valid NCCL syntax.
+    # NCCL_ALGO sanity check on a launcher-supplied value. Accepted tokens and
+    # why each is allowed (comma-separated lists are valid NCCL syntax):
+    #   - ``Ring``          the default; bit-exact by construction, fully verified.
+    #   - ``CollnetDirect``,
+    #     ``CollnetChain``  verified bit-exact at smaller scale with SHARP
+    #                       in-network reduction (AllReduce and an end-to-end run).
+    #   - ``^NVLS``         excludes NVLS rather than selecting an algo, so NCCL
+    #                       falls back to whichever algo fits the hardware.
+    #                       Verified bit-exact in our setup; some risk remains
+    #                       because determinism then depends on that fallback algo.
+    #
+    # ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
+    # order is not user-controllable and its multi-node inter-tree topology can
+    # vary across runs without a pinned topology file, so we cannot vouch for it.
     accepted_tokens = {"Ring", "CollnetDirect", "CollnetChain", "^NVLS"}
     nccl_algo = os.environ.get("NCCL_ALGO")
     if nccl_algo is not None:
@@ -96,20 +118,9 @@ def apply_determinism_to_args(args) -> None:
             f"{sorted(accepted_tokens)}."
         )
 
-    # 3. Apply env vars. ``setdefault`` preserves any launcher-set value
-    #    that just passed validation; the default of ``Ring`` only kicks
-    #    in when nothing was set.
-    set_determinism_env_vars()
+    # Apply env vars. ``setdefault`` preserves any launcher-set value that just
+    # passed validation; the default of ``Ring`` only kicks in when nothing was set.
+    set_determinism_env_var_defaults()
 
-    # 4. Override tp_comm_overlap. ``warn_rank_0`` (not print_rank_0) so the
-    #    override is capturable via ``pytest.warns`` / ``-W error``.
-    if args.tp_comm_overlap:
-        # Lazy import — warn_rank_0 lives in training.utils which has heavier
-        # dependencies than this module.
-        from megatron.training.utils import warn_rank_0
-
-        warn_rank_0("Disabling tp_comm_overlap for deterministic mode.")
-        args.tp_comm_overlap = False
-
-    # 5. Torch global state last — all assertions have already passed.
+    # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)

@@ -93,7 +93,7 @@ class BitExactRunner:
         tp = min(self.default_tp, Utils.world_size)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
         # Determinism env vars are pinned for the lifetime of the test
-        # process by ``correctness/__init__.py:set_determinism_env_vars()``.
+        # process by ``correctness/__init__.py:set_determinism_env_var_defaults()``.
         # The deterministic-algos flag is set here per-test but never
         # toggled off in teardown — flipping it off would contaminate any
         # code that runs later in the same pytest process and assumes the
