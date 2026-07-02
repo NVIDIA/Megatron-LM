@@ -15,18 +15,25 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
 )
 
+# Each sharded Linear's collective must be large enough that NCCL selects its
+# symmetric-memory (ncclSymk*) kernels over ring. Sub-KB collectives fall back to
+# ring on some platforms (e.g. CI with NCCL_NVLS_ENABLE=0), which would make the
+# symmetric-kernel assertions below fail; 1024-wide units (a few-MiB bf16 weight)
+# reliably engage the symmetric kernels.
+_HIDDEN = 1024
+
 
 class TinyModel(nn.Module):
-    """Small model with two separately shardable units."""
+    """Two separately shardable units, sized so NCCL selects symmetric-memory kernels."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(8, 16)
+        self.fc1 = nn.Linear(_HIDDEN, _HIDDEN)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, 4)
+        self.fc2 = nn.Linear(_HIDDEN, _HIDDEN)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the tiny model."""
+        """Run the model."""
         return self.fc2(self.relu(self.fc1(x)))
 
 
@@ -80,9 +87,11 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
 
         micro_batch_size = 2
-        x = torch.randn(num_microbatches, micro_batch_size, 8, device=device, dtype=torch.bfloat16)
+        x = torch.randn(
+            num_microbatches, micro_batch_size, _HIDDEN, device=device, dtype=torch.bfloat16
+        )
         target = torch.randn(
-            num_microbatches, micro_batch_size, 4, device=device, dtype=torch.bfloat16
+            num_microbatches, micro_batch_size, _HIDDEN, device=device, dtype=torch.bfloat16
         )
         microbatches = tuple(zip(x.unbind(), target.unbind()))
 
