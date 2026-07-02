@@ -24,6 +24,7 @@
 #       v
 #   authorize -> attempt 1 -> optional attempt 2 -> optional attempt 3
 #       |                                                    |
+#       +--> acknowledge (best effort)                       |
 #       +---------------------> final report <---------------+
 #
 # 1. `authorize` freezes the original PR head and current base SHA. It also
@@ -31,7 +32,9 @@
 #    maintainer edits, and a non-default/non-protected fork branch. It checks
 #    the complete PR file list for forbidden control or security-policy files.
 #    Optional text after `/claude fix` becomes steering; a bare command relies
-#    on the merge conflict or supported CI failure.
+#    on the merge conflict or supported CI failure. A separate best-effort job
+#    acknowledges the command without making repair depend on a cosmetic API
+#    call.
 #
 # 2. Each attempt calls `_claude-fix-attempt.yml` from this trusted revision.
 #    That reusable workflow prepares a read-only Claude patch, validates and
@@ -56,12 +59,13 @@
 #
 # SECURITY MODEL
 # --------------
-# Permissions default to none and are granted per job. Claude never receives
-# the service PAT or GitHub write access. Fixed publish, CI-authorization, and
-# reporting steps receive the PAT explicitly. The command is nevertheless
-# explicit maintainer authorization to execute the generated SHA in
-# credentialed internal CI, so maintainers must use it only on PRs they already
-# trust.
+# Permissions default to none and are granted per job. The acknowledgement job
+# alone receives pull-request write access; it has no checkout or secrets and
+# cannot block a repair. Claude never receives the service PAT or GitHub write
+# access. Fixed publish, CI-authorization, and reporting steps receive the PAT
+# explicitly. The command is nevertheless explicit maintainer authorization to
+# execute the generated SHA in credentialed internal CI, so maintainers must
+# use it only on PRs they already trust.
 name: Claude Fix PR
 
 on: # zizmor: ignore[concurrency-limits] queued commands must not replace a run
@@ -197,9 +201,39 @@ jobs:
             echo "steer_b64=$steer_b64"
             echo "previous_ci_run_id=$previous_ci_run_id"
           } >>"$GITHUB_OUTPUT"
-          gh api --method POST \
-            "repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -f content=eyes >/dev/null
+
+  acknowledge:
+    name: Acknowledge Claude Fix
+    needs: authorize
+    if: needs.authorize.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    continue-on-error: true
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+    steps:
+      # GitHub currently rejects PR-comment reactions when the job has only
+      # `issues: write`, despite documenting that permission as sufficient.
+      # Keep the practical `pull-requests: write` grant isolated in this job.
+      - name: React to trigger comment
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]]
+          response="$RUNNER_TEMP/claude-fix-reaction-response.txt"
+          if ! gh api --include --method POST \
+            "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes >"$response"; then
+            grep -i '^x-accepted-github-permissions:' "$response" || true
+            echo "::warning::Could not add the acknowledgement reaction."
+            exit 1
+          fi
+          grep -i '^x-accepted-github-permissions:' "$response" || true
 
   attempt_1:
     name: Claude Fix Attempt 1
