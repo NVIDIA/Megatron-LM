@@ -59,10 +59,7 @@ class _FakeTESequential(torch.nn.Module):
         self.args = args
         hidden_states = args[0]
         return torch.ones(
-            hidden_states.size(0),
-            4,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            hidden_states.size(0), 4, device=hidden_states.device, dtype=hidden_states.dtype
         )
 
 
@@ -98,8 +95,7 @@ def _fake_te_module(linear_cls=_FakeTELinear):
         ),
         common=SimpleNamespace(
             recipe=SimpleNamespace(
-                MXFP8BlockScaling=_FakeMXFP8Recipe,
-                NVFP4BlockScaling=_FakeNVFP4Recipe,
+                MXFP8BlockScaling=_FakeMXFP8Recipe, NVFP4BlockScaling=_FakeNVFP4Recipe
             )
         ),
     )
@@ -222,10 +218,7 @@ def test_fused_grouped_swiglu_ops_replay_linear_pre_forward_hooks(monkeypatch):
     tokens_per_expert = torch.tensor([2])
     ops(hidden_states, tokens_per_expert, torch.ones(2), tokens_per_expert)
 
-    assert calls == [
-        ("fc1", shared_expert.linear_fc1),
-        ("fc2", shared_expert.linear_fc2),
-    ]
+    assert calls == [("fc1", shared_expert.linear_fc1), ("fc2", shared_expert.linear_fc2)]
 
 
 def test_fused_grouped_swiglu_ops_reject_input_modifying_hooks(monkeypatch):
