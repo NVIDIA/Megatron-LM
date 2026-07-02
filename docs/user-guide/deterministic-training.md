@@ -33,14 +33,14 @@ Populated with `os.environ.setdefault`, so a user-supplied value wins. Must be s
 
 If you override `NCCL_ALGO`, the value must be a comma-separated subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
 
-## Config overrides
+## Config requirements
 
-Applied to the parsed `args` Namespace in `apply_determinism_to_args`:
+Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Incompatible options are rejected with an explicit error rather than silently flipped off — you must disable them yourself so the run matches the config you asked for:
 
 | Flag | Behavior under `--deterministic-mode` |
 |---|---|
-| `--cross-entropy-loss-fusion` | Must be off (asserted; fused CE is non-deterministic) |
-| `--tp-comm-overlap` | Forced off (the overlap path uses non-deterministic NCCL collectives) |
+| `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
+| `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
 | `torch.use_deterministic_algorithms` | Set to `True` |
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
