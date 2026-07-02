@@ -33,6 +33,34 @@ import torch
 # verified by :func:`apply_determinism_to_args`.
 ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
 
+# Env-var defaults required for bit-exact reproducibility.
+DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
+    "NCCL_ALGO": "Ring",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+}
+
+# Accepted NCCL_ALGO tokens under --deterministic-mode. Comma-separated lists
+# are valid NCCL syntax; every token in a launcher-supplied ``NCCL_ALGO`` must
+# be in this set.
+#   - ``Ring``          the default; bit-exact by construction, fully verified.
+#   - ``CollnetDirect``,
+#     ``CollnetChain``  verified bit-exact at smaller scale with SHARP
+#                       in-network reduction (AllReduce and an end-to-end run).
+#   - ``^NVLS``         excludes NVLS rather than selecting an algo, so NCCL
+#                       falls back to whichever algo fits the hardware.
+#                       Verified bit-exact in our setup; some risk remains
+#                       because determinism then depends on that fallback algo.
+#
+# ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
+# order is not user-controllable and its multi-node inter-tree topology can
+# vary across runs without a pinned topology file, so we cannot vouch for it.
+#
+# Exposed as ``frozenset`` so external pre-submit validators (e.g. a Slurm
+# launcher that pre-validates a user-supplied ``nccl_algo`` string) can reuse
+# it without duplicating the list.
+ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
+
 
 def set_determinism_env_var_defaults() -> None:
     """Set defaults for the env vars required for bit-exact reproducibility.
@@ -49,9 +77,8 @@ def set_determinism_env_var_defaults() -> None:
     in which case the Python-side setdefault is too late and the launcher's
     shell-side export is what actually takes effect.
     """
-    os.environ.setdefault("NCCL_ALGO", "Ring")
-    os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
+        os.environ.setdefault(k, v)
 
 
 def apply_determinism_to_args(args) -> None:
@@ -95,27 +122,15 @@ def apply_determinism_to_args(args) -> None:
     # and the bf16 parallelism matrix). Backend choice is left to TE's
     # default selection or to the launcher via ``NVTE_*_ATTN`` env vars.
 
-    # NCCL_ALGO sanity check on a launcher-supplied value. Accepted tokens and
-    # why each is allowed (comma-separated lists are valid NCCL syntax):
-    #   - ``Ring``          the default; bit-exact by construction, fully verified.
-    #   - ``CollnetDirect``,
-    #     ``CollnetChain``  verified bit-exact at smaller scale with SHARP
-    #                       in-network reduction (AllReduce and an end-to-end run).
-    #   - ``^NVLS``         excludes NVLS rather than selecting an algo, so NCCL
-    #                       falls back to whichever algo fits the hardware.
-    #                       Verified bit-exact in our setup; some risk remains
-    #                       because determinism then depends on that fallback algo.
-    #
-    # ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
-    # order is not user-controllable and its multi-node inter-tree topology can
-    # vary across runs without a pinned topology file, so we cannot vouch for it.
-    accepted_tokens = {"Ring", "CollnetDirect", "CollnetChain", "^NVLS"}
+    # NCCL_ALGO sanity check on a launcher-supplied value. See
+    # :data:`ACCEPTED_NCCL_ALGO_TOKENS` for the accepted set and the rationale
+    # for each entry (and why ``Tree`` is excluded).
     nccl_algo = os.environ.get("NCCL_ALGO")
     if nccl_algo is not None:
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
-        assert tokens and all(t in accepted_tokens for t in tokens), (
+        assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
             f"NCCL_ALGO={nccl_algo!r} must be a comma-separated subset of "
-            f"{sorted(accepted_tokens)}."
+            f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
         )
 
     # Apply env vars. ``setdefault`` preserves any launcher-set value that just
