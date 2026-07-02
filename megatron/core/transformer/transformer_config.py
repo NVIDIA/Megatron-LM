@@ -689,6 +689,18 @@ class TransformerConfig(ModelParallelConfig):
     Only effective when moe-shared-expert-intermediate-size is set.
     """
 
+    use_grouped_gemm_for_shared_expert: bool = False
+    """Use GroupedLinear(num_groups=1) for the shared expert MLP to trigger the
+    Transformer Engine grouped SwiGLU fusion path. Only effective when
+    moe-shared-expert-intermediate-size is set.
+    """
+
+    moe_shared_expert_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the shared expert MLP will use a block
+    interleaved format. This is only effective when
+    use_grouped_gemm_for_shared_expert is set.
+    """
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
