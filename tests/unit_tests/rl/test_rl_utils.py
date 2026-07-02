@@ -242,12 +242,19 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     @pytest.mark.parametrize("use_sequence_packing", [False])
-    def test_get_logprobs(self, initialize_model_parallel, use_sequence_packing):
+    @pytest.mark.parametrize("vp_logprobs", [True, False])
+    def test_get_logprobs(self, initialize_model_parallel, use_sequence_packing, vp_logprobs):
         """Test that getting logprobs at least does not crash."""
-        self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
+        self.create_test_args(
+            rl_use_sequence_packing=use_sequence_packing,
+            rl_vocab_parallel_logprobs=vp_logprobs,
+        )
 
         model = MockModel()
-        tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
+        # CUDA tokens (MockModel follows x.device): the vocab-parallel path
+        # all-reduces over the NCCL-only TP group, which rejects CPU tensors.
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        tokens = torch.ones((BATCH, SEQ), dtype=torch.long, device=device)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )

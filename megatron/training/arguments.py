@@ -2460,6 +2460,13 @@ def _add_rl_args(parser):
                             'to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-vocab-parallel-logprobs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='Compute RL token logprobs directly from vocab-parallel (TP-sharded) '
+                            'logits, chunked over the sequence, instead of all-gathering full-vocab '
+                            'logits. Avoids the [seq/cp, vocab] logits + saved log_softmax + backward '
+                            'transients (3x8 GiB per rank at seq 131072 / CP4 / 128k vocab) that OOM '
+                            'the GRPO train-step backward. --no-rl-vocab-parallel-logprobs restores '
+                            'the gathered path.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
