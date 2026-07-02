@@ -183,6 +183,8 @@ class GraphableMegatronModule(MegatronModule):
             # script with the graphs returned by make_graphed_callables API before the first
             # training step.
             self.cuda_graphs = []
+            # DCP communicators are capture-time constants, so keep one graph list per CP size.
+            self.cuda_graphs_by_dynamic_cp_size = {}
             # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param

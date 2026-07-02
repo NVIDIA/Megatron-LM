@@ -3077,6 +3077,14 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
 
+        if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl != "transformer_engine":
+                raise ValueError("Dynamic CP supports only layer-wise TE CUDA graphs.")
+            if not self.cuda_graph_dynamic_microbatches:
+                raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
+            if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
+                raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
+
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
             if not HAVE_PACKAGING:

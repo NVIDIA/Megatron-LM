@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -1724,6 +1724,11 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
+    if getattr(config, 'dynamic_context_parallel', False) and not hasattr(
+        layer, '_activate_dynamic_cp_cuda_graph'
+    ):
+        return False
+
     # If cuda_graph_modules is not set, every layer is graphed.
     if not config.cuda_graph_modules:
         return True
@@ -2021,12 +2026,18 @@ class TECudaGraphHelper:
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
                 ):
-                    rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
-                        None, transformer_module.decoder, transformer_input, self.config, None
-                    )
+                    packed_seq = hasattr(layer, "_is_thd_cuda_graph") and layer._is_thd_cuda_graph()
+                    capture_cp_group = None
+                    if packed_seq:
+                        capture_cp_size, capture_cp_group = layer._get_thd_cuda_graph_capture_cp()
+                        rotary_seq_len = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
+                    else:
+                        rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
+                            None, transformer_module.decoder, transformer_input, self.config, None
+                        )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                            rotary_seq_len, packed_seq=packed_seq, cp_group=capture_cp_group
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
@@ -2323,6 +2334,17 @@ class TECudaGraphHelper:
         self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
     ):
         """Return the THD packing upper bound used for dynamic CUDA graph capture."""
+        if self.config.sequence_packing_scheduler == 'default_dynamic_cp':
+            max_num_microbatches = runtime_num_microbatches * self.micro_batch_size
+            max_num_microbatches *= self.dp_group.size() * getattr(
+                self.config,
+                'thd_max_subsamples_per_item',
+                self.config.thd_max_packed_sequences,
+            )
+            return (
+                max(1, max_num_microbatches),
+                "dynamic_cp_global_subsample_upper_bound",
+            )
         if self.config.sequence_packing_scheduler != 'dp_balanced':
             return runtime_num_microbatches, "runtime"
         if self.config.max_seqlen_per_dp_cp_rank is None:
@@ -2592,6 +2614,31 @@ class TECudaGraphHelper:
         kwargs = get_make_graphed_callables_kwargs()
         return sample_args, kwargs
 
+    def _get_dynamic_cp_capture_contexts(self):
+        """Return ``(local_cp_size, process_group)`` contexts to capture eagerly."""
+        if not self.config.dynamic_context_parallel:
+            return [(None, None)]
+
+        max_size = self.dp_cp_group.size()
+        min_size = self.config.min_dynamic_context_parallel_size
+        if min_size > max_size or any(
+            size < 1 or size & (size - 1) for size in (min_size, max_size)
+        ):
+            raise ValueError("Dynamic CP graph sizes must be powers of two with min <= max.")
+        largest, smallest = (int(math.log2(size)) for size in (max_size, min_size))
+        return [
+            (size, parallel_state.get_dynamic_data_context_parallel_groups(group_size=size))
+            for size in (2**exponent for exponent in range(largest, smallest - 1, -1))
+        ]
+
+    @staticmethod
+    def _clear_cuda_graph_state(layer):
+        layer.cuda_graphs = []
+        layer.cuda_graphs_by_dynamic_cp_size = {}
+        layer.cuda_graph_manual_hooks = []
+        for module in layer.modules():
+            vars(module).pop('_cuda_graph_static_tensor_refs', None)
+
     def _start_capturing(self):
         """
         Start capturing CUDA Graphs.
@@ -2662,52 +2709,110 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _abort_capturing(self, captured_graphs):
+        """Best-effort, non-collective cleanup that preserves the capture error."""
+        _set_capture_end()
+        self._graphs_created = False
+        if FREEZE_GC:
+            with suppress(BaseException):
+                gc.unfreeze()
+
+        for graph in chain.from_iterable(captured_graphs.values()):
+            with suppress(BaseException):
+                graph.reset()
+
+        for layers in self.callables_per_chunk:
+            for layer in layers:
+                with suppress(BaseException):
+                    self._clear_cuda_graph_state(layer)
+
+        if self.config.fine_grained_activation_offloading:
+            with suppress(BaseException):
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                off_interface.reset()
+
+        for cleanup in (self._reset_after_capture, gc.collect, torch.cuda.empty_cache):
+            with suppress(BaseException):
+                cleanup()
+
+    def _install_captured_graphs(self, capture_contexts, captured_graphs):
+        """Install completed graph-bank variants on their corresponding layers."""
+        num_layers_accumulated = 0
+        for layers in self.callables_per_chunk:
+            for layer_number, layer in enumerate(layers):
+                base = (
+                    (num_layers_accumulated + layer_number) * self.num_microbatches
+                    if self.config.overlap_moe_expert_parallel_comm
+                    else num_layers_accumulated * self.num_microbatches + layer_number
+                )
+                stride = 1 if self.config.overlap_moe_expert_parallel_comm else len(layers)
+                for cp_size, _ in capture_contexts:
+                    graphs = captured_graphs[cp_size]
+                    layer_graphs = [
+                        graphs[base + batch_number * stride]
+                        for batch_number in range(self.num_microbatches)
+                    ]
+
+                    layer.cuda_graphs = layer_graphs
+                    if cp_size is not None:
+                        layer.cuda_graphs_by_dynamic_cp_size[cp_size] = layer_graphs
+            num_layers_accumulated += len(layers)
+
+        self._graphs_created = True
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
-        start_time = self._start_capturing()
-
-        if not self.flattened_callables:
-            # Check if there are any graphable layers. If not, log a warning and skip capture,
-            # but still call _finish_capturing to ensure all ranks complete the capture phase.
-            logger.warning(
-                'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
-            )
-        else:
-            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
-            if self.config.sequence_parallel:
-                rng_context = get_cuda_rng_tracker().fork()
-            else:
-                rng_context = nullcontext()
-            with rng_context:
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
+        captured_graphs = {}
+        try:
+            start_time = self._start_capturing()
+            has_graphable_layers = bool(self.flattened_callables)
+            if not has_graphable_layers:
+                # Still participate in every schedule collective and barrier so
+                # PP stages with graphable layers cannot deadlock.
+                logger.warning(
+                    'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
                 )
 
-            # Push the captured graphs to the corresponding TransformerBlock.
-            num_layers_accumulated = 0
-            for layers in self.callables_per_chunk:
-                for layer_number, layer in enumerate(layers):
-                    layer.cuda_graphs = []
-                    for batch_number in range(self.num_microbatches):
-                        if self.config.overlap_moe_expert_parallel_comm:
-                            graph_idx = (
-                                num_layers_accumulated + layer_number
-                            ) * self.num_microbatches + batch_number
+            # Keep variants helper-local so later captures cannot replay earlier ones.
+            capture_contexts = self._get_dynamic_cp_capture_contexts()
+            try:
+                for capture_idx, (cp_size, cp_group) in enumerate(capture_contexts):
+                    if cp_size is not None:
+                        self.config._cuda_graph_capture_dynamic_cp = (cp_size, cp_group)
+
+                    # This call contains PP-group collectives when dynamic graph
+                    # slots are enabled, so all PP stages must participate.
+                    sample_args, kwargs = self._get_cuda_graph_input_data()
+                    if has_graphable_layers:
+                        if self.config.sequence_parallel:
+                            rng_context = get_cuda_rng_tracker().fork()
                         else:
-                            graph_idx = (
-                                num_layers_accumulated * self.num_microbatches
-                                + batch_number * len(layers)
-                                + layer_number
+                            rng_context = nullcontext()
+                        with rng_context:
+                            captured_graphs[cp_size] = make_graphed_callables(
+                                tuple(self.flattened_callables), sample_args, **kwargs
                             )
-                        layer.cuda_graphs.append(graphs[graph_idx])
-                num_layers_accumulated += len(layers)
 
-            self._graphs_created = True
+                    if capture_idx + 1 < len(capture_contexts):
+                        torch.cuda.synchronize()
+                        torch.distributed.barrier()
+                        self._reset_after_capture()
+            finally:
+                vars(self.config).pop('_cuda_graph_capture_dynamic_cp', None)
 
-        self._finish_capturing(start_time)
+            if has_graphable_layers:
+                self._install_captured_graphs(capture_contexts, captured_graphs)
+            self._finish_capturing(start_time)
+            if self.config.dynamic_context_parallel and self.pp_group.size() > 1:
+                self.config._cuda_graph_num_microbatches = self.num_microbatches
+        except BaseException:
+            self._abort_capturing(captured_graphs)
+            raise
 
     def cuda_graph_set_manual_hooks(self):
         """
@@ -2729,14 +2834,17 @@ class TECudaGraphHelper:
         graphs_reset, graphs_not_reset = 0, 0
         for layers in self.callables_per_chunk:
             for layer in layers:
-                for graph in layer.cuda_graphs:
+                graph_bank = layer.cuda_graphs_by_dynamic_cp_size
+                graph_lists = graph_bank.values() if graph_bank else (layer.cuda_graphs,)
+                for graph in chain.from_iterable(graph_lists):
                     if graph_resettable:
                         graph.reset()
                         graphs_reset += 1
                     else:
                         graphs_not_reset += 1
-                layer.cuda_graphs = []
-                layer.cuda_graph_manual_hooks = []
+                self._clear_cuda_graph_state(layer)
+
+        vars(self.config).pop('_cuda_graph_num_microbatches', None)
 
         log_on_each_pipeline_stage(
             logger=logger,

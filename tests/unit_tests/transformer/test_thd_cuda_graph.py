@@ -25,7 +25,9 @@ import os
 import re
 import socket
 import subprocess
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -268,18 +270,16 @@ class TestPadSequenceForThd:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_generic_alignment_appends_dummy_padding_sequence(self):
-        """Generic THD padding covers tail slots with an independent dummy sequence."""
+        """Generic THD padding covers tail slots with a zero-valid-token dummy sequence."""
         seqlens, total_T = [50, 30], 80
         psp = _make_psp(seqlens)
-        orig = psp.cu_seqlens_q.clone()
         p_tok, _, _, _, p, mask = pad_sequence_for_thd(
             torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment=64
         )
         assert p_tok.shape == (1, 128)
-        expected = torch.cat((orig, torch.tensor([128], dtype=orig.dtype, device=orig.device)))
-        assert torch.equal(p.cu_seqlens_q, expected)
-        assert torch.equal(p.cu_seqlens_q_padded, expected)
-        assert p.pad_between_seqs is False
+        assert p.cu_seqlens_q.tolist() == [0, 50, 80, 80]
+        assert p.cu_seqlens_q_padded.tolist() == [0, 50, 80, 128]
+        assert p.pad_between_seqs is True
         assert mask.shape == (1, 128)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
 
@@ -291,18 +291,19 @@ class TestPadSequenceForThd:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
 
         psp = _make_psp([140])
+        psp.cu_seqlens_q_padded[-1] = psp.cu_seqlens_kv_padded[-1] = 160
+        psp.max_seqlen_q = psp.max_seqlen_kv = 160
         local_T = 80
         p_tok, _, _, _, p, mask = pad_sequence_for_thd(
             torch.ones(1, local_T, device="cuda"), None, None, None, psp, alignment=128
         )
 
         assert p_tok.shape[-1] >= local_T
-        assert p.cu_seqlens_q[-1].item() == 256
+        assert p.cu_seqlens_q[-1].item() == 140
         assert p.cu_seqlens_q_padded[-1].item() == 256
-        assert p.max_seqlen_q == 140
-        assert p.max_seqlen_kv == 140
+        assert p.max_seqlen_q == 160
+        assert p.max_seqlen_kv == 160
         assert mask.shape[-1] == p_tok.shape[-1]
-        assert not mask[0, :local_T].any()
 
     @pytest.mark.internal
     @_REQUIRES_TWO_RANKS
@@ -318,7 +319,7 @@ class TestPadSequenceForThd:
         )
 
         assert p_tok.shape[-1] == 1664
-        assert p.cu_seqlens_q[-1].item() == 3328
+        assert p.cu_seqlens_q[-1].item() == 3200
         assert p.cu_seqlens_q_padded[-1].item() == 3328
         assert mask.shape[-1] == p_tok.shape[-1]
         assert not mask[0, :local_T].any()
@@ -375,16 +376,19 @@ class TestPadSequenceForThd:
             p_params.cu_seqlens_kv_padded,
         ):
             assert cu.shape[0] == max_num_seqs + 1
-        expected_cu = torch.tensor(
+        expected_actual_cu = torch.tensor(
+            [0, 100, 150, 180, 180, 180, 180, 180, 180], dtype=torch.int32, device="cuda"
+        )
+        expected_padded_cu = torch.tensor(
             [0, 100, 150, 180, 256, 256, 256, 256, 256], dtype=torch.int32, device="cuda"
         )
-        assert torch.equal(p_params.cu_seqlens_q, expected_cu)
-        assert torch.equal(p_params.cu_seqlens_kv, expected_cu)
-        assert torch.equal(p_params.cu_seqlens_q_padded, expected_cu)
-        assert torch.equal(p_params.cu_seqlens_kv_padded, expected_cu)
+        assert torch.equal(p_params.cu_seqlens_q, expected_actual_cu)
+        assert torch.equal(p_params.cu_seqlens_kv, expected_actual_cu)
+        assert torch.equal(p_params.cu_seqlens_q_padded, expected_padded_cu)
+        assert torch.equal(p_params.cu_seqlens_kv_padded, expected_padded_cu)
         assert p_params.max_seqlen_q == max_seqlen
         assert p_params.max_seqlen_kv == max_seqlen
-        assert p_params.pad_between_seqs is False
+        assert p_params.pad_between_seqs is True
         assert p_mask.shape == (1, max_seqlen) and p_mask.dtype == torch.bool
         assert torch.equal(p_tok[0, :total_T], tokens[0])
         assert (p_tok[0, total_T:] == 0).all()
@@ -392,10 +396,11 @@ class TestPadSequenceForThd:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_eager_pad_to_max_adds_dummy_padding_sequence(self):
-        """Eager pad-to-max represents the tail as an independent dummy sequence."""
+        """Eager pad-to-max represents the tail as a zero-valid-token dummy sequence."""
         seqlens, total_T, target_len = [50, 30], 80, 8192
         psp = _make_psp(seqlens)
-        orig_cu = psp.cu_seqlens_q.clone()
+        psp.cu_seqlens_q_padded = None
+        psp.cu_seqlens_kv_padded = None
         alignment, pad_target_len, max_num_seqs = get_thd_padding_kwargs(
             pad_packed_seq_alignment="max",
             max_seqlen_per_dp_cp_rank=target_len,
@@ -415,16 +420,12 @@ class TestPadSequenceForThd:
         )
 
         assert p_tok.shape == (1, target_len)
-        expected = torch.cat(
-            (orig_cu, torch.tensor([target_len], dtype=orig_cu.dtype, device=orig_cu.device))
-        )
-        assert torch.equal(p_params.cu_seqlens_q, expected)
-        assert torch.equal(p_params.cu_seqlens_q_padded, expected)
-        assert p_params.cu_seqlens_q.shape[0] == orig_cu.shape[0] + 1
+        assert p_params.cu_seqlens_q.tolist() == [0, 50, 80, 80]
+        assert p_params.cu_seqlens_q_padded.tolist() == [0, 50, 80, target_len]
         assert p_params.max_seqlen_q == target_len - total_T
         assert p_params.max_seqlen_kv == target_len - total_T
         assert p_params.total_tokens == target_len
-        assert p_params.pad_between_seqs is False
+        assert p_params.pad_between_seqs is True
         assert p_mask.shape == (1, target_len)
         assert not p_mask[0, :total_T].any()
         assert p_mask[0, total_T:].all()
@@ -489,10 +490,10 @@ class TestPadSequenceForThd:
             max_num_seqs=32,
         )
         assert p.cu_seqlens_q[0] == 0 and p.cu_seqlens_q[2] == 80
-        assert (p.cu_seqlens_q[3:] == 128).all()
+        assert (p.cu_seqlens_q[3:] == 80).all()
         assert p.cu_seqlens_q_padded[0] == 0 and p.cu_seqlens_q_padded[2] == 80
         assert (p.cu_seqlens_q_padded[3:] == 128).all()
-        assert p.pad_between_seqs is False
+        assert p.pad_between_seqs is True
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -540,7 +541,7 @@ class TestDecomposeReconstruct:
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         r = kw['packed_seq_params']
         assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
-        assert r.pad_between_seqs is False
+        assert r.pad_between_seqs is True
         for k, v in orig.items():
             assert torch.equal(getattr(r, k), v)
 
@@ -580,6 +581,52 @@ class TestStaticInputs:
 
 
 class TestDynamicMicrobatchSlots:
+
+    @pytest.mark.internal
+    def test_dynamic_cp_graph_bank_and_capture_contexts(self, monkeypatch):
+        from megatron.core import parallel_state
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        groups = {size: object() for size in (1, 2, 4, 8)}
+        monkeypatch.setattr(
+            parallel_state,
+            'get_dynamic_data_context_parallel_groups',
+            lambda group_size: groups[group_size],
+        )
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            dynamic_context_parallel=True, min_dynamic_context_parallel_size=1
+        )
+        helper.dp_cp_group = SimpleNamespace(size=lambda: 8)
+        assert helper._get_dynamic_cp_capture_contexts() == [
+            (size, groups[size]) for size in (8, 4, 2, 1)
+        ]
+
+        bank = {size: [f'cp{size}'] for size in groups}
+        layer = SimpleNamespace(cuda_graphs=[], cuda_graphs_by_dynamic_cp_size=bank)
+        params = SimpleNamespace(local_cp_size=4, cp_group=groups[4])
+        TransformerLayer._activate_dynamic_cp_cuda_graph(layer, params)
+        assert layer.cuda_graphs is bank[4]
+
+    @pytest.mark.internal
+    def test_mla_rope_tensor_follows_te_graph_lifetime(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        mla = MLASelfAttention.__new__(MLASelfAttention)
+        torch.nn.Module.__init__(mla)
+        mla.config = SimpleNamespace(cuda_graph_impl='transformer_engine')
+        monkeypatch.setattr(cuda_graphs, 'is_graph_capturing', lambda: True)
+
+        tensor = torch.ones(1)
+        tensor_ref = weakref.ref(tensor)
+        mla._retain_cuda_graph_rope_tensors(tensor)
+        del tensor
+        assert tensor_ref() is not None
+
+        TECudaGraphHelper._clear_cuda_graph_state(mla)
+        assert tensor_ref() is None
 
     @pytest.mark.internal
     def test_pp2_slots_track_max_outstanding_microbatches(self):
