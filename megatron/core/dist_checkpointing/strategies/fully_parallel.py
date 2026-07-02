@@ -184,6 +184,13 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
 
+    @property
+    def stream_ckpt_dequant(self) -> bool:
+        """Forward the streaming dequantize flag from the wrapped strategy so that
+        ``serialization.load`` can skip the upfront ``force_all_tensors_to_non_fp8`` pass
+        when streaming is enabled."""
+        return getattr(self.base_strategy, "stream_ckpt_dequant", False)
+
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
     def load(
         self,
