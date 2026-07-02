@@ -1827,6 +1827,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
+        if (
+            packed_seq_kwargs.get("qkv_format") == "thd"
+            and packed_seq_kwargs.get("pad_between_seqs") is False
+        ):
+            # Megatron represents end padding as dummy THD sequences. TE DPA
+            # sizes THD outputs from cu_seqlens_q/kv, so pass padded
+            # boundaries as the effective attention boundaries while keeping
+            # the original PackedSeqParams metadata intact for downstream
+            # loss/routing paths.
+            if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
+            if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
