@@ -17,6 +17,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_flex_dispatcher_backend,
     get_valid_fp8_flags,
     get_valid_token_dispatcher_types,
 )
@@ -102,7 +103,7 @@ class TestA2AOverlap:
         # create TransformerConfig
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -213,7 +214,7 @@ class TestA2AOverlap:
             "sequence_parallel": tp_size > 1,
         }
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         with deterministic_mode():
             for layer_num in layers:
                 output_tensors = []
