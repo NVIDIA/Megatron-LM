@@ -135,9 +135,10 @@ class SFTDataset(torch.utils.data.Dataset):
 
         # [WAR]: For DeepSeek-V3/R1 tokenizer, we modify the chat_template such that the <think>
         # tokens are preserved for supervised learning.
-        self.tokenizer.chat_template = self.tokenizer.chat_template.replace(
-            REMOVE_THINK_CHAT_TEMPLATE, ""
-        )
+        if self.tokenizer.chat_template is not None:
+            self.tokenizer.chat_template = self.tokenizer.chat_template.replace(
+                REMOVE_THINK_CHAT_TEMPLATE, ""
+            )
 
         hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
             self.hf_dataset, {"split": "train"}
@@ -158,8 +159,11 @@ class SFTDataset(torch.utils.data.Dataset):
             flush=True,
         )
 
-        if self.tokenizer.chat_template is None:
-            self.tokenizer.chat_template = SFTDataset.hf_dataset_to_prompt_template
+        if self.tokenizer.chat_template is None and self.hf_dataset is not None:
+            self.tokenizer.chat_template = SFTDataset._wildcard_get(
+                SFTDataset.hf_dataset_to_prompt_template,
+                self.hf_dataset,
+            )
         elif self.hf_dataset is not None:
             self.data_transformation = SFTDataset._wildcard_get(
                 SFTDataset.hf_dataset_to_conversation,
