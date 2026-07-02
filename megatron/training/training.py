@@ -83,6 +83,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.optimizer.utils import dump_optimizer_parameters
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
@@ -2089,6 +2090,15 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        # Optional: dump per-rank optimizer parameter sharding for fixture capture.
+        # Optimizer-agnostic — fires regardless of optimizer class. See
+        # `megatron.core.optimizer.utils` for the schema.
+        if args.optimizer_parameters_dump_dir:
+            # `MegatronOptimizer` wraps an inner `torch.optim.Optimizer` and
+            # exposes it at `.optimizer`. Unwrap so the helper receives a
+            # real `torch.optim.Optimizer` (matches its type signature).
+            dump_optimizer_parameters(optimizer.optimizer, args.optimizer_parameters_dump_dir)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
