@@ -134,6 +134,18 @@ class MultiLatentAttention(Attention):
     "cross attn" specializations.
     """
 
+    def _retain_cuda_graph_rope_tensors(self, *rope_tensors: Optional[torch.Tensor]) -> None:
+        """Retain MLA-internal RoPE allocations used by TE CUDA graphs."""
+        if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
+            return
+
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not is_graph_capturing():
+            return
+        refs = self.__dict__.setdefault('_cuda_graph_static_tensor_refs', {})
+        refs.update((id(tensor), tensor) for tensor in rope_tensors if tensor is not None)
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -718,6 +730,8 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb, mscale = self.rotary_pos_emb(
                     rotary_seq_len, packed_seq=thd_packed_seq
                 )
+
+        self._retain_cuda_graph_rope_tensors(rotary_pos_emb, rotary_pos_cos, rotary_pos_sin)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:

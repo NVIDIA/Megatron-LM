@@ -144,18 +144,16 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
     return padded
 
 
-def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[Tensor]:
-    """Append a dummy sequence boundary to a cu_seqlens tensor.
-
-    ``dummy_end`` is the padded target length. Appending it to both
-    ``cu_seqlens_*`` and ``cu_seqlens_*_padded`` represents the post-pack
-    alignment tail as an ordinary dummy sequence. That keeps every token row
-    covered by THD metadata without enabling TE's pad-between-sequences mode.
-    """
+def _append_dummy_seq(
+    cu_seqlens: Optional[Tensor], dummy_end: Optional[int] = None
+) -> Optional[Tensor]:
+    """Append a boundary, repeating the final offset by default for a zero-token dummy."""
     if cu_seqlens is None:
         return None
-
-    dummy = torch.full((1,), int(dummy_end), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    if dummy_end is None:
+        dummy = cu_seqlens[-1:]
+    else:
+        dummy = cu_seqlens.new_full((1,), int(dummy_end))
     return torch.cat((cu_seqlens, dummy), dim=0)
 
 
@@ -206,7 +204,7 @@ def _resolve_thd_padding_lengths(
 
     Returns:
         local_actual_T: Current rank's token-like tensor length.
-        global_actual_T: Global packed length represented by THD metadata.
+        global_actual_T: Global physical packed length represented by THD metadata.
         local_target_len: Current rank's padded token-like tensor length.
         global_target_len: Global padded endpoint represented by THD metadata.
         mask_device: Device used to build the returned padding mask.
@@ -227,10 +225,15 @@ def _resolve_thd_padding_lengths(
 
     # Prefer THD metadata for the global packed length when it is available.
     has_local_tensor = local_tensor_T is not None
-    if packed_seq_params.cu_seqlens_q is not None:
-        global_actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
+    physical_cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    if physical_cu_seqlens is not None:
+        global_actual_T = int(physical_cu_seqlens[-1].item())
         if mask_device is None:
-            mask_device = packed_seq_params.cu_seqlens_q.device
+            mask_device = physical_cu_seqlens.device
     else:
         assert has_local_tensor, (
             "packed_seq_params.cu_seqlens_q must be available to derive padding_mask "
@@ -386,8 +389,8 @@ def pad_sequence_for_thd(
           stages, Megatron asks TE which packed rows this CP rank would receive
           and uses that row count as the local length instead of assuming equal
           division by CP size.
-        - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
-          represented as an ordinary dummy sequence in cu_seqlens metadata.
+        - When ``pad_by_appending_dummy_seq`` is true, the padding tail is represented
+          by a zero-valid-token dummy sequence whose padded boundary spans the tail.
         - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
           by CUDA Graph replay because those tensors are graph inputs.
 
@@ -437,16 +440,25 @@ def pad_sequence_for_thd(
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
 
+    physical_q = cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+    physical_kv = cu_seqlens_kv_padded if cu_seqlens_kv_padded is not None else cu_seqlens_kv
+
     # Represent post-pack padding as a dummy sequence when requested.
     target_cu_entries = None if max_num_seqs is None else max_num_seqs + 1
     has_dummy_padding_seq = pad_by_appending_dummy_seq and global_target_len > global_actual_T
     dummy_seq_len = global_target_len - global_actual_T if has_dummy_padding_seq else 0
 
     if has_dummy_padding_seq:
-        cu_seqlens_q = _append_dummy_seq(cu_seqlens_q, global_target_len)
-        cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, global_target_len)
-        cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
-        cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+        if physical_q is not None and physical_kv is not None and physical_q is not physical_kv:
+            assert physical_q[-1].item() == physical_kv[-1].item(), (
+                "One appended THD tail dummy requires matching Q and KV physical endpoints."
+            )
+        # Keep the logical endpoint unchanged and span the physical tail only in the
+        # padded metadata so fused THD helpers initialize every tensor row.
+        cu_seqlens_q = _append_dummy_seq(cu_seqlens_q)
+        cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv)
+        cu_seqlens_q_padded = _append_dummy_seq(physical_q, global_target_len)
+        cu_seqlens_kv_padded = _append_dummy_seq(physical_kv, global_target_len)
 
     # Pad cu_seqlens entry counts for static CUDA Graph inputs.
     if target_cu_entries is not None:
@@ -475,7 +487,7 @@ def pad_sequence_for_thd(
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
         total_tokens=local_target_len if target_cu_entries is None else None,
-        pad_between_seqs=False if has_dummy_padding_seq else packed_seq_params.pad_between_seqs,
+        pad_between_seqs=has_dummy_padding_seq or packed_seq_params.pad_between_seqs,
     )
 
     # True marks padded local token slots for routing/loss paths.

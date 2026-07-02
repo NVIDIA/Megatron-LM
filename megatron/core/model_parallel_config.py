@@ -125,6 +125,10 @@ class ModelParallelConfig:
     pad_packed_seq_alignment, but cu_seqlens sequence boundaries are not extended
     for the padding tail. CUDA Graph static-input padding may still pad the
     cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+
+    Fused RoPE is unsafe only when disabling this option creates a hidden-only
+    tail beyond the last padded cu_seqlens boundary; inputs without such a tail
+    are unaffected.
     """
 
     expert_model_parallel_size: int = 1

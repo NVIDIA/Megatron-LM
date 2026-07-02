@@ -1583,6 +1583,11 @@ def validate_args(args, defaults={}):
             f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
             f'must be <= dp_size * cp_size ({dp_cp_size})'
         )
+        if (
+            args.cuda_graph_impl == 'transformer_engine'
+            and args.step_batch_size_schedule is not None
+        ):
+            raise ValueError('Dynamic CP CUDA graphs do not support step_batch_size_schedule.')
 
         import warnings
 

@@ -536,6 +536,7 @@ def next_hdp_group_packing_aware(
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
+    max_num_seqs: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -549,7 +550,7 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    every rank. ``max_num_seqs`` optionally caps the real sequences per subgroup.
     """
     if not sample_seqlens:
         return (
@@ -609,6 +610,11 @@ def next_hdp_group_packing_aware(
 
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
+                    continue
+                if (
+                    max_num_seqs is not None
+                    and len(micro_batches[group_members[group_id][0]]) >= max_num_seqs
+                ):
                     continue
                 if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
                     continue
@@ -745,7 +751,9 @@ def next_hdp_group_packing_aware(
 
         for sample_id, seq_len in sample_seqlens:
             per_rank_len = seq_len / total_gpus
-            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+            if (
+                max_num_seqs is None or len(selected) < max_num_seqs
+            ) and packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
             else:
