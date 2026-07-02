@@ -2626,7 +2626,7 @@ class TestThdWrapperDispatchAndValidation:
             dsa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_sparse_attn_thd_pass_through_no_reshape(self):
+    def test_dsa_sparse_attn_thd_pass_through_no_reshape(self, reset_lazy_kernel_state):
         """THD inputs flow into ``SparseAttnFunc`` unchanged (no SBHD
         reshape) and the output is ``(total_q, np * d_v)``.
         """
