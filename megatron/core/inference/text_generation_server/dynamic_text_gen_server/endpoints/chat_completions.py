@@ -593,6 +593,12 @@ try:
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
 
+            # When ignore_eos is set, disable EOS-based termination (termination_id=-1)
+            # so generation runs to num_tokens_to_generate exactly. Mirrors the
+            # /v1/completions endpoint; without it the chat endpoint stops at the
+            # model's natural EOS and emits fewer tokens than requested.
+            ignore_eos = bool(_get_non_none(req, "ignore_eos", False))
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -602,6 +608,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
