@@ -698,6 +698,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         process_group = expt_dp_group if expt_dp_group is not None else mpu.get_expert_data_parallel_group()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
