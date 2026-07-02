@@ -11,6 +11,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
+    PagedTensor,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -83,15 +85,17 @@ class MoEModelTestContainer:
             expert_tensor_parallel_size=moe_tp_size,
         )
         _set_random_seed(seed_=123, data_parallel_random_init=data_parallel_random_init)
+        fp8 = kwargs.get("fp8", 'e4m3')
+        fp8_recipe = kwargs.get("fp8_recipe", 'mxfp8')
         self.config = TransformerConfig(
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=ep_size,
             pipeline_model_parallel_size=pp_size,
             context_parallel_size=cp_size,
             expert_tensor_parallel_size=moe_tp_size,
-            fp8='e4m3',
-            fp8_recipe='mxfp8',
-            fp8_wgrad=True,
+            fp8=fp8,
+            fp8_recipe=fp8_recipe,
+            fp8_wgrad=kwargs.get("fp8_wgrad", fp8 is not None),
             fp8_amax_compute_algo='most_recent',
             fp8_amax_history_len=1,
             fp8_interval=1,
@@ -115,7 +119,7 @@ class MoEModelTestContainer:
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
-            moe_router_padding_for_fp8=kwargs.get("moe_router_padding_for_fp8", True),
+            moe_router_padding_for_fp8=kwargs.get("moe_router_padding_for_fp8", fp8 is not None),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
             moe_mlp_glu_interleave_size=kwargs.get("moe_mlp_glu_interleave_size", None),
             moe_router_padding_for_quantization=kwargs.get(
@@ -208,6 +212,174 @@ _MXFP8_SKIP_REASON = (
 )
 
 
+class _LegacyGroupedTensor:
+    """Fake TE 2.14/2.15-style GroupedTensor constructor."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        num_tensors,
+        shapes=None,
+        quantizer=None,
+        data=None,
+        columnwise_data=None,
+        scale_inv=None,
+        columnwise_scale_inv=None,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=None,
+        last_dims=None,
+        tensor_offsets=None,
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        requires_grad=False,
+        with_gemm_swizzled_scales=False,
+    ):
+        self.kwargs = {
+            "shape": shape,
+            "dtype": dtype,
+            "num_tensors": num_tensors,
+            "shapes": shapes,
+            "quantizer": quantizer,
+            "data": data,
+            "columnwise_data": columnwise_data,
+            "scale_inv": scale_inv,
+            "columnwise_scale_inv": columnwise_scale_inv,
+            "amax": amax,
+            "columnwise_amax": columnwise_amax,
+            "scale": scale,
+            "first_dims": first_dims,
+            "last_dims": last_dims,
+            "tensor_offsets": tensor_offsets,
+            "offsets": offsets,
+            "scale_inv_offsets": scale_inv_offsets,
+            "columnwise_scale_inv_offsets": columnwise_scale_inv_offsets,
+            "requires_grad": requires_grad,
+            "with_gemm_swizzled_scales": with_gemm_swizzled_scales,
+        }
+
+
+class _RowScaledGroupedTensor(_LegacyGroupedTensor):
+    """Fake newer GroupedTensor constructor with row-scaled NVFP4 support."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        num_tensors,
+        shapes=None,
+        quantizer=None,
+        data=None,
+        columnwise_data=None,
+        scale_inv=None,
+        columnwise_scale_inv=None,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=None,
+        last_dims=None,
+        tensor_offsets=None,
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        requires_grad=False,
+        with_gemm_swizzled_scales=False,
+        row_scaled_nvfp4=False,
+    ):
+        super().__init__(
+            shape,
+            dtype,
+            num_tensors=num_tensors,
+            shapes=shapes,
+            quantizer=quantizer,
+            data=data,
+            columnwise_data=columnwise_data,
+            scale_inv=scale_inv,
+            columnwise_scale_inv=columnwise_scale_inv,
+            amax=amax,
+            columnwise_amax=columnwise_amax,
+            scale=scale,
+            first_dims=first_dims,
+            last_dims=last_dims,
+            tensor_offsets=tensor_offsets,
+            offsets=offsets,
+            scale_inv_offsets=scale_inv_offsets,
+            columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            requires_grad=requires_grad,
+            with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+        )
+        self.kwargs["row_scaled_nvfp4"] = row_scaled_nvfp4
+
+
+def _grouped_tensor_metadata(grouped_cls):
+    return {
+        "cls": grouped_cls,
+        "shape": (2, 3),
+        "logical_shape": (2, 3),
+        "dtype": torch.float32,
+        "num_tensors": 2,
+        "shapes": [(1, 3), (1, 3)],
+        "quantizer": None,
+        "columnwise_data": None,
+        "scale_inv": None,
+        "columnwise_scale_inv": None,
+        "amax": None,
+        "columnwise_amax": None,
+        "scale": None,
+        "first_dims": None,
+        "last_dims": None,
+        "tensor_offsets": None,
+        "offsets": None,
+        "scale_inv_offsets": None,
+        "columnwise_scale_inv_offsets": None,
+        "with_gemm_swizzled_scales": False,
+        "row_scaled_nvfp4": True,
+        "requires_grad": True,
+        "nvfp4_use_4over6": True,
+        "nvfp4_e4m3_max": 448,
+    }
+
+
+def _restore_fake_grouped_tensor(grouped_cls):
+    rowwise_data = torch.arange(6, dtype=torch.float32).view(2, 3)
+    paged_tensor = PagedTensor(
+        rowwise_data,
+        num_tokens_tensor=torch.tensor([2], dtype=torch.int64),
+        max_num_tokens=2,
+        hidden_size=3,
+        tensor_attrs={"grouped_tensor_scale_inv": False},
+        grouped_tensor_metadata=_grouped_tensor_metadata(grouped_cls),
+    )
+    return paged_tensor.restore_grouped_tensor()
+
+
+def test_grouped_tensor_restore_skips_row_scaled_nvfp4_for_legacy_signature():
+    """Older TE GroupedTensor constructors should not receive newer NVFP4 kwargs."""
+    restored = _restore_fake_grouped_tensor(_LegacyGroupedTensor)
+
+    assert restored.kwargs["requires_grad"] is True
+    assert "row_scaled_nvfp4" not in restored.kwargs
+    assert "nvfp4_use_4over6" not in restored.kwargs
+    assert "nvfp4_e4m3_max" not in restored.kwargs
+    assert restored.grouped_tensor_scale_inv is False
+
+
+def test_grouped_tensor_restore_passes_row_scaled_nvfp4_when_signature_supports_it():
+    """Newer TE GroupedTensor constructors should keep row-scaled NVFP4 metadata."""
+    restored = _restore_fake_grouped_tensor(_RowScaledGroupedTensor)
+
+    assert restored.kwargs["requires_grad"] is True
+    assert restored.kwargs["row_scaled_nvfp4"] is True
+    assert "nvfp4_use_4over6" not in restored.kwargs
+    assert "nvfp4_e4m3_max" not in restored.kwargs
+    assert restored.grouped_tensor_scale_inv is False
+
+
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
 @pytest.mark.skipif(
     not _te_grouped_mlp_op_fuser_environment_supported(),
@@ -216,9 +388,10 @@ _MXFP8_SKIP_REASON = (
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
 class TestPagedStashing:
     def setup_method(self, method):
-        pass
+        PagedStashManager.STASH_MGR = None
 
     def teardown_method(self, method):
+        PagedStashManager.STASH_MGR = None
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -298,6 +471,87 @@ class TestPagedStashing:
             ), f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
 
 
+@pytest.mark.skipif(
+    not _te_grouped_mlp_op_fuser_environment_supported(),
+    reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
+)
+@pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
+class TestPagedStashingPureBF16:
+    def setup_method(self, method):
+        PagedStashManager.STASH_MGR = None
+
+    def teardown_method(self, method):
+        PagedStashManager.STASH_MGR = None
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_forward_backward_4_layers_pure_bf16(self):
+        """Pure BF16 paged stashing captures token-major fused expert activations."""
+        if not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+
+        config.ENABLE_EXPERIMENTAL = True
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            num_layers=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend="hybridep",
+            test_dtype=torch.bfloat16,
+            fp8=None,
+            fp8_recipe=None,
+            fp8_wgrad=False,
+            moe_router_padding_for_fp8=False,
+            moe_router_padding_for_quantization=False,
+            moe_grouped_gemm=True,
+            moe_use_legacy_grouped_gemm=False,
+            moe_paged_stash=True,
+            moe_expert_rank_capacity_factor=1.5,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+        )
+
+        seq_length = 1024
+        batch_size = 1
+        hidden_size = container.config.hidden_size
+        hidden_states = torch.randn((seq_length, batch_size, hidden_size), dtype=torch.bfloat16)
+
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output_ref, hidden_states_grad_ref, _, _ = _forward_backward_all_layers(
+            container, hidden_states
+        )
+
+        container.zero_grad()
+
+        paged_stash_reset(True, config=container.config)
+        stash_manager = PagedStashManager.get_instance()
+        assert stash_manager.stash_buffers is not None
+        assert torch.bfloat16 in stash_manager.stash_buffers
+        paged_stash_init_chunk_handler(1, 0)
+        output, hidden_states_grad, _, _ = _forward_backward_all_layers(container, hidden_states)
+
+        overflow = check_paged_stash_overflow()
+        assert overflow.any().item() == 0
+        assert torch.allclose(
+            output, output_ref, atol=1e-4, rtol=1e-4
+        ), f"output != output_ref: max diff = {(output - output_ref).abs().max().item()}"
+        assert torch.allclose(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4), (
+            f"hidden_states_grad != ref: max diff = "
+            f"{(hidden_states_grad - hidden_states_grad_ref).abs().max().item()}"
+        )
+
+
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
 @pytest.mark.skipif(
     not _te_grouped_mlp_op_fuser_environment_supported(),
@@ -306,9 +560,10 @@ class TestPagedStashing:
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
 class TestPagedStashingOverBudget:
     def setup_method(self, method):
-        pass
+        PagedStashManager.STASH_MGR = None
 
     def teardown_method(self, method):
+        PagedStashManager.STASH_MGR = None
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
