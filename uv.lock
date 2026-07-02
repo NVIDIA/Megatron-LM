@@ -2328,7 +2328,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=b9d690e042b1c4e455214e7dab65d6d3512c05d6" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -5224,7 +5224,7 @@ wheels = [
 [[package]]
 name = "transformer-engine"
 version = "2.16.0+4220403e"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=b9d690e042b1c4e455214e7dab65d6d3512c05d6#b9d690e042b1c4e455214e7dab65d6d3512c05d6" }
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15#42b840051647eef89761a16dfdff87e82bb253ab" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
