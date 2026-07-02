@@ -749,7 +749,13 @@ def build_mtp_layer_callables(layer):
         ), f"multi token prediction + sequence packing is not yet supported."
 
         if layer.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_model_and_context_parallel_rng_tracker_name()
+            )
+        elif layer.config.context_parallel_size > 1:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_context_parallel_rng_tracker_name()
+            )
         else:
             rng_context = nullcontext()
 
@@ -771,7 +777,13 @@ def build_mtp_layer_callables(layer):
         Wrapper to add rng context to submodule callables
         """
         if layer.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_model_and_context_parallel_rng_tracker_name()
+            )
+        elif layer.config.context_parallel_size > 1:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_context_parallel_rng_tracker_name()
+            )
         else:
             rng_context = nullcontext()
         with rng_context:
