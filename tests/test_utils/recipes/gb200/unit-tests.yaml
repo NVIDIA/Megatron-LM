@@ -5,7 +5,7 @@ loggers: [stdout]
 spec:
   name: "{test_case}_{environment}_{platforms}_{tag}"
   model: unit-tests
-  nodes: 2
+  nodes: 1
   build: mcore-pyt-{environment}
   gpus: 4
   platforms: dgx_gb200
@@ -51,105 +51,26 @@ spec:
       --tag $TAG \
       --environment $ENVIRONMENT \
       --bucket $BUCKET \
+      --platform gb200 \
       --unit-test-repeat $UNIT_TEST_REPEAT \
       --log-dir {assets_dir}/logs/1/
 
-    ls -al 
+    ls -al
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
+    /opt/venv/bin/coverage xml
     cp .coverage {assets_dir}/coverage_report
     cp coverage.xml {assets_dir}
 
+# GB200 unit-test selection is marker-driven: a single catch-all bucket is
+# narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py
+# (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
+# buckets here if the marked set grows large enough to need parallelism.
 products:
-  - test_case: [tests/unit_tests/test_model_configs.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/test_fp8_param.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/pipeline_parallel/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/models/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/data/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/dist_checkpointing/test_optimizer.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/dist_checkpointing/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/dist_checkpointing/models/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/dist_checkpointing/models/test_moe_experts.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/transformer/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/transformer/moe/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest, legacy]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
-  - test_case: [tests/unit_tests/distributed/megatron_fsdp/**/*.py]
-    products:
-      - environment: [dev]
-        tag: [latest]
-        scope: [unit-tests]
-        n_repeat: [1]
-        time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [dev]
-        tag: [latest, legacy]
+        tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
