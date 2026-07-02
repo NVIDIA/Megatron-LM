@@ -192,6 +192,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            get_sub_layer_offset,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -202,14 +203,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
+        main_pattern = parsed.main_pattern or ''
         layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
+            main_pattern,
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
         )
+        # Used by `HybridStack.sharded_state_dict` to rewrite decoder keys
+        # into a fusion-independent layout. `_decoder_physical_offset`
+        # mirrors `layer_offset` (physical-block index where this pipeline
+        # segment starts); `_decoder_sub_layer_offset` is its sub-layer
+        # counterpart, counting each character of a fused `[XY]` group
+        # separately.
+        self._decoder_physical_offset = layer_offset
+        self._decoder_sub_layer_offset = get_sub_layer_offset(main_pattern, layer_offset)
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -277,7 +287,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config,
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
-            pp_layer_offset=layer_offset,
+            pp_layer_offset=self._decoder_physical_offset,
+            sub_layer_offset=self._decoder_sub_layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
