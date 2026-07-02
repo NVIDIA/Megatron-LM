@@ -4084,6 +4084,20 @@ def _add_distributed_args(parser):
         help='If set, average directly in data-parallel communication collective.',
     )
     group.add_argument(
+        '--disable-grad-buffers-cpu-backup',
+        action='store_true',
+        default=False,
+        help='If set, allocate DDP gradient buffers in a torch_memory_saver region '
+        'without CPU backup.',
+    )
+    group.add_argument(
+        '--disable-param-buffers-cpu-backup',
+        action='store_true',
+        default=False,
+        help='If set, allocate DDP parameter buffers in a torch_memory_saver region '
+        'without CPU backup. Only applies when using the distributed optimizer.',
+    )
+    group.add_argument(
         '--overlap-param-gather',
         action='store_true',
         default=False,
