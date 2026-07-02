@@ -43,6 +43,17 @@ class A:
         return success_string
 
 
+def test_is_flashinfer_min_version():
+    from packaging.version import Version as PkgVersion
+
+    with patch.object(util, '_flashinfer_version', PkgVersion('0.5.0')):
+        assert util.is_flashinfer_min_version("0.4.0")
+        assert util.is_flashinfer_min_version("0.5.0")
+        assert util.is_flashinfer_min_version("0.4.0", check_equality=False)
+        assert not util.is_flashinfer_min_version("0.5.0", check_equality=False)
+        assert not util.is_flashinfer_min_version("0.6.0")
+
+
 def test_divide_properly():
     assert util.divide(4, 2) == 2
 
