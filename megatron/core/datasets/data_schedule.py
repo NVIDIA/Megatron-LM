@@ -1,12 +1,22 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, List, Optional
+import enum
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.datasets.data_schedule_utils import (
+    broadcast_scalars,
+    broadcast_to_pp_group,
+    build_packed_microbatches,
+    create_data_iterator,
+    get_batch_and_global_seqlens,
+    reroute_samples_to_dcp_ranks,
+)
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import LayerType
 
 
 class HybridCPDataLoaderWrapper:
@@ -299,3 +309,460 @@ class HybridCPDataLoaderWrapper:
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
         return samples_this_rank_with_id, sample_id_groups
+
+
+class BasePackingScheduler:
+    """Base class for sequence packing schedulers."""
+
+    def __init__(
+        self,
+        max_seqlen_per_dp_cp_rank: int,
+        cp_size: int,
+        dp_size: int,
+        microbatch_group_size_per_vp_stage: int | None,
+    ):
+        """
+        Args:
+            max_seqlen_per_dp_cp_rank: The maximum sequence length per DPxCP rank.
+            cp_size: The context parallel size.
+            dp_size: The data parallel size.
+            microbatch_group_size_per_vp_stage: The microbatch group size per virtual
+            pipeline stage, only used when enabling VPP, otherwise None.
+        """
+        if max_seqlen_per_dp_cp_rank <= 0:
+            raise ValueError("max_seqlen_per_dp_cp_rank must be positive.")
+        if cp_size <= 0 or dp_size <= 0:
+            raise ValueError("cp_size and dp_size must be positive.")
+        if (
+            microbatch_group_size_per_vp_stage is not None
+            and microbatch_group_size_per_vp_stage <= 0
+        ):
+            raise ValueError("microbatch_group_size_per_vp_stage must be positive.")
+        self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
+        self.cp_size = cp_size
+        self.dp_size = dp_size
+        self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+
+    def get_required_sample_keys(self) -> List[str]:
+        """Return the required key of each batch."""
+        raise NotImplementedError
+
+    def get_groups_and_subsamples(
+        self, sample_id_seqlens: List[tuple[int, int]]
+    ) -> List[List[List[int]]]:
+        """Schedule samples into per-microbatch, per-DP×CP-rank groups."""
+        raise NotImplementedError
+
+    def run(
+        self,
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+    ):
+        """
+        Run the scheduler and return the new data_iterator.
+
+        Args:
+            data_iterator: The data iterator.
+            num_microbatches: The number of microbatches to fetch.
+            dp_group: Data parallel process group.
+            tp_group: Tensor parallel process group.
+            pp_group: Pipeline parallel process group.
+            dp_cp_group: Data parallel + context parallel process group.
+            dev: CUDA device.
+            config: Model parallel config.
+
+        Returns:
+            new_data_iterator: The new data iterator (or list for VPP).
+            num_micro_batches: Number of micro batches after scheduling.
+            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+        """
+        raise NotImplementedError
+
+
+def _get_vpp_stages_needing_data(config, pp_rank: int, pp_size: int) -> List[bool]:
+    """Return which virtual stages on a physical PP rank consume full batches."""
+
+    configured_vpp_size = getattr(config, "virtual_pipeline_model_parallel_size", None)
+    vpp_size = configured_vpp_size if configured_vpp_size is not None else 1
+    needs_data = [False] * vpp_size
+
+    if pp_rank == 0:
+        needs_data[0] = True
+    if pp_rank == pp_size - 1:
+        needs_data[-1] = True
+
+    layout = getattr(config, "pipeline_model_parallel_layout", None)
+    if layout is not None:
+        physical_stage_layout = layout.layout[pp_rank]
+        assert len(physical_stage_layout) == vpp_size, (
+            f"Pipeline layout has {len(physical_stage_layout)} virtual stages on PP rank "
+            f"{pp_rank}, expected {vpp_size}."
+        )
+        for vp_stage, stage_layout in enumerate(physical_stage_layout):
+            needs_data[vp_stage] |= LayerType.mtp in stage_layout
+    elif getattr(config, "mtp_num_layers", None) is not None and pp_rank == pp_size - 1:
+        # Without a custom layout, MTP is colocated with the final pipeline stage.
+        needs_data[-1] = True
+
+    return needs_data
+
+
+class DpBalancedScheduler(BasePackingScheduler):
+    """Packs sequences in their original order until reaching the max limit of sequence length."""
+
+    def __init__(
+        self,
+        max_seqlen_per_dp_cp_rank: int,
+        cp_size: int,
+        dp_size: int,
+        microbatch_group_size_per_vp_stage: int | None,
+    ):
+        super().__init__(
+            max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+        )
+        self.max_seq_len_all_ranks = self.max_seqlen_per_dp_cp_rank * self.cp_size
+
+    def get_required_sample_keys(self) -> List[str]:
+        """Return the required key of each batch."""
+        return [
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "original_seq_len",  # Length of the original sequence length, should be a gpu tensor.
+            "padded_seq_len",  # Length of the padded sequence length, should be a gpu tensor.
+        ]
+
+    def get_groups_and_subsamples(
+        self, sample_id_seqlens: List[tuple[int, int]]
+    ) -> List[List[List[int]]]:
+        """
+        Packs sequences in their original order until reaching the max limit of sequence length.
+        """
+        sample_id_groups = []
+        packed_id_groups = []
+        sum_seqlen = 0
+        single_microbatch = []
+
+        for sample_id, seqlen in sample_id_seqlens:
+            if seqlen > self.max_seq_len_all_ranks:
+                raise ValueError(
+                    f"Sample {sample_id} has padded length {seqlen}, exceeding the "
+                    f"per-microbatch capacity {self.max_seq_len_all_ranks}."
+                )
+            if sum_seqlen + seqlen <= self.max_seq_len_all_ranks:
+                single_microbatch.append(sample_id)
+                sum_seqlen += seqlen
+            else:
+                packed_id_groups.append(single_microbatch)
+                single_microbatch = [sample_id]
+                sum_seqlen = seqlen
+        if len(single_microbatch) > 0:
+            packed_id_groups.append(single_microbatch)
+
+        # we want the number of packed sequences to be multiple of dp_size
+        # so we move few samples from previous microbatch
+        # to the end of the microbatches if needed
+        num_packed_sequence = len(packed_id_groups)
+
+        # when enabling vpp, we want the number of packed sequences to be
+        # multiple of dp_size * microbatch_group_size_per_vp_stage
+        multiple = self.dp_size * (
+            self.microbatch_group_size_per_vp_stage
+            if self.microbatch_group_size_per_vp_stage is not None
+            else 1
+        )
+        if num_packed_sequence % multiple != 0:
+            remainder = num_packed_sequence % multiple
+            num_to_move = multiple - remainder
+            i = num_packed_sequence - 1
+            while num_to_move > 0:
+                while i >= 0 and len(packed_id_groups[i]) <= 1:
+                    i -= 1
+                if i < 0:
+                    raise ValueError("Not enough samples to align packed microbatches")
+                seq_id = packed_id_groups[i].pop()
+                packed_id_groups.append([seq_id])
+                num_to_move -= 1
+
+        assert len(packed_id_groups) % multiple == 0
+
+        num_micro_batches = int(len(packed_id_groups) / self.dp_size)
+        for i in range(num_micro_batches):
+            sample_id_groups.append([])
+            for j in range(self.cp_size * self.dp_size):
+                seq_id = int(i * self.dp_size + j / self.cp_size)
+                sample_id_groups[i].append(packed_id_groups[seq_id])
+        return sample_id_groups
+
+    def run(
+        self,
+        data_iterator,
+        num_microbatches: int,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev: torch.device,
+        config,
+    ):
+        """
+        Run the complete scheduling pipeline.
+
+        Steps:
+            1. Fetch batches and gather global sequence lengths
+            2. Check required sample keys
+            3. Schedule samples into groups
+            4. Reroute samples to DCP ranks
+            5. Build packed microbatches
+            6. Calculate FLOPs info
+            7. Broadcast to PP group (for middle PP stages)
+            8. Broadcast to TP group (for non-TP-0 ranks)
+            9. Handle VPP if enabled
+
+        Args:
+            data_iterator: The data iterator.
+            num_microbatches: The number of microbatches to fetch.
+            dp_group: Data parallel process group.
+            tp_group: Tensor parallel process group.
+            pp_group: Pipeline parallel process group.
+            dp_cp_group: Data parallel + context parallel process group.
+            dev: CUDA device.
+            config: Model parallel config.
+
+        Returns:
+            new_data_iterator: The new data iterator (or list for VPP).
+            num_micro_batches: Number of micro batches after scheduling.
+            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+        """
+
+        total_dcp_gpus = dp_cp_group.size()
+        is_first_pp_stage = pp_group.rank() == 0
+        is_last_pp_stage = pp_group.rank() == pp_group.size() - 1
+        vpp_needs_data = _get_vpp_stages_needing_data(
+            config, pp_rank=pp_group.rank(), pp_size=pp_group.size()
+        )
+        owns_raw_data = any(vpp_needs_data)
+        mtp_on_this_pp_stage = owns_raw_data and not (is_first_pp_stage or is_last_pp_stage)
+
+        # Handle VPP: extract the data iterator owned by this physical PP stage.
+        if (
+            config.virtual_pipeline_model_parallel_size is not None
+            and config.virtual_pipeline_model_parallel_size > 1
+        ):
+            vpp_size = config.virtual_pipeline_model_parallel_size
+            if data_iterator is not None:
+                assert len(data_iterator) == vpp_size
+                if owns_raw_data:
+                    data_iterator = next(
+                        (
+                            iterator
+                            for vp_stage, iterator in enumerate(data_iterator)
+                            if vpp_needs_data[vp_stage] and iterator is not None
+                        ),
+                        None,
+                    )
+                else:
+                    data_iterator = None
+        else:
+            vpp_needs_data = None
+
+        # Only TP rank zero consumes raw data. Intermediate PP stages may still
+        # receive a redundant iterator from legacy callers; ignore it and use
+        # metadata broadcast from the first stage instead.
+        if data_iterator is not None and not owns_raw_data:
+            data_iterator = None
+        if tp_group.rank() == 0 and owns_raw_data:
+            assert (
+                data_iterator is not None
+            ), "Sequence packing requires a data iterator on embedding, loss, and MTP stages."
+        if data_iterator is not None:
+            assert tp_group.rank() == 0, "Only TP rank 0 should have a data iterator"
+
+            # Step 1: Fetch batches and gather global sequence lengths
+            (
+                batch,
+                global_id_seqlens,
+                global_ids_this_rank,
+                offsets,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
+
+            # Step 2: Check required sample keys
+            for key in self.get_required_sample_keys():
+                assert (
+                    key in batch[0]
+                ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
+
+            # Step 3: Schedule samples into groups
+            sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
+
+            # Validate scheduling result
+            set_gbs = set()
+            for group in sample_id_groups:
+                for sub in group:
+                    set_gbs.update(sub)
+            assert len(set_gbs) == len(global_id_seqlens), (
+                f"set_gbs length: {len(set_gbs)} != "
+                f"global_id_seqlens length: {len(global_id_seqlens)}"
+            )
+
+            # Step 4: Reroute samples to DCP ranks
+            samples_this_rank_with_id = reroute_samples_to_dcp_ranks(
+                batch,
+                global_ids_this_rank,
+                global_id_seqlens,
+                sample_id_groups,
+                offsets,
+                dp_group,
+                dp_cp_group,
+                total_dcp_gpus,
+            )
+
+            dcp_rank = dp_cp_group.rank()
+            num_micro_batches = len(sample_id_groups)
+
+            grouped_samples = [
+                [
+                    samples_this_rank_with_id[sub_sample_id]
+                    for sub_sample_id in sample_id_groups[i][dcp_rank]
+                ]
+                for i in range(num_micro_batches)
+            ]
+
+            # Step 5: Build packed microbatches
+            new_samples = build_packed_microbatches(grouped_samples, dev)
+
+        else:
+            (
+                new_samples,
+                num_micro_batches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = (None, None, None, None)
+
+        # Step 7: Broadcast to PP group (for middle PP stages)
+        if tp_group.rank() == 0:
+            (
+                new_samples,
+                num_micro_batches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = broadcast_to_pp_group(
+                new_samples,
+                num_micro_batches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+                pp_group,
+                dev,
+                preserve_local_samples=mtp_on_this_pp_stage,
+            )
+
+        # Step 8: Broadcast to TP group. Keep the integer count separate from
+        # float64 FLOP statistics so neither is truncated through float32.
+        num_micro_batches = int(
+            broadcast_scalars([num_micro_batches], tp_group, dev, dtype=torch.int64)[0]
+        )
+        (seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = broadcast_scalars(
+            [seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch],
+            tp_group,
+            dev,
+            dtype=torch.float64,
+        )
+
+        # Step 9: create data_iterator and handle VPP if enabled
+        new_data_iterator = create_data_iterator(
+            new_samples,
+            tp_group,
+            config,
+            vpp_needs_data=vpp_needs_data,
+            needs_full_data=owns_raw_data,
+        )
+
+        return (
+            new_data_iterator,
+            num_micro_batches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
+
+
+class PackingSchedulerEnum(enum.Enum):
+    """Enum for supported sequence packing algorithms."""
+
+    DP_BALANCED = "dp_balanced"
+
+
+scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
+    PackingSchedulerEnum.DP_BALANCED: DpBalancedScheduler
+}
+
+
+def wrap_data_iterator(
+    data_iterator, config, num_microbatches: int, pg_collection: ProcessGroupCollection
+):
+    """
+    A wrapper function that wraps around an existing data_iterator
+    and return the num_micro_batches for sequence packing.
+
+    Args:
+        data_iterator: The original data_iterator to wrap around
+        config: The config object containing the max_seqlen_per_dp_cp_rank
+        num_microbatches: Number of input microbatches to schedule.
+        pg_collection: Explicit process groups used for scheduling.
+    """
+
+    dp_cp_group = pg_collection.dp_cp
+    dp_group = pg_collection.dp
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+    assert (
+        dp_cp_group is not None
+        and dp_group is not None
+        and tp_group is not None
+        and pp_group is not None
+    ), "dp_cp_group, dp_group, tp_group must not be None when using sequence packing"
+
+    dev = torch.cuda.current_device()
+    dp_size = dp_group.size()
+    cp_size = dp_cp_group.size() // dp_size
+
+    # Convert string to enum
+    scheduler_type = PackingSchedulerEnum(config.sequence_packing_scheduler)
+
+    scheduler = scheduler_map[scheduler_type](
+        config.max_seqlen_per_dp_cp_rank,
+        cp_size,
+        dp_size,
+        # When VPP is enabled, align num_micro_batches to this multiple.
+        (
+            None
+            if config.virtual_pipeline_model_parallel_size is None
+            else config.microbatch_group_size_per_vp_stage
+        ),
+    )
+
+    (
+        new_data_iterator,
+        num_micro_batches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
+    ) = scheduler.run(
+        data_iterator, num_microbatches, dp_group, tp_group, pp_group, dp_cp_group, dev, config
+    )
+
+    return (
+        new_data_iterator,
+        num_micro_batches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
+    )
