@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for THD / padded batch construction in multimodal_dev.
 
@@ -196,6 +196,7 @@ class TestPackOrPadBatchPadded:
         assert padded["input_ids"].shape == (2, S)
         assert padded["labels"].shape == (2, S)
         assert padded["loss_mask"].shape == (2, S)
+        assert "padding_mask" not in padded
         # Sample-0 content is preserved verbatim.
         assert padded["input_ids"][0].tolist() == list(range(S))
 
@@ -213,6 +214,11 @@ class TestPackOrPadBatchPadded:
         assert padded["labels"][1].tolist() == [110, 111, 112, -100, -100, -100, -100]
         # loss_mask pads with 0.
         assert padded["loss_mask"][1].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        assert padded["padding_mask"].dtype == torch.bool
+        assert padded["padding_mask"].tolist() == [
+            [False, False, False, False, False, False, False],
+            [False, False, False, True, True, True, True],
+        ]
 
     def test_seq_length_required(self):
         """``seq_length`` must be provided in padded mode."""
@@ -312,3 +318,7 @@ class TestPackOrPadBatchDivisibleBy4:
         assert padded["input_ids"][1].tolist() == [10, 11, 12, 0, 0, 0, 0, 0]
         assert padded["labels"][1].tolist() == [110, 111, 112, -100, -100, -100, -100, -100]
         assert padded["loss_mask"][1].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        assert padded["padding_mask"].tolist() == [
+            [False, False, False, False, False, True, True, True],
+            [False, False, False, True, True, True, True, True],
+        ]

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
@@ -309,8 +309,11 @@ def pack_or_pad_batch(
         padded_batch["loss_mask"] = torch.concat(
             [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
         )
-        positions = torch.arange(target_seqlens).unsqueeze(0)
-        padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+        # Keep None as the known-no-padding fast path for MoE routing.
+        has_padding = any(real_seqlen < target_seqlens for real_seqlen in real_seqlens)
+        if has_padding:
+            positions = torch.arange(target_seqlens).unsqueeze(0)
+            padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
