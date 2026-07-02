@@ -40,6 +40,15 @@ for split in Split:
 
 _MARGIN = 0.005
 
+# Pin the per-sample key sets that GPTDataset and BlendedDataset emit. These are the
+# upstream contract that drives:
+#   - BATCH_KEYS in pretrain_gpt.py / pretrain_hybrid.py (must remain a superset of
+#     these keys, modulo provenance fields).
+#   - `_add_provenance_keys` in tests/unit_tests/data/test_get_batch.py (must simulate
+#     the *exact* extras BlendedDataset adds on top of the inner dataset).
+_EXPECTED_GPT_DATASET_KEYS = {"tokens", "labels", "loss_mask", "position_ids"}
+_EXPECTED_BLENDED_DATASET_EXTRA_KEYS = {"dataset_id"}
+
 
 def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents, dataset_dir):
     # Create dataset directory
@@ -483,6 +492,13 @@ def test_fast_builder(
                 ds_fast
             ), f"ds_slow: {len(ds_slow)}, ds_fast: {len(ds_fast)}, split_name: {split_name}"
             if isinstance(ds_slow, GPTDataset):
+                assert set(ds_slow[0].keys()) == _EXPECTED_GPT_DATASET_KEYS, (
+                    f"GPTDataset emits {set(ds_slow[0].keys())}; expected "
+                    f"{_EXPECTED_GPT_DATASET_KEYS}. If you changed the schema, "
+                    f"update _EXPECTED_GPT_DATASET_KEYS here, BATCH_KEYS in "
+                    f"pretrain_gpt.py / pretrain_hybrid.py, and `_add_provenance_keys` "
+                    f"in tests/unit_tests/data/test_get_batch.py."
+                )
                 assert torch.all(ds_slow[0]["tokens"] == ds_fast[0]["tokens"])
                 assert torch.all(ds_slow[-1]["tokens"] == ds_fast[-1]["tokens"])
                 numpy.testing.assert_array_equal(ds_slow.document_index, ds_fast.document_index)
@@ -498,6 +514,15 @@ def test_fast_builder(
                     ds_slow.dataset.index.sequence_pointers, ds_fast.dataset.index.sequence_pointers
                 )
             elif isinstance(ds_slow, BlendedDataset):
+                expected_blended_keys = (
+                    _EXPECTED_GPT_DATASET_KEYS | _EXPECTED_BLENDED_DATASET_EXTRA_KEYS
+                )
+                assert set(ds_slow[0].keys()) == expected_blended_keys, (
+                    f"BlendedDataset emits {set(ds_slow[0].keys())}; expected "
+                    f"{expected_blended_keys}. If you changed the schema, update "
+                    f"_EXPECTED_BLENDED_DATASET_EXTRA_KEYS here and the provenance "
+                    f"helper in tests/unit_tests/data/test_get_batch.py."
+                )
                 assert torch.all(ds_slow[0]["tokens"] == ds_fast[0]["tokens"])
                 assert torch.all(ds_slow[-1]["tokens"] == ds_fast[-1]["tokens"])
                 numpy.testing.assert_array_equal(ds_slow.dataset_index, ds_fast.dataset_index)
@@ -505,6 +530,9 @@ def test_fast_builder(
                     ds_slow.dataset_sample_index, ds_fast.dataset_sample_index
                 )
                 for ds_slow_i, ds_fast_i in zip(ds_slow.datasets, ds_fast.datasets):
+                    # Inner dataset under BlendedDataset is the un-wrapped GPTDataset:
+                    # contract checks the bare key set, not the BlendedDataset extras.
+                    assert set(ds_slow_i[0].keys()) == _EXPECTED_GPT_DATASET_KEYS
                     assert torch.all(ds_slow_i[0]["tokens"] == ds_fast_i[0]["tokens"])
                     assert torch.all(ds_slow_i[-1]["tokens"] == ds_fast_i[-1]["tokens"])
                     numpy.testing.assert_array_equal(
