@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -84,16 +84,25 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
     "dsa_indexer_head_dim": None,
+    "dsa_indexer_k_norm_epsilon": None,
+    "dsa_indexer_k_norm_fp32": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_rope_interleaved": False,
+    "dsa_indexer_rotate_activation": True,
+    "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
+    "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
+    "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
     "expert_tensor_parallel_size": 1,
     "external_cuda_graph": False,
@@ -301,6 +310,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
+    "delay_offload_until_cuda_graph": False,
+    "delta_offload_bytes_across_pp_ranks": 0,
+    "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
