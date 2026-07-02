@@ -181,9 +181,7 @@ class TestResolveThdPaddingLengths:
         cu_valid = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
         cu_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
         psp = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_valid,
-            cu_seqlens_q_padded=cu_padded,
+            qkv_format="thd", cu_seqlens_q=cu_valid, cu_seqlens_q_padded=cu_padded
         )
 
         resolved = _resolve_thd_padding_lengths(
@@ -292,12 +290,7 @@ class TestPadSequenceForThd:
         psp = _make_psp(seqlens)
         orig = psp.cu_seqlens_q.clone()
         p_tok, _, _, _, p, mask = pad_sequence_for_thd(
-            torch.ones(1, total_T, device="cuda"),
-            None,
-            None,
-            None,
-            psp,
-            alignment=64,
+            torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment=64
         )
         assert p_tok.shape == (1, 128)
         expected = torch.cat((orig, torch.tensor([128], dtype=orig.dtype, device=orig.device)))
@@ -323,9 +316,7 @@ class TestPadSequenceForThd:
             max_seqlen_kv=4,
         )
         initial_padding_mask = torch.tensor(
-            [[False, False, False, True, False, False, True, True]],
-            dtype=torch.bool,
-            device="cuda",
+            [[False, False, False, True, False, False, True, True]], dtype=torch.bool, device="cuda"
         )
 
         p_tok, _, _, _, padded, mask = pad_sequence_for_thd(
@@ -351,22 +342,7 @@ class TestPadSequenceForThd:
         assert torch.equal(
             mask,
             torch.tensor(
-                [
-                    [
-                        False,
-                        False,
-                        False,
-                        True,
-                        False,
-                        False,
-                        True,
-                        True,
-                        True,
-                        True,
-                        True,
-                        True,
-                    ]
-                ],
+                [[False, False, False, True, False, False, True, True, True, True, True, True]],
                 dtype=torch.bool,
                 device="cuda",
             ),
@@ -424,12 +400,7 @@ class TestPadSequenceForThd:
 
         with pytest.raises(AssertionError, match="must be divisible"):
             pad_sequence_for_thd(
-                torch.ones(1, 2, device="cuda"),
-                None,
-                None,
-                None,
-                _make_psp([4]),
-                target_len=3,
+                torch.ones(1, 2, device="cuda"), None, None, None, _make_psp([4]), target_len=3
             )
 
     @pytest.mark.internal
@@ -746,9 +717,7 @@ class TestDecomposeReconstruct:
 
         reconstructed = kw['packed_seq_params']
         assert reconstructed.pad_between_seqs is True
-        assert not torch.equal(
-            reconstructed.cu_seqlens_q, reconstructed.cu_seqlens_q_padded
-        )
+        assert not torch.equal(reconstructed.cu_seqlens_q, reconstructed.cu_seqlens_q_padded)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
