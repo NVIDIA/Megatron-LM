@@ -489,11 +489,13 @@ def split_dtensor(
         for size in split_size_or_sections:
             split_points.append(split_points[-1] + size)
 
-    # One collective call — result reused for all splits below.
-    assert hasattr(dtensor._local_tensor, "__create_chunk_list__"), (
-        "DTensor local tensor is missing chunk metadata."
-    )
-    chunk_meta = dtensor._local_tensor.__create_chunk_list__()[0]
+    # Chunk metadata is reused for all splits below. Use the cached closure
+    # when present (fast path, no collective); otherwise compute it once via a
+    # single collective.
+    if hasattr(dtensor._local_tensor, "__create_chunk_list__"):
+        chunk_meta = dtensor._local_tensor.__create_chunk_list__()[0]
+    else:
+        chunk_meta = gather_and_compute_chunk_metadata(dtensor)
     chunk_slice = slice(chunk_meta.offsets[dim], chunk_meta.offsets[dim] + chunk_meta.sizes[dim])
     local_offset = chunk_meta.offsets[dim]
     local_tensor = dtensor.to_local()
