@@ -1715,3 +1715,26 @@ class DSAttention(MegatronModule):
             output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
         return output
+
+
+# --- DSA top-k layer-sharing helpers (from main; used by module_specs) ---
+def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
+    if layer_number < 1:
+        raise ValueError(f"layer_number must be 1-indexed and positive, got {layer_number}.")
+    if skip_topk_offset < 0:
+        raise ValueError(f"skip_topk_offset must be non-negative, got {skip_topk_offset}.")
+    if topk_freq < 1:
+        raise ValueError(f"topk_freq must be positive, got {topk_freq}.")
+    # Layers are 1-indexed, so the default offset 0 must still start at layer 1.
+    skip_topk_offset = max(skip_topk_offset, 1)
+    return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+
+
+def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    """Return the computing layer whose DSA top-k a skip layer reuses."""
+    is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq)
+    skip_topk_offset = max(skip_topk_offset, 1)
+    if layer_number <= skip_topk_offset:
+        return layer_number
+    return layer_number - ((layer_number - skip_topk_offset) % topk_freq)

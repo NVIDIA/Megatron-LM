@@ -476,6 +476,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        inter_document_masking=getattr(args, 'dataloader_inter_document_masking', False),
     )
 
 
@@ -565,8 +566,8 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider,
         store=store,
     )

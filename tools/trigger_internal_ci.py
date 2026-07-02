@@ -35,21 +35,38 @@ import gitlab  # python-gitlab
 GITLAB_PROJECT_ID = 19378
 GITLAB_BRANCH_PREFIX = "pull-request"
 
-PIPELINE_VARIABLES_FIXED = {
-    "UNIT_TEST": "no",
-    "INTEGRATION_TEST": "no",
-}
+PIPELINE_VARIABLES_FIXED = {"UNIT_TEST": "no", "INTEGRATION_TEST": "no"}
+
+# Scopes whose recipes run full convergence/checkpointing workloads and need a
+# long wall-clock budget. The default short-scope time limit is left untouched.
+LONG_RUNNING_SCOPES = ("release", "weekly")
+LONG_RUNNING_TIME_LIMIT_SECONDS = 4 * 60 * 60
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_time_limit(scope, override):
+    """Resolve the FUNCTIONAL_TEST_TIME_LIMIT value for a functional test scope.
+
+    Args:
+        scope: The functional test scope (e.g. ``mr``, ``release``, ``weekly``).
+        override: Explicit time limit in seconds, or ``None`` to auto-resolve.
+
+    Returns:
+        The time limit in seconds when one applies, otherwise ``None`` so the
+        variable is left unset and short-running scopes keep their default.
+    """
+    if override is not None:
+        return override
+    if scope in LONG_RUNNING_SCOPES:
+        return LONG_RUNNING_TIME_LIMIT_SECONDS
+    return None
 
 
 def get_remote_url(origin):
     """Return the fetch URL configured for the given git remote name."""
     result = subprocess.run(
-        ["git", "remote", "get-url", origin],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["git", "remote", "get-url", origin], capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
 
@@ -66,10 +83,7 @@ def get_gitlab_hostname(remote_url):
 def get_current_branch():
     """Return the name of the currently checked-out git branch."""
     result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
 
@@ -79,10 +93,7 @@ def git_push(origin, target_branch, dry_run=False):
     if dry_run:
         logger.info("[DRY RUN] Would push HEAD to remote '%s' as %s", origin, target_branch)
         return
-    subprocess.run(
-        ["git", "push", origin, f"HEAD:{target_branch}", "--force"],
-        check=True,
-    )
+    subprocess.run(["git", "push", origin, f"HEAD:{target_branch}", "--force"], check=True)
 
 
 def trigger_pipeline(gitlab_url, access_token, ref, pipeline_vars, dry_run=False):
@@ -137,6 +148,25 @@ def main():
         help="FUNCTIONAL_TEST_CASES pipeline variable (default: all)",
     )
     parser.add_argument(
+        "--functional-test-name",
+        default=None,
+        help=(
+            "FUNCTIONAL_TEST_NAME pipeline variable — names the run for "
+            "pre-release/release scopes (used as the run name and W&B experiment). "
+            "Defaults to the commit SHA when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--functional-test-time-limit",
+        type=int,
+        default=None,
+        help=(
+            "FUNCTIONAL_TEST_TIME_LIMIT pipeline variable in seconds. Defaults to "
+            "14400 (4h) for the long-running 'release' and 'weekly' scopes and is "
+            "left unset for other scopes."
+        ),
+    )
+    parser.add_argument(
         "--cluster-a100",
         default=None,
         help="CLUSTER_A100 pipeline variable (override the default cluster)",
@@ -179,6 +209,15 @@ def main():
         "FUNCTIONAL_TEST_REPEAT": str(args.functional_test_repeat),
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }
+
+    # Only override FUNCTIONAL_TEST_NAME when explicitly provided; otherwise the
+    # pipeline default (the commit SHA) applies.
+    if args.functional_test_name is not None:
+        pipeline_vars["FUNCTIONAL_TEST_NAME"] = args.functional_test_name
+
+    time_limit = resolve_time_limit(args.functional_test_scope, args.functional_test_time_limit)
+    if time_limit is not None:
+        pipeline_vars["FUNCTIONAL_TEST_TIME_LIMIT"] = str(time_limit)
 
     for var, val in [
         ("CLUSTER_A100", args.cluster_a100),

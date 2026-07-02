@@ -17,4 +17,8 @@
 from .dbuffer import DBuffer
 from .placement import Flat, Partial, Placement, Replicate
 
+from .fully_shard import fully_shard  # isort:skip  # main-new: re-export for FSDP tests
+from .placement import Placements  # isort:skip  # main-new: re-export for FSDP tests
+
 __all__ = ["DBuffer", "Flat", "Partial", "Placement", "Replicate"]
+__all__ += ["Placements", "fully_shard"]
