@@ -440,7 +440,7 @@ class BlendedMegatronDatasetBuilder(object):
             False
             if (
                 synchronize_ranks
-                and (isinstance(self.cls, GPTDatasetConfig) and self.config.fast_cache_load)
+                and (isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load)
             )
             else synchronize_ranks
         )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
