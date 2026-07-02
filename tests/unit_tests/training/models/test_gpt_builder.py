@@ -851,19 +851,21 @@ class TestMtpBlockSpec:
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is mock_decoder_specs.return_value[-1]
 
-    @patch("megatron.training.models.gpt.default_layer_spec")
+    @patch("megatron.training.models.gpt._te_or_local_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
-    def test_uses_default_layer_spec_for_empty_layer_specs(self, mock_get_mtp, mock_default):
+    def test_uses_te_or_local_layer_spec_for_empty_layer_specs(
+        self, mock_get_mtp, mock_te_or_local
+    ):
         config = self._make_config(mtp_num_layers=1)
         spec = Mock(spec=ModuleSpec)
-        spec.layer_specs = []  # Empty → falls back to default_layer_spec
+        spec.layer_specs = []  # Empty → falls back to _te_or_local_layer_spec
         fallback_spec = Mock(spec=ModuleSpec)
-        mock_default.return_value = fallback_spec
+        mock_te_or_local.return_value = fallback_spec
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
         mtp_block_spec(config, spec, vp_stage=4)
 
-        mock_default.assert_called_once_with(config, 4)
+        mock_te_or_local.assert_called_once_with(config, 4)
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
 

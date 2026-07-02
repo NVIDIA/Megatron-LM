@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Type
 
 try:
     import einops
@@ -90,6 +90,22 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "TopKRouter",
         },
     }
+
+    @staticmethod
+    def _fine_grained_recurse_module_types(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> Tuple[Type[nn.Module], ...]:
+        """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            # Lazy import to avoid circular chain.
+            from megatron.core.transformer.moe.experts import TEGroupedMLP
+            from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+            return (TEGroupedMLP, SharedExpertMLP)
+        return ()
 
     def __init__(
         self,
@@ -210,6 +226,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
                     and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                ),
+                fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
+                    config, ddp_config
                 ),
             ),
         )
