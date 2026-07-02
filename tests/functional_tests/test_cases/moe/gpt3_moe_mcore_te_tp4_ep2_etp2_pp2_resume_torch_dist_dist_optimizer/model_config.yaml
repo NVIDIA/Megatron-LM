@@ -67,5 +67,6 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
   --async-ckpt-use-cpu-shm: true
+  --log-moe-overload-factor: true
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher
