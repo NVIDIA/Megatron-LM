@@ -31,7 +31,7 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
-RUN ln -sfn /usr/local/cuda/targets/x86_64-linux/include/cccl/cuda \
+RUN ln -sf /usr/local/cuda/include/cccl/cuda \
     /usr/local/include/cuda
 RUN find /usr/local/cuda -name "utility" 2>/dev/null | head -5 && \
     ls /usr/local/cuda/targets/x86_64-linux/include/ | head -20
