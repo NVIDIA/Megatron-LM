@@ -1,7 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Heterogeneous TP/PP reshard of Mamba conv/ssm state between prefill and
-decode shard layouts (the Mamba analog of the attention KV reshard)."""
+"""Heterogeneous TP/PP reshard of Mamba boundary-snapshot state between
+prefill and decode shard layouts (the Mamba analog of the attention KV
+reshard).
+
+A snapshot's conv state packs three channel bands, [x | B | C], on one axis:
+x is head-sharded (d_inner) and B/C are group-sharded (ngroups * d_state).
+The ssm state is head-sharded. plan_mamba_reshard emits one transfer per
+(src rank, dst rank, global layer, band) whose layer and channel ranges
+overlap; both sides compute the same plan from the same layout lists, so the
+send and receive orders match.
+"""
 
 from __future__ import annotations
 
@@ -10,22 +19,20 @@ from typing import List, Tuple
 
 from megatron.core.inference.disaggregation.utils import intersect
 
-# Channel bands of a Mamba layer's state, in the order the conv state
-# concatenates them on its channel axis (x, B, C); ssm is the head axis.
-# (name, lives_in_conv). conv bands share one tensor; ssm is its own tensor.
+# Channel bands of a Mamba layer's conv state, in the order the conv state
+# concatenates them on its channel axis. The ssm band is the head axis of its
+# own tensor.
 _CONV_BANDS = ("x", "B", "C")
 
 
 @dataclass(frozen=True)
 class MambaStateDims:
-    """The model's (global, unsharded) Mamba structural dims.
+    """The model's global (unsharded) Mamba structural dims.
 
-    These belong to the MambaMixer / model config -- carried as one unit (rather
-    than loose constants spread across the layout) so there's a single source
-    and they can't drift apart. The producer should read them straight from the
-    model config (e.g. ``ngroups = config.mamba_num_groups``) rather than
-    reverse-deriving from tensor shapes. TP shards ``nheads``/``ngroups``; the
-    rest are unsharded.
+    Carried as one unit so there is a single source and the dims cannot drift
+    apart. The producer should read them from the model config (e.g.
+    ngroups = config.mamba_num_groups) rather than deriving them from tensor
+    shapes. TP shards nheads/ngroups; the rest are unsharded.
     """
 
     nheads: int
@@ -37,9 +44,9 @@ class MambaStateDims:
 
 @dataclass(frozen=True)
 class MambaShardLayout:
-    """One rank's Mamba-state ownership: which global layers + TP rank, plus the
-    model's structural dims (:class:`MambaStateDims`). Per-rank locals follow by
-    dividing by ``tp_size``."""
+    """One rank's Mamba-state ownership: which global layers and TP rank,
+    plus the model's structural dims. Per-rank local sizes follow by dividing
+    by tp_size."""
 
     global_rank: int
     tp_size: int
@@ -49,47 +56,16 @@ class MambaShardLayout:
     dims: MambaStateDims
 
     def __post_init__(self) -> None:
-        # Wire reconstruction (MambaShardLayout(**dict)) hands ``dims`` as a
-        # plain dict; coerce it back to MambaStateDims.
+        # Wire reconstruction (MambaShardLayout(**dict)) hands dims as a plain
+        # dict; coerce it back to MambaStateDims.
         if isinstance(self.dims, dict):
             object.__setattr__(self, "dims", MambaStateDims(**self.dims))
         # TP shards heads and groups; both must divide evenly or the local
-        # conv/ssm band sizes truncate to the wrong (or zero) width silently.
+        # band widths are wrong.
         if self.dims.nheads % self.tp_size != 0:
             raise ValueError(f"nheads={self.dims.nheads} not divisible by tp_size={self.tp_size}")
         if self.dims.ngroups % self.tp_size != 0:
             raise ValueError(f"ngroups={self.dims.ngroups} not divisible by tp_size={self.tp_size}")
-
-    # Convenience proxies onto the dims so callers read ``layout.headdim`` etc.
-    @property
-    def nheads(self) -> int:
-        """Global (unsharded) number of Mamba heads."""
-        return self.dims.nheads
-
-    @property
-    def headdim(self) -> int:
-        """Dimension of each Mamba head."""
-        return self.dims.headdim
-
-    @property
-    def d_state(self) -> int:
-        """SSM state size per head."""
-        return self.dims.d_state
-
-    @property
-    def ngroups(self) -> int:
-        """Global (unsharded) number of B/C groups."""
-        return self.dims.ngroups
-
-    @property
-    def d_conv(self) -> int:
-        """Convolution kernel width."""
-        return self.dims.d_conv
-
-    def mamba_shard_key(self) -> Tuple[int, int]:
-        """The Mamba shard this rank holds: ``(tp_rank, layer_start)``. Ranks
-        sharing a key hold identical state (e.g. EP/DP replicas of it)."""
-        return (self.tp_rank, self.layer_start)
 
     @property
     def d_inner(self) -> int:
@@ -98,7 +74,7 @@ class MambaShardLayout:
 
     @property
     def nheads_local(self) -> int:
-        """Number of Mamba heads held by this TP rank."""
+        """Mamba heads held by this TP rank."""
         return self.dims.nheads // self.tp_size
 
     @property
@@ -108,7 +84,7 @@ class MambaShardLayout:
 
     @property
     def ngroups_local(self) -> int:
-        """Number of B/C groups held by this TP rank."""
+        """B/C groups held by this TP rank."""
         return self.dims.ngroups // self.tp_size
 
     @property
@@ -116,19 +92,24 @@ class MambaShardLayout:
         """Total local conv channel width (x + B + C bands)."""
         return self.d_inner_local + 2 * self.ngroups_local * self.dims.d_state
 
+    def mamba_shard_key(self) -> Tuple[int, int]:
+        """The Mamba shard this rank holds: (tp_rank, layer_start). Ranks
+        sharing a key hold identical state (e.g. EP/DP replicas)."""
+        return (self.tp_rank, self.layer_start)
+
     def layer_range(self) -> Tuple[int, int]:
-        """Global Mamba-layer range ``[lo, hi)`` owned by this rank."""
+        """Global Mamba-layer range [lo, hi) owned by this rank."""
         return (self.layer_start, self.layer_start + self.num_layers)
 
-    def _band(self, name: str) -> Tuple[int, int, int]:
-        """``(global_total, local_size, conv_local_offset)`` for a band.
+    def band(self, name: str) -> Tuple[int, int, int]:
+        """Return (global_total, local_size, local_offset) for a band.
 
-        ``conv_local_offset`` is the band's start on the local conv channel
-        axis; for the ``ssm`` (head) band it is the start on the local head
-        axis (always 0, heads are the whole tensor)."""
+        local_offset is the band's start on the local conv channel axis; for
+        the "ssm" (head) band it is the start on the local head axis (always
+        0, heads are the whole tensor).
+        """
         if name == "x":
-            g = self.d_inner
-            return g, self.d_inner_local, 0
+            return self.d_inner, self.d_inner_local, 0
         if name == "B":
             g = self.dims.ngroups * self.dims.d_state
             return g, self.ngroups_local * self.dims.d_state, self.d_inner_local
@@ -146,11 +127,11 @@ class MambaShardLayout:
 
 @dataclass(frozen=True)
 class MambaReshardTransfer:
-    """One sub-block move for the reshard.
+    """One sub-block move of the snapshot reshard.
 
-    ``band`` is ``"x"``/``"B"``/``"C"`` (conv channel axis) or ``"ssm"`` (head
-    axis). ``src_layer``/``dst_layer`` are local layer indices on each side;
-    ``*_lo``/``*_hi`` are the local channel/head slice bounds.
+    band is "x"/"B"/"C" (conv channel axis) or "ssm" (head axis).
+    src_layer/dst_layer are local layer indices on each side; *_lo/*_hi are
+    the local channel or head slice bounds.
     """
 
     src_rank: int
@@ -173,12 +154,15 @@ class MambaReshardTransfer:
 def plan_mamba_reshard(
     src_layouts: List[MambaShardLayout], dst_layouts: List[MambaShardLayout]
 ) -> List[MambaReshardTransfer]:
-    """Plan the conv/ssm sub-block moves from the prefill (src) layouts to the
-    decode (dst) layouts. One transfer per (src rank, dst rank, global layer,
-    band) where both the layer ranges and the channel ranges overlap."""
-    # Dedupe replica sources: ranks sharing (tp_rank, layer_start) hold identical
-    # Mamba state (e.g. EP/DP replicas), so source each shard from exactly one of
-    # them -- the smallest global_rank -- to avoid duplicate sends.
+    """Plan the conv/ssm sub-block moves from the prefill (src) layouts to
+    the decode (dst) layouts: one transfer per (src rank, dst rank, global
+    layer, band) where both the layer ranges and the channel ranges overlap.
+
+    Ranks sharing (tp_rank, layer_start) hold identical Mamba state (e.g.
+    EP/DP replicas), so each shard is sourced from exactly one of them, the
+    smallest global_rank. Deterministic given the layout lists, so both sides
+    enumerate the same transfers in the same order.
+    """
     rep_rank: dict = {}
     for s in src_layouts:
         key = s.mamba_shard_key()
@@ -196,8 +180,8 @@ def plan_mamba_reshard(
             if layer_ov is None:
                 continue
             for band in (*_CONV_BANDS, "ssm"):
-                _, s_size, s_off = s._band(band)
-                _, d_size, d_off = d._band(band)
+                _, s_size, s_off = s.band(band)
+                _, d_size, d_off = d.band(band)
                 s_glo = (s.tp_rank * s_size, s.tp_rank * s_size + s_size)
                 d_glo = (d.tp_rank * d_size, d.tp_rank * d_size + d_size)
                 chan_ov = intersect(s_glo, d_glo)
