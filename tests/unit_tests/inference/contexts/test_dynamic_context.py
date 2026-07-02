@@ -300,6 +300,25 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_initialize_attention_state_can_defer_bookkeeping_transfer(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.transfer_bookkeeping_to_gpu = mock.Mock()
+
+        dynamic_context.initialize_attention_state(transfer_bookkeeping_to_gpu=False)
+
+        dynamic_context.transfer_bookkeeping_to_gpu.assert_not_called()
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_transfer_bookkeeping_to_gpu_can_skip_input_token_ids(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -329,7 +348,10 @@ class TestDynamicContext:
         )
         dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = existing_gpu_tokens
 
-        dynamic_context.transfer_bookkeeping_to_gpu(skip_token_input_ids=True)
+        done_event = dynamic_context.transfer_bookkeeping_to_gpu(
+            skip_token_input_ids=True, record_done_event=True
+        )
+        done_event.synchronize()
 
         assert torch.equal(
             dynamic_context.gpu_view.token_to_input_ids[:num_tokens], existing_gpu_tokens
