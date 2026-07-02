@@ -1480,7 +1480,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant != "dsv4_hybrid"
                 and self.cp_partition_mode != "zigzag"
             ):
-                raise ValueError("cp_partition_mode='contiguous' is only supported with DSv4.")
+                raise ValueError(
+                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                )
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
