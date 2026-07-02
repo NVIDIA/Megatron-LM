@@ -300,6 +300,90 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_transfer_bookkeeping_to_gpu_can_skip_input_token_ids(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        num_tokens = 4
+        dynamic_context.total_request_count = 2
+        dynamic_context.paused_request_count = 0
+        dynamic_context.padded_active_request_count = 2
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [11, 12, 13, 14], dtype=torch.int64
+        )
+        dynamic_context.token_to_pos_ids[:num_tokens] = torch.tensor(
+            [21, 22, 23, 24], dtype=torch.int64
+        )
+        existing_gpu_tokens = torch.tensor(
+            [91, 92, 93, 94],
+            dtype=torch.int64,
+            device=dynamic_context.gpu_view.token_to_input_ids.device,
+        )
+        dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = existing_gpu_tokens
+
+        dynamic_context.transfer_bookkeeping_to_gpu(skip_token_input_ids=True)
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens], existing_gpu_tokens
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_pos_ids[:num_tokens].cpu(),
+            torch.tensor([21, 22, 23, 24], dtype=torch.int64),
+        )
+
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [31, 32, 33, 34], dtype=torch.int64
+        )
+        dynamic_context.transfer_bookkeeping_to_gpu()
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens].cpu(),
+            torch.tensor([31, 32, 33, 34], dtype=torch.int64),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_copy_async_sched_input_tokens_to_gpu_populates_active_and_clears_padding(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=32,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=32,
+            max_requests=8,
+        )
+
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = 3
+        ctx.padded_active_token_count = 8
+        device = ctx.gpu_view.token_to_input_ids.device
+        ctx.gpu_view.token_to_input_ids[:8] = torch.full(
+            (8,), 777, dtype=torch.int64, device=device
+        )
+        sampled_tokens_cuda = torch.tensor([90, 91, 92], dtype=torch.int64, device=device)
+
+        ctx.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
+
+        assert torch.equal(ctx.gpu_view.token_to_input_ids[:3], sampled_tokens_cuda)
+        assert torch.equal(
+            ctx.gpu_view.token_to_input_ids[3:8].cpu(), torch.zeros(5, dtype=torch.int64)
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
 
@@ -911,44 +995,45 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(8)
     @pytest.mark.parametrize(
-        "new_tokens, kv_offsets, last_offsets, expected_kv_offsets, expected_last_offsets",
+        "active_request_count, kv_offsets, last_offsets, expected_kv_offsets, expected_last_offsets",
         [
-            ([], [], [], [], []),
-            ([90, 91], [3, 5], [1, 2], [4, 6], [2, 3]),
-            ([90, 91], [3, 5], [3, 1], [4, 6], [0, 2]),
+            (0, [], [], [], []),
+            (2, [3, 5], [1, 2], [4, 6], [2, 3]),
+            (2, [3, 5], [3, 1], [4, 6], [0, 2]),
         ],
     )
     def test_async_sched_prepare_requests_success(
-        self, new_tokens, kv_offsets, last_offsets, expected_kv_offsets, expected_last_offsets
+        self,
+        active_request_count,
+        kv_offsets,
+        last_offsets,
+        expected_kv_offsets,
+        expected_last_offsets,
     ):
         """Async scheduling prepare advances active decode rows without lifecycle changes."""
         ctx = self._get_async_sched_context()
         self._setup_async_sched_decode_rows(
             ctx,
-            active_request_count=len(new_tokens),
+            active_request_count=active_request_count,
             kv_offsets=kv_offsets,
             last_block_offsets=last_offsets,
         )
-        tokens = torch.tensor(new_tokens, dtype=torch.int64)
-        if new_tokens and torch.cuda.is_available():
-            tokens = tokens.cuda()
+        original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
 
-        ctx.prepare_requests(tokens)
+        ctx.prepare_requests()
 
-        assert ctx.active_token_count == len(new_tokens)
+        assert ctx.active_token_count == active_request_count
         assert torch.equal(
-            ctx.request_kv_length_offsets[: len(new_tokens)],
+            ctx.request_kv_length_offsets[:active_request_count],
             torch.tensor(expected_kv_offsets, dtype=torch.int32),
         )
         assert torch.equal(
-            ctx.request_last_kv_block_offset[: len(new_tokens)],
+            ctx.request_last_kv_block_offset[:active_request_count],
             torch.tensor(expected_last_offsets, dtype=torch.int32),
         )
+        assert torch.equal(ctx.token_to_input_ids[:active_request_count], original_tokens)
         assert torch.equal(
-            ctx.token_to_input_ids[: len(new_tokens)], torch.tensor(new_tokens, dtype=torch.long)
-        )
-        assert torch.equal(
-            ctx.token_to_pos_ids[: len(new_tokens)],
+            ctx.token_to_pos_ids[:active_request_count],
             torch.tensor(expected_kv_offsets, dtype=torch.long),
         )
         if last_offsets and last_offsets[0] == ctx.block_size_tokens - 1:
@@ -957,18 +1042,43 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    def test_async_sched_commit_sampled_tokens(self):
+        """Async scheduling commits sampled CPU tokens after prepare."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2, kv_offsets=[3, 5])
+        original_tokens = ctx.token_to_input_ids[:2].clone()
+
+        ctx.prepare_requests()
+
+        assert torch.equal(ctx.token_to_input_ids[:2], original_tokens)
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:2], torch.tensor([4, 6], dtype=torch.int32)
+        )
+
+        sampled_tokens_cpu = torch.tensor([90, 91], dtype=torch.int64)
+        if torch.cuda.is_available():
+            with pytest.raises(AssertionError, match="must be on the CPU"):
+                ctx.commit_sampled_tokens(sampled_tokens_cpu.cuda())
+        ctx.commit_sampled_tokens(sampled_tokens_cpu)
+
+        assert torch.equal(ctx.token_to_input_ids[:2], sampled_tokens_cpu)
+
+        with pytest.raises(RuntimeError, match="Expected 2 new tokens"):
+            ctx.commit_sampled_tokens(torch.tensor([90], dtype=torch.int64))
+
+    @pytest.mark.internal
+    @rounder_override(8)
     @pytest.mark.parametrize(
-        "setup, new_tokens, expected_message",
+        "setup, expected_message",
         [
-            (lambda ctx: setattr(ctx, "num_speculative_tokens", 1), [90, 91], "speculative"),
-            (lambda ctx: setattr(ctx, "num_prefill_requests", 1), [90, 91], "decode-only"),
-            (lambda ctx: setattr(ctx, "paused_request_count", 1), [90, 91], "paused"),
-            (lambda ctx: None, [90], "Expected 2 new tokens"),
-            (lambda ctx: None, [90, 91], "pause requests"),
-            (lambda ctx: None, [90, 91], "evict requests"),
+            (lambda ctx: setattr(ctx, "num_speculative_tokens", 1), "speculative"),
+            (lambda ctx: setattr(ctx, "num_prefill_requests", 1), "decode-only"),
+            (lambda ctx: setattr(ctx, "paused_request_count", 1), "paused"),
+            (lambda ctx: None, "pause requests"),
+            (lambda ctx: None, "evict requests"),
         ],
     )
-    def test_async_sched_prepare_requests_errors(self, setup, new_tokens, expected_message):
+    def test_async_sched_prepare_requests_errors(self, setup, expected_message):
         """Async scheduling prepare raises instead of performing lifecycle operations."""
         ctx = self._get_async_sched_context()
         self._setup_async_sched_decode_rows(
@@ -983,7 +1093,7 @@ class TestDynamicContext:
             setup(ctx)
 
         with pytest.raises(RuntimeError, match=expected_message):
-            ctx.prepare_requests(torch.tensor(new_tokens, dtype=torch.int64))
+            ctx.prepare_requests()
 
     @pytest.mark.internal
     @rounder_override(8)
