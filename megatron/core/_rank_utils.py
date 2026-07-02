@@ -28,21 +28,25 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        if "RANK" in os.environ:
-            return int(os.environ["RANK"])
+    if (rank_env := os.environ.get("RANK")) is not None:
+        try:
+            return int(rank_env)
+        except (ValueError, TypeError):
+            warnings.warn(
+                f"Invalid RANK environment variable value {rank_env!r}. Defaulting to rank 0.",
+                stacklevel=2,
+            )
+            return 0
 
-        slurm_rank = resolve_slurm_rank()
-        if slurm_rank is not None:
-            return slurm_rank
+    slurm_rank = resolve_slurm_rank()
+    if slurm_rank is not None:
+        return slurm_rank
 
-        warnings.warn(
-            "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
-            "Defaulting to rank 0."
-        )
-        return 0
-    except (ValueError, TypeError):
-        return 0
+    warnings.warn(
+        "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
+        "Defaulting to rank 0."
+    )
+    return 0
 
 
 def safe_get_world_size() -> int:
