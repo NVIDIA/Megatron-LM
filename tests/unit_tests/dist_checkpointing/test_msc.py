@@ -12,7 +12,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
-from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.msc_utils import MultiStorageClientFeature
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -52,7 +52,7 @@ class TestSerializationWithMultiStorageClient:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
 

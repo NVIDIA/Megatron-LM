@@ -33,7 +33,6 @@ from megatron.core.dist_checkpointing.serialization import (
     load_sharded_metadata,
     load_tensors_metadata,
 )
-from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.utils import is_torch_min_version
@@ -839,7 +838,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -910,7 +909,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -974,7 +973,7 @@ class TestNonStrictLoad:
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -1011,7 +1010,7 @@ class TestNonStrictLoad:
 
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
             sharded_metadata = load_sharded_metadata(ckpt_dir)
