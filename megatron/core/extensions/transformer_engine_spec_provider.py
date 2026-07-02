@@ -88,7 +88,8 @@ class TESpecProvider(BackendSpecProvider):
                 warnings.warn(
                     "Only transformer-engine>=1.7.0 supports MoE experts, "
                     f"but your version is {get_te_version()}. "
-                    "Use local linear implementation instead."
+                    "Use local linear implementation instead.",
+                    stacklevel=2,
                 )
                 return partial(
                     SequentialMLP,

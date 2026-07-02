@@ -79,7 +79,9 @@ class Scheduler:
         if inference_parameters is not None:
             warnings.warn(
                 "`inference_parameters` has been renamed to `sampling_params`, and the "
-                "previous name will be removed in `megatron-core` 0.13."
+                "previous name will be removed in `megatron-core` 0.13.",
+                DeprecationWarning,
+                stacklevel=2,
             )
             if sampling_params is None:
                 sampling_params = inference_parameters

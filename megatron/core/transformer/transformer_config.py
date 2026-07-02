@@ -1502,7 +1502,8 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
                 "moe_enable_deepep is deprecated."
-                "Please use --moe-flex-dispatcher-backend=deepep instead."
+                "Please use --moe-flex-dispatcher-backend=deepep instead.",
+                DeprecationWarning,
             )
 
         if self.moe_token_dispatcher_type == "flex":
@@ -1712,7 +1713,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_layer_recompute:
             warnings.warn(
                 "--moe-layer-recompute is deprecated. "
-                "Use --recompute-granularity selective --recompute-modules moe_layer instead."
+                "Use --recompute-granularity selective --recompute-modules moe_layer instead.",
+                DeprecationWarning,
             )
             if self.recompute_granularity == "full":
                 raise ValueError(
@@ -2165,7 +2167,8 @@ class TransformerConfig(ModelParallelConfig):
             # enable moe_router_padding_for_quantization
             warnings.warn(
                 "--moe-router-padding-for-fp8 is going to be deprecated. "
-                "Use --moe-router-padding-for-quantization instead."
+                "Use --moe-router-padding-for-quantization instead.",
+                DeprecationWarning,
             )
             self.moe_router_padding_for_quantization = True
 
@@ -2213,7 +2216,8 @@ class TransformerConfig(ModelParallelConfig):
         elif self.moe_router_topk_limited_devices:
             warnings.warn(
                 "moe_router_topk_limited_devices is deprecated. Use moe_router_group_topk and "
-                "moe_router_num_groups instead."
+                "moe_router_num_groups instead.",
+                DeprecationWarning,
             )
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
@@ -2227,12 +2231,16 @@ class TransformerConfig(ModelParallelConfig):
             ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
 
             if self.enable_cuda_graph:
-                warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.')
+                warnings.warn(
+                    'enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.',
+                    DeprecationWarning,
+                )
                 self.cuda_graph_impl = "local"
             if self.external_cuda_graph:
                 warnings.warn(
                     'external_cuda_graph is deprecated, '
-                    'use cuda_graph_impl=transformer_engine instead.'
+                    'use cuda_graph_impl=transformer_engine instead.',
+                    DeprecationWarning,
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
@@ -2245,7 +2253,6 @@ class TransformerConfig(ModelParallelConfig):
             warnings.warn(
                 "cuda_graph_scope is deprecated, use cuda_graph_modules instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
 
             # CudaGraphScope is preserved as a standalone class (not an alias of CudaGraphModule)
@@ -2270,7 +2277,8 @@ class TransformerConfig(ModelParallelConfig):
         if used_full_scope:
             warnings.warn(
                 "full scope is deprecated. "
-                "Use empty cuda_graph_modules to capture the whole layer."
+                "Use empty cuda_graph_modules to capture the whole layer.",
+                DeprecationWarning,
             )
         for scope, attr, value in deprecated_scopes:
             migration = get_deprecated_cuda_graph_modules_migration(
@@ -2282,7 +2290,6 @@ class TransformerConfig(ModelParallelConfig):
                     "cuda_graph_impl='none'. Use cuda_graph_impl='local' with "
                     "inference_cuda_graph_scope='block' to enable inference CUDA graphs.",
                     DeprecationWarning,
-                    stacklevel=2,
                 )
                 continue
             migration_attr, migration_value = migration
@@ -2290,7 +2297,6 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_modules '{scope}' is deprecated. "
                 f"Use {migration_attr}={migration_value!r} instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes

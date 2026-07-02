@@ -445,7 +445,6 @@ class ModelParallelConfig:
                 "Megatron-LM training args validation rejects this combination by default. "
                 "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
                 UserWarning,
-                stacklevel=2,
             )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
