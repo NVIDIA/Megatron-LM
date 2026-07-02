@@ -170,6 +170,81 @@ def test_multi_device_hybrid_optimizer(
         "misaligned optimizer accuracy for CPU and GPU."
     ),
 )
+@pytest.mark.parametrize('offload_fraction', [0.5, 1.0])
+@pytest.mark.parametrize('param_update_in_fp32', [True, False])
+def test_reload_model_params_reseeds_internal_copies(offload_fraction, param_update_in_fp32):
+    """``reload_model_params`` must re-seed the optimizer's internal copies.
+
+    Regression test for the bug where loading a checkpoint without the
+    optimizer state (fine-tuning) left ``HybridDeviceOptimizer``'s pinned CPU
+    clones (``gpu_params_map_cpu_copy``) and FP32 working copies
+    (``param_to_fp32_param``) at their stale (random-init) values. The first
+    ``step()`` would then copy those stale values back onto the model
+    parameters, silently discarding the freshly loaded weights.
+    See NVIDIA-NeMo/RL#2371.
+    """
+    setup_seed(42)
+    # FP32 working copies only exist for non-FP32 params, so use BF16 when
+    # exercising the ``param_update_in_fp32`` path.
+    dtype = torch.bfloat16 if param_update_in_fp32 else torch.float32
+    net = Net().cuda().to(dtype)
+    params = list(net.parameters())
+
+    hdo = HybridDeviceOptimizer(
+        params,
+        offload_fraction=offload_fraction,
+        lr=1e-3,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=param_update_in_fp32,
+        overlap_cpu_optimizer_d2h_h2d=False,
+    )
+
+    # Run one step so the internal copies and optimizer state are populated.
+    net(torch.randn(1, 3, 32, 32).cuda().to(dtype)).sum().backward()
+    hdo.step()
+    hdo.zero_grad()
+
+    if param_update_in_fp32:
+        assert len(hdo.param_to_fp32_param) > 0
+    if offload_fraction > 0:
+        assert len(hdo.gpu_params_map_cpu_copy) > 0
+
+    def _matches_param(internal_copy, orig_param):
+        return torch.allclose(
+            internal_copy.to(device=orig_param.device, dtype=orig_param.dtype),
+            orig_param,
+            atol=1e-2,
+        )
+
+    # Simulate a fine-tune checkpoint load: overwrite the model parameters in
+    # place with brand new values without touching the optimizer's copies.
+    with torch.no_grad():
+        for param in params:
+            param.copy_(torch.randn_like(param))
+
+    # Before reload, the internal copies are stale (do not match new params).
+    for orig_param, cpu_copy in hdo.gpu_params_map_cpu_copy.items():
+        assert not _matches_param(cpu_copy, orig_param)
+    for orig_param, fp32_param in hdo.param_to_fp32_param.items():
+        assert not _matches_param(fp32_param, orig_param)
+
+    # Reload re-seeds every internal copy from the current parameter values.
+    hdo.reload_model_params()
+
+    for orig_param, cpu_copy in hdo.gpu_params_map_cpu_copy.items():
+        assert _matches_param(cpu_copy, orig_param), "CPU clone not re-seeded on reload"
+    for orig_param, fp32_param in hdo.param_to_fp32_param.items():
+        assert _matches_param(fp32_param, orig_param), "FP32 copy not re-seeded on reload"
+
+
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
 @pytest.mark.parametrize('n_steps', [1, 10])
 @pytest.mark.parametrize('offload_fraction', [1, 0.5, 0])
 @pytest.mark.parametrize('optimizer', ['adam', 'sgd'])
