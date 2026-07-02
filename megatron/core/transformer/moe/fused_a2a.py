@@ -8,16 +8,32 @@ from typing import Optional
 from megatron.core.utils import internal_api
 
 try:
-    from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
+except ImportError:
+    try:
+        from deep_ep import EventHandle, EventOverlap
+    except ImportError:
+        EventHandle = None
+        EventOverlap = None
+
+try:
+    from deep_ep import Buffer
 
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
 
+try:
+    from deep_ep import ElasticBuffer
+
+    HAVE_DEEP_EP_V2 = True
+except ImportError:
+    HAVE_DEEP_EP_V2 = False
+
 import torch
 
 _buffer = None
+_elastic_buffer = None
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -66,6 +82,32 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     ):
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
+
+
+def get_elastic_buffer(
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+):
+    """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
+    global _elastic_buffer
+
+    num_bytes = ElasticBuffer.get_buffer_size_hint(
+        group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
+    )
+
+    if (
+        _elastic_buffer is None
+        or _elastic_buffer.group != group
+        or _elastic_buffer.num_bytes < num_bytes
+        or _elastic_buffer.num_max_tokens_per_rank < num_max_tokens_per_rank
+    ):
+        _elastic_buffer = ElasticBuffer(
+            group,
+            num_bytes=num_bytes,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden,
+            num_topk=num_topk,
+        )
+    return _elastic_buffer
 
 
 class FusedDispatch(torch.autograd.Function):
@@ -265,6 +307,184 @@ else:
     fused_dispatch = None
     fused_combine = None
     set_deepep_num_sms = None
+
+
+class DeepepV2Dispatch(torch.autograd.Function):
+    """Dispatch operation using the DeepEP v2 ElasticBuffer backend."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        buffer,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        num_max_tokens_per_rank,
+        expert_alignment,
+        num_sms,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Forward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # Capture the current stream for the communication stream to wait on when
+        # DeepEP v2 allocates output tensors on the communication stream.
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
+        # Process the dispatch and keep the handle for the subsequent combine call.
+        recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
+            x,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            expert_alignment=expert_alignment,
+            num_sms=num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+
+        if async_finish:
+            event.current_stream_wait()
+
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_sms = handle.num_sms
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        tokens_per_expert = torch.tensor(handle.num_recv_tokens_per_expert_list)
+
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(
+        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+    ):
+        """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # The backward pass of dispatch is a combine over the dispatch handle.
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
+        )
+        grad_x, grad_token_probs, event = ctx.buffer.combine(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            topk_weights=grad_token_probs.float(),
+            num_sms=ctx.num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            event.current_stream_wait()
+        return None, grad_x, None, grad_token_probs, None, None, None, None, None, None
+
+
+class DeepepV2Combine(torch.autograd.Function):
+    """DeepEP v2 elastic combine with autograd support."""
+
+    @staticmethod
+    def forward(ctx, buffer, x, handle, num_sms, async_finish=False, allocate_on_comm_stream=False):
+        """Forward pass of DeepEP v2 elastic combine."""
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
+        combined_x, combined_token_probs, event = buffer.combine(
+            x,
+            handle=handle,
+            num_sms=num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            event.current_stream_wait()
+
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_sms = handle.num_sms if num_sms == 0 else num_sms
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, combined_token_probs
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_combined_token_probs):
+        """Backward pass of DeepEP v2 elastic combine."""
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
+        )
+        grad_x, _, _, _, event = ctx.buffer.dispatch(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            num_sms=ctx.num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            event.current_stream_wait()
+        return None, grad_x, None, None, None, None
+
+
+if HAVE_DEEP_EP_V2:
+
+    def deepepv2_dispatch(
+        buffer,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        num_max_tokens_per_rank,
+        expert_alignment=1,
+        num_sms=0,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform dispatch using the DeepEP v2 ElasticBuffer backend.
+
+        Args:
+            buffer (ElasticBuffer):
+                DeepEP v2 buffer used for all-to-all communication.
+            x (torch.Tensor):
+                Input hidden states to dispatch.
+            token_indices (torch.Tensor):
+                Top-k expert indices for each token.
+            token_probs (torch.Tensor):
+                Top-k routing probabilities for each token.
+            num_experts (int):
+                Total number of experts across the communication group.
+            num_max_tokens_per_rank (int):
+                Maximum number of input tokens on each rank.
+            expert_alignment (int):
+                Alignment applied to per-expert token counts.
+            num_sms (int):
+                Number of SMs used by the dispatch API.
+            async_finish (bool):
+                Whether to use asynchronous communication completion.
+            allocate_on_comm_stream (bool):
+                Whether to allocate DeepEP output buffers on the communication stream.
+        """
+        return DeepepV2Dispatch.apply(
+            buffer,
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            num_max_tokens_per_rank,
+            expert_alignment,
+            num_sms,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+    def deepepv2_combine(
+        buffer, x, handle, num_sms=0, async_finish=False, allocate_on_comm_stream=False
+    ):
+        """Perform DeepEP v2 elastic combine."""
+        return DeepepV2Combine.apply(
+            buffer, x.contiguous(), handle, num_sms, async_finish, allocate_on_comm_stream
+        )
+
+else:
+    deepepv2_dispatch = None
+    deepepv2_combine = None
 
 
 try:
