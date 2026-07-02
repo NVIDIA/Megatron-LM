@@ -7,8 +7,8 @@ from torch import nn
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
-    safe_get_rank,
     is_mcore_tensor_parallel_duplicated,
+    safe_get_rank,
     using_tensor_parallel,
 )
 
