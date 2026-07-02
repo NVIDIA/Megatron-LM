@@ -141,7 +141,9 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_optimizer(optimizer_config, [model], pg_collection=pg_collection)
+        optimizer = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=False
+        )
         return model, optimizer, pg_collection
 
     def create_model_and_optimizer_with_overlap_param_gather(
@@ -237,7 +239,7 @@ class TestLayerWiseOptimizer:
         optimizer = get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=[model],
-            use_gloo_process_groups=True,
+            use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
@@ -588,7 +590,18 @@ class TestLayerWiseOptimizer:
         )
 
         assert optimizer is not None, "Optimizer should not be None"
-        assert optimizer.overlap_param_gather, "overlap_param_gather should be True"
+        # ``optimizer`` may be a ChainedOptimizer wrapping the LayerWise +
+        # DistOpt pair when non-Muon params are routed to DistOpt. Find the
+        # LayerWise instance to check its ``overlap_param_gather`` flag.
+        layer_wise_optimizer = next(
+            (
+                sub_optimizer
+                for sub_optimizer in getattr(optimizer, 'chained_optimizers', [optimizer])
+                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            ),
+            optimizer,
+        )
+        assert layer_wise_optimizer.overlap_param_gather, "overlap_param_gather should be True"
 
         reference_model = self.create_reference_model(model)
 
