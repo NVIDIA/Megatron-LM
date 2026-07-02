@@ -2017,7 +2017,7 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
 
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and hasattr(cfg_container, "model"):
+        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
