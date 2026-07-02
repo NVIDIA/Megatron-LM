@@ -1,0 +1,38 @@
+# NeMo Evaluator config for the Gemma4 E4B MLM eval server.
+#
+# Pairs with examples/gemma4/eval/run_gemma4_eval_server.sh, which boots
+# gemma4_eval_server.py on localhost:5000 and then runs `nel eval run` against
+# this config. The server is single-flight (single-batch KV cache, no
+# request batching) so every benchmark MUST use concurrency: 1.
+#
+# Start small (max_problems: 20) to sanity-check end-to-end, then bump
+# max_problems for a real number.
+
+services:
+  gemma4:
+    type: api
+    url: http://localhost:5000/v1/chat/completions
+    protocol: chat_completions
+    model: gemma4-mlm     # server returns this verbatim; not validated
+    api_key: dummy        # required by the OpenAI client, value is ignored
+    generation:
+      temperature: 0.0
+      top_p: 1.0
+      max_tokens: 512
+
+benchmarks:
+  - name: mmlu
+    max_problems: 20
+    concurrency: 1
+    solver:
+      type: simple
+      service: gemma4
+  - name: gsm8k
+    max_problems: 20
+    concurrency: 1
+    solver:
+      type: simple
+      service: gemma4
+
+output:
+  dir: ${RESULTS_DIR}
