@@ -4081,7 +4081,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt:
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
@@ -4127,7 +4127,7 @@ def evaluate(
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if is_pp_last_stage(eval_pgc.pp):
+            if is_pp_last_stage(eval_pgc.pp) and loss_dicts:
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
