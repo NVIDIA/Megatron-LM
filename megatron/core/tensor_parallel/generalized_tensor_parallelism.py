@@ -45,13 +45,6 @@ _GTP_TE_MIN_VERSION = Version("2.19.0.dev0")
 try:
     import transformer_engine as te  # noqa: F401
 
-    _te_version = Version(te.__version__)
-    if _te_version < _GTP_TE_MIN_VERSION:
-        raise ImportError(
-            f"megatron.core.tensor_parallel.gtp_api requires TransformerEngine "
-            f">= {_GTP_TE_MIN_VERSION} (found {_te_version})."
-        )
-
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.constants import (
         MXFP8_BLOCK_SCALING_SIZE,
