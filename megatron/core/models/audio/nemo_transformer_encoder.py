@@ -11,8 +11,8 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from torch.nn import Conv1d
 from torch.nn import GELU as TorchGELU
+from torch.nn import Conv1d
 from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.checkpoint import checkpoint
 
@@ -47,13 +47,14 @@ def _resolve_attn_impl(impl: str) -> str:
         return impl
     try:
         import transformer_engine.pytorch  # noqa: F401
+
         return "te"
     except ImportError:
         return "sdpa"
 
 
 @dataclass
-class GPTConfig():
+class GPTConfig:
     vocab_size: int = 50257
     context_length: int = 1024
     emb_dim: int = 768
@@ -65,7 +66,7 @@ class GPTConfig():
 
 
 @dataclass
-class TransformerEncoderConfig():
+class TransformerEncoderConfig:
     n_mels: int = 80
     d_model: int = 512
     n_heads: int = 12
@@ -95,8 +96,7 @@ def _normalize_left_context(left_context: Optional[int]) -> Optional[int]:
 
 
 def _causal_window_size(
-    causal_mask: bool,
-    left_context: Optional[int],
+    causal_mask: bool, left_context: Optional[int]
 ) -> Optional[Tuple[int, int]]:
     left_context = _normalize_left_context(left_context)
     if left_context is None:
@@ -107,18 +107,13 @@ def _causal_window_size(
 
 
 def _causal_disallow_mask(
-    query_len: int,
-    key_len: int,
-    left_context: Optional[int],
-    device,
+    query_len: int, key_len: int, left_context: Optional[int], device
 ) -> torch.Tensor:
     """Return a bool mask where True means the key is not visible to the query."""
     query_offset = key_len - query_len
-    query_positions = torch.arange(
-        query_offset,
-        query_offset + query_len,
-        device=device,
-    ).unsqueeze(1)
+    query_positions = torch.arange(query_offset, query_offset + query_len, device=device).unsqueeze(
+        1
+    )
     key_positions = torch.arange(key_len, device=device).unsqueeze(0)
     disallow = key_positions > query_positions
     left_context = _normalize_left_context(left_context)
@@ -131,11 +126,7 @@ class FeedForward(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
-            TorchGELU(),
-            nn.Linear(4 * dim, dim),
-        )
+        self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), TorchGELU(), nn.Linear(4 * dim, dim))
 
     def forward(self, x):
         return self.ffn(x)
@@ -146,10 +137,16 @@ class GELU(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) *
-            (x + 0.044715 * torch.pow(x, 3))
-        ))
+        return (
+            0.5
+            * x
+            * (
+                1
+                + torch.tanh(
+                    torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))
+                )
+            )
+        )
 
 
 class LayerNorm(nn.Module):
@@ -176,14 +173,17 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
 
     # Compute the inverse frequencies
     inv_freq = 1.0 / (
-        theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim)
+        theta_base
+        ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim)
     )
 
     # Generate position indices
     positions = torch.arange(context_length, dtype=dtype)
 
     # Compute the angles
-    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(
+        0
+    )  # Shape: (context_length, head_dim // 2)
 
     # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
@@ -202,7 +202,7 @@ def apply_rope(x, cos, sin):
 
     # Split x into first half and second half
     x1 = x[..., : head_dim // 2]  # First half
-    x2 = x[..., head_dim // 2:]  # Second half
+    x2 = x[..., head_dim // 2 :]  # Second half
 
     # Adjust sin and cos shapes
     cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
@@ -253,12 +253,7 @@ class MultiHeadAttentionWithFA(nn.Module):
         if self.window_size is not None:
             flash_kwargs["window_size"] = self.window_size
         output = _flash_attn_func(
-            queries,
-            keys,
-            values,
-            dropout_p=dropout,
-            causal=self.causal_mask,
-            **flash_kwargs,
+            queries, keys, values, dropout_p=dropout, causal=self.causal_mask, **flash_kwargs
         )
 
         # Bxnum_tokens x Hx head_dim
@@ -445,22 +440,14 @@ class MultiHeadAttentionWithSDPA(nn.Module):
         is_causal = self.causal_mask
         if self.causal_mask and self.left_context is not None:
             causal_mask = ~_causal_disallow_mask(
-                num_tokens,
-                num_tokens,
-                self.left_context,
-                x.device,
+                num_tokens, num_tokens, self.left_context, x.device
             )
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             attn_mask = causal_mask if attn_mask is None else attn_mask & causal_mask
             is_causal = False
 
         output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            attn_mask=attn_mask,
-            is_causal=is_causal,
-            dropout_p=dropout,
+            queries, keys, values, attn_mask=attn_mask, is_causal=is_causal, dropout_p=dropout
         )
 
         # B xH x num_tokens x head_dim
@@ -502,14 +489,13 @@ class MultiHeadAttention(nn.Module):
 
         self.register_buffer(
             "mask",
-            _causal_disallow_mask(
-                context_length,
-                context_length,
-                self.left_context,
-                torch.device("cpu"),
-            )
-            if self.causal_mask
-            else torch.zeros(context_length, context_length, dtype=torch.bool),
+            (
+                _causal_disallow_mask(
+                    context_length, context_length, self.left_context, torch.device("cpu")
+                )
+                if self.causal_mask
+                else torch.zeros(context_length, context_length, dtype=torch.bool)
+            ),
         )
 
         self.register_buffer("cache_k", None, persistent=False)
@@ -551,16 +537,13 @@ class MultiHeadAttention(nn.Module):
             mask = self.mask[:num_tokens, :key_tokens]
         elif self.causal_mask:
             mask = _causal_disallow_mask(
-                num_tokens,
-                key_tokens,
-                self.left_context,
-                attn_scores.device,
+                num_tokens, key_tokens, self.left_context, attn_scores.device
             )
         else:
             mask = self.mask[:num_tokens, :key_tokens]
         masked = attn_scores.masked_fill(mask.bool(), -torch.inf)
 
-        attn_weights = torch.softmax(masked / d_k ** 0.5, dim=-1)
+        attn_weights = torch.softmax(masked / d_k**0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
         output = torch.matmul(attn_weights, values)  # B xH x num_tokens x head_dim
@@ -718,11 +701,7 @@ class NGPTStackingSubsampling(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        subsampling_factor: int,
-        feat_in: int,
-        feat_out: int,
-        use_bias: bool = False,
+        self, subsampling_factor: int, feat_in: int, feat_out: int, use_bias: bool = False
     ):
         super().__init__()
         self.subsampling_factor = subsampling_factor
@@ -740,11 +719,11 @@ class NGPTStackingSubsampling(torch.nn.Module):
         """
         x = x.transpose(1, 2)  # BxCxT -> BxTxC
         b, t, h = x.size()
-        pad_size = (self.subsampling_factor - (t % self.subsampling_factor)) % self.subsampling_factor
+        pad_size = (
+            self.subsampling_factor - (t % self.subsampling_factor)
+        ) % self.subsampling_factor
         length = torch.div(
-            length + self.subsampling_factor - 1,
-            self.subsampling_factor,
-            rounding_mode='floor',
+            length + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode='floor'
         )
 
         # Pad and fill padding frames (all-zero) with a learnable padding 'embedding'
@@ -835,7 +814,7 @@ class TransformerEncoder(nn.Module):
         x, length = self.pre_encode(x, length)
         if self.nan_debug:
             self._check_nan(x, "pre_encode")
-        x = x * (self.d_model ** 0.5)
+        x = x * (self.d_model**0.5)
         if self.nan_debug:
             self._check_nan(x, "embedding_scale")
         x = self.layer_norm(x)
@@ -861,12 +840,10 @@ class TransformerEncoder(nn.Module):
                 else:
                     x = x.new_zeros(B, T_prime, self.d_model)
             else:
-                valid_mask = (
-                    torch.arange(T_prime, device=x.device).unsqueeze(0) < lengths32.unsqueeze(1)
-                )
-                cu_seqlens = torch.nn.functional.pad(
-                    lengths32.cumsum(0).to(torch.int32), (1, 0)
-                )
+                valid_mask = torch.arange(T_prime, device=x.device).unsqueeze(
+                    0
+                ) < lengths32.unsqueeze(1)
+                cu_seqlens = torch.nn.functional.pad(lengths32.cumsum(0).to(torch.int32), (1, 0))
                 psp = PackedSeqParams(
                     qkv_format="thd",
                     cu_seqlens_q=cu_seqlens,
@@ -879,9 +856,7 @@ class TransformerEncoder(nn.Module):
                 for idx, layer in enumerate(self.layers):
                     if self.recompute_layers and self.training and x_packed.requires_grad:
                         x_packed = checkpoint(
-                            lambda hidden, layer=layer: layer(
-                                hidden, packed_seq_params=psp
-                            ),
+                            lambda hidden, layer=layer: layer(hidden, packed_seq_params=psp),
                             x_packed,
                             use_reentrant=False,
                         )
@@ -919,10 +894,7 @@ class TransformerEncoder(nn.Module):
                     )
                 else:
                     x = layer(
-                        x,
-                        attn_mask=attn_mask,
-                        lengths=length,
-                        packed_seq_params=packed_seq_params,
+                        x, attn_mask=attn_mask, lengths=length, packed_seq_params=packed_seq_params
                     )
                 if self.nan_debug:
                     self._check_nan(x, f"layer_{idx}")
@@ -931,10 +903,9 @@ class TransformerEncoder(nn.Module):
                 self._check_nan(x, "final_norm")
             if return_packed:
                 lengths32 = length.to(torch.int32)
-                valid_mask = (
-                    torch.arange(x.shape[1], device=x.device).unsqueeze(0)
-                    < lengths32.unsqueeze(1)
-                )
+                valid_mask = torch.arange(x.shape[1], device=x.device).unsqueeze(
+                    0
+                ) < lengths32.unsqueeze(1)
                 x = x[valid_mask]
 
         if return_packed:

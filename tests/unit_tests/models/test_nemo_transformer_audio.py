@@ -27,14 +27,8 @@ from megatron.core.models.audio.nemo_transformer_audio_model import (
     NemoTransformerAudioModel,
 )
 
-
 _MIN_CFG = NemoTransformerAudioConfig(
-    n_mels=8,
-    d_model=16,
-    n_heads=2,
-    n_layers=1,
-    pre_encode="conv",
-    nan_debug=False,
+    n_mels=8, d_model=16, n_heads=2, n_layers=1, pre_encode="conv", nan_debug=False
 )
 
 
@@ -109,9 +103,7 @@ class TestNemoTransformerAudioModel:
         model = NemoTransformerAudioModel(_MIN_CFG)
 
         input_features = torch.randn(2, 40, _MIN_CFG.n_mels)
-        attention_mask = torch.tensor(
-            [[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool
-        )
+        attention_mask = torch.tensor([[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool)
 
         hidden_states, output_mask = model(input_features, attention_mask)
 
@@ -135,19 +127,12 @@ class TestNemoTransformerAudioModel:
 
     def test_forward_shapes_windowed_causal_sdpa(self):
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "attn_impl": "sdpa",
-                "causal_mask": True,
-                "left_context": 2,
-            }
+            **{**_MIN_CFG.__dict__, "attn_impl": "sdpa", "causal_mask": True, "left_context": 2}
         )
         model = NemoTransformerAudioModel(cfg)
 
         input_features = torch.randn(2, 40, cfg.n_mels)
-        attention_mask = torch.tensor(
-            [[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool
-        )
+        attention_mask = torch.tensor([[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool)
 
         hidden_states, output_mask = model(input_features, attention_mask)
 
@@ -158,19 +143,13 @@ class TestNemoTransformerAudioModel:
 
     def test_forward_packed_matches_dense_valid_tokens_sdpa(self):
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "attn_impl": "sdpa",
-                "drop_rate": 0.0,
-            }
+            **{**_MIN_CFG.__dict__, "attn_impl": "sdpa", "drop_rate": 0.0}
         )
         model = NemoTransformerAudioModel(cfg)
         model.eval()
 
         input_features = torch.randn(2, 40, cfg.n_mels)
-        attention_mask = torch.tensor(
-            [[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool
-        )
+        attention_mask = torch.tensor([[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool)
 
         dense_hidden, dense_mask = model(input_features, attention_mask)
         packed_hidden = model.forward_packed(input_features, attention_mask)
@@ -183,9 +162,7 @@ class TestNemoArchiveReaders:
     def test_read_nemo_config_returns_dict(self, tmp_path):
         pytest.importorskip("omegaconf")
         ref_model = NemoTransformerAudioModel(_MIN_CFG)
-        nemo_path = _write_fake_nemo_archive(
-            tmp_path, encoder_state=ref_model.encoder.state_dict()
-        )
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
 
         cfg = read_nemo_config(nemo_path)
         assert "encoder" in cfg
@@ -195,9 +172,7 @@ class TestNemoArchiveReaders:
     def test_configs_from_path_skip_state_dict(self, tmp_path):
         pytest.importorskip("omegaconf")
         ref_model = NemoTransformerAudioModel(_MIN_CFG)
-        nemo_path = _write_fake_nemo_archive(
-            tmp_path, encoder_state=ref_model.encoder.state_dict()
-        )
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
 
         encoder_cfg, preproc_cfg = nemo_audio_configs_from_path(nemo_path)
         assert encoder_cfg.n_mels == _MIN_CFG.n_mels
@@ -233,11 +208,7 @@ class TestNemoArchiveReaders:
 
     def test_left_context_requires_causal_mask(self):
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "causal_mask": False,
-                "left_context": 2,
-            }
+            **{**_MIN_CFG.__dict__, "causal_mask": False, "left_context": 2}
         )
 
         with pytest.raises(ValueError, match="left_context requires causal_mask"):
@@ -253,18 +224,9 @@ class TestNemoArchiveReaders:
             captured["is_causal"] = is_causal
             return torch.zeros_like(query)
 
-        monkeypatch.setattr(
-            nemo_transformer_encoder,
-            "scaled_dot_product_attention",
-            fake_sdpa,
-        )
+        monkeypatch.setattr(nemo_transformer_encoder, "scaled_dot_product_attention", fake_sdpa)
         mha = nemo_transformer_encoder.MultiHeadAttentionWithSDPA(
-            dim_in=4,
-            dim_out=4,
-            num_heads=1,
-            dropout=0.0,
-            causal_mask=True,
-            left_context=2,
+            dim_in=4, dim_out=4, num_heads=1, dropout=0.0, causal_mask=True, left_context=2
         )
         x = torch.randn(1, 5, 4)
         pad_mask = torch.ones(1, 1, 1, 5, dtype=torch.bool)
@@ -301,12 +263,7 @@ class TestNemoArchiveReaders:
         )
 
         nemo_transformer_encoder.MultiHeadAttentionWithTE(
-            dim_in=4,
-            dim_out=4,
-            num_heads=1,
-            dropout=0.0,
-            causal_mask=True,
-            left_context=3,
+            dim_in=4, dim_out=4, num_heads=1, dropout=0.0, causal_mask=True, left_context=3
         )
 
         assert captured["window_size"] == (3, 0)
@@ -320,18 +277,9 @@ class TestNemoArchiveReaders:
             captured.update(kwargs)
             return torch.zeros_like(query)
 
-        monkeypatch.setattr(
-            nemo_transformer_encoder,
-            "_flash_attn_func",
-            fake_flash_attn_func,
-        )
+        monkeypatch.setattr(nemo_transformer_encoder, "_flash_attn_func", fake_flash_attn_func)
         mha = nemo_transformer_encoder.MultiHeadAttentionWithFA(
-            dim_in=4,
-            dim_out=4,
-            num_heads=1,
-            dropout=0.0,
-            causal_mask=True,
-            left_context=4,
+            dim_in=4, dim_out=4, num_heads=1, dropout=0.0, causal_mask=True, left_context=4
         )
 
         mha(torch.randn(1, 5, 4))
@@ -350,12 +298,7 @@ class TestNemoArchiveReaders:
 
         monkeypatch.setattr(nemo_transformer_encoder, "checkpoint", fake_checkpoint)
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "attn_impl": "sdpa",
-                "n_layers": 2,
-                "recompute_layers": True,
-            }
+            **{**_MIN_CFG.__dict__, "attn_impl": "sdpa", "n_layers": 2, "recompute_layers": True}
         )
         model = NemoTransformerAudioModel(cfg)
         model.train()
@@ -390,9 +333,7 @@ class TestNemoArchiveReaders:
     def test_write_checkpoint_local_audio_configs_from_nemo_args(self, tmp_path):
         pytest.importorskip("omegaconf")
         ref_model = NemoTransformerAudioModel(_MIN_CFG)
-        nemo_path = _write_fake_nemo_archive(
-            tmp_path, encoder_state=ref_model.encoder.state_dict()
-        )
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
         ckpt_dir = tmp_path / "iter_0002000"
         args = SimpleNamespace(
             audio_model_type="nemo_transformer",
@@ -437,9 +378,7 @@ class TestNemoArchiveReaders:
     def test_extract_archive_returns_full_state(self, tmp_path):
         pytest.importorskip("omegaconf")
         ref_model = NemoTransformerAudioModel(_MIN_CFG)
-        nemo_path = _write_fake_nemo_archive(
-            tmp_path, encoder_state=ref_model.encoder.state_dict()
-        )
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
 
         cfg, state = extract_nemo_archive(nemo_path)
         assert cfg["encoder"]["n_layers"] == _MIN_CFG.n_layers
@@ -450,9 +389,7 @@ class TestNemoArchiveReaders:
     def test_configs_from_archive_strips_encoder_prefix(self, tmp_path):
         pytest.importorskip("omegaconf")
         ref_model = NemoTransformerAudioModel(_MIN_CFG)
-        nemo_path = _write_fake_nemo_archive(
-            tmp_path, encoder_state=ref_model.encoder.state_dict()
-        )
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
 
         _, _, encoder_state = nemo_audio_configs_from_archive(nemo_path)
         assert encoder_state, "expected non-empty encoder state dict"
@@ -534,11 +471,7 @@ class TestNemoTransformerAudioCheckpoint:
         )
 
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "qk_norm": True,
-                "attn_impl": "sdpa",
-            }
+            **{**_MIN_CFG.__dict__, "qk_norm": True, "attn_impl": "sdpa"}
         )
         ref_model = NemoTransformerAudioModel(cfg)
         nemo_path = _write_fake_nemo_archive(
@@ -548,11 +481,7 @@ class TestNemoTransformerAudioCheckpoint:
         )
 
         te_cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "qk_norm": True,
-                "attn_impl": "te",
-            }
+            **{**_MIN_CFG.__dict__, "qk_norm": True, "attn_impl": "te"}
         )
         fresh = NemoTransformerAudioModel(te_cfg)
         missing, unexpected = load_nemo_transformer_audio_weights(fresh, nemo_path)
@@ -566,9 +495,7 @@ class TestNemoTransformerAudioCheckpoint:
 class TestNemoTransformerAudioTokenEstimator:
     def test_matches_encoder_floor_then_projection_ceil_formula(self):
         est = NemoTransformerAudioTokenEstimator(
-            stack_factor=2,
-            encoder_time_stride=4,
-            pre_encode="conv",
+            stack_factor=2, encoder_time_stride=4, pre_encode="conv"
         )
         assert est.estimate(40) == 5
         assert est.estimate(39) == 5
@@ -594,25 +521,17 @@ class TestNemoTransformerAudioTokenEstimator:
 
     def test_matches_nemo_stacking_subsample_per_sample_ceil_lengths(self):
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "pre_encode": "stacking",
-                "subsampling_factor": 8,
-            }
+            **{**_MIN_CFG.__dict__, "pre_encode": "stacking", "subsampling_factor": 8}
         )
         model = NemoTransformerAudioModel(cfg)
         estimator = NemoTransformerAudioTokenEstimator(
-            stack_factor=1,
-            encoder_time_stride=cfg.encoder_time_stride,
-            pre_encode=cfg.pre_encode,
+            stack_factor=1, encoder_time_stride=cfg.encoder_time_stride, pre_encode=cfg.pre_encode
         )
 
         input_lengths = torch.tensor([293, 300], dtype=torch.long)
         padded_num_frames = 302
         input_features = torch.randn(2, padded_num_frames, cfg.n_mels)
-        attention_mask = (
-            torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
-        )
+        attention_mask = torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
         _, output_mask = model(input_features, attention_mask)
 
         expected = [estimator.estimate(int(num_frames)) for num_frames in input_lengths.tolist()]
@@ -620,9 +539,7 @@ class TestNemoTransformerAudioTokenEstimator:
 
     def test_stacking_estimate_is_independent_of_batch_padded_width(self):
         est = NemoTransformerAudioTokenEstimator(
-            stack_factor=2,
-            encoder_time_stride=8,
-            pre_encode="stacking",
+            stack_factor=2, encoder_time_stride=8, pre_encode="stacking"
         )
 
         assert est.estimate(293) == est.estimate(293, padded_num_frames=293)
@@ -631,25 +548,17 @@ class TestNemoTransformerAudioTokenEstimator:
 
     def test_stacking_lengths_cover_partial_tail_frames(self):
         cfg = NemoTransformerAudioConfig(
-            **{
-                **_MIN_CFG.__dict__,
-                "pre_encode": "stacking",
-                "subsampling_factor": 8,
-            }
+            **{**_MIN_CFG.__dict__, "pre_encode": "stacking", "subsampling_factor": 8}
         )
         model = NemoTransformerAudioModel(cfg)
         estimator = NemoTransformerAudioTokenEstimator(
-            stack_factor=1,
-            encoder_time_stride=cfg.encoder_time_stride,
-            pre_encode=cfg.pre_encode,
+            stack_factor=1, encoder_time_stride=cfg.encoder_time_stride, pre_encode=cfg.pre_encode
         )
 
         input_lengths = torch.tensor([2597, 546, 2331, 1876], dtype=torch.long)
         padded_num_frames = 3000
         input_features = torch.randn(len(input_lengths), padded_num_frames, cfg.n_mels)
-        attention_mask = (
-            torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
-        )
+        attention_mask = torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
         _, output_mask = model(input_features, attention_mask)
 
         expected = [estimator.estimate(int(num_frames)) for num_frames in input_lengths.tolist()]

@@ -55,7 +55,7 @@ class NemoAudioFeatureConfig:
     highfreq: float | None = None
     log: bool = True
     log_zero_guard_type: str = "add"
-    log_zero_guard_value: Any = 2 ** -24
+    log_zero_guard_value: Any = 2**-24
     dither: float = 1e-5
     pad_to: int = 0
     frame_splicing: int = 1
@@ -100,11 +100,7 @@ class NemoTransformerAudioTokenEstimator:
     stack_factor: int = 1
     pre_encode: str = "conv"
 
-    def _estimate_encoder_steps(
-        self,
-        num_frames: int,
-        padded_num_frames: int | None = None,
-    ) -> int:
+    def _estimate_encoder_steps(self, num_frames: int, padded_num_frames: int | None = None) -> int:
         if num_frames < 0:
             raise ValueError(f"num_frames must be >= 0, got {num_frames}")
         if padded_num_frames is not None and padded_num_frames < num_frames:
@@ -128,9 +124,7 @@ class NemoTransformerAudioTokenEstimator:
         return math.ceil(encoder_steps / self.stack_factor)
 
     def estimate_from_num_frames(
-        self,
-        num_frames: int,
-        padded_num_frames: int | None = None,
+        self, num_frames: int, padded_num_frames: int | None = None
     ) -> int:
         return self.estimate(num_frames, padded_num_frames)
 

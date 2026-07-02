@@ -48,9 +48,7 @@ class AudioProjection(MegatronModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, hidden_size = hidden_states.shape
         if hidden_size != self.input_size:
-            raise ValueError(
-                f"Expected hidden size {self.input_size}, got {hidden_size}"
-            )
+            raise ValueError(f"Expected hidden size {self.input_size}, got {hidden_size}")
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool, device=hidden_states.device)
@@ -69,9 +67,9 @@ class AudioProjection(MegatronModule):
 
         output_mask = None
         if attention_mask is not None:
-            output_mask = attention_mask.reshape(batch_size, stacked_seq_len, self.stack_factor).any(
-                dim=-1
-            )
+            output_mask = attention_mask.reshape(
+                batch_size, stacked_seq_len, self.stack_factor
+            ).any(dim=-1)
 
         return hidden_states, output_mask
 

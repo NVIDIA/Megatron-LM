@@ -36,8 +36,6 @@ class PackedAudioEmbeddings:
             offset += length
 
         embeddings = (
-            torch.cat(chunks, dim=0)
-            if chunks
-            else self.embeddings.new_zeros(0, hidden_size)
+            torch.cat(chunks, dim=0) if chunks else self.embeddings.new_zeros(0, hidden_size)
         )
         return PackedAudioEmbeddings(embeddings=embeddings, lengths=target_lengths)

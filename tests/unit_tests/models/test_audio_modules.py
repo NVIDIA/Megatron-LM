@@ -3,10 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.audio import (
-    AudioProjection,
-    PackedAudioEmbeddings,
-)
+from megatron.core.models.audio import AudioProjection, PackedAudioEmbeddings
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,8 +18,7 @@ class TestAudioProjection:
 
         hidden_states = torch.randn(2, 5, 24)
         attention_mask = torch.tensor(
-            [[True, True, True, True, True], [True, True, True, False, False]],
-            dtype=torch.bool,
+            [[True, True, True, True, True], [True, True, True, False, False]], dtype=torch.bool
         )
 
         stacked_states, output_mask = projector._stack_features(hidden_states, attention_mask)
@@ -45,8 +41,7 @@ class TestAudioProjection:
         embeddings = torch.arange(5 * 3, dtype=torch.float32).view(5, 3)
         lengths = torch.tensor([2, 3], dtype=torch.int32)
         projected = AudioProjection.forward_packed(
-            projector,
-            PackedAudioEmbeddings(embeddings=embeddings, lengths=lengths),
+            projector, PackedAudioEmbeddings(embeddings=embeddings, lengths=lengths)
         )
 
         assert projected.lengths.tolist() == [2, 3]
@@ -62,8 +57,7 @@ class TestAudioProjection:
             AudioProjection.forward_packed(
                 projector,
                 PackedAudioEmbeddings(
-                    embeddings=torch.zeros(1, 3),
-                    lengths=torch.tensor([1], dtype=torch.int32),
+                    embeddings=torch.zeros(1, 3), lengths=torch.tensor([1], dtype=torch.int32)
                 ),
             )
 
@@ -111,8 +105,7 @@ class TestAudioProjectionWithModelParallel:
     def test_forward_shapes_and_mask(self):
         hidden_states = torch.randn(2, 5, 24)
         attention_mask = torch.tensor(
-            [[True, True, True, True, True], [True, True, True, False, False]],
-            dtype=torch.bool,
+            [[True, True, True, True, True], [True, True, True, False, False]], dtype=torch.bool
         )
 
         projected_states, output_mask = self.projector(hidden_states, attention_mask)
