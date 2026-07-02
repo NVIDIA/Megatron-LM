@@ -27,6 +27,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    use_symm_mem: bool = False,
 ) -> None:
     """Shard one module as a per-module FSDP unit.
 
@@ -39,6 +40,8 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
+        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
+            PyTorch's NCCL symmetric-memory pool.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -49,7 +52,11 @@ def fully_shard(
     try:
         assert isinstance(module, FsdpModule)
         FsdpModule.__init__(
-            module, mesh=mesh, placements=placements, mixed_precision_policy=mixed_precision_policy
+            module,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=mixed_precision_policy,
+            use_symm_mem=use_symm_mem,
         )
     except Exception:
         module.__class__ = original_cls

@@ -30,6 +30,7 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 import dataclasses
+from collections.abc import Iterable
 
 import torch.distributed as dist
 
@@ -56,6 +57,25 @@ class Partial(Placement):
 @dataclasses.dataclass(frozen=True)
 class Flat(Placement):
     """Flat per-unit dim-0 sharded local buffer placement."""
+
+
+def changed_mesh_axis(
+    old_placements: Iterable[Placement], new_placements: Iterable[Placement]
+) -> int | None:
+    """Return the changed mesh axis, requiring at most one placement change."""
+    changed_axis = None
+    for axis, (old_placement, new_placement) in enumerate(
+        zip(old_placements, new_placements, strict=True)
+    ):
+        if old_placement == new_placement:
+            continue
+        if changed_axis is not None:
+            raise NotImplementedError(
+                "Expected at most one changed placement axis, "
+                f"got changed axes {changed_axis} and {axis}."
+            )
+        changed_axis = axis
+    return changed_axis
 
 
 @dataclasses.dataclass(frozen=True)

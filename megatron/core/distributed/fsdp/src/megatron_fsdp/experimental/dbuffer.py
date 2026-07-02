@@ -19,12 +19,13 @@ from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed.tensor as dist_tensor
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate
+from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +121,11 @@ class DBuffer:
         # existing Storage releases the allocation while preserving those aliases
         # for a later reallocate_storage().
         self._resize_storage(0)
+
+    def rendezvous(self, mesh_axis: int) -> None:
+        """Rendezvous this local buffer for symmetric-memory collectives."""
+        group = self.mesh.get_group(mesh_axis)
+        symm_mem.rendezvous(self.local_buffer, group=group.group_name)
 
     def _resize_storage(self, numel: int) -> None:
         self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
@@ -294,19 +300,7 @@ class DBuffer:
             )
         _validate_placements(new_placements)
 
-        changed_axis: int | None = None
-        for axis, (old_placement, new_placement) in enumerate(
-            zip(self.placements, new_placements, strict=True)
-        ):
-            if old_placement == new_placement:
-                continue
-            if changed_axis is not None:
-                raise NotImplementedError(
-                    "redistribute() currently supports one placement change, "
-                    f"got changed axes {changed_axis} and {axis}."
-                )
-            changed_axis = axis
-
+        changed_axis = changed_mesh_axis(self.placements, new_placements)
         if changed_axis is None:
             if out is None:
                 return self
