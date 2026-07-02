@@ -26,6 +26,10 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 - **[2024/06]** Megatron Core added support for Mamba-based models. Review the paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
 - **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
 
+- **[Agentic Heterogeneous Parallelism for Megatron Multimodal Training](agentic-heterogeneous-parallelism/agentic-heterogeneous-parallelism.md)**
+
+  An agent-driven exploration of heterogeneous TP/DP/PP between the vision encoder and LLM in colocated multimodal training. Documents the agent team structure, the experiment loop, the optimization chains the team identified, the failure modes that required human verification, and the operating model. Includes throughput results across 1B/3B encoders, 7B–70B LLMs, and 8K–64K sequence lengths on H100 (BF16) as case-study evidence.
+
 ## Contributing
 
 To contribute a guide or tutorial, follow this structure:
