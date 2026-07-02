@@ -923,7 +923,7 @@ class TransformerConfig(ModelParallelConfig):
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    cp_comm_type of each layer can be "p2p", "all_gather", "a2a", "a2a+p2p", or "swa_p2p".
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
@@ -933,6 +933,10 @@ class TransformerConfig(ModelParallelConfig):
     "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
+    "swa_p2p": A causal sliding-window-attention implementation that keeps Q/K/V sequence-sharded
+    and exchanges only the previous-token K/V borders required by the local SWA window.
+    In layer-wise CP configurations, use `swa_p2p` for SWA layers and `p2p` or
+    `a2a+p2p` for full-attention layers.
     """
 
     ##################
