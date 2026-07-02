@@ -1192,8 +1192,6 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
-    if args.grad_reduce_in_bf16:
-        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert (
@@ -1279,9 +1277,22 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        assert (
-            args.ckpt_format == "fsdp_dtensor"
-        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            args.fsdp_double_buffer = True
+            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
 
         if args.megatron_fsdp_prefetch_recompute_forward_weights:
             assert args.data_parallel_sharding_strategy == "optim_grads_params", (
@@ -1319,18 +1330,6 @@ def validate_args(args, defaults={}):
                 'Megatron-FSDP zero-SM all-gather requires a dedicated all-gather '
                 'process group. Enabling --create-all-gather-group.',
                 args.rank,
-            )
-
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
-
-        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
-            raise ValueError(
-                "Meta device initialization (init_model_with_meta_device=True) is not "
-                "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
 
     if args.fsdp_manual_registration:
@@ -5104,6 +5103,16 @@ def _add_experimental_args(parser):
             'recomputation will be unsharded.'
         ),
     )
+
+    group.add_argument("--megatron-fsdp-max-pool-double-buffer", action='store_true',
+                        help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
+                             "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
+                             "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
+                             "NCCL user buffer registration and CUDA graph replay for mixed-arch models.")
+    group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
+                        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
+                             "are not included in the symmetric buffer pool. May be necessary for NCCL "
+                             "UBR or CUDA Graphs on hybrid architectures.")
 
     return parser
 

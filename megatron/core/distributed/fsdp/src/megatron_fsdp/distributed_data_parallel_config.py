@@ -194,6 +194,15 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
     def __post_init__(self):
         import os
 
@@ -220,3 +229,7 @@ class DistributedDataParallelConfig:
                 raise ValueError(
                     "fsdp_zero_sm_allgather requires symmetric NCCL registration."
                 )
+
+        if self.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            self.fsdp_double_buffer = True
