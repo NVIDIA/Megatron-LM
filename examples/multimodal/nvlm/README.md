@@ -21,7 +21,7 @@ Please use `examples/multimodal/Dockerfile`.
 ## Dataset preparation
 
 Please refer to Tables 4 and 6 in the [NVLM paper](https://arxiv.org/pdf/2409.11402) for full list of pretrain and SFT datasets.
-Please refer to https://nvidia.github.io/Megatron-Energon/data_prep.html on preparing datasets in the Megatron Energon format.
+Please refer to https://nvidia.github.io/Megatron-Energon/basic/data_prep.html on preparing datasets in the Megatron Energon format.
 
 ## Model conversion
 
@@ -55,7 +55,7 @@ python tools/checkpoint/convert.py --bf16 --model-type GPT --loader llama_mistra
 
 ### Combined checkpoint
 
-Combine the vision model checkpoint from [InternVit](#internvit) with the [34B](#34b-language-model) or [72B](#72b-language-model) language model by running:
+Combine the vision model checkpoint from [Vision model](#vision-model) with the [34B](#34b-language-model) or [72B](#72b-language-model) language model by running:
 ```
 examples/multimodal/combine_lm_vision_checkpoints.sh <language model directory> <vision model directory> <output directory> nvlm
 ```
