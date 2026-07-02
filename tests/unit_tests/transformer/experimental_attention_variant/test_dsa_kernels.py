@@ -1545,7 +1545,7 @@ class TestDenseFusedIndexerSparseAttn:
 #   * CUDA is unavailable;
 #   * cuDNN frontend is not installed (``import cudnn`` fails);
 #   * ``cudnn.DSA`` namespace is missing;
-#   * SM is too low (sparse: SM90+; dense: SM100+);
+#   * SM is below SM90;
 #   * for FlashMLA-needing tests, ``flash_mla`` is not installed.
 # ---------------------------------------------------------------------------
 
@@ -1783,8 +1783,8 @@ _REAL_SHAPES_SPARSE = dict(
     d=512,
     idx_nh=32,
     idx_hd=128,
-    # topk = lcm(64, 128) = 128 satisfies SparseScoreRecomputeSm100's
-    # `topk % n_block_size == 0` (64 for score_type=attention, 128 for indexer).
+    # topk = lcm(64, 128) = 128 satisfies both score block-size requirements
+    # (64 for score_type=attention, 128 for indexer).
     topk=128,
     ratio=1,
     softmax_scale=512**-0.5,
@@ -1848,7 +1848,7 @@ class TestRealKernelScoreHelpers:
         ['sparse_indexer_predict', 'sparse_attn_target', 'dense_indexer_score', 'dense_attn_score'],
     )
     def test_real_score_helper(self, case, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)
+        _skip_if_real_kernels_unavailable()
 
         s = _REAL_SHAPES_SPARSE
         # Each case needs a different combination of the input fixture.
@@ -1991,7 +1991,7 @@ class TestRealKernelKLLossDense:
 
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)
+        _skip_if_real_kernels_unavailable()
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
@@ -2053,7 +2053,7 @@ class TestRealKernelIndexerTopk:
 
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)  # IndexerForward is SM100+
+        _skip_if_real_kernels_unavailable()
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             indexer_topk,
         )
@@ -2173,7 +2173,7 @@ class TestRealKernelDsaSparseAttn:
         in one test halves cuDNN compile time vs running them separately,
         since they share the same kernel cache key.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
 
         # ---- Real path: forward + backward via dsa_sparse_attn ----
@@ -2271,7 +2271,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         emits its own internal lse_indexer that differs slightly), so the
         tolerance is wider than for the kernel-only ``KLLossDense`` test.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'
@@ -2317,21 +2317,11 @@ class TestRealKernelFusedIndexerSparseAttn:
         q_attn_bshd = query.permute(1, 0, 2, 3).contiguous().float()
         k_attn_bsd = kv_full[kv_offset:].permute(1, 0, 2).contiguous().float()
 
-        # PyTorch reference that mirrors the fused path's dense-loss math
-        # exactly. Two non-obvious requirements:
-        #   * Use FlashMLA's emitted ``lse_indexer`` (logsumexp over the
-        #     indexer-selected top-K positions, with the per-head sink term),
-        #     not an analytical full-KV logsumexp. Otherwise the per-row LSE
-        #     basis differs from the kernel by ~50x.
-        #   * Do NOT apply the ratio-causal mask in the reference scores —
-        #     the dense-score-recompute kernels emit values at every position
-        #     (no internal masking). Masking the reference would shift the
-        #     ``attn_score / attn_l1norm`` normalization and the indexer LSE
-        #     basis, producing a different KL than the kernel's.
+        # The reference uses FlashMLA's actual normalization because it
+        # includes the selected top-k positions and the per-head sink term.
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             _dsa_fwd_flash_mla,
             _indexer_topk_core,
-            _kl_loss_from_dense_scores,
         )
 
         # Run indexer + FlashMLA to capture the same ``lse_indexer`` the fused
@@ -2363,23 +2353,17 @@ class TestRealKernelFusedIndexerSparseAttn:
         )
         lse_indexer_bsqh = lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
 
-        # Attention path: exp(QK*scale - lse_indexer), head-summed. No mask.
-        qk_attn = torch.einsum('bqhd,bkd->bqhk', q_attn_bshd, k_attn_bsd) * s['softmax_scale']
-        attn_score_ref = torch.exp(qk_attn - lse_indexer_bsqh.unsqueeze(-1)).sum(dim=2)
-        attn_l1norm_ref = attn_score_ref.sum(dim=-1)
-
-        # Indexer path: ReLU(QK_indexer) * W head-summed, scaled by
-        # ``indexer_softmax_scale`` once. The fused path applies the scale
-        # via pre-scaled ``w_bsh_scaled`` only (not again inside the
-        # kernel), giving ``score = sum_h(relu(QK) * w_raw) * sm_scale``.
-        qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd, k_idx_bsd)
-        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * s[
-            'indexer_softmax_scale'
-        ]
-        idx_lse_ref = torch.logsumexp(idx_score_ref, dim=-1)
-
-        loss_ref = _kl_loss_from_dense_scores(
-            attn_score_ref, attn_l1norm_ref, idx_score_ref, idx_lse_ref, loss_coeff
+        loss_ref = _ref_dense_indexer_loss(
+            q_idx_bshd,
+            k_idx_bsd,
+            w_bsh,
+            q_attn_bshd,
+            k_attn_bsd,
+            lse_indexer_bsqh,
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            attn_softmax_scale=s['softmax_scale'],
+            ratio=s['ratio'],
+            loss_coeff=loss_coeff,
         )
         assert torch.allclose(indexer_loss, loss_ref, atol=5e-2, rtol=1e-1), (
             f"actual = {indexer_loss.item():.6f}, ref = {loss_ref.item():.6f}, "
@@ -2578,6 +2562,7 @@ class TestThdWrapperDispatchAndValidation:
         q, k, w, cu_q, cu_kv = self._make_indexer_topk_thd_inputs()
         total_q, idx_nh, idx_hd = q.shape
         total_k = k.shape[0]
+        q_causal_offsets = torch.tensor([5, 0], dtype=torch.int32, device=q.device)
 
         fake_dsa = MagicMock(name='_DSA_thd_stub')
 
@@ -2587,6 +2572,7 @@ class TestThdWrapperDispatchAndValidation:
             assert 'cu_seqlens_k' in kwargs and kwargs['cu_seqlens_k'] is cu_kv
             assert kwargs['max_seqlen_q'] == 3
             assert kwargs['max_seqlen_k'] == 2
+            assert kwargs['q_causal_offsets'] is q_causal_offsets
             return {'scores': torch.zeros(total_q, 2, dtype=torch.float32, device=q_thd.device)}
 
         fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
@@ -2608,12 +2594,15 @@ class TestThdWrapperDispatchAndValidation:
             cu_seqlens_kv=cu_kv,
             max_seqlen_q=3,
             max_seqlen_kv=2,
+            q_causal_offsets=q_causal_offsets,
         )
         # THD return shape: (total_q, topk) + (total_q,).
         assert topk_idxs.shape == (total_q, 2)
         assert topk_len.shape == (total_q,)
         # Confirmed the kernel was called with THD kwargs.
         fake_dsa.indexer_forward_wrapper.assert_called_once()
+        seq_lens = fake_dsa.indexer_top_k_wrapper.call_args.args[1]
+        assert torch.equal(seq_lens, torch.tensor([1, 1, 2, 0, 0], device=q.device))
 
     # =====================================================================
     # dsa_sparse_attn(is_thd=True)
@@ -2758,7 +2747,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         on the same input tensors (just reshaped), for both dense-loss
         and sparse-loss Path B.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'
@@ -3105,7 +3094,7 @@ class TestThdPaddingRowMasking:
         then expand each segment with intra-segment padding and supply
         cu_seqlens_q_unpadded.  Losses should match.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         dev = 'cuda'
 
         # Baseline: tightly packed (real lengths only, no padding).
@@ -3131,7 +3120,7 @@ class TestThdPaddingRowMasking:
         """Without cu_seqlens_q_unpadded, random per-segment padding rows
         DO corrupt the loss — confirming the masking is necessary.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         dev = 'cuda'
 
         real = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
@@ -3154,7 +3143,9 @@ class TestThdPaddingRowMasking:
         """Indexer gradients at per-segment padding positions are zero,
         and gradients at real-token positions match the unpadded baseline.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        if torch.cuda.get_device_capability()[0] == 9 and not sparse_loss:
+            pytest.skip("cuDNN Frontend SM90 dense DSA has shape-incomplete compile caches")
         dev = 'cuda'
 
         # ---- Unpadded baseline (reference grads) -----------------------------
@@ -3270,7 +3261,7 @@ class TestRealKernelDenseIndexerBackward:
     SHAPES = TestRealKernelFusedIndexerSparseAttn.SHAPES
 
     def test_real_dense_backward_grad_matches_autograd(self, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'
@@ -3404,7 +3395,12 @@ class TestRealKernelDenseIndexerBackward:
         idx_score_aligned = (
             idx_score_analytical + (kernel_indexer_scores - idx_score_analytical).detach()
         )
-        idx_lse_aligned = torch.logsumexp(idx_score_aligned, dim=-1)
+        position_valid = torch.isfinite(kernel_indexer_scores)
+        idx_score_aligned = idx_score_aligned.masked_fill(~position_valid, float('-inf'))
+        row_valid = position_valid.any(dim=-1)
+        idx_lse_aligned = torch.logsumexp(
+            torch.where(row_valid.unsqueeze(-1), idx_score_aligned, 0), dim=-1
+        ).masked_fill(~row_valid, float('-inf'))
         loss_ref = _kl_loss_from_dense_scores(
             attn_score_const.detach(),
             attn_l1norm_const.detach(),

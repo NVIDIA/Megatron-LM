@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from math import ceil, log2
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -12,16 +12,26 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
 
 
-def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
+def get_cp_slice_for_thd(
+    batch,
+    cp_group,
+    keys: Optional[Sequence[str]] = None,
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag",
+    partition_total_tokens: Optional[int] = None,
+):
     """Partition sequence data for context parallelism in THD format.
 
-    Uses TE's THD partitioned indices to split the packed sequence across CP ranks.
+    ``zigzag`` uses TE's THD partitioned indices. ``contiguous`` splits the flattened rows into
+    ``cp_size`` equal slices and assigns one slice to each rank.
     Only keys present in the batch are sliced.
 
     Args:
         batch: Dict with packed sequence data.
         cp_group: Context parallel process group.
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
+        cp_partition_mode: How to assign packed rows to CP ranks.
+        partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
+            before slicing. Existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:
@@ -33,10 +43,44 @@ def get_cp_slice_for_thd(batch, cp_group, keys: Optional[Sequence[str]] = None):
     # Use cu_seqlens_padded[-1] for total_tokens instead of batch['tokens'].size(0):
     # under VPP, the last PP stage has labels/loss_mask but no tokens, so
     # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
-    total_tokens = int(cu_seqlens[-1].item())
-    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    total_tokens = (
+        int(cu_seqlens[-1].item())
+        if partition_total_tokens is None
+        else int(partition_total_tokens)
+    )
     if keys is None:
         keys = ('tokens', 'position_ids', 'labels', 'loss_mask')
+    if partition_total_tokens is not None:
+        for key in keys:
+            if key not in batch or batch[key] is None:
+                continue
+            pad_len = total_tokens - batch[key].numel()
+            if pad_len < 0:
+                raise RuntimeError(
+                    f"partition_total_tokens={total_tokens} is smaller than {key} length "
+                    f"{batch[key].numel()}."
+                )
+            if pad_len > 0:
+                pad_value = True if key == 'padding_mask' else 0
+                batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    if cp_partition_mode == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise RuntimeError(
+                f"Contiguous CP slicing requires total_tokens={total_tokens} to be divisible by "
+                f"cp_size={cp_size}."
+            )
+        local_rows = total_tokens // cp_size
+        # Rank r takes [r * local_rows, (r + 1) * local_rows).
+        row_slice = slice(cp_rank * local_rows, (cp_rank + 1) * local_rows)
+        for key in keys:
+            if key in batch and batch[key] is not None:
+                batch[key] = batch[key][row_slice]
+        return
+
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
+
+    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
     for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)

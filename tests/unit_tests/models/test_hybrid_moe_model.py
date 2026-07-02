@@ -62,6 +62,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "config_logger_dir": "",
     "context_parallel_size": 1,
     "cp_comm_type": "p2p",
+    "cp_partition_mode": "zigzag",
     "cpu_offloading": False,
     "cpu_offloading_activations": True,
     "cpu_offloading_double_buffering": False,

@@ -307,6 +307,9 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
+
     ####################
     # DSA
     ####################
@@ -1477,6 +1480,28 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.experimental_attention_variant == "dsv4_hybrid" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+
+        if self.context_parallel_size > 1:
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.cp_partition_mode != "contiguous"
+            ):
+                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+            if (
+                self.experimental_attention_variant != "dsv4_hybrid"
+                and self.cp_partition_mode != "zigzag"
+            ):
+                raise ValueError("cp_partition_mode='contiguous' is only supported with DSv4.")
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1570,8 +1595,8 @@ class TransformerConfig(ModelParallelConfig):
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
                 sm = torch.cuda.get_device_capability()
-                assert sm[0] >= 10, (
-                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                assert sm[0] >= 9, (
+                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
 

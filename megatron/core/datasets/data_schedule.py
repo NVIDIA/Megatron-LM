@@ -573,8 +573,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
-        config: Model parallel config used for optional THD packed-sequence padding.
-            When None or config.pad_packed_seq_alignment is None, no padding is applied.
+        config: Model config used for CP partitioning and optional THD packed-sequence padding.
+            When None, CP partitioning defaults to zigzag and no padding is applied.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -630,6 +630,34 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
+    cp_partition_mode = config.cp_partition_mode if config is not None else "zigzag"
+    contiguous_cp_local_target_len = None
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    alignment = target_len = max_num_seqs = None
+    if pad_alignment is not None:
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_alignment,
+            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+            getattr(config, 'thd_max_packed_sequences', None),
+            getattr(config, 'cuda_graph_impl', 'none') != 'none',
+        )
+    if (
+        is_tp_rank_0
+        and cp_group.size() > 1
+        and cp_partition_mode == "contiguous"
+        and pad_alignment is not None
+    ):
+        if target_len is not None:
+            contiguous_cp_local_target_len = target_len
+        else:
+            # Fix the local width before slicing so later padding cannot shift rank origins.
+            assert alignment is not None
+            total_rows = int(batch['cu_seqlens_padded'][-1].item())
+            local_rows = (total_rows + cp_group.size() - 1) // cp_group.size()
+            contiguous_cp_local_target_len = ((local_rows + alignment - 1) // alignment) * alignment
+
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
     if is_tp_rank_0:
@@ -644,7 +672,18 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_slice_keys = ['padding_mask']
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-        get_cp_slice_for_thd(batch, cp_group, keys=cp_slice_keys)
+        partition_total_tokens = (
+            contiguous_cp_local_target_len * cp_group.size()
+            if contiguous_cp_local_target_len is not None
+            else None
+        )
+        get_cp_slice_for_thd(
+            batch,
+            cp_group,
+            keys=cp_slice_keys,
+            cp_partition_mode=cp_partition_mode,
+            partition_total_tokens=partition_total_tokens,
+        )
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
     # cu_seqlens_padded for non TP 0 ranks.
@@ -658,12 +697,17 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Broadcast total_tokens because padding_mask is prepared on every PP stage.
     # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
     if is_tp_rank_0:
-        # Under VPP, the last PP stage has labels but no tokens, so derive
-        # total_tokens from cu_seqlens_padded, which is present on every
-        # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
-        # by cp_size to match the already CP-sliced sequence tensors.
-        cp_world = cp_group.size()
-        total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
+        if contiguous_cp_local_target_len is not None:
+            total_tokens = torch.tensor(
+                [contiguous_cp_local_target_len], dtype=torch.int32, device=dev
+            )
+        else:
+            # Under VPP, the last PP stage has labels but no tokens, so derive
+            # total_tokens from cu_seqlens_padded, which is present on every
+            # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
+            # by cp_size to match the already CP-sliced sequence tensors.
+            cp_world = cp_group.size()
+            total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
     else:
         total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
     broadcast_tensor(total_tokens, tp_src_rank, tp_group)
@@ -778,21 +822,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        cp_partition_mode=cp_partition_mode,
         pad_between_seqs=False,
     )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
     # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    pad_alignment = (
-        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
-    )
     if pad_alignment is not None and packed_seq_params is not None:
-        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
-            pad_alignment,
-            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
-            getattr(config, 'thd_max_packed_sequences', None),
-            getattr(config, 'cuda_graph_impl', 'none') != 'none',
-        )
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,
