@@ -955,9 +955,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
                 for model_param, main_param in zip(model_group, main_group):
                     if is_float8tensor(model_param):
-                        copy_back_gathered_bf16_into_fp8_param(
-                            model_param, main_param.detach().to(torch.bfloat16)
-                        )
+                        # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
+                        # by the fp8 all-gather's requantize (``_allgather_helper_fp8``), which
+                        # would overwrite this copy -- so skip it for them. Non-gathered fp8 params
+                        # (e.g. MoE experts at expt_dp == 1, which the all-gather skips) are not
+                        # tagged and still get their ``Q(bf16(master))`` written here.
+                        if not getattr(model_param, '_layer_wise_fp8_gathered', False):
+                            copy_back_gathered_bf16_into_fp8_param(
+                                model_param, main_param.detach().to(torch.bfloat16)
+                            )
                     else:
                         other_model_data.append(model_param.data)
                         other_main_data.append(main_param.data)

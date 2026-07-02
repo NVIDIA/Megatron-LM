@@ -419,17 +419,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # Engage FP8 param sync automatically when the decouple-managed params are actually
         # quantized (fp8_param_gather on + TE Float8/MXFP8 weights). Off -> plain bf16 path.
+        # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
+        # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
+        # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
+        # per-rank lists are all-gathered (dp_cp / expt_dp size > 1 here); non-gathered fp8 params
+        # (e.g. expt_dp == 1 experts, which are absent from these lists) still need the copy-back.
         self.use_fp8_param_sync = False
         if self.decouple_ddp_layout:
             for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
                 if not params_list:
                     continue
                 for per_rank in params_list:
-                    if any(is_float8tensor(p) for p in per_rank):
-                        self.use_fp8_param_sync = True
-                        break
-                if self.use_fp8_param_sync:
-                    break
+                    for p in per_rank:
+                        if is_float8tensor(p):
+                            self.use_fp8_param_sync = True
+                            p._layer_wise_fp8_gathered = True
 
         # When a full_param_layout is available (and we are not decoupling),
         # ddp_config.use_distributed_optimizer is True and model params are views into the
