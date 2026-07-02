@@ -22,6 +22,13 @@ try:
 except ImportError:
     HAVE_TE_FUSED_ADAM = False
 
+# torch 2.13 (NGC PyTorch 26.06) DTensor sharding propagation no longer supports
+# the in-place fused `aten._foreach_lerp_.Scalar` (torch.optim.Adam moment update)
+# on Replicate-placed DTensors, raising "in-place operations that require placement
+# changes are not supported". This is an upstream torch regression triggered by the
+# base-image bump, not a Megatron-FSDP bug; skip the affected test until torch fixes it.
+TORCH_DTENSOR_INPLACE_LERP_BROKEN = version.parse(torch.__version__) >= version.parse('2.13.0a0')
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     MixedPrecisionPolicy,
     fully_shard,
