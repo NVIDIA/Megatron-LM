@@ -112,6 +112,8 @@ def run_fused_qk_topk(
     local_packed_cp_rank: int = 0,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
@@ -131,6 +133,8 @@ def run_fused_qk_topk(
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
+        packed_seq_params=packed_seq_params,
+        cp_size=cp_size,
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -159,6 +163,8 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_rank: int = 0,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
@@ -186,6 +192,8 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
+        packed_seq_params=packed_seq_params,
+        cp_size=cp_size,
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")

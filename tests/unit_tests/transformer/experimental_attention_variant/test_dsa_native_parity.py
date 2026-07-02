@@ -1,8 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
 from megatron.core.transformer.experimental_attention_variant import (
@@ -18,11 +21,6 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
 )
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("kernel_backend", ["cudnn", "tilelang"])
 @pytest.mark.parametrize("seqlen", [1024, 2048])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
@@ -40,11 +38,6 @@ def test_fused_absorbed_mla_dsa_matches_native(
     )
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("seqlen", [1024, 2048, 4096])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
 @pytest.mark.parametrize("use_sparse_loss", [False, True], ids=["dense_loss", "sparse_loss"])
@@ -465,6 +458,175 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
     torch.testing.assert_close(
         topk_length, torch.tensor([[2, 2]], dtype=torch.int32), rtol=0, atol=0
     )
+
+
+def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
+    seen = {}
+
+    class FakeDSA:
+        @staticmethod
+        def indexer_forward_wrapper(
+            q, k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+        ):
+            del weights, ratio, sm_scale
+            seen["q_shape"] = q.shape
+            seen["k_shape"] = k.shape
+            seen["cu_q"] = cu_seqlens_q.clone()
+            seen["cu_k"] = cu_seqlens_k.clone()
+            seen["max_q"] = max_seqlen_q
+            seen["max_k"] = max_seqlen_k
+            scores = torch.full((q.size(0), max_seqlen_k), float("-inf"))
+            for segment in range(cu_seqlens_q.numel() - 1):
+                q_start = int(cu_seqlens_q[segment])
+                q_end = int(cu_seqlens_q[segment + 1])
+                k_length = int(cu_seqlens_k[segment + 1] - cu_seqlens_k[segment])
+                q_length = q_end - q_start
+                for row in range(q_length):
+                    valid_k = k_length - q_length + row + 1
+                    scores[q_start + row, :valid_k] = torch.arange(valid_k, dtype=torch.float32)
+            return {"scores": scores}
+
+        @staticmethod
+        def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val):
+            del next_n
+            masked_scores = scores.clone()
+            key_ids = torch.arange(scores.size(1)).view(1, -1)
+            masked_scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
+            values, indices = masked_scores.topk(top_k, dim=-1)
+            return {"indices": indices.to(torch.int32), "values": values if return_val else None}
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+
+    query_positions = torch.tensor([0, 1, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23])
+    starts = torch.tensor([0] * 4 + [8] * 8)
+    ends = query_positions + 1
+    topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones((1, 12, 1, 1)),
+        torch.ones((1, 24, 1)),
+        torch.ones((1, 12, 1)),
+        topk=3,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        return_scores=False,
+        return_topk_scores=True,
+        use_local_indexer_varlen=True,
+        packed_cu_seqlens_q=torch.tensor([0, 8, 24], dtype=torch.int32),
+        packed_cu_seqlens_k=torch.tensor([0, 8, 24], dtype=torch.int32),
+        packed_max_seqlen_q=16,
+        packed_max_seqlen_k=16,
+        packed_cp_size=2,
+        local_packed_cp_rank=0,
+    )
+
+    assert seen["q_shape"] == torch.Size([12, 1, 1])
+    assert seen["k_shape"] == torch.Size([30, 1, 1])
+    torch.testing.assert_close(seen["cu_q"], torch.tensor([0, 2, 4, 8, 12], dtype=torch.int32))
+    torch.testing.assert_close(seen["cu_k"], torch.tensor([0, 2, 10, 14, 30], dtype=torch.int32))
+    assert seen["max_q"] == 4
+    assert seen["max_k"] == 16
+    expected_indices = []
+    expected_scores = []
+    expected_lengths = []
+    for position, start in zip(query_positions.tolist(), starts.tolist()):
+        valid_count = position - start + 1
+        row = list(range(position, max(start - 1, position - 3), -1))
+        expected_indices.append(row + [-1] * (3 - len(row)))
+        local_scores = [value - start for value in row]
+        expected_scores.append(
+            local_scores + [torch.finfo(torch.float32).min] * (3 - len(local_scores))
+        )
+        expected_lengths.append(min(valid_count, 3))
+    expected_indices = torch.tensor([expected_indices], dtype=torch.int32)
+    torch.testing.assert_close(topk_indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(
+        topk_length, torch.tensor([expected_lengths], dtype=torch.int32), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        topk_scores, torch.tensor([expected_scores], dtype=torch.float32), rtol=0, atol=0
+    )
+
+
+def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 8, 24], dtype=torch.int32),
+        cu_seqlens_kv=torch.tensor([0, 8, 24], dtype=torch.int32),
+        max_seqlen_q=16,
+        max_seqlen_kv=16,
+    )
+    q = torch.ones((12, 1, 1, 1))
+    k = torch.ones((24, 1, 1))
+    weights = torch.ones((12, 1, 1))
+    starts = torch.zeros(12, dtype=torch.int64)
+    ends = torch.arange(1, 13, dtype=torch.int64)
+    seen = {}
+
+    def fake_indexer_topk(q_bshd, _k_bsd, _w_bsh, topk, **kwargs):
+        seen["loss_off"] = kwargs
+        return (
+            torch.zeros((q_bshd.size(0), q_bshd.size(1), topk), dtype=torch.int32),
+            torch.full((q_bshd.size(0), q_bshd.size(1)), topk, dtype=torch.int32),
+            None,
+        )
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", fake_indexer_topk)
+    dsa_cudnn_kernels.run_fused_qk_topk(
+        q,
+        k,
+        weights,
+        index_topk=3,
+        starts=starts,
+        ends=ends,
+        block_size=128,
+        use_local_indexer_varlen=True,
+        packed_seq_params=packed_seq_params,
+        cp_size=2,
+    )
+
+    def fake_sparse_loss_apply(*args):
+        seen["loss_on"] = args
+        return (
+            torch.zeros((1, 12, 3), dtype=torch.int32),
+            torch.full((1, 12), 3, dtype=torch.int32),
+            torch.tensor(0.0),
+        )
+
+    monkeypatch.setattr(
+        dsa_cudnn_kernels,
+        "FusedQKTopKWithSparseLossFunc",
+        SimpleNamespace(apply=fake_sparse_loss_apply),
+    )
+    dsa_cudnn_kernels.run_fused_qk_topk_with_loss(
+        q,
+        k,
+        weights,
+        index_topk=3,
+        starts=starts,
+        ends=ends,
+        block_size=128,
+        query=torch.ones((12, 1, 64, 576)),
+        key=torch.ones((24, 1, 1, 576)),
+        softmax_scale=1.0,
+        loss_coeff=0.001,
+        pg_collection=SimpleNamespace(tp=None),
+        config=SimpleNamespace(kv_lora_rank=512),
+        use_local_indexer_varlen=True,
+        packed_seq_params=packed_seq_params,
+        cp_size=2,
+    )
+
+    loss_off = seen["loss_off"]
+    torch.testing.assert_close(loss_off["packed_cu_seqlens_q"], packed_seq_params.cu_seqlens_q)
+    torch.testing.assert_close(loss_off["packed_cu_seqlens_k"], packed_seq_params.cu_seqlens_kv)
+    assert loss_off["packed_max_seqlen_q"] == 16
+    assert loss_off["packed_max_seqlen_k"] == 16
+    assert loss_off["packed_cp_size"] == 2
+
+    loss_on = seen["loss_on"]
+    torch.testing.assert_close(loss_on[18], packed_seq_params.cu_seqlens_q)
+    torch.testing.assert_close(loss_on[19], packed_seq_params.cu_seqlens_kv)
+    assert loss_on[20:23] == (16, 16, 2)
 
 
 def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
@@ -1807,12 +1969,7 @@ def test_cudnn_sparse_attention_declines_unsupported_flashmla_value_dim(monkeypa
     assert output is None
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
-def test_cudnn_attention_backward_pads_small_local_head_count():
+def test_cudnn_attention_backward_supports_small_local_head_count():
     _skip_if_fused_dsa_unavailable()
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
@@ -2435,6 +2592,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         query_valid_rows=None,
         use_relu=True,
         use_local_indexer_varlen=True,
+        single_packed_thd_sequence=True,
     )
 
     assert output is not None

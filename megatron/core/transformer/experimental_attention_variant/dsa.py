@@ -2139,6 +2139,8 @@ class DSAttention(MegatronModule):
                     local_packed_cp_rank=cp_rank,
                     local_packed_cp_query_start=local_packed_cp_query_start,
                     local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
@@ -2180,6 +2182,8 @@ class DSAttention(MegatronModule):
                     local_packed_cp_rank=cp_rank,
                     local_packed_cp_query_start=local_packed_cp_query_start,
                     local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
