@@ -69,6 +69,60 @@ class ToyModel(nn.Module):
 
 
 # -----------------------
+# Synthetic supervised data (teacher-student)
+# -----------------------
+
+def set_seed(seed: int) -> None:
+    """Seed CPU + CUDA RNGs so all ranks initialize identically."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class TeacherStudentData:
+    """Deterministic teacher-student regression task for convergence checks.
+
+    A frozen, randomly-initialized ``ToyModel`` acts as the teacher. Inputs are
+    drawn from a per-(step, rank) seeded generator so every rank sees a distinct
+    but reproducible stream (proper data parallelism), and targets are the
+    teacher's outputs. The student (the FSDP model) learns to match the teacher,
+    so the MSE loss must decrease monotonically toward zero.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int,
+        seed: int,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.dim = dim
+        self.device = device
+        self.dtype = dtype
+        self.seed = seed
+        # Build the teacher identically on all ranks (seed differs from student
+        # init so the student does not start at the solution).
+        set_seed(seed)
+        self.teacher = ToyModel(dim=dim, n_layers=n_layers).to(device=device, dtype=dtype)
+        self.teacher.eval()
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def sample(
+        self, batch_size: int, seq_len: int, step: int, rank: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(self.seed + 1_000_003 * step + 9_176 * rank)
+        x = torch.randn(
+            batch_size, seq_len, self.dim,
+            device=self.device, dtype=self.dtype, generator=gen,
+        )
+        y = self.teacher(x)
+        return x, y
+
+
+# -----------------------
 # Distributed init / mesh
 # -----------------------
 
@@ -88,7 +142,7 @@ def build_fsdp_model(
     n_layers: int,
     use_megatron_fsdp: bool,
     use_activation_checkpointing: bool = False,
-    enable_cuda_graph: bool = True,
+    enable_cuda_graph: bool = False,
     enable_trace_pool: bool = False,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
@@ -246,20 +300,29 @@ def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     start_step: int = 0,
+    data: "TeacherStudentData" = None,
 ) -> None:
     rank = dist.get_rank()
 
     model.train()
     step = start_step
     t_start = time.time()
+    initial_loss = None
+    final_loss = None
 
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
-            # Dummy data
-            x = torch.randn(args.batch_size, args.seq_len, args.model_dim,
-                            device="cuda", dtype=torch.bfloat16)
-            y = model(x)
-            loss = y.sum() / (args.batch_size * args.seq_len)
+            if data is not None:
+                # Deterministic teacher-student regression: loss must decrease.
+                x, target = data.sample(args.batch_size, args.seq_len, step, rank)
+                y = model(x)
+                loss = torch.nn.functional.mse_loss(y.float(), target.float())
+            else:
+                # Dummy data (no convergence signal).
+                x = torch.randn(args.batch_size, args.seq_len, args.model_dim,
+                                device="cuda", dtype=torch.bfloat16)
+                y = model(x)
+                loss = y.sum() / (args.batch_size * args.seq_len)
             loss.backward()
             if args.use_megatron_fsdp and args.release_memory_pool:
                 model.release_memory_pool()
@@ -267,16 +330,25 @@ def train(
             optimizer.zero_grad()
             model.zero_grad()
 
+            # Average loss across DP ranks so the value is identical everywhere
+            # (safe for a consistent convergence assert on all ranks).
+            global_loss = loss.detach()
+            dist.all_reduce(global_loss, op=dist.ReduceOp.AVG)
+            global_loss = global_loss.item()
+            if initial_loss is None:
+                initial_loss = global_loss
+            final_loss = global_loss
+
             if step % args.log_interval == 0 and rank == 0:
                 t_now = time.time()
                 elapsed = t_now - t_start
-                it_s = elapsed / max(step - start_step + 1, 1)
+                s_per_step = elapsed / max(step - start_step + 1, 1)
                 alloc = _fmt_bytes(torch.cuda.memory_allocated())
                 max_reserved = _fmt_bytes(torch.cuda.max_memory_reserved())
                 print(
-                    f"[rank0] epoch={epoch} step={step} loss={loss.item():.4f} "
+                    f"[rank0] epoch={epoch} step={step} loss={global_loss:.4e} "
                     f"alloc={alloc} max_reserved={max_reserved} "
-                    f"it={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
+                    f"elapsed={elapsed:.1f}s ({s_per_step * 1000:.0f}ms/step)"
                 )
 
             if args.ckpt_dir and step % args.ckpt_interval == 0 and step > 0:
@@ -287,6 +359,20 @@ def train(
     # Final checkpoint
     if args.ckpt_dir:
         save_checkpoint(model, optimizer, step, args.ckpt_dir)
+
+    # Convergence verification (teacher-student mode only).
+    if data is not None and initial_loss is not None:
+        ratio = final_loss / max(initial_loss, 1e-12)
+        if rank == 0:
+            print(
+                f"[rank0] convergence: initial_loss={initial_loss:.4e} "
+                f"final_loss={final_loss:.4e} ratio={ratio:.3f} "
+                f"(threshold={args.convergence_threshold})"
+            )
+        assert final_loss < initial_loss * args.convergence_threshold, (
+            f"Convergence check failed: final_loss={final_loss:.4e} is not < "
+            f"initial_loss={initial_loss:.4e} * {args.convergence_threshold}"
+        )
 
 
 # -----------------------
@@ -309,8 +395,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
     parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
-    parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph",
-                        default=True, help="Disable CUDA graph capture")
+    parser.add_argument("--cuda-graph", action="store_true", default=False,
+                        help="Enable CUDA graph capture (Megatron-FSDP only). Off by default "
+                        "to keep the Megatron-FSDP and PyTorch FSDP2 paths aligned.")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
     parser.add_argument("--release-memory-pool", action="store_true", default=False,
@@ -319,6 +406,13 @@ def parse_args() -> argparse.Namespace:
                         "Only takes effect with --use-megatron-fsdp.")
     parser.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
                         help="Enable CUDA memory recording, dump snapshot to this directory")
+    parser.add_argument("--use-real-data", action="store_true", default=False,
+                        help="Train a deterministic teacher-student regression task with MSE "
+                        "loss to verify convergence, instead of the dummy sum-loss.")
+    parser.add_argument("--seed", type=int, default=1234,
+                        help="Random seed for model init and teacher-student data.")
+    parser.add_argument("--convergence-threshold", type=float, default=0.5,
+                        help="With --use-real-data, assert final_loss < initial_loss * this.")
     return parser.parse_args()
 
 
@@ -331,6 +425,9 @@ def main() -> None:
             stacks="all",
         )
 
+    # Seed before model construction so all ranks share identical initial weights.
+    set_seed(args.seed)
+
     model, _ = build_fsdp_model(
         dim=args.model_dim,
         n_layers=args.n_layers,
@@ -341,11 +438,21 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    data = None
+    if args.use_real_data:
+        # Teacher seed differs from student init so the student does not start
+        # at the solution; both are identical across ranks.
+        data = TeacherStudentData(
+            dim=args.model_dim,
+            n_layers=args.n_layers,
+            seed=args.seed + 10000,
+        )
+
     start_step = 0
     if args.ckpt_dir:
         start_step = load_checkpoint_if_available(model, optimizer, args.ckpt_dir)
 
-    train(args, model, optimizer, start_step=start_step)
+    train(args, model, optimizer, start_step=start_step, data=data)
 
     if args.record_memory_history:
         rank = dist.get_rank()

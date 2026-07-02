@@ -16,6 +16,7 @@ Features:
   - Per-step GPU memory tracking
   - NVML real GPU memory logging
   - Numerical verification probe (--verify)
+  - Convergence overfit check (--real-data)
   - Nsight profiling support (--cuda_profiler_capture)
 
 Usage (per node):
@@ -268,6 +269,12 @@ def parse():
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--verify", action="store_true",
                    help="Cross-rank gloss + global grad-norm probe; timing INVALID for this run.")
+    p.add_argument("--real-data", action="store_true",
+                   help="Overfit a fixed flow-matching batch (target velocity v=x1-x0) so the "
+                        "loss decreases; verifies convergence instead of the dummy L2 loss. "
+                        "Adds a cross-rank loss all-reduce, so timing is not meaningful.")
+    p.add_argument("--convergence-threshold", type=float, default=0.5,
+                   help="With --real-data, assert final_loss < initial_loss * this.")
     p.add_argument("--cuda_profiler_capture", action="store_true",
                    help="Bracket bench steps with cudaProfilerStart/Stop for Nsight capture ranges.")
     p.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
@@ -434,6 +441,33 @@ def make_batch(args, device, dtype, gen):
     return hidden, timestep, prompt, img_shapes, [txt_len] * B
 
 
+def make_fixed_flow_matching_batch(args, device, dtype, gen):
+    """Deterministic flow-matching batch to overfit for convergence checks.
+
+    Builds a clean latent ``x1``, noise ``x0`` and per-sample time ``t in [0, 1]``.
+    The model input is the interpolant ``xt = (1 - t) * x0 + t * x1`` and the
+    regression target is the velocity ``v = x1 - x0``. Reusing this fixed batch
+    every step lets the model overfit, so ``MSE(model(xt, t), v)`` must decrease.
+
+    The returned ``timestep`` is ``t * 1000`` to match the ``timestep / 1000``
+    convention used at the model call site.
+    """
+    B = args.batch_size
+    H, W = args.height // 16, args.width // 16
+    seq = H * W
+    txt_len = args.instruction_seq_len + qwen25vl_vision_tokens(
+        args.height, args.width, args.vl_patch_size, args.vl_merge_size)
+    x1 = torch.randn(B, seq, 64, device=device, dtype=dtype, generator=gen)
+    x0 = torch.randn(B, seq, 64, device=device, dtype=dtype, generator=gen)
+    t = torch.rand(B, device=device, dtype=dtype, generator=gen)
+    t_b = t.view(B, 1, 1)
+    xt = (1.0 - t_b) * x0 + t_b * x1
+    target = x1 - x0
+    prompt = torch.randn(B, txt_len, 3584, device=device, dtype=dtype, generator=gen)
+    img_shapes = [[(1, H, W)]] * B
+    return xt, t * 1000.0, prompt, img_shapes, [txt_len] * B, target
+
+
 # ----------------------------- main -----------------------------
 def main():
     args = parse()
@@ -508,6 +542,11 @@ def main():
     _mem_log("after_model_init", rank=rank)
 
     gen = torch.Generator(device=device).manual_seed(args.seed + rank)
+    fixed_batch = None
+    real_initial_loss = None
+    real_final_loss = None
+    if args.real_data:
+        fixed_batch = make_fixed_flow_matching_batch(args, device, dtype, gen)
     step_times = []
     cuda_profiler_active = False
     oom_occurred = False
@@ -521,8 +560,12 @@ def main():
                     cuda_profiler_active = True
                     if rank == 0:
                         print("[nsys] cudaProfilerStart")
-                hs, ts, pe, img_shapes, txt_lens = make_batch(args, device, dtype, gen)
-                hs.requires_grad_(True)
+                if args.real_data:
+                    xt, ts, pe, img_shapes, txt_lens, target = fixed_batch
+                    hs = xt.detach().clone().requires_grad_(True)
+                else:
+                    hs, ts, pe, img_shapes, txt_lens = make_batch(args, device, dtype, gen)
+                    hs.requires_grad_(True)
                 torch.cuda.synchronize(); dist.barrier()
                 t0 = time.perf_counter()
 
@@ -534,7 +577,10 @@ def main():
                                 img_shapes=img_shapes, txt_seq_lens=txt_lens, return_dict=False)
                     pred = (out[0] if isinstance(out, tuple) else out)[:, :hs.size(1)]
                     pred = _NvtxFwdEndBwdStart.apply(pred)
-                loss = pred.float().pow(2).mean()
+                if args.real_data:
+                    loss = torch.nn.functional.mse_loss(pred.float(), target.float())
+                else:
+                    loss = pred.float().pow(2).mean()
                 loss.backward()
                 t_bwd = time.perf_counter()
 
@@ -560,11 +606,26 @@ def main():
                 dt = time.perf_counter() - t0
                 if step >= args.warmup_steps:
                     step_times.append(dt)
+
+                # Cross-rank mean loss for a consistent convergence signal
+                # (identical on all ranks; added after timing).
+                gl = None
+                if args.real_data:
+                    g = loss.detach().float()
+                    dist.all_reduce(g, op=dist.ReduceOp.AVG)
+                    gl = g.item()
+                    if real_initial_loss is None:
+                        real_initial_loss = gl
+                    real_final_loss = gl
+
                 if rank == 0:
                     tag = "warmup" if step < args.warmup_steps else "bench "
                     if args.verify:
                         print(f"[{args.backend}] {tag} step {step:3d} | VERIFY (timing invalid) | "
                               f"gloss={gloss:.6f} | gnorm={gnorm:.4f} | n_grad={n}")
+                    elif gl is not None:
+                        print(f"[{args.backend}] {tag} step {step:3d} | {dt*1000:8.2f} ms | "
+                              f"loss={gl:.4e}")
                     else:
                         print(f"[{args.backend}] {tag} step {step:3d} | {dt*1000:8.2f} ms | "
                               f"loss={loss.item():.4f}")
@@ -591,6 +652,19 @@ def main():
         avg = sum(step_times) / max(1, len(step_times)) * 1000
         print(f"\n[{args.backend}] avg step (n={len(step_times)}): {avg:.2f} ms | "
               f"peak mem: {peak.item():.2f} GB")
+
+    # Convergence verification (--real-data overfit only). ``real_final_loss`` is
+    # the cross-rank mean, so this assert is consistent across ranks.
+    if args.real_data and real_initial_loss is not None:
+        ratio = real_final_loss / max(real_initial_loss, 1e-12)
+        if rank == 0:
+            print(f"[{args.backend}] convergence: initial_loss={real_initial_loss:.4e} "
+                  f"final_loss={real_final_loss:.4e} ratio={ratio:.3f} "
+                  f"(threshold={args.convergence_threshold})")
+        assert real_final_loss < real_initial_loss * args.convergence_threshold, (
+            f"Convergence check failed: final_loss={real_final_loss:.4e} is not < "
+            f"initial_loss={real_initial_loss:.4e} * {args.convergence_threshold}"
+        )
 
     _mem_log("final", rank=rank)
 
