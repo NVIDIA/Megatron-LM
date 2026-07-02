@@ -79,7 +79,7 @@ def _dsv4_cp_fused_kernels_available():
         sm_major = torch.cuda.get_device_capability()[0]
     except RuntimeError:
         return False
-    if sm_major < 10:
+    if sm_major < 9:
         return False
     try:
         from cudnn import DSA  # noqa: F401
@@ -90,7 +90,7 @@ def _dsv4_cp_fused_kernels_available():
 
 
 _DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON = (
-    "DSv4 fused DSA cases require SM100+, flash_mla, and cudnn.DSA"
+    "DSv4 fused DSA cases require SM90+, flash_mla, and cudnn.DSA"
 )
 
 
@@ -567,6 +567,12 @@ class TestDSv4HybridAttentionTHDCP:
         Verifies local CP output, hidden grad, and reduced parameter grads
         against the sliced full-reference tensors.
         """
+        if (
+            torch.cuda.get_device_capability()[0] == 9
+            and self.fused_kernels_available
+            and not sparse_loss
+        ):
+            pytest.skip("cuDNN Frontend SM90 dense DSA has offset, cache, and stream bugs")
         packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
 
         torch.manual_seed(_SEED + layer_number)
@@ -817,6 +823,11 @@ class TestDSv4HybridAttentionTHDCP:
                 for name, param in graph_attn.named_parameters()
                 if param.grad is not None
             }
+            # The unfused graph pool is large on H100. Its results are cloned, so
+            # release it before allocating the eager reference's backward buffers.
+            del graph, graph_output, graph_attn, full_hidden, test_hidden
+            del static_hidden, static_grad
+            _clear_cuda_test_state()
 
             eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
                 eager_attn, eager_hidden, test_grad, packed
@@ -838,9 +849,7 @@ class TestDSv4HybridAttentionTHDCP:
                     f"layer={layer_number}:{mode}:param_grad:{name}",
                 )
 
-            del graph, graph_output
-            del graph_attn, eager_attn, full_hidden, test_hidden, test_grad, static_hidden
-            del eager_hidden, static_grad, graph_out, graph_hidden_grad
+            del eager_attn, test_grad, eager_hidden, graph_out, graph_hidden_grad
             _clear_cuda_test_state()
 
     @pytest.mark.parametrize(

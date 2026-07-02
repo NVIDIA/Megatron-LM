@@ -1555,8 +1555,8 @@ class TransformerConfig(ModelParallelConfig):
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
                 sm = torch.cuda.get_device_capability()
-                assert sm[0] >= 10, (
-                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                assert sm[0] >= 9, (
+                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
 

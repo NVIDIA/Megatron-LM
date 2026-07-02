@@ -1545,7 +1545,7 @@ class TestDenseFusedIndexerSparseAttn:
 #   * CUDA is unavailable;
 #   * cuDNN frontend is not installed (``import cudnn`` fails);
 #   * ``cudnn.DSA`` namespace is missing;
-#   * SM is too low (sparse: SM90+; dense: SM100+);
+#   * SM is below SM90;
 #   * for FlashMLA-needing tests, ``flash_mla`` is not installed.
 # ---------------------------------------------------------------------------
 
@@ -1783,8 +1783,8 @@ _REAL_SHAPES_SPARSE = dict(
     d=512,
     idx_nh=32,
     idx_hd=128,
-    # topk = lcm(64, 128) = 128 satisfies SparseScoreRecomputeSm100's
-    # `topk % n_block_size == 0` (64 for score_type=attention, 128 for indexer).
+    # topk = lcm(64, 128) = 128 satisfies both score block-size requirements
+    # (64 for score_type=attention, 128 for indexer).
     topk=128,
     ratio=1,
     softmax_scale=512**-0.5,
@@ -1848,7 +1848,7 @@ class TestRealKernelScoreHelpers:
         ['sparse_indexer_predict', 'sparse_attn_target', 'dense_indexer_score', 'dense_attn_score'],
     )
     def test_real_score_helper(self, case, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)
+        _skip_if_real_kernels_unavailable()
 
         s = _REAL_SHAPES_SPARSE
         # Each case needs a different combination of the input fixture.
@@ -1991,7 +1991,7 @@ class TestRealKernelKLLossDense:
 
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)
+        _skip_if_real_kernels_unavailable()
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
@@ -2053,7 +2053,7 @@ class TestRealKernelIndexerTopk:
 
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10)  # IndexerForward is SM100+
+        _skip_if_real_kernels_unavailable()
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             indexer_topk,
         )
@@ -2173,7 +2173,7 @@ class TestRealKernelDsaSparseAttn:
         in one test halves cuDNN compile time vs running them separately,
         since they share the same kernel cache key.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
 
         # ---- Real path: forward + backward via dsa_sparse_attn ----
@@ -2271,7 +2271,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         emits its own internal lse_indexer that differs slightly), so the
         tolerance is wider than for the kernel-only ``KLLossDense`` test.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'
@@ -2747,7 +2747,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         on the same input tensors (just reshaped), for both dense-loss
         and sparse-loss Path B.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'
@@ -3094,7 +3094,7 @@ class TestThdPaddingRowMasking:
         then expand each segment with intra-segment padding and supply
         cu_seqlens_q_unpadded.  Losses should match.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         dev = 'cuda'
 
         # Baseline: tightly packed (real lengths only, no padding).
@@ -3120,7 +3120,7 @@ class TestThdPaddingRowMasking:
         """Without cu_seqlens_q_unpadded, random per-segment padding rows
         DO corrupt the loss — confirming the masking is necessary.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         dev = 'cuda'
 
         real = self._build_multi_seg_inputs(self.SEG_LENS_REAL, self.SHAPES, dev)
@@ -3143,7 +3143,9 @@ class TestThdPaddingRowMasking:
         """Indexer gradients at per-segment padding positions are zero,
         and gradients at real-token positions match the unpadded baseline.
         """
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        if torch.cuda.get_device_capability()[0] == 9 and not sparse_loss:
+            pytest.skip("cuDNN Frontend SM90 dense DSA has shape-incomplete compile caches")
         dev = 'cuda'
 
         # ---- Unpadded baseline (reference grads) -----------------------------
@@ -3259,7 +3261,7 @@ class TestRealKernelDenseIndexerBackward:
     SHAPES = TestRealKernelFusedIndexerSparseAttn.SHAPES
 
     def test_real_dense_backward_grad_matches_autograd(self, reset_lazy_kernel_state):
-        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
         torch.manual_seed(0)
         dev = 'cuda'

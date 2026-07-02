@@ -304,23 +304,39 @@ def _native_sparse_attn(
 ) -> torch.Tensor:
     sq, batch_size, num_heads, head_dim = query.size()
     kv_t = kv_full.permute(1, 0, 2)
-    safe_indices = topk_indices.clamp(min=0).long()
-    gather_index = safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    kv_gathered = torch.gather(kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=gather_index)
+    chunk_size = 1024 if sq > 4096 else sq
+    outputs = []
+    for query_chunk, topk_chunk in zip(
+        query.split(chunk_size), topk_indices.split(chunk_size, dim=1)
+    ):
+        safe_indices = topk_chunk.clamp(min=0).long()
+        chunk_len = query_chunk.size(0)
+        if sq > 4096:
+            # Expanded gather backward materializes [B, S, K, D], which is
+            # 80 GiB for pro/8192. Chunking also bounds einsum workspace.
+            batch = torch.arange(batch_size, device=kv_t.device)[:, None, None]
+            kv_gathered = kv_t[batch, safe_indices]
+        else:
+            gather_index = safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            kv_gathered = torch.gather(
+                kv_t.unsqueeze(1).expand(-1, chunk_len, -1, -1), dim=2, index=gather_index
+            )
 
-    q = query.permute(1, 2, 0, 3).float()
-    scores = torch.einsum("bnsh,bskh->bnsk", q, kv_gathered.float()) * softmax_scale
-    scores = scores.masked_fill((topk_indices < 0).unsqueeze(1), float("-inf"))
+        q = query_chunk.permute(1, 2, 0, 3).float()
+        kv_gathered_float = kv_gathered.float()
+        scores = torch.einsum("bnsh,bskh->bnsk", q, kv_gathered_float) * softmax_scale
+        scores = scores.masked_fill((topk_chunk < 0).unsqueeze(1), float("-inf"))
 
-    sink = attn_sink.view(1, num_heads, 1, 1).float()
-    scores_max = torch.max(scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(scores - scores_max)
-    exp_sink = torch.exp(sink - scores_max)
-    attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
+        sink = attn_sink.view(1, num_heads, 1, 1).float()
+        scores_max = torch.max(scores.max(dim=-1, keepdim=True).values, sink)
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+        attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
 
-    output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_gathered.float())
-    output = output.to(query.dtype).permute(2, 0, 1, 3).contiguous()
-    return output.reshape(sq, batch_size, num_heads * head_dim)
+        output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_gathered_float)
+        output = output.to(query.dtype).permute(2, 0, 1, 3).contiguous()
+        outputs.append(output.reshape(chunk_len, batch_size, num_heads * head_dim))
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
 
 def _native_fused_sparse_indexer_loss(
@@ -915,7 +931,7 @@ class TestDSv4HybridNativeParity:
         dsa_indexer_use_sparse_loss: bool,
     ):
         if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable(sm_min=10)
+            _skip_if_real_kernels_unavailable()
         major, _ = torch.cuda.get_device_capability()
         if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
@@ -1021,8 +1037,15 @@ class TestDSv4HybridNativeParity:
         gradients against the native reference.
         """
         if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable(sm_min=10)
+            _skip_if_real_kernels_unavailable()
         major, _ = torch.cuda.get_device_capability()
+        if (
+            major == 9
+            and apply_dsa_kernel_fusion
+            and compress_ratio == 4
+            and not dsa_indexer_use_sparse_loss
+        ):
+            pytest.skip("cuDNN Frontend SM90 THD dense DSA has cache and stream bugs")
         if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
@@ -1143,7 +1166,7 @@ class TestDSv4HybridNativeParity:
         max compress ratio) so compression is exact at every ratio.
         """
         if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable(sm_min=10)
+            _skip_if_real_kernels_unavailable()
         major, _ = torch.cuda.get_device_capability()
         total_T = sum(seg_lens)
         if major < 10 and not apply_dsa_kernel_fusion and total_T > 4096:
@@ -1273,7 +1296,14 @@ class TestDSv4HybridNativeParity:
         within tolerance.
         """
         if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable(sm_min=10)
+            _skip_if_real_kernels_unavailable()
+        if (
+            torch.cuda.get_device_capability()[0] == 9
+            and apply_dsa_kernel_fusion
+            and compress_ratio == 4
+            and not dsa_indexer_use_sparse_loss
+        ):
+            pytest.skip("cuDNN Frontend SM90 THD dense DSA has cache and stream bugs")
 
         actual_T = sum(seg_lens)
         assert actual_T <= pad_max_seqlen, "seg_lens must fit within pad_max_seqlen"

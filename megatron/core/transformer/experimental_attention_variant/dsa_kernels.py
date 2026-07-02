@@ -334,7 +334,7 @@ def build_flat_topk_idxs(
 
 
 class SparseAttnFunc(torch.autograd.Function):
-    """SM100 sparse attention fwd + bwd on flat tensors.
+    """Sparse attention fwd + bwd on flat tensors.
 
     Forward uses :mod:`flash_mla`; backward uses cuDNN Frontend's
     :attr:`cudnn.DSA.sparse_attention_backward_wrapper`.
