@@ -390,6 +390,9 @@ class DpBalancedScheduler(BasePackingScheduler):
             )
         )
         num_micro_batches = int(num_micro_batches)
+        graph_slots = getattr(config, '_cuda_graph_num_microbatches', None)
+        if graph_slots is not None and num_micro_batches > graph_slots:
+            raise ValueError(f"{num_micro_batches=} exceeds captured CUDA graph {graph_slots=}.")
 
         # Step 8: Broadcast to TP group and create data_iterator
         new_data_iterator = create_data_iterator(
@@ -433,6 +436,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 self.total_hdp_gpus,
                 max_seq_len_per_rank=mslpr,
                 min_cp_size=min_cp,
+                max_num_seqs=self.max_num_seqs,
             )
             sample_id_groups.append(sample_ids)
 
@@ -457,8 +461,8 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     """Return the scheduler cap for real THD sequences.
 
     ``thd_max_packed_sequences`` is the final static THD capacity, including the
-    optional dummy sequence appended for a padding tail. The dp_balanced
-    scheduler only packs real sequences, so reserve one slot when dummy-tail
+    optional dummy sequence appended for a padding tail. Packing schedulers
+    only place real sequences, so reserve one slot when dummy-tail
     padding is enabled.
     """
     max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
@@ -525,11 +529,7 @@ def wrap_data_iterator(
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
 
-    scheduler_max_num_seqs = (
-        _get_scheduler_max_real_num_seqs(config)
-        if scheduler_type == 'dp_balanced'
-        else getattr(config, 'thd_max_packed_sequences', None)
-    )
+    scheduler_max_num_seqs = _get_scheduler_max_real_num_seqs(config)
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
