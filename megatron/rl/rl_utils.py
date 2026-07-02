@@ -1,18 +1,18 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import gc
 
-import copy
-from functools import partial
 # Keep this to make the env registered.
 import itertools
-import math
-import logging
 import json
+import logging
+import math
 import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -22,46 +22,40 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+from wandb import wandb_run
 
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
-from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
-from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.utils import (
-    toggle_cuda_graphs,
-    transition_moe_cudagraphs,
-)
-from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
-from megatron.core.inference.utils import device_memory_summary
-from megatron.core.utils import get_asyncio_loop, log_single_rank
-from megatron.rl.sequence_packing_utils import (
-    get_microbatch_dataloader,
-    pack_inference_logprobs,
-    compute_packed_inference_logprobs_stats,
-    pack_all_trajectories,
-    load_packed_data_by_index,
-    get_sequence_packing_tensorboard_metrics,
-    get_sequence_packing_log_info,
-    get_default_packed_seq_params,
-    get_packing_actual_tokens,
-    get_packing_compute_tokens,
-    get_packing_efficiency,
-    get_packing_avg_seq_length,
-    update_microbatch_calculator,
+from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.utils import toggle_cuda_graphs, transition_moe_cudagraphs
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_attr_wrapped_model,
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    unwrap_model,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -79,6 +73,21 @@ from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
+from megatron.rl.sequence_packing_utils import (
+    compute_packed_inference_logprobs_stats,
+    get_default_packed_seq_params,
+    get_microbatch_dataloader,
+    get_packing_actual_tokens,
+    get_packing_avg_seq_length,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
+    get_sequence_packing_log_info,
+    get_sequence_packing_tensorboard_metrics,
+    load_packed_data_by_index,
+    pack_all_trajectories,
+    pack_inference_logprobs,
+    update_microbatch_calculator,
+)
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -86,19 +95,8 @@ from megatron.training.global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from megatron.training.utils import (
-    get_ltor_masks_and_position_ids,
-    get_nvtx_range,
-    print_rank_0,
-)
-from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model, unwrap_model
-from megatron.core.process_groups_config import ProcessGroupCollection
-from wandb import wandb_run
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
-)
+from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
@@ -565,18 +563,16 @@ def get_inference_interface(args, loop, model):
 
 
 _ROLLOUT_GENERATOR = None
+_ROLLOUT_AGENT = None
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR
+    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
-        num_groups = n_prompts
-        if streaming and args.rl_submission_granularity != "B":
-            num_groups = 1
         request = GroupedRolloutRequest(
-            num_groups=num_groups,
+            num_groups=n_prompts,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -590,6 +586,9 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             submission_granularity=args.rl_submission_granularity,
             consumption_granularity=args.rl_consumption_granularity,
         )
+        # Keep the agent handle so metric logging can read the live rollout
+        # pipelines (see _collect_rollout_pipeline_metrics).
+        _ROLLOUT_AGENT = agent
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
 
@@ -1100,6 +1099,89 @@ def prep_wandb_metrics(
     return metrics
 
 
+def _collect_rollout_pipeline_metrics() -> dict:
+    """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
+
+    Walks the live rollout agent (set by get_rollout_generator) and, for each
+    sub-agent with an active _RolloutPipeline, reads queue sizes, gate state,
+    per-stage dwell times, and rate counters. Accumulators are reset after
+    reading; point-in-time values (queue sizes, gate held) are re-read next
+    call. Keys follow the existing f"{env_id}_{metric}" convention.
+    """
+    if _ROLLOUT_AGENT is None:
+        return {}
+    sub_agents = (
+        _ROLLOUT_AGENT.agents
+        if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
+        else [_ROLLOUT_AGENT]
+    )
+    metrics: dict = {}
+    for sub_agent in sub_agents:
+        pipeline = getattr(sub_agent, "_active_pipeline", None)
+        if pipeline is None:
+            continue
+        env_id = getattr(sub_agent, "env_id", "") or "rollout"
+        gate = pipeline.gate
+        metrics.update({
+            # Queue sizes and gate held are point-in-time reads.
+            f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
+            f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+            f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+            f"{env_id}_pipeline_output_queue_maxsize": pipeline.output_queue_maxsize,
+            f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+            f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+            f"{env_id}_pipeline_gate_capacity": gate.capacity,
+            f"{env_id}_pipeline_gate_held": gate.held,
+            f"{env_id}_pipeline_gate_utilization": (
+                gate.held / gate.capacity if gate.capacity else 0.0
+            ),
+            # Counters below accumulate since the previous collection.
+            f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
+            f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
+            f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
+            f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
+            f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
+            f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+            f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+        })
+        for name, samples in (
+            ("infer_queue_dwell", pipeline.infer_queue_dwell),
+            ("engine_dwell", pipeline.engine_dwell),
+            ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+            ("output_queue_dwell", pipeline.output_queue_dwell),
+        ):
+            if samples:
+                arr = np.asarray(samples, dtype=np.float64)
+                metrics[f"{env_id}_pipeline_mean_{name}_s"] = float(arr.mean())
+                metrics[f"{env_id}_pipeline_max_{name}_s"] = float(arr.max())
+                metrics[f"{env_id}_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
+                metrics[f"{env_id}_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
+        # Reset accumulators; queue sizes and gate held are point-in-time.
+        pipeline.infer_queue_dwell = []
+        pipeline.engine_dwell = []
+        pipeline.assemble_queue_dwell = []
+        pipeline.output_queue_dwell = []
+        pipeline.prepared_count = 0
+        pipeline.inferred_count = 0
+        pipeline.assembled_count = 0
+        pipeline.yielded_count = 0
+        gate.prepare_blocked_seconds = 0.0
+        gate.acquire_calls = 0
+        gate.release_calls = 0
+
+    # WeightedMultiTask work distribution (agent_slots / agent_pgts).
+    dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)
+    if dist:
+        for env_id, groups, pgt, slots in zip(
+            dist["env_ids"], dist["agent_groups"], dist["agent_pgts"], dist["agent_slots"]
+        ):
+            metrics[f"{env_id}_agent_groups"] = groups
+            metrics[f"{env_id}_agent_pgts"] = pgt
+            metrics[f"{env_id}_agent_slots"] = slots
+        metrics["multitask_total_pgt"] = dist["total_pgt"]
+    return metrics
+
+
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
@@ -1177,6 +1259,11 @@ def maybe_log_training_metrics(
         )
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
+
+    # Snapshot per-pipeline instrumentation (queue sizes, gate state,
+    # per-stage timings) and the multi-task work distribution. Reads happen
+    # while the asyncio loop is idle so there is no concurrent writer.
+    metrics.update(_collect_rollout_pipeline_metrics())
 
     wandb_writer.log(metrics, step=current_iteration)
 
@@ -2084,11 +2171,13 @@ def megatron_rl_inference_mode(
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
+    global _ROLLOUT_AGENT
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
+    _ROLLOUT_AGENT = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
