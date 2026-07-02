@@ -998,9 +998,10 @@ def make_tp_sharded_tensor_for_checkpoint(
             else:
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
                 new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
-            # GTP peers hold distinct shards (disambiguated by the offset above); the true
-            # replicas are the replicate DP group, so elect the writer over that group.
-            dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
+            dp_replica_id = parallel_state.get_data_parallel_rank(
+                with_context_parallel=True, with_gtp_remat=False
+            )
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)

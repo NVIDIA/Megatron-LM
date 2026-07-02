@@ -604,9 +604,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
     # Checkpoint replica election for gtp_remat-REPLICATED params needs the gtp_remat-INCLUSIVE
     # group so gtp_remat peers get distinct replica_ids (matches production's get_default
     # metadata, which uses the gtp_remat-inclusive default). The replicate group would collide.
-    metadata = {
-        'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)
-    }
+    metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
     sd = layer.mixer.sharded_state_dict(prefix='mixer.', metadata=metadata)
 
     target_bases = {'A_log', 'dt_bias', 'D', 'conv1d.weight', 'conv1d.bias'}
@@ -703,6 +701,62 @@ def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
         assert (
             sum(is_main_replica(r) for r in rids_full) == 1
         ), f"full group must elect exactly one writer, got {rids_full}"
+
+
+def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, port):
+    """VocabParallelEmbedding calls make_tp_sharded_tensor_for_checkpoint directly (needs
+    allow_shape_mismatch), so its GTP writer election must use the gtp_remat-EXCLUDED DP group.
+    Assert every axis-0 offset has exactly one main-replica writer and the offsets tile the vocab.
+
+    world=4 -> tp1 * gtp2 * dp2: vocab split in 2 (gtp), each half replicated on 2 dp ranks.
+    """
+    from collections import defaultdict
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.dist_checkpointing.mapping import is_main_replica
+    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    gtp_group = ps.get_gtp_weight_remat_group()
+    assert gtp_group.size() == 2, f"expected gtp_remat_size=2, got {gtp_group.size()}"
+
+    full_vocab, hidden = 8, 4
+    per_shard = full_vocab // gtp_group.size()  # 4 (tp=1 -> per_tp == full_vocab)
+    weight = _make_gtp_shard(full_vocab, hidden, gtp_group)
+    assert weight.shape == (per_shard, hidden)
+
+    st = make_tp_sharded_tensor_for_checkpoint(
+        tensor=weight,
+        key="embedding.word_embeddings.weight",
+        tp_axis=0,
+        allow_shape_mismatch=True,  # how VocabParallelEmbedding calls it
+        prepend_offsets=(),
+        tp_group=ps.get_tensor_model_parallel_group(),
+        dp_cp_group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    mine = (int(st.global_offset[0]), tuple(st.replica_id))
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, mine)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        by_offset = defaultdict(list)
+        for off, rid in gathered:
+            by_offset[off].append(rid)
+        assert set(by_offset) == {0, per_shard}, f"vocab offsets must tile: {sorted(by_offset)}"
+        for off, rids in by_offset.items():
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, (
+                f"vocab offset {off}: expected exactly 1 checkpoint writer, got {n_writers} "
+                f"(replica_ids {rids}); a gtp_remat-inclusive default DP group leaves a shard "
+                f"with no main-replica writer -> 'Invalid access pattern' at save"
+            )
 
 
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
@@ -833,6 +887,10 @@ class TestGtpDcpHelper:
     def test_embedding_offsets(self):
         _require_world_size(4)
         _worker_helper_embedding_offsets(dist.get_rank(), 4, None)
+
+    def test_embedding_writer_election(self):
+        _require_world_size(4)
+        _worker_embedding_writer_election_gtp_inclusive_default(dist.get_rank(), 4, None)
 
     def test_public_wrapper_delegates(self):
         _require_world_size(4)
