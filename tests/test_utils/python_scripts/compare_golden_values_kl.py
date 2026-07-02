@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 
-"""Compare old vs. new golden-value JSONs using KL divergence.
+"""Compare old vs. new golden-value JSONs by average normalized relative difference.
 
 The golden-value JSON files produced by `download_golden_values.py` look like:
 
@@ -13,25 +13,20 @@ The golden-value JSON files produced by `download_golden_values.py` look like:
         "num-zeros": { ... }
     }
 
-For each metric we treat the per-step value series as a discrete distribution
-(after restricting to steps present in both files and applying a strictly
-positive shift) and compute KL divergence plus a couple of summary stats.
+For each (file, metric) we compute a single number:
 
-The printed table and the CSV both emit the same 6 columns, each answering
-a distinct question:
+    avg_rel_diff = mean( (old_v - new_v) / old_v )    over shared steps
 
-  * file / metric          -- which test, which metric
-  * sym_KL                 -- did the distribution shape change, and by how
-                              much?
-  * median(old)/median(new) -- typical value before/after (matches what the
-                               framework's median-based check uses, e.g. for
-                               iteration-time)
-  * max rel|d|             -- worst-step relative shift; catches single bad
-                               steps that approximate-equality checks reject
+Steps where `|old_v|` is below a small epsilon are skipped to avoid a
+division blow-up. The result is **signed**: a positive value means the
+new run is smaller than the old run at the typical step (e.g. loss went
+down); negative means it went up. The magnitude `|avg_rel_diff|` is the
+average fractional shift, so it's directly comparable across metrics of
+wildly different absolute scales.
 
 By default the script compares the working-tree version of each modified
-golden-value file against its `git show HEAD:<path>` version, so the typical
-flow is:
+golden-value file against its `git show HEAD:<path>` version, so the
+typical flow is:
 
     # after running download_golden_values.py, before committing
     python tests/test_utils/python_scripts/compare_golden_values_kl.py
@@ -45,10 +40,10 @@ You can also point at explicit files / pairs:
     python .../compare_golden_values_kl.py --old old.json --new new.json
 
     # write a CSV summary
-    python .../compare_golden_values_kl.py --csv kl_summary.csv
+    python .../compare_golden_values_kl.py --csv summary.csv
 
-    # only print rows whose symmetric KL exceeds a threshold
-    python .../compare_golden_values_kl.py --threshold 1e-4
+    # only print rows whose |avg_rel_diff| exceeds a threshold
+    python .../compare_golden_values_kl.py --threshold 1e-3
 """
 
 from __future__ import annotations
@@ -72,6 +67,10 @@ REPO_ROOT = pathlib.Path(
         ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
     ).stdout.strip()
 )
+
+# Steps where |old| is below this are skipped — (old - new) / old is not
+# meaningful when old ≈ 0 (e.g. num-zeros on dense models, mem-* at step 0).
+ZERO_EPS = 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -139,39 +138,6 @@ def list_modified_golden_files() -> list[pathlib.Path]:
 
 
 # ---------------------------------------------------------------------------
-# Math
-# ---------------------------------------------------------------------------
-
-
-def _normalize(values: list[float]) -> list[float]:
-    """Shift to be strictly positive and normalize so they sum to 1.
-
-    Loss-style trajectories are not probability distributions, so we treat the
-    series as positive masses. Shifting by `min - eps` keeps the relative
-    differences between adjacent steps well-defined while making KL finite.
-    """
-    eps = 1e-12
-    m = min(values)
-    shift = 0.0 if m > eps else (-m + eps)
-    shifted = [v + shift for v in values]
-    s = sum(shifted)
-    if s <= 0:
-        return [1.0 / len(shifted)] * len(shifted)
-    return [v / s for v in shifted]
-
-
-def kl_divergence(p: list[float], q: list[float]) -> float:
-    """KL(P || Q) in nats. Assumes p, q are probability vectors of equal length."""
-    eps = 1e-12
-    out = 0.0
-    for pi, qi in zip(p, q):
-        if pi <= 0:
-            continue
-        out += pi * math.log(pi / max(qi, eps))
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Per-metric comparison
 # ---------------------------------------------------------------------------
 
@@ -180,17 +146,8 @@ def kl_divergence(p: list[float], q: list[float]) -> float:
 class MetricStats:
     file: str
     metric: str
-    sym_kl: float
-    median_old: float
-    median_new: float
-    max_rel_diff: float
-
-
-def _median(xs: list[float]) -> float:
-    n = len(xs)
-    s = sorted(xs)
-    mid = n // 2
-    return s[mid] if n % 2 == 1 else 0.5 * (s[mid - 1] + s[mid])
+    n_steps: int  # number of shared steps that contributed (after skipping old≈0)
+    avg_rel_diff: float  # mean( (old - new) / old )
 
 
 def _extract_series(metric_block: dict) -> dict[int, float]:
@@ -213,26 +170,23 @@ def compare_metric(
     old_series = _extract_series(old_block)
     new_series = _extract_series(new_block)
     shared = sorted(set(old_series) & set(new_series))
-    if len(shared) < 2:
+
+    rel_diffs: list[float] = []
+    for s in shared:
+        old_v = old_series[s]
+        new_v = new_series[s]
+        if abs(old_v) < ZERO_EPS:
+            continue
+        rel_diffs.append((old_v - new_v) / old_v)
+
+    if not rel_diffs:
         return None
-
-    old_vals = [old_series[s] for s in shared]
-    new_vals = [new_series[s] for s in shared]
-
-    p = _normalize(old_vals)
-    q = _normalize(new_vals)
-
-    rel_diffs = [abs(a - b) / max(abs(a), 1e-12) for a, b in zip(old_vals, new_vals)]
-
-    sym_kl = kl_divergence(p, q) + kl_divergence(q, p)
 
     return MetricStats(
         file=file_label,
         metric=metric_name,
-        sym_kl=sym_kl,
-        median_old=_median(old_vals),
-        median_new=_median(new_vals),
-        max_rel_diff=max(rel_diffs),
+        n_steps=len(rel_diffs),
+        avg_rel_diff=sum(rel_diffs) / len(rel_diffs),
     )
 
 
@@ -250,18 +204,12 @@ def compare_files(file_label: str, old_doc: dict, new_doc: dict) -> list[MetricS
 # Output
 # ---------------------------------------------------------------------------
 
-# Six columns, each answers a distinct question:
-#   file / metric        -- which test, which metric
-#   sym_KL               -- did the distribution shape change, and by how much?
-#   median(old)/median(new) -- typical value before/after (matches the
-#                              framework's median-based check, e.g.
-#                              iteration-time)
-#   max rel|d|           -- worst-step relative shift; catches single bad
-#                            steps that approximate-equality checks reject
-_HEADERS = ["file", "metric", "sym_KL", "median(old)", "median(new)", "max rel|d|"]
+_HEADERS = ["file", "metric", "n_steps", "avg_rel_diff"]
 
 
 def _fmt(x: float) -> str:
+    if isinstance(x, int):
+        return str(x)
     if x == 0:
         return "0"
     if abs(x) < 1e-4 or abs(x) >= 1e4:
@@ -270,7 +218,7 @@ def _fmt(x: float) -> str:
 
 
 def _row(r: MetricStats) -> list:
-    return [r.file, r.metric, r.sym_kl, r.median_old, r.median_new, r.max_rel_diff]
+    return [r.file, r.metric, r.n_steps, r.avg_rel_diff]
 
 
 def print_table(rows: Iterable[MetricStats]) -> None:
@@ -330,13 +278,13 @@ def write_csv(rows: Iterable[MetricStats], path: pathlib.Path) -> None:
     type=float,
     default=0.0,
     show_default=True,
-    help="Only print metrics with sym_KL >= threshold.",
+    help="Only print metrics whose |avg_rel_diff| >= threshold.",
 )
 @click.option(
     "--top",
     type=int,
     default=0,
-    help="If >0, also print the top-N metrics by sym_KL across all files.",
+    help="If >0, also print the top-N metrics by |avg_rel_diff| across all files.",
 )
 @click.option(
     "--csv",
@@ -353,7 +301,7 @@ def main(
     top: int,
     csv_path: pathlib.Path | None,
 ):
-    """Compare old vs new golden-value JSONs using KL divergence."""
+    """Compare old vs new golden-value JSONs by average normalized relative difference."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     all_rows: list[MetricStats] = []
@@ -390,15 +338,15 @@ def main(
             label = str(p.relative_to(REPO_ROOT))
             all_rows.extend(compare_files(label, old_doc, new_doc))
 
-    rows = [r for r in all_rows if r.sym_kl >= threshold]
-    rows.sort(key=lambda r: r.sym_kl, reverse=True)
+    rows = [r for r in all_rows if abs(r.avg_rel_diff) >= threshold]
+    rows.sort(key=lambda r: abs(r.avg_rel_diff), reverse=True)
 
     print_table(rows)
 
     if top > 0:
         print()
-        print(f"Top {min(top, len(all_rows))} metrics by symmetric KL:")
-        top_rows = sorted(all_rows, key=lambda r: r.sym_kl, reverse=True)[:top]
+        print(f"Top {min(top, len(all_rows))} metrics by |avg_rel_diff|:")
+        top_rows = sorted(all_rows, key=lambda r: abs(r.avg_rel_diff), reverse=True)[:top]
         print_table(top_rows)
 
     if csv_path is not None:

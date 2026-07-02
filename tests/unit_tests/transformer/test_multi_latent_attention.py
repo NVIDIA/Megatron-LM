@@ -28,12 +28,12 @@ from megatron.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.core.typed_torch import apply_module
+from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -804,8 +804,12 @@ class TestParallelMLAAttentionPrecision:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
@@ -963,8 +967,12 @@ class TestContextParallelMLAAttentionPrecision:
             )
             torch.testing.assert_close(_core_attn_out_sbhd, core_attn_out_thd, atol=atol, rtol=rtol)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             torch.testing.assert_close(_output_sbhd, output_thd, atol=atol, rtol=rtol)
 
@@ -1108,8 +1116,12 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
@@ -1754,6 +1766,36 @@ class TestFusedMLAGradientFlow:
             fused.linear_qkv_down_proj.weight.grad.shape == fused.linear_qkv_down_proj.weight.shape
         )
         assert hidden_states.grad is not None
+
+
+def test_fused_mla_training_hooks_use_fused_down_projection(monkeypatch):
+    """Training hooks should use fused q/kv down projection attributes."""
+
+    class LinearWithDelayedWgrad:
+        def __init__(self, name):
+            self.name = name
+
+        def backward_dw(self):
+            calls.append(self.name)
+
+    calls = []
+    fused = FusedMLASelfAttention.__new__(FusedMLASelfAttention)
+    fused.linear_kv_up_proj = LinearWithDelayedWgrad("kv_up")
+    fused.linear_qkv_down_proj = LinearWithDelayedWgrad("qkv_down")
+    fused.linear_q_up_proj = LinearWithDelayedWgrad("q_up")
+    fused.linear_proj = LinearWithDelayedWgrad("out")
+
+    fused.backward_dw()
+
+    assert calls == ["kv_up", "qkv_down", "q_up", "out"]
+
+    saved_inputs = []
+    mla_module = __import__(FusedMLASelfAttention.__module__, fromlist=["set_save_original_input"])
+    monkeypatch.setattr(mla_module, "set_save_original_input", saved_inputs.append)
+
+    fused.set_for_recompute_input_layernorm()
+
+    assert saved_inputs == [fused.linear_qkv_down_proj]
 
 
 class TestFusedMLALoadFromStateDict:

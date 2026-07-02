@@ -79,9 +79,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             logprobs=choice.generation_log_probs,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.prompt_token_ids),
-            policy_epoch=choice.policy_epoch,
-            kv_cache_epoch=choice.kv_cache_epoch,
-            num_evictions=getattr(choice, 'num_evictions', 0),
+            policy_epoch=choice.message.policy_epoch,
+            kv_cache_epoch=choice.message.kv_cache_epoch,
+            num_evictions=choice.message.num_evictions,
         )
 
     @classmethod
@@ -98,6 +98,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 logging.WARNING,
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
+
+        # RL needs log probs, but not prompt log probs.
+        args.return_log_probs = True
+        args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
@@ -117,7 +121,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=[],
+                parsers=args.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
             )
         else:

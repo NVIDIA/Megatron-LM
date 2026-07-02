@@ -1,0 +1,47 @@
+# Multi-GPU (DP=4) inference perf tests on GB200. Single-node, fills the whole 4-GPU
+# allocation that GB200 QOS requires. Exercises the same ZMQ DP-coordinator path the
+# H100 gpt-perf-dp8.yaml covers, but at half the DP width (GB200 nodes only have 4 GPUs).
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}_{platforms}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 4
+  n_repeat: 1
+  platforms: dgx_gb200
+  time_limit: 3600
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+  script: |-
+    set -euo pipefail
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "CONFIG_PATH=tests/performance_tests/test_cases/gpt/{test_case}/model_config.yaml"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
+        "RESULTS_ROOT={assets_dir}/perf_results"
+    )
+
+    GPUS_PER_NODE=4 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [gpt_583m_perf_gb200_4gpu]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]

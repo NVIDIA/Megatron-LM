@@ -186,13 +186,18 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+    def _set_cos_sin_cache(
+        self, seq_len, offset, dtype, packed_seq=False, cp_group=None, mscale=None
+    ):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
+        self.mscale_cached = mscale
 
         emb, _mscale = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        if mscale is not None:
+            _mscale = mscale
         self.register_buffer(
             "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
         )
@@ -201,16 +206,34 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
     ):
-        """Get cached cos and sin values."""
+        """Get cached cos and sin values.
+
+        Args:
+            mscale: when ``None`` (default), the cached cos/sin are
+                multiplied by yarn's internal concentration factor (the
+                normal long-context behaviour). When a float is supplied,
+                that value is used in place of the internal factor — e.g.
+                the DSv4 hybrid model passes ``mscale=1.0`` to enforce
+                its "pure rotation" contract and keep the fused /
+                unfused rope paths bit-equivalent.
+        """
         if (
-            seq_len > self.max_seq_len_cached
+            not hasattr(self, "max_seq_len_cached")
+            or seq_len > self.max_seq_len_cached
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
+            or mscale != getattr(self, "mscale_cached", None)
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group, mscale)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 

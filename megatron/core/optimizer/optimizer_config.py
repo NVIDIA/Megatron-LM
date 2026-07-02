@@ -299,9 +299,6 @@ class OptimizerConfig:
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 
-    soap_precondition_frequency: int = 1
-    """The frequency of the Shampoo preconditioner."""
-
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
@@ -325,6 +322,13 @@ class OptimizerConfig:
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
+
+    use_layer_wise_param_layout: bool = False
+    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
+    the shard-aligned padded LayerWise param layout. When False (default), the compact decoupled
+    layout is selected: LayerWise-managed (Muon) buffers use a compact no-padding DDP layout with
+    all-reduce gradients and legacy whole-param ping-pong ownership + ``allgather_params``
+    param sync."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -379,6 +383,12 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    grad_norm_skip_threshold: float = float('inf')
+    """Skip gradient update if the gradient norm exceeds this threshold.
+
+    Disabled by default. Set a finite value to enable skip-on-large-grad behavior.
+    """
+
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 
@@ -422,6 +432,12 @@ class OptimizerConfig:
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
                     "recommended for mxfp8 training."
                 )
+
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
 
         if self.use_precision_aware_optimizer:
             assert (

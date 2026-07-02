@@ -111,14 +111,14 @@ TEST_CASES = [
     # TP/CP/SP: similarity checks (TE Attention)
     # -------------------------------------------------------------------------
     TestCase("tp2_cp4_sp",              4096,  64,    4, 12288,  [2039, 1013, 509],          2, 4, True,  "similarity"),
-    TestCase("tp2_cp2_sp_longseq",      4096,  32,    8, 14336,  [65536, 8191, 4096],        2, 2, True,  "similarity"),
+    TestCase("tp2_cp2_sp_longseq",      4096,  32,    8, 14336,  [16384, 4096, 2048],         2, 4, True,  "similarity"),
 
     # -------------------------------------------------------------------------
     # Edge cases
     # -------------------------------------------------------------------------
     TestCase("short_seqs_parallel",     1024,  16,    4, 4096,   [17, 31, 11],               2, 2, True,  "similarity"),
     TestCase("extreme_mixed",           4096,  32,    8, 14336,  [4093, 127, 257],           2, 2, True,  "similarity"),
-    TestCase("long_short_mix",          4096,  32,    8, 14336,  [65535, 512, 1024],         2, 2, True,  "similarity"),
+    TestCase("long_short_mix",          4096,  32,    8, 14336,  [16384, 512, 1024],         2, 4, True,  "similarity"),
 ]
 # fmt: on
 

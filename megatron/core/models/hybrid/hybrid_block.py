@@ -7,7 +7,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -19,15 +19,27 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -41,9 +53,419 @@ class HybridStackSubmodules:
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    csa_layer: Union[ModuleSpec, type] = IdentityOp
+    hca_layer: Union[ModuleSpec, type] = IdentityOp
+    window_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+
+
+class HyperConnectionHybridLayer(GraphableMegatronModule):
+    """Layer-boundary mHC wrapper for HybridStack layers.
+
+    Hybrid layers already own their local residual paths. For this initial
+    integration we treat each hybrid layer as a single function by aggregating
+    n streams to the layer input, running the existing layer, and feeding only
+    the layer delta back through mHC expansion. The expansion path intentionally
+    uses zero additional dropout because the wrapped hybrid layer has already
+    applied its local dropout/residual update before the delta is computed.
+
+    Checkpoint compatibility: this is a *wrapper* (the inner layer is held as
+    `self.inner_layer`), so wrapped-layer state_dict keys are nested under
+    `inner_layer.` (e.g. `layers.0.inner_layer.input_layernorm.weight` instead
+    of `layers.0.input_layernorm.weight`). HybridStack checkpoints saved with
+    `enable_hyper_connections=False` cannot be loaded into a model with
+    `enable_hyper_connections=True` (and vice versa) without a key-mapping
+    migration. Note: this differs from `HyperConnectionTransformerLayer`,
+    which subclasses `TransformerLayer` and only adds new sibling fields,
+    keeping all base keys stable.
+
+    CUDA graphs: this wrapper subclasses ``GraphableMegatronModule`` so that, with
+    ``cuda_graph_impl="transformer_engine"``, wrapped layers are captured per-layer —
+    mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this, the TE
+    graph discovery (``_layer_is_graphable``) only inspects the top-level layer type and
+    silently skips every wrapped layer, so an mHC-enabled HybridStack would run entirely
+    eager. Two capture modes:
+
+    * Non-MoE inner layers (attention variants, Mamba): the whole wrapper forward
+      (mHC aggregate + inner layer + n-stream BDA) is captured as one graph. The inner
+      layer's own ``__call__`` graph routing is bypassed during capture (see
+      ``_call_inner_layer``) to avoid nested capture.
+    * MoE inner layers, when ``moe_router`` is in ``cuda_graph_modules``: the expert
+      all-to-all is not graph-safe, so only the deterministic prefix is graphed (mHC
+      ``compute_mappings``/``aggregate`` + the inner layer's router/preprocess). The graph
+      outputs the router intermediates, the mHC state (``h_post``, ``h_res``) and the
+      n-stream residual; on replay the experts run eagerly and the n-stream BDA (eager)
+      consumes the inner's raw ``mlp_output_with_bias`` as the layer delta. Routing the
+      residual *through the graph* (not reusing the layer input directly in the eager BDA)
+      keeps the backward gradient flowing into the captured graph, which is required for
+      bit-identical training — again mirroring ``HyperConnectionTransformerLayer``.
+
+    ``_get_submodules_under_cudagraphs`` returns the submodules whose params the wrapper
+    graph's manual hooks must drive: ``[self]`` for whole-wrapper capture, or the mHC module
+    + the inner router/preprocess submodules for partial MoE capture (experts stay eager).
+    """
+
+    def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
+        super().__init__(config=config)
+        self.inner_layer = layer
+        self.layer_number = layer.layer_number
+        self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        if config.params_dtype is not None:
+            self.hyper_connection.to(dtype=config.params_dtype)
+        if hasattr(layer, 'tp_group'):
+            self.tp_group = layer.tp_group
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Override to produce n-stream hidden_states of shape [s, b, n*C].
+
+        CUDA graph capture allocates static buffers sized by this method. The base
+        returns [s, b, C], but mHC layers carry n-stream hidden states [s, b, n*C].
+        Mirrors ``HyperConnectionTransformerLayer.get_layer_static_inputs``.
+        """
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hs = static_inputs["hidden_states"]
+        n = self.config.num_residual_streams
+        static_inputs["hidden_states"] = torch.ones(
+            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
+            dtype=hs.dtype,
+            requires_grad=hs.requires_grad,
+            device=hs.device,
+        )
+        return static_inputs
+
+    def _inner_is_moe(self) -> bool:
+        """True when the inner layer is an MoE ``TransformerLayer``. Such layers use the
+        GPT-style raw-delta path (feed the inner's ``mlp_output_with_bias`` straight to the
+        n-stream BDA) in both the eager forward and the CUDA-graph replay."""
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        return isinstance(self.inner_layer, TransformerLayer) and isinstance(
+            getattr(self.inner_layer, 'mlp', None), MoELayer
+        )
+
+    def _inner_is_partial_moe_capture(self) -> bool:
+        """True when the inner layer is MoE and the configured ``cuda_graph_modules`` request
+        partial MoE capture (``moe_router``).
+
+        In that case the wrapper does NOT capture the whole forward as one graph (the expert
+        all-to-all is not graph-safe). Instead it graphs the deterministic prefix (mHC aggregate
+        + the inner layer's router/preprocess) and runs the experts + mHC BDA eagerly — mirroring
+        how ``HyperConnectionTransformerLayer`` graphs MoE layers on the GPT path. Whole-wrapper
+        capture is still used for non-MoE inner layers (attention variants, Mamba).
+        """
+        return (
+            self._inner_is_moe()
+            and bool(self.config.cuda_graph_modules)
+            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        )
+
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        """Capture the graph-safe portion of the wrapper forward.
+
+        For non-MoE inner layers the whole wrapper forward (mHC aggregate + inner layer +
+        n-stream BDA) is captured as one graph. For MoE inner layers under ``moe_router``
+        partial capture, only the deterministic prefix is graphed: the mHC
+        ``compute_mappings``/``aggregate`` followed by the inner layer's router/preprocess.
+        The captured outputs are the inner router/preprocess intermediates plus the mHC
+        state (``h_post``, ``h_res``) and the aggregated single-stream input needed to
+        reconstruct the layer delta on replay. ``context`` is ``None`` for the graphed
+        hybrid layer types, so it is dropped (a tuple containing ``None`` cannot be a
+        CUDA-graph output).
+        """
+        if self._inner_is_partial_moe_capture():
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            aggregated, h_res, h_post, residual = self.hyper_connection(hidden_states)
+            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated))
+            # inner_out = router/preprocess intermediates ending in the inner residual;
+            # append the mHC state AND the n-stream `residual` returned by the (graphed)
+            # hyper_connection. Routing `residual` through the graph as an output keeps its
+            # backward grad flowing into the graph's backward (mirrors
+            # HyperConnectionTransformerLayer), instead of a second autograd path the captured
+            # backward does not account for. The experts' raw mlp_output_with_bias (produced
+            # on replay) is the layer delta, so `aggregated` need not be captured.
+            return tuple(inner_out) + (h_post, h_res, residual)
+
+        hidden_states, context = self.forward(*args, **kwargs)
+        cuda_graph_outputs = [hidden_states]
+        if context is not None:
+            cuda_graph_outputs.append(context)
+        return tuple(cuda_graph_outputs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Replay the captured graph and restore the (hidden_states, context) contract.
+
+        Non-MoE inner layers: the whole wrapper forward was captured, so the only graph
+        output is the layer's n-stream hidden_states; re-append ``None`` for context.
+
+        MoE inner layers (partial capture): replay the graphed prefix, then run the
+        experts eagerly and apply the mHC n-stream BDA — reproducing exactly the eager
+        wrapper tail (``layer_delta = layer_output - aggregated`` then
+        ``fused_h_res_h_post_bda``), just with the deterministic prefix graphed.
+        """
+        if self._inner_is_partial_moe_capture():
+            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
+            residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
+            h_res = out.pop()
+            h_post = out.pop()
+            # Resume the inner MoE experts eagerly to the raw delta (mlp_output_with_bias),
+            # then let the n-stream BDA own the residual — identical to the eager forward
+            # (`_call_inner_transformer_layer_without_local_bda` fast path →
+            # fused_h_res_h_post_bda), just with the router/preprocess prefix graphed.
+            # Mirror the eager fast path's BDA args (it feeds the inner layer's
+            # `hidden_dropout` / `bias_dropout_fusion`) so replay == eager bit-for-bit.
+            mlp_output_with_bias = self.inner_layer.resume_moe_experts_after_partial_cudagraph(out)
+            hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+                h_res,
+                residual,
+                h_post,
+                mlp_output_with_bias,
+                dropout_prob=self.inner_layer.hidden_dropout,
+                training=self.training,
+                fused=self.inner_layer.config.bias_dropout_fusion,
+                manager=None,
+            )
+            if (
+                self.config.fp32_residual_connection
+                and self.config.params_dtype is not None
+                and hidden_states.dtype != self.config.params_dtype
+            ):
+                hidden_states = hidden_states.to(self.config.params_dtype)
+            return hidden_states, None
+
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        return cuda_graph_output[0], None
+
+    def _get_submodules_under_cudagraphs(self):
+        """Submodules whose params are driven by the wrapper graph's manual hooks.
+
+        Whole-wrapper capture covers the entire wrapper (``[self]``, the base default).
+        For partial MoE capture only the graphed prefix is covered — the mHC module plus
+        the inner layer's router/preprocess submodules — so the experts (run eagerly)
+        keep their normal forward hooks.
+        """
+        if self._inner_is_partial_moe_capture():
+            return [self.hyper_connection] + self.inner_layer._get_submodules_under_cudagraphs()
+        return super()._get_submodules_under_cudagraphs()
+
+    def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
+        """Delegate Mamba inference state shape requests to the wrapped layer."""
+        if not hasattr(self.inner_layer, 'mamba_state_shapes_per_request'):
+            return None
+        return self.inner_layer.mamba_state_shapes_per_request()
+
+    def _call_inner_layer(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Tensor],
+        sequence_len_offset: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        # When this wrapper is itself being CUDA-graph captured, the inner layer
+        # must run as a plain forward: routing through its ``__call__`` would
+        # trigger nested TE graph capture (the inner layer is also a
+        # GraphableMegatronModule). During eager steps we keep ``__call__`` so the
+        # inner layer's forward pre-hooks (e.g. param all-gather) fire normally;
+        # under graph replay these are driven by the wrapper's manual hooks.
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        inner = self.inner_layer.forward if is_graph_capturing() else self.inner_layer
+
+        if isinstance(self.inner_layer, TransformerLayer):
+            output = inner(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                _called_from_hybrid_mhc_wrapper=True,
+            )
+        else:
+            # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
+            # accept `sequence_len_offset` is currently always wrapped inside a
+            # TransformerLayer spec, so it takes the branch above) do not accept
+            # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
+            # the common arguments. New layer types that consume any of these
+            # must add explicit handling here.
+            output = inner(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+
+        if isinstance(output, tuple):
+            context = output[1] if len(output) > 1 else None
+            return output[0], context
+        return output, None
+
+    def _call_inner_transformer_layer_without_local_bda(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Tensor],
+        sequence_len_offset: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
+    ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
+        """Return a raw TransformerLayer branch output when the wrapped layer is split.
+
+        Hybrid DSv4 layers are usually attention-only (`W/C/H/D`) or MLP/MoE-only (`-/E`)
+        TransformerLayer instances. For those layers, skip the inner layer's local
+        residual+BDA and feed the raw branch output directly into the mHC BDA, matching the
+        GPT mHC path and avoiding a residual add followed by `layer_output - aggregated`.
+        """
+        if not isinstance(self.inner_layer, TransformerLayer):
+            return None
+
+        layer = self.inner_layer
+        if (not layer.training) and layer.config.inference_fuse_tp_communication:
+            return None
+
+        has_attention = not isinstance(layer.self_attention, IdentityOp)
+        has_cross_attention = not isinstance(layer.cross_attention, IdentityOp)
+        has_mlp = not isinstance(layer.mlp, IdentityOp)
+
+        if has_cross_attention or has_attention == has_mlp:
+            return None
+
+        if has_attention:
+            output_with_bias, attn_norm_manager, residual = (
+                layer._forward_self_attention_output_with_bias(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+            )
+            output_with_bias = layer._group_offload_output_with_bias(
+                output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
+            )
+            return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
+
+        output_with_bias, residual = layer._forward_mlp_output_with_bias(
+            hidden_states,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+        )
+        if layer.mlp_norm_manager is not None:
+            output_with_bias = layer._group_offload_output_with_bias(
+                output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
+            )
+            layer.mlp_norm_manager = None
+        return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager=None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Run the wrapped hybrid layer through one layer-boundary mHC update.
+
+        ``attention_mask`` defaults to ``None`` so that CUDA-graph capture, which
+        calls this forward with only the static ``hidden_states`` input, does not
+        fail on a missing positional argument (causal masking is inferred by the
+        attention backend when the mask is ``None``).
+        """
+
+        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        aggregated, h_res, h_post, residual = self.hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
+        fast_path_result = self._call_inner_transformer_layer_without_local_bda(
+            aggregated,
+            attention_mask,
+            inference_context,
+            rotary_pos_emb,
+            sequence_len_offset,
+            packed_seq_params,
+            padding_mask,
+            input_ids,
+        )
+
+        if fast_path_result is None:
+            layer_output, context = self._call_inner_layer(
+                aggregated,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                input_ids,
+            )
+            # The inner hybrid layer already applied its own local residual/dropout, so
+            # it returns `aggregated + f(aggregated)`. We feed only the function
+            # delta `f(aggregated)` into the n-stream BDA so it does not double-count
+            # the residual that mHC owns.
+            if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
+                aggregated = aggregated.to(layer_output.dtype)
+            layer_output_with_bias = (layer_output - aggregated, None)
+            dropout_prob = 0.0
+            bias_dropout_fusion = False
+        else:
+            layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
+
+        layer_output = layer_output_with_bias[0]
+        # Sanity check: this contract requires the branch output to preserve shape;
+        # any mismatch indicates a future layer type is breaking the residual assumption
+        # and would silently corrupt the n-stream state.
+        if layer_output.shape != aggregated.shape:
+            raise RuntimeError(
+                "HyperConnectionHybridLayer requires wrapped branches to preserve "
+                f"hidden-state shape. Got {tuple(layer_output.shape)} from wrapped branch "
+                f"vs {tuple(aggregated.shape)} input."
+            )
+        is_last_in_recompute_block = bool(
+            mhc_recompute_manager is not None
+            and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
+        )
+        mhc_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
+
+        hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+            h_res,
+            residual,
+            h_post,
+            layer_output_with_bias,
+            dropout_prob=dropout_prob,
+            training=self.training,
+            fused=bias_dropout_fusion,
+            manager=mhc_bda_manager,
+        )
+        # In `HyperConnectionTransformerLayer` the n-stream output stays in compute
+        # dtype because the post-attention `x` is in compute dtype. In the hybrid
+        # wrapper, `layer_delta` may be fp32 (when `fp32_residual_connection=True`
+        # or an inner layer upcasts), so `fused_h_res_h_post_bda`'s `output.to(x.dtype)`
+        # would leave the result in fp32 and silently propagate fp32 n-stream
+        # hidden states to every subsequent layer (~2x activation memory). Restore
+        # the compute-dtype contract here.
+        if (
+            self.config.fp32_residual_connection
+            and self.config.params_dtype is not None
+            and hidden_states.dtype != self.config.params_dtype
+        ):
+            hidden_states = hidden_states.to(self.config.params_dtype)
+        return hidden_states, context
 
 
 class HybridStack(MegatronModule):
@@ -69,6 +491,7 @@ class HybridStack(MegatronModule):
         pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
+        mtp_layer_number (int, optional): enclosing MTP depth for logging nested MTP metrics.
     """
 
     def __init__(
@@ -84,12 +507,19 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        mtp_layer_number: Optional[int] = None,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.mtp_layer_number = mtp_layer_number
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -99,6 +529,10 @@ class HybridStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+
+        # Lazily populated mHC recompute layout cache (deterministic from config
+        # and num_layers); see `_build_mhc_recompute_layer_plan`.
+        self._mhc_block_end_plan: Optional[List[bool]] = None
 
         assert layer_type_list is not None, (
             "layer_type_list must be provided. It should be pre-computed from "
@@ -124,6 +558,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -134,10 +569,46 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.CSA:
+                    # DSv4 Compressed Sparse Attention (compress_ratio fixed by the spec).
+                    layer = build_module(
+                        submodules.csa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.HCA:
+                    # DSv4 Heavily Compressed Attention (compress_ratio fixed by the spec).
+                    layer = build_module(
+                        submodules.hca_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.WINDOW:
+                    # DSv4 sliding-window-only attention (compress_ratio=0 fixed by the spec;
+                    # no compressor / no top-k indexer — attends only within csa_window_size).
+                    layer = build_module(
+                        submodules.window_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -152,6 +623,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -159,7 +631,9 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
@@ -169,9 +643,14 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
+            if self.is_mtp_layer and self.mtp_layer_number is not None:
+                self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
+            if self.config.enable_hyper_connections:
+                layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
             self.layers.append(layer)
 
         # Required for activation recomputation
@@ -184,6 +663,32 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+        # Skip hc_head_* params inside the nested MTP HybridStack — `forward()`
+        # no longer calls `learned_output_contract` there (MTP owns that), so these
+        # params would be orphaned and break DDP's per-param grad-ready accounting
+        # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+            hc_mult = self.config.num_residual_streams
+            hc_dim = self.config.hidden_size * hc_mult
+            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            if self.config.sequence_parallel:
+                setattr(self.hc_head_fn, 'sequence_parallel', True)
+                setattr(self.hc_head_base, 'sequence_parallel', True)
+                setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+    @staticmethod
+    def _set_mtp_layer_number_for_moe_metrics(
+        layer: torch.nn.Module, mtp_layer_number: int
+    ) -> None:
+        """Tell nested MTP MoE routers which MTP depth they belong to for logging."""
+        for module in layer.modules():
+            router = getattr(module, "router", None)
+            if router is not None and getattr(router, "is_mtp_layer", False):
+                router.mtp_layer_number = mtp_layer_number
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -205,6 +710,59 @@ class HybridStack(MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
+    def _compute_mhc_block_end_plan(self) -> List[bool]:
+        """Compute per-layer block-end markers (deterministic from config)."""
+        num_layers = len(self.layers)
+        is_recompute_block_end: List[bool] = [False] * num_layers
+        if num_layers == 0:
+            return is_recompute_block_end
+        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+        for l_no in range(num_layers):
+            is_last_in_stack = l_no == num_layers - 1
+            is_last_in_recompute_block = is_last_in_stack
+            if mhc_recompute_layer_num is not None:
+                is_last_in_recompute_block = is_last_in_stack or (
+                    (l_no + 1) % mhc_recompute_layer_num == 0
+                )
+            is_recompute_block_end[l_no] = is_last_in_recompute_block
+        return is_recompute_block_end
+
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Pre-build per-layer MHC recompute managers and block-end markers.
+
+        The block-end plan is deterministic from config and cached on the
+        instance; only the per-block ``CheckpointManager`` instances are
+        allocated fresh per forward pass (managers are single-use). Mirrors
+        the caching scheme used by ``TransformerBlock``.
+        """
+        num_layers = len(self.layers)
+        if not use_mhc_recompute or num_layers == 0:
+            return [None] * num_layers, [False] * num_layers
+
+        if self._mhc_block_end_plan is None:
+            self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
+        is_recompute_block_end = self._mhc_block_end_plan
+
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        mhc_manager = CheckpointManager()
+        for l_no in range(num_layers):
+            layer_managers[l_no] = mhc_manager
+            if is_recompute_block_end[l_no] and l_no != num_layers - 1:
+                mhc_manager = CheckpointManager()
+        return layer_managers, is_recompute_block_end
+
+    @staticmethod
+    def _finalize_mhc_recompute_layer(
+        mhc_manager: Optional[CheckpointManager],
+        hidden_states: Tensor,
+        is_last_in_recompute_block: bool,
+    ) -> None:
+        """Finalize MHC recompute state for the current layer when a block ends."""
+        if mhc_manager is not None and is_last_in_recompute_block:
+            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -215,7 +773,8 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
-    ):
+        input_ids: Optional[Tensor] = None,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Forward function of the HybridStack class.
 
@@ -231,7 +790,11 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
         Returns:
-            Tensor: the output tensor.
+            Tensor in the common case. A 2-tuple ``(hidden_states, mhc_multistream)`` ONLY when
+            ``enable_hyper_connections and post_process and mtp_num_layers > 0 and not
+            is_mtp_layer`` — the extra element is the pre-contraction multi-stream tensor that
+            MTP's ``_concat_embeddings`` consumes. Callers (e.g. ``HybridModel.forward``) must
+            handle both; pipeline send/recv only ever transfers the contracted ``hidden_states``.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -244,6 +807,15 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        # Skip input_expand inside MTP nested HybridStack: when mHC + MTP, the outer
+        # decoder hands in already-multi-stream hidden_states via mhc_multistream
+        # (see multi_token_prediction.py _concat_embeddings), so expanding again would
+        # produce [s, b, n*(n*h)] instead of [s, b, n*h] and break HC mapping_proj.
+        if self.config.enable_hyper_connections and self.pre_process and not self.is_mtp_layer:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.config.num_residual_streams
+            )
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
@@ -255,7 +827,7 @@ class HybridStack(MegatronModule):
             (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context
             and inference_context.is_static_batching()
-            and not self.training
+            and InferenceMode.is_active()
         ):
             current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
@@ -291,34 +863,106 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
+        use_mhc_recompute = (
+            self.training
+            and self.config.enable_hyper_connections
+            and self.config.recompute_granularity == 'selective'
+            and "mhc" in self.config.recompute_modules
+        )
+        mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
+            use_mhc_recompute
+        )
+
         with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
+            if self.config.recompute_granularity == 'full' and self.training:
+                hidden_states = checkpointed_forward(
+                    self,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=None,
+                    context_mask=None,
+                    rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=None,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                )
+            else:
+                for l_no, layer in enumerate(self.layers):
+                    # Layers have 1-indexed layer numbers attribute.
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+
+                    mhc_manager = mhc_layer_managers[l_no]
+                    if mhc_manager is not None:
+                        mhc_manager.is_last_layer_in_recompute_block = (
+                            mhc_is_last_in_recompute_block[l_no]
                         )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    with inner_quant_context:
+                        if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                            layer_kwargs = dict(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                            if input_ids is not None:
+                                layer_kwargs["input_ids"] = input_ids
+                            if mhc_manager is not None and isinstance(
+                                layer, HyperConnectionHybridLayer
+                            ):
+                                layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                            hidden_states, _ = layer(**layer_kwargs)
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
+
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
+
+                    self._finalize_mhc_recompute_layer(
+                        mhc_manager=mhc_manager,
+                        hidden_states=hidden_states,
+                        is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
+                    )
+
+        # When mHC + MTP, save the pre-contraction multi-stream tensor for MTP input.
+        # MTP's _concat_embeddings mHC branch expects [s, b, n*h] (multi-stream), while
+        # the contracted hidden_states is [s, b, h]. Mirrors transformer_block.py:948-988.
+        # Only the OUTER decoder stack does this; nested MTP stacks (is_mtp_layer=True)
+        # must keep returning a single Tensor so MTP's _postprocess receives the right
+        # type for learned_output_contract.
+        # On the final stage of a (non-MTP) stack with mHC active, capture the pre-contraction
+        # multi-stream tensor for MTP's `_concat_embeddings` (only meaningful when MTP layers
+        # exist, i.e. mtp_num_layers > 0), THEN contract the streams. Combining capture and
+        # contraction avoids repeating the condition. Nested MTP HybridStacks (is_mtp_layer=True)
+        # must NOT contract here — MTP's own `_postprocess` calls learned_output_contract +
+        # final_layernorm itself, so doing it here would double-collapse the multi-stream tensor.
+        mhc_multistream = None
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+            if (self.config.mtp_num_layers or 0) > 0:
+                mhc_multistream = hidden_states
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -330,6 +974,8 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
         return hidden_states
 
     def sharded_state_dict(
@@ -354,6 +1000,7 @@ class HybridStack(MegatronModule):
             dict: The sharded state dictionary for the current object.
         """
 
+        sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
 
@@ -387,6 +1034,20 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        local_state_dict: dict = {}
+        self._save_to_state_dict(local_state_dict, '', keep_vars=True)
+        if local_state_dict:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    local_state_dict,
+                    prefix,
+                    sharded_offsets=sharded_offsets or (),
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
 
         return sharded_state_dict
 

@@ -297,6 +297,88 @@ def test_load_state_dict(mock_optimizer):
     assert scheduler.end_wd == 0.2
     assert scheduler.wd_incr_steps == 500
     assert scheduler.wd_incr_style == 'cosine'
+    assert mock_optimizer.param_groups[0]['weight_decay'] == pytest.approx(0.2)
+
+
+def test_load_state_dict_override_restores_runtime_param_group_scheduler_values():
+    optimizer = MagicMock()
+    optimizer.param_groups = [
+        {
+            'lr': 0.0,
+            'weight_decay': 0.0,
+            'max_lr': 0.2,
+            'min_lr': 0.02,
+            'start_wd': 0.0,
+            'end_wd': 0.1,
+            'default_config': True,
+        },
+        {
+            'lr': 0.0,
+            'weight_decay': 0.0,
+            'max_lr': 0.05,
+            'min_lr': 0.005,
+            'start_wd': 0.01,
+            'end_wd': 0.05,
+            'default_config': False,
+        },
+    ]
+    scheduler = OptimizerParamScheduler(
+        optimizer=optimizer,
+        init_lr=0.0,
+        max_lr=0.2,
+        min_lr=0.02,
+        lr_warmup_steps=20,
+        lr_decay_steps=200,
+        lr_decay_style='linear',
+        start_wd=0.0,
+        end_wd=0.1,
+        wd_incr_steps=200,
+        wd_incr_style='linear',
+        use_checkpoint_opt_param_scheduler=False,
+        override_opt_param_scheduler=True,
+    )
+
+    # Simulate optimizer.load_state_dict restoring scheduler-owned fields from
+    # an older checkpoint before opt_param_scheduler.load_state_dict is called.
+    optimizer.param_groups[0].update(
+        {'lr': 1.0, 'max_lr': 1.0, 'min_lr': 0.1, 'start_wd': 0.2, 'end_wd': 0.3}
+    )
+    optimizer.param_groups[1].update(
+        {'lr': 0.4, 'max_lr': 0.4, 'min_lr': 0.04, 'start_wd': 0.2, 'end_wd': 0.3}
+    )
+
+    scheduler.load_state_dict(
+        {
+            'max_lr': 1.0,
+            'min_lr': 0.1,
+            'lr_warmup_steps': 5,
+            'lr_decay_steps': 50,
+            'lr_decay_style': 'linear',
+            'num_steps': 10,
+            'start_wd': 0.01,
+            'end_wd': 0.2,
+            'wd_incr_steps': 50,
+            'wd_incr_style': 'linear',
+        }
+    )
+
+    assert scheduler.max_lr == 0.2
+    assert scheduler.min_lr == 0.02
+    assert scheduler.lr_warmup_steps == 20
+    assert scheduler.lr_decay_steps == 200
+    assert scheduler.num_steps == 10
+    assert optimizer.param_groups[0]['max_lr'] == 0.2
+    assert optimizer.param_groups[0]['min_lr'] == 0.02
+    assert optimizer.param_groups[0]['start_wd'] == 0.0
+    assert optimizer.param_groups[0]['end_wd'] == 0.1
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(0.1)
+    assert optimizer.param_groups[0]['weight_decay'] == pytest.approx(0.005)
+    assert optimizer.param_groups[1]['max_lr'] == 0.05
+    assert optimizer.param_groups[1]['min_lr'] == 0.005
+    assert optimizer.param_groups[1]['start_wd'] == 0.01
+    assert optimizer.param_groups[1]['end_wd'] == 0.05
+    assert optimizer.param_groups[1]['lr'] == pytest.approx(0.025)
+    assert optimizer.param_groups[1]['weight_decay'] == pytest.approx(0.012)
 
 
 # ── get_canonical_lr_for_logging tests ──────────────────────────────────────

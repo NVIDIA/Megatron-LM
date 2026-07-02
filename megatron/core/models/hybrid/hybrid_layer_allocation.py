@@ -18,11 +18,16 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
+    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
+    WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, CSA, HCA, WINDOW, MLP, MOE}
+    # MLA-based attention layers (incompatible with standard '*' attention in one model).
+    MLA_ATTENTION = {DS_ATTENTION, CSA, HCA, WINDOW}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -173,10 +178,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
+        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 2, '-': 0, 'E': 0, 'W': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
+        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 8, '-': 4, 'E': 0, 'W': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -292,9 +297,12 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H/W).
+    # MLA variants (DSA / CSA / HCA / Window) may freely coexist with each other.
+    if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
 
 def validate_segment_layers(segment: str) -> List[str]:
@@ -320,9 +328,11 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"one of {Symbols.VALID_LAYERS}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H/W).
+    if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
     return layer_type_list
 
@@ -333,6 +343,8 @@ def select_pipeline_segment(
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[List[str], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
@@ -352,6 +364,8 @@ def select_pipeline_segment(
             uneven PP. Only valid when the pattern has no pipe separators.
         last_stage_layers: Number of layers on the last pipeline stage for
             uneven PP. Only valid when the pattern has no pipe separators.
+        tp_group: Optional tensor-parallel process group used for per-stage logging.
+        dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
         Tuple of (layer_type_list, layer_offset) where layer_type_list is
@@ -445,6 +459,8 @@ def select_pipeline_segment(
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
             f"layers='{''.join(selected)}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
         )
         return selected, offset
 
@@ -479,6 +495,8 @@ def select_pipeline_segment(
         f"segment_index={segment_index}/{len(segments)}, "
         f"layers='{my_segment}' ({len(layer_type_list)} layers), "
         f"layer_offset={layer_offset}",
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
     return layer_type_list, layer_offset

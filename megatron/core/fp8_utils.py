@@ -529,6 +529,24 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
         return False
 
 
+def is_mxfp8_output_proj_active(config) -> bool:
+    """Return True when the LM-head output projection should run under MXFP8.
+
+    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
+    and Transformer Engine is installed.
+    """
+    if not HAVE_TE:
+        return False
+    if not getattr(config, "fp8_output_proj", False):
+        return False
+    if not getattr(config, "fp8", False):
+        return False
+
+    fp8_recipe = getattr(config, "fp8_recipe", None)
+    recipe_value = getattr(fp8_recipe, "value", fp8_recipe)
+    return str(recipe_value).lower() == "mxfp8" or str(fp8_recipe).lower().endswith(".mxfp8")
+
+
 if HAVE_TE:
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling

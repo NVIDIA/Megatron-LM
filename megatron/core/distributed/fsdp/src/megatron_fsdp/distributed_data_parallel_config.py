@@ -1,9 +1,11 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+from .utils import is_torch_min_version
 
 
 @dataclass
@@ -90,7 +92,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
@@ -159,11 +163,49 @@ class DistributedDataParallelConfig:
     """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 
+    megatron_fsdp_prefetch_recompute_forward_weights: bool = False
+    """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
+      recomputation during backward before prefetching backward transpose weights.
+    """
+
+    megatron_fsdp_cache_param_bucket_views: bool = False
+    """If set to True, Megatron-FSDP caches parameter bucket views to reduce repeated
+      Python-side view setup when attaching module parameters to all-gather buckets.
+    """
+
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
+    not dereferencing `param.grad` after the optimizer step to preserve references for
+    CUDA graph replay. Can affect memory utilization in some cases, such as when the
+    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
+    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
+    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    recommended to avoid casting the gradient to the parameter precision and creating
+    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
+    """
+
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
+      This feature increases the overlap between parameter all-gather and forward computation,
+      at the cost of more frequent communication calls.
+      For MXFP8, this approach helps save memory during fine-grained activation
+      recomputation, because MXFP8 forward and backward passes use different
+      parameter representations (rowwise data for forward, colwise data for backward).
+      In this mode, only the rowwise parameters of modules involved in recomputation
+      will be unsharded.
+    """
+
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
-        if self.nccl_ub:
+        if self.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert self.data_parallel_sharding_strategy == "optim_grads_params", (
+                "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
+                "data_parallel_sharding_strategy='optim_grads_params'."
+            )
+
+        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "

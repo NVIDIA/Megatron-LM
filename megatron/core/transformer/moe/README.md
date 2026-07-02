@@ -122,7 +122,7 @@ The following flags are general performance flags that can help to achieve highe
 --moe-router-fusion
 --moe-permute-fusion
 --cross-entropy-loss-fusion
---cross-entropy-fusion-impl te
+--cross-entropy-fusion-impl native
 
 ## Communication optimization
 --use-distributed-optimizer
@@ -386,7 +386,7 @@ Unlike recomputation (which trades compute for memory), offloading trades **GPU-
 **Usage**
 ```bash
 --fine-grained-activation-offloading
---offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
+--offload-modules expert_fc1 moe_act # Choices: attn_norm, qkv_linear, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act, fused_group_mlp
 ```
 
 For more details, see `docs/user-guide/features/fine_grained_activation_offloading.md`

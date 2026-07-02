@@ -26,9 +26,13 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version
 
 try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_mla_rope_inplace,
+        fused_mla_rope_out_of_place,
+    )
 except Exception:
     fused_mla_rope_inplace = None
+    fused_mla_rope_out_of_place = None
 
 
 if HAVE_TE:
@@ -69,7 +73,10 @@ class DSv4HybridAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        compress_ratio: Optional[int] = None,
+        name: str | None = None,
     ) -> None:
 
         super().__init__(
@@ -79,7 +86,9 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
         self.config: MLATransformerConfig
 
@@ -109,22 +118,29 @@ class DSv4HybridAttention(Attention):
 
         self.softmax_scale = None
 
-        if is_mtp_layer:
-            layer_idx = self.config.num_layers + layer_number - 1
-            compress_ratio = self.config.csa_compress_ratios[layer_idx]
-        else:
-            compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
-        rope_base = self.config.rotary_base
-        if compress_ratio > 1:
-            rope_base = self.config.csa_compress_rotary_base
-        if self.config.rope_type == "rope":
+        # Per-layer compress ratio. When set explicitly (e.g. hybrid 'C'/'H' layer symbols
+        # pass compress_ratio=4/128 via the spec), use it directly; otherwise fall back to the
+        # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
+        _ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
+        if compress_ratio is None:
+            compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
+        # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
+        # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
+        use_compressed_yarn = compress_ratio > 1
+        rope_base = (
+            self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
+        )
+        self._dsv4_compress_ratio = compress_ratio
+        self._dsv4_rope_base = rope_base
+        self._dsv4_uses_yarn_rope = use_compressed_yarn
+        if not use_compressed_yarn:
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=rope_base,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.config.rope_type == "yarn":
+        else:
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=rope_base,
@@ -135,11 +151,6 @@ class DSv4HybridAttention(Attention):
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
                 cp_group=self.pg_collection.cp,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
-                "'rope' and 'yarn'"
             )
 
         core_attn_extra_kwargs = {
@@ -246,6 +257,15 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # both QKV RoPE and the post-attention inverse RoPE use
+        # self.pg_collection.cp, which must point at this microbatch's dynamic
+        # CP group. Restored before every return.
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -310,33 +330,42 @@ class DSv4HybridAttention(Attention):
                 if packed_seq_params.cu_seqlens_kv_padded is not None
                 else packed_seq_params.cu_seqlens_kv
             )
-            rope_seqlen = cu_seqlens_kv
+            rope_seqlen = packed_seq_params.max_seqlen_kv
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_kv = None
             rope_seqlen = seq_len
+            rope_max_seqlen_kv = None
+        # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+        # concentration factor (mscale) is NOT part of the DSv4 model contract --
+        # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_mla_rope_inplace is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
-            else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-                # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-                # concentration factor (mscale) is NOT part of the DSv4 model contract --
-                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-                mscale = 1.0
         if self.config.apply_rope_fusion:
-            core_attn_out = fused_mla_rope_inplace(
+            # ``mscale=1.0`` strips yarn's concentration factor from the
+            # cached cos/sin so the fused kernel matches the unfused
+            # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+            )
+            rotary_pos_emb = None
+            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+            assert (
+                fused_mla_rope_inplace is not None
+            ), "Fused MLA RoPE apply is not imported successfully"
+        elif self._dsv4_uses_yarn_rope:
+            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+        else:
+            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+        if self.config.apply_rope_fusion:
+            if packed_seq:
+                core_attn_out = core_attn_out.squeeze(1)
+            # Fused DSA backward retains the raw attention output O. Applying
+            # inverse RoPE to its view in-place corrupts the retained O used by
+            # the softmax backward, so this call needs private storage.
+            assert fused_mla_rope_out_of_place is not None
+            core_attn_out = fused_mla_rope_out_of_place(
                 core_attn_out,
                 rotary_pos_cos,
                 rotary_pos_sin,
@@ -348,12 +377,21 @@ class DSv4HybridAttention(Attention):
                 inverse=True,
                 remove_interleaving=True,
             )
+            if packed_seq:
+                core_attn_out = core_attn_out.unsqueeze(1)
         else:
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
             )
-            rot_part = apply_rotary_pos_emb(
-                rot_part,
+            # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
+            # and adds its own batch dim internally; drop the dummy ``b=1`` axis
+            # for THD before the rope and add it back after.
+            if packed_seq:
+                rot_part_in = rot_part.squeeze(1)
+            else:
+                rot_part_in = rot_part
+            rot_part_out = apply_rotary_pos_emb(
+                rot_part_in,
                 rotary_pos_emb,
                 self.config,
                 cu_seqlens=cu_seqlens_kv,
@@ -362,7 +400,12 @@ class DSv4HybridAttention(Attention):
                 mla_rotary_interleaved=True,
                 inverse=True,
                 mla_output_remove_interleaving=True,
+                max_seqlen=rope_max_seqlen_kv,
             )
+            if packed_seq:
+                rot_part = rot_part_out.unsqueeze(1)
+            else:
+                rot_part = rot_part_out
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
@@ -384,6 +427,7 @@ class DSv4HybridAttention(Attention):
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
 
@@ -403,6 +447,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        pp_layer_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -416,6 +463,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+            pp_layer_offset=pp_layer_offset,
+            compress_ratio=compress_ratio,
+            name=name,
         )
 
         q_down_proj_kwargs = {}
@@ -436,6 +486,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_comm_buffer_name='q_down_proj',
             skip_weight_param_allocation=False,
             tp_group=None,
+            name=(name + ".linear_q_down_proj") if name is not None else None,
             **q_down_proj_kwargs,
         )
 
@@ -451,6 +502,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_q_up_proj") if name is not None else None,
         )
 
         self.linear_kv_proj = build_module(
@@ -465,6 +517,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_kv_proj") if name is not None else None,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
@@ -496,11 +549,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic_context_parallel."
 
         assert (
             inference_context is None and inference_params is None
@@ -514,28 +562,29 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         )
 
         # rotary_pos_emb:[s, b, 1, 64]
+        # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+        # concentration factor (mscale) is NOT part of the DSv4 model contract --
+        # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+        if self.config.apply_rope_fusion:
+            # ``mscale=1.0`` strips yarn's concentration factor from the
+            # cached cos/sin so the fused kernel matches the unfused
+            # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+            )
+            rotary_pos_emb = None
+            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+            assert (
+                fused_mla_rope_inplace is not None
+            ), "Fused MLA RoPE apply is not imported successfully"
+        elif self._dsv4_uses_yarn_rope:
+            rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_mla_rope_inplace is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
-            else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
-                # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-                # concentration factor (mscale) is NOT part of the DSv4 model contract --
-                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-                mscale = 1.0
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -546,8 +595,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_max_seqlen_q = rope_max_seqlen_kv = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -563,6 +615,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
+            kv_compressed = kv_compressed.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -656,6 +709,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_q,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -673,6 +727,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_kv,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]

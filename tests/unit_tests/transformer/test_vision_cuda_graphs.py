@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
-import os
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -10,8 +9,15 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -23,9 +29,11 @@ from megatron.core.transformer.cuda_graphs import (
     _layer_is_graphable,
     _wrap_graph_for_vision,
     get_vision_cuda_graph_seq_length,
-    set_current_microbatch,
 )
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -236,16 +244,19 @@ class TestVisionTECudaGraphHelper:
             pipeline_dtype=torch.bfloat16,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         self.vision_config.vision_model_type = "clip"
         language_config.language_model_type = "dummy"
 
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=self.vision_config,
@@ -267,10 +278,19 @@ class TestVisionTECudaGraphHelper:
         self.micro_batch_size = 2
 
     def teardown_method(self, method):
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         gc.collect()
 
     def _make_helper(self, num_microbatches=1):
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_microbatches,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
         return VisionTECudaGraphHelper(
             model=[self.llava_model],
             vision_config=self.vision_config,
@@ -347,8 +367,6 @@ class TestVisionTECudaGraphHelper:
         assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
@@ -385,8 +403,6 @@ class TestVisionTECudaGraphHelper:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_create_cudagraphs_multi_microbatch(self):
         """Verify that graphs are created per-microbatch per-layer."""
         self.llava_model.cuda()
@@ -495,9 +511,10 @@ class TestVisionTECudaGraphHelperPP2:
             pipeline_dtype=torch.bfloat16,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         self.vision_config.vision_model_type = "clip"
         language_config.language_model_type = "dummy"
@@ -505,7 +522,9 @@ class TestVisionTECudaGraphHelperPP2:
         self.is_first_stage = is_first_stage
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=self.vision_config,
@@ -527,6 +546,7 @@ class TestVisionTECudaGraphHelperPP2:
         self.micro_batch_size = 2
 
     def teardown_method(self, method):
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         gc.collect()
 
@@ -537,6 +557,16 @@ class TestVisionTECudaGraphHelperPP2:
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
             num_microbatches=num_microbatches,
+        )
+
+    def _init_microbatches(self, num_microbatches):
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_microbatches,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
         )
 
     def test_pp2_first_stage_finds_vision_layers(self):
@@ -579,20 +609,26 @@ class TestVisionTECudaGraphHelperPP2:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_pp2_create_cudagraphs_first_stage(self):
         """On stage 0, CUDA graphs should be captured with the full pipeline order."""
-        if not self.is_first_stage:
-            pytest.skip("Vision layers only on pp_rank 0")
-
         self.llava_model.cuda()
         num_mb = 4
         helper = self._make_helper(num_microbatches=num_mb)
 
+        self._init_microbatches(num_mb)
+
         assert not helper.graphs_created()
 
+        # create_cudagraphs() contains a distributed barrier even on stages
+        # without graphable vision layers, so all PP stages must participate.
         helper.create_cudagraphs()
+        assert helper.capture_finished()
+
+        if not self.is_first_stage:
+            assert helper.vision_model is None
+            assert not helper.graphs_created()
+            return
+
         assert helper.graphs_created()
 
         # num_microbatches should be preserved (PP>1 does not collapse)
@@ -619,11 +655,20 @@ class TestVisionTECudaGraphHelperPP2:
     )
     def test_pp2_create_cudagraphs_last_stage_noop(self):
         """On stage 1 (no vision model), create_cudagraphs should be a no-op."""
-        if self.is_first_stage:
-            pytest.skip("This assertion is only for pp_rank 1")
-
+        self.llava_model.cuda()
         helper = self._make_helper(num_microbatches=4)
+        self._init_microbatches(num_microbatches=4)
+
+        # create_cudagraphs() synchronizes all ranks at capture completion.
+        # The first stage creates graphs only to keep collective ordering aligned
+        # while the last stage exercises the no-vision-layer path.
         helper.create_cudagraphs()
+
+        if self.is_first_stage:
+            assert helper.graphs_created()
+            helper.delete_cuda_graphs()
+            return
+
         assert helper.capture_finished()  # Capture process finished
         assert not helper.graphs_created()  # But no graphs were created
 

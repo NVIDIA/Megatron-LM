@@ -1,0 +1,195 @@
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.03-py3
+  dockerfile: |
+    # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+    # IMAGE_NAME: gb200-torch2603
+
+    ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.03-py3
+    FROM ${FROM_IMAGE_NAME} AS base
+
+    ENV SHELL=/bin/bash
+    ENV DEBIAN_FRONTEND=noninteractive
+
+    ARG YQ_VERSION=4.27.5
+    ARG TE_TAG=release_v2.14
+    ARG NVTE_CUDA_ARCHS="100a"
+
+    # Install system dependencies
+    RUN bash -ex <<"EOF"
+        rm -rf /opt/megatron-lm
+        apt-get update
+        apt-get install -y --no-install-recommends git curl gettext sudo
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+          "x86_64") YQ_ARCH=amd64 ;;
+          "aarch64") YQ_ARCH=arm64 ;;
+          *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
+        esac
+        wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/bin/yq
+        chmod +x /usr/bin/yq
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    EOF
+
+    # Install Megatron-Core dependencies (mlm + dev + test groups from pyproject.toml)
+    RUN bash -ex <<"EOF"
+        unset PIP_CONSTRAINT
+        pip install \
+            sentencepiece tiktoken transformers accelerate \
+            wandb einops tqdm datasets nvtx \
+            flask-restful flask[async] fastapi hypercorn \
+            nltk wrapt pydantic pyyaml omegaconf \
+            pytest==8.3.5 pytest-mock pytest-cov pytest-random-order pytest-asyncio \
+            coverage tensorboard
+    EOF
+
+    # Install TransformerEngine
+    RUN unset PIP_CONSTRAINT && \
+        NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_FRAMEWORK=pytorch \
+        pip install --no-build-isolation --no-cache-dir \
+        "git+https://github.com/nvidia/TransformerEngine.git@${TE_TAG}"
+
+    # Install Flash Attention 4, CUTLASS DSL, and cuDNN frontend with CuTe DSL support.
+    # Keep cudnn-frontend at 1.22.1: 1.23.0 removes the c_dtype kwarg from
+    # grouped_gemm_quant_wrapper_sm100, which TE 2.14 still passes.
+    RUN pip install --no-cache-dir flash-attn-4==4.0.0b4 "nvidia-cutlass-dsl[cu13]==4.4.2" && \
+        pip install --no-cache-dir --no-deps "nvidia-cudnn-frontend==1.22.1"
+
+    # Install Flash Linear Attention for gated-delta-net Qwen3.5-VL recipes.
+    RUN pip install --no-cache-dir --no-deps \
+        fla-core==0.4.2 \
+        flash-linear-attention==0.4.2
+
+    # =========================
+    # Option 1: HybridEP
+    # =========================
+    FROM base AS hybridep
+
+    RUN bash -ex <<"EOF"
+        cd /workspace
+        git clone https://github.com/linux-rdma/rdma-core.git
+        cd rdma-core && git checkout tags/v60.0 && sh build.sh
+        apt-get update
+        apt-get install -y --no-install-recommends libnvidia-ml-dev
+        git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+        cd DeepEP && git checkout 7febc6e25660af0f54d95dd781ecdcd62265ecca
+        RDMA_CORE_HOME=/workspace/rdma-core/build HYBRID_EP_MULTINODE=1 \
+            TORCH_CUDA_ARCH_LIST="10.0" MAX_JOBS=8 \
+            pip install --no-build-isolation .
+        apt-get purge -y libnvidia-ml-dev
+        apt-get autoremove -y
+        rm -rf /root/.cache /tmp/* /var/lib/apt/lists/*
+    EOF
+
+    WORKDIR /workspace/
+ENV_VARS:
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_GRAPH_REGISTER: 0
+  HF_HUB_OFFLINE: '1'
+  NVTE_FUSED_ATTN: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: Qwen/Qwen3-30B-A3B
+  num_layers: 48
+  hidden_size: 2048
+  ffn_hidden_size: 6144
+  num_attention_heads: 32
+  kv_channels: 128
+  max_position_embeddings: 40960
+  group_query_attention: true
+  num_query_groups: 4
+  qk_layernorm: true
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  swiglu: true
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  position_embedding_type: rope
+  rotary_percent: 1.0
+  rotary_base: 1000000
+  make_vocab_size_divisible_by: 1187
+  num_experts: 128
+  moe_ffn_hidden_size: 768
+  moe_router_load_balancing_type: aux_loss
+  moe_router_topk: 8
+  moe_router_pre_softmax: false
+  moe_aux_loss_coeff: 1e-3
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  mock_data: true
+  seq_length: 4096
+  moe_router_force_load_balancing: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 16
+  context_parallel_size: 1
+  expert_tensor_parallel_size: 1
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  use_transformer_engine_op_fuser: true
+  moe_paged_stash: true
+  moe_expert_rank_capacity_factor: 1.5
+  moe_paged_stash_page_size: 64
+  moe_paged_stash_buffer_size_factor_cuda: 1.1
+  cuda_graph_impl: local
+  cuda_graph_scope: full_iteration
+  moe_pad_experts_for_cuda_graph_inference: true
+  moe_mlp_glu_interleave_size: 32
+  use_mcore_models: true
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  micro_batch_size: 4
+  global_batch_size: 512
+  train_samples: 268554688
+  exit_duration_in_mins: 230
+  no_create_attention_mask_in_dataloader: true
+  no_check_for_nan_in_loss_and_grad: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: te
+  manual_gc: true
+  manual_gc_interval: 5
+  lr: 0.00012
+  min_lr: 1.2e-05
+  lr_decay_style: cosine
+  lr_decay_samples: 255126953
+  lr_warmup_samples: 162761
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  bf16: true
+  fp8_format: e4m3
+  fp8_recipe: mxfp8
+  init_method_std: 0.02
+  eval_iters: 32
+  eval_interval: 500
+  finetune: true
+  auto_detect_ckpt_format: true
+  no_load_rng: true
+  no_load_optim: true
+  load: ${LOAD_PATH}
+  save_interval: 500
+  dist_ckpt_strictness: log_all
+  log_throughput: true
+  log_interval: 1
+  log_timers_to_tensorboard: true
+  log_memory_to_tensorboard: true
+  log_num_zeros_in_grad: true
+  log_params_norm: true
+  log_validation_ppl_to_tensorboard: true
+  logging_level: 20
+  tensorboard_dir: ${OUTPUT_PATH}/tensorboard
+  wandb_exp_name: Qwen3-30B-GB200-MXFP8-PagedStash-TP1PP1EP16-GBS512
+  enable_experimental: true

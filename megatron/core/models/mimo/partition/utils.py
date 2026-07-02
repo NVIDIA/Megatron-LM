@@ -50,11 +50,6 @@ class PartitionConfig:
     cp_group: Optional[ProcessGroup] = None
     tp_group: Optional[ProcessGroup] = None
 
-    @property
-    def is_partitioning_enabled(self) -> bool:
-        """Returns True if context parallelism or sequence parallelism is active."""
-        return self.use_cp or self.seq_parallel
-
     @classmethod
     def from_mp_config(
         cls,
@@ -89,7 +84,7 @@ class PartitionConfig:
 
 
 class PartitionAdapter:
-    """Shard batch-first embeddings & label tensors for Context and Sequence Parallelism."""
+    """Shard MIMO sequence inputs (CP/SP) and return language-model-ready embeddings."""
 
     def __init__(self, cfg: PartitionConfig):
         """Initialize the partition adapter.
@@ -100,97 +95,83 @@ class PartitionAdapter:
 
     def shard(
         self,
-        embeddings: torch.Tensor,
-        labels: torch.Tensor,
-        loss_mask: torch.Tensor,
-        attention_mask: torch.Tensor,
+        embeddings: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
         packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[PackedSeqParams]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[PackedSeqParams],
+    ]:
+        """Apply context- (CP) and sequence-parallel (SP) sharding along the sequence.
+
+        Inputs:
+            - embeddings: sequence-first ``(S, B, H)``, or ``None`` on non-first PP stages.
+            - labels / loss_mask: batch-first ``(B, S)``.
+
+        Returns ``(embeddings, labels, loss_mask, packed_seq_params)`` with embeddings in
+        ``(S/(cp*tp), B, H)`` language-model layout. CP shards every tensor along the
+        sequence; SP additionally scatters only the embeddings -- labels/loss_mask are not
+        SP-scattered because the loss runs after the TP all-gather on the full CP-local
+        sequence. A dense ``[B, S]`` attention mask is intentionally not handled: under CP
+        it cannot line up with the sharded sequence, so MIMO masks via a causal
+        ``attn_mask_type`` or ``packed_seq_params`` (THD) instead.
         """
-        Apply context parallel (CP) and sequence parallel (SP) sharding to input tensors.
-
-        All input tensors must be in batch-first layout:
-            - embeddings: (B, S, H)
-            - labels / loss_mask / attention_mask: (B, S)
-
-        After this call embeddings are still in (B, S/cp, H) batch-first layout.
-        The caller is responsible for transposing to (S/cp, B, H) if the language model
-        requires sequence-first tensors.
-
-        Args:
-            embeddings (torch.Tensor):
-                Input embeddings tensor. Shape: (B, S, H)
-            labels (torch.Tensor):
-                Labels tensor. Shape: (B, S)
-            loss_mask (torch.Tensor):
-                Loss mask tensor. Shape: (B, S)
-            attention_mask (torch.Tensor):
-                Attention mask tensor. Shape: (B, S)
-            packed_seq_params (PackedSeqParams, optional):
-                Packed sequence parameters. Defaults to None.
-
-        Returns:
-            Tuple containing:
-                - embeddings (torch.Tensor): Sharded embeddings. Shape: (B, S/cp, H)
-                - labels (torch.Tensor): Possibly sharded labels. Shape: (B, S/cp)
-                - loss_mask (torch.Tensor): Possibly sharded loss mask. Shape: (B, S/cp)
-                - attention_mask (torch.Tensor): Possibly sharded attention mask. Shape: (B, S/cp)
-                - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
-        """
-        if not (self.cfg.use_cp or self.cfg.seq_parallel):
-            return embeddings, labels, loss_mask, attention_mask, packed_seq_params
-
-        # Sanity-check the sequence length before any sharding happens.
+        # Sanity-check the sequence length before sharding. Embeddings are sequence-first,
+        # so the token sequence is dim 0.
         if embeddings is not None:
             shard_factor = None
-            seq_dim = None  # which dimension holds the token sequence
 
             if self.cfg.use_cp and self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(self.cfg.cp_group) * 2
-                seq_dim = 1  # embeddings shape: [B, S, H]
             elif self.cfg.use_cp:
                 shard_factor = get_pg_size(self.cfg.cp_group) * 2
-                seq_dim = 1
             elif self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group)
-                seq_dim = 0  # embeddings shape: [S, B, H]
 
             if shard_factor is not None and (
                 packed_seq_params is None
                 or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd'
             ):
-                assert embeddings.shape[seq_dim] % shard_factor == 0, (
+                assert embeddings.shape[0] % shard_factor == 0, (
                     f"Sequence length should be divisible by {shard_factor} "
                     "for Sequence/Context parallelism"
                 )
 
                 if self.cfg.seq_parallel and self.cfg.tp_comm_overlap:
-                    assert embeddings.shape[seq_dim] == self.cfg.max_seq_len, (
+                    assert embeddings.shape[0] == self.cfg.max_seq_len, (
                         "TP Comm overlap requires Vision+Text token length "
                         "== language_max_sequence_length"
                     )
 
         if self.cfg.use_cp:
-            embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
-                self._apply_context_parallel(
-                    embeddings, labels, loss_mask, attention_mask, packed_seq_params
-                )
+            # CP shards batch-first (get_batch_on_this_cp_rank requirement): transpose
+            # (S, B, H) -> (B, S, H) in, then the CP-local result back to (S/cp, B, H).
+            if embeddings is not None:
+                embeddings = embeddings.transpose(0, 1).contiguous()
+            embeddings, labels, loss_mask, packed_seq_params = self._apply_context_parallel(
+                embeddings, labels, loss_mask, packed_seq_params
+            )
+            if embeddings is not None:
+                embeddings = embeddings.transpose(0, 1).contiguous()
+
+        # SP scatters the sequence (dim 0); the SP-only path needs no transpose.
+        if self.cfg.seq_parallel and embeddings is not None:
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                embeddings, group=self.cfg.tp_group
             )
 
-        if self.cfg.seq_parallel and embeddings is not None:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
-
-        return embeddings, labels, loss_mask, attention_mask, packed_seq_params
+        return embeddings, labels, loss_mask, packed_seq_params
 
     def _apply_context_parallel(
         self,
         embeddings: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         loss_mask: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
         packed_seq_params: Optional[PackedSeqParams],
     ) -> Tuple[
-        Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -206,8 +187,6 @@ class PartitionAdapter:
                 Labels tensor. Shape: (B, S)
             loss_mask (Optional[torch.Tensor]):
                 Loss mask tensor. Shape: (B, S)
-            attention_mask (Optional[torch.Tensor]):
-                Attention mask tensor. Shape: (B, S)
             packed_seq_params (PackedSeqParams, optional):
                 Packed sequence parameters. Defaults to None.
 
@@ -216,12 +195,10 @@ class PartitionAdapter:
                 - embeddings (Optional[torch.Tensor]): Sharded embeddings. Shape: (B, S/cp, H)
                 - labels (Optional[torch.Tensor]): Possibly sharded labels. Shape: (B, S/cp)
                 - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S/cp)
-                - attention_mask (Optional[torch.Tensor]): Possibly sharded attention mask.
-                                                           Shape: (B, S/cp)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
         if not self.cfg.use_cp:
-            return embeddings, labels, loss_mask, attention_mask, packed_seq_params
+            return embeddings, labels, loss_mask, packed_seq_params
 
         # Distribute sequence across CP ranks
         batch = dict()
@@ -231,11 +208,9 @@ class PartitionAdapter:
             batch["labels"] = labels
         if loss_mask is not None:
             batch["loss_mask"] = loss_mask
-        if attention_mask is not None:
-            batch["attention_mask"] = attention_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cfg.cp_group)
         else:
             assert _HAVE_TEX and is_te_min_version("1.10.0"), (
                 "Please update Transformer Engine to >= 1.10 "
@@ -250,11 +225,10 @@ class PartitionAdapter:
                 )
                 batch[key] = data.index_select(1, index)
 
-        # Extract sharded tensors; embeddings remain in [B, S/cp, H] — the caller
-        # is responsible for transposing to [S/cp, B, H] for the language model.
+        # Extract sharded tensors; embeddings stay in [B, S/cp, H]. shard() transposes
+        # them to language-model layout [S/cp, B, H] after CP and before optional SP.
         embeddings = batch.get("embeddings", None)
         labels = batch.get("labels", None)
         loss_mask = batch.get("loss_mask", None)
-        attention_mask = batch.get("attention_mask", None)
 
-        return embeddings, labels, loss_mask, attention_mask, packed_seq_params
+        return embeddings, labels, loss_mask, packed_seq_params
