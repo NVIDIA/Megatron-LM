@@ -9,6 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -966,7 +967,7 @@ def check_paged_stash_host_spill():
 
 
 class PagedStashRunner:
-    """Runner for paged stash"""
+    """Runner for bounded MoE workspace overflow and optional paged stash fallback."""
 
     def __init__(self, config, copy_main_params, model, optimizer, forward_backward_func):
         self.stash_manager = PagedStashManager.get_instance()
@@ -1089,8 +1090,8 @@ class PagedStashRunner:
         log_single_rank(
             logger,
             logging.INFO,
-            "Paged stash: rerunning forward-backward without "
-            "moe_expert_rank_capacity_factor padding and with moe_paged_stash disabled.",
+            "MoE bounded workspace: rerunning forward-backward without "
+            "moe_expert_rank_capacity_factor and with moe_paged_stash disabled.",
         )
         # check for token dispatcher overflow
         for mlp in self.moe_layers:
@@ -1104,6 +1105,10 @@ class PagedStashRunner:
         if self.stash_manager.host_spill is not None:
             self.stash_manager.host_spill.zero_()
         self._set_moe_paged_stash_all(False)
+        get_moe_metrics_tracker().clear()
+        from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
 
         # Set grad to zero.
         for model_chunk in self.model:
@@ -1147,14 +1152,13 @@ class PagedStashRunner:
             self.stash_manager.release_stash_buffers()
 
     def __call__(self, *args, **kwargs):
-        """Training-step wrapper with fallback when static-buffer paths overflow.
+        """Training-step wrapper with fallback when bounded-buffer paths overflow.
 
-        The first attempt runs forward/backward with a static HybridEP receive budget
-        (moe_expert_rank_capacity_factor) and paged stashing enabled. If either the
-        HybridEP permute buffer is over budget (tokens dropped) or the paged stash
-        buffer overflows, this wrapper retries once in synced dropless mode: no static
-        limit on HybridEP (capacity factor cleared, dynamic permuted size via CPU sync)
-        and no paged stash (moe_paged_stash disabled).
+        The first attempt runs forward/backward with a bounded HybridEP permuted-token
+        workspace (moe_expert_rank_capacity_factor) and optional paged stashing. If either the
+        HybridEP workspace is over budget or the paged stash buffer overflows, this wrapper
+        retries once in synced dropless mode: no static limit on HybridEP (capacity factor
+        cleared, dynamic permuted size via CPU sync) and no paged stash (moe_paged_stash disabled).
 
         At most two attempts. Each attempt prefetches microbatches, runs the schedule,
         then all-reduces stash overflow, HybridEP over-budget, and host spill across ranks.
@@ -1205,7 +1209,7 @@ class PagedStashRunner:
                         "potentially better performance.",
                     )
                 # Restore moe_expert_rank_capacity_factor on every HybridEP MoE layer so the
-                # next step uses the static dispatch budget again (cleared by prepare_for_rerun
+                # next step uses the bounded dispatch workspace again (cleared by prepare_for_rerun
                 # on a failed retry).
                 for mlp in self.moe_layers:
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
@@ -1222,15 +1226,15 @@ class PagedStashRunner:
                 log_single_rank(
                     logger,
                     logging.INFO,
-                    "Paged stash: token drop during MoE token dispatch (over budget) "
+                    "MoE bounded workspace: HybridEP dispatch exceeded rank capacity "
                     f"on {overbudget_ranks} rank(s). "
-                    "Consider increasing moe_expert_rank_capacity_factor.",
+                    "Rerunning dropless; consider increasing moe_expert_rank_capacity_factor.",
                 )
             if stash_overflow_ranks > 0:
                 log_single_rank(
                     logger,
                     logging.INFO,
-                    "Paged stash: stashing buffer overflow "
+                    "MoE bounded workspace: paged-stash buffer overflow "
                     f"on {stash_overflow_ranks} rank(s). "
                     "Consider increasing moe_paged_stash_buffer_size_factor_cuda or "
                     "moe_paged_stash_buffer_size_factor_cpu.",

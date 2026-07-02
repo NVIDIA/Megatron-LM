@@ -477,7 +477,15 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
+    def forward(
+        ctx,
+        x,
+        handle,
+        num_permuted_tokens=None,
+        pad_multiple=None,
+        fused=False,
+        num_actual_permuted_tokens=None,
+    ):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
@@ -490,6 +498,7 @@ class HybridEPCombine(torch.autograd.Function):
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.num_actual_permuted_tokens = num_actual_permuted_tokens
         ctx.fused = fused
         return combined_hidden
 
@@ -507,7 +516,9 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens=ctx.num_permuted_tokens,
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
-        return dispatched_hidden, None, None, None, None
+        if ctx.num_actual_permuted_tokens is not None:
+            dispatched_hidden = dispatched_hidden[: ctx.num_actual_permuted_tokens]
+        return dispatched_hidden, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -578,7 +589,14 @@ if HAVE_HYBRIDEP:
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
+    def hybrid_ep_combine(
+        x,
+        handle,
+        num_permuted_tokens,
+        pad_multiple,
+        fused=False,
+        num_actual_permuted_tokens=None,
+    ):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -595,7 +613,14 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
+        return HybridEPCombine.apply(
+            x,
+            handle,
+            num_permuted_tokens,
+            pad_multiple,
+            fused,
+            num_actual_permuted_tokens,
+        )
 
 else:
     hybrid_ep_dispatch = None
