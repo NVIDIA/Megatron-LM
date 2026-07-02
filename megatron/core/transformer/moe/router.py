@@ -573,7 +573,11 @@ class TopKRouter(Router):
                 layer_number = self.layer_number
 
             get_moe_metrics_tracker().record(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss",
+                z_loss / moe_z_loss_coeff,
+                layer_number,
+                num_layers,
+                avg_group=self.tp_dp_cp_group,
             )
         return logits
 
