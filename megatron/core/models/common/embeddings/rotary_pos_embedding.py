@@ -182,6 +182,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        use_default_cp_group: bool = True,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -191,12 +192,14 @@ class RotaryEmbedding(nn.Module):
             packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            use_default_cp_group (bool, optional): Whether to fall back to the static context
+                parallel group when cp_group is None. Defaults to True.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
         emb = self.get_emb(max_seq_len, offset)
-        if cp_group is None:
+        if cp_group is None and use_default_cp_group:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
@@ -317,6 +320,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        use_default_cp_group: bool = True,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -326,6 +330,8 @@ class MultimodalRotaryEmbedding(nn.Module):
                 height and width in rope calculation.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            use_default_cp_group (bool, optional): Whether to fall back to the static context
+                parallel group when cp_group is None. Defaults to True.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -358,7 +364,7 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if cp_group is None:
+        if cp_group is None and use_default_cp_group:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
