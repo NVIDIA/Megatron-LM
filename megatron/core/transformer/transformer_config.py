@@ -323,6 +323,18 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """GLM-5.2 IndexShare cadence: >1 shares DSA top-k across layers (every Nth layer computes
+    fresh top-k, the rest reuse the most recent computing layer's). Read by
+    ``glm_dsa_fused.DSAttentionFused``. Declared here (not just set via the bridge) so the
+    value survives the provider->config conversion; otherwise it defaults back to 1 and
+    IndexShare is silently disabled."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """GLM-5.2 IndexShare offset: the first ``dsa_indexer_skip_topk_offset`` layers always own
+    their indexer (set to ``first_k_dense_replace`` by the GLM bridge). Declared for the same
+    conversion-survival reason as ``dsa_indexer_topk_freq``."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 

@@ -24,6 +24,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.glm_dsa_fused import (
+    build_glm_dsa_fused_attention_spec,
+)
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
@@ -99,18 +102,13 @@ def get_dsa_module_spec_for_backend(
 
     # Because TransformerEngine does not support sparse attention yet, we use local
     # implementation whether the backend is TransformerEngine or not.
-    core_attention = ModuleSpec(
-        module=DSAttention,
-        submodules=DSAttentionSubmodules(
-            indexer=ModuleSpec(
-                module=DSAIndexer,
-                submodules=DSAIndexerSubmodules(
-                    linear_wq_b=backend.linear(),
-                    linear_wk=backend.linear(),
-                    k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
-                    linear_weights_proj=backend.linear(),
-                ),
-            )
+    indexer = ModuleSpec(
+        module=DSAIndexer,
+        submodules=DSAIndexerSubmodules(
+            linear_wq_b=backend.linear(),
+            linear_wk=backend.linear(),
+            k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
+            linear_weights_proj=backend.linear(),
         ),
     )
 
@@ -122,22 +120,33 @@ def get_dsa_module_spec_for_backend(
         backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
 
-    attention = ModuleSpec(
-        module=MLASelfAttention,
-        params={"attn_mask_type": AttnMaskType.causal},
-        submodules=MLASelfAttentionSubmodules(
-            linear_q_proj=backend.column_parallel_linear(),
-            linear_q_down_proj=backend.linear(),
-            linear_q_up_proj=backend.column_parallel_linear(),
-            linear_kv_down_proj=backend.linear(),
-            linear_kv_up_proj=backend.column_parallel_linear(),
-            core_attention=core_attention,
-            linear_proj=backend.row_parallel_linear(),
-            q_layernorm=qk_norm,
-            kv_layernorm=qk_norm,
-        ),
-        metainfo={"fuse_input_layernorm": False},
-    )
+    if config.apply_dsa_kernel_fusion:
+        # GLM-5.2 fused DSA (absorbed MLA + fused frozen-indexer core) is built in the additive
+        # Baseten module to keep this upstream builder merge-clean; see
+        # glm_dsa_fused.build_glm_dsa_fused_attention_spec.
+        attention = build_glm_dsa_fused_attention_spec(backend, qk_norm, indexer)
+    else:
+        # Unfused reference path: standard MLA (combined kv up-proj) + multi-head DSAttention.
+        core_attention = ModuleSpec(
+            module=DSAttention,
+            submodules=DSAttentionSubmodules(indexer=indexer),
+        )
+        attention = ModuleSpec(
+            module=MLASelfAttention,
+            params={"attn_mask_type": AttnMaskType.causal},
+            submodules=MLASelfAttentionSubmodules(
+                linear_q_proj=backend.column_parallel_linear(),
+                linear_q_down_proj=backend.linear(),
+                linear_q_up_proj=backend.column_parallel_linear(),
+                linear_kv_down_proj=backend.linear(),
+                linear_kv_up_proj=backend.column_parallel_linear(),
+                core_attention=core_attention,
+                linear_proj=backend.row_parallel_linear(),
+                q_layernorm=qk_norm,
+                kv_layernorm=qk_norm,
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
 
     return attention
 
