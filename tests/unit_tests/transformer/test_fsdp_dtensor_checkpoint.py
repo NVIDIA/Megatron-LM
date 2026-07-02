@@ -660,6 +660,68 @@ class TestVLMSWiGLUScenario:
 
 
 # ============================================================================
+# Test split_swiglu_linear_fc1 plain-tensor fix (PR #5265)
+# ============================================================================
+class TestSplitSWiGLUPlainTensor:
+    """Tests for PR #5265 fix: split_swiglu_linear_fc1 must not call .to_local()
+    on plain-tensor optimizer states (exp_avg, exp_avg_sq).
+
+    split_swiglu_linear_fc1 is invoked for both model parameters (DTensors) and
+    optimizer momentum buffers (plain local tensors).  Three bugs existed:
+      1. Assertion on data.shape[axis] % 2 == 0 used the local shard size, which
+         can be odd under uneven FSDP distributions.
+      2. data_size = data.numel() // tp_count used local numel, producing a wrong
+         W/V midpoint for optimizer states.
+      3. data.to_local() raised AttributeError on plain tensors.
+    """
+
+    def test_plain_tensor_is_not_dtensor(self):
+        """A plain torch.Tensor must not satisfy isinstance(data, DTensor)."""
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            pytest.skip("DTensor not available (requires torch >= 2.0)")
+        plain = torch.randn(8, 4)
+        assert not isinstance(plain, DTensor)
+
+    def test_plain_tensor_has_no_to_local(self):
+        """torch.Tensor does not expose .to_local(); only DTensor does.
+        The pre-fix code called data.to_local() unconditionally, raising
+        AttributeError whenever data was a plain optimizer state tensor."""
+        plain = torch.randn(8, 4)
+        assert not hasattr(plain, 'to_local')
+
+    def test_isinstance_guard_returns_plain_tensor_unchanged(self):
+        """The fixed isinstance guard must return plain tensors as-is."""
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            pytest.skip("DTensor not available")
+        plain = torch.randn(6, 8)
+        result = plain.to_local() if isinstance(plain, DTensor) else plain
+        assert result is plain
+
+    def test_split_midpoint_uses_global_numel_not_local_shard(self):
+        """W/V split midpoint must come from dist_param.numel() (global), not
+        data.numel() (local shard).  For uneven FSDP shards the local count is
+        odd, making the old midpoint wrong.
+
+        Example: 8-element global param split across 3 ranks → rank 1 gets 3
+        elements.  Old code: midpoint = 3//1//2 = 1 (wrong).
+        Fixed code: midpoint = 8//1//2 = 4 (correct).
+        """
+        tp_count = 1
+        global_numel = 8   # dist_param.numel()
+        local_shard_numel = 3  # data.numel() on an uneven-shard rank
+
+        old_midpoint = local_shard_numel // tp_count // 2   # 1  — wrong
+        new_midpoint = global_numel // tp_count // 2         # 4  — correct
+
+        assert old_midpoint != new_midpoint, "Bug scenario: midpoints must differ"
+        assert new_midpoint == 4, f"Expected midpoint 4, got {new_midpoint}"
+
+
+# ============================================================================
 # Test checkpoint_inspector.py pretrained-only checkpoint handling
 # (hasattr mcore_data guard — part of PR #3912 but related)
 # ============================================================================

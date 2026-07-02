@@ -274,25 +274,29 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
-        """
-        assert data.shape[swiglu_shard_axis] % 2 == 0, (
-            f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
-            f"got {data.shape[swiglu_shard_axis]}"
-        )
 
+        `data` may be a DTensor (model state dict) or a plain tensor (optimizer states
+        such as exp_avg / exp_avg_sq).  In the plain-tensor case `data.shape` is the
+        local shard shape — which can be odd for uneven FSDP distributions — so all
+        global shape/size information is derived from `dist_param` (always a DTensor).
+        """
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
             [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
         )
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        # Use dist_param (always a DTensor model parameter) for global size and shape so
+        # that the W/V split point is correct regardless of whether `data` is a DTensor
+        # (global .shape) or a plain local-shard tensor (local .shape, possibly odd).
+        data_size = dist_param.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
 
-        view_shape = list(data.shape)
+        view_shape = list(dist_param.shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        # DTensors expose .to_local(); plain tensors (optimizer states) are already local.
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -304,7 +308,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         # Fake parameters w and v are used to provide the correct parameter
         # shape and Tensor-Parallelism information.
-        per_tp_rank_shape = list(data.shape)
+        per_tp_rank_shape = list(dist_param.shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
