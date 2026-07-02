@@ -82,7 +82,7 @@ class TestLionOptimizerConfig:
     @patch("torch.distributed.get_world_size", return_value=1)
     @patch(
         "torch.distributed.all_gather_object",
-        lambda output_list, obj: output_list.__setitem__(0, obj),
+        lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
     )
     def test_lion_param_groups_via_get_param_groups(self, mock_world_size):
         """_get_param_groups should work with lion config (same as adam)."""
