@@ -1827,10 +1827,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
-                    gbuf_world_numel_unpadded = (
-                        self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
-                    )
-                    gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
+                    buffer = self.buffers[gbuf_idx]
+                    gbuf_world_numel_unpadded = buffer.buckets[bucket_idx].numel_unpadded
+                    if buffer.has_nvfp4_params:
+                        # NVFP4 stores parameters as packed uint8 (two FP4 values per byte),
+                        # and the optimizer-state ShardedTensors below are laid out over that
+                        # packed storage: the global size (gbuf_world_numel_unpadded) and the
+                        # per-tensor gbuf_local_start/end are all in packed element units.
+                        # The per-rank shard stride must therefore also use the packed bucket
+                        # size. Using the unpacked grad_data size here makes the shard offset
+                        # (data_parallel_rank * gbuf_local_numel + gbuf_local_start) overrun
+                        # the declared packed global tensor size, tripping PyTorch DCP
+                        # global-plan validation with an out-of-bounds chunk (see issue #5174).
+                        packed_start, packed_end = buffer.nvfp4_packed_bucket_indices[bucket_idx]
+                        gbuf_world_numel = packed_end - packed_start
+                    else:
+                        gbuf_world_numel = buffer.buckets[bucket_idx].grad_data.numel()
                     assert gbuf_world_numel_unpadded <= gbuf_world_numel
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
