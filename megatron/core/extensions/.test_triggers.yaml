@@ -1,0 +1,19 @@
+# Extensions module (transformer_engine, kitchen).
+#
+# Test imports traced:
+#   models              → extensions.transformer_engine, extensions.kitchen
+#   ckpt                → extensions.transformer_engine (in model tests)
+#   ckpt_models         → extensions.transformer_engine
+#   ckpt_moe_experts    → extensions.transformer_engine
+#   transformer*        → extensions.transformer_engine (TEColumnParallelLinear, etc.)
+#   extension           → extensions.transformer_engine (test suite)
+#   tensor_parallel     → extensions.transformer_engine
+test_buckets:
+  - models
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - transformer
+  - transformer_moe
+  - extension
+  - tensor_parallel

@@ -1,0 +1,3 @@
+# Top-level megatron package.
+# __init__.py and other top-level files are imported broadly.
+test_buckets: ALL
