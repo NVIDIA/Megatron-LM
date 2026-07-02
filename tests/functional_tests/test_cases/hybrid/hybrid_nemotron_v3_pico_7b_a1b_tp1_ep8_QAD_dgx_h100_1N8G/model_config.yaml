@@ -73,6 +73,7 @@ BEFORE_SCRIPT: |
     --distributed-timeout-minutes 30 \
     --export-default-te-spec \
     --export-quant-cfg MAMBA_MOE_NVFP4_CONSERVATIVE_CFG \
+    --calib-dataset-path-or-name cnn_dailymail \
     --calib-size 256 \
     --calib-batch-size 8 \
     --skip-generate
@@ -178,3 +179,6 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 30
   --exit-interval: 50
 TEST_TYPE: regular
+METRICS:
+  - lm loss
+  - total loss

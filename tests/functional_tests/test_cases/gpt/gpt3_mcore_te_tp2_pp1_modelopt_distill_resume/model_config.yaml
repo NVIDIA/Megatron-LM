@@ -4,7 +4,7 @@ ENV_VARS:
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ARTIFACTS_ROOT: /workspace/checkpoints
-  DISTILL_CONFIG: '{intermediate_layer_pairs: [["decoder.final_layernorm", "decoder.final_layernorm"]], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: true, kd_loss_scale: 10.0}'
+  DISTILL_CONFIG: '{intermediate_layer_pairs: [["decoder.final_layernorm", "decoder.final_layernorm"]], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: true, kd_loss_scale: 1.0}'
 BEFORE_SCRIPT: |
   mkdir -p ${DATA_CACHE_PATH}/distill && echo $DISTILL_CONFIG | yq -P > ${DATA_CACHE_PATH}/distill/distill_config.yaml
 MODEL_ARGS:
@@ -68,3 +68,6 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume
+METRICS:
+  - lm loss # should be all zero
+  #- total loss # [TODO] values for this metric seem to be ruined by outdated checkpoint (renamed/missing keys)
