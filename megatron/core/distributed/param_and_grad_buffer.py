@@ -586,6 +586,18 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
 
+        # Local CUDA graph replay is asynchronous with respect to the outer
+        # autograd hooks. Wait before reading, scaling, or reducing gradients
+        # accumulated by a replay into this bucket.
+        current_stream = torch.cuda.current_stream()
+        waited_event_ids = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                event = getattr(param, "_cudagraph_wgrad_ready_event", None)
+                if event is not None and id(event) not in waited_event_ids:
+                    current_stream.wait_event(event)
+                    waited_event_ids.add(id(event))
+
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
         # gradient accumulation in a higher precision).

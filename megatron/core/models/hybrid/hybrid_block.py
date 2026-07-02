@@ -25,6 +25,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -186,6 +187,9 @@ class HybridStack(MegatronModule):
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
+
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)

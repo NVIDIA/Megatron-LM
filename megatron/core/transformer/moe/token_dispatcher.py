@@ -461,6 +461,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             'num_global_tokens_per_local_expert',
             'reversed_local_input_permutation_mapping',
             'routing_map',
+            'hidden_shape',
+            'probs',
         ]
 
         self.shared_experts = None
