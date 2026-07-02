@@ -25,6 +25,15 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -219,6 +228,7 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    global _global_process_group_list
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -238,7 +248,6 @@ def create_group(
             # type error.
             kwargs.pop("timeout")
     group = torch.distributed.new_group(**kwargs)
-    global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
@@ -1013,6 +1022,7 @@ def initialize_model_parallel(
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
+    global _global_process_group_list
     global _PIPELINE_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
     assert (
@@ -1077,10 +1087,19 @@ def initialize_model_parallel(
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
     for ranks in decoder_rank_generator.get_ranks('pp'):
+        # Under torchcomms, request a members-only, lazily-initialized group
+        # (use_local_synchronization=True, no device_id) so new_group builds a
+        # per-peer nccl-lazy ProcessGroup for P2P overlap (like ProcessGroupNCCL).
+        # ucc keeps the eager path. With torchcomms off this is byte-for-byte
+        # the original create_group call.
         group = create_group(
             ranks,
             timeout=timeout,
             backend=pipeline_model_parallel_comm_backend,
+            use_local_synchronization=(
+                _use_torchcomms_enabled()
+                and pipeline_model_parallel_comm_backend != "ucc"
+            ),
             pg_options=(
                 None
                 if pipeline_model_parallel_comm_backend == "ucc"
