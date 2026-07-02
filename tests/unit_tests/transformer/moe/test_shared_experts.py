@@ -7,12 +7,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -116,7 +117,7 @@ def _patch_fake_shared_expert_te(monkeypatch, linear_cls=_FakeTELinear):
 
 
 def _fake_shared_expert(**config_kwargs):
-    shared_expert = SharedExpertMLP.__new__(SharedExpertMLP)
+    shared_expert = FusedSharedExpertMLP.__new__(FusedSharedExpertMLP)
     torch.nn.Module.__init__(shared_expert)
     config = SimpleNamespace(
         add_bias_linear=False,
@@ -134,8 +135,40 @@ def _fake_shared_expert(**config_kwargs):
     shared_expert.tp_group = object()
     shared_expert._fused_grouped_swiglu_ops = None
     shared_expert._fused_grouped_swiglu_recipe = None
-    shared_expert._use_fused_grouped_swiglu = True
     return shared_expert
+
+
+def test_shared_expert_builder_selects_implementation_from_config(monkeypatch):
+    class FakeSharedExpert:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeFusedSharedExpert(FakeSharedExpert):
+        pass
+
+    monkeypatch.setattr(moe_module_specs, "SharedExpertMLP", FakeSharedExpert)
+    monkeypatch.setattr(moe_module_specs, "FusedSharedExpertMLP", FakeFusedSharedExpert)
+    submodules = object()
+
+    shared = moe_module_specs._build_shared_experts(
+        config=SimpleNamespace(use_grouped_gemm_for_shared_expert=False),
+        pg_collection=None,
+        gate=False,
+        submodules=submodules,
+        name="shared",
+    )
+    fused = moe_module_specs._build_shared_experts(
+        config=SimpleNamespace(use_grouped_gemm_for_shared_expert=True),
+        pg_collection=None,
+        gate=False,
+        submodules=submodules,
+        name="shared",
+    )
+
+    assert isinstance(shared, FakeSharedExpert)
+    assert not isinstance(shared, FakeFusedSharedExpert)
+    assert isinstance(fused, FakeFusedSharedExpert)
+    assert fused.kwargs["submodules"] is submodules
 
 
 def test_validate_fused_grouped_swiglu_requires_te(monkeypatch):
