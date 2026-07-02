@@ -284,8 +284,8 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
     over the router's tp_dp_cp group, then sign-updates the replicated expert_bias. gtp_remat peers
     hold DISTINCT tokens but share the replicated router, so the reduction must span gtp_remat.
     ``get_tensor_and_data_parallel_group`` therefore spans gtp_remat (like dp); over a gtp-EXCLUDED
-    group the peers reduce different token sums and the bias diverges -> routing instability (a55b
-    loss spikes). world=4 -> tp1 * gtp_remat2 * dp2.
+    group the peers reduce different token sums and the bias diverges -> routing instability
+    (loss spikes). world=4 -> tp1 * gtp_remat2 * dp2.
     """
     import torch.distributed as dist
 

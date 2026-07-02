@@ -31,7 +31,7 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
 
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
-from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401  (autouse, module-scoped: initializes the dist PG); noqa: F401  (autouse)
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -343,7 +343,7 @@ def _worker_distopt(rank, world_size, port):
 
 
 # ---------------------------------------------------------------------------
-# MoE + EGTP_remat dist-opt grad-norm path (a55b has experts; EGTP_remat shards expert weights)
+# MoE + EGTP_remat dist-opt grad-norm path (EGTP_remat shards expert weights)
 # ---------------------------------------------------------------------------
 
 NUM_EXPERTS = 4
@@ -445,7 +445,7 @@ def _worker_moe_distopt(rank, world_size, port):
     for name, p in moe_stack.named_parameters():
         full = saved[name]  # EP2 layout identical to baseline -> rank-local match
         if isinstance(p, GTPShardedParam):
-            # dense GTP_remat shards over gtp_remat group; expert (EGTP_remat) over egtp_remat group.
+            # dense GTP_remat shards over gtp_remat group; expert (EGTP_remat) over egtp_remat.
             is_expert = _is_expert_param(name, p)
             r = egtp_rank if is_expert else gtp_rank
             ss = p.shape[0]
@@ -482,7 +482,7 @@ def _worker_idog_span(rank, world_size, port):
     group (egtp factored out of expert_data_parallel_size), under-counting the grad-norm."""
     from megatron.core import parallel_state as ps
 
-    # MoE EP2 EGTP2 GTP2 (the a55b-shaped expert config).
+    # MoE EP2 EGTP2 GTP2 expert config.
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -526,7 +526,7 @@ class TestGTPGradCorrectness:
         _run_distributed(_worker, 4)
 
     def test_gtp2_dp2_grad_matches_dp4_baseline_per_token_loss(self):
-        """Same as above but with calculate_per_token_loss=True (the a55b config).
+        """Same as above but with calculate_per_token_loss=True.
 
         Per-token-loss disables DDP's 1/dp pre-scaling and normalizes by 1/total_global_tokens,
         so the gtp_remat axis must be SUM-reduced (plain reduce-scatter + SUM finalize), NOT the
@@ -553,8 +553,8 @@ class TestGTPGradCorrectness:
     @pytest.mark.skip(
         reason="EP=2 (engages EGTP_remat) but the minimal test dims (SEQ16 BATCH1 hidden256) hit a "
         "token-dispatcher shape error in the alltoall path (RuntimeError shape [2,1,4]). Needs a "
-        "larger MoE config to run; left as a stub. The real EGTP_remat path validated by a55b "
-        "re-run (loss matches the GTP1/EGTP1 baseline after the is_gtp/allreduce master-param fix)."
+        "larger MoE config to run; left as a stub. The real EGTP_remat path is validated at scale "
+        "(loss matches the GTP1/EGTP1 baseline after the is_gtp/allreduce master-param fix)."
     )
     def test_moe_egtp_distopt_grad_norm_matches_baseline(self):
         """GTP2/EGTP2 MoE dist-opt grad-norm must match GTP1/EGTP1 baseline (EP=2 both)."""

@@ -1499,12 +1499,6 @@ def validate_args(args, defaults={}):
             from megatron.core.tensor_parallel.gtp import update_gtp_config
 
             update_gtp_config(fp8_param_gather=True)
-            warn_rank_0(
-                "GTP + --fp8-param-gather: setting "
-                "GTPConfig.fp8_param_gather=True (optimizer step "
-                "pre-quantizes GTP shards, skipping the per-forward "
-                "BF16->FP8 cast)."
-            )
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:

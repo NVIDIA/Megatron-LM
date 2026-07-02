@@ -535,25 +535,55 @@ class GTPShardedParam(torch.nn.Parameter):
     ) -> None:
         """Buffer one prefetch-link row (flushed atomically on the second forward pass)."""
         _W = 70
+        _D = 20
+        _S = 20
 
         def _layer_id(name: str) -> str:
             m = re.search(r"\d+", name)
             return m.group() if m else "-"
+
+        def _shape(param: "GTPShardedParam") -> str:
+            # Full (unsharded) weight shape that will be all-gathered across the gtp_remat
+            # group — i.e. the size actually prefetched into the chain, not the local shard.
+            try:
+                return str(tuple(param._unsharded_shape))
+            except Exception:
+                return str(tuple(param.shape))
+
+        def _dtype(param: "GTPShardedParam") -> str:
+            # Report the dtype of the tensor that is ACTUALLY all-gathered, not the
+            # GTPShardedParam wrapper (whose logical dtype is the high-precision model-weight
+            # shard, i.e. params_dtype — bf16 in mixed precision). When the param has an FP8
+            # representation (``param.quantized`` populated — by --fp8-param-gather's optimizer
+            # FP32->FP8 write, or by the per-forward cast otherwise), that quantized tensor is
+            # what gets gathered, yet a TE QuantizedTensor still reports a "fake" params_dtype
+            # ``.dtype``. So surface its raw storage dtype (e.g. uint8) tagged with the quantized
+            # class to make the FP8 all-gather unambiguous.
+            q = getattr(param, "quantized", None)
+            if getattr(param, "did_cast_to_low_precision", False) and q is not None:
+                raw = getattr(q, "_rowwise_data", None)
+                if raw is None:
+                    raw = getattr(q, "_data", None)
+                raw_dt = str(raw.dtype).replace("torch.", "") if raw is not None else "?"
+                return f"{type(q).__name__}/{raw_dt}"
+            return str(getattr(param, "dtype", "-"))
 
         chain["link_node_count"] += 1
         if chain["link_node_count"] == 1:
             chain_id = getattr(curr, "chain_id", GTPChain.UNGRAPHED.value)
             chain["link_table_buffer"].append(
                 f"\n[{chain_id} chain]\n{'node_id':>7} | {'layer_id':>8} |"
-                f" {'curr_weight_name':<{_W}} |"
-                f" prev_weight_name\n{'-'*7}-+-{'-'*8}-+-{'-'*_W}-+-{'-'*_W}"
+                f" {'dtype':<{_D}} | {'shape':<{_S}} | {'curr_weight_name':<{_W}} |"
+                f" prev_weight_name\n{'-'*7}-+-{'-'*8}-+-{'-'*_D}-+-{'-'*_S}-+-{'-'*_W}-+-{'-'*_W}"
             )
             # Seed weight (first GTP param) as row 0
             chain["link_table_buffer"].append(
-                f"{'0':>7} | {_layer_id(prev._debug_name):>8} | {prev._debug_name:<{_W}} | -"
+                f"{'0':>7} | {_layer_id(prev._debug_name):>8} | "
+                f"{_dtype(prev):<{_D}} | {_shape(prev):<{_S}} | {prev._debug_name:<{_W}} | -"
             )
         chain["link_table_buffer"].append(
             f"{chain['link_node_count']:>7} | {_layer_id(curr._debug_name):>8} | "
+            f"{_dtype(curr):<{_D}} | {_shape(curr):<{_S}} | "
             f"{curr._debug_name:<{_W}} | {prev._debug_name}"
         )
 
@@ -1555,11 +1585,13 @@ class GTPWeightCache:
         dtype_str = (
             str(dtype) if isinstance(dtype, torch.dtype) else getattr(dtype, "name", str(dtype))
         )
+        op_str = "RS(grad)" if reduce_scatter else ("AG(fwd)" if fwd else "AG(bwd)")
         log_single_rank(
             logger,
             logging.INFO,
             f"[GTP Cache] +{buf_bytes / 1024**2:.1f} MB  (shape={out_shape}, dtype={dtype_str})  "
-            f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} fwd: {fwd}",
+            f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} "
+            f"op: {op_str}",
         )
         return buf
 

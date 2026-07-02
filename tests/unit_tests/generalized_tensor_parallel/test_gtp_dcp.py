@@ -645,7 +645,7 @@ def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
     group from the model's ProcessGroupCollection. It MUST be the gtp_remat-INCLUSIVE group
     (``pg.dp_cp_gtp_remat``): with the gtp-excluded replicate group (``pg.dp_cp``) the gtp_remat
     peers collapse to the same replica_id -> multiple writers -> dist_checkpointing.save
-    validation failure (the a55b OCI_HSG TP1GTP4 save crash). This guards the group *selection*
+    validation failure (the TP1 x GTP_remat save crash). This guards the group *selection*
     that save_checkpoint_and_time makes (the leaf logic is covered by the workers above, which
     hardcode the full group).
 

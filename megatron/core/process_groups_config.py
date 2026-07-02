@@ -264,8 +264,7 @@ class ProcessGroupCollection:
                 with_gtp_remat=False,
             ),
             'dp_cp_gtp_remat': partial(
-                parallel_state.get_data_parallel_group,
-                with_context_parallel=True,
+                parallel_state.get_data_parallel_group, with_context_parallel=True
             ),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
@@ -295,8 +294,7 @@ class ProcessGroupCollection:
                 with_gtp_remat=False,
             ),
             'expt_dp_gtp_remat': partial(
-                parallel_state.get_expert_data_parallel_group,
-                check_initialized=False,
+                parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
             'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(
