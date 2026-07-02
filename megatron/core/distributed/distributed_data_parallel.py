@@ -408,7 +408,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Force synchronize parameters.
         if param_sync:
-            self.start_param_sync(force_sync=True)
+            # Hook-disable paths (eval/checkpointing/shutdown) synchronize params as an
+            # explicit state update, not as differentiable forward compute.
+            with torch.no_grad():
+                self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -528,6 +531,11 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
+
+    def reset_param_sync_dispatch_state(self):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.param_gather_dispatched = False
 
     def start_grad_sync(self, *unused):
         """
