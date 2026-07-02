@@ -268,6 +268,12 @@ class TestMegatronFsdpFullyShard:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
+        TORCH_DTENSOR_INPLACE_LERP_BROKEN,
+        reason="torch>=2.13 (NGC PyTorch 26.06) DTensor no longer supports in-place "
+        "aten._foreach_lerp_ (Adam moment update) on Replicate-placed DTensors. "
+        "Upstream torch regression from the base-image bump, not a Megatron-FSDP bug.",
+    )
+    @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
         reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
     )
