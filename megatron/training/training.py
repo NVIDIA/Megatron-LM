@@ -68,6 +68,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
+from megatron.core.transformer.per_layer_profiling import log_per_layer_resource_usage
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
@@ -2497,6 +2498,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2835,6 +2837,17 @@ def training_log(
             not reported_memory_in_this_iteration:
             report_memory(
                 f'(after {iteration} iterations)',
+                process_group=pg_collection.dp if pg_collection is not None else None,
+            )
+        per_layer_interval = getattr(args, 'log_per_layer_resource_usage_interval', None)
+        if (
+            getattr(args, 'log_per_layer_resource_usage', False)
+            and per_layer_interval is not None
+            and iteration % per_layer_interval == 0
+        ):
+            log_per_layer_resource_usage(
+                model,
+                iteration,
                 process_group=pg_collection.dp if pg_collection is not None else None,
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
@@ -3861,6 +3874,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            model=model,
         )
         is_first_iteration = False
 
