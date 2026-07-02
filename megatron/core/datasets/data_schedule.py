@@ -778,15 +778,16 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
-        pad_between_seqs=False,
+        pad_between_seqs=(True if not torch.equal(cu_seqlens, cu_seqlens_padded) else None),
     )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    # Pad token-like tensors after CP slicing. In non-dummy mode the tail is
+    # deliberately absent from cu_seqlens metadata; dummy mode appends an
+    # ordinary sequence boundary that covers the tail.
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
-    if pad_alignment is not None and packed_seq_params is not None:
+    if pad_alignment is not None:
         alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
             pad_alignment,
             getattr(config, 'max_seqlen_per_dp_cp_rank', None),
