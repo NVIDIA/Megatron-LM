@@ -276,6 +276,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
+                    if cpu_copy and self.pin_cpu_params:
+                        param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
