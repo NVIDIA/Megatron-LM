@@ -677,6 +677,16 @@ class TestMegatronNetworkArgumentGeneration:
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
 
+    def test_sequence_packing_scheduler_is_not_registered_as_a_cli_arg(self):
+        """The scheduler stays internal until its training integration lands."""
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        destinations = {action.dest for action in parser._actions}
+        assert "sequence_packing_scheduler" not in destinations
+
 
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
