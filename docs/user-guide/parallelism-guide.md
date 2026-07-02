@@ -11,20 +11,23 @@
 
 Megatron Core supports multiple parallelism strategies that can be combined to efficiently train models from billions to trillions of parameters across thousands of GPUs.
 
-## Overview
-
 The following table summarizes supported parallelism strategies.
 
 | Strategy | Parallelism Objective | Best For |
 |----------|---------------------|----------|
 | **Data Parallelism (DP)** | Batch Dimension | Data Scalability, Standard Training |
-| **Tensor Parallelism (TP)** | Individual Layers | Large Layers & Activation, GPU Memory Constraints |
+| **Tensor Parallelism (TP)** | Individual Layers | Large Layers and Activation, GPU Memory Constraints |
 | **Pipeline Parallelism (PP)** | Model Depth | Very Deep Models |
 | **Context Parallelism (CP)** | Sequence Length | Long Sequences (8K+ Tokens) |
 | **Expert Parallelism (EP)** | MoE Experts | Mixture-of-Experts Models |
-| **Fully-Sharded Data Parallelism (Megatron-FSDP)** | Model State | Extremely Large Models & DP Interchangeability |
+| **Fully-Sharded Data Parallelism (Megatron-FSDP)** | Model State | Extremely Large Models and DP Interchangeability |
 
 ## Data Parallelism (DP)
+
+Data parallelism replicates the model across GPUs and divides the global batch among them. Megatron Core supports two variants:
+
+- **Standard DDP**: keeps a full model copy on each GPU
+- **Megatron-FSDP**: shards model state across GPUs to reduce memory
 
 ### Standard Distributed Data Parallel (DDP)
 
@@ -52,24 +55,24 @@ Shard model parameters, gradients, and optimizer states across GPUs to reduce me
 
 `--data-parallel-sharding-strategy` supports the following options:
 
-- `optim` - Shard optimizer states only (ZeRO-1)
-- `optim_grads` - Shard gradients + optimizer (ZeRO-2)
-- `optim_grads_params` - Shard parameters + gradients + optimizer (ZeRO-3)
+- `optim`: shard optimizer states only (ZeRO-1)
+- `optim_grads`: shard gradients and optimizer (ZeRO-2)
+- `optim_grads_params`: shard parameters, gradients, and optimizer (ZeRO-3)
 
-If `--num-distributed-optimizer-instances` is > 1, then hierarchical data parallelism is enabled.
+If `--num-distributed-optimizer-instances` exceeds 1, this enables hierarchical data parallelism.
 
 `--outer-dp-sharding-strategy` supports the following options:
 
-- `no_shard` (**Hybrid-Sharded Data Parallelism**) - Replicate the model state across outer data parallel ranks.
-- `optim` (**Hybrid-FSDP**) - Shard the optimizer state across the outer data parallel ranks.
+- `no_shard` (**Hybrid-Sharded Data Parallelism**): replicate the model state across outer data parallel ranks
+- `optim` (**Hybrid-FSDP**): shard the optimizer state across outer data parallel ranks
   - Requires `--data-parallel-sharding-strategy optim_grads_params`.
 
-**When to Use**
+**Use For**
 
-- Large models with large or fused compute kernels to hide communications under.
-- Integrated with TP, CP, EP, and easily composable with heterogeneous parallelisms.
-- With SM-reducing optimizations from NCCL and activation offloading from TransformerEngine.
-- Using `fully_shard` without depending on Megatron-LM.
+- Large models with large or fused compute kernels to hide communication under
+- Integrated with TP, CP, and EP, and composable with heterogeneous parallelisms
+- Streaming Multiprocessor (SM)-reducing optimizations from NCCL and activation offloading from Transformer Engine
+- Standalone use of `fully_shard` without depending on Megatron-LM
 
 ## Tensor Parallelism (TP)
 
@@ -80,11 +83,11 @@ Split individual model layers across GPUs. Recommended for large hidden dimensio
 --sequence-parallel              # Enable sequence parallelism (recommended)
 ```
 
-**When to Use**
+**Use For**
 
-- Model layers do not fit on a single GPU
-- Large hidden dimensions (4096+)
-- Usually combined with DP and PP
+- Model layers too large for a single GPU
+- Large hidden dimensions (4,096+)
+- Typically combined with DP and PP
 
 ## Pipeline Parallelism (PP)
 
@@ -95,11 +98,11 @@ Split model layers across GPUs vertically (by depth).
 --num-layers-per-virtual-pipeline-stage 4     # Virtual pipeline for load balancing
 ```
 
-**When to Use**
+**Use For**
 
 - Very deep models (50+ layers)
-- Combine with TP for large models
-- Helps distribute memory across GPUs
+- Large models when combined with TP
+- High memory pressure distributed across GPUs
 
 ## Context Parallelism (CP)
 
@@ -110,11 +113,11 @@ Split long sequences across GPUs for efficient long-context training.
 --cp-comm-type p2p                  # Communication type
 ```
 
-**When to Use**
+**Use For**
 
 - Long sequences (8K+ tokens)
-- Reduces activation memory
-- Can combine with TP, PP, DP
+- Reduced activation memory
+- Composable with TP, PP, and DP
 
 Refer to [Context Parallelism Deep Dive](features/context_parallel.md) for a detailed guide with performance analysis.
 
@@ -138,7 +141,7 @@ Distribute experts across GPUs in Mixture-of-Experts models.
 
 ## Parallelism Selection Guide
 
-For a list of supported configurations, refer to [Megatron Bridge Supported Models](https://github.com/NVIDIA-NeMo/Megatron-Bridge#supported-models).
+The tables below show tested configurations for common model architectures. Use them as starting points and adjust based on your hardware and sequence length. For a complete list of supported configurations, refer to [Megatron Bridge Supported Models](https://github.com/NVIDIA-NeMo/Megatron-Bridge#supported-models).
 
 ### Language Models
 
@@ -148,8 +151,8 @@ Recommended language model configurations:
 |-------|------|------|----|----|----|----|---------------------|
 | **LLaMA-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP=2 for long context (8K seqlen) |
 | **LLaMA-3** | 70B | 64 | 4 | 4 | 2 | 1 | Balanced TP+PP for 70B scale |
-| **LLaMA-3.1** | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism (TP+PP+CP) |
-| **GPT-3** | 175B | 128-512 | 4 | 8 | 1 | 1 | Standard large model config |
+| **LLaMA-3.1** | 405B | 1,024 | 8 | 8 | 2 | 1 | 3D parallelism (TP+PP+CP) |
+| **GPT-3** | 175B | 128–512 | 4 | 8 | 1 | 1 | Standard large model config |
 
 ### Mixture-of-Experts Models
 
@@ -159,13 +162,15 @@ Recommended mixture-of-experts configurations:
 |-------|------|------|----|----|----|----|---------------------|
 | **Mixtral** | 8x7B | 64 | 1 | 4 | 1 | 8 | EP=8 for 8 experts |
 | **Mixtral** | 8x22B | 256 | 4 | 4 | 1 | 8 | TP+PP+EP for large MoE |
-| **DeepSeek-V3** | 671B | 1024 | 2 | 16 | 1 | 64 | Massive MoE with 256 experts |
+| **DeepSeek-V3** | 671B | 1,024 | 2 | 16 | 1 | 64 | Massive MoE with 256 experts |
 
 ## Combining Strategies
 
+Parallelism strategies compose multiplicatively. The total GPU count is the product of all parallelism degrees, and each GPU belongs to exactly one group for each dimension.
+
 ### Total GPU Count
 
-The total number of GPUs is calculated as:
+Calculate the total GPU count as:
 
 ```
 Total GPUs = TP × PP × CP × EP × DP
@@ -189,6 +194,8 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 ```
 
 ## Performance Optimizations
+
+After configuring parallelism, enable these optimizations to improve throughput by overlapping communication with computation and reducing memory overhead.
 
 ### Communication Overlap
 
@@ -222,9 +229,11 @@ Always enable when using TP:
 --sequence-parallel
 ```
 
-Reduces activation memory by sharding sequence dimension in LayerNorm and Dropout.
+Reduces activation memory by sharding the sequence dimension in `LayerNorm` and `Dropout`.
 
 ## Choosing the Right Strategy
+
+Start with the simplest configuration that fits your model in memory, then add parallelism dimensions as needed. The guidance below addresses the three main constraints: memory, communication, and scale.
 
 ### Start Simple
 1. Begin with **Data Parallelism** (DP) only.
@@ -245,6 +254,6 @@ Reduces activation memory by sharding sequence dimension in LayerNorm and Dropou
 
 ## Next Steps
 
-- **API Reference**: Refer to [Tensor Parallel](../api-guide/core/tensor_parallel.md) and [Pipeline Parallel](../api-guide/core/pipeline_parallel.md) in the API documentation
-- **Advanced Features**: Refer to [Megatron-FSDP](features/megatron_fsdp.md), [MoE](features/moe.md), and [Distributed Optimizer](features/dist_optimizer.md)
-- **Performance Tuning**: Refer to the [NVIDIA NeMo Performance Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html)
+- **API Reference**: Refer to [Tensor Parallel](../api-guide/core/tensor_parallel.md) and [Pipeline Parallel](../api-guide/core/pipeline_parallel.md) in the API documentation.
+- **Advanced Features**: Refer to [Megatron-FSDP](features/megatron_fsdp.md), [MoE](features/moe.md), and [Distributed Optimizer](features/dist_optimizer.md).
+- **Performance Tuning**: Refer to the [NVIDIA NeMo Performance Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html).
