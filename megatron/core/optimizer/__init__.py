@@ -10,43 +10,6 @@ import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
-try:
-    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
-    from transformer_engine.pytorch.optimizers import FusedSGD as SGD
-
-    USING_PYTORCH_OPTIMIZER = False
-except ImportError:
-    try:
-        from apex.optimizers import FusedAdam as Adam
-        from apex.optimizers import FusedSGD as SGD
-
-        USING_PYTORCH_OPTIMIZER = False
-    except ImportError:
-        warnings.warn(
-            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
-        )
-
-        # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
-        # pylint: disable-next=line-too-long.
-        # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
-        from torch.optim import SGD
-        from torch.optim import AdamW as Adam
-
-        USING_PYTORCH_OPTIMIZER = True
-
-try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
-    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
-except (ImportError, PackageNotFoundError):
-    _eo_ver = (0, 0)
-
-HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
-
-if HAVE_EMERGING_OPTIMIZERS:
-    from emerging_optimizers.scalar_optimizers import Lion
-
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
@@ -86,6 +49,31 @@ from .optimizer_config import (
     ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
+
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+    from transformer_engine.pytorch.optimizers import FusedSGD as SGD
+
+    USING_PYTORCH_OPTIMIZER = False
+except ImportError:
+    try:
+        from apex.optimizers import FusedAdam as Adam
+        from apex.optimizers import FusedSGD as SGD
+
+        USING_PYTORCH_OPTIMIZER = False
+    except ImportError:
+        warnings.warn(
+            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
+        )
+
+        # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
+        # pylint: disable-next=line-too-long.
+        # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
+        from torch.optim import SGD
+        from torch.optim import AdamW as Adam
+
+        USING_PYTORCH_OPTIMIZER = True
+
 
 logger = logging.getLogger(__name__)
 
@@ -493,8 +481,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         raise ValueError(
             "skip_megatron_wrapping=True is incompatible with use_precision_aware_optimizer."
         )
-    if skip_megatron_wrapping and config.optimizer_cpu_offload:
-        raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
+    # NOTE: skip_megatron_wrapping + optimizer_cpu_offload is allowed for Muon,
+    # where LayerWiseDistributedOptimizer handles CPU offloading itself.
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -907,6 +895,9 @@ def _get_megatron_emerging_optimizer(
                         "the legacy LayerWise ping-pong path for MoE models."
                     )
                 fallback_config.use_distributed_optimizer = True
+                # The separate DistributedOptimizer manages its own CPU offloading
+                # (via HybridDeviceOptimizer) independently of LayerWise — do NOT
+                # disable optimizer_cpu_offload here.
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,
@@ -934,6 +925,12 @@ def _get_megatron_emerging_optimizer(
                 # ``(optimizer, init_state_fn)`` tuple via ``skip_megatron_wrapping``)
                 # feeds into ``LayerWiseDistributedOptimizer``.
                 fallback_config.use_distributed_optimizer = False
+                # Disable per-optimizer CPU offload (HybridDeviceOptimizer) for the
+                # Adam fallback when LayerWiseDistributedOptimizer is active.
+                # CPU offloading is handled uniformly by LayerWiseDistributedOptimizer
+                # for all sub-optimizers (Muon + Adam), preventing double-offloading.
+                if use_layer_wise:
+                    fallback_config.optimizer_cpu_offload = False
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,

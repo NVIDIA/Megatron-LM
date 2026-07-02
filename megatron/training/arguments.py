@@ -1662,9 +1662,10 @@ def validate_args(args, defaults={}):
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
-        assert args.use_precision_aware_optimizer, (
-            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
-            "as the hybrid device optimizer reuses the code path of this flag."
+        assert args.use_precision_aware_optimizer or args.use_layer_wise_distributed_optimizer, (
+            "The optimizer cpu offload must be used in conjunction with "
+            "`--use-precision-aware-optimizer` (for HybridDeviceOptimizer) or "
+            "`--use-layer-wise-distributed-optimizer` (for Muon/emerging optimizer offloading)."
         )
         assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
             "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
