@@ -23,7 +23,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -260,6 +260,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        self._validate_async_sched_support_for_config()
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
@@ -974,11 +975,56 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    def _validate_async_sched_support_for_config(self) -> None:
+        """Validate config-level restrictions for serial async scheduling.
+
+        Raises if the config does not support serial async scheduling.
+        """
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        if self.num_speculative_tokens > 0:
+            raise ValueError("Async scheduling does not support speculative tokens.")
+        if self.context.is_hybrid_model:
+            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
+        if self.context.enable_prefix_caching:
+            raise ValueError("Async scheduling does not support prefix caching.")
+        if not self.materialize_only_last_token_logits:
+            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
+        if model_config.expert_model_parallel_size > 1:
+            raise ValueError("Async scheduling does not support expert parallelism.")
+        if model_config.num_moe_experts is not None:
+            raise ValueError("Async scheduling does not support MoE models.")
+        if model_config.moe_enable_routing_replay:
+            raise ValueError("Async scheduling does not support routing replay.")
+
+    def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
+        """Validate request-level restrictions for serial async scheduling.
+
+        Args:
+            request (DynamicInferenceRequest): Request being added to the engine.
+        """
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        sampling_params = request.sampling_params
+        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
+            raise ValueError(
+                "Async scheduling only supports greedy sampling "
+                "(SamplingParams.top_k == 1 and top_p == 0.0)."
+            )
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            raise ValueError("Async scheduling does not support log probabilities.")
+        if sampling_params.stop_words:
+            raise ValueError("Async scheduling does not support stop words.")
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
+        self._validate_async_sched_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -1544,22 +1590,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
-        """Find farthest block with cached Mamba state by iterating from the end.
-
-        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
-        only divergence and last-aligned blocks do. Iterating from the end
-        finds the farthest block with cached state, which is the only one
-        needed for restore since Mamba state is cumulative.
-        """
-        if not req.precomputed_block_hashes:
-            return 0
-        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
-        for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
-            if req.precomputed_block_hashes[i] in mamba_map:
-                return i + 1
-        return 0
-
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         # Keep track of which requests get scheduled.
@@ -1582,11 +1612,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
-        mamba_caching_enabled = (
-            prefix_caching_enabled
-            and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
-        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1604,10 +1629,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_coordination_waits += 1
                     pending_request_ids.append(self.waiting_request_ids.popleft())
                     continue
-
-            # Find Mamba prefix match before check_availability (sets skip count)
-            if mamba_caching_enabled:
-                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
@@ -1746,11 +1767,6 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
-        mamba_caching_enabled = (
-            prefix_caching_enabled
-            and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
-        )
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1777,10 +1793,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.waiting_request_ids.popleft()
                     )
                     continue
-
-            # Find Mamba prefix match for non-continuing requests
-            if mamba_caching_enabled and not is_continuing_chunked_prefill:
-                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)

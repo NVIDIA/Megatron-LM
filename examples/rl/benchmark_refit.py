@@ -14,7 +14,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.training import get_args, get_model as get_training_model, print_rank_0
 from megatron.training.initialize import initialize_megatron
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.rl.parallel_utils import build_inference_pg_collection
+from megatron.core.inference.shards import build_inference_pg_collection
 from gpt_builders import gpt_builder
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
