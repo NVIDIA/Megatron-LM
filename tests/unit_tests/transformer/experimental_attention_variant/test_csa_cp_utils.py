@@ -246,6 +246,10 @@ def test_compute_cp_indexer_topk_passes_offsets_without_repacking_k(monkeypatch)
     assert compute_cp_indexer_topk(
         q, weights, k_seq[:0], cu_q, cu_comp, 2, 4, 2, 1.0, 10, True
     ) == (None, None)
+    assert compute_cp_indexer_topk(
+        q, weights, k_seq, cu_q, torch.zeros_like(cu_comp), 2, 4, 2, 1.0, 3, True
+    ) == (None, None)
+    assert len(topk_calls) == 1
 
 
 def test_compute_cp_indexer_topk_unfused_uses_exact_global_positions(monkeypatch):

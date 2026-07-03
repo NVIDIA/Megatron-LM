@@ -317,6 +317,9 @@ def compute_cp_indexer_topk(
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None
+    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
+    if max_seqlen_kv == 0:
+        return None, None
 
     global_start = int(global_start)
     l_local = q_indexer_local.shape[0]
@@ -390,7 +393,7 @@ def compute_cp_indexer_topk(
         cu_seqlens_q=cu_q_topk,
         cu_seqlens_kv=cu_k_topk,
         max_seqlen_q=int(max_seqlen_q),
-        max_seqlen_kv=int(max_seqlen_q) // int(ratio),
+        max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
     )
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)

@@ -701,7 +701,7 @@ def _unfused_indexer_sparse_attn_from_topk(
                 ~valid.unsqueeze(1), float("-inf")
             )
             target_logits = torch.where(row_valid.unsqueeze(1), target_logits, 0.0)
-            sink = attn_sink.view(1, np_, 1).float()
+            sink = attn_sink.detach().view(1, np_, 1).float()
             scores_max = torch.maximum(target_logits.max(dim=-1, keepdim=True).values, sink)
             exp_scores = torch.exp(target_logits - scores_max)
             exp_sink = torch.exp(sink - scores_max)
@@ -758,7 +758,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     attn_scores = torch.einsum("rhd,rkd->rhk", query.detach().float(), selected_kv.float())
     attn_scores = attn_scores * softmax_scale
     attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-    sink = attn_sink.view(1, np_, 1).float()
+    sink = attn_sink.detach().view(1, np_, 1).float()
     scores_max = torch.maximum(attn_scores.max(dim=-1, keepdim=True).values, sink)
     exp_scores = torch.exp(attn_scores - scores_max)
     exp_sink = torch.exp(sink - scores_max)

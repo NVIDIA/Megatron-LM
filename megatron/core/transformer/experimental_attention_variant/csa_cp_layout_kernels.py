@@ -8,7 +8,6 @@ reuses MCore's fused MLA implementation.
 """
 
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -591,11 +590,7 @@ if _CUTE_AVAILABLE:
 
 def _require_cute(message: str, *tensors: Optional[torch.Tensor]) -> None:
     """Raise ``RuntimeError`` when a wrapper cannot use CuTeDSL kernels."""
-    if (
-        not _CUTE_AVAILABLE
-        or os.environ.get("DSV4_CP_DISABLE_CUTE_KERNELS")
-        or not all(tensor is None or tensor.is_cuda for tensor in tensors)
-    ):
+    if not _CUTE_AVAILABLE or not all(tensor is None or tensor.is_cuda for tensor in tensors):
         raise RuntimeError(message)
 
 

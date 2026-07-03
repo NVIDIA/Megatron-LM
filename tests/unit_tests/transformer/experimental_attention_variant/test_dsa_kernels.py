@@ -3395,7 +3395,12 @@ class TestRealKernelDenseIndexerBackward:
         idx_score_aligned = (
             idx_score_analytical + (kernel_indexer_scores - idx_score_analytical).detach()
         )
-        position_valid = torch.isfinite(kernel_indexer_scores)
+        position_valid = (
+            _ratio_causal_valid_mask(s['sq'], s['n_comp'], s['ratio'], dev)
+            .unsqueeze(0)
+            .expand(s['b'], -1, -1)
+        )
+        assert torch.isfinite(kernel_indexer_scores[position_valid]).all()
         idx_score_aligned = idx_score_aligned.masked_fill(~position_valid, float('-inf'))
         row_valid = position_valid.any(dim=-1)
         idx_lse_aligned = torch.logsumexp(

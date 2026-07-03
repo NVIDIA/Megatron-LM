@@ -933,6 +933,13 @@ class TestDSv4HybridNativeParity:
         if apply_dsa_kernel_fusion:
             _skip_if_real_kernels_unavailable()
         major, _ = torch.cuda.get_device_capability()
+        if (
+            major == 9
+            and apply_dsa_kernel_fusion
+            and compress_ratio == 4
+            and not dsa_indexer_use_sparse_loss
+        ):
+            pytest.skip("cuDNN Frontend SM90 dense DSA is not supported")
         if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 

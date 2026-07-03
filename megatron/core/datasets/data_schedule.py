@@ -630,7 +630,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
-    cp_partition_mode = config.cp_partition_mode if config is not None else "zigzag"
+    cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
     contiguous_cp_local_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
