@@ -177,7 +177,7 @@ MODEL_ARGS:
   --timing-log-level: 0
   --no-gradient-accumulation-fusion: true
   --distributed-timeout-minutes: 30
-  --exit-interval: 50
+  --exit-interval: 10
 TEST_TYPE: regular
 METRICS:
   - lm loss
