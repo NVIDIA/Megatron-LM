@@ -18,6 +18,9 @@ runs/
 /test_cases/
 **/dist/
 
+# Local profiling output
+/artifacts/mhc_overlap_nsys/
+
 # Sphinx documentation
 docs/_build
 docs/apidocs

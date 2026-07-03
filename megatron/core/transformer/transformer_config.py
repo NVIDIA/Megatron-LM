@@ -1178,6 +1178,16 @@ class TransformerConfig(ModelParallelConfig):
 
     Must be a positive integer when set."""
 
+    mhc_high_priority_stream_mode: Literal["none", "post", "recompute", "all"] = "none"
+    """Select which mHC work runs on the dedicated high-priority compute stream.
+
+    ``post`` moves the schedulable MoE post-combine mHC work in forward and backward,
+    ``recompute`` moves explicit mHC group recomputation, and ``all`` moves both.
+    When post work is not selected (``none`` or ``recompute``), it remains fused into
+    the MoE combine node on the communication stream. Dense-layer and attention-side
+    mHC work remain in their existing compute nodes.
+    """
+
     ####################
     # miscellaneous
     ####################
@@ -2122,7 +2132,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading and self.offload_modules:
                 # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
                 # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
-                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # recompute trigger runs before GroupCommitFunction.backward() initializes
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
@@ -2132,12 +2142,50 @@ class TransformerConfig(ModelParallelConfig):
                 if conflicting:
                     raise ValueError(
                         f"'mhc' in recompute_modules is incompatible with "
-                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"offload_modules {conflicting}. The mHC recompute replay starts "
                         f"before the offloading backward chunk is initialized for these "
                         f"modules, causing tensor_pop on a None chunk. Remove "
                         f"{conflicting} from offload_modules or remove 'mhc' from "
                         f"recompute_modules."
                     )
+
+        valid_mhc_stream_modes = {"none", "post", "recompute", "all"}
+        if self.mhc_high_priority_stream_mode not in valid_mhc_stream_modes:
+            raise ValueError(
+                "mhc_high_priority_stream_mode must be one of "
+                f"{sorted(valid_mhc_stream_modes)}, got {self.mhc_high_priority_stream_mode!r}."
+            )
+
+        if (
+            self.overlap_moe_expert_parallel_comm
+            and self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+            and (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            )
+        ):
+            raise ValueError(
+                "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
+                "to be disabled because explicit group replay is eager-only."
+            )
+
+        if self.mhc_high_priority_stream_mode != "none":
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "mhc_high_priority_stream_mode requires enable_hyper_connections=True."
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "mhc_high_priority_stream_mode requires "
+                    "overlap_moe_expert_parallel_comm=True."
+                )
+            if self.mhc_high_priority_stream_mode in ("recompute", "all") and not (
+                self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "mhc_high_priority_stream_mode='recompute' or 'all' requires selective "
+                    "recompute with 'mhc' in recompute_modules."
+                )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules

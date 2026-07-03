@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 from torch.autograd import Variable
@@ -156,6 +156,8 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        forward_nvtx_name: Optional[str] = None,
+        backward_nvtx_name: Optional[str] = None,
     ):
         """Initialize a schedule node.
 
@@ -173,8 +175,12 @@ class ScheduleNode:
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
             name (str): Name of the node for debugging purposes.
+            forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
+            backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
         """
         self.name = name
+        self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
+        self.backward_nvtx_name = backward_nvtx_name or f"{name} backward"
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
@@ -206,7 +212,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} forward"):
+        with self.stream_acquire_context(self.forward_nvtx_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -215,7 +221,9 @@ class ScheduleNode:
             data = tuple(self.inputs)
             data = self.forward_func(*data)
 
-            if not isinstance(data, tuple):
+            if data is None:
+                pass
+            elif not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
@@ -246,7 +254,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} backward"):
+        with self.stream_acquire_context(self.backward_nvtx_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)
@@ -331,6 +339,7 @@ class AbstractSchedulePlan(ABC):
 _USE_DYNAMIC_COMP_STREAM = None
 _COMP_STREAM = None
 _COMM_STREAM = None
+_MHC_HIGH_PRIORITY_STREAM = None
 
 
 def set_streams(comm_stream=None, high_priority=False):
@@ -357,3 +366,37 @@ def get_comm_stream():
     """Get the stream for communication"""
     global _COMM_STREAM
     return _COMM_STREAM
+
+
+def get_mhc_high_priority_stream() -> torch.cuda.Stream:
+    """Get the lazily-created high-priority compute stream used by mHC work."""
+    global _MHC_HIGH_PRIORITY_STREAM
+    if _MHC_HIGH_PRIORITY_STREAM is None:
+        _, high = torch.cuda.Stream.priority_range()
+        _MHC_HIGH_PRIORITY_STREAM = torch.cuda.Stream(device="cuda", priority=high)
+    return _MHC_HIGH_PRIORITY_STREAM
+
+
+def get_mhc_execution_stream(
+    config, work_kind: Literal["post", "recompute"]
+) -> Callable[[], torch.cuda.Stream]:
+    """Resolve the actual execution stream getter for one kind of mHC work.
+
+    Args:
+        config: Transformer configuration containing ``mhc_high_priority_stream_mode``.
+        work_kind: Either ``post`` for MLP-side mHC post-processing or ``recompute``
+            for explicit group recomputation.
+
+    Returns:
+        A callable returning the communication stream for merged post work, the
+        normal compute stream for non-priority recompute, or the dedicated
+        high-priority mHC stream when selected.
+    """
+    if work_kind not in ("post", "recompute"):
+        raise ValueError(f"Unsupported mHC work kind: {work_kind}")
+
+    mode = config.mhc_high_priority_stream_mode
+    use_high_priority = mode == "all" or mode == work_kind
+    if use_high_priority:
+        return get_mhc_high_priority_stream
+    return get_comm_stream if work_kind == "post" else get_comp_stream
