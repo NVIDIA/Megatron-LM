@@ -239,7 +239,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
         backend = TESpecProvider(
-            fallback_to_eager_attn=fallback_to_eager_attn, flex_attention=flex_attention
+            fallback_to_eager_attn=fallback_to_eager_attn, use_flex_attention=flex_attention
         )
 
     mlp = get_mlp_module_spec_for_backend(
