@@ -148,13 +148,16 @@ class TestSkipGradNormClip:
         the container must NOT be flagged (not all base subs are orthogonalizing)."""
         _, opt = self._build(MuonAdamMix(), 'muon', use_layer_wise=True)
         assert isinstance(opt, ChainedOptimizer)
-        flagged = {i: getattr(s, 'skip_grad_norm_clip', False) for i, s in enumerate(opt.chained_optimizers)}
+        flagged = {
+            i: getattr(s, 'skip_grad_norm_clip', False)
+            for i, s in enumerate(opt.chained_optimizers)
+        }
         orthog = {i: _is_orthogonalizing(s) for i, s in enumerate(opt.chained_optimizers)}
         # exactly the orthogonalizing (Muon) subs are flagged
         for i, s in enumerate(opt.chained_optimizers):
-            assert bool(flagged[i]) == orthog[i], (
-                f"member {i} ({type(_inner(s)).__name__}): flagged={flagged[i]} orthog={orthog[i]}"
-            )
+            assert (
+                bool(flagged[i]) == orthog[i]
+            ), f"member {i} ({type(_inner(s)).__name__}): flagged={flagged[i]} orthog={orthog[i]}"
         assert any(orthog.values()), "expected a Muon sub"
         assert not all(orthog.values()), "expected an Adam sub in the mix"
         # container must not claim skip when a non-orthogonalizing sub is present
@@ -194,7 +197,7 @@ class TestSkipGradNormClip:
             if g is None:
                 continue
             if p.dim() >= 2:
-                g.fill_(1.0e5)   # Muon sub -> huge norm
+                g.fill_(1.0e5)  # Muon sub -> huge norm
             else:
                 g.fill_(1.0e-4)  # Adam sub -> tiny norm
 
@@ -202,7 +205,9 @@ class TestSkipGradNormClip:
         full = float(opt.get_grad_norm())
         threshold_norm = float(opt._get_grad_norm_skip_threshold())
         if Utils.rank == 0:
-            print(f"\n[B3] get_grad_norm()={full:.3e}  _get_grad_norm_skip_threshold()={threshold_norm:.3e}")
+            print(
+                f"\n[B3] get_grad_norm()={full:.3e}  _get_grad_norm_skip_threshold()={threshold_norm:.3e}"
+            )
         # the skip-threshold norm must be far smaller than the full norm (Muon grad excluded)
         assert threshold_norm < full
         # and below the Adam sub's finite threshold (10) so the update is NOT skipped,
@@ -243,7 +248,9 @@ class TestSkipGradNormClip:
 
     def test_b4_adam_chain_runs_clip_norm_compute(self):
         """Clippable Adam chain: should_clip is True -> _compute_grad_norms_by_group is called."""
-        model, opt = self._build(nn.Linear(64, 32, bias=True), 'adam', use_layer_wise=False, clip_grad=1.0)
+        model, opt = self._build(
+            nn.Linear(64, 32, bias=True), 'adam', use_layer_wise=False, clip_grad=1.0
+        )
         self._forward_backward(model)
         calls = {'n': 0}
         orig = opt._compute_grad_norms_by_group
@@ -273,8 +280,13 @@ class TestSkipGradNormClip:
             use_layer_wise_distributed_optimizer=True,
         )[0]
         cfg = OptimizerConfig(
-            optimizer='muon', lr=0.01, weight_decay=0.01, bf16=True, clip_grad=1.0,
-            muon_tp_mode="duplicated", use_layer_wise_distributed_optimizer=True,
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            clip_grad=1.0,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
         )
         pg = ProcessGroupCollection.use_mpu_process_groups()
         pg.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
