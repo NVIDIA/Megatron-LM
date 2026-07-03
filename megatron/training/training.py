@@ -137,6 +137,7 @@ from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
     load_checkpoint,
+    load_kd_teacher_checkpoint,
     save_checkpoint,
     save_grads,
 )
@@ -2184,6 +2185,9 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    load_kd_teacher_checkpoint(model)
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the

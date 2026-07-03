@@ -1715,6 +1715,27 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def load_kd_teacher_checkpoint(model):
+    """Load the teacher checkpoint for ModelOpt distillation if the model has one."""
+    args = get_args()
+    if not (has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None)):
+        return
+
+    teacher = unwrap_model(model[0]).teacher_model
+    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
+    # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
+    # set args.finetune to True while loading the teacher checkpoint.
+    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
+    args.finetune = True
+    if args.export_kd_teacher_ckpt_format is not None:
+        args.ckpt_format = args.export_kd_teacher_ckpt_format
+    try:
+        load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
+    finally:
+        args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+    print_rank_0("... teacher loaded successfully.")
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
@@ -2207,25 +2228,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg="After loading checkpoint")
-
-        # Load teacher model in Distillation mode.
-        if getattr(args, "export_kd_teacher_load", None):
-            from megatron.post_training.checkpointing import load_modelopt_checkpoint
-
-            unwrapped_model = unwrap_model(model)[0]
-            # Note: load_modelopt_checkpoint may call this function so we prevent infinite recursion.
-            if hasattr(unwrapped_model, 'teacher_model'):
-                teacher = unwrapped_model.teacher_model
-                print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-                # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
-                # set args.finetune to True while loading the teacher checkpoint.
-                original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-                args.finetune = True
-                if args.export_kd_teacher_ckpt_format is not None:
-                    args.ckpt_format = args.export_kd_teacher_ckpt_format
-                load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-                args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-                print_rank_0("... teacher loaded successfully.")
 
     return iteration, num_floating_point_operations_so_far
 
