@@ -195,11 +195,23 @@ the time the forward kernel uses them.
 all-gather. This ensures that writes performed on the main stream (e.g., reshard after a
 previous forward, or tensor-parallel slice updates) are fully visible to the all-gather
 kernel. Without this barrier, stale or partially-written parameter shards may be read by
-the NCCL collective, causing convergence divergence.
+the NCCL collective, causing convergence divergence. The edge also makes `ag_stream`
+join a full-iteration CUDA graph capture before the capture stream waits on the recorded
+unshard event; otherwise CUDA reports `cudaErrorStreamCaptureIsolation` at the first
+captured async unshard.
 
 **NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
+
+**All-gather coalescing.** `FSDPModule.unshard()` coalesces consecutive weight-buffer
+all-gathers that use the same process group before calling the mixed-precision
+`post_unshard()` hook. Each `ParameterGroup` still owns its buffers and post-processing,
+while the module-level loop submits multiple buffer all-gathers through one grouped
+launch. With `async_ops=True`, the coalescing manager owns the resulting `Work`; the
+async path calls `manager.wait()` while `ag_stream` is current before recording the
+module readiness event, so the event cannot run before the backend finishes writing
+the gathered buffers.
 
 Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
 for them. If a module's pre-hook arrives and its event is already set (prefetch was launched

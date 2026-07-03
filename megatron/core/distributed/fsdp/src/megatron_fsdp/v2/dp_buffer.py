@@ -586,12 +586,15 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        stream = stream or torch.cuda.current_stream()
-        stream.wait_stream(torch.cuda.current_stream())
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+        stream.wait_stream(caller_stream)
         with torch.cuda.stream(stream):
             torch.distributed.all_gather_into_tensor(
                 output_tensor=full_buffer, input_tensor=shard_buffer, group=self.dp_group
             )
+            if full_buffer.is_cuda:
+                full_buffer.record_stream(stream)
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)

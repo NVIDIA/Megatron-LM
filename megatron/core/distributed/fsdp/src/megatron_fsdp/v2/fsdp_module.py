@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.distributed import _coalescing_manager
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
@@ -19,6 +20,29 @@ from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
+
+
+def _unshard_weight_buffers(dp_group, weight_buffers, *, async_op: bool) -> None:
+    """Unshard one same-process-group buffer run and order async completion."""
+    cm = (
+        _coalescing_manager(dp_group, async_ops=async_op)
+        if len(weight_buffers) > 1
+        else nullcontext()
+    )
+    with cm as coalescing_event:
+        for weight_buffer in weight_buffers:
+            weight_buffer.unshard(bind_params=True)
+    if async_op and coalescing_event is not None:
+        coalescing_event.wait()
+
+
+def _select_unshard_stream(ctx, *, async_op: bool):
+    """Select the unshard stream and preserve caller-to-AG ordering."""
+    caller_stream = torch.cuda.current_stream()
+    if not async_op:
+        return caller_stream
+    ctx.ag_stream.wait_stream(caller_stream)
+    return ctx.ag_stream
 
 
 class _FSDPState:
@@ -635,7 +659,7 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
-        stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
+        stream = _select_unshard_stream(ctx, async_op=async_op)
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
@@ -651,16 +675,32 @@ class FSDPModule:
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            # Unshard parameters for this module
-            for param_names, param_group in module._named_param_groups:
-                # Optional NaN checking for debugging
-                if getattr(module, "_enable_nan_checks", False):
-                    for name, dist_param in zip(param_names, param_group.dist_params):
-                        assert not torch.isnan(
-                            dist_param._local_tensor
-                        ).any(), f"NaN detected in dist param for parameter {name}"
+            # Coalesce consecutive all-gathers that use the same process group,
+            # then run mixed-precision post-processing on the same stream.
+            with torch.cuda.stream(stream):
+                pending_post_unshard = []
+                buffer_runs = []
 
-                param_group.unshard(bwd_pass=bwd_pass, stream=stream)
+                for param_names, param_group in module._named_param_groups:
+                    # Optional NaN checking for debugging
+                    if getattr(module, "_enable_nan_checks", False):
+                        for name, dist_param in zip(param_names, param_group.dist_params):
+                            assert not torch.isnan(
+                                dist_param._local_tensor
+                            ).any(), f"NaN detected in dist param for parameter {name}"
+
+                    pending_post_unshard.append(param_group)
+                    for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+                        if buffer_runs and buffer_runs[-1][0] is weight_buffer.dp_group:
+                            buffer_runs[-1][1].append(weight_buffer)
+                        else:
+                            buffer_runs.append((weight_buffer.dp_group, [weight_buffer]))
+
+                for dp_group, weight_buffers in buffer_runs:
+                    _unshard_weight_buffers(dp_group, weight_buffers, async_op=async_op)
+
+                for param_group in pending_post_unshard:
+                    param_group.post_unshard(bwd_pass=bwd_pass)
 
             # Record event to track when unshard is done for this module
             if async_op:

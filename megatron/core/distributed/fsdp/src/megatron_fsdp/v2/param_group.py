@@ -217,6 +217,21 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
+    def weight_buffers_for_unshard(self, bwd_pass: bool = False):
+        """Return weight buffers that must be unsharded for this pass."""
+        self._ensure_buffers_on_gpu()
+        return [
+            weight_buffer
+            for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+                self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
+            )
+            if weight_buffer is not None
+        ]
+
+    def post_unshard(self, bwd_pass: bool = False):
+        """Run post-unshard processing after required buffers have been gathered."""
+        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
+
     def unshard(
         self,
         bwd_pass: bool = False,
@@ -229,15 +244,9 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        self._ensure_buffers_on_gpu()
-
-        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
-        ):
-            if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=bind_params, stream=stream)
-
-        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
+        for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+            weight_buffer.unshard(bind_params=bind_params, stream=stream)
+        self.post_unshard(bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
         """Return whether this phase can skip launching another distributed unshard."""
