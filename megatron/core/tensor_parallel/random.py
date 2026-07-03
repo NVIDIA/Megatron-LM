@@ -770,11 +770,17 @@ class CheckpointManager:
         ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckptManager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
+        # Hook-driven path:
         ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+        # Or scheduler-driven path:
+        ckpt_manager.discard_all_outputs()
+        ckpt_manager.recompute_now()
     """
 
     def __init__(self):
         self.checkpoints = []
+        self._outputs_discarded = False
+        self._recomputed = False
         # Set by TransformerBlock before each layer forward.
         # When True, the layer should keep block-boundary output uncheckpointed.
         self.is_last_layer_in_recompute_block = False
@@ -789,19 +795,37 @@ class CheckpointManager:
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
-        for ckpt in self.checkpoints:
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+        self.discard_all_outputs()
 
         # Register unified recompute hook
         if hook_tensor.requires_grad:
             hook_tensor.register_hook(self._unified_recompute_hook)
 
-    def _unified_recompute_hook(self, grad_output):
+    def discard_all_outputs(self) -> None:
+        """Discard all managed checkpoint outputs without registering a backward hook."""
+        if self._outputs_discarded:
+            return
         for ckpt in self.checkpoints:
-            # Call _recompute for each checkpoint in forward order
-            # The _recompute method will restore the output tensor storage
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+        self._outputs_discarded = True
+
+    def recompute_now(self) -> None:
+        """Eagerly replay all managed checkpoints in their original forward order.
+
+        Replaying is idempotent because each ``CheckpointWithoutOutput`` clears its
+        context after the first successful recomputation.
+        """
+        if self._recomputed:
+            return
+        if not self._outputs_discarded:
+            raise RuntimeError("CheckpointManager.recompute_now() requires discarded outputs.")
+        for ckpt in self.checkpoints:
             ckpt._recompute(None)
+        self._recomputed = True
+
+    def _unified_recompute_hook(self, grad_output):
+        self.recompute_now()
 
 
 class CheckpointWithoutOutput(object):

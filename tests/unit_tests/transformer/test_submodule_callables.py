@@ -66,7 +66,8 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, dispatch, moe, combine, post_process = callables
+    attn, dispatch, moe, combine, mhc_post, post_process = callables
+    assert mhc_post is None
     assert post_process is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
@@ -75,6 +76,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         # build mock func/state
         node = DummyNode()
         node.is_mtp = False
+        node.is_last_layer = False
         node.chunk_state.model = dummy_model
 
         # attn fwd
