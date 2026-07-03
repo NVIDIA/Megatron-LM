@@ -897,6 +897,62 @@ class TestFusedPreGatedDeltaRule:
             fused_outputs, unfused_outputs, atol=2e-3, rtol=2e-3
         )
 
+    def test_fused_packed_g_softplus_matches_torch_for_large_alpha(self):
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        device = torch.cuda.current_device()
+        batch = 1
+        cu_seqlens = torch.tensor([0, 3, 8], device=device, dtype=torch.int32)
+        seq_len = cu_seqlens[-1].item()
+        num_value_heads = fused_gdn.num_v_heads_local_tp
+        beta_channel_offset = 2 * fused_gdn.qk_dim_local_tp + 2 * fused_gdn.v_dim_local_tp
+        alpha_channel_offset = beta_channel_offset + num_value_heads
+
+        qkvzba = torch.zeros(
+            (seq_len, batch, fused_gdn.in_proj_dim),
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            qkvzba[
+                :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+            ] = 100.0
+            fused_gdn.A_log.zero_()
+            fused_gdn.dt_bias.zero_()
+        fused_gdn.zero_grad(set_to_none=True)
+
+        *_, g = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cu_seqlens_q=cu_seqlens)
+
+        alpha = qkvzba[
+            :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+        ].transpose(0, 1)
+        expected_g = -torch.exp(fused_gdn.A_log.float()).view(1, 1, -1) * F.softplus(
+            alpha.float() + fused_gdn.dt_bias.float().view(1, 1, -1)
+        )
+        assert torch.isfinite(g).all()
+        torch.testing.assert_close(g.float(), expected_g, atol=0.0, rtol=0.0)
+
+        g.float().sum().backward()
+        expected_alpha_grad = -torch.ones_like(alpha.float())
+        expected_A_log_grad = expected_g.sum(dim=(0, 1))
+        expected_dt_bias_grad = -torch.full_like(fused_gdn.dt_bias.float(), seq_len * batch)
+        alpha_grad = qkvzba.grad[
+            :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+        ].transpose(0, 1)
+
+        assert torch.isfinite(alpha_grad).all()
+        assert torch.isfinite(fused_gdn.A_log.grad).all()
+        assert torch.isfinite(fused_gdn.dt_bias.grad).all()
+        torch.testing.assert_close(alpha_grad.float(), expected_alpha_grad, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            fused_gdn.A_log.grad.float(), expected_A_log_grad, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad.float(), expected_dt_bias_grad, atol=0.0, rtol=0.0
+        )
+
     def test_fused_and_unfused_packed_pre_gated_delta_rule_backward_match(self):
         reference_gdn = self._build_gdn(
             gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
