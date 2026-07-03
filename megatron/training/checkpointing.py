@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -65,9 +66,12 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
+    import modelopt.torch.utils.distributed as dist
+    import modelopt.torch.opt as mto
 
+    from modelopt.torch.opt.plugins import save_modelopt_state
     from megatron.post_training.utils import print_distributed_quant_summary
+
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
@@ -2286,3 +2290,56 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
+
+
+def remove_per_module_state(
+    modelopt_state: dict[str, Any],
+) -> None:
+    """Remove metadata from the modelopt_state.
+
+    The metadata of the modelopt_state contains keys which may change with different pipeline
+    and expert parallelism. As a result, the metadata must be stored as several ShardedObject with
+    global and local layer offset mapping.
+
+    Args:
+        modelopt_state: the state_dict that contains all algorithms that have been applied
+            to the given model.
+    """
+    if "modelopt_state_dict" not in modelopt_state:
+        return
+
+    for mode, config in modelopt_state["modelopt_state_dict"]:
+        metadata = config.get("metadata", None)
+        if metadata is not None:
+            _ = metadata.pop("quantizer_state", None)
+            _ = metadata.pop("subnet_config", None)
+            _ = metadata.pop("real_quantizer_state", None)
+            _ = metadata.pop("q_tensor_state", None)
+        else:
+            config["metadata"] = {}
+
+
+def save_sharded_modelopt_state(
+    model: list[torch.nn.Module],
+    checkpoint_name: str | Path,
+    sharded_strategy: tuple[str, int] | None = None,
+    prefix: str = "",
+) -> None:
+    """Save modelopt_state in the sharded state_dict format.
+
+    Args:
+        model: the model to restore the modelopt optimization
+        checkpoint_name: the checkpoint folder path
+        sharded_strategy: configures sharded tensors saving behavior and backend
+        prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
+    """
+    if not mto.ModeloptStateManager.is_converted(model[0]):
+        return
+    if len(model) > 1:
+        raise ValueError("sharded_modelopt_state does not support virtual pipeline parallel!")
+    modelopt_checkpoint_name = f"{checkpoint_name}/modelopt_state"
+    if dist.is_master():
+        os.makedirs(modelopt_checkpoint_name, exist_ok=True)
+    modelopt_state = copy.deepcopy(mto.modelopt_state(model[0]))
+    remove_per_module_state(modelopt_state)
+    dist_checkpointing.save(modelopt_state, modelopt_checkpoint_name, sharded_strategy)
