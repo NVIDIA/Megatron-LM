@@ -1029,6 +1029,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # miscellaneous
     ####################
+    log_per_layer_profiling: bool = False
+    """If set, a PerLayerProfiler is created on the TransformerBlock and hooks
+    are installed lazily on logged steps."""
+
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
