@@ -1679,6 +1679,18 @@ def wrap_model_chunks_with_ddp(
     return wrapped
 
 
+def _maybe_enable_modelopt(args):
+    if has_nvidia_modelopt and not getattr(args, "modelopt_enabled", False):
+        from megatron.post_training.checkpointing import has_modelopt_state
+
+        if args.load is not None and has_modelopt_state(args.load):
+            print_rank_0("ModelOpt checkpoint detected")
+            args.modelopt_enabled = True
+        if getattr(args, "export_kd_teacher_load", None):
+            # For distillation ckpts without ModelOpt state
+            args.modelopt_enabled = True
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1699,17 +1711,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")
 
-    if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
+    _maybe_enable_modelopt(args)
 
     # Build model.
     def build_model():
@@ -2016,6 +2018,8 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
+    _maybe_enable_modelopt(args)
+
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and hasattr(cfg_container, "model"):
             from megatron.training.utils import start_memory_history_recording
@@ -2024,7 +2028,12 @@ def setup_model_and_optimizer(
 
             cfg = cfg_container
             model_config = cfg.model
-            builder_cls = model_config.get_builder_cls()
+            if getattr(args, "modelopt_enabled", False):
+                from megatron.post_training.model_builder import ModelOptModelBuilder
+
+                builder_cls = ModelOptModelBuilder
+            else:
+                builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,

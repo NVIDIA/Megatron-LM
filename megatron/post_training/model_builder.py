@@ -17,15 +17,43 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel as MCoreHybridModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.models.gpt import GPTModelBuilder
+
+
+class ModelOptModelBuilder(GPTModelBuilder):
+    """ModelBuilder adapter for the legacy ModelOpt model construction path."""
+
+    def build_model(
+        self,
+        pg_collection: ProcessGroupCollection,
+        pre_process: bool | None = None,
+        post_process: bool | None = None,
+        vp_stage: int | None = None,
+    ) -> MegatronModule:
+        args = get_args()
+        if pre_process is None:
+            pre_process = is_pp_first_stage(pg_collection.pp)
+        if post_process is None:
+            post_process = is_pp_last_stage(pg_collection.pp)
+        return modelopt_gpt_hybrid_builder(
+            args,
+            pre_process,
+            post_process,
+            vp_stage,
+            pg_collection=pg_collection,
+        )
 
 logger = logging.getLogger(__name__)
 
