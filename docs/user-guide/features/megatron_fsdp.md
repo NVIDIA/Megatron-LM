@@ -345,6 +345,7 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 |--------------|-------------|----------------------|----------------------|
 | **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to supported Megatron-Core modules (`TransformerLayer`, etc.) in Megatron-LM. | `fsdp_unit_modules=[...]` |
 | **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` | `fsdp_double_buffer=True` |
+| **FSDP Max Pool Allocator** | Megatron-FSDP uses the `MaxPoolAllocator`, which supports double buffering hybrid / asymmetrical model architectures by taking the maximum of all layers. Automatically sets `--fsdp-double-buffer`. | `--megatron-fsdp-max-pool-double-buffer` | `maxpool_double_buffer=True` |
 | **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` | `overlap_param_gather=True` |
 | **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` | `overlap_grad_reduce=True` |
 | **FSDP Communication Size** | Customize the size (in `numel()` elements) of AG and RS communications in Megatron-FSDP, by limiting how many elements are concurrently pre-fetched or reduced for AG and RS. Effectively suggests how many FSDP units are processed concurrently, which may launch collectives earlier and improve performance. Optionally, tune this value depending on system memory and performance requirements. | `--suggested-communication-unit-size <num-elements>` | N/A (Megatron-Core Only) |
@@ -408,6 +409,15 @@ Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP u
 ```
 
 With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
+
+Not all model architectures support depth-wise model symmetry. For example, hybrid architectures like **Nemotron** are a combination of Transformer, Mamba, and MoE blocks that are asymmetrical in size and data-type. To double-buffer these model architectures, we need a pool of buffers that can support any FSDP unit, which can be computed from the _**maximum**_ of all FSDP units, and this "MaxPool" of (now symmetric) buffers of maximum size, shape, and dtype can be double-buffered.
+
+```{figure} ../../images/megatron_fsdp/maxpool_allocator.png
+:alt: MaxPoolAllocator
+:align: center
+
+Visualizing the MaxPoolAllocator initialization in Megatron-FSDP. Iterating through all FSDP units, data buckets are categorized by data-type, sorted from small to large, and compared to the current MaxPool. If there are not enough buckets in the pool to support the unit, buckets are added to the pool (with size 0). If the largest buckets of the pool are not large enough to support the buckets in the unit (assigned to the pool from smallest to largest), the buckets in the pool are enlarged. After this process, we arrive at a minimal set of buckets that can double-buffer every FSDP unit in the model.
+```
 
 ### Data-Parallel Sharding Strategies
 

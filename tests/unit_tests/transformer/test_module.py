@@ -8,6 +8,10 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+# Seed for the GB200 unit-test lane: launch this module on GB200 hardware
+# (4 GPUs/node) in CI. Extend coverage by adding this marker to other tests.
+pytestmark = pytest.mark.launch_on_gb200
+
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
