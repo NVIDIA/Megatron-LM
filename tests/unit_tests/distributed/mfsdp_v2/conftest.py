@@ -39,6 +39,7 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     if dist.is_initialized():
         # Keep the default process group alive for later distributed tests.
         if device.type == "cuda":
+            # Pass the device explicitly to suppress PyTorch's NCCL barrier warning.
             dist.barrier(device_ids=[device.index])
         else:
             dist.barrier()
