@@ -3095,6 +3095,8 @@ class TestThdPaddingRowMasking:
         cu_seqlens_q_unpadded.  Losses should match.
         """
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        if torch.cuda.get_device_capability()[0] == 9 and not sparse_loss:
+            pytest.skip("cuDNN Frontend SM90 dense DSA has a default-stream race")
         dev = 'cuda'
 
         # Baseline: tightly packed (real lengths only, no padding).

@@ -40,8 +40,6 @@ COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
-ARG CUDNN_FRONTEND_COMMIT=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d
-ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
@@ -63,12 +61,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusolver-cu12 \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
-        --no-install-package nvidia-nccl-cu12 \
-        --no-install-package nvidia-cudnn-frontend
-    uv pip install --no-build-isolation \
-        "flash-mla @ git+https://github.com/deepseek-ai/FlashMLA.git@${FLASH_MLA_COMMIT}" \
-        "nvidia-cudnn-frontend[cutedsl] @ git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_COMMIT}" \
-        "torch-c-dlpack-ext==0.1.5"
+        --no-install-package nvidia-nccl-cu12
 EOF
 
 # Install DeepEP
@@ -90,11 +83,6 @@ RUN bash -ex <<"EOF"
 EOF
 
 COPY assets/ /opt/data/
-# Reinstall CuTe DSL cleanly after upgrading the version provided by the base image.
-RUN uv pip install --reinstall --no-deps \
-    nvidia-cutlass-dsl==4.5.0 \
-    nvidia-cutlass-dsl-libs-base==4.5.0 \
-    nvidia-cutlass-dsl-libs-cu13==4.5.0
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
