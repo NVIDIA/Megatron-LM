@@ -70,5 +70,5 @@ MODEL_ARGS:
   --exit-interval: 100
 TEST_TYPE: ckpt-resume
 METRICS:
-  - lm loss # should be all zero
-  #- total loss # [TODO] values for this metric seem to be ruined by outdated checkpoint (renamed/missing keys)
+  - lm loss
+  - total loss
