@@ -306,10 +306,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        split_shapes = self._get_muon_split_shapes(p) if self.split_qkv else None
-        if split_shapes is not None:
-            grad = self._orthogonalize_split_grad(grad, split_shapes, tp_group, partition_dim)
-        else:
+        grad_was_split = False
+        if self.split_qkv:
+            split_shapes = self._get_muon_split_shapes(p)
+            if split_shapes is not None:
+                grad = self._orthogonalize_split_grad(grad, split_shapes, tp_group, partition_dim)
+                grad_was_split = True
+        if not grad_was_split:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
 
