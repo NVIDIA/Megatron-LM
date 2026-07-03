@@ -22,33 +22,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
-def _apply_yarn_config_from_args(config, args) -> None:
-    """Populate YaRN fields on config from args when not already set.
-
-    Preserves values already present on ``config`` (e.g. from YAML or a caller-
-    supplied config). YaRN-specific hyperparameters must be supplied via CLI
-    when ``position_embedding_type == 'yarn'`` (see functional test configs).
-    """
-    if args.position_embedding_type != 'yarn':
-        return
-
-    def _set_if_missing(attr: str, value) -> None:
-        if value is None:
-            return
-        if not hasattr(config, attr):
-            setattr(config, attr, value)
-
-    _set_if_missing('yarn_rotary_scaling_factor', args.rotary_scaling_factor)
-    _set_if_missing(
-        'yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings
-    )
-    _set_if_missing('yarn_beta_fast', args.yarn_beta_fast)
-    _set_if_missing('yarn_beta_slow', args.yarn_beta_slow)
-    _set_if_missing('yarn_mscale', args.mscale)
-    _set_if_missing('yarn_mscale_all_dim', args.mscale_all_dim)
-    _set_if_missing('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int)
-
-
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
@@ -56,7 +29,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
-    _apply_yarn_config_from_args(config, args)
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

@@ -711,11 +711,11 @@ class TestSplitSWiGLUPlainTensor:
         Fixed code: midpoint = 8//1//2 = 4 (correct).
         """
         tp_count = 1
-        global_numel = 8   # dist_param.numel()
+        global_numel = 8  # dist_param.numel()
         local_shard_numel = 3  # data.numel() on an uneven-shard rank
 
-        old_midpoint = local_shard_numel // tp_count // 2   # 1  — wrong
-        new_midpoint = global_numel // tp_count // 2         # 4  — correct
+        old_midpoint = local_shard_numel // tp_count // 2  # 1  — wrong
+        new_midpoint = global_numel // tp_count // 2  # 4  — correct
 
         assert old_midpoint != new_midpoint, "Bug scenario: midpoints must differ"
         assert new_midpoint == 4, f"Expected midpoint 4, got {new_midpoint}"

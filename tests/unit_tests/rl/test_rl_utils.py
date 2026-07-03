@@ -967,6 +967,9 @@ class TestRLUtils:
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
         wrapped_model = Float16Module(transformer_config, model)
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in wrapped_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         # Create test inputs (batch_size=1 required for thd format with sequence packing)
         batch_size = 1
