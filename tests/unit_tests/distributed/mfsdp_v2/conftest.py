@@ -38,4 +38,7 @@ def distributed_setup() -> Iterator[DistributedSetup]:
 
     if dist.is_initialized():
         # Keep the default process group alive for later distributed tests.
-        dist.barrier()
+        if device.type == "cuda":
+            dist.barrier(device_ids=[device.index])
+        else:
+            dist.barrier()
