@@ -149,6 +149,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        # A value of 1 is ordinary next-token training. Values > 1 enable
+        # Token-Superposition Training (TST) with that many raw tokens per bag.
+        self.token_superposition_size = int(
+            getattr(self.config, 'token_superposition_size', 1)
+        )
+        if self.token_superposition_size < 1:
+            raise ValueError(
+                "token_superposition_size must be at least 1, got "
+                f"{self.token_superposition_size}."
+            )
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -332,6 +342,184 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def _validate_token_superposition_inputs(
+        self,
+        input_ids: Tensor,
+        labels: Tensor,
+        decoder_input: Optional[Tensor],
+        attention_mask: Optional[Tensor],
+        loss_mask: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+    ) -> None:
+        """Validate the deliberately small first-pass TST support surface."""
+        s = self.token_superposition_size
+
+        if getattr(self.config, 'pipeline_model_parallel_size', 1) != 1:
+            raise NotImplementedError(
+                "Token superposition currently requires pipeline_model_parallel_size == 1. "
+                "Megatron's pipeline schedule otherwise expects the uncompressed sequence length."
+            )
+        if getattr(self.config, 'context_parallel_size', 1) != 1:
+            raise NotImplementedError(
+                "Token superposition currently requires context_parallel_size == 1."
+            )
+        if decoder_input is not None:
+            raise NotImplementedError(
+                "Token superposition currently requires HybridModel to build its own embeddings."
+            )
+        if input_ids is None or labels is None:
+            raise ValueError("Token superposition training requires both input_ids and labels.")
+        if input_ids.dim() != 2 or labels.dim() != 2:
+            raise ValueError(
+                "Token superposition expects input_ids and labels with shape [batch, sequence]."
+            )
+        if input_ids.shape != labels.shape:
+            raise ValueError(
+                "Token superposition expects input_ids and labels to have identical shapes; "
+                f"got {tuple(input_ids.shape)} and {tuple(labels.shape)}."
+            )
+        if input_ids.size(1) % s != 0:
+            raise ValueError(
+                f"Raw sequence length {input_ids.size(1)} must be divisible by "
+                f"token_superposition_size={s}."
+            )
+        if loss_mask is not None and loss_mask.shape != labels.shape:
+            raise ValueError(
+                "Token superposition expects loss_mask to have the same shape as labels."
+            )
+        if packed_seq_params is not None:
+            raise NotImplementedError(
+                "Packed sequences are not supported by this first-pass token-superposition path."
+            )
+        if attention_mask is not None:
+            raise NotImplementedError(
+                "An explicit attention_mask is not supported by this first-pass "
+                "token-superposition path. Use the model's ordinary causal-mask path."
+            )
+        if padding_mask is not None:
+            raise NotImplementedError(
+                "padding_mask is not supported by this first-pass token-superposition path."
+            )
+        if self.position_embedding_type == 'learned_absolute':
+            raise NotImplementedError(
+                "Learned absolute position embeddings need an explicit bag-position policy. "
+                "This first pass supports rope, yarn, MLA-managed positions, and none."
+            )
+        if self.mtp_process or getattr(self.config, 'mtp_num_layers', None) not in (None, 0):
+            raise NotImplementedError(
+                "Megatron MTP and token superposition are not combined in this first pass."
+            )
+
+    def _compute_token_superposition_embeddings(self, input_ids: Tensor) -> Tensor:
+        """Average each non-overlapping bag of token embeddings in fp32."""
+        s = self.token_superposition_size
+        batch_size, raw_sequence_length = input_ids.shape
+        grouped_input_ids = input_ids.reshape(batch_size, raw_sequence_length // s, s)
+
+        # Keep the loop on purpose: this mirrors the paper implementation and avoids
+        # materializing embeddings for the full raw sequence at once.
+        embeddings = self.embedding.word_embeddings(grouped_input_ids[..., 0])
+        embedding_dtype = embeddings.dtype
+        embeddings = embeddings.float()
+        for bag_offset in range(1, s):
+            embeddings = embeddings + self.embedding.word_embeddings(
+                grouped_input_ids[..., bag_offset]
+            ).float()
+        embeddings = (embeddings / s).to(embedding_dtype)
+
+        # Mirror LanguageModelEmbedding.forward after the word-embedding lookup.
+        # Learned absolute positions are rejected above because their bag-position
+        # convention is ambiguous; RoPE/Yarn are applied later at the latent length.
+        if not self.embedding.reduce_scatter_embeddings:
+            # [batch, latent_sequence, hidden] -> [latent_sequence, batch, hidden]
+            embeddings = embeddings.transpose(0, 1).contiguous()
+
+        if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
+            embeddings = embeddings * self.config.mup_embedding_mult
+
+        if self.config.fp32_residual_connection:
+            embeddings = embeddings.float()
+
+        if self.config.sequence_parallel:
+            if (
+                not self.embedding.reduce_scatter_embeddings
+                and self.embedding.scatter_to_sequence_parallel
+            ):
+                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                    embeddings, group=self.embedding.tp_group
+                )
+            if (
+                self.config.clone_scatter_output_in_embedding
+                and self.embedding.scatter_to_sequence_parallel
+            ):
+                embeddings = embeddings.clone()
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                embeddings = self.embedding.embedding_dropout(embeddings)
+        else:
+            embeddings = self.embedding.embedding_dropout(embeddings)
+
+        return embeddings
+
+    def _compute_token_superposition_loss(
+        self,
+        labels: Tensor,
+        logits: Tensor,
+        loss_mask: Optional[Tensor],
+    ) -> Tensor:
+        """Average ordinary CE over the s labels in each next-token bag.
+
+        The returned tensor is broadcast back to the ordinary [batch, raw_sequence]
+        loss shape. This lets the existing pretrain_hybrid.py loss reduction remain
+        unchanged: its masked mean of a broadcast scalar is the same scalar.
+        """
+        s = self.token_superposition_size
+        raw_sequence_length = labels.size(1)
+        latent_sequence_length = logits.size(0)
+        expected_latent_length = raw_sequence_length // s
+        if latent_sequence_length != expected_latent_length:
+            raise ValueError(
+                "Token-superposition logits have the wrong sequence length: expected "
+                f"{expected_latent_length}, got {latent_sequence_length}."
+            )
+
+        # Standard GPT labels are already shifted by one token. Starting at s - 1
+        # therefore makes latent bag j predict raw tokens [(j+1)s, (j+2)s - 1].
+        superposition_offset = s - 1
+        loss_sum = logits.float().new_zeros(())
+        weight_total = 0.0
+
+        for bag_offset in range(s):
+            start = superposition_offset + bag_offset
+            target = labels[:, start::s]
+            valid_length = min(target.size(1), latent_sequence_length)
+            if valid_length == 0:
+                continue
+
+            target = target[:, :valid_length].contiguous()
+            offset_logits = logits[:valid_length]
+
+            # Missing tail targets and ordinary masked labels are ignored. Replacing
+            # ignored target IDs with zero keeps the vocab-parallel CE kernel happy.
+            valid_target = target.ge(0)
+            if loss_mask is None:
+                offset_mask = valid_target.float()
+            else:
+                offset_mask = loss_mask[:, start::s][:, :valid_length].float()
+                offset_mask = offset_mask * valid_target.float()
+            safe_target = target.masked_fill(~valid_target, 0)
+
+            token_loss = self.compute_language_model_loss(safe_target, offset_logits).float()
+            denominator = offset_mask.sum().clamp_min(1.0)
+            loss_sum = loss_sum + (token_loss * offset_mask).sum() / denominator
+            weight_total += 1.0
+
+        if weight_total == 0.0:
+            raise ValueError("Token-superposition loss has no valid target offsets.")
+
+        scalar_loss = loss_sum / weight_total
+        return scalar_loss.expand_as(labels).contiguous()
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -446,11 +634,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        use_token_superposition = (
+            self.token_superposition_size > 1 and not in_inference_mode
+        )
+        if use_token_superposition:
+            self._validate_token_superposition_inputs(
+                input_ids=input_ids,
+                labels=labels,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if use_token_superposition:
+                decoder_input = self._compute_token_superposition_embeddings(input_ids)
+            else:
+                decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
@@ -618,6 +823,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        if use_token_superposition:
+            loss = self._compute_token_superposition_loss(labels, logits, loss_mask)
+        else:
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
