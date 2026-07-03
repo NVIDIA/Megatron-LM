@@ -77,6 +77,14 @@ def _g_beta_autotune_configs():
     ]
 
 
+@triton.jit
+def _softplus_with_torch_threshold(x):
+    """Match torch.nn.functional.softplus default threshold without exp overflow."""
+
+    exp_input = tl.minimum(x, 20.0)
+    return tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(exp_input)))
+
+
 @triton.autotune(
     configs=_conv_autotune_configs(),
     key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS"],
@@ -429,10 +437,7 @@ def _compute_g_and_beta_kernel(
     dt_bias = tl.load(dt_bias_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
 
     pre = alpha + dt_bias[None, :]
-    # softplus(x) = log(1 + exp(x)); torch's softplus thresholds at x>20 but we
-    # rely on fp32 evaluation here, which stays well within range for typical
-    # GDN inputs (the unfused path computes the same expression).
-    softplus_val = tl.log(1.0 + tl.exp(pre))
+    softplus_val = _softplus_with_torch_threshold(pre)
     g = -tl.exp(A_log)[None, :] * softplus_val
     beta_sig = tl.sigmoid(beta)
 
@@ -705,7 +710,7 @@ def _g_beta_backward_kernel(
 
     Forward:
         pre = alpha + dt_bias                       # fp32
-        softplus_pre = log(1 + exp(pre))
+        softplus_pre = softplus(pre)                # torch default threshold
         g       = -exp(A_log) * softplus_pre
         beta_sig = sigmoid(beta_raw)
 
@@ -749,8 +754,8 @@ def _g_beta_backward_kernel(
     dt_bias = tl.load(dt_bias_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
 
     pre = alpha + dt_bias[None, :]
-    sigmoid_pre = tl.sigmoid(pre)
-    softplus_pre = tl.log(1.0 + tl.exp(pre))
+    sigmoid_pre = tl.where(pre > 20.0, 1.0, tl.sigmoid(pre))
+    softplus_pre = _softplus_with_torch_threshold(pre)
     exp_A = tl.exp(A_log)[None, :]
     g = -exp_A * softplus_pre
     beta_sig = tl.sigmoid(beta_raw)
