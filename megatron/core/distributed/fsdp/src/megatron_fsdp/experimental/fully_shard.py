@@ -21,8 +21,6 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpModule
 from .placement import Placements
 
-__all__ = ["fully_shard"]
-
 
 def fully_shard(
     module: nn.Module,
