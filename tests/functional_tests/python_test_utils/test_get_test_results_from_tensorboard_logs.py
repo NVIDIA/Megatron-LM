@@ -16,11 +16,9 @@ import pytest
 from click.testing import CliRunner
 
 from tests.functional_tests.python_test_utils import common
-from tests.functional_tests.python_test_utils import (
-    get_test_results_from_tensorboard_logs as gtr,
-)
+from tests.functional_tests.python_test_utils import get_test_results_from_tensorboard_logs as gtr
 
-# ── helpers ─────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────
 
 
 def make_metric(values: dict, step_interval: int = 5) -> common.GoldenValueMetric:
@@ -75,10 +73,7 @@ class TestGoldenValueMetricRepr:
 
 class TestGoldenValuesRootModel:
     def test_round_trip_multiple_metrics(self):
-        metrics = {
-            "lm loss": make_metric({1: 1.0}),
-            "num-zeros": make_metric({1: 0.0}),
-        }
+        metrics = {"lm loss": make_metric({1: 1.0}), "num-zeros": make_metric({1: 0.0})}
         gv = common.GoldenValues(root=metrics)
         dumped = json.loads(gv.model_dump_json())
         reloaded = common.GoldenValues(**dumped).root
@@ -117,9 +112,7 @@ class TestCollectTrainTestMetrics:
             "not-a-golden-metric": make_metric({1: 42.0}),
         }
         out = tmp_path / "out.json"
-        result, _ = self._invoke(
-            monkeypatch, summaries, extra_args=["--output-path", str(out)]
-        )
+        result, _ = self._invoke(monkeypatch, summaries, extra_args=["--output-path", str(out)])
 
         assert result.exit_code == 0, result.output
         written = json.loads(out.read_text())
@@ -136,9 +129,7 @@ class TestCollectTrainTestMetrics:
 
     def test_no_logs_found_warns_and_writes_nothing(self, monkeypatch, tmp_path):
         out = tmp_path / "out.json"
-        result, _ = self._invoke(
-            monkeypatch, None, extra_args=["--output-path", str(out)]
-        )
+        result, _ = self._invoke(monkeypatch, None, extra_args=["--output-path", str(out)])
         assert result.exit_code == 0, result.output
         assert not out.exists()
 
@@ -149,18 +140,14 @@ class TestCollectTrainTestMetrics:
 
     def test_convergence_test_uses_index_minus_one(self, monkeypatch):
         result, captured = self._invoke(
-            monkeypatch,
-            {"lm loss": make_metric({1: 1.0})},
-            extra_args=["--is-convergence-test"],
+            monkeypatch, {"lm loss": make_metric({1: 1.0})}, extra_args=["--is-convergence-test"]
         )
         assert result.exit_code == 0, result.output
         assert captured["index"] == -1
 
     def test_step_size_is_forwarded(self, monkeypatch):
         result, captured = self._invoke(
-            monkeypatch,
-            {"lm loss": make_metric({1: 1.0})},
-            extra_args=["--step-size", "10"],
+            monkeypatch, {"lm loss": make_metric({1: 1.0})}, extra_args=["--step-size", "10"]
         )
         assert result.exit_code == 0, result.output
         assert captured["step_size"] == 10
