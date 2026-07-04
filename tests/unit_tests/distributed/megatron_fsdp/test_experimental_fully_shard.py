@@ -180,9 +180,7 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [
-        name for group in model.inner.parameter_groups for name in group.parameter_names
-    ]
+    inner_names = [name for group in model.inner.parameter_groups for name in group.parameter_names]
     outer_names = [name for group in model.parameter_groups for name in group.parameter_names]
 
     assert inner_names == ["weight"]
