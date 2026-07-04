@@ -542,7 +542,16 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    if _HAS_SHARED_CALIB:
+    # A local .jsonl calibration file must always use the local-file loop below, even
+    # on modelopt 0.45+: the shared Megatron calibration loop fetches its dataset from
+    # the HuggingFace Hub, which fails in an offline environment (e.g. CI runs with
+    # HF_HUB_OFFLINE set). Falling back to the local path lets calibration run from a
+    # staged .jsonl without any Hub access.
+    _calib_is_local_jsonl = os.path.isfile(args.calib_dataset_path_or_name) and (
+        args.calib_dataset_path_or_name.endswith(".jsonl")
+    )
+
+    if _HAS_SHARED_CALIB and not _calib_is_local_jsonl:
         _dataset_forward_loop_func = get_megatron_calibration_forward_loop(
             tokenizer,
             dataset_name=args.calib_dataset_path_or_name,
