@@ -1542,7 +1542,10 @@ def _pad_attn_target_heads(
 ) -> Tuple[Tensor, Tensor, int]:
     """Pad local query heads to cuDNN sparse-score-recompute MMA constraints."""
     actual_heads = q_attn_bshd.size(2)
-    padded_heads = max(min_heads, round_up_to_nearest_multiple(actual_heads, head_multiple))
+    if q_attn_bshd.is_cuda:
+        padded_heads = _get_head_padding(actual_heads)
+    else:
+        padded_heads = max(min_heads, round_up_to_nearest_multiple(actual_heads, head_multiple))
     if padded_heads == actual_heads:
         return q_attn_bshd, lse, actual_heads
 
