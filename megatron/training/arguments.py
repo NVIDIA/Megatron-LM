@@ -3121,9 +3121,9 @@ def _add_biencoder_args(parser):
 def _add_vision_args(parser):
     group = parser.add_argument_group(title="vision")
 
-    # general vision arguements
+    # general vision arguments
     group.add_argument('--num-classes', type=int, default=1000,
-                       help='num of classes in vision classificaiton task')
+                       help='num of classes in vision classification task')
     group.add_argument('--img-h', type=int, default=224,
                        help='Image height for vision classification task')
     group.add_argument('--img-w', type=int, default=224,
