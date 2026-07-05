@@ -1970,15 +1970,16 @@ class DSAttention(MegatronModule):
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
                 q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-                if cp_size > 1 and local_cp_kv_len is not None and k.size(0) == local_cp_kv_len:
+                if cp_size > 1 and k.size(0) in local_cp_kv_lens:
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
                     k = gather_from_sequence_parallel_region(k, group=cp_group)
-                    if kv_reorder_idx is not None:
-                        if k.size(0) != kv_reorder_idx.numel():
-                            raise RuntimeError(
-                                "DSA gathered indexer-key length mismatch: "
-                                f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
-                            )
-                        k = k.index_select(0, kv_reorder_idx)
+                    if k.size(0) != kv_reorder_idx.numel():
+                        raise RuntimeError(
+                            "DSA gathered indexer-key length mismatch: "
+                            f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
+                        )
+                    k = k.index_select(0, kv_reorder_idx)
                 if sequence_parallel_tp and q.size(0) != sq:
                     if (
                         q.size(0) != sequence_parallel_tp_full_rows

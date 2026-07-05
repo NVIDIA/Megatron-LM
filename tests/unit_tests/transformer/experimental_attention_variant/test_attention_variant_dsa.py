@@ -2803,6 +2803,85 @@ class TestDSAttention:
         assert seen["single_packed_thd_sequence"] is True
         assert seen["local_packed_cp_rank"] == cp_rank
 
+    def test_packed_cp_gathers_local_indexer_key_with_global_attention_kv(self, monkeypatch):
+        """A pre-gathered attention KV still requires gathering the local indexer key."""
+        seq_len = 4
+        cp_size = 2
+        cp_rank = 1
+        global_seq_len = seq_len * cp_size
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        cp_group = _FakeCPGroup(cp_size, cp_rank)
+        gathered_cp_lengths = []
+        seen = {}
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.randn(seq_len, batch_size, 2, 4),
+                torch.randn(seq_len, batch_size, 4),
+                torch.ones(seq_len, batch_size, 2),
+            )
+
+        expected_output = torch.randn(seq_len, batch_size, self.config.hidden_size)
+
+        def _fake_run_fused_attention(**kwargs):
+            seen["k_indexer_len"] = kwargs["k_indexer"].size(0)
+            seen["key_len"] = kwargs["key"].size(0)
+            return expected_output, None
+
+        def _fake_gather_from_sequence_parallel_region(tensor, group):
+            if group is cp_group:
+                gathered_cp_lengths.append(tensor.size(0))
+                return torch.cat([tensor, tensor], dim=0)
+            return tensor
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", False)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_dsa_attention",
+            _fake_run_fused_attention,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "gather_from_sequence_parallel_region",
+            _fake_gather_from_sequence_parallel_region,
+        )
+
+        cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+            max_seqlen_q=global_seq_len,
+            max_seqlen_kv=global_seq_len,
+        )
+        output = self.sparse_attention(
+            query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+            key=torch.randn(global_seq_len, batch_size, num_heads, head_dim),
+            value=torch.randn(global_seq_len, batch_size, num_heads, head_dim),
+            x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+            qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+            attention_mask=None,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=packed_seq_params,
+        )
+
+        torch.testing.assert_close(output, expected_output)
+        assert gathered_cp_lengths == [seq_len]
+        assert seen["k_indexer_len"] == global_seq_len
+        assert seen["key_len"] == global_seq_len
+
     def test_nonpacked_tp_sequence_parallel_uses_global_causal_rows(self, monkeypatch):
         """A sequence-local TP rank should use its global rows for causal bounds."""
         seq_len = 4
