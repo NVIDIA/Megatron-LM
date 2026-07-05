@@ -27,6 +27,8 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 # ---------------------------------------------------------------------------
@@ -468,6 +470,143 @@ def dsa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+@triton.jit
+def _dsa_indexer_score_kernel(
+    q_ptr, k_ptr, w_ptr, o_ptr,
+    q_start, q_len, seqlen_k,
+    stride_qm, stride_qh, stride_qd,
+    stride_kn, stride_kd,
+    stride_wm, stride_wh,
+    stride_om, stride_on,
+    H: tl.constexpr, D: tl.constexpr, RATIO: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Fused lightning-indexer score for one ``[BLOCK_M, BLOCK_N]`` output tile.
+
+    ``score[m, n] = sum_h relu(q[m, h, :] . k[n, :]) * w[m, h]`` with a *compressed*
+    causal mask: query at global position ``q_start + m`` may attend compressed key
+    ``n`` iff ``n < (q_start + m + 1) // RATIO`` (clamped to ``seqlen_k``). ``k`` is
+    shared across heads (multi-query), loaded once per tile; the per-head relu and
+    weighted head-sum accumulate in fp32 registers so the ``[H, M, N]`` intermediate
+    is never materialized.
+
+    All offsets feeding pointer arithmetic are promoted to int64 — at 131k the
+    element offsets (``offs * stride``) overflow int32.
+    """
+    # int64 BEFORE the multiply: pid*BLOCK must not be computed in int32 (overflows
+    # int32 once chunk/seq grows). Cast program_id and q_start to int64 up front so
+    # every derived offset and address is 64-bit.
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+    q_start = q_start.to(tl.int64)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
+    offs_d = tl.arange(0, D).to(tl.int64)
+
+    m_valid = offs_m < q_len
+    n_valid = offs_n < seqlen_k
+
+    # k tile [BLOCK_N, D], shared across all query heads.
+    k = tl.load(
+        k_ptr + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+        mask=n_valid[:, None], other=0.0,
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for h in range(H):
+        q = tl.load(
+            q_ptr + offs_m[:, None] * stride_qm + h * stride_qh + offs_d[None, :] * stride_qd,
+            mask=m_valid[:, None], other=0.0,
+        )
+        s = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)  # per-head relu, fp32 accumulate
+        w = tl.load(w_ptr + offs_m * stride_wm + h * stride_wh, mask=m_valid, other=0.0)
+        acc += s * w[:, None]
+
+    # Compressed causal: query (q_start + m) may attend compressed key n iff
+    # n < (q_start + m + 1) // RATIO. n_valid already bounds n < seqlen_k, so this
+    # is equivalent to clamping the valid count to seqlen_k.
+    q_global = q_start + offs_m  # int64
+    valid = (q_global + 1) // RATIO  # (BLOCK_M,) int64
+    keep = (offs_n[None, :] < valid[:, None]) & n_valid[None, :]
+    acc = tl.where(keep, acc, float("-inf"))
+
+    tl.store(
+        o_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc,
+        mask=m_valid[:, None] & n_valid[None, :],
+    )
+
+
+import os as _os
+_DSV4_INDEXER_QBLOCK = int(_os.environ.get("DSV4_INDEXER_QBLOCK", "4096"))
+
+
+def _chunked_indexer_topk_bshd(
+    q_bshd: Tensor,
+    k_bsd: Tensor,
+    w_bsh: Tensor,
+    topk: int,
+    ratio: int = 4,
+    query_block_size: int = _DSV4_INDEXER_QBLOCK,
+) -> Tuple[Tensor, Tensor]:
+    """Frozen-indexer top-k without materializing the dense ``(b, sq, sk)`` scores.
+
+    Drop-in replacement for the score+top-k half of :func:`_indexer_topk_bshd` used
+    on the frozen-indexer path (``dsa_indexer_loss_coeff == 0``): the lightning-indexer
+    score is computed by ``_dsa_indexer_score_kernel`` in query chunks, so peak logits
+    memory is ``O(query_block_size * sk)`` instead of ``O(sq * sk)`` (32 GiB at 131k).
+    ``torch.topk`` selects per chunk; rows with fewer valid (causal) keys than ``topk``
+    get ``-1`` in the surplus slots, matching the cuDNN path's semantics.
+
+    Returns ``(topk_indices (b, sq, topk) int32, topk_length (b, sq) int32)``.
+    """
+    b, sq, n_heads, head_dim = q_bshd.shape
+    sk = k_bsd.shape[1]
+    device = q_bshd.device
+    if b != 1:
+        raise RuntimeError(f"chunked frozen indexer requires microbatch size 1, got {b}.")
+    topk_k = min(topk, sk)
+    if topk_k < 1:
+        raise ValueError(f"index_topk must be positive, got {topk}.")
+
+    # Drop the size-1 batch dim: q -> [Sq, H, D], k -> [Sk, D], w -> [Sq, H].
+    q2 = q_bshd[0].contiguous()
+    k2 = k_bsd[0].contiguous()
+    w2 = w_bsh[0].float().contiguous()
+
+    BLOCK_M, BLOCK_N = 64, 128
+    idx_chunks = []
+    for q_start in range(0, sq, query_block_size):
+        q_end = min(q_start + query_block_size, sq)
+        q_len = q_end - q_start
+        qs = q2[q_start:q_end]
+        ws = w2[q_start:q_end]
+        logits = torch.empty((q_len, sk), dtype=torch.float32, device=device)
+        grid = (triton.cdiv(q_len, BLOCK_M), triton.cdiv(sk, BLOCK_N))
+        _dsa_indexer_score_kernel[grid](
+            qs, k2, ws, logits,
+            q_start, q_len, sk,
+            qs.stride(0), qs.stride(1), qs.stride(2),
+            k2.stride(0), k2.stride(1),
+            ws.stride(0), ws.stride(1),
+            logits.stride(0), logits.stride(1),
+            H=n_heads, D=head_dim, RATIO=ratio,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        )
+        sc, idx = logits.topk(topk_k, dim=-1)  # (q_len, topk_k)
+        # Mask surplus slots (causally-invalid rows scored -inf) to -1.
+        idx = torch.where(sc > float("-inf"), idx.to(torch.int32), torch.full_like(idx, -1, dtype=torch.int32))
+        idx_chunks.append(idx)
+
+    topk_indices = torch.cat(idx_chunks, dim=0)  # (sq, topk_k)
+    if topk_k < topk:
+        pad = torch.full((sq, topk - topk_k), -1, dtype=torch.int32, device=device)
+        topk_indices = torch.cat([topk_indices, pad], dim=-1)
+    topk_indices = topk_indices.unsqueeze(0)  # (1, sq, topk)
+    topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (1, sq)
+    return topk_indices, topk_length
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -673,6 +812,13 @@ def indexer_topk(
         q = q_indexer.permute(1, 0, 2, 3).contiguous()
         k = k_indexer.permute(1, 0, 2).contiguous()
         w = weights.permute(1, 0, 2).contiguous()
+        # Frozen-indexer top-k selection only needs the top-k indices, never the
+        # dense (b, sq, sk) scores. For the mb=1 BSHD path use the chunked Triton
+        # scorer so the O(seq^2) score tensor (32 GiB at 131k) is never
+        # materialized. THD (packed/CP) inputs keep the core path: their per-rank
+        # local sq is already sharded by CP.
+        if q.shape[0] == 1:
+            return _chunked_indexer_topk_bshd(q, k, w, topk, ratio)
 
     topk_indices, topk_length, _ = _indexer_topk_core(
         q,
@@ -1095,19 +1241,33 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # requires a consistent TopK dimension; _indexer_topk_core handles the
         # case where sk < topk internally (selects min(topk, sk) values, then
         # pads to topk with -1).
-        topk_indices_cmp, _, indexer_scores = _indexer_topk_core(
-            q_indexer_flat,
-            k_indexer_flat,
-            w_indexer_scaled,
-            indexer_topk,
-            ratio,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_compressed_idx,
-            max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
-            max_seqlen_kv=(
-                int(max_seqlen_compressed_idx) if max_seqlen_compressed_idx is not None else None
-            ),
-        )
+        # Frozen indexer (loss_coeff == 0, the DSv4 recipe default) on the SBHD
+        # mb=1 path: use the chunked Triton scorer so the O(seq^2) score tensor
+        # (32 GiB at 131k) is never materialized — only top-k indices are needed
+        # and there is no backward through the indexer. THD (packed/CP) inputs
+        # keep the core path: their per-rank local sq is already sharded by CP.
+        if loss_coeff == 0 and not is_thd and q_indexer_flat.shape[0] == 1:
+            with torch.no_grad():
+                topk_indices_cmp, _ = _chunked_indexer_topk_bshd(
+                    q_indexer_flat, k_indexer_flat, w_indexer_scaled, indexer_topk, ratio
+                )
+            indexer_scores = None
+        else:
+            topk_indices_cmp, _, indexer_scores = _indexer_topk_core(
+                q_indexer_flat,
+                k_indexer_flat,
+                w_indexer_scaled,
+                indexer_topk,
+                ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_compressed_idx,
+                max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
+                max_seqlen_kv=(
+                    int(max_seqlen_compressed_idx)
+                    if max_seqlen_compressed_idx is not None
+                    else None
+                ),
+            )
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
         if is_thd:
@@ -1173,103 +1333,110 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
             padding_row_mask = pos_in_seg >= real_len_per_row
 
+
         # ---- 5. Derive predict from indexer_scores, compute target. ----------
-        # Layout-specific attn tensors (detached — loss is not differentiable
-        # through them).
-        if is_thd:
-            assert compressed_kv is not None, "compressed_kv is required for THD"
-            q_attn_det = query.detach()
-            k_attn_compressed_det = compressed_kv.detach()
-            lse_indexer_det = lse_indexer.detach()
-        else:
-            q_attn_det = query.detach().permute(1, 0, 2, 3).contiguous()
-            k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
-            lse_indexer_det = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
-
-        # Invalidate padding rows for the loss/backward path.  The sparse
-        # attention (steps 3-4) has already built global_idxs from the
-        # original topk_indices_cmp, so this mutation only affects steps 5-7.
-        if padding_row_mask is not None:
-            topk_indices_cmp = topk_indices_cmp.clone()
-            topk_indices_cmp[padding_row_mask] = -1
-            indexer_scores = indexer_scores.clone()
-            indexer_scores[padding_row_mask] = float('-inf')
-
-        if sparse_loss:
-            # Derive predict: gather topk scores from indexer_scores → softmax.
-            safe_indices = topk_indices_cmp.clamp(min=0).long()
-            gathered_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
-            gathered_scores = torch.where(
-                topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
-            )
-            predict = torch.softmax(gathered_scores, dim=-1)
-
-            # THD: _compute_attn_target's kernel addresses K by flat ids over
-            # the packed (total_k, D) buffer, so promote per-segment-local
-            # indices to flat-global against cu_seqlens_compressed_idx.
+        # Only needed to train the indexer (loss_coeff > 0). On the frozen path
+        # (loss_coeff == 0, the DSv4 recipe default) indexer_scores is None and
+        # there is nothing to compute.
+        if loss_coeff > 0:
+            # Layout-specific attn tensors (detached — loss is not differentiable
+            # through them).
             if is_thd:
-                topk_for_target = local_to_global_flat(
-                    topk_indices_cmp,
-                    batch_size=-1,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_compressed_idx,
-                )
+                assert compressed_kv is not None, "compressed_kv is required for THD"
+                q_attn_det = query.detach()
+                k_attn_compressed_det = compressed_kv.detach()
+                lse_indexer_det = lse_indexer.detach()
             else:
-                topk_for_target = topk_indices_cmp
+                q_attn_det = query.detach().permute(1, 0, 2, 3).contiguous()
+                k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+                lse_indexer_det = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
 
-            target = _compute_attn_target(
-                q_attn_det,
-                k_attn_compressed_det,
-                lse_indexer_det,
-                topk_for_target,
-                softmax_scale,
-                qhead_per_kv_head=np_,
-                topk_indices_global=is_thd,
-            )
-
-            if loss_coeff > 0:
-                indexer_loss = _kl_loss_from_target_predict(
-                    target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
-                )
-            else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
-        else:
-            index_score = indexer_scores
-            index_lse = torch.logsumexp(indexer_scores, dim=-1)
-
-            k_unsqueeze_dim = 1 if is_thd else 2
-            dense_attn_kwargs = {}
-            if is_thd:
-                dense_attn_kwargs = dict(
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_compressed_idx,
-                    max_seqlen_q=int(max_seqlen_q),
-                    max_seqlen_kv=int(max_seqlen_compressed_idx),
-                )
-            attn_score, attn_l1norm = _compute_dense_attn_score(
-                q_attn_det,
-                k_attn_compressed_det.unsqueeze(k_unsqueeze_dim),
-                lse_indexer_det,
-                qhead_per_kv_head=np_,
-                softmax_scale=softmax_scale,
-                ratio=ratio,
-                **dense_attn_kwargs,
-            )
+            # Invalidate padding rows for the loss/backward path.  The sparse
+            # attention (steps 3-4) has already built global_idxs from the
+            # original topk_indices_cmp, so this mutation only affects steps 5-7.
             if padding_row_mask is not None:
-                attn_score = attn_score.masked_fill(padding_row_mask.unsqueeze(-1), 0)
-                attn_l1norm = attn_l1norm.masked_fill(padding_row_mask, 0)
+                topk_indices_cmp = topk_indices_cmp.clone()
+                topk_indices_cmp[padding_row_mask] = -1
+                indexer_scores = indexer_scores.clone()
+                indexer_scores[padding_row_mask] = float('-inf')
 
-            if loss_coeff > 0:
-                indexer_loss = _kl_loss_from_dense_scores(
-                    attn_score,
-                    attn_l1norm,
-                    index_score,
-                    index_lse,
-                    loss_coeff,
-                    calculate_per_token_loss,
+            if sparse_loss:
+                # Derive predict: gather topk scores from indexer_scores → softmax.
+                safe_indices = topk_indices_cmp.clamp(min=0).long()
+                gathered_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
+                gathered_scores = torch.where(
+                    topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
                 )
+                predict = torch.softmax(gathered_scores, dim=-1)
+
+                # THD: _compute_attn_target's kernel addresses K by flat ids over
+                # the packed (total_k, D) buffer, so promote per-segment-local
+                # indices to flat-global against cu_seqlens_compressed_idx.
+                if is_thd:
+                    topk_for_target = local_to_global_flat(
+                        topk_indices_cmp,
+                        batch_size=-1,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_compressed_idx,
+                    )
+                else:
+                    topk_for_target = topk_indices_cmp
+
+                target = _compute_attn_target(
+                    q_attn_det,
+                    k_attn_compressed_det,
+                    lse_indexer_det,
+                    topk_for_target,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                    topk_indices_global=is_thd,
+                )
+
+                if loss_coeff > 0:
+                    indexer_loss = _kl_loss_from_target_predict(
+                        target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
+                    )
+                else:
+                    indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
             else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
+                index_score = indexer_scores
+                index_lse = torch.logsumexp(indexer_scores, dim=-1)
+
+                k_unsqueeze_dim = 1 if is_thd else 2
+                dense_attn_kwargs = {}
+                if is_thd:
+                    dense_attn_kwargs = dict(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_compressed_idx,
+                        max_seqlen_q=int(max_seqlen_q),
+                        max_seqlen_kv=int(max_seqlen_compressed_idx),
+                    )
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    q_attn_det,
+                    k_attn_compressed_det.unsqueeze(k_unsqueeze_dim),
+                    lse_indexer_det,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
+                    ratio=ratio,
+                    **dense_attn_kwargs,
+                )
+                if padding_row_mask is not None:
+                    attn_score = attn_score.masked_fill(padding_row_mask.unsqueeze(-1), 0)
+                    attn_l1norm = attn_l1norm.masked_fill(padding_row_mask, 0)
+
+                if loss_coeff > 0:
+                    indexer_loss = _kl_loss_from_dense_scores(
+                        attn_score,
+                        attn_l1norm,
+                        index_score,
+                        index_lse,
+                        loss_coeff,
+                        calculate_per_token_loss,
+                    )
+                else:
+                    indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
+        else:
+            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
 
         # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
         # The actual grad_loss scaling is deferred to backward (when

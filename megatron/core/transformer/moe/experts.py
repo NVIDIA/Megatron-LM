@@ -826,9 +826,11 @@ class TEGroupedMLP(MegatronModule):
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
                             x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
-                        )
+                        # glu_linear_offset==0 (DSv4 default): skip the redundant
+                        # x_linear+0.0 copy (saves a GLU-sized ~1.5-3 GiB alloc at 131k).
+                        _xl = (x_linear if self.config.glu_linear_offset == 0.0
+                               else x_linear + self.config.glu_linear_offset)
+                        return self.config.activation_func(x_glu) * _xl
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
