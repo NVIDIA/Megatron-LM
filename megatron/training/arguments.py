@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import json
 import os
+import warnings
 from pathlib import Path
 import re
 import types
@@ -1293,9 +1294,20 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.moe_grouped_gemm:
+    # validate_args may run device-less (a launcher/driver parsing args before
+    # device init), so gate each device probe below on torch.cuda.is_available().
+    # The feature flag is checked first so is_available() (and its CUDA-init /
+    # fork-safety cost) is reached only for configs that already probed the device.
+    if args.moe_grouped_gemm and torch.cuda.is_available():
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
+    elif args.moe_grouped_gemm:
+        warnings.warn(
+            "Skipping the GroupedGEMM compute-capability check (>= 8.0) because no "
+            "CUDA device is visible to this process. Ensure the GPU workers have "
+            "compute capability >= 8.0.",
+            stacklevel=2,
+        )
 
     if args.no_weight_decay_cond_type is not None:
         print_rank_0(
@@ -1369,6 +1381,29 @@ def validate_args(args, defaults={}):
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+        and not torch.cuda.is_available():
+        # Can't read the arch here; warn instead. The correct env value depends on
+        # flags knowable without a device, so mirror the device-side guidance below.
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            cdmc_hint = (
+                "with Torch-FSDP2 / Megatron-FSDP, CUDA_DEVICE_MAX_CONNECTIONS should "
+                "NOT be set to 1"
+            )
+        elif args.overlap_moe_expert_parallel_comm:
+            cdmc_hint = (
+                "with overlap_moe_expert_parallel_comm, set CUDA_DEVICE_MAX_CONNECTIONS "
+                "to 1 or a larger value (e.g. 32) depending on which parallelization to "
+                "prioritize"
+            )
+        else:
+            cdmc_hint = "set CUDA_DEVICE_MAX_CONNECTIONS=1"
+        warnings.warn(
+            "Skipping the arch-dependent CUDA_DEVICE_MAX_CONNECTIONS check because no "
+            "CUDA device is visible to this process. On pre-Blackwell GPU workers, "
+            f"{cdmc_hint}.",
+            stacklevel=2,
+        )
+    elif (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
         and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_megatron_fsdp:
@@ -1399,7 +1434,20 @@ def validate_args(args, defaults={}):
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
+    # This branch mutates args (the FSDP high-priority stream groups), so warn
+    # rather than silently skip it when the arch can't be read device-less.
+    if args.use_megatron_fsdp and not args.use_torch_fsdp2 and not torch.cuda.is_available():
+        warnings.warn(
+            "Cannot determine GPU arch on a device-less process, so the FSDP "
+            "high-priority stream groups are not configured here. Configure them "
+            "on a process that can see the device.",
+            stacklevel=2,
+        )
+
+    # Parenthesized to preserve the original precedence: fsdp2 OR (mfsdp AND arch>=10).
+    if args.use_torch_fsdp2 or (
+        args.use_megatron_fsdp and torch.cuda.is_available() and get_device_arch_version() >= 10
+    ):
         if 'dp_cp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
