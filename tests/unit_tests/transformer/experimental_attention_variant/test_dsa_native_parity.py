@@ -557,6 +557,84 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("max_segment_k", [5, 6], ids=["odd-k", "even-k"])
+@pytest.mark.parametrize("return_topk_scores", [False, True], ids=["indices", "scores"])
+def test_cudnn_indexer_topk_multi_packed_cp_selects_all_segment_keys(
+    monkeypatch, max_segment_k, return_topk_scores
+):
+    class FakeDSA:
+        @staticmethod
+        def indexer_forward_wrapper(
+            q, k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+        ):
+            del k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
+            return {
+                "scores": torch.arange(max_seqlen_k, dtype=torch.float32)
+                .view(1, max_seqlen_k)
+                .expand(q.size(0), max_seqlen_k)
+                .contiguous()
+            }
+
+        @staticmethod
+        def indexer_top_k_wrapper(*args, **kwargs):
+            raise AssertionError("all-column selection must bypass the cuDNN top-k kernel")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+
+    starts = torch.tensor([0, 0, 4, 4])
+    ends = torch.tensor([1, 4, 5, 8])
+    topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones((1, 4, 1, 1)),
+        torch.ones((1, 8, 1)),
+        torch.ones((1, 4, 1)),
+        topk=8,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        return_scores=False,
+        return_topk_scores=return_topk_scores,
+        use_local_indexer_varlen=True,
+        packed_cu_seqlens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        packed_cu_seqlens_k=torch.tensor([0, 4, 8], dtype=torch.int32),
+        packed_max_seqlen_q=4,
+        packed_max_seqlen_k=max_segment_k,
+        packed_cp_size=2,
+        local_packed_cp_rank=0,
+    )
+
+    expected_indices = torch.tensor(
+        [
+            [
+                [0, -1, -1, -1, -1, -1, -1, -1],
+                [0, 1, 2, 3, -1, -1, -1, -1],
+                [4, -1, -1, -1, -1, -1, -1, -1],
+                [4, 5, 6, 7, -1, -1, -1, -1],
+            ]
+        ],
+        dtype=torch.int32,
+    )
+    expected_scores = torch.tensor(
+        [
+            [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 1, 2, 3, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 1, 2, 3, 0, 0, 0, 0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    expected_scores.masked_fill_(expected_indices < 0, torch.finfo(torch.float32).min)
+    torch.testing.assert_close(topk_indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(
+        topk_length, torch.tensor([[1, 4, 1, 4]], dtype=torch.int32), rtol=0, atol=0
+    )
+    if return_topk_scores:
+        torch.testing.assert_close(topk_scores, expected_scores, rtol=0, atol=0)
+    else:
+        assert topk_scores is None
+
+
 def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",

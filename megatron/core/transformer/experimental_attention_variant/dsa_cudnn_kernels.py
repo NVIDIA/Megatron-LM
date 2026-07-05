@@ -776,6 +776,15 @@ def _indexer_topk_multi_packed_cp_thd(
     )["scores"]
 
     segment_topk = min(topk_k, max_segment_k)
+    if segment_topk == max_segment_k:
+        # Ranking is unnecessary when K covers every score column. This also
+        # avoids cuDNN FE's vectorized-output restriction for large odd K.
+        topk_indices = torch.arange(segment_topk, dtype=torch.int32, device=device).view(
+            1, 1, segment_topk
+        ) + starts.view(1, sq, 1).to(dtype=torch.int32)
+        topk_scores = scores.view(1, sq, segment_topk) if return_topk_scores else None
+        return _pad_topk_result(topk_indices, topk_scores, topk_k)
+
     local_seq_lens = (ends - starts).clamp(max=max_segment_k).to(torch.int32).contiguous()
     use_tie_break = _use_dense_indexer_topk_tie_break(scores, segment_topk)
     scores_for_topk = _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
