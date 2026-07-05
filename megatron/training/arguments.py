@@ -2369,6 +2369,13 @@ def _add_rl_args(parser):
                         'This evaluation can be very expensive when using environments'
                         'that evaluate pass@k so we default to a lower number.')
     # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
+    group.add_argument('--rl-rollout-keepalive-interval', type=float, default=0.0,
+                       help='If > 0, rank 0 submits a tiny dummy generation to the inference '
+                            'engine every this many seconds while in inference mode (rollout '
+                            'collection and evaluation). Keeps SM utilization above cluster '
+                            'idle-GPU watchdog thresholds when agentic environments (e.g. SWE '
+                            'containers running test suites) leave the engine legitimately '
+                            'idle for long stretches. 0 disables.')
     group.add_argument('--grpo-prompts-per-step', type=int, default=32,
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,

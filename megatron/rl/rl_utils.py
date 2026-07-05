@@ -2537,6 +2537,86 @@ def calculate_grpo_loss(
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
 
 
+async def _rollout_keepalive(inference_interface, interval_s, requests_per_tick, stop_event):
+    """Submit tiny dummy generations while the engine sits in inference mode.
+
+    Agentic environments (SWE containers building repos and running test suites)
+    leave the engine with no decode work for tens of minutes, which cluster
+    idle-GPU watchdogs read as an abandoned job. A short burst of generation per
+    interval keeps mean SM utilization above the kill threshold. Must never
+    raise: keepalive is cosmetic and losing it must not affect training.
+    """
+    import asyncio
+
+    from megatron.rl import GenericGenerationArgs
+    from megatron.rl.inference.api import InferenceRequest, LLMChatMessage
+
+    request = InferenceRequest(
+        prompt=[LLMChatMessage(role='user', content='keepalive ping')],
+        generation_args=GenericGenerationArgs(max_tokens=8, temperature=1.0),
+    )
+    consecutive_failures = 0
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        try:
+            # requests_per_tick requests so the coordinator's round-robin
+            # reaches every inference DP group, not just one engine.
+            await asyncio.gather(
+                *[inference_interface.agenerate(request) for _ in range(requests_per_tick)]
+            )
+            consecutive_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            consecutive_failures += 1
+            if consecutive_failures == 1:
+                logger.warning("Rollout keepalive generation failed; retrying quietly.", exc_info=True)
+            if consecutive_failures >= 10:
+                logger.warning("Rollout keepalive disabled after 10 consecutive failures.")
+                return
+
+
+def _maybe_start_rollout_keepalive(args, loop, inference_interface):
+    """Start the keepalive task on rank 0 if --rl-rollout-keepalive-interval > 0."""
+    import asyncio
+
+    interval_s = getattr(args, 'rl_rollout_keepalive_interval', 0.0) or 0.0
+    if interval_s <= 0 or torch.distributed.get_rank() != 0:
+        return None, None
+    requests_per_tick = max(1, getattr(args, 'data_parallel_size', 1) or 1)
+    stop_event = asyncio.Event()
+    task = loop.create_task(
+        _rollout_keepalive(inference_interface, interval_s, requests_per_tick, stop_event)
+    )
+    logger.info(
+        f"Rollout keepalive enabled: {requests_per_tick} dummy generation(s) "
+        f"every {interval_s:.0f}s while in inference mode."
+    )
+    return stop_event, task
+
+
+def _stop_rollout_keepalive(loop, stop_event, task):
+    """Stop the keepalive task, letting an in-flight tiny generation drain first."""
+    import asyncio
+
+    if task is None:
+        return
+    stop_event.set()
+    try:
+        loop.run_until_complete(asyncio.wait_for(task, timeout=60))
+    except Exception:
+        task.cancel()
+        try:
+            loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        except Exception:
+            pass
+
+
 @contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
@@ -2613,8 +2693,15 @@ def megatron_rl_inference_mode(
         inference_interface.set_generation_epoch(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
+        keepalive_stop, keepalive_task = _maybe_start_rollout_keepalive(
+            args, loop, inference_interface
+        )
+
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
-        yield inference_interface
+        try:
+            yield inference_interface
+        finally:
+            _stop_rollout_keepalive(loop, keepalive_stop, keepalive_task)
 
         with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
