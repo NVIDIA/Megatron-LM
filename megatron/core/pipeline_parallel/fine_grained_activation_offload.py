@@ -1360,6 +1360,11 @@ class FineGrainedActivationOffloadingInterface:
         """Exit context manager to disable activation offloading hooks."""
         if self.offload:
             PipelineOffloadManager.get_instance().__exit__()
+        # Release the held activation reference. This object outlives the 
+        # block as a per-layer module attr (e.g. self.mlp_norm_manager), so keeping
+        # self.tensor here pins the ~4 GiB mHC boundary from the backward recompute
+        # until the next forward. self.tensor is only read in __enter__, so safe.
+        self.tensor = None
 
     @staticmethod
     def cuda_graph_stream():

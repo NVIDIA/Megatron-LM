@@ -130,7 +130,10 @@ class BroadcastTensorFused(torch.autograd.Function):
             return grads[0], None
         if len(grads) == 2:
             return grads[0] + grads[1], None
-        return ctx.fused_add_3_fn(grad1, grad2, grad3), None
+        # In-place 3-way sum: reuse grad1's storage instead of allocating a fresh
+        # ~4 GiB n-stream residual gradient every layer (the per-layer mHC-backward
+        # pile-up). grad1/2/3 are this node's own grads (not aliased), so safe.
+        return grad1.add_(grad2).add_(grad3), None
 
 
 @torch.compile

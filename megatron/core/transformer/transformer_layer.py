@@ -2282,6 +2282,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+        self.mlp_norm_manager = None  # release the ~4 GiB mHC boundary (mirror variant-1 free)
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
