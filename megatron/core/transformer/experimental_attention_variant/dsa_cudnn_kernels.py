@@ -1997,6 +1997,24 @@ def _run_sparse_attention_backward(
     bwd_dO_flat = dO_flat
     bwd_lse = lse
     bwd_attn_sink = attn_sink
+    padded_num_heads = num_heads
+    if q_flat.is_cuda:
+        padded_num_heads = _get_head_padding(num_heads)
+    if padded_num_heads != num_heads:
+        bwd_q_flat = q_flat.new_zeros((q_flat.size(0), padded_num_heads, q_flat.size(2)))
+        bwd_q_flat[:, :num_heads, :] = q_flat
+
+        bwd_out_flat = out_flat.new_zeros((out_flat.size(0), padded_num_heads, out_flat.size(2)))
+        bwd_out_flat[:, :num_heads, :] = out_flat
+
+        bwd_dO_flat = dO_flat.new_zeros((dO_flat.size(0), padded_num_heads, dO_flat.size(2)))
+        bwd_dO_flat[:, :num_heads, :] = dO_flat
+
+        bwd_lse = lse.new_zeros((lse.size(0), padded_num_heads))
+        bwd_lse[:, :num_heads] = lse
+
+        bwd_attn_sink = attn_sink.new_full((padded_num_heads,), float("-inf"))
+        bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
     if all_rows_nonempty:
@@ -2012,6 +2030,8 @@ def _run_sparse_attention_backward(
             topk_length=topk_length,
         )
         grad_query_flat = attn_bwd["dq"]
+        if padded_num_heads != num_heads:
+            grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
         grad_kv_flat = attn_bwd["dkv"]
         grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
         grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
@@ -2043,6 +2063,8 @@ def _run_sparse_attention_backward(
         topk_length=topk_length.index_select(0, compact_row_indices).contiguous(),
     )
     grad_query_valid = attn_bwd["dq"][:-1]
+    if padded_num_heads != num_heads:
+        grad_query_valid = grad_query_valid[:, :num_heads, :].contiguous()
     grad_query_flat = torch.zeros_like(q_flat)
     grad_query_flat.index_copy_(0, valid_row_indices, grad_query_valid)
     grad_kv_flat = attn_bwd["dkv"]
