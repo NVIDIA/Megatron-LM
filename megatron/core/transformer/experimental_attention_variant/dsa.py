@@ -776,9 +776,7 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
-        dim=-1, keepdim=True
-    ).clamp_min(1e-10)
+    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 

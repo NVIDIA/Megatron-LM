@@ -126,7 +126,6 @@ class CudnnDsaInterface(Protocol):
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
-_KL_EPS = 1e-10
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
@@ -1492,18 +1491,16 @@ def _all_reduce_tp_target(target: Tensor, tp_group) -> Tensor:
     return target
 
 
-def _pad_indexer_heads_for_backward(
-    q_bshd: Tensor, w_bsh: Tensor, min_heads: int = 64
-) -> Tuple[Tensor, Tensor, int]:
+def _pad_indexer_heads_for_backward(q_bshd: Tensor, w_bsh: Tensor) -> Tuple[Tensor, Tensor, int]:
     """Pad indexer heads for cuDNN backward kernels that require at least 64 heads."""
     actual_heads = q_bshd.size(2)
-    if actual_heads >= min_heads:
+    if actual_heads >= 64:
         return q_bshd, w_bsh, actual_heads
 
-    q_padded = q_bshd.new_zeros((q_bshd.size(0), q_bshd.size(1), min_heads, q_bshd.size(3)))
+    q_padded = q_bshd.new_zeros((q_bshd.size(0), q_bshd.size(1), 64, q_bshd.size(3)))
     q_padded[:, :, :actual_heads, :] = q_bshd
 
-    w_padded = w_bsh.new_zeros((w_bsh.size(0), w_bsh.size(1), min_heads))
+    w_padded = w_bsh.new_zeros((w_bsh.size(0), w_bsh.size(1), 64))
     w_padded[:, :, :actual_heads] = w_bsh
     return q_padded.contiguous(), w_padded.contiguous(), actual_heads
 
@@ -1537,15 +1534,13 @@ def _pad_sparse_backward_topk(
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
-def _pad_attn_target_heads(
-    q_attn_bshd: Tensor, lse: Tensor, *, min_heads: int = 8, head_multiple: int = 8
-) -> Tuple[Tensor, Tensor, int]:
+def _pad_attn_target_heads(q_attn_bshd: Tensor, lse: Tensor) -> Tuple[Tensor, Tensor, int]:
     """Pad local query heads to cuDNN sparse-score-recompute MMA constraints."""
     actual_heads = q_attn_bshd.size(2)
     if q_attn_bshd.is_cuda:
         padded_heads = _get_head_padding(actual_heads)
     else:
-        padded_heads = max(min_heads, round_up_to_nearest_multiple(actual_heads, head_multiple))
+        padded_heads = max(8, round_up_to_nearest_multiple(actual_heads, 8))
     if padded_heads == actual_heads:
         return q_attn_bshd, lse, actual_heads
 
@@ -1704,7 +1699,7 @@ def _kl_loss_from_dense_scores(
     (LSE); those rows contribute 0 to the loss — the same ``row_valid``
     semantics as the reference ``compute_dsa_indexer_loss``.
     """
-    eps = _KL_EPS
+    eps = dsa_indexer_loss.INDEXER_LOSS_EPS
     # row_valid: rows with at least one un-masked KV position.
     row_valid = (attn_l1norm > eps) & torch.isfinite(index_lse)
 
