@@ -1718,14 +1718,21 @@ class DSAttention(MegatronModule):
         nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
-        if packed_thd and cp_size > 1:
+        if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
+            single_packed_thd_sequence = (
+                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
+            )
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
-            if sequence_parallel_tp:
+            if sequence_parallel_query_is_local and cp_size == 1:
+                row_start = sequence_parallel_tp_row_start
+                packed_query_positions = torch.arange(
+                    row_start, row_start + sq, dtype=torch.int64, device=query.device
+                )
+            elif sequence_parallel_tp and cp_size > 1:
                 packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
                     cu_seqlens_q,
                     cp_size,
@@ -1738,7 +1745,7 @@ class DSAttention(MegatronModule):
                     packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
                 else:
                     packed_query_positions = packed_query_positions_full
-            else:
+            elif cp_size > 1:
                 # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
                 # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
                 query_cu_seqlens_cover_output = (
@@ -1765,7 +1772,8 @@ class DSAttention(MegatronModule):
                         key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
                     )
                 )
-            packed_query_positions = packed_query_positions.contiguous()
+            if packed_query_positions is not None:
+                packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device

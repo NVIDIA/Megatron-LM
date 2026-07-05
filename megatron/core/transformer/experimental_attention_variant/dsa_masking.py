@@ -436,19 +436,18 @@ def build_dsattention_forward_mask(
         if packed_thd:
             cu_seqlens_q, _ = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
             cu_seqlens_q = cu_seqlens_q.to(device=device, dtype=torch.int64)
-            if cp_size > 1:
-                if packed_query_positions is not None:
-                    query_idx = packed_query_positions.to(device=device, dtype=torch.int64)
-                else:
-                    query_idx, _key_idx = dsa_layout.get_cp_positions_from_layout(
-                        sq=sq,
-                        skv=skv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        cp_comm_type=cp_comm_type,
-                        device=device,
-                        cp_group=cp_group,
-                    )
+            if packed_query_positions is not None:
+                query_idx = packed_query_positions.to(device=device, dtype=torch.int64)
+            elif cp_size > 1:
+                query_idx, _key_idx = dsa_layout.get_cp_positions_from_layout(
+                    sq=sq,
+                    skv=skv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    cp_comm_type=cp_comm_type,
+                    device=device,
+                    cp_group=cp_group,
+                )
             else:
                 query_idx = torch.arange(sq, dtype=torch.int64, device=device)
             varlen_starts, varlen_ends = generate_varlen_mask_params_for_positions(

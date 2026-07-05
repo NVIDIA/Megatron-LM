@@ -2882,8 +2882,9 @@ class TestDSAttention:
         assert seen["k_indexer_len"] == global_seq_len
         assert seen["key_len"] == global_seq_len
 
-    def test_nonpacked_tp_sequence_parallel_uses_global_causal_rows(self, monkeypatch):
-        """A sequence-local TP rank should use its global rows for causal bounds."""
+    @pytest.mark.parametrize("packed_thd", [False, True], ids=["nonpacked", "packed"])
+    def test_tp_sequence_parallel_uses_global_causal_rows(self, monkeypatch, packed_thd):
+        """A sequence-local TP rank should use global rows for causal and packed bounds."""
         seq_len = 4
         tp_size = 2
         tp_rank = 1
@@ -2906,6 +2907,7 @@ class TestDSAttention:
             seen["query_len"] = kwargs["query"].size(0)
             seen["key_len"] = kwargs["key"].size(0)
             seen["q_indexer_len"] = kwargs["q_indexer"].size(0)
+            seen["varlen_starts"] = kwargs["varlen_starts"].detach().clone()
             seen["varlen_ends"] = kwargs["varlen_ends"].detach().clone()
             return expected_output, None
 
@@ -2935,6 +2937,20 @@ class TestDSAttention:
 
         was_training = self.sparse_attention.training
         self.sparse_attention.train()
+        packed_seq_params = None
+        expected_starts = torch.zeros(seq_len, dtype=torch.int64)
+        if packed_thd:
+            cu_seqlens = torch.tensor([0, 3, full_seq_len], dtype=torch.int32)
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens.clone(),
+                cu_seqlens_kv_padded=cu_seqlens.clone(),
+                max_seqlen_q=5,
+                max_seqlen_kv=5,
+            )
+            expected_starts.fill_(3)
         try:
             output = self.sparse_attention(
                 query=torch.randn(seq_len, batch_size, num_heads, head_dim),
@@ -2944,6 +2960,7 @@ class TestDSAttention:
                 qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
                 attention_mask=None,
                 attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
             )
         finally:
             self.sparse_attention.train(was_training)
@@ -2952,6 +2969,7 @@ class TestDSAttention:
         assert seen["query_len"] == seq_len
         assert seen["key_len"] == full_seq_len
         assert seen["q_indexer_len"] == seq_len
+        torch.testing.assert_close(seen["varlen_starts"], expected_starts)
         torch.testing.assert_close(seen["varlen_ends"], torch.arange(5, 9, dtype=torch.int64))
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
