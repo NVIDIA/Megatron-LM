@@ -29,9 +29,7 @@ except (ModuleNotFoundError, ImportError):
 logger = logging.getLogger(__name__)
 
 
-def remove_per_module_state(
-    modelopt_state: dict[str, Any],
-) -> None:
+def remove_per_module_state(modelopt_state: dict[str, Any]) -> None:
     """Remove metadata from the modelopt_state.
 
     The metadata of the modelopt_state contains keys which may change with different pipeline
@@ -180,7 +178,9 @@ def restore_sharded_modelopt_state(
 
     modelopt_load_version = common_modelopt_state["modelopt_version"]
 
-    logger.info(f"nvidia-modelopt ckpt/inst version: {modelopt_load_version}/{modelopt.__version__}")
+    logger.info(
+        f"nvidia-modelopt ckpt/inst version: {modelopt_load_version}/{modelopt.__version__}"
+    )
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
 
