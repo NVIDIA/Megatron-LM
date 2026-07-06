@@ -1524,10 +1524,7 @@ class _NCCLEPManager(_DispatchManager):
         budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
         if self.alignment != 0:
             budget += -budget % self.alignment
-            self._recv_capacity = budget + self.num_local_experts * self.alignment
-        else:
-            self._recv_capacity = budget
-        self._recv_capacity = max(self._recv_capacity, self._max_tokens_per_rank)
+        self._recv_capacity = budget
 
         ensure_nccl_ep_bootstrapped(
             self.group,
