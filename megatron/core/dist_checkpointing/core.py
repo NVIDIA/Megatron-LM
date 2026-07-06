@@ -48,6 +48,23 @@ def check_is_distributed_checkpoint(checkpoint_dir):
     return maybe_load_config(checkpoint_dir) is not None
 
 
+def check_is_dtensor_format(checkpoint_dir):
+    """Checks if the checkpoint is saved in DTensor format.
+
+    Args:
+        checkpoint_dir: checkpoint directory
+
+    Returns:
+        bool: True if the checkpoint is saved in DTensor format.
+    """
+    checkpoint_config = maybe_load_config(checkpoint_dir)
+
+    if checkpoint_config.get("tensor_format", "ShardedTensor") == "DTensor":
+        return True
+
+    return False
+
+
 def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     """Returns checkpoint config if `checkpoint_dir` is a distributed checkpoint and None otherwise
 

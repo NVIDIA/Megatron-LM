@@ -1358,7 +1358,6 @@ def _load_global_dist_base_checkpoint(
         load_strategy,
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
-        use_dtensor_format=args.dist_ckpt_use_dtensor_format,
         verify_integrity=args.verify_integrity,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL

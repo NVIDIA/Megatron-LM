@@ -18,7 +18,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
-from .core import CheckpointingConfig, save_config
+from .core import CheckpointingConfig, check_is_dtensor_format, save_config
 from .dict_utils import merge
 from .mapping import (
     CommonStateDict,
@@ -58,7 +58,6 @@ def load(
     common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
-    use_dtensor_format: Optional[bool] = False,
     verify_integrity: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
@@ -155,6 +154,7 @@ def load(
         if getattr(ckpt_args, "async_save", False)
         else "mcore"
     )
+    use_dtensor_format = check_is_dtensor_format(checkpoint_dir)
     loaded_state_dict = sharded_strategy.load(
         sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
     )
