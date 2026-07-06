@@ -1081,12 +1081,7 @@ class _HybridEPManager(_DispatchManager):
                     or pad_alignment == self.config.max_seqlen_per_dp_cp_rank
                 )
             )
-            if has_static_token_count:
-                # The sequence-packing path has already padded every rank to the
-                # same configured maximum. This is a data invariant independent
-                # of Dynamo tracing or CUDA graph capture state.
-                padded_num_tokens = num_tokens
-            else:
+            if not has_static_token_count:
                 # Use the actual tp_ep max so all ranks in the MoE communication
                 # group pass the same token count to HybridEP.
                 max_num_tokens_across_ep = torch.tensor(
@@ -1096,6 +1091,8 @@ class _HybridEPManager(_DispatchManager):
                     max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
                 )
                 padded_num_tokens = int(max_num_tokens_across_ep.item())
+            # Otherwise, the sequence-packing path has already padded every rank
+            # to the same configured maximum, so the local token count can be used.
             padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
