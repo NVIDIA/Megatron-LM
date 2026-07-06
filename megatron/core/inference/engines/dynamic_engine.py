@@ -1088,7 +1088,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             else:
                 request.generated_text = ""
-        request_entry.future.set_result(request_entry.record)
+        if not request_entry.future.done():
+            request_entry.future.set_result(request_entry.record)
+        else:
+            # The client future may already be resolved or cancelled — shutdown()
+            # cancels every pending future before a suspend, and requests that
+            # persist across suspend/resume can then fail their re-add in
+            # resume(). Setting a result on a done future raises
+            # InvalidStateError and kills the whole engine loop (observed
+            # bakedval, Jul 5 2026); dropping the request is the right outcome
+            # since no client is waiting on it anymore.
+            warnings.warn(
+                f"Request {request_id} failed with an already-resolved client "
+                f"future (cancelled before suspend?); dropping it."
+            )
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
@@ -1446,7 +1459,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
+                    if not finished_entry.future.done():
+                        finished_entry.future.set_result(finished_entry.record)
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
