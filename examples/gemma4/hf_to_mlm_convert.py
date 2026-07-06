@@ -159,6 +159,8 @@ def build_state_dict(hf, config):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-save", action="store_true", help="skip dist-checkpoint write")
+    ap.add_argument("--hf-weights", default=HF_WEIGHTS, help="source HF model.safetensors")
+    ap.add_argument("--out-ckpt", default=CKPT_OUT, help="output MLM dist-checkpoint dir")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -169,7 +171,7 @@ def main():
     config = _make_config()
     model = _build_model(get_gemma4_layer_local_spec, config)  # random-init, bf16, cuda
 
-    hf = HFStore(HF_WEIGHTS)
+    hf = HFStore(args.hf_weights)
     sd, log = build_state_dict(hf, config)
 
     # Move state_dict to the model's device/dtype (bf16, cuda) for load + compare.
@@ -263,7 +265,7 @@ def main():
     all_eq = n_mismatch == 0
 
     # ---- Write V1 result ----
-    out = os.path.join(IMPL, "V_RESULTS.md")
+    out = os.path.join(args.out_ckpt, "V_RESULTS.md") if args.out_ckpt != CKPT_OUT else os.path.join(IMPL, "V_RESULTS.md")
     lines = [
         "# V_RESULTS — Gemma 4 E4B HF->MLM conversion + parity (I-d)",
         "",
@@ -303,10 +305,10 @@ def main():
     if not args.no_save:
         from megatron.core import dist_checkpointing
 
-        os.makedirs(CKPT_OUT, exist_ok=True)
+        os.makedirs(args.out_ckpt, exist_ok=True)
         ckpt_sd = model.sharded_state_dict()
-        dist_checkpointing.save(ckpt_sd, CKPT_OUT)
-        print("SAVED MLM dist checkpoint ->", CKPT_OUT)
+        dist_checkpointing.save(ckpt_sd, args.out_ckpt)
+        print("SAVED MLM dist checkpoint ->", args.out_ckpt)
 
 
 if __name__ == "__main__":

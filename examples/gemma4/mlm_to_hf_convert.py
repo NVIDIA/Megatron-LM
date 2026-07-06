@@ -73,7 +73,7 @@ HF_WORKER_FLAG = "--_hf-worker"
 # Phase 1 helpers: load MLM ckpt + reverse conversion
 # ---------------------------------------------------------------------------
 
-def load_mlm_model():
+def load_mlm_model(mlm_ckpt=MLM_CKPT):
     """Build Gemma4Model (local spec, E4B dims) and load the dist-checkpoint into it."""
     from megatron.core import dist_checkpointing
     from megatron.core.models.gemma4.gemma4_layer_specs import get_gemma4_layer_local_spec
@@ -82,9 +82,9 @@ def load_mlm_model():
     model = _build_model(get_gemma4_layer_local_spec, config, vocab=262144)
     model.eval()
 
-    print(f"[MLM] loading dist-checkpoint from {MLM_CKPT} ...", flush=True)
+    print(f"[MLM] loading dist-checkpoint from {mlm_ckpt} ...", flush=True)
     sharded_sd = model.sharded_state_dict()
-    loaded = dist_checkpointing.load(sharded_sd, MLM_CKPT)
+    loaded = dist_checkpointing.load(sharded_sd, mlm_ckpt)
     model.load_state_dict(loaded, strict=False)
     return model, config
 
@@ -312,6 +312,11 @@ def main():
     ap.add_argument("--save-dir", default=None,
                     help="write a standalone from_pretrained-loadable HF checkpoint here "
                          "(text tower from MLM, vision tower + aux files from original)")
+    ap.add_argument("--mlm-ckpt", default=MLM_CKPT,
+                    help="MLM dist-checkpoint dir to load (default: original converter output)")
+    ap.add_argument("--allow-diff", action="store_true",
+                    help="allow --save-dir to write even when recovered weights differ from "
+                         "base HF (required for fine-tuned checkpoints)")
     ap.add_argument(HF_WORKER_FLAG, nargs=2, metavar=("WEIGHTS_PT", "OUT_PT"), dest="hf_worker",
                     help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -329,7 +334,7 @@ def main():
     print("="*60)
 
     _init_distributed()
-    model, config = load_mlm_model()
+    model, config = load_mlm_model(args.mlm_ckpt)
 
     print("[convert] building HF state_dict (reverse conversion)...", flush=True)
     hf_sd = build_hf_state_dict(model, config)
@@ -347,11 +352,13 @@ def main():
     # Export: write a standalone HF checkpoint (only if the weight check passed).
     # -------------------------------------------------------------------------
     if args.save_dir:
-        if not all_eq:
-            print("[export] SKIPPED: weight bitwise check FAILED; refusing to write checkpoint.")
+        if not all_eq and not args.allow_diff:
+            print("[export] SKIPPED: weight bitwise check FAILED; pass --allow-diff to write anyway (fine-tuned ckpt).")
         else:
             print("\n" + "="*60)
             print(f"Export: writing HF checkpoint -> {args.save_dir}")
+            if not all_eq:
+                print(f"[export] --allow-diff set; proceeding despite {n_mismatch} weight diffs.")
             print("="*60)
             export_hf_checkpoint(hf_sd, HF_WEIGHTS_FILE, HF_WEIGHTS_DIR, args.save_dir)
 
@@ -456,9 +463,10 @@ def main():
             "",
         ]
 
-    with open(RESULTS_OUT, "w") as f:
+    results_out = os.path.join(args.save_dir, "V_RESULTS_MLM2HF.md") if args.save_dir else RESULTS_OUT
+    with open(results_out, "w") as f:
         f.write("\n".join(lines))
-    print(f"\nWROTE {RESULTS_OUT}")
+    print(f"\nWROTE {results_out}")
 
     overall = all_eq and (fwd_pass is True or fwd_pass is None)
     print(f"\nOVERALL: {'PASS' if overall else 'FAIL'}")

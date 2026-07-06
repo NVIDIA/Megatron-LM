@@ -143,21 +143,40 @@ def _forward_step(
 ) -> Optional[torch.Tensor]:
     """All ranks run model.forward against the shared inference context.
 
-    Returns last-position logits on rank 0 (float32), None elsewhere. The
-    caller is responsible for advancing ``inference_context.step`` after this
-    call.
+    ``Gemma4Model`` is built with ``parallel_output=True`` so ``out`` is
+    vocab-sharded on the last dim under TP (shape ``[b, s, V/TP]``). We
+    all-gather the last-position slice across TP so rank 0 sees the full
+    vocab and can sample correctly. Returns full-vocab last-position logits
+    on rank 0 (float32), None elsewhere. The caller is responsible for
+    advancing ``inference_context.step`` after this call.
     """
+    from megatron.core import parallel_state, tensor_parallel
+
     out = model(tokens, None, None, inference_context=inference_context)
+    last = out[:, -1, :]  # [b, V/TP] under parallel_output=True
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        # AG on last dim -> [b, V] on every rank.
+        last = tensor_parallel.gather_from_tensor_model_parallel_region(last)
     if dist.get_rank() == 0:
-        # out has shape [b, s, V] (Gemma4Model.forward transposes back).
-        return out[:, -1, :].float()
+        return last.float()
     return None
 
 
-def _sample(logits: torch.Tensor, temperature: float, top_p: float) -> int:
-    """Greedy if temperature == 0; else temperature + top-p (nucleus)."""
+def _sample(logits: torch.Tensor, temperature: float, top_p: float, top_k: int = 0) -> int:
+    """Greedy if temperature == 0; else temperature + top-k + top-p (nucleus).
+
+    Ordering matches Gemma's HF `GenerationConfig` default: top-k filter first
+    (drop everything outside the top-k logits), then top-p on the remainder.
+    top_k <= 0 disables the top-k filter.
+    """
     if temperature <= 0.0:
         return int(logits.argmax(dim=-1).item())
+    # top-k filter on raw logits before softmax
+    if top_k and top_k > 0 and top_k < logits.numel():
+        vals, _ = torch.topk(logits, top_k)
+        kth = vals[..., -1, None]
+        logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
     probs = F.softmax(logits / temperature, dim=-1)
     if 0.0 < top_p < 1.0:
         sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
@@ -173,7 +192,7 @@ def _sample(logits: torch.Tensor, temperature: float, top_p: float) -> int:
 
 
 def _generate(model, prompt_ids: List[int], max_new: int, temperature: float,
-              top_p: float, eos_ids: List[int]) -> List[int]:
+              top_p: float, eos_ids: List[int], top_k: int = 0) -> List[int]:
     """Rank-0 driver. Issues control broadcasts; returns the generated token list.
 
     One prefill forward over the full prompt seeds the KV cache, then a decode
@@ -189,7 +208,7 @@ def _generate(model, prompt_ids: List[int], max_new: int, temperature: float,
     dist.broadcast(prompt_tokens, src=0)
     logits = _forward_step(model, prompt_tokens, ctx)
     ctx.advance(n_prompt)
-    next_tok = _sample(logits[0], temperature, top_p)
+    next_tok = _sample(logits[0], temperature, top_p, top_k)
 
     generated: List[int] = [next_tok]
     if next_tok in eos_ids or max_new <= 1:
@@ -203,7 +222,7 @@ def _generate(model, prompt_ids: List[int], max_new: int, temperature: float,
         dist.broadcast(tok, src=0)
         logits = _forward_step(model, tok, ctx)
         ctx.advance(1)
-        next_tok = _sample(logits[0], temperature, top_p)
+        next_tok = _sample(logits[0], temperature, top_p, top_k)
         generated.append(next_tok)
         if next_tok in eos_ids:
             break
@@ -281,7 +300,12 @@ def _load_gemma4_tokenizer(path: str):
 
 def _build_app(model, hf_tokenizer, args, model_lock: threading.Lock) -> Flask:
     app = Flask(__name__)
-    eos_ids = [tok for tok in [hf_tokenizer.eos_token_id, hf_tokenizer.pad_token_id] if tok is not None]
+    # Gemma4-E4B's chat template closes every assistant turn with <turn|> (id 106).
+    # Without it here, thinking-mode responses loop `<|channel>thought…<channel|>\boxed{}<turn|>`
+    # cycles until max_tokens.
+    turn_id = hf_tokenizer.convert_tokens_to_ids("<turn|>")
+    eos_ids = [tok for tok in [hf_tokenizer.eos_token_id, hf_tokenizer.pad_token_id, turn_id]
+               if tok is not None and tok != hf_tokenizer.unk_token_id]
 
     @app.get("/health")
     @app.get("/v1/health")
@@ -297,10 +321,11 @@ def _build_app(model, hf_tokenizer, args, model_lock: threading.Lock) -> Flask:
         max_new = int(body.get("max_tokens", args.max_new_tokens))
         temperature = float(body.get("temperature", args.default_temperature))
         top_p = float(body.get("top_p", args.default_top_p))
+        top_k = int(body.get("top_k", 0))
         prompt_ids = hf_tokenizer(prompt, add_special_tokens=False).input_ids
         with model_lock:
-            out_ids = _generate(model, prompt_ids, max_new, temperature, top_p, eos_ids)
-        text = hf_tokenizer.decode(out_ids, skip_special_tokens=True)
+            out_ids = _generate(model, prompt_ids, max_new, temperature, top_p, eos_ids, top_k)
+        text = hf_tokenizer.decode(out_ids, skip_special_tokens=bool(body.get("skip_special_tokens", False)))
         return jsonify({
             "id": "cmpl-gemma4-mlm",
             "object": "text_completion",
@@ -320,12 +345,22 @@ def _build_app(model, hf_tokenizer, args, model_lock: threading.Lock) -> Flask:
         max_new = int(body.get("max_tokens", args.max_new_tokens))
         temperature = float(body.get("temperature", args.default_temperature))
         top_p = float(body.get("top_p", args.default_top_p))
+        top_k = int(body.get("top_k", 0))
+        # Gemma4-E4B-it ships with an `enable_thinking` branch in its chat template:
+        # when true the model prefixes reasoning with `<|channel>thought` and closes
+        # the block with `<channel|>` before emitting the final answer (typically
+        # `\boxed{...}` for math). Default on for AIME/GPQA-style long-CoT eval;
+        # callers can override via `extra_body.enable_thinking=false`.
+        enable_thinking = bool(body.get("enable_thinking", True))
         prompt_ids = hf_tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
         with model_lock:
-            out_ids = _generate(model, prompt_ids, max_new, temperature, top_p, eos_ids)
-        text = hf_tokenizer.decode(out_ids, skip_special_tokens=True)
+            out_ids = _generate(model, prompt_ids, max_new, temperature, top_p, eos_ids, top_k)
+        text = hf_tokenizer.decode(out_ids, skip_special_tokens=bool(body.get("skip_special_tokens", False)))
         return jsonify({
             "id": "chatcmpl-gemma4-mlm",
             "object": "chat.completion",
