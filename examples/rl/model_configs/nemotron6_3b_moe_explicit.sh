@@ -63,10 +63,8 @@ MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
-  --inference-dynamic-batching-max-tokens 8192 \
-  --inference-dynamic-batching-max-requests 128 \
-  --inference-dynamic-batching-num-cuda-graphs 2 \
-  --decode-only-cuda-graphs \
+  --inference-dynamic-batching-num-cuda-graphs 32 \
+  --inference-moe-token-dispatcher-type nvls \
   --cuda-graph-impl local \
   --num-layers 52 \
   --hidden-size 2688 \
