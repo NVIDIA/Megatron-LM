@@ -81,6 +81,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1537,6 +1538,8 @@ def validate_args(args, defaults={}):
     # fsdp_dtensor checkpointing format checks.
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    _validate_varlen_dataset_args(args)
 
     if args.sequence_packing_scheduler is not None:
         assert args.calculate_per_token_loss, (
@@ -3553,6 +3556,67 @@ def _add_sft_args(parser):
         'Supports file and lognormal distribution modes.',
     )
     return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='variable-length dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action='store_true',
+        help='Use variable-length instruction or pretraining data.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action='store_true',
+        help='Use a dense-model fixed-shape reference padded to --seq-length.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Inline JSON or a JSON file configuring synthetic variable-length samples.',
+    )
+    return parser
+
+
+def _validate_varlen_dataset_args(args):
+    assert (
+        not args.varlen_sbhd_validation or args.use_varlen_dataset
+    ), "--varlen-sbhd-validation requires --use-varlen-dataset"
+    assert (
+        args.varlen_mock_dataset_config_json is None or args.use_varlen_dataset
+    ), "--varlen-mock-dataset-config-json requires --use-varlen-dataset"
+    assert (
+        args.varlen_mock_dataset_config_json is None or args.mock_data
+    ), "--varlen-mock-dataset-config-json requires --mock-data"
+    if not args.use_varlen_dataset:
+        return
+
+    assert not args.sft, "--use-varlen-dataset and --sft are mutually exclusive"
+    assert not args.fim_data, "--use-varlen-dataset and --fim-data are mutually exclusive"
+    assert not args.reset_position_ids, "--use-varlen-dataset does not support reset position ids"
+    assert not args.reset_attention_mask, (
+        "--use-varlen-dataset does not support reset attention masks"
+    )
+    assert not args.dataloader_inter_document_masking, (
+        "--use-varlen-dataset does not support inter-document masking"
+    )
+    args.create_attention_mask_in_dataloader = False
+    if args.varlen_sbhd_validation:
+        assert not args.dynamic_context_parallel, (
+            "--varlen-sbhd-validation cannot use dynamic context parallelism"
+        )
+        assert (
+            args.sequence_packing_scheduler is None
+        ), "--varlen-sbhd-validation cannot use a sequence packing scheduler"
+        assert not args.mock_data, "--varlen-sbhd-validation is only supported with real datasets"
+        assert args.num_experts is None, (
+            "--varlen-sbhd-validation currently supports dense models only; "
+            "MoE requires physical padding-mask propagation"
+        )
+    elif args.sequence_packing_scheduler is None:
+        args.sequence_packing_scheduler = "dp_balanced"
+
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')

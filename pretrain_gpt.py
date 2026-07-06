@@ -61,6 +61,11 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.utils import load_json_arg
+from megatron.training.datasets.varlen_dataset import (
+    MockVarlenDataset,
+    VarlenDataset,
+    VarlenDatasetConfig,
+)
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -478,6 +483,15 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         )
         return GPTFIMDatasetConfig(**data_args)
 
+    if args.use_varlen_dataset:
+        data_args["mock_dataset_config"] = (
+            load_json_arg(args.varlen_mock_dataset_config_json)
+            if args.varlen_mock_dataset_config_json is not None
+            else None
+        )
+        data_args["sbhd_validation"] = args.varlen_sbhd_validation
+        return VarlenDatasetConfig(**data_args)
+
     if args.sft:
         data_args["mock_dataset_config"] = (
             load_json_arg(args.sft_mock_dataset_config_json)
@@ -500,7 +514,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
     is_packed_sequence = False
-    if args.sft:
+    if args.use_varlen_dataset:
+        if args.mock_data:
+            dataset_type = MockVarlenDataset
+        else:
+            dataset_type = VarlenDataset
+        is_packed_sequence = not args.varlen_sbhd_validation
+    elif args.sft:
         if args.mock_data:
             dataset_type = MockSFTDataset
         else:
