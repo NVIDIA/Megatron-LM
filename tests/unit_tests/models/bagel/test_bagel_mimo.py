@@ -458,7 +458,7 @@ def _make_test_data(T: int, G: int, seed: int = 42):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
+def _check_packed_seq_params(cp_size: int, T: int, G: int, label: str):
     """Verify MoTPackedSeqParams fields match manual computation."""
     device = "cuda"
     text_idx = torch.arange(0, T, device=device)
@@ -527,7 +527,7 @@ def test_get_packed_seq_params(cp_size: int, T: int, G: int, label: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_forward_vs_qwen2(T: int, G: int, label: str):
+def _check_forward_vs_qwen2(T: int, G: int, label: str):
     assert HAVE_BAGEL_PKG, "skip: bagel-package not available"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
     device = "cuda"
@@ -746,18 +746,18 @@ def main():
     # ── Test 1: get_packed_seq_params ─────────────────────────────────────────
     if rank == 0:
         print("\n=== Test 1: get_packed_seq_params ===")
-    test_get_packed_seq_params(cp_size=1, T=T_CLEAN, G=G_CLEAN, label="clean")
-    test_get_packed_seq_params(cp_size=1, T=T_PAD, G=G_PAD, label="padding")
-    test_get_packed_seq_params(cp_size=1, T=T_CLEAN, G=0, label="und-only")
-    test_get_packed_seq_params(cp_size=1, T=0, G=G_CLEAN, label="gen-only")
+    _check_packed_seq_params(cp_size=1, T=T_CLEAN, G=G_CLEAN, label="clean")
+    _check_packed_seq_params(cp_size=1, T=T_PAD, G=G_PAD, label="padding")
+    _check_packed_seq_params(cp_size=1, T=T_CLEAN, G=0, label="und-only")
+    _check_packed_seq_params(cp_size=1, T=0, G=G_CLEAN, label="gen-only")
 
     # ── Test 2: forward accuracy vs Qwen2Model ────────────────────────────────
     if HAVE_BAGEL_PKG and HAVE_WRAPPED_NORM:
         if rank == 0:
             print("\n=== Test 2: BagelMimoModel.forward vs Qwen2Model ===")
-        test_forward_vs_qwen2(T=T_CLEAN, G=G_CLEAN, label="mixed")
-        test_forward_vs_qwen2(T=T_CLEAN, G=0, label="und-only")
-        test_forward_vs_qwen2(T=0, G=G_CLEAN, label="gen-only")
+        _check_forward_vs_qwen2(T=T_CLEAN, G=G_CLEAN, label="mixed")
+        _check_forward_vs_qwen2(T=T_CLEAN, G=0, label="und-only")
+        _check_forward_vs_qwen2(T=0, G=G_CLEAN, label="gen-only")
     else:
         if rank == 0:
             print("\n=== Test 2: SKIPPED (bagel-package not available) ===")
@@ -772,8 +772,8 @@ def main():
         # Re-run get_packed_seq_params with cp=2
         if rank == 0:
             print("  [psp CP=2 check]")
-        test_get_packed_seq_params(cp_size=2, T=T_CLEAN, G=G_CLEAN, label="clean")
-        test_get_packed_seq_params(cp_size=2, T=T_PAD, G=G_PAD, label="padding")
+        _check_packed_seq_params(cp_size=2, T=T_CLEAN, G=G_CLEAN, label="clean")
+        _check_packed_seq_params(cp_size=2, T=T_PAD, G=G_PAD, label="padding")
 
         model_cp = _build_bagel_mcore_model(mcore_cfg)
         model_cp.train()
