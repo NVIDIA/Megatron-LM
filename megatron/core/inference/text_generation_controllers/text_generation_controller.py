@@ -2144,7 +2144,7 @@ class TextGenerationController:
             sampled_tokens_gpu = self._run_async_sched_sample()
 
             # Populate the next forward's input-ID view directly from GPU samples.
-            context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
+            context.copy_async_sched_sample_to_forward(sampled_tokens_gpu)
 
             # Start D2H after sampling; it may overlap the GPU input-ID copy.
             sampled_tokens_cpu_view, sample_cpu_ready_event = self._copy_async_sched_sample_to_cpu(

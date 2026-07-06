@@ -2510,7 +2510,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return done_event
 
-    def copy_async_sched_input_tokens_to_gpu(self, sampled_tokens_cuda: Tensor) -> None:
+    def copy_async_sched_sample_to_forward(self, sampled_tokens_cuda: Tensor) -> None:
         """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
 
         Async scheduling keeps sampled tokens GPU-resident for the next decode

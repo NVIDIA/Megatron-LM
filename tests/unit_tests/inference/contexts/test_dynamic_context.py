@@ -392,7 +392,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
-    def test_copy_async_sched_input_tokens_to_gpu_populates_active_and_clears_padding(self):
+    def test_copy_async_sched_sample_to_forward_populates_active_and_clears_padding(self):
         ctx = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -416,7 +416,7 @@ class TestDynamicContext:
         )
         sampled_tokens_cuda = torch.tensor([90, 91, 92], dtype=torch.int64, device=device)
 
-        ctx.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
+        ctx.copy_async_sched_sample_to_forward(sampled_tokens_cuda)
 
         assert torch.equal(ctx.gpu_view.token_to_input_ids[:3], sampled_tokens_cuda)
         assert torch.equal(

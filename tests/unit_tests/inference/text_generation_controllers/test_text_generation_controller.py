@@ -227,7 +227,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         prepare_requests=mock.Mock(),
         commit_sampled_tokens=mock.Mock(),
         resolve_requests=mock.Mock(return_value=torch.empty(0, dtype=torch.int32)),
-        copy_async_sched_input_tokens_to_gpu=mock.Mock(),
+        copy_async_sched_sample_to_forward=mock.Mock(),
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
         max_requests=metadata_len,
@@ -729,7 +729,7 @@ def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
     controller._run_async_sched_sample = mock.Mock(
         side_effect=lambda: call_order.append("sample") or sample_tokens
     )
-    context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
+    context.copy_async_sched_sample_to_forward = mock.Mock(
         side_effect=lambda _: call_order.append("copy_input")
     )
     controller._copy_async_sched_sample_to_cpu = mock.Mock(
@@ -807,10 +807,8 @@ def test_async_sched_step_wires_sampling_through_resolution(
 
     assert torch.equal(result["sample"], sampled_tokens)
     assert result["finished_request_ids"].tolist() == expected_finished_ids
-    context.copy_async_sched_input_tokens_to_gpu.assert_called_once()
-    assert torch.equal(
-        context.copy_async_sched_input_tokens_to_gpu.call_args.args[0], sampled_tokens
-    )
+    context.copy_async_sched_sample_to_forward.assert_called_once()
+    assert torch.equal(context.copy_async_sched_sample_to_forward.call_args.args[0], sampled_tokens)
     context.commit_sampled_tokens.assert_called_once()
     assert torch.equal(context.commit_sampled_tokens.call_args.args[0], sampled_tokens)
     assert context.resolve_requests.call_args.args[0].tolist() == expected_mask
