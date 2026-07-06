@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -97,6 +97,62 @@ class TestCudaGraphConfigAndArguments:
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_local_impl_allows_expert_activation_offload_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1', 'moe_act'],
+            num_moe_experts=4,
+        )
+
+        assert cfg.cuda_graph_impl == 'local'
+        assert CudaGraphModule.attn in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_router in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_preprocess in cfg.cuda_graph_modules
+
+    def test_local_impl_rejects_unsupported_activation_offload_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['qkv_linear'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.attn],
+                fine_grained_activation_offloading=True,
+                offload_modules=['qkv_linear'],
+            )
+
+    def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
+        with pytest.raises(
+            AssertionError, match="not supported with whole-layer CUDA graph capture"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[],
+                fine_grained_activation_offloading=True,
+                offload_modules=['expert_fc1'],
+            )
+
+    def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['mlp_norm'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.moe_router],
+                fine_grained_activation_offloading=True,
+                offload_modules=['mlp_norm'],
+                num_moe_experts=4,
+            )
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -644,6 +700,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in self.llava_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         set_current_microbatch(self.llava_model.vision_model, 1)
         set_current_microbatch(self.llava_model.language_model, 1)
