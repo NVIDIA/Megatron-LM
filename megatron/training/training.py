@@ -1218,6 +1218,12 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    if should_fire(callback_manager, "on_setup_start"):
+        callback_manager.fire(
+            "on_setup_start",
+            CallbackContext(model=None, user_state=callback_manager.user_state),
+        )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -1526,6 +1532,17 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
+
+    if should_fire(callback_manager, "on_pretrain_end"):
+        callback_manager.fire(
+            "on_pretrain_end",
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                optimizer=optimizer,
+                scheduler=opt_param_scheduler,
+            ),
+        )
 
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
@@ -2533,6 +2550,8 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2851,6 +2870,22 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        if should_fire(callback_manager, "on_log"):
+            log_fragments: list[str] = []
+            callback_manager.fire(
+                "on_log",
+                CallbackContext(
+                    model=model,
+                    user_state=callback_manager.user_state,
+                    writer=writer,
+                    wandb_writer=wandb_writer,
+                    iteration=iteration,
+                    timers_to_log=timers_to_log,
+                    log_fragments=log_fragments,
+                ),
+            )
+            log_string += "".join(log_fragments)
         print_rank_last(log_string)
         reported_memory_in_this_iteration = False
         if report_memory_flag:
@@ -3690,6 +3725,16 @@ def train(
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
+            if should_fire(callback_manager, "on_microbatch_change"):
+                callback_manager.fire(
+                    "on_microbatch_change",
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                        optimizer=optimizer,
+                        scheduler=opt_param_scheduler,
+                    ),
+                )
             if args.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
@@ -3741,6 +3786,19 @@ def train(
             continue
 
         args.curr_iteration = iteration
+
+        if should_fire(callback_manager, "on_train_iteration_start"):
+            callback_manager.fire(
+                "on_train_iteration_start",
+                CallbackContext(
+                    model=model,
+                    user_state=callback_manager.user_state,
+                    optimizer=optimizer,
+                    scheduler=opt_param_scheduler,
+                    iteration=iteration,
+                ),
+            )
+
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -3884,6 +3942,20 @@ def train(
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
 
+        if should_fire(callback_manager, "on_train_iteration_end"):
+            callback_manager.fire(
+                "on_train_iteration_end",
+                CallbackContext(
+                    model=model,
+                    user_state=callback_manager.user_state,
+                    optimizer=optimizer,
+                    scheduler=opt_param_scheduler,
+                    loss_dict=loss_dict,
+                    grad_norm=grad_norm,
+                    skipped_iter=bool(skipped_iter),
+                ),
+            )
+
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
@@ -3957,6 +4029,8 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            model=model,
+            callback_manager=callback_manager,
         )
         is_first_iteration = False
 
@@ -4083,6 +4157,17 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
+    if should_fire(callback_manager, "on_train_end"):
+        callback_manager.fire(
+            "on_train_end",
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                optimizer=optimizer,
+                scheduler=opt_param_scheduler,
+            ),
+        )
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         # Deregister NCCL user-buffer memory pools before exit.
@@ -4103,17 +4188,6 @@ def train(
         if args.perform_rl_step:
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
-
-    if should_fire(callback_manager, "on_train_end"):
-        callback_manager.fire(
-            "on_train_end",
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                optimizer=optimizer,
-                scheduler=opt_param_scheduler,
-            ),
-        )
 
     return iteration, num_floating_point_operations_so_far
 
