@@ -212,7 +212,7 @@ def _build_local_qkv(
 # =============================================================================
 
 
-def test_cp1_smoke(cfg):
+def _check_cp1_smoke(cfg):
     """Verify _forward_mot runs for cp=1 and produces finite output."""
     device = "cuda"
     nh, hd = cfg.nh, cfg.hd
@@ -874,7 +874,7 @@ def main():
 
     if args.smoke:
         dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1)
-        test_cp1_smoke(CONFIGS[2])
+        _check_cp1_smoke(CONFIGS[2])
         dist.destroy_process_group()
         print("\nSmoke test passed.")
         return

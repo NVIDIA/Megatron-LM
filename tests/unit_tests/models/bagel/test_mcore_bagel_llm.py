@@ -553,7 +553,7 @@ def _make_psp(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, label: str):
+def _check_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, label: str):
     device = "cuda"
     H = HIDDEN_SIZE
     S = T + V + G
@@ -615,7 +615,7 @@ def test_scatter_correctness(model: BagelMCoreModel, T: int, V: int, G: int, lab
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_vs_qwen2(T: int, V: int, G: int, label: str):
+def _check_vs_qwen2(T: int, V: int, G: int, label: str):
     assert HAVE_BAGEL_PKG, "skip: bagel-package not available"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
     device = "cuda"
@@ -804,7 +804,7 @@ def run_cp2_parity(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, label: str):
+def _check_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, label: str):
     """CE loss test.  V should be 0 so that ce_loss_indexes ⊆ text_idx is unambiguous."""
     device = "cuda"
     H = HIDDEN_SIZE
@@ -1104,16 +1104,16 @@ def main():
     model_acc = _build_bagel_mcore_model(mcore_cfg)
     model_acc.train()
 
-    test_scatter_correctness(model_acc, T_CLEAN, V_CLEAN, G_CLEAN, "clean")
-    test_scatter_correctness(model_acc, T_PAD, V_PAD, G_PAD, "padding")
+    _check_scatter_correctness(model_acc, T_CLEAN, V_CLEAN, G_CLEAN, "clean")
+    _check_scatter_correctness(model_acc, T_PAD, V_PAD, G_PAD, "padding")
 
     # ── Test 2: vs Qwen2 reference ────────────────────────────────────────────
     if HAVE_BAGEL_PKG and HAVE_WRAPPED_NORM:
         if rank == 0:
             print("\n=== Test 2: Qwen2 accuracy ===")
-        test_vs_qwen2(T_CLEAN, V_CLEAN, G_CLEAN, "clean")
-        test_vs_qwen2(0, 0, G_CLEAN, "gen-only")
-        test_vs_qwen2(T_CLEAN, V_CLEAN, 0, "und-only")
+        _check_vs_qwen2(T_CLEAN, V_CLEAN, G_CLEAN, "clean")
+        _check_vs_qwen2(0, 0, G_CLEAN, "gen-only")
+        _check_vs_qwen2(T_CLEAN, V_CLEAN, 0, "und-only")
     else:
         if rank == 0:
             print("\n=== Test 2: Qwen2 accuracy — SKIPPED (bagel-package not available) ===")
@@ -1121,9 +1121,9 @@ def main():
     # ── Test 4a: CE loss correctness (CP=1) ──────────────────────────────────
     if rank == 0:
         print("\n=== Test 4a: CE loss correctness (CP=1) ===")
-    test_ce_loss(model_acc, T_CE, 0, G_CE_MIX, L_CE_MIX, "mixed")
-    test_ce_loss(model_acc, T_CE, 0, G_CE_UND, L_CE_UND, "und-only")
-    test_ce_loss(model_acc, T_CE, 0, G_CE_MIX, 0, "no-CE")
+    _check_ce_loss(model_acc, T_CE, 0, G_CE_MIX, L_CE_MIX, "mixed")
+    _check_ce_loss(model_acc, T_CE, 0, G_CE_UND, L_CE_UND, "und-only")
+    _check_ce_loss(model_acc, T_CE, 0, G_CE_MIX, 0, "no-CE")
 
     # ── Test 3: CP=2 parity ──────────────────────────────────────────────────
     if world_size >= 2:

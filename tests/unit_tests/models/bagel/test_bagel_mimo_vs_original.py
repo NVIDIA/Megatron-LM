@@ -443,7 +443,7 @@ def _bagel_hidden_states(bagel_ref: "Bagel", packed_batch: dict) -> torch.Tensor
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_text_only_parity(T: int, label: str):
+def _check_text_only_parity(T: int, label: str):
     assert HAVE_BAGEL_PKG, "skip: bagel-package not importable"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
 
@@ -538,7 +538,7 @@ def test_text_only_parity(T: int, label: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_text_and_gen_parity(T: int, G: int, label: str):
+def _check_text_and_gen_parity(T: int, G: int, label: str):
     assert HAVE_BAGEL_PKG, "skip: bagel-package not importable"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
 
@@ -775,7 +775,7 @@ class _TestDiffusionSubmodule(nn.Module):
         )  # [G, H]
 
 
-def test_diffusion_module_parity(T: int, G: int, label: str):
+def _check_diffusion_module_parity(T: int, G: int, label: str):
     """BagelMimoModel with a real diffusion-encoding submodule matches Bagel reference."""
     assert HAVE_BAGEL_PKG, "skip: bagel-package not importable"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
@@ -930,7 +930,7 @@ class _TestVitSubmodule(nn.Module):
         return self.connector(features) + self.pos_embed(pos_ids)  # [V, H]
 
 
-def test_vit_module_parity(T: int, V: int, label: str):
+def _check_vit_module_parity(T: int, V: int, label: str):
     """BagelMimoModel with a real ViT-projection submodule matches Bagel reference."""
     assert HAVE_BAGEL_PKG, "skip: bagel-package not importable"
     assert HAVE_WRAPPED_NORM, "skip: WrappedTorchNorm not available"
@@ -1059,26 +1059,26 @@ def main():
     if rank == 0:
         print("\n=== Test A: text-only parity (BagelMimoModel vs Bagel) ===")
 
-    test_text_only_parity(T=T_TOKENS, label="T=8")
-    test_text_only_parity(T=T_TOKENS * 2, label="T=16")
+    _check_text_only_parity(T=T_TOKENS, label="T=8")
+    _check_text_only_parity(T=T_TOKENS * 2, label="T=16")
 
     # ── Test B: text + gen parity ─────────────────────────────────────────────
     if rank == 0:
         print("\n=== Test B: text+gen parity (BagelMimoModel vs Bagel) ===")
 
-    test_text_and_gen_parity(T=T_TOKENS, G=G_TOKENS, label="T=8,G=16")
+    _check_text_and_gen_parity(T=T_TOKENS, G=G_TOKENS, label="T=8,G=16")
 
     # ── Test C: diffusion module parity ───────────────────────────────────────
     if rank == 0:
         print("\n=== Test C: diffusion module parity (BagelMimoModel vs Bagel) ===")
 
-    test_diffusion_module_parity(T=T_TOKENS, G=G_TOKENS, label="T=128,G=128")
+    _check_diffusion_module_parity(T=T_TOKENS, G=G_TOKENS, label="T=128,G=128")
 
     # ── Test D: ViT module parity ─────────────────────────────────────────────
     if rank == 0:
         print("\n=== Test D: ViT module parity (BagelMimoModel vs Bagel) ===")
 
-    test_vit_module_parity(T=T_TOKENS, V=V_TOKENS, label="T=128,V=128")
+    _check_vit_module_parity(T=T_TOKENS, V=V_TOKENS, label="T=128,V=128")
 
     dist.barrier()
     if rank == 0:
