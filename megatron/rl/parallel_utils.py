@@ -6,10 +6,9 @@ Utilities for building process groups for RL inference models with custom parall
 
 from typing import Optional
 
-import torch.distributed as dist
-
 from megatron.core import mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.parallel_state import create_split_groups
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -70,8 +69,6 @@ def build_inference_pg_collection(
     assert expt_dp_size >= 1 and (expt_tp_size * ep_size * expt_dp_size * pp_size) == world_size, (
         f"World size ({world_size}) must be divisible by expt_tp*ep*pp ({expt_tp_size * ep_size * pp_size})"
     )
-
-    rank = dist.get_rank()
 
     # ====================
     # Create decoder grid for dense/attention layers
@@ -139,25 +136,22 @@ def build_inference_pg_collection(
     # ====================
     # Embedding groups (derived from PP groups)
     # ====================
-    embd_group = None
-    pos_embd_group = None
-
     pp_rank_enum = decoder_grid.get_rank_enum("pp")
-    for pp_ranks in pp_rank_enum:
-        # Embedding is on first and last PP stage
-        if len(pp_ranks) == 1:
-            embd_ranks = [pp_ranks[0]]
-        else:
-            embd_ranks = [pp_ranks[0], pp_ranks[-1]]
-        group = dist.new_group(ranks=embd_ranks)
-        if rank in embd_ranks:
-            embd_group = group
+    # Embedding is on the first and last PP stage; position embedding only on the
+    # first. Collect the full partitions first and build each family with a
+    # single ``split_group`` collective (mirrors ``parallel_state``): a per-PP-group
+    # eager ``new_group`` would drive non-member ranks through
+    # ``performNocolorSplit``, which the ``nccl2`` backend does not implement.
+    embedding_partition = [
+        [pp_ranks[0]] if len(pp_ranks) == 1 else [pp_ranks[0], pp_ranks[-1]]
+        for pp_ranks in pp_rank_enum
+    ]
+    position_embedding_partition = [[pp_ranks[0]] for pp_ranks in pp_rank_enum]
 
-        # Position embedding is only on first PP stage
-        pos_embd_ranks = [pp_ranks[0]]
-        group = dist.new_group(ranks=pos_embd_ranks)
-        if rank in pos_embd_ranks:
-            pos_embd_group = group
+    embd_group = create_split_groups(embedding_partition, group_desc="EMBEDDING_GROUP")
+    pos_embd_group = create_split_groups(
+        position_embedding_partition, group_desc="POSITION_EMBEDDING_GROUP"
+    )
 
     return ProcessGroupCollection(
         tp=tp_group,

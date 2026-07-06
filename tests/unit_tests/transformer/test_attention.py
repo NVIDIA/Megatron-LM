@@ -32,7 +32,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
@@ -452,8 +452,7 @@ class TestSelfAttention:
         model_parallel_cuda_manual_seed(123)
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
         grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])

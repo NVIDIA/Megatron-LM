@@ -28,7 +28,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   --tokenizer-type: HuggingFaceTokenizer
   --tokenizer-model: llava-hf/llava-1.5-7b-hf
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --lr: 0.001
   --lr-decay-style: cosine
   --min-lr: 2.0e-5

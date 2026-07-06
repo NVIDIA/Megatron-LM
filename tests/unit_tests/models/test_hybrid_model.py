@@ -1,7 +1,6 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from datetime import timedelta
 from itertools import accumulate
 from types import SimpleNamespace
 
@@ -9,7 +8,6 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
-from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
@@ -26,7 +24,11 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    create_embedding_groups,
+    ensure_distributed_initialized,
+)
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -67,8 +69,7 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         assert torch.distributed.get_world_size() == 8, "Test requires 8 GPUs"
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         dp_size = 1
 
@@ -79,12 +80,10 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         cp_group = grid.create_pg("cp")
         tp_group = grid.create_pg("tp")
         dp_cp_group = grid.create_pg(["cp", "dp"])
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
-        )
+        # One split_group over the grid's full PP partition rather than a
+        # new_group over this rank's slice: an eager new_group would drive
+        # non-member ranks through performNocolorSplit, unimplemented in nccl2.
+        embd_group, _ = create_embedding_groups(grid)
 
         # Create model with custom process groups
         from megatron.core.process_groups_config import ProcessGroupCollection

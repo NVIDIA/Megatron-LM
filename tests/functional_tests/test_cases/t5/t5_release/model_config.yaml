@@ -29,7 +29,7 @@ MODEL_ARGS:
   --lr-decay-style: linear
   --min-lr: 1.0e-5
   --lr-warmup-fraction: .01
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   # Transformer Engine args
   --use-mcore-models: true
   --transformer-impl: transformer_engine

@@ -43,7 +43,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --eval-iters: 0
   --manual-gc: true
   --use-mcore-models: true
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   # parallelism settings
   --sequence-parallel: true
   # embedding settings

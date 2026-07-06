@@ -31,7 +31,7 @@ MODEL_ARGS:
   --vocab-size: 131073
   --mock-data: true
   --split: 949,50,1
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --lr: 0.00015
   --lr-decay-style: cosine
   --min-lr: 1.0e-5

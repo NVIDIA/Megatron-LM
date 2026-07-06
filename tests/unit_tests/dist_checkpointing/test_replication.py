@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import megatron.core.parallel_state as ps
 from megatron.training.arguments import parse_args
 
 nvidia_resiliency_ext = pytest.importorskip(
@@ -60,11 +61,16 @@ def test_all_gather_batch(tp, pp):
     t1 = torch.arange(6, device="cuda").reshape((3, 1, 2))
     t2 = torch.arange(12, device="cuda").reshape((2, 3, 2))
     test_ranks = [0, 3, 7]
-    test_group = GroupWrapper(dist.new_group(test_ranks))
+    # split_group, not new_group: test_ranks is a strict subset of the world, so
+    # an eager new_group would push the remaining ranks through
+    # performNocolorSplit, which the nccl2 backend does not implement. Every rank
+    # still enters the (collective) split; non-members get None back.
+    test_pg = ps.create_split_groups([test_ranks], group_desc="REPLICATION_TEST_GROUP")
     rank = dist.get_rank()
     if rank not in test_ranks:
         dist.barrier()
         return
+    test_group = GroupWrapper(test_pg)
     batch = [[t1, t2], [t0], []]
     pred_batch = test_group.all_gather_batch(batch[test_group.my_group_rank])
     assert equal_(batch, pred_batch)
@@ -108,7 +114,12 @@ class TestLocalCheckpointingReplication:
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
             mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
-            repl_groups_init = [dist.new_group(g) for g in repl_groups]
+            # ``repl_groups`` is a covering partition of the world, so the whole
+            # family is built with a single split_group collective; this rank
+            # only ever needs a handle to the one group it belongs to.
+            repl_groups_init = [
+                ps.create_split_groups(repl_groups, group_desc="REPLICATION_GROUP")
+            ]
             my_process_group = GroupWrapper.from_list_of_groups(repl_groups_init)
             repl_strategy = CliqueReplicationStrategy(my_process_group, target_device="cpu")
             self.checkpointing_context = {

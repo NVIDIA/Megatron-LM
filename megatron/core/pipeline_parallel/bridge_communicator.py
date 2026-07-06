@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.parallel_state import create_group, create_split_groups
 
 
 class CommRole(Enum):
@@ -63,7 +64,9 @@ class BridgeCommunicator:
     def destroy_bridge_pgs(cls):
         """Destroy all cached bridge process groups."""
         for pg in cls._bridge_pg_cache.values():
-            if pg is not None:
+            # ``new_group`` hands non-member ranks the NON_GROUP_MEMBER sentinel,
+            # which is not None and must not be passed to destroy_process_group.
+            if pg is not None and pg is not dist.GroupMember.NON_GROUP_MEMBER:
                 dist.destroy_process_group(pg)
         cls._bridge_pg_cache.clear()
 
@@ -196,7 +199,13 @@ class BridgeCommunicator:
         """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
         cache_key = str(sorted([tuple(r) for r in ranks_list]))
         if cache_key not in cls._broadcast_pg_cache:
-            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
+            # Collective (broadcast) subgroups -> one ``split_group`` over the
+            # world PG, inheriting the world's cuda backend rather than pinning
+            # stock "nccl" (which would sit a stock-NCCL child under an nccl2
+            # world). ``new_subgroups_by_enumeration`` cannot be used: it drives
+            # non-member ranks through ``performNocolorSplit``, unimplemented in
+            # the nccl2 backend.
+            pg = create_split_groups(ranks_list)
             cls._broadcast_pg_cache[cache_key] = pg
         return cls._broadcast_pg_cache[cache_key]
 
@@ -206,7 +215,22 @@ class BridgeCommunicator:
         ranks = sorted(ranks)
         cache_key = str(ranks)
         if cache_key not in cls._bridge_pg_cache:
-            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl')
+            # The bridge PG carries only point-to-point traffic (send / recv /
+            # isend / irecv between src and dest grid leaders), so it uses the
+            # lazy per-peer backend, members-only. Members-only is required on
+            # an nccl2 world because non-member ranks must not take new_group's
+            # eager no-color-split path.
+            cls._bridge_pg_cache[cache_key] = create_group(
+                ranks,
+                backend="nccl-lazy",
+                use_local_synchronization=True,
+                device_id=(
+                    torch.device(f"cuda:{torch.cuda.current_device()}")
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                group_desc="BRIDGE_P2P_GROUP",
+            )
         return cls._bridge_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:

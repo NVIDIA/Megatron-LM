@@ -25,7 +25,7 @@ MODEL_ARGS:
   --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-bert_00_text_sentence
   --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/vocab.txt
   --split: 949,50,1
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --lr: 0.0001
   --min-lr: 0.00001
   --lr-warmup-fraction: 0.01

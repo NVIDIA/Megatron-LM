@@ -217,10 +217,11 @@ class HyperCommGrid:
             dims: Name of leading dimensions to create process group
             view: Optional registered rank view name. Defaults to the base view.
 
-        Keyword arguments are directly passed into new_subgroups_by_enumeration(). The docstring
-        is copied from new_subgroups_by_enumeration().
+        Keyword arguments are directly passed into
+        ``megatron.core.parallel_state.create_split_groups()`` (a ``split_group``-based
+        replacement for ``dist.new_subgroups_by_enumeration``).
 
-        Keyword args from `dist.new_subgroups_by_enumeration`:
+        Keyword args:
             timeout (timedelta, optional): see `init_process_group` for details and default value.
             pg_options (ProcessGroupOptions, optional): process group options
                 specifying what additional options need to be passed in during
@@ -256,7 +257,15 @@ class HyperCommGrid:
             )
 
         rank_enum = self._gen_rank_enum_for(enum_view.shape, enum_view.dim_names, enum_dims)
-        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
+        # Build every subgroup of the enumeration with one ``split_group``
+        # collective instead of one eager ``new_group`` per sublist:
+        # ``new_subgroups_by_enumeration`` makes non-member ranks call
+        # ``performNocolorSplit`` on the parent backend, which the ``nccl2``
+        # backend does not implement. Imported lazily to keep ``hyper_comm_grid``
+        # free of a module-level ``parallel_state`` dependency.
+        from megatron.core.parallel_state import create_split_groups
+
+        pg = create_split_groups(rank_enum, backend=self.backend, **kwargs)
 
         if dist.is_initialized() and dist.get_rank() == 0:
             if self._is_base_pg_key(unique_group_key):
@@ -331,7 +340,7 @@ class HyperCommGrid:
         return self._gen_rank_enum_for(view_spec.shape, view_spec.dim_names, ordered_dims)
 
     def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
-        r"""Generate rank enumeration before calling new_subgroups_by_enumeration
+        r"""Generate rank enumeration before creating the process groups
 
         This function returns ranks grouped by the specified dimensions, but in REVERSE order
         of the input dimensions. For example, if you request dimensions ["a", "b"],

@@ -20,7 +20,7 @@ MODEL_ARGS:
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --timing-log-level: 0
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --log-interval: 1
   --log-progress: true
   --transformer-impl: transformer_engine

@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 class TestParallelTransformerBlock:
@@ -478,8 +478,7 @@ class TestProcessGroupTransformerBlock:
         model_parallel_cuda_manual_seed(123)
         if use_custom_pg:
             # Initialize torch.distributed if not already initialized
-            if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(backend='nccl')
+            ensure_distributed_initialized()
 
             # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
             grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
@@ -565,7 +564,15 @@ class TestMixedProcessGroups:
             self.local_attn_config = copy.deepcopy(self.config)
             self.local_pgs = ProcessGroupCollection.use_mpu_process_groups()
             self.local_attn_config.context_parallel_size = 1
-            self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+            # Degenerate 1-rank CP group. Members-only (not split_group): every
+            # rank passes a different ranks list, and use_local_synchronization
+            # keeps non-members out of new_group's eager no-color-split path,
+            # which the nccl2 backend does not implement.
+            self.local_pgs.cp = parallel_state.create_group(
+                ranks=[torch.distributed.get_rank()],
+                use_local_synchronization=True,
+                group_desc="SINGLE_RANK_GROUP",
+            )
 
             # offset is implicit in TransformerLayer
             self.layers = torch.nn.ModuleList(

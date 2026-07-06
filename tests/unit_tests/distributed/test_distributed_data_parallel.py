@@ -9,7 +9,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 # Test model for testing DDP
@@ -74,8 +74,7 @@ class TestDistributedDataParallel:
         )
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Create HyperCommGrid with dimension ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([1, 1, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])

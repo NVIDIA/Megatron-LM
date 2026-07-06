@@ -97,7 +97,7 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   --export-default-te-spec: true
   --export-model-type: HybridModel
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --distributed-timeout-minutes: 20
   # ── Flextron (from train_flextron.sh flex_options, int-lists with ÷8) ─────
   --flextron: true

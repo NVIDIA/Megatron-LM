@@ -46,7 +46,7 @@ MODEL_ARGS:
   --save-interval: 50
   --eval-interval: 1000
   --eval-iters: 10
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --data-cache-path: ${DATA_CACHE_PATH}
   --deterministic-mode: true
   --attention-softmax-in-fp32: true

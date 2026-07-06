@@ -7,6 +7,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from megatron.core.parallel_state import create_split_groups
+
 from .base import CopyService, RecvOp, SendOp, match_local_ops_by_task_id
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,20 @@ class GlooCopyService(CopyService):
         if group is not None:
             self.gloo_pg = group
         else:
-            self.gloo_pg = dist.new_group(backend="gloo")
+            # A dedicated world-sized group so refit traffic does not interleave
+            # with the default PG. Built with ``split_group`` rather than
+            # ``new_group`` so it works uniformly under an ``nccl2`` world.
+            # ``backend="gloo"`` selects the parent's cpu/gloo backend; the
+            # split filter must also retain the parent's default (cuda) device,
+            # so the resulting group is a compound ``cpu:gloo,cuda:<world cuda>``
+            # group. That is fine here: this PG only ever carries CPU tensors
+            # (``isend``/``irecv`` on pinned CPU buffers), which dispatch to the
+            # gloo backend, and it is never handed to a GLOO-only API.
+            self.gloo_pg = create_split_groups(
+                [list(range(dist.get_world_size()))],
+                backend="gloo",
+                group_desc="REFIT_GLOO_GROUP",
+            )
         self.send_ops: List[SendOp] = []
         # Each recv op is paired with its GPU destination tensor; the SendOp/RecvOp
         # itself carries a pinned-CPU staging buffer for Gloo's CPU PG.
