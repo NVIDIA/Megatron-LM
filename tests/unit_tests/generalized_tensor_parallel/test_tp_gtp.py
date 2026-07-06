@@ -22,6 +22,8 @@ Multi-GPU tests skip automatically when ``torch.distributed.get_world_size()`` d
 the requested combination of tp_size x gtp_remat_size.
 """
 
+import types
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -33,7 +35,13 @@ if not HAVE_GTP:
 
 import transformer_engine.pytorch as te
 
-from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
+from megatron.core.extensions.transformer_engine import _gtp_pre_init
+from megatron.core.tensor_parallel.gtp import (
+    GTP_CONFIG,
+    GTPShardedParam,
+    update_gtp_config,
+    wrap_module_params_gtp,
+)
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _requires_multi_gpu,
@@ -334,3 +342,56 @@ class TestTPGTPLayerNormLinear:
         world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_layernorm_linear, world_size, tp_size, gtp_remat_size)
+
+
+# ---------------------------------------------------------------------------
+# 5. TestTPGTPPaddingAlignment - GTP pre-shard must pad the *per-TP* slice so the weight
+#    stays MXFP8-aligned AFTER TE's tp-split (padding the full out_features would let the
+#    tp-split de-align it).
+# ---------------------------------------------------------------------------
+
+
+def _worker_pre_init_tp_padding(rank, world_size, port, tp_size, gtp_remat_size):
+    """`_gtp_pre_init` pads ``output_size // out_split_size`` (the per-TP slice), so the shard
+    TE hands each rank after its own tp-split is a multiple of ``pad_for_alignment`` (32 for MXFP8).
+
+    tp2 x gtp2, pad=32, out_features=192:
+      correct:   per-TP slice 96 -> pad 128 -> /gtp2 = 64 -> TE tp-split /2 = 64 (32-aligned).
+      pre-fix:   pad full 192 -> /gtp2 = 96 -> TE tp-split /2 = 48 (NOT 32-aligned).
+    """
+    tp_group, gtp_remat_group, tp_rank, gtp_rank = _build_groups(
+        rank, world_size, tp_size, gtp_remat_size
+    )
+    out_features = 192
+    orig_pad = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=32)
+    try:
+        extra_kwargs = {}
+        shard_out, gtp_ctx = _gtp_pre_init(
+            types.SimpleNamespace(),
+            out_features,
+            gtp_remat_group,
+            extra_kwargs,
+            out_split_size=tp_size,
+        )
+        # shard_out is what TE receives as out_features; TE splits it again across tp_size.
+        per_gpu = shard_out // tp_size
+        assert per_gpu % 32 == 0, (
+            f"rank {rank}: per-GPU shard {per_gpu} not 32-aligned -- TE tp-split de-aligned the "
+            "GTP pad (pad the per-TP slice, not the full out_features)"
+        )
+        assert per_gpu == 64, f"rank {rank}: expected per-GPU 64, got {per_gpu}"
+        # pad_length is measured on the per-TP slice: 128 - 96 = 32.
+        _, pad_length, gtp_size, logical = gtp_ctx
+        assert pad_length == 32, f"rank {rank}: expected pad_length 32, got {pad_length}"
+        assert gtp_size == gtp_remat_size and logical == out_features
+    finally:
+        update_gtp_config(pad_for_alignment=orig_pad)
+
+
+class TestTPGTPPaddingAlignment:
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_pre_init_pads_per_tp_slice(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_pre_init_tp_padding, world_size, tp_size, gtp_remat_size)

@@ -383,15 +383,31 @@ def condition_init_method(config, init_method):
 
 
 def _gtp_pre_init(
-    module, output_size, gtp_remat_group, extra_kwargs, *, is_expert=False, rng_via_kwarg=True
+    module,
+    output_size,
+    gtp_remat_group,
+    extra_kwargs,
+    *,
+    is_expert=False,
+    rng_via_kwarg=True,
+    out_split_size=1,
 ):
     """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
     RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
+
+    ``out_split_size`` is the factor TE further splits ``out_features`` by AFTER GTP (=tp_size for
+    column-parallel, else 1). GTP pads the per-TP slice (``output_size // out_split_size``) so each
+    rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
+    post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
     """
     from megatron.core.tensor_parallel.gtp import gtp_remat_shard_dim0
     from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
 
-    shard_out, pad_length = gtp_remat_shard_dim0(output_size, gtp_remat_group)
+    assert output_size % out_split_size == 0, (
+        f"_gtp_pre_init: output_size={output_size} not divisible by out_split_size={out_split_size}"
+    )
+    per_rank, pad_length = gtp_remat_shard_dim0(output_size // out_split_size, gtp_remat_group)
+    shard_out = per_rank * out_split_size
     gtp_ctx = (gtp_remat_group, pad_length, gtp_remat_group.size(), output_size)
 
     tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
@@ -428,9 +444,12 @@ def _init_gtp_remat_context(
     is_expert=False,
     is_grouped=False,
     rng_via_kwarg=True,
+    out_split_size=1,
 ):
     """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
     GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
+
+    ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         yield output_size
@@ -442,6 +461,7 @@ def _init_gtp_remat_context(
         extra_kwargs,
         is_expert=is_expert,
         rng_via_kwarg=rng_via_kwarg,
+        out_split_size=out_split_size,
     )
     yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
@@ -962,7 +982,12 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, torch.is_grad_enabled()
         )
         init_gtp_remat_context = _init_gtp_remat_context(
-            self, output_size, gtp_remat_group, extra_kwargs, is_expert=is_expert
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            is_expert=is_expert,
+            out_split_size=tp_size if te_parallel_mode == "column" else 1,
         )
 
         with init_quant_context, init_gtp_remat_context as output_size:
@@ -1184,7 +1209,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # (divide(output_size, tp_size)), so it must stay unsharded.
         # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
         init_gtp_remat_context = _init_gtp_remat_context(
-            self, output_size, gtp_remat_group, extra_kwargs, rng_via_kwarg=False
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            out_split_size=self.tp_size,
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -2100,7 +2130,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 self.te_quant_params, torch.is_grad_enabled()
             )
             init_gtp_remat_context = _init_gtp_remat_context(
-                self, output_size, gtp_remat_group, extra_kwargs, is_expert=True, is_grouped=True
+                self,
+                output_size,
+                gtp_remat_group,
+                extra_kwargs,
+                is_expert=True,
+                is_grouped=True,
+                out_split_size=tp_size if parallel_mode == "column" else 1,
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:

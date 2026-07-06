@@ -302,8 +302,8 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
 
 
 @dataclass
-class GTPConfig:
-    """Global configuration for Generalized Tensor Parallelism."""
+class GTPRematConfig:
+    """Global configuration for Generalized Tensor Parallelism (weight remat)."""
 
     pad_for_alignment: int = 16
     check_param_states: bool = False
@@ -321,7 +321,7 @@ class GTPConfig:
     calculate_per_token_loss: bool = False
 
 
-GTP_CONFIG = GTPConfig()
+GTP_CONFIG = GTPRematConfig()
 
 
 def update_gtp_config(**kwargs):

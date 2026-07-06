@@ -75,7 +75,7 @@ Wire bandwidth scales with the **quantized** size, not BF16 size — GTP_remat c
 - **BF16 GTP_remat (no FP8 params).** The BF16 shard is all-gathered as-is. (Per-forward BF16→FP8 casting for GTP weights has been removed with the move to native FP8 params, so `mxfp8` GTP requires `--fp8-param-gather`.)
 - **NVFP4** (4-bit, block-scaled) previously cast the BF16 shard to NVFP4 each forward (with GTP_remat-group amax reduction) before gathering; that per-forward-cast path was removed alongside native-FP8 params, so **NVFP4 GTP_remat is currently unsupported pending a native NVFP4-param path** (tracked separately). The comm-volume figures below still describe NVFP4 for reference.
 - **Coalesced NCCL**: `grouped_gather_along_first_dim` uses `torch.distributed._coalescing_manager` to batch E experts' AGs into a single NCCL op.
-- **Padding**: for the TE wrappers both representations allocate the shard **already padded** (`out_features` rounded up to a multiple of `pad_for_alignment × gtp_remat_size`, divided by `gtp_remat_size`) — see the GTP-agnostic init in §3.1. (Megatron-local linears, which still build the full weight and slice it post-init, pad the full tensor first.) Either way the padding ends up contiguous at the tail after all-gather, so stripping is a single trailing slice (`tensor[:-pad_length]`) — no per-shard reshuffle, and `pad_length` may span multiple ranks' shards when the unpadded dim0 is small.
+- **Padding**: the TE wrappers allocate the shard **already padded** so each rank's final dim0 stays `pad_for_alignment`-divisible (MXFP8 requires 32). For column-parallel — where TE *also* splits `out_features` across TP — GTP pads the **per-TP slice** (`out_features / tp_size`) up to a multiple of `pad_for_alignment × gtp_remat_size`, so the shard survives TE's TP split still aligned; row-parallel (whose `out_features` is not TP-split) and the Megatron-local post-init path pad the already-TP-local tensor directly. See the GTP-agnostic init in §3.1. Either way the padding ends up contiguous at the tail after all-gather, so stripping is a single trailing slice (`tensor[:-pad_length]`) — no per-shard reshuffle, and `pad_length` may span multiple ranks' shards when the unpadded dim0 is small.
 
 #### Per-microbatch schedule
 
@@ -130,7 +130,7 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 - **Opt-in by linear class — sharding stays per-weight.** Materialization and gradient reduction remain at individual-weight granularity (each wrapped weight is its own `GTPShardedParam`, gathered/reduce-scattered per-weight, per-call — §1.1). What is class-based is only *which* linears opt in: GTP_remat wraps the tensor-parallel TE linear classes that resolve a shard group internally — `TEColumnParallelLinear` / `TERowParallelLinear` / `TELayerNormColumnParallelLinear` (dense) and `TEGroupedLinear` (routed experts) — so the upper-level modules thread no `gtp_remat_group` argument. The base `TELinear` (e.g. the duplicated MoE latent-proj MLPs) and small replicated tensors (LayerNorm γ/β, biases, Mamba `dt_bias`/`A_log`/`D`/`conv1d`, MoE router) stay full — no NCCL launch latency for params where the all-gather wouldn't amortize. The split is visible in §3.2's *dense non-GTP_remat* vs *dense GTP_remat* membership.
 - `classify_gtp_chains(model)` walks `named_parameters()` once at init and sets `chain_id` on every `GTPShardedParam` based on the current `cuda_graph_modules`.
 - Turning it off is a no-op: when the resolved group is `None` / size 1, `_gtp_pre_init` leaves `out_features` unsharded and `_gtp_attach_post_init` short-circuits (as does `wrap_module_params_gtp` for the Megatron-local linears); when `gtp_weight_remat_size == 1`, the GTP_remat path in `layers.py` is skipped entirely.
-- User-tunable knobs (`GTPConfig.pad_for_alignment`, `weight_prefetch`, `check_param_states`) plus a debug-name tagger (`tag_gtp_params_with_names`) for readable link-table output.
+- User-tunable knobs (`GTPRematConfig.pad_for_alignment`, `weight_prefetch`, `check_param_states`) plus a debug-name tagger (`tag_gtp_params_with_names`) for readable link-table output.
 
 ### 1.6 Optimizer-agnostic (Adam + Muon)
 
@@ -236,7 +236,7 @@ torchrun --nproc-per-node 4 pretrain_gpt.py \
 At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
-GTP_remat enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
+GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False)
 ```
 

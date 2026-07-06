@@ -1794,7 +1794,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             tag_gtp_params_with_names(model_module)
             classify_gtp_chains(model_module)
-        print_rank_0(f"GTP enabled. {GTP_CONFIG}")
+        print_rank_0(f"GTP_remat enabled. {GTP_CONFIG}")
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
