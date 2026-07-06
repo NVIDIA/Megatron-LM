@@ -6,7 +6,7 @@ when_to_use: Adding GB200 github-mr tests; creating single-node variants of exis
 user_invocable: true
 argument: "[model-yaml]  # optional: gpt, moe, or both (default: both)"
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Onboard GB200 1-Node GitHub MR Tests
