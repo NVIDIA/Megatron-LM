@@ -18,7 +18,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1593,15 +1593,13 @@ class MoETransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
 
-        for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            obj, name = self._resolve_token_dispatcher_attr(attr_name)
-            attr = getattr(obj, name)
-            if torch.is_tensor(attr):
-                cached_attr = self.token_dispatcher_attrs.get(attr_name)
-                if torch.is_tensor(cached_attr) and not cached_attr.requires_grad:
-                    cached_attr.copy_(attr)
-                else:
-                    self.token_dispatcher_attrs[attr_name] = attr.detach()
+        if is_graph_capturing() and not is_graph_warmup():
+            for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
+                obj, name = self._resolve_token_dispatcher_attr(attr_name)
+                attr = getattr(obj, name)
+                if torch.is_tensor(attr):
+                    attr.is_from_global_mempool = True
+                    self.token_dispatcher_attrs[attr_name] = attr
 
         return residual, *router_outputs
 
@@ -1634,14 +1632,18 @@ class MoETransformerLayer(TransformerLayer):
 
         """
 
-        # Restore token dispatcher attributes. During graph warmup, the router capture leaves these
-        # attrs pointing into cudagraph pool memory; restoring them here ensures the postprocess
-        # graph captures with valid pointers.
-        self._restore_token_dispatcher_attrs()
-
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
-        return self._forward_post_mlp((output, mlp_bias), residual)
+        out = self._forward_post_mlp((output, mlp_bias), residual)
+
+        if is_graph_capturing() and not is_graph_warmup():
+            for attr_name, attr in self.token_dispatcher_attrs.items():
+                weak_ref = make_weakref(attr, inplace=False)
+                self.token_dispatcher_attrs[attr_name] = weak_ref
+                obj, name = self._resolve_token_dispatcher_attr(attr_name)
+                setattr(obj, name, weak_ref)
+
+        return out
 
     def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
         """
