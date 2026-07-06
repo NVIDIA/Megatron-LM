@@ -217,6 +217,7 @@ def create_group(
     pg_options=None,
     use_local_synchronization=False,
     group_desc=None,
+    device_id=None,
 ):
     """Creates a ProcessGroup."""
     kwargs = {
@@ -227,6 +228,8 @@ def create_group(
         "use_local_synchronization": use_local_synchronization,
         "group_desc": group_desc,
     }
+    if device_id is not None:
+        kwargs["device_id"] = device_id
     if not is_torch_min_version("2.4.0"):
         kwargs.pop("group_desc")
         if timeout is None:
@@ -245,6 +248,74 @@ def create_group(
     if torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
     return group
+
+
+def _split_group_backend(backend):
+    """Device-qualify the backend filter handed to ``split_group``.
+
+    The world PG carries both a cpu (gloo) and a cuda (nccl2) backend, so a
+    subgroup split from it inherits both unless the filter restricts it. Cuda
+    subgroups keep only the world PG's cuda backend. Gloo subgroups keep
+    ``cpu:gloo`` plus the parent's cuda backend: split_group requires the filter
+    to include the parent PG's default device type (cuda), so a cpu-only filter
+    is rejected. The resulting gloo group carries a redundant (but harmless)
+    cuda backend, as upstream vLLM's cpu group does. Returning ``None`` lets the
+    child inherit the full parent config (used when the cuda backend can't be
+    determined).
+    """
+    requested = str(backend or "").lower()
+    if requested not in ("", "nccl", "nccl2", "gloo"):
+        return backend
+    cuda_backend = None
+    world_config = torch.distributed.get_backend_config()
+    for part in world_config.split(","):
+        device, _, name = part.partition(":")
+        if device.strip() == "cuda" and name.strip():
+            cuda_backend = name.strip()
+            break
+    if requested == "gloo":
+        return f"cpu:gloo,cuda:{cuda_backend}" if cuda_backend else "cpu:gloo"
+    return f"cuda:{cuda_backend}" if cuda_backend else None
+
+
+def create_partition_groups(
+    ranks_list,
+    timeout=None,
+    backend=None,
+    pg_options=None,
+    group_desc=None,
+):
+    """Create every subgroup of a rank *partition*; return this rank's
+    ``(group, ranks)`` (``(None, None)`` if the rank is in no subgroup).
+
+    Both the cuda subgroups (backend None/"nccl") and the gloo subgroups
+    (``backend="gloo"``) are built with a single ``torch.distributed.split_group``
+    collective over the world PG. split_group is entered by every rank in the
+    parent group, is self-contained (it does not use ``new_group``'s eager
+    no-color-split path, which nccl2 does not implement) and uses hashed group
+    names, so it stays in lockstep across ranks. The gloo split requires the
+    world PG to carry a ``cpu:gloo`` backend (see ``initialize.py``).
+    """
+    rank = torch.distributed.get_rank()
+    ranks_list = [list(r) for r in ranks_list]
+    group = torch.distributed.split_group(
+        split_ranks=ranks_list,
+        timeout=timeout,
+        pg_options=pg_options,
+        group_desc=group_desc,
+        backend=_split_group_backend(backend),
+    )
+    if group is None or group == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+        return None, None
+    global _global_process_group_list
+    if _global_process_group_list is None:
+        # None stands for the default process group
+        _global_process_group_list = [None]
+    _global_process_group_list.append(group)
+    for r in ranks_list:
+        if rank in r:
+            return group, r
+    return None, None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -393,26 +464,26 @@ def create_hierarchical_groups(
             s=hierarchical_group_sizes[level],
             l=int(np.prod(hierarchical_group_sizes[level + 1 :])),
         ).tolist()
-        for sub_ranks in rearranged_ranks:
-            sub_group = create_group(
-                sub_ranks,
+        # The sub-groups at each level partition ``ranks`` (a subset of the
+        # world PG), so build them with one split_group collective per level.
+        sub_group, my_sub_ranks = create_partition_groups(
+            rearranged_ranks,
+            timeout=timeout,
+            pg_options=pg_options[level],
+            group_desc=f"HIERARCHICAL_{group_desc}_L{level}",
+        )
+        if create_gloo_process_groups:
+            sub_group_gloo, _ = create_partition_groups(
+                rearranged_ranks,
                 timeout=timeout,
-                pg_options=pg_options[level],
-                group_desc=f"HIERARCHICAL_{group_desc}_L{level}",
+                backend="gloo",
+                group_desc=f"HIERARCHICAL_{group_desc}_GLOO_L{level}",
             )
-            if create_gloo_process_groups:
-                sub_group_gloo = create_group(
-                    sub_ranks,
-                    timeout=timeout,
-                    backend="gloo",
-                    pg_options=pg_options[level],
-                    group_desc=f"HIERARCHICAL_{group_desc}_GLOO_L{level}",
-                )
-            else:
-                sub_group_gloo = None
-            if rank in sub_ranks:
-                hierarchical_groups.append(sub_group)
-                hierarchical_groups_gloo.append(sub_group_gloo)
+        else:
+            sub_group_gloo = None
+        if my_sub_ranks is not None:
+            hierarchical_groups.append(sub_group)
+            hierarchical_groups_gloo.append(sub_group_gloo)
     assert rank not in ranks or len(hierarchical_groups) == len(hierarchical_group_sizes)
     assert rank not in ranks or len(hierarchical_groups_gloo) == len(hierarchical_group_sizes)
     return hierarchical_groups, hierarchical_groups_gloo
@@ -429,17 +500,19 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     # We limit the allowed group sizes in order to avoid excessive overhead.
     group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
     for group_size in group_sizes:
-        for i in range(0, len(ranks), group_size):
-            group = create_group(
-                ranks[i : i + group_size],
-                pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
-            )
-            if rank in ranks[i : i + group_size]:
-                assert (
-                    group_size not in hybrid_dp_cp_groups
-                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
-                hybrid_dp_cp_groups[group_size] = group
+        # The equal-sized slices at a given group_size partition ``ranks`` (a
+        # subset of the world PG), so build them with one split_group per size.
+        partition = [ranks[i : i + group_size] for i in range(0, len(ranks), group_size)]
+        group, my_ranks = create_partition_groups(
+            partition,
+            pg_options=pg_options,
+            group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+        )
+        if my_ranks is not None:
+            assert (
+                group_size not in hybrid_dp_cp_groups
+            ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
+            hybrid_dp_cp_groups[group_size] = group
     return hybrid_dp_cp_groups
 
 
@@ -842,58 +915,62 @@ def initialize_model_parallel(
     # is eligible for using the NCCL COLLNET feature.
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
-    for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-        group_with_cp = create_group(
-            ranks_with_cp,
+    group_with_cp, my_ranks_with_cp = create_partition_groups(
+        decoder_rank_generator.get_ranks('dp-cp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+        group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+    )
+    if create_gloo_process_groups:
+        group_with_cp_gloo, _ = create_partition_groups(
+            decoder_rank_generator.get_ranks('dp-cp'),
             timeout=timeout,
-            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+            backend="gloo",
+            group_desc="DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+        )
+    else:
+        group_with_cp_gloo = None
+    if my_ranks_with_cp is not None:
+        _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+        _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+        _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = my_ranks_with_cp
+
+    if num_distributed_optimizer_instances > 1:
+        # Intra-partial DP groups are equal slices of each dp-cp group; across
+        # all dp-cp groups they partition the world PG, so build them with a
+        # single split_group collective.
+        intra_partial_dp_partition_with_cp = [
+            ranks_with_cp[
+                (i * intra_partial_data_parallel_size) : (
+                    (i + 1) * intra_partial_data_parallel_size
+                )
+            ]
+            for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp')
+            for i in range(num_distributed_optimizer_instances)
+        ]
+        intra_partial_dp_group_with_cp, my_intra_ranks = create_partition_groups(
+            intra_partial_dp_partition_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
+            group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
         )
         if create_gloo_process_groups:
-            group_with_cp_gloo = create_group(
-                ranks_with_cp,
+            intra_partial_dp_group_with_cp_gloo, _ = create_partition_groups(
+                intra_partial_dp_partition_with_cp,
                 timeout=timeout,
                 backend="gloo",
-                group_desc="DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+                group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO",
             )
         else:
-            group_with_cp_gloo = None
-        if rank in ranks_with_cp:
-            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
-
-        if num_distributed_optimizer_instances > 1:
-            # Create groups for intra-partial DP domain
-            for i in range(num_distributed_optimizer_instances):
-                intra_partial_dp_ranks_with_cp = ranks_with_cp[
-                    (i * intra_partial_data_parallel_size) : (
-                        (i + 1) * intra_partial_data_parallel_size
-                    )
-                ]
-                intra_partial_dp_group_with_cp = create_group(
-                    intra_partial_dp_ranks_with_cp,
-                    timeout=timeout,
-                    pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
-                    group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
-                )
-                if create_gloo_process_groups:
-                    intra_partial_dp_group_with_cp_gloo = create_group(
-                        intra_partial_dp_ranks_with_cp,
-                        timeout=timeout,
-                        backend="gloo",
-                        group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO",
-                    )
-                else:
-                    intra_partial_dp_group_with_cp_gloo = None
-                if rank in intra_partial_dp_ranks_with_cp:
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = intra_partial_dp_group_with_cp
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
-                        intra_partial_dp_group_with_cp_gloo
-                    )
-        else:
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+            intra_partial_dp_group_with_cp_gloo = None
+        if my_intra_ranks is not None:
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = intra_partial_dp_group_with_cp
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                intra_partial_dp_group_with_cp_gloo
+            )
+    else:
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
     # Apply SHARP to the dp group.
     if sharp_enabled_group == "dp":
@@ -932,41 +1009,45 @@ def initialize_model_parallel(
             )
         # TODO: Are gloo groups needed for hybrid cp?
 
-    for ranks in decoder_rank_generator.get_ranks('dp'):
-        group = create_group(
-            ranks,
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('dp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+        group_desc="DATA_PARALLEL_GROUP",
+    )
+    if create_gloo_process_groups:
+        group_gloo, _ = create_partition_groups(
+            decoder_rank_generator.get_ranks('dp'),
             timeout=timeout,
-            pg_options=get_nccl_options("dp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP",
+            backend="gloo",
+            group_desc="DATA_PARALLEL_GROUP_GLOO",
         )
-        if create_gloo_process_groups:
-            group_gloo = create_group(
-                ranks, timeout=timeout, backend="gloo", group_desc="DATA_PARALLEL_GROUP_GLOO"
-            )
-        else:
-            group_gloo = None
-        if rank in ranks:
-            _DATA_PARALLEL_GROUP = group
-            _DATA_PARALLEL_GROUP_GLOO = group_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS = ranks
+    else:
+        group_gloo = None
+    if my_ranks is not None:
+        _DATA_PARALLEL_GROUP = group
+        _DATA_PARALLEL_GROUP_GLOO = group_gloo
+        _DATA_PARALLEL_GLOBAL_RANKS = my_ranks
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("cp", nccl_comm_cfgs),
-            group_desc="CONTEXT_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _CONTEXT_PARALLEL_GROUP = group
-            _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
-        if hierarchical_context_parallel_sizes:
-            assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
-            global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('cp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("cp", nccl_comm_cfgs),
+        group_desc="CONTEXT_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _CONTEXT_PARALLEL_GROUP = group
+        _CONTEXT_PARALLEL_GLOBAL_RANKS = my_ranks
+    if hierarchical_context_parallel_sizes:
+        # Hierarchical CP builds nested subgroups per cp group; every rank must
+        # enter create_hierarchical_groups for each cp group, so keep the loop.
+        assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
+        global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+        for ranks in decoder_rank_generator.get_ranks('cp'):
             hierarchical_groups, _ = create_hierarchical_groups(
                 rank,
                 ranks,
@@ -983,16 +1064,15 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-            group_desc="MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _MODEL_PARALLEL_GROUP = group
-            _MODEL_PARALLEL_GLOBAL_RANKS = ranks
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('tp-pp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("mp", nccl_comm_cfgs),
+        group_desc="MODEL_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _MODEL_PARALLEL_GROUP = group
+        _MODEL_PARALLEL_GLOBAL_RANKS = my_ranks
 
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
@@ -1000,16 +1080,15 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp", nccl_comm_cfgs),
-            group_desc="TENSOR_MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _TENSOR_MODEL_PARALLEL_GROUP = group
-            _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('tp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+        group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _TENSOR_MODEL_PARALLEL_GROUP = group
+        _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = my_ranks
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -1076,16 +1155,27 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
+    pp_partitions = decoder_rank_generator.get_ranks('pp')
+    for ranks in pp_partitions:
+        # The PP device group is the ONLY new_group in the nccl2 path: it is a
+        # members-only ("use_local_synchronization=True") per-peer "nccl-lazy"
+        # ProcessGroup (a dedicated comm + stream per send/recv peer, like
+        # ProcessGroupNCCL) so concurrent P2P to different peers overlaps.
+        # Members-only is required because nccl2 does not implement new_group's
+        # eager no-color-split path, so non-member ranks must short-circuit.
+        # Bind to this rank's cuda device so a lazily initialized comm never
+        # infers the wrong device (e.g. non-contiguous PP groups recving on the
+        # wrong device). The "ucc" backend keeps the eager path.
+        pp_ucc = pipeline_model_parallel_comm_backend == "ucc"
         group = create_group(
             ranks,
             timeout=timeout,
-            backend=pipeline_model_parallel_comm_backend,
-            pg_options=(
-                None
-                if pipeline_model_parallel_comm_backend == "ucc"
-                else get_nccl_options("pp", nccl_comm_cfgs)
+            backend="ucc" if pp_ucc else "nccl-lazy",
+            use_local_synchronization=not pp_ucc,
+            device_id=(
+                None if pp_ucc else torch.device(f"cuda:{torch.cuda.current_device()}")
             ),
+            pg_options=(None if pp_ucc else get_nccl_options("pp", nccl_comm_cfgs)),
             group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
         )
         assert (
@@ -1105,27 +1195,32 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
 
-        embedding_ranks = get_embedding_ranks(ranks)
-        group = create_group(
-            embedding_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("embd", nccl_comm_cfgs),
-            group_desc="EMBEDDING_GROUP",
-        )
-        if rank in embedding_ranks:
-            _EMBEDDING_GROUP = group
-            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+    # Embedding and position-embedding groups are cuda subsets of the world PG
+    # (the first/last rank of each PP group), so build them via split_group over
+    # their partition lists rather than per-PP-group new_group.
+    embedding_partition = [get_embedding_ranks(ranks) for ranks in pp_partitions]
+    group, my_embedding_ranks = create_partition_groups(
+        embedding_partition,
+        timeout=timeout,
+        pg_options=get_nccl_options("embd", nccl_comm_cfgs),
+        group_desc="EMBEDDING_GROUP",
+    )
+    if my_embedding_ranks is not None:
+        _EMBEDDING_GROUP = group
+        _EMBEDDING_GLOBAL_RANKS = my_embedding_ranks
 
-        position_embedding_ranks = get_position_embedding_ranks(ranks)
-        group = create_group(
-            position_embedding_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
-            group_desc="POSITION_EMBEDDING_GROUP",
-        )
-        if rank in position_embedding_ranks:
-            _POSITION_EMBEDDING_GROUP = group
-            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+    position_embedding_partition = [
+        get_position_embedding_ranks(ranks) for ranks in pp_partitions
+    ]
+    group, my_position_embedding_ranks = create_partition_groups(
+        position_embedding_partition,
+        timeout=timeout,
+        pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
+        group_desc="POSITION_EMBEDDING_GROUP",
+    )
+    if my_position_embedding_ranks is not None:
+        _POSITION_EMBEDDING_GROUP = group
+        _POSITION_EMBEDDING_GLOBAL_RANKS = my_position_embedding_ranks
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -1133,98 +1228,91 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-dp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
-        )
-        if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP = group
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('tp-dp-cp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
+        group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
+    )
+    if my_ranks is not None:
+        _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('tp-dp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
+        group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
+    group, my_ranks = create_partition_groups(
+        decoder_rank_generator.get_ranks('tp-cp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+        group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('ep'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
-            group_desc="EXPERT_MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _EXPERT_MODEL_PARALLEL_GROUP = group
-            _EXPERT_MODEL_PARALLEL_RANKS = ranks
+    group, my_ranks = create_partition_groups(
+        expert_decoder_rank_generator.get_ranks('ep'),
+        timeout=timeout,
+        pg_options=get_nccl_options("ep", nccl_comm_cfgs),
+        group_desc="EXPERT_MODEL_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _EXPERT_MODEL_PARALLEL_GROUP = group
+        _EXPERT_MODEL_PARALLEL_RANKS = my_ranks
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
     assert (
         _EXPERT_TENSOR_PARALLEL_GROUP is None
     ), 'Expert tensor model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _EXPERT_TENSOR_PARALLEL_GROUP = group
+    group, my_ranks = create_partition_groups(
+        expert_decoder_rank_generator.get_ranks('tp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
+        group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _EXPERT_TENSOR_PARALLEL_GROUP = group
 
     # Build the tensor + expert parallel groups
     global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
     assert (
         _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
     ), 'Expert tensor + model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
+    group, my_ranks = create_partition_groups(
+        expert_decoder_rank_generator.get_ranks('tp-ep'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
+        group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
 
     # Build the expert+tensor+pipeline parallel groups
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
     ), 'The expert_tensor_model_pipeline parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
+    group, my_ranks = create_partition_groups(
+        expert_decoder_rank_generator.get_ranks('tp-ep-pp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
+        group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
+    )
+    if my_ranks is not None:
+        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
 
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
@@ -1251,30 +1339,34 @@ def initialize_model_parallel(
         expert_data_parallel_size // num_distributed_optimizer_instances
     )
 
-    for ranks in expert_decoder_rank_generator.get_ranks('dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
-            group_desc="EXPERT_DATA_PARALLEL_GROUP",
+    group, my_ranks = create_partition_groups(
+        expert_decoder_rank_generator.get_ranks('dp'),
+        timeout=timeout,
+        pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+        group_desc="EXPERT_DATA_PARALLEL_GROUP",
+    )
+    if create_gloo_process_groups:
+        group_gloo, _ = create_partition_groups(
+            expert_decoder_rank_generator.get_ranks('dp'),
+            backend="gloo",
+            group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO",
         )
-        if create_gloo_process_groups:
-            group_gloo = create_group(
-                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
-            )
-        else:
-            group_gloo = None
-        if rank in ranks:
-            _EXPERT_DATA_PARALLEL_GROUP = group
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+    else:
+        group_gloo = None
+    if my_ranks is not None:
+        _EXPERT_DATA_PARALLEL_GROUP = group
+        _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
-            # Create groups for Partial DistOpt, one for intra-partial DP domain
-            # Another for inter-partial DP domain
+    if num_distributed_optimizer_instances > 1:
+        # Create groups for Partial DistOpt, one for intra-partial DP domain
+        # Another for inter-partial DP domain. These hierarchical groups are
+        # built per ep-dp group; every rank must enter create_hierarchical_groups
+        # for each, so keep the loop.
 
-            # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
-            if sharp_enabled_group == "dp_replica":
-                os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
+        if sharp_enabled_group == "dp_replica":
+            os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        for ranks in expert_decoder_rank_generator.get_ranks('dp'):
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
@@ -1292,21 +1384,21 @@ def initialize_model_parallel(
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
                 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
 
-            if sharp_enabled_group == "dp_replica":
-                # PyTorch is performing lazy initialization of the communicator group.
-                # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
-                if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
-                    torch.distributed.barrier(
-                        group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
-                        device_ids=[torch.cuda.current_device()],
-                    )
-                    torch.cuda.synchronize()
-                # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
-                if "NCCL_COLLNET_ENABLE" in os.environ:
-                    del os.environ["NCCL_COLLNET_ENABLE"]
-        else:
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+        if sharp_enabled_group == "dp_replica":
+            # PyTorch is performing lazy initialization of the communicator group.
+            # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+            if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
+                torch.distributed.barrier(
+                    group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+                    device_ids=[torch.cuda.current_device()],
+                )
+                torch.cuda.synchronize()
+            # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
+            if "NCCL_COLLNET_ENABLE" in os.environ:
+                del os.environ["NCCL_COLLNET_ENABLE"]
+    else:
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
     ### End of expert related parallel groups initialization
 
     # build the intra distributed optimizer instance group
@@ -1315,21 +1407,26 @@ def initialize_model_parallel(
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
     ), "Intra distributed optimizer instance group is already initialized"
 
+    # Each intra distributed-optimizer instance group is the union of a run of
+    # tp-ep-pp groups; across the world these partition it, so build them with a
+    # single split_group collective.
+    intra_dist_opt_partition = []
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
     for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
         model_parallel_group_id += 1
         intra_dist_opt_ranks.extend(ranks)
         if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
-            intra_dist_opt_instance_group = create_group(
-                intra_dist_opt_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
-                group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
-            )
-            if rank in intra_dist_opt_ranks:
-                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+            intra_dist_opt_partition.append(list(intra_dist_opt_ranks))
             intra_dist_opt_ranks = []
+    group, my_ranks = create_partition_groups(
+        intra_dist_opt_partition,
+        timeout=timeout,
+        pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
+        group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+    )
+    if my_ranks is not None:
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = group
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -1384,15 +1481,14 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
     )
 
-    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
-        if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+    group_with_cp_ag, my_ranks_with_cp = create_partition_groups(
+        decoder_rank_gen.get_ranks('dp-cp'),
+        timeout=timeout,
+        pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+        group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+    )
+    if my_ranks_with_cp is not None:
+        dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
@@ -1410,15 +1506,14 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             rank_offset=0,
         )
 
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
-            )
-            if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
+        expert_dp_ag, my_expert_dp_ranks = create_partition_groups(
+            expert_rank_gen.get_ranks('dp'),
+            timeout=timeout,
+            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+            group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+        )
+        if my_expert_dp_ranks is not None:
+            expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
 

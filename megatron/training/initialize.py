@@ -312,8 +312,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             )
 
         # Call the init process
+        world_backend = args.distributed_backend
+        if world_backend in ("nccl", "nccl2"):
+            # Give the world PG a cpu:gloo backend alongside the cuda backend so
+            # gloo subgroups can be built with split_group. nccl2 has no eager
+            # no-color-split, so every subgroup (cuda and gloo) is a split_group
+            # of the world PG, and gloo split requires a gloo backend on the
+            # parent to filter for.
+            world_backend = f"cpu:gloo,cuda:{world_backend}"
         init_process_group_kwargs = {
-            'backend': args.distributed_backend,
+            'backend': world_backend,
             'store': store,
             'world_size': args.world_size,
             'rank': args.rank,
@@ -328,6 +336,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
+        elif device_id is not None:
+            # Bind the world PG (nccl2) to this rank's cuda device.
+            init_process_group_kwargs['device_id'] = device_id
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
