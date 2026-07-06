@@ -1222,7 +1222,9 @@ class _DeepepManager(_DispatchManager):
             )
         # None -> 20 (DeepEP's historical mcore default when moe_flex_dispatcher_num_sms is unset).
         set_deepep_num_sms(
-            config.moe_flex_dispatcher_num_sms if config.moe_flex_dispatcher_num_sms is not None else 20
+            config.moe_flex_dispatcher_num_sms
+            if config.moe_flex_dispatcher_num_sms is not None
+            else 20
         )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1400,7 +1402,6 @@ class _DeepepManager(_DispatchManager):
             pad_offsets=self.pad_offsets,
         )
         return hidden_states
-
 
 
 class _NCCLEPManager(_DispatchManager):
