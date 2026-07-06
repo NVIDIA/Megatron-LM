@@ -132,7 +132,7 @@ class TestMoESingleGroupedWeightNumerics:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -161,7 +161,7 @@ class TestMoESingleGroupedWeightNumerics:
         sys.argv = ["test_moe_single_grouped_weight_numerics.py"]
         args = parse_args()
         args.num_layers = 1
-        args.vocal_size = 1024
+        args.vocab_size = 1024
         args.hidden_size = 256
         args.ffn_hidden_size = 256
         args.num_attention_heads = 8
