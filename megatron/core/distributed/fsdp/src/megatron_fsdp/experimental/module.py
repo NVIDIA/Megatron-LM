@@ -114,7 +114,27 @@ class FsdpModule:
         self._register_hooks()
 
     def _lazy_init_context(self) -> None:
-        """Initialize the shared runtime context for this FSDP root subtree."""
+        """Initialize one shared runtime context for this FSDP root subtree.
+
+        MFSDP v2 requires users to apply ``fully_shard`` bottom-up, so child FSDP
+        modules are constructed before their eventual root module is constructed.
+        This method resolves the root lazily on the first forward through the
+        outermost FSDP module and shares that one context with every FSDP
+        descendant.
+
+        Alternatives considered:
+        - Eagerly initialize contexts during ``fully_shard``. When a parent is
+          sharded, we could create a new root context and reassign it to all
+          descendant FSDP modules. This creates transient child contexts that are
+          never used if the parent is later sharded, and each parent shard must
+          walk its descendants again, making nested sharding quadratic.
+        - Store an ``is_root`` field on each FSDP module. ``fully_shard`` could
+          mark newly sharded modules as roots and clear that flag on descendant
+          FSDP modules when a parent is sharded. This avoids creating unused
+          contexts but moves root tracking onto every FSDP module, adding
+          per-module state that must stay consistent with the final sharded
+          module hierarchy.
+        """
         if self._context is not None:
             return
 
