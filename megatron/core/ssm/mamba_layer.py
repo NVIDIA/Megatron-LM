@@ -87,6 +87,7 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
+        self.pg_collection = pg_collection
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -168,15 +169,31 @@ class MambaLayer(GraphableMegatronModule):
             # Recompute the mixer during the backward pass to save activation memory.
             # Guarded to training only (inference_context is None) so the stateful SSM
             # update is never re-executed during inference.
-            mixer_out_with_bias = tensor_parallel.checkpoint(
-                functools.partial(
+            if self.config.fp8 or self.config.fp4:
+                # te_checkpoint enters TE's activation-recompute phase so fp8/fp4
+                # amax/scaling state is not updated a second time by the recompute.
+                # import here to avoid circular import
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                mixer_out_with_bias = te_checkpoint(
                     self.mixer,
+                    False,  # distribute_saved_activations
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
                     inference_context=inference_context,
                     packed_seq_params=packed_seq_params,
-                ),
-                False,  # distribute_saved_activations
-                hidden_states,
-            )
+                )
+            else:
+                mixer_out_with_bias = tensor_parallel.checkpoint(
+                    functools.partial(
+                        self.mixer,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                    ),
+                    False,  # distribute_saved_activations
+                    hidden_states,
+                )
         else:
             mixer_out_with_bias = self.mixer(
                 hidden_states,
