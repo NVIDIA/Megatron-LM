@@ -385,6 +385,23 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _validate_raw_moment_logging_args(args):
+    raw_moment_logging_enabled = any(
+        (
+            args.log_param_raw_moments_by_param,
+            args.log_grad_raw_moments_by_param,
+            args.log_activation_raw_moments_by_layer,
+            args.log_dgrad_raw_moments_by_layer,
+        )
+    )
+    if raw_moment_logging_enabled and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+        raise ValueError(
+            'Raw-moment statistics logging is not supported with '
+            '--use-megatron-fsdp or --use-torch-fsdp2.'
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -625,6 +642,8 @@ def validate_args(args, defaults={}):
                                                  v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
+
+    _validate_raw_moment_logging_args(args)
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'

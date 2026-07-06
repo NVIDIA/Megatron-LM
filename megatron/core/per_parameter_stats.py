@@ -288,10 +288,7 @@ def _split_tensors_for_multi_tensor_raw_moments(
     split_tensors = []
     source_indices = []
     for index, tensor in enumerate(tensors):
-        local_tensor = getattr(tensor, "_local_tensor", None)
-        if local_tensor is None:
-            local_tensor = tensor
-        flat_tensor = local_tensor.detach().view(-1)
+        flat_tensor = tensor.detach().view(-1)
         if flat_tensor.numel() == 0 or flat_tensor.numel() <= _MAX_MULTI_TENSOR_RAW_MOMENTS_NUMEL:
             split_tensors.append(flat_tensor)
             source_indices.append(index)

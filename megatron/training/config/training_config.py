@@ -273,7 +273,7 @@ class LoggerConfig:
 
     statistics_log_dir: str | None = None
     """Directory for high-cardinality JSONL statistics. If unset, statistics use
-    tensorboard_dir when available, then save as a fallback."""
+    tensorboard_dir when available, then the --save directory as a fallback."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""

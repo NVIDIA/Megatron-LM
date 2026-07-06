@@ -53,7 +53,7 @@ from ..per_parameter_stats import (
     reduce_raw_moments_by_param,
 )
 from ..transformer.module import param_is_not_shared
-from ..utils import get_data_parallel_group_if_dtensor, log_single_rank, to_local_if_dtensor
+from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -306,19 +306,14 @@ class MegatronOptimizer(ABC):
         """Build gradient buckets for per-parameter raw-moment reductions."""
         names = []
         grads = []
-        data_parallel_group = None
         for name, param in self.get_named_parameters_for_grad_norm(registry):
             grad = self._get_grad_for_grad_norm(param)
             if not self._include_param_in_grad_norm(param, grad):
                 continue
-            data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
             names.append(name)
-            grads.append(to_local_if_dtensor(grad).detach())
+            grads.append(grad.detach())
 
-        reduce_groups = ((data_parallel_group,) if data_parallel_group is not None else ()) + (
-            self.get_grad_stats_parallel_group(),
-        )
-        return [NamedTensorBucket(names, grads, reduce_groups)]
+        return [NamedTensorBucket(names, grads, (self.get_grad_stats_parallel_group(),))]
 
     def get_grad_raw_moments_by_param(
         self,

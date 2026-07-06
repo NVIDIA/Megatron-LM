@@ -105,13 +105,17 @@ def _calc_params_l2_norm_or_raw_moments(
             "parallel ranks."
         )
 
+    if raw_moments_by_param and (
+        getattr(args, 'use_megatron_fsdp', False) or getattr(args, 'use_torch_fsdp2', False)
+    ):
+        raise RuntimeError(
+            "calc_params_raw_moments_by_param() is not implemented for Megatron-FSDP "
+            "or Torch-FSDP2"
+        )
+
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.
-        if raw_moments_by_param:
-            raise RuntimeError(
-                "calc_params_raw_moments_by_param() is not implemented for --use-megatron-fsdp"
-            )
         params = []
         for model_chunk in model:
             model_chunk.stop_communication()
