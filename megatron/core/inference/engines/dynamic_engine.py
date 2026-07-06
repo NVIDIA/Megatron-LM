@@ -424,7 +424,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
+            input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
             # Progress.

@@ -584,7 +584,8 @@ class TextGenerationController:
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_dummy_forward: bool = False,
         transfer_bookkeeping_to_gpu: bool = True,
-    ):
+        record_bookkeeping_done_event: bool = False,
+    ) -> Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]:
         """Initializes the inference context for dynamic batching.
 
         Args:
@@ -593,9 +594,13 @@ class TextGenerationController:
             is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
             transfer_bookkeeping_to_gpu (bool): Whether to publish the prepared
                 CPU bookkeeping snapshot to GPU before returning.
+            record_bookkeeping_done_event (bool): Whether to record an event
+                after the bookkeeping H2D transfer.
 
         Returns:
-            Tuple[Tensor, Tensor]: The active input IDs and position IDs.
+            Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]: The active input
+                IDs, position IDs, and optional bookkeeping H2D completion
+                event.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -605,10 +610,11 @@ class TextGenerationController:
 
         # Initialize attention state and optionally publish CPU bookkeeping to GPU.
         range_push("initialize_attention_state")
-        context.initialize_attention_state(
+        bookkeeping_done_event = context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
             transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
+            record_bookkeeping_done_event=record_bookkeeping_done_event,
         )
         range_pop()
 
@@ -659,11 +665,12 @@ class TextGenerationController:
         # If we are running a dummy forward step we want to use the token count agreed upon
         # by all EP ranks rather than the minimum number of tokens.
         if construct_graph_dimensions is not None and not is_dummy_forward:
-            return context.current_input_and_position_ids(
+            input_ids, position_ids = context.current_input_and_position_ids(
                 num_warmup_tokens=construct_graph_dimensions.token_count
             )
         else:
-            return context.current_input_and_position_ids()
+            input_ids, position_ids = context.current_input_and_position_ids()
+        return input_ids, position_ids, bookkeeping_done_event
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor):
         """Forward step the model to get logits for dynamic batching.
@@ -1532,7 +1539,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
 
         # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
@@ -1957,7 +1964,10 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         context.prepare_requests()
-        return self._dynamic_step_context_init(transfer_bookkeeping_to_gpu=False)
+        input_ids, position_ids, _ = self._dynamic_step_context_init(
+            transfer_bookkeeping_to_gpu=False
+        )
+        return input_ids, position_ids
 
     def _run_async_sched_publish_bookkeeping(self) -> Optional[torch.cuda.Event]:
         """Publish prepared bookkeeping without overwriting GPU input token IDs.
@@ -2002,21 +2012,24 @@ class TextGenerationController:
         # Return the forward-done event.
         return forward_done_event
 
-    def _run_async_sched_forward_primer(self) -> bool:
+    def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Launch the initial forward when no valid logits state exists.
 
         Returns:
-            bool: Whether this call launched the forward primer.
+            Tuple[bool, Optional[torch.cuda.Event]]: Whether this call launched
+                the forward primer and its bookkeeping H2D completion event.
         """
         if self._async_sched_logits.is_valid:
-            return False
+            return False, None
 
         # Initialize, forward, and record the pending logits state.
         with torch.inference_mode():
-            input_ids_gpu_view, position_ids_gpu_view = self._dynamic_step_context_init()
+            input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
+                self._dynamic_step_context_init(record_bookkeeping_done_event=True)
+            )
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
-        return True
+        return True, bookkeeping_done_event
 
     def _run_async_sched_resolve(
         self,
@@ -2109,15 +2122,17 @@ class TextGenerationController:
             return None
 
         # Launch the forward primer if no existing logits state can be reused.
-        primer_launched = self._run_async_sched_forward_primer()
+        primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
         with torch.inference_mode():
             current_logits_ready_event = self._async_sched_logits.ready_event
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
 
-            # A new primer must finish before prepare can reuse its pinned CPU source buffers.
-            if not overlap or primer_launched:
+            # Serial mode waits for logits; overlap only waits for a new primer's H2D source read.
+            if not overlap:
                 self._synchronize_async_sched_event(current_logits_ready_event)
+            elif primer_launched:
+                self._synchronize_async_sched_event(primer_bookkeeping_done_event)
 
             # Prepare CPU state and live GPU views without publishing bookkeeping yet.
             range_push("prepare_requests")
@@ -2224,7 +2239,7 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
-            input_ids, position_ids = self._dynamic_step_context_init()
+            input_ids, position_ids, _ = self._dynamic_step_context_init()
 
             cuda_graph_request_count = (
                 context.padded_active_request_count

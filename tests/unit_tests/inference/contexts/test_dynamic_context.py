@@ -300,7 +300,13 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_initialize_attention_state_can_defer_bookkeeping_transfer(self):
+    @pytest.mark.parametrize(
+        "transfer_bookkeeping,record_done_event,expected_event",
+        [(False, False, None), (True, False, None), (True, True, "bookkeeping")],
+    )
+    def test_initialize_attention_state_bookkeeping_transfer_event(
+        self, transfer_bookkeeping, record_done_event, expected_event
+    ):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -311,11 +317,24 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
         )
-        dynamic_context.transfer_bookkeeping_to_gpu = mock.Mock()
+        dynamic_context.transfer_bookkeeping_to_gpu = mock.Mock(
+            side_effect=lambda *, record_done_event=False: (
+                "bookkeeping" if record_done_event else None
+            )
+        )
 
-        dynamic_context.initialize_attention_state(transfer_bookkeeping_to_gpu=False)
+        done_event = dynamic_context.initialize_attention_state(
+            transfer_bookkeeping_to_gpu=transfer_bookkeeping,
+            record_bookkeeping_done_event=record_done_event,
+        )
 
-        dynamic_context.transfer_bookkeeping_to_gpu.assert_not_called()
+        if transfer_bookkeeping:
+            dynamic_context.transfer_bookkeeping_to_gpu.assert_called_once_with(
+                record_done_event=record_done_event
+            )
+        else:
+            dynamic_context.transfer_bookkeeping_to_gpu.assert_not_called()
+        assert done_event == expected_event
 
     @pytest.mark.internal
     @rounder_override(64)

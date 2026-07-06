@@ -373,6 +373,47 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
     assert compaction_done_event == "compaction"
 
 
+def test_dynamic_step_context_init_returns_bookkeeping_event():
+    context = _make_async_sched_context()
+    input_ids = torch.tensor([[10, 11]])
+    position_ids = torch.tensor([[0, 1]])
+    context.initialize_attention_state = mock.Mock(return_value="bookkeeping")
+    context.current_input_and_position_ids = mock.Mock(return_value=(input_ids, position_ids))
+    model_config = SimpleNamespace(
+        symmetric_ar_type=None,
+        nccl_all_reduce_for_prefill=False,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        transformer_impl="transformer_engine",
+    )
+    controller = _make_async_sched_controller(context, model_config)
+
+    with (
+        mock.patch(
+            "megatron.core.inference.text_generation_controllers."
+            "text_generation_controller.set_moe_metadata_sync"
+        ),
+        mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+        ),
+        mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+        ),
+    ):
+        returned_input_ids, returned_position_ids, bookkeeping_done_event = (
+            controller._dynamic_step_context_init(record_bookkeeping_done_event=True)
+        )
+
+    context.initialize_attention_state.assert_called_once_with(
+        construct_graph_dimensions=None,
+        is_expert_parallel_dummy_cuda_graph_step=False,
+        transfer_bookkeeping_to_gpu=True,
+        record_bookkeeping_done_event=True,
+    )
+    assert torch.equal(returned_input_ids, input_ids)
+    assert torch.equal(returned_position_ids, position_ids)
+    assert bookkeeping_done_event == "bookkeeping"
+
+
 def test_run_async_sched_prepare_stops_before_bookkeeping_h2d():
     context = _make_async_sched_context()
     controller = _make_async_sched_controller(context)
@@ -385,7 +426,7 @@ def test_run_async_sched_prepare_stops_before_bookkeeping_h2d():
         side_effect=lambda *, transfer_bookkeeping_to_gpu=True: call_order.append(
             f"context_init:{transfer_bookkeeping_to_gpu}"
         )
-        or (input_ids, position_ids)
+        or (input_ids, position_ids, None)
     )
 
     returned_input_ids, returned_position_ids = controller._run_async_sched_prepare()
@@ -456,16 +497,22 @@ def test_run_async_sched_forward_primer(is_valid):
     )
     input_ids = torch.tensor([[10, 11]])
     position_ids = torch.tensor([[0, 1]])
-    controller._dynamic_step_context_init = mock.Mock(return_value=(input_ids, position_ids))
+    controller._dynamic_step_context_init = mock.Mock(
+        return_value=(input_ids, position_ids, "bookkeeping")
+    )
     controller._run_async_sched_forward = mock.Mock()
 
-    result = controller._run_async_sched_forward_primer()
+    primer_launched, bookkeeping_done_event = controller._run_async_sched_forward_primer()
 
-    assert result is (not is_valid)
+    assert primer_launched is (not is_valid)
+    assert bookkeeping_done_event == (None if is_valid else "bookkeeping")
     if is_valid:
         controller._dynamic_step_context_init.assert_not_called()
         controller._run_async_sched_forward.assert_not_called()
     else:
+        controller._dynamic_step_context_init.assert_called_once_with(
+            record_bookkeeping_done_event=True
+        )
         controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
 
 
@@ -620,7 +667,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
             False,
             [
                 "primer",
-                "wait:current",
+                "wait:primer_bookkeeping",
                 "prepare",
                 "sample",
                 "copy_input",
@@ -654,7 +701,7 @@ def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
         if not has_valid_logits:
             call_order.append("primer")
             controller._async_sched_logits.set_pending(7, "current")
-        return not has_valid_logits
+        return not has_valid_logits, "primer_bookkeeping" if not has_valid_logits else None
 
     controller._run_async_sched_forward_primer = mock.Mock(side_effect=run_primer)
     controller._synchronize_async_sched_event = mock.Mock(

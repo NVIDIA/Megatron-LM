@@ -2132,7 +2132,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
         transfer_bookkeeping_to_gpu: bool = True,
-    ) -> None:
+        record_bookkeeping_done_event: bool = False,
+    ) -> Optional[torch.cuda.Event]:
         """Initialize attention state so that every layer can use it.
 
         Args:
@@ -2144,6 +2145,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 CPU bookkeeping snapshot to GPU before returning. Legacy
                 callers publish immediately; async scheduling binds the GPU
                 views here and publishes their values later.
+            record_bookkeeping_done_event (bool): Whether to record an event
+                after the bookkeeping H2D transfer.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking bookkeeping H2D
+                completion, or `None` when no event was requested or no
+                transfer was performed.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
@@ -2383,7 +2391,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Preserve the existing behavior for callers that do not publish explicitly.
         if transfer_bookkeeping_to_gpu:
-            self.transfer_bookkeeping_to_gpu()
+            return self.transfer_bookkeeping_to_gpu(record_done_event=record_bookkeeping_done_event)
+        return None
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
