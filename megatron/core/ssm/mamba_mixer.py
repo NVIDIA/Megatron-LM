@@ -5,9 +5,10 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -15,8 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
@@ -28,12 +27,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
+from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
-    cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -81,6 +80,12 @@ if not HAVE_MAMBA_SSM:
 
     RMSNormGated = MagicMock()
     HAVE_MAMBA_SSM = False
+
+MAMBA_HAS_STATE_DTYPE = (
+    HAVE_MAMBA_SSM
+    and ("state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters)
+    and ("state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters)
+)
 
 try:
     from einops import rearrange, repeat
@@ -208,6 +213,14 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.mamba_training_ssm_states_dtype = (
+            config.mamba_training_ssm_states_dtype or config.params_dtype
+        )
+        if config.mamba_training_ssm_states_dtype is not None and not MAMBA_HAS_STATE_DTYPE:
+            raise RuntimeError(
+                "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
+                "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
+            )
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -400,6 +413,7 @@ class MambaMixer(MegatronModule):
             )
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
+            self.norm.tp_group = self.pg_collection.tp
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
         self.out_proj = build_module(
@@ -723,6 +737,9 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -740,6 +757,7 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            **state_dtype_kwarg,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
@@ -1016,6 +1034,11 @@ class MambaMixer(MegatronModule):
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
+            state_dtype_kwarg = (
+                {"state_dtype": self.mamba_training_ssm_states_dtype}
+                if MAMBA_HAS_STATE_DTYPE
+                else {}
+            )
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -1033,6 +1056,7 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
             )
 
             if ssm_state is not None:
@@ -1310,6 +1334,8 @@ class MambaMixer(MegatronModule):
                 "conv1d_bias": 0,
             },
             sharded_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
         # Submodules
         for name, module in self.named_children():
@@ -1372,66 +1398,6 @@ class MambaMixer(MegatronModule):
             )
 
         return sharded_state_dict
-
-
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
-
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
-
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key,
-        orig_sh_ten.data,
-        sh_ten_build_fn,
-        cat_with_oom_fallback,
-        orig_sh_ten.replica_id,
-    )
 
 
 def _check_mamba_sequence_packing_support(
