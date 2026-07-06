@@ -578,7 +578,10 @@ class CheckpointConfig:
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
 
     dist_ckpt_use_dtensor_format: bool = False
-    """Sets distributed checkpoint tensors format to torch's DTensor."""
+    """Saves distributed checkpoint tensors in torch's DTensor format. This controls the
+    save format only; on load the format is auto-detected from the checkpoint's
+    metadata.json, so checkpoints can be resumed regardless of this flag (e.g. save in
+    DTensor format, then resume with the flag off to continue in ShardedTensor format)."""
 
     save_tokenizer_assets: bool = True
     """Save tokenizer files to checkpoint directory. When enabled, saves all tokenizer artifacts

@@ -58,11 +58,10 @@ def check_is_dtensor_format(checkpoint_dir):
         bool: True if the checkpoint is saved in DTensor format.
     """
     checkpoint_config = maybe_load_config(checkpoint_dir)
+    if checkpoint_config is None:
+        return False
 
-    if checkpoint_config.get("tensor_format", "ShardedTensor") == "DTensor":
-        return True
-
-    return False
+    return checkpoint_config.tensor_format == "DTensor"
 
 
 def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:

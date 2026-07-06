@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
-from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing import ShardedTensor, check_is_dtensor_format, load, save
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.torch import (
     PlaceholderValue,
@@ -423,7 +423,11 @@ def _make_dcp_device_mesh():
 
 
 class TestDTensorSaveLoad:
-    """End-to-end save/load tests with use_dtensor_format=True.
+    """End-to-end save/load tests for the DTensor format.
+
+    Checkpoints are saved with ``use_dtensor_format=True``; loading relies on the
+    format being auto-detected from the checkpoint's ``metadata.json`` (see
+    ``check_is_dtensor_format``), so ``load`` is called without any format flag.
 
     These tests use DeviceMesh.from_group() (not get_dtensor_metadata) so that
     torch.distributed.checkpoint.save/load can use properly-initialized NCCL
@@ -467,7 +471,7 @@ class TestDTensorSaveLoad:
                 'key_a': self._make_sh_ten('key_a', torch.zeros(4, 8, device='cuda'), device_mesh),
                 'key_b': self._make_sh_ten('key_b', torch.zeros(3, 5, device='cuda'), device_mesh),
             }
-            loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
+            loaded = load(load_spec, ckpt_dir)
 
         assert set(loaded.keys()) == {'key_a', 'key_b'}
         assert torch.allclose(loaded['key_a'], tensor_a)
@@ -490,7 +494,7 @@ class TestDTensorSaveLoad:
                     'bf_key', torch.zeros(6, 4, dtype=torch.bfloat16, device='cuda'), device_mesh
                 )
             }
-            loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
+            loaded = load(load_spec, ckpt_dir)
 
         assert loaded['bf_key'].dtype == torch.bfloat16
         assert torch.allclose(loaded['bf_key'].float(), tensor.float())
@@ -524,7 +528,7 @@ class TestDTensorSaveLoad:
                     ),
                 }
             }
-            loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
+            loaded = load(load_spec, ckpt_dir)
 
         assert torch.allclose(loaded['model']['weight'], t1)
         assert torch.allclose(loaded['model']['bias'], t2)
@@ -580,7 +584,33 @@ class TestDTensorSaveLoad:
             save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
             load_spec = {'weight': make_tp_sh_ten('weight', torch.zeros(8, 1, device='cuda'))}
-            loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
+            loaded = load(load_spec, ckpt_dir)
 
         assert torch.allclose(loaded['weight'], local_tensor)
+        Utils.destroy_model_parallel()
+
+    def test_format_is_auto_detected_from_metadata(self, tmp_path_dist_ckpt):
+        """`check_is_dtensor_format` reflects the format the checkpoint was saved in.
+
+        This is what lets `load` pick the right code path without a runtime flag, so
+        users can switch between ShardedTensor and DTensor formats across restarts.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        device_mesh = _make_dcp_device_mesh()
+        tensor = torch.full((4, 8), 2.0, dtype=torch.float32, device='cuda')
+
+        # Saved in DTensor format -> detected as DTensor.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_detect_dtensor') as ckpt_dir:
+            save_sd = {'key_a': self._make_sh_ten('key_a', tensor, device_mesh)}
+            save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
+            assert check_is_dtensor_format(ckpt_dir) is True
+
+        # Saved in the default ShardedTensor format -> not detected as DTensor.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_detect_sharded') as ckpt_dir:
+            save_sd = {
+                'key_a': ShardedTensor.from_rank_offsets('key_a', tensor.clone(), replica_id=0)
+            }
+            save(save_sd, ckpt_dir, async_sharded_save=False)
+            assert check_is_dtensor_format(ckpt_dir) is False
+
         Utils.destroy_model_parallel()

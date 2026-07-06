@@ -1072,8 +1072,21 @@ def generate_state_dict(
     optim_sd_kwargs=None,
     model_sd_kwargs=None,
     rerun_state=None,
+    use_dtensor_format=None,
 ):
-    """Generate a state dict from given model, optimizer, scheduler, rng state and others. """
+    """Generate a state dict from given model, optimizer, scheduler, rng state and others.
+
+    Args:
+        use_dtensor_format (bool, optional): whether to build the sharded state dict in
+            DTensor format. When None (default) it falls back to
+            ``args.dist_ckpt_use_dtensor_format``. On the load path this should be set to
+            the format detected from the checkpoint (see ``check_is_dtensor_format``) so
+            that the requested state dict matches the on-disk format regardless of the
+            runtime flag.
+    """
+
+    if use_dtensor_format is None:
+        use_dtensor_format = args.dist_ckpt_use_dtensor_format
 
     # Arguments, iteration, and model.
     state_dict = {}
@@ -1096,10 +1109,10 @@ def generate_state_dict(
                 }
                 kwargs = {"metadata": metadata}
 
-            if args.dist_ckpt_use_dtensor_format:
+            if use_dtensor_format:
                 base_metadata = kwargs.get("metadata", {})
                 kwargs = {**kwargs, "metadata": {**base_metadata, "singleton_local_shards": True, "use_dtensor_format": True}}
-                
+
             model_sd = model[i].sharded_state_dict(**kwargs)
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
@@ -1780,6 +1793,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
+        # Detect the tensor format (ShardedTensor vs DTensor) from the checkpoint itself
+        # rather than from `args.dist_ckpt_use_dtensor_format`. This lets the requested
+        # sharded state dict match the on-disk format regardless of the runtime flag, so
+        # users can switch formats across restarts (e.g. save in DTensor, resume without
+        # the flag) without a shape/placement mismatch on load.
+        load_use_dtensor_format = dist_checkpointing.check_is_dtensor_format(checkpoint_name)
+
         ckpt_args = types.SimpleNamespace()
         if state_dict is not None and "args" in state_dict:
             ckpt_args = state_dict.get("args")
@@ -1906,7 +1926,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             load_kwargs['sharded_state_dict'] = generate_state_dict(
                 args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
                 optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
-                rerun_state=gen_sd_rerun_state
+                rerun_state=gen_sd_rerun_state, use_dtensor_format=load_use_dtensor_format
             )
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
