@@ -340,8 +340,11 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         train_one_iteration()
-        prof.step()
-    torch.cuda.synchronize(device)
+        # Synchronize inside the profiler context so in-flight device kernels
+        # complete and get recorded before the profiler stops on __exit__.
+        # Synchronizing after the context would finalize the trace first and
+        # drop the CUDA events.
+        torch.cuda.synchronize(device)
 
     cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
     all_gather_events = [
