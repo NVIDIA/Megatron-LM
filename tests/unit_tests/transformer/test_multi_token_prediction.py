@@ -31,6 +31,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -80,6 +81,40 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_mtp_detach_heads_config(self):
+        """Test that mtp_detach_heads config defaults to False."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        assert config.mtp_detach_heads is False
+
+    def test_constructor_with_detach_heads(self):
+        """Test construction of MTP module with mtp_detach_heads=True."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_detach_heads=True,
+        )
+        transformer_layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        assert isinstance(mtp, MultiTokenPredictionBlock)
+        assert mtp.config.mtp_detach_heads is True
+
+        # Verify all parameters are tagged for separate MTP grad-norm handling.
+        for name, param in mtp.named_parameters():
+            assert (
+                getattr(param, 'grad_norm_group', None) == 'mtp'
+            ), f"Parameter {name} missing grad_norm_group attribute"
 
     @pytest.mark.parametrize(('tp'), [(1), (2), (4)])
     def test_constructor_local(self, tp):
@@ -227,6 +262,165 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 
+    def test_get_embeddings_detaches_decoder_input(self):
+        """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
+        gradient flow to the shared embedding) while still returning a hidden_states
+        tensor that requires grad so MTP layer params and activation checkpointing work."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.mtp_detach_heads = True
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        # hidden_states arrives without requires_grad (it is detached upstream by the block).
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        emb_weight = torch.nn.Parameter(torch.randn(seq_len, batch_size, config.hidden_size))
+
+        def fake_embedding(input_ids, position_ids):
+            return emb_weight.clone()
+
+        _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=fake_embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=None,
+        )
+
+        # decoder_input is detached from the embedding graph.
+        assert decoder_input.requires_grad is False
+        assert decoder_input.grad_fn is None
+        # hidden_states is still marked requires_grad so checkpointing and the MTP
+        # layer parameters keep a differentiable path.
+        assert returned_hidden_states.requires_grad is True
+
+    @pytest.mark.parametrize("detach_heads", [False, True])
+    def test_forward_detach_heads_gradient_flow(self, monkeypatch, detach_heads):
+        """Block-level check of mtp_detach_heads: with the flag on, MTP gradients must
+        not reach the main-model hidden_states or the shared embedding, while the MTP
+        layer parameters still receive gradients."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.mtp_detach_heads = detach_heads
+        # Runs on GPU because _concat_embeddings exercises the (fused) norm and
+        # projection kernels; the rest of the MTP transformer layer is stubbed out.
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+
+        # Replace each MTP transformer layer with an identity so the test isolates
+        # gradient flow to the detach logic (not the attention kernels). Must be an
+        # nn.Module since it is assigned as a child module of the layer.
+        class _IdentityMTPLayer(torch.nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                return hidden_states, None
+
+        for layer in mtp.layers:
+            monkeypatch.setattr(layer, "mtp_model_layer", _IdentityMTPLayer())
+
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64).cuda()
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1).cuda()
+        attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool).cuda()
+        hidden_states = torch.randn(
+            seq_len, batch_size, config.hidden_size, device="cuda", requires_grad=True
+        )
+        emb_weight = torch.nn.Parameter(
+            torch.randn(seq_len, batch_size, config.hidden_size, device="cuda")
+        )
+
+        def fake_embedding(input_ids, position_ids):
+            return emb_weight.clone()
+
+        output = mtp.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            embedding=fake_embedding,
+        )
+
+        # forward concatenates [main_hidden_states, mtp_out_0, mtp_out_1] along dim 0;
+        # back-propagate only from the MTP outputs to mimic the MTP loss path.
+        mtp_outputs = output[seq_len:]
+        mtp_outputs.sum().backward()
+
+        # MTP layer parameters always receive gradients.
+        for layer in mtp.layers:
+            assert layer.enorm.weight.grad is not None
+            assert layer.hnorm.weight.grad is not None
+            assert layer.eh_proj.weight.grad is not None
+
+        if detach_heads:
+            # Gradients must not reach the main model or the shared embedding.
+            # The returned block output still includes the original hidden-state
+            # chunk, so autograd may allocate a zero grad for it through cat().
+            if hidden_states.grad is not None:
+                torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states))
+            assert emb_weight.grad is None
+        else:
+            assert hidden_states.grad is not None
+            assert emb_weight.grad is not None
+
+    @pytest.mark.parametrize("detach_heads", [False, True])
+    def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
+        """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
+        so the MTP loss does not update the (shared) output projection weight."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_detach_heads=detach_heads,
+        )
+
+        seq_len = 4
+        batch_size = 2
+        vocab_size = 16
+        # hidden_states is the concatenation [main, mtp_0, mtp_1] along the sequence dim;
+        # requires_grad so the returned tensor stays in the autograd graph for backward.
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len,
+            batch_size,
+            config.hidden_size,
+            requires_grad=True,
+        )
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        loss_mask = torch.ones(batch_size, seq_len)
+        output_weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            # hidden: [s, b, h] -> logits: [s, b, vocab]
+            return torch.matmul(hidden, weight.t()), None
+
+        def compute_language_model_loss(labels, logits):
+            # per-token loss of shape [b, s] that depends on logits (hence output_weight).
+            return logits.sum(dim=-1).transpose(0, 1)
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+        )
+        result.sum().backward()
+
+        if detach_heads:
+            assert output_weight.grad is None
+        else:
+            assert output_weight.grad is not None
+
 
 class TestMultiTokenPrediction:
     def setup_method(self, method):
@@ -284,7 +478,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -416,8 +610,15 @@ class TestMultiTokenPrediction:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        gpt_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        gpt_model = unwrap_model(gpt_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = gpt_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        gpt_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = gpt_model[0].sharded_state_dict()
         for i in range(args.mtp_num_layers):
             assert f"mtp.layers.{i}.enorm.weight" in sharded_state_dict.keys()
@@ -446,7 +647,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -493,7 +694,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder, self.model_provider
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -553,7 +754,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
 
         output = gpt_model[0].forward(
@@ -596,8 +797,14 @@ class TestMultiTokenPrediction:
         packed_seq_params = batch['packed_seq_params']
 
         # Create model
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         # Forward pass with packed sequences
@@ -657,8 +864,15 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
 
         batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output = gpt_model[0].forward(
@@ -1098,7 +1312,7 @@ class TestMultiTokenPredictionHybrid:
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
@@ -1122,7 +1336,6 @@ class TestMultiTokenPredictionHybrid:
         args.bf16 = True
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
-        args.spec = "megatron.core.models.hybrid.hybrid_layer_specs.hybrid_stack_spec"
 
         if fp8 is not None:
             args.fp8 = 'e4m3'
@@ -1165,8 +1378,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        mamba_model = unwrap_model(mamba_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        mamba_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = mamba_model[0].sharded_state_dict()
 
         # Verify MTP layers are in the state dict
@@ -1190,8 +1410,14 @@ class TestMultiTokenPredictionHybrid:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1233,8 +1459,15 @@ class TestMultiTokenPredictionHybrid:
             set_ckpt_path(ckpt_dir)
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+
+            model_parallel_cuda_manual_seed(_SEED)
+            cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
@@ -1278,8 +1511,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
         try:
-            mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
+            model_parallel_cuda_manual_seed(_SEED)
+            mamba_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
             mamba_model = unwrap_model(mamba_model)
             assert isinstance(mamba_model[0], HybridModel)
             assert mamba_model[0].mtp is not None

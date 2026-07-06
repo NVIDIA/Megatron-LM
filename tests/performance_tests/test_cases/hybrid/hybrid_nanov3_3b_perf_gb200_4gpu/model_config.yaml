@@ -12,8 +12,13 @@ DP: 1
 EP: 4
 DATASET: gsm8k
 NUM_OUTPUT_TOKENS: 128
-NUM_WARMUP_ITERS: 2
-NUM_TIMED_ITERS: 5
+# 2 warmup iters left the first timed iteration cold at batch 128 (~2.5x slower
+# than steady state), poisoning the mean/tail metrics. Warm up more so timing
+# starts at steady state.
+NUM_WARMUP_ITERS: 5
+# 5 timed iters left batch-128 p99/throughput sensitive to a single outlier
+# iteration (~10–14% run-to-run swing on GB200). 10 iters stabilizes the mean.
+NUM_TIMED_ITERS: 10
 BATCH_SIZES:
   - 1
   - 8

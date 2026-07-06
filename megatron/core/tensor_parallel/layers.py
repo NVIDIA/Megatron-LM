@@ -374,7 +374,14 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_input = grad_output.matmul(weight)
+        if grad_output.dim() > 2:
+            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
+            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
+            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+            grad_input = grad_output_2d.matmul(weight)
+            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
