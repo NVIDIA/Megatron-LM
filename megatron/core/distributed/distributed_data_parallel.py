@@ -536,6 +536,14 @@ class DistributedDataParallel(_BaseDataParallel):
     def reset_param_sync_dispatch_state(self):
         """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # A non-None handle means the previous all-gather is still in flight. Resetting only
+            # the dispatch flag would create the invalid state
+            # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
+            # second all-gather into the same parameter buffer.
+            assert bucket_group.param_gather_handle is None, (
+                "Cannot reset parameter all-gather dispatch state while an asynchronous "
+                "parameter all-gather is still in flight."
+            )
             bucket_group.param_gather_dispatched = False
 
     def start_grad_sync(self, *unused):
