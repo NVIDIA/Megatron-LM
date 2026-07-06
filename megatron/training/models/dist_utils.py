@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 from typing import Any, Callable
 
 import torch
-from megatron.core import tensor_parallel, mpu
+from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
@@ -235,9 +235,7 @@ def _ddp_wrap(
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
         if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(
-                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-            )
+            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
@@ -249,7 +247,7 @@ def _ddp_wrap(
     ddp_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
-        if use_megatron_fsdp:
+        if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
 
         wrapped_model = []
@@ -266,7 +264,7 @@ def _ddp_wrap(
                 all_params = [
                     p for p in model_chunk.parameters() if p.requires_grad
                 ]
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                pp_rank = pg_collection.pp.rank()
                 effective_bucket_size = (
                     None
                     if disable_bucketing or pp_rank > 0
@@ -276,11 +274,9 @@ def _ddp_wrap(
                     DistributedOptimizer.compute_full_param_layout(
                         all_params,
                         effective_bucket_size,
-                        mpu.get_data_parallel_world_size(with_context_parallel=True),
+                        pg_collection.dp_cp.size(),
                         ddp_config,
-                        expert_data_parallel_world_size=(
-                            mpu.get_expert_data_parallel_world_size()
-                        ),
+                        expert_data_parallel_world_size=pg_collection.expt_dp.size(),
                     )
                 )
 

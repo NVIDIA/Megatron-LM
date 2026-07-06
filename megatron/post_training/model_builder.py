@@ -157,6 +157,67 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
     return teacher
 
 
+def _freeze_for_qad(model, target):
+    """Select which side of an MTP model trains during QAD / MTP QAT.
+
+    Splits parameters into the MTP heads (``mtp.layers.*``) and the base model,
+    and freezes one side so controlled QAD+MTP experiments can be run:
+
+    * ``"mtp"``  — train the MTP heads only, freeze the base. Used after QAD:
+      load a quantized checkpoint, add MTP heads, and train them while the
+      quantized base stays fixed (the production two-phase recipe).
+    * ``"base"`` — train the base only, freeze the MTP heads. QAD on the base
+      with the MTP head held at its init (e.g. measuring how well a frozen MTP
+      head rides on a quantizing base).
+    * ``"both"`` — train the base and the MTP heads together (QAD co-training).
+    """
+    if target not in ("mtp", "base", "both"):
+        raise ValueError(f"qad train target must be one of mtp/base/both, got {target!r}")
+
+    if target == "both":
+        for param in model.parameters():
+            param.requires_grad = True
+        # Nothing is frozen, so no router expert_bias should be pinned.
+        for module in model.modules():
+            if hasattr(module, 'expert_bias'):
+                module.frozen_expert_bias = False
+        print_rank_0("QAD train target 'both': all parameters trainable")
+        return
+
+    train_mtp = target == "mtp"
+    trainable, frozen = 0, 0
+    for name, param in model.named_parameters():
+        is_mtp = 'mtp.layers.' in name
+        param.requires_grad = is_mtp == train_mtp
+        if param.requires_grad:
+            trainable += 1
+        else:
+            frozen += 1
+
+    # The MoE router's expert bias is updated from load-balancing token counts in
+    # finalize_model_grads._update_router_expert_bias, independently of requires_grad.
+    # Setting requires_grad=False does NOT stop it, so the frozen side would keep
+    # drifting. Flag the frozen side's routers so the update is skipped; the trainable
+    # side's routers must keep updating (so we clear the flag there).
+    frozen_bias = 0
+    for name, module in model.named_modules():
+        if hasattr(module, 'expert_bias'):
+            is_mtp = 'mtp.layers.' in name
+            freeze_this = is_mtp != train_mtp
+            module.frozen_expert_bias = freeze_this
+            if freeze_this:
+                frozen_bias += 1
+    print_rank_0(
+        f"QAD train target '{target}': training {'MTP' if train_mtp else 'base'} "
+        f"({trainable} trainable, {frozen} frozen, {frozen_bias} router expert_bias frozen)"
+    )
+
+
+def _freeze_base_for_mtp(model):
+    """Deprecated alias for ``_freeze_for_qad(model, "mtp")``."""
+    _freeze_for_qad(model, "mtp")
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -260,6 +321,22 @@ def modelopt_gpt_hybrid_builder(
                 use_arbitrary_attention_mask=False,
             )
 
+        # Build MTP block spec if MTP is enabled.
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            from megatron.core.models.gpt.gpt_layer_specs import (
+                get_gpt_decoder_layer_specs,
+                get_gpt_mtp_block_spec,
+            )
+
+            use_te = args.transformer_impl == "transformer_engine"
+            decoder_layer_specs = get_gpt_decoder_layer_specs(
+                config, use_transformer_engine=use_te,
+            )
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+            )
+
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": args.padded_vocab_size,
@@ -273,6 +350,7 @@ def modelopt_gpt_hybrid_builder(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
@@ -337,6 +415,17 @@ def modelopt_gpt_hybrid_builder(
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
         load_modelopt_state(model=model)
+
+    qad_train_target = getattr(args, 'qad_train_target', None)
+    if args.freeze_base_for_mtp:
+        if qad_train_target not in (None, 'mtp'):
+            raise ValueError(
+                "--freeze-base-for-mtp is an alias for --qad-train-target mtp and "
+                f"conflicts with --qad-train-target {qad_train_target}"
+            )
+        qad_train_target = 'mtp'
+    if qad_train_target is not None:
+        _freeze_for_qad(model, qad_train_target)
 
     _add_load_convert_hooks(model)
 

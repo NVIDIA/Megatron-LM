@@ -81,7 +81,7 @@ products:
   - test_case: [bert_mcore_tp1_pp2]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [nightly, L0-smoke]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp1_pp4_vp2]
     products:

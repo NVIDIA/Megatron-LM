@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -51,6 +52,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
+        """Prepare gradients for all active module optimizers."""
         found_inf = False
         for opt in self._active_optimizers:
             found_inf |= opt.prepare_grads()
@@ -72,6 +74,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
+        """Run one optimizer step across all active module optimizers."""
         found_inf = self.prepare_grads()
         # Synchronize found_inf across all ranks to prevent deadlock:
         # if encoder ranks detect inf but LLM ranks don't, the early return
@@ -104,21 +107,25 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
+        """Step active optimizers after gradients have been prepared."""
         success = True
         for opt in self._active_optimizers:
             success &= opt.step_with_ready_grads()
         return success
 
     def zero_grad(self, set_to_none: bool = True):
+        """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
     def get_loss_scale(self) -> torch.Tensor:
+        """Return the loss scale tensor from the first active optimizer."""
         if self._active_optimizers:
             return self._active_optimizers[0].get_loss_scale()
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
+        """Count zero gradients across all active module optimizers."""
         return sum(opt.count_zeros() for opt in self._active_optimizers)
 
     @property
@@ -132,6 +139,7 @@ class MimoOptimizer(MegatronOptimizer):
     # Checkpointing
 
     def state_dict(self):
+        """Return per-module optimizer state dicts."""
         return {
             name: info.optimizer.state_dict() if info.is_active and info.optimizer else None
             for name, info in self.module_infos.items()
@@ -153,6 +161,7 @@ class MimoOptimizer(MegatronOptimizer):
 
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
+                _restore_param_state_sharding_type(sub_sd)
                 _restore_grad_scaler(sub_sd)
 
             info.optimizer.load_state_dict(module_sd)
@@ -175,14 +184,17 @@ class MimoOptimizer(MegatronOptimizer):
                 ):
                     suffix = f'.{idx}' if idx > 0 else ''
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
+                    _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
 
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
                 sharded_state[name] = module_sd
             else:
                 sharded_state[name] = {}
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
+        """Reload model parameters in all active module optimizers."""
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
 
@@ -218,6 +230,8 @@ def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
             replica_id=replica_id,
         )
         del opt_sub['param_groups']
+        if not opt_sub:
+            del sub_sd['optimizer']
 
 
 def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
@@ -226,6 +240,18 @@ def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
         sub_sd[f'_mimo_grad_scaler{suffix}'] = ShardedObject(
             f'optimizer.mimo.{module_name}{suffix}.grad_scaler',
             sub_sd.pop('grad_scaler'),
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+
+
+def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
+    """Save: extract param_state_sharding_type into a ShardedObject."""
+    if 'param_state_sharding_type' in sub_sd:
+        sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
+            f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
+            sub_sd.pop('param_state_sharding_type'),
             (1,),
             (0,),
             replica_id=replica_id,
@@ -260,6 +286,14 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
     # common-state save/load. Use setdefault so the restored param_groups land
     # in the right place regardless.
     sub_sd.setdefault('optimizer', {})['param_groups'] = loaded_pg
+
+
+def _restore_param_state_sharding_type(sub_sd):
+    """Load: restore param_state_sharding_type from ShardedObject key."""
+    for k in list(sub_sd.keys()):
+        if k.startswith('_mimo_param_state_sharding_type'):
+            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
+            break
 
 
 def _restore_grad_scaler(sub_sd):
