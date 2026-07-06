@@ -8,7 +8,7 @@ deprecated — new work should target the dynamic path described here.
 ---
 
 ## Table of Contents
-F
+
 1. [What Megatron Inference Is For](#1-what-megatron-inference-is-for)
 2. [Rollout Performance](#2-rollout-performance)
 3. [Supported Features](#3-supported-features)
@@ -87,9 +87,9 @@ async scheduling is merged, and add a prefill-perf analysis section. -->
 <!-- TODO: Add a "Benchmark setup" note documenting the versions benched with
 (vLLM version, MCore commit/version, GPU/hardware, model sizes). -->
 
-![Sample rollout decode step times — Nemotron 3 Ultra](images/inference_performance/ultra-performance.png)
+<img src="images/inference_performance/ultra-performance.png" alt="Sample rollout decode step times — Nemotron 3 Ultra" width="600">
 
-![Sample rollout decode step times — Nemotron 3 Super](images/inference_performance/super-performance.png)
+<img src="images/inference_performance/super-performance.png" alt="Sample rollout decode step times — Nemotron 3 Super" width="600">
 
 The takeaway: you are not trading away rollout performance to gain the
 training/inference consistency benefits of MCore inference.
@@ -117,10 +117,12 @@ training/inference consistency benefits of MCore inference.
 > GEMM/attention/norm kernels can produce slightly different numerics depending
 > on batch composition, which shows up as log-prob mismatch between training and
 > inference — a real source of error and instability in RL. Megatron Inference
-> offers **batch-invariant kernels** (enabled via `batch_invariant_mode`) whose
-> outputs do not depend on how requests are batched, so per-token log-probs
-> match between the training and inference forward passes. **This is currently
-> supported only for non-MoE (dense) models.**
+> offers **batch-invariant kernels** whose outputs do not depend on how requests
+> are batched, so per-token log-probs match between the training and inference
+> forward passes. **This is currently supported only for non-MoE (dense)
+> models.** Note this is enabled via `batch_invariant_mode` on the model's
+> `TransformerConfig` — it is **not** an `InferenceConfig` field, so it must be
+> set when you build the model, not on the engine config.
 
 Many of these are toggled through `InferenceConfig` — see
 [Section 4.6](#46-engine-configuration).
@@ -608,7 +610,9 @@ All supported modes produce numerically identical generated text.
 
 ## 8. Known Limitations
 
-- **`MLA models are not supported`**.
+- **MLA models are not supported.**
+- **Vision-language (VLM) / multimodal models are not supported.** Only
+  text-in/text-out generation is supported today.
 - **Gated delta-net (GDN) layers are not yet supported in inference.** The
   dynamic context raises `NotImplementedError` if a model contains GDN layers;
   Mamba (SSM) and attention hybrid layers are supported.
@@ -654,7 +658,7 @@ for the detailed root-cause notes behind each limitation.
 - **All2Allv-based token dispatcher** for MoE.
 - **Large-scale inference optimizations** (large models and long sequences).
 - **Low-precision numerics** for KV cache and Mamba state.
-- **Router-Replay** for reducing mismatch between inference and training for MOE models. 
+- **Router-Replay** for reducing mismatch between inference and training for MoE models.
 
 ---
 
