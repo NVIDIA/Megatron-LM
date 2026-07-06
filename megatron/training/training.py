@@ -2062,13 +2062,13 @@ def get_model(
                 timeout=timeout,
                 nccl_communicator_config_path=getattr(args, "nccl_communicator_config_path", None),
                 high_priority_stream_groups=getattr(args, "high_priority_stream_groups", None),
-                zero_sm_all_gather=getattr(args, "megatron_fsdp_zero_sm_all_gather", False),
+                fsdp_zero_sm_allgather=getattr(args, "fsdp_zero_sm_allgather", False),
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
 
             print_rank_0("> created all-gather process groups for AG/RS overlap")
-            if getattr(args, "megatron_fsdp_zero_sm_all_gather", False):
+            if getattr(args, "fsdp_zero_sm_allgather", False):
                 print_rank_0(">   zero-SM all-gather enabled for Megatron-FSDP AG groups")
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")

@@ -201,7 +201,7 @@ def _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_grou
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
 
-def _apply_zero_sm_all_gather_group_options(nccl_comm_cfgs, for_expert_parallelism):
+def _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism):
     """Configure FSDP all-gather groups to use NCCL's zero-CTA policy."""
     overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "dp_cp_ag", ("cta_policy", "zero"))
     if for_expert_parallelism:
@@ -1423,7 +1423,7 @@ def create_all_gather_groups(
     nccl_comm_cfgs=None,
     nccl_communicator_config_path=None,
     high_priority_stream_groups=None,
-    zero_sm_all_gather=False,
+    fsdp_zero_sm_allgather=False,
 ):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
@@ -1438,7 +1438,7 @@ def create_all_gather_groups(
         nccl_communicator_config_path (str): Path to NCCL communicator YAML.
         high_priority_stream_groups (List[str]): Communicator groups that should use
             high priority streams.
-        zero_sm_all_gather (bool): If true, request NCCL's zero-CTA policy on the
+        fsdp_zero_sm_allgather (bool): If true, request NCCL's zero-CTA policy on the
             dedicated all-gather groups. NCCL falls back for ineligible buffers.
 
     Returns:
@@ -1465,8 +1465,8 @@ def create_all_gather_groups(
     if nccl_comm_cfgs is None:
         nccl_comm_cfgs = _load_nccl_comm_cfgs(nccl_communicator_config_path)
     _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_groups)
-    if zero_sm_all_gather:
-        _apply_zero_sm_all_gather_group_options(nccl_comm_cfgs, for_expert_parallelism)
+    if fsdp_zero_sm_allgather:
+        _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism)
 
     rank = torch.distributed.get_rank()
     pp_size = get_pipeline_model_parallel_world_size()

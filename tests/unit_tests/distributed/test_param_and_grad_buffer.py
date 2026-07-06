@@ -19,22 +19,22 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
 
-def test_megatron_fsdp_zero_sm_all_gather_config_valid(monkeypatch):
+def test_fsdp_zero_sm_allgather_config_valid(monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     ddp_config = DistributedDataParallelConfig(
-        use_megatron_fsdp=True, nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True
+        use_megatron_fsdp=True, nccl_ub=True, fsdp_zero_sm_allgather=True
     )
 
-    assert ddp_config.megatron_fsdp_zero_sm_all_gather
+    assert ddp_config.fsdp_zero_sm_allgather
 
 
-def test_standalone_fsdp_zero_sm_all_gather_config_valid(monkeypatch):
+def test_standalone_fsdp_zero_sm_allgather_config_valid(monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     ddp_config = StandaloneFSDPDistributedDataParallelConfig(
-        nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True
+        nccl_ub=True, fsdp_zero_sm_allgather=True
     )
 
-    assert ddp_config.megatron_fsdp_zero_sm_all_gather
+    assert ddp_config.fsdp_zero_sm_allgather
 
 
 @pytest.mark.parametrize(
@@ -44,13 +44,13 @@ def test_standalone_fsdp_zero_sm_all_gather_config_valid(monkeypatch):
         (StandaloneFSDPDistributedDataParallelConfig, {}),
     ],
 )
-def test_megatron_fsdp_zero_sm_all_gather_preserves_allocator_fallback(
+def test_fsdp_zero_sm_allgather_preserves_allocator_fallback(
     config_cls, kwargs, monkeypatch
 ):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     ddp_config = config_cls(
         nccl_ub=True,
-        megatron_fsdp_zero_sm_all_gather=True,
+        fsdp_zero_sm_allgather=True,
         fsdp_db_use_persist_buf_on_alloc_fail=False,
         **kwargs,
     )
@@ -58,10 +58,10 @@ def test_megatron_fsdp_zero_sm_all_gather_preserves_allocator_fallback(
     assert not ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
 
 
-def test_megatron_fsdp_zero_sm_all_gather_config_requires_megatron_fsdp(monkeypatch):
+def test_fsdp_zero_sm_allgather_config_requires_megatron_fsdp(monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     with pytest.raises(ValueError, match="only supported with Megatron-FSDP"):
-        DistributedDataParallelConfig(nccl_ub=True, megatron_fsdp_zero_sm_all_gather=True)
+        DistributedDataParallelConfig(nccl_ub=True, fsdp_zero_sm_allgather=True)
 
 
 @pytest.mark.parametrize(
@@ -71,10 +71,10 @@ def test_megatron_fsdp_zero_sm_all_gather_config_requires_megatron_fsdp(monkeypa
         (StandaloneFSDPDistributedDataParallelConfig, {}),
     ],
 )
-def test_megatron_fsdp_zero_sm_all_gather_config_requires_nccl_ub(config_cls, kwargs, monkeypatch):
+def test_fsdp_zero_sm_allgather_config_requires_nccl_ub(config_cls, kwargs, monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     with pytest.raises(ValueError, match="requires NCCL user-buffer registration"):
-        config_cls(megatron_fsdp_zero_sm_all_gather=True, **kwargs)
+        config_cls(fsdp_zero_sm_allgather=True, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -84,7 +84,7 @@ def test_megatron_fsdp_zero_sm_all_gather_config_requires_nccl_ub(config_cls, kw
         (StandaloneFSDPDistributedDataParallelConfig, {}),
     ],
 )
-def test_megatron_fsdp_zero_sm_all_gather_config_requires_symmetric_registration(
+def test_fsdp_zero_sm_allgather_config_requires_symmetric_registration(
     config_cls, kwargs, monkeypatch
 ):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -92,7 +92,7 @@ def test_megatron_fsdp_zero_sm_all_gather_config_requires_symmetric_registration
         config_cls(
             nccl_ub=True,
             disable_symmetric_registration=True,
-            megatron_fsdp_zero_sm_all_gather=True,
+            fsdp_zero_sm_allgather=True,
             **kwargs,
         )
 

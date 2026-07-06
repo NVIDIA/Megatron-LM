@@ -1736,7 +1736,7 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
-        if self.ddp_config.megatron_fsdp_zero_sm_all_gather:
+        if self.ddp_config.fsdp_zero_sm_allgather:
             assert self.ddp_config.nccl_ub, (
                 "Megatron-FSDP zero-SM all-gather requires NCCL user-buffer registration. "
                 "Please set nccl_ub=True."

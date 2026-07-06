@@ -72,7 +72,7 @@ class TestModelUniform(torch.nn.Module):
         return x
 
 
-def _make_zero_sm_all_gather_args(**extra_overrides):
+def _make_fsdp_zero_sm_allgather_args(**extra_overrides):
     import argparse
 
     from megatron.training.arguments import add_megatron_arguments
@@ -96,7 +96,7 @@ def _make_zero_sm_all_gather_args(**extra_overrides):
         "use_megatron_fsdp": True,
         "ckpt_format": "fsdp_dtensor",
         "nccl_ub": True,
-        "megatron_fsdp_zero_sm_all_gather": True,
+        "fsdp_zero_sm_allgather": True,
         "data_parallel_sharding_strategy": "optim_grads_params",
         "check_for_nan_in_loss_and_grad": False,
         "eval_iters": 0,
@@ -111,22 +111,22 @@ def _make_zero_sm_all_gather_args(**extra_overrides):
     return args
 
 
-def test_zero_sm_all_gather_validation_enables_ag_group(monkeypatch):
+def test_fsdp_zero_sm_allgather_validation_enables_ag_group(monkeypatch):
     from megatron.training.arguments import validate_args
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    args = _make_zero_sm_all_gather_args(create_all_gather_group=False)
+    args = _make_fsdp_zero_sm_allgather_args(create_all_gather_group=False)
 
     validate_args(args)
 
     assert args.create_all_gather_group
 
 
-def test_zero_sm_all_gather_validation_requires_nccl_ub(monkeypatch):
+def test_fsdp_zero_sm_allgather_validation_requires_nccl_ub(monkeypatch):
     from megatron.training.arguments import validate_args
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    args = _make_zero_sm_all_gather_args(nccl_ub=False)
+    args = _make_fsdp_zero_sm_allgather_args(nccl_ub=False)
 
     with pytest.raises(AssertionError, match="requires --use-nccl-ub"):
         validate_args(args)

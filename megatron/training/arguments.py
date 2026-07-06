@@ -1304,7 +1304,7 @@ def validate_args(args, defaults={}):
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
 
-    if args.megatron_fsdp_zero_sm_all_gather:
+    if args.fsdp_zero_sm_allgather:
         assert (
             args.use_megatron_fsdp
         ), "Megatron-FSDP zero-SM all-gather requires --use-megatron-fsdp."
@@ -4139,9 +4139,9 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
-        '--megatron-fsdp-zero-sm-all-gather',
+        '--fsdp-zero-sm-allgather',
         action='store_true',
-        dest='megatron_fsdp_zero_sm_all_gather',
+        dest='fsdp_zero_sm_allgather',
         default=False,
         help='Request NCCL zero-CTA/copy-engine collectives for eligible Megatron-FSDP '
         'parameter all-gather buffers. Requires --use-megatron-fsdp, --use-nccl-ub, '

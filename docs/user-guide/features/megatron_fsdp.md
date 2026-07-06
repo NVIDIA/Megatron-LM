@@ -174,7 +174,7 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 --fsdp-manual-registration
 
 # Request NCCL zero-CTA/copy-engine collectives for eligible Megatron-FSDP parameter all-gather buffers. Requires NCCL user buffers and symmetric registration.
---megatron-fsdp-zero-sm-all-gather
+--fsdp-zero-sm-allgather
 ```
 
 ### 🤖 Megatron-Core
@@ -594,7 +594,7 @@ Megatron-FSDP sharding and communication buffers support mixed-precision, such t
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
 |--------------|-------------|----------------------|----------------------|
 | **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Uses double buffering. | `--use-nccl-ub` | `nccl_ub=True` |
-| **Zero-SM All-Gather** | Request NCCL zero-CTA/copy-engine policy on dedicated Megatron-FSDP parameter all-gather groups. NCCL uses copy engines for eligible symmetrically registered buffers and falls back otherwise. | `--megatron-fsdp-zero-sm-all-gather` | `megatron_fsdp_zero_sm_all_gather=True` |
+| **Zero-SM All-Gather** | Request NCCL zero-CTA/copy-engine policy on dedicated Megatron-FSDP parameter all-gather groups. NCCL uses copy engines for eligible symmetrically registered buffers and falls back otherwise. | `--fsdp-zero-sm-allgather` | `fsdp_zero_sm_allgather=True` |
 | **NCCL Manual Registration** | Instead of registering NCCL user buffers on first allocation, batch registration of all communication buffers at the end of the initial training step. Reduces registration latency. | `--fsdp-manual-registration` | N/A (Megatron-Core Only) |
 | **Disable Symmetric Registration** | Disable symmetric registration with NCCL. Optional, as symmetric registration failure defaults to normal registration. | `--disable-symmetric-registration` | `disable_symmetric_registration=True` |
 
@@ -609,6 +609,6 @@ NCCL (`v2.27+`) supports symmetric allocation or registration for communicators 
 - **Copy-Engine (CE) Collectives**: Instead of using SMs (or CTAs) for common non-computational collectives like AG in Megatron-FSDP, copy engines are instead used to perform all-gather collectives, dedicating SM resources to compute and reduction during FSDP. Requires NCCL `v2.28+`.
 - **High-Precision Reduction**: When training large models, high-precision gradient reduction and accumulation is desired for accuracy and convergence, but communicating FP32 gradients is expensive. With symmetric registration, FP32 accumulators enable gradients to be reduced in FP32 but communicated in BF16, which decreases gradient RS communication latency while maintaining high accuracy during training. Megatron-FSDP supports FP32 main gradient accumulation but BF16 gradient communication, customizable through `megatron_fsdp.MixedPrecisionPolicy`.
 
-`--megatron-fsdp-zero-sm-all-gather` sets `NCCL_CTA_POLICY_ZERO` only on the dedicated dense and expert parameter all-gather communicators. Zero-CTA requires CUDA driver `12.5+` and NCCL `v2.28+` within supported NVLink domains; network transport requires NCCL `v2.30.6+`. The policy is best-effort: buffers that are not symmetrically registered, including FSDP buckets that fall back outside the fixed double-buffer pool, use NCCL's kernel path. The zero-CTA policy prioritizes SM availability and may increase isolated collective latency, so evaluate end-to-end compute/communication overlap rather than collective latency alone.
+`--fsdp-zero-sm-allgather` sets `NCCL_CTA_POLICY_ZERO` only on the dedicated dense and expert parameter all-gather communicators. Zero-CTA requires CUDA driver `12.5+` and NCCL `v2.28+` within supported NVLink domains; network transport requires NCCL `v2.30.6+`. The policy is best-effort: buffers that are not symmetrically registered, including FSDP buckets that fall back outside the fixed double-buffer pool, use NCCL's kernel path. The zero-CTA policy prioritizes SM availability and may increase isolated collective latency, so evaluate end-to-end compute/communication overlap rather than collective latency alone.
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).
