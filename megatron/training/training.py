@@ -42,7 +42,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -92,7 +92,7 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -254,6 +254,7 @@ stimer = StragglerDetector()
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+_seqlen_stats_are_global: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -315,7 +316,7 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -334,6 +335,25 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
+    _seqlen_stats_are_global = False
+
+
+def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
+    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if total_real_tokens is None or seqlen_squared_sum is None:
+        return
+    if _seqlen_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else 'cpu'
+        )
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _seqlen_stats_in_iteration[0] = float(total_real_tokens)
+    _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_active = True
+    _seqlen_stats_are_global = True
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -354,20 +374,23 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         fuse onto one device tensor and consume issues a single 2-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
-    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+    Sync cost: at most one all-reduce of a 2-element ``float64`` tensor and one
+    host sync (``tolist()``). Scheduler-provided global values skip the all-reduce;
+    inactive BSHD iterations skip both.
 
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    For locally accumulated values, all ranks within one DP group see identical
+    ``cu_seqlens``. The world all-reduce therefore overcounts by ``TP * CP * PP``,
+    which we divide out.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if _seqlen_stats_are_global:
+        dedup = 1
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -383,6 +406,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
@@ -2239,7 +2263,7 @@ def dummy_train_step(data_iterator):
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -2277,7 +2301,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 
@@ -2303,7 +2327,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    source_data_iterator = data_iterator
+    while rerun_state_machine.should_run_forward_backward(source_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2345,6 +2370,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            scheduler_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+            (
+                scheduled_data_iterator,
+                scheduled_num_microbatches,
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            ) = wrap_data_iterator(
+                source_data_iterator,
+                config,
+                get_num_microbatches(),
+                pg_collection=(
+                    scheduler_pg_collection
+                    if isinstance(scheduler_pg_collection, ProcessGroupCollection)
+                    else None
+                ),
+            )
+            set_seqlen_stats_in_iteration(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            )
+        else:
+            scheduled_data_iterator = source_data_iterator
+            scheduled_num_microbatches = get_num_microbatches()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2354,9 +2404,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
+            data_iterator=scheduled_data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=scheduled_num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -3382,9 +3432,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
-
     if args.run_workload_inspector_server:
         try:
             import threading
@@ -3703,6 +3750,9 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -4135,11 +4185,32 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=(
+                                eval_pgc
+                                if isinstance(eval_pgc, ProcessGroupCollection)
+                                else None
+                            ),
+                        )
+                    )
+                except StopIteration:
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -4163,7 +4234,7 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
+                        if args.sft and getattr(config, "sequence_packing_scheduler", None) is None:
                             # normalize over micro batch instead of global
                             val = torch.vstack(val)
                             val = val[:, 0] / val[:, 1].clamp(min=1)

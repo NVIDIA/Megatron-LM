@@ -367,17 +367,19 @@ class TestMoELayerRecompute:
             requires_grad=True,
         )
 
-        # Create padding mask if needed: shape [batch_size, sequence_length]
+        # Sequence-parallel hidden states are TP-local, while the mask arrives
+        # with the full sequence dimension and is scattered inside MoELayer.
         padding_mask = None
         if with_padding_mask:
-            padding_mask = torch.ones(
+            mask_sequence_length = sequence_length * tp_size if tp_size > 1 else sequence_length
+            padding_mask = torch.zeros(
                 micro_batch_size,
-                sequence_length,
+                mask_sequence_length,
                 device=torch.cuda.current_device(),
                 dtype=torch.bool,
             )
             # Mark last 4 tokens as padding for each batch
-            padding_mask[:, -4:] = False
+            padding_mask[:, -4:] = True
 
         output, _ = moe_layer(hidden_states, padding_mask=padding_mask)
 
@@ -398,6 +400,17 @@ class TestMoELayerRecompute:
                 assert param.grad is not None, f"Gradient for {name} should exist"
 
         Utils.destroy_model_parallel()
+
+    def test_sequence_parallel_padding_mask_alignment(self):
+        """Exercise global-mask alignment with TP-local sequence-parallel activations."""
+        self.test_moe_layer_recompute_forward_backward(
+            num_moe_experts=2,
+            moe_token_dispatcher_type="alltoall",
+            with_padding_mask=True,
+            tp_size=2,
+            ep_size=1,
+            fp8=False,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

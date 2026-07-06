@@ -341,7 +341,7 @@ class GPTModel(LanguageModule):
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
+                        padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                     )
                     .transpose(0, 1)
                     .contiguous()

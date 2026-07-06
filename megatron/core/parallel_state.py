@@ -115,8 +115,8 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
-# Hybrid context parallel groups
-_HYBRID_DP_CP_GROUPS = {}
+# Dynamic context parallel groups, indexed by group size.
+_DYNAMIC_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -418,29 +418,29 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
     """
-    Creates groups required for hybrid DPxCP.
-    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Creates groups required for dynamic DPxCP.
+    Creates a new group for every power of 2 from min_cp_size up to the number of DPxCP ranks.
     Returns a dictionary indexed by group size.
     """
-    hybrid_dp_cp_groups = {}
-    # Generate group for every power of 2 up to the number of CP ranks
-    # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    dynamic_dp_cp_groups = {}
+    group_sizes = [
+        2**i for i in range(int(log2(len(ranks))) + 1) if min_cp_size <= 2**i < len(ranks)
+    ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
                 ranks[i : i + group_size],
                 pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
             )
             if rank in ranks[i : i + group_size]:
                 assert (
-                    group_size not in hybrid_dp_cp_groups
-                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
-                hybrid_dp_cp_groups[group_size] = group
-    return hybrid_dp_cp_groups
+                    group_size not in dynamic_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
+                dynamic_dp_cp_groups[group_size] = group
+    return dynamic_dp_cp_groups
 
 
 class RankGenerator(object):
@@ -553,6 +553,8 @@ def initialize_model_parallel(
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     hybrid_context_parallel: bool = False,
+    dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
@@ -920,17 +922,43 @@ def initialize_model_parallel(
             del os.environ["NCCL_COLLNET_ENABLE"]
 
     if hybrid_context_parallel:
-        global _HYBRID_DP_CP_GROUPS
+        assert not dynamic_context_parallel, (
+            "hybrid_context_parallel is a deprecated alias and cannot be combined with "
+            "dynamic_context_parallel"
+        )
+        dynamic_context_parallel = True
+
+    if dynamic_context_parallel:
+        global _DYNAMIC_DP_CP_GROUPS
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-            assert (
-                len(ranks_with_cp) % 2 == 0
-            ), "Hybrid context parallel requires an even number of ranks"
-            _HYBRID_DP_CP_GROUPS.update(
-                create_hybrid_dp_cp_groups(
-                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+            assert len(ranks_with_cp) % 2 == 0 or min_dynamic_context_parallel_size == len(
+                ranks_with_cp
+            ), (
+                "Dynamic context parallel requires an even DP x CP domain unless the "
+                "minimum group size selects the full domain"
+            )
+            _DYNAMIC_DP_CP_GROUPS.update(
+                create_dynamic_dp_cp_groups(
+                    rank,
+                    ranks_with_cp,
+                    get_nccl_options("dp_cp", nccl_comm_cfgs),
+                    min_cp_size=min_dynamic_context_parallel_size,
                 )
             )
-        # TODO: Are gloo groups needed for hybrid cp?
+
+        # Eagerly initialize all DCP communicators in a consistent order.
+        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
+        group_sizes = [
+            2**i
+            for i in range(int(log2(data_parallel_size_with_cp)) + 1)
+            if 2**i >= min_dynamic_context_parallel_size and 2**i <= data_parallel_size_with_cp
+        ]
+        if data_parallel_size_with_cp not in group_sizes:
+            group_sizes.append(data_parallel_size_with_cp)
+        for group_size in group_sizes:
+            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1523,16 +1551,21 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
-    """Get the hybrid context parallel groups the caller rank belongs to."""
+def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Get the dynamic context parallel group of ``group_size`` for this rank."""
     # If the group size is the same as the entire DPxCP group, return the original group
     if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
-        assert _HYBRID_DP_CP_GROUPS is not None
-    return _HYBRID_DP_CP_GROUPS[group_size]
+        assert _DYNAMIC_DP_CP_GROUPS is not None
+    return _DYNAMIC_DP_CP_GROUPS[group_size]
+
+
+def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Deprecated alias for get_dynamic_data_context_parallel_groups."""
+    return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
 
 
 def get_embedding_group(check_initialized=True):
@@ -2120,6 +2153,9 @@ def destroy_model_parallel():
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
+
+    global _DYNAMIC_DP_CP_GROUPS
+    _DYNAMIC_DP_CP_GROUPS = {}
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None

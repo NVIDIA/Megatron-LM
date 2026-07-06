@@ -452,6 +452,12 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+    if args.dynamic_context_parallel:
+        raise ValueError(
+            "Dynamic context parallelism is not supported by pretrain_hybrid.py. "
+            "Hybrid/Mamba layers do not yet implement per-microbatch context groups "
+            "and padding semantics; use pretrain_gpt.py for DCP training."
+        )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):

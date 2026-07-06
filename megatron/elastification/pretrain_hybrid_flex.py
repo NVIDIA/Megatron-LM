@@ -565,6 +565,12 @@ if __name__ == "__main__":
         extra_args_provider=mamba_flex_extra_args_provider,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+    if args.dynamic_context_parallel:
+        raise ValueError(
+            "Dynamic context parallelism is not supported by pretrain_hybrid_flex.py. "
+            "Hybrid/Mamba layers do not yet implement per-microbatch context groups "
+            "and padding semantics; use pretrain_gpt.py for DCP training."
+        )
 
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(full_config,

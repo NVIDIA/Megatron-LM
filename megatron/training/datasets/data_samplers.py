@@ -11,7 +11,6 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
@@ -46,22 +45,14 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel:
-            batch_sampler = HybridCPMegatronPretrainingSampler(
-                total_samples=len(dataset),
-                consumed_samples=consumed_samples,
-                micro_batch_size=micro_batch_size,
-                global_batch_size=global_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
-        else:
-            # Megatron sampler
-            batch_sampler = MegatronPretrainingSampler(
-                total_samples=len(dataset),
-                consumed_samples=consumed_samples,
-                micro_batch_size=micro_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+        # Packing schedulers consume one microbatch at a time and form packed
+        # global batches themselves.
+        batch_sampler = MegatronPretrainingSampler(
+            total_samples=len(dataset),
+            consumed_samples=consumed_samples,
+            micro_batch_size=micro_batch_size,
+            data_parallel_rank=mpu.get_data_parallel_rank(),
+            data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -97,9 +88,14 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     maybe_worker_init_fn = (
         worker_init_fn if args.num_workers > 0 else None
     )
-    # Torch dataloader.
-    if args.hybrid_context_parallel:
-        extra_kwargs = {"collate_fn": lambda x: x,}
+    # Packing schedulers consume variable-length dictionaries that cannot be
+    # stacked by the default collate function.
+    if (
+        getattr(args, "dynamic_context_parallel", False)
+        or getattr(args, "sequence_packing_scheduler", None) is not None
+        or getattr(args, "use_vanilla_collate_fn", False)
+    ):
+        extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
     return torch.utils.data.DataLoader(

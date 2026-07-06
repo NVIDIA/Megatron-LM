@@ -58,15 +58,29 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    This is used to calculate the number and length of sub-samples assigned to
+    each rank when dynamic_context_parallel or sequence_packing_scheduler is enabled.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
+    Please set max_seqlen_per_dp_cp_rank.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP)."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for dynamic_context_parallel."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
     expert_model_parallel_size: int = 1
@@ -423,6 +437,34 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel."
+                )
+            self.dynamic_context_parallel = True
+            # Do not select the removed legacy pipeline scheduler.
+            self.hybrid_context_parallel = False
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    "Dynamic context parallelism requires "
+                    "sequence_packing_scheduler=default_dynamic_cp"
+                )
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    "min_dynamic_context_parallel_size must be >= 1, got "
+                    f"{self.min_dynamic_context_parallel_size}"
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

@@ -1277,6 +1277,13 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert (
+                packed_seq_params.cp_group is not None
+            ), "cp_group must be set in PackedSeqParams for dynamic context parallelism"
+            cp_group = packed_seq_params.cp_group
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1464,7 +1471,7 @@ class Attention(MegatronModule, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
-                            cp_group=self.pg_collection.cp,
+                            cp_group=cp_group,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1472,7 +1479,7 @@ class Attention(MegatronModule, ABC):
                             q_pos_emb,
                             self.config,
                             cu_seqlens_q,
-                            self.pg_collection.cp,
+                            cp_group,
                             mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
@@ -1482,7 +1489,7 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=cp_group,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(

@@ -59,12 +59,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
     """
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for dynamic_context_parallel."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
@@ -84,6 +87,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
+
+        if self.hybrid_context_parallel:
+            assert not self.dynamic_context_parallel
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
 
         assert self.tokenizer is not None
 

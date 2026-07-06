@@ -6,15 +6,16 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+import warnings
+from pathlib import Path
 
 import torch
 
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -23,23 +24,24 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
-
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -385,6 +387,28 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _validate_dynamic_context_parallel_topology(dp_cp_size, min_cp_size):
+    """Validate the DPxCP domain used to form power-of-two DCP groups."""
+    assert dp_cp_size > 1, (
+        'Dynamic context parallelism requires a DP x CP world size greater than one, '
+        f'got {dp_cp_size}'
+    )
+    assert 1 <= min_cp_size <= dp_cp_size, (
+        f'--min-dynamic-context-parallel-size must be in [1, {dp_cp_size}], '
+        f'got {min_cp_size}'
+    )
+    assert min_cp_size == dp_cp_size or dp_cp_size & (dp_cp_size - 1) == 0, (
+        'Dynamic context parallelism requires DP x CP world size to be a power of two '
+        'unless --min-dynamic-context-parallel-size selects the full DP x CP domain; '
+        f'got DP x CP size {dp_cp_size} and minimum size {min_cp_size}'
+    )
+    assert min_cp_size == dp_cp_size or min_cp_size & (min_cp_size - 1) == 0, (
+        '--min-dynamic-context-parallel-size must be a power of two or the full '
+        f'DP x CP size ({dp_cp_size}), got {min_cp_size}'
+    )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -398,8 +422,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -719,8 +744,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -1360,11 +1387,43 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
-        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+        warnings.warn(
+            '--hybrid-context-parallel is deprecated; use --dynamic-context-parallel.',
+            DeprecationWarning,
+        )
+        assert not args.dynamic_context_parallel, (
+            '--hybrid-context-parallel and --dynamic-context-parallel cannot be combined'
+        )
+        args.dynamic_context_parallel = True
+        args.hybrid_context_parallel = False
+
+    if args.dynamic_context_parallel:
+        assert not args.enable_cuda_graph, (
+            'Dynamic context parallelism is not supported with CUDA Graph'
+        )
+        assert not args.use_megatron_fsdp, (
+            'Dynamic context parallelism is not supported with Megatron FSDP'
+        )
+        assert args.dataloader_type == 'single', (
+            'Dynamic context parallelism only supports the single dataloader type'
+        )
+        assert args.calculate_per_token_loss, (
+            'Dynamic context parallelism requires --calculate-per-token-loss'
+        )
+        assert args.num_experts in (None, 0), (
+            'Dynamic context parallelism does not support MoE models'
+        )
+        if args.sequence_packing_scheduler is None:
+            args.sequence_packing_scheduler = 'default_dynamic_cp'
+        if args.sequence_packing_scheduler != 'default_dynamic_cp':
+            raise ValueError(
+                'Dynamic context parallelism requires '
+                'sequence_packing_scheduler=default_dynamic_cp'
+            )
+
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        min_cp_size = args.min_dynamic_context_parallel_size
+        _validate_dynamic_context_parallel_topology(dp_cp_size, min_cp_size)
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1478,6 +1537,27 @@ def validate_args(args, defaults={}):
     # fsdp_dtensor checkpointing format checks.
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    if args.sequence_packing_scheduler is not None:
+        assert args.calculate_per_token_loss, (
+            "Sequence packing requires --calculate-per-token-loss so gradients "
+            "do not depend on packing boundaries"
+        )
+        assert args.cuda_graph_impl == "none", (
+            "Sequence packing does not support CUDA graphs without fixed-shape alignment"
+        )
+        args.variable_seq_lengths = True
+        assert args.max_seqlen_per_dp_cp_rank is not None, (
+            "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
+        )
+        scheduler_world_size = args.context_parallel_size
+        if args.sequence_packing_scheduler == 'default_dynamic_cp':
+            scheduler_world_size *= args.data_parallel_size
+        packed_capacity = scheduler_world_size * args.max_seqlen_per_dp_cp_rank
+        assert packed_capacity >= args.seq_length, (
+            f"Packed sequence capacity ({packed_capacity}) must be at least "
+            f"--seq-length ({args.seq_length})"
+        )
 
     # Data blend checks
     assert args.mock_data + \
@@ -2128,6 +2208,11 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "dynamic_context_parallel",
+        "min_dynamic_context_parallel_size",
+        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2559,8 +2644,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2899,6 +2983,19 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
+                       help='Maximum packed sequence length assigned to each DP x CP rank.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Deprecated alias for --dynamic-context-parallel.')
+    group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
+                       help='Dynamically balance variable-length packed samples across DP x CP '
+                       'ranks. Requires --max-seqlen-per-dp-cp-rank and '
+                       '--calculate-per-token-loss.')
+    group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
+                       help='Minimum process-group size used by dynamic context parallelism.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
+                       choices=['dp_balanced', 'default_dynamic_cp'],
+                       help='Pack variable-length sequences across DP x CP ranks.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -3419,7 +3516,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
@@ -3448,6 +3545,13 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument(
+        '--sft-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Inline JSON or a JSON file configuring synthetic SFT sequence lengths. '
+        'Supports file and lognormal distribution modes.',
+    )
     return parser
 
 def _add_logits_distillation_args(parser):
