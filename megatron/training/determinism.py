@@ -61,6 +61,21 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
 # it without duplicating the list.
 ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
 
+# Env vars whose valid deterministic values are a small fixed exact-match set
+# (unlike NCCL_ALGO which accepts comma-separated subsets of tokens). An unset
+# value is fine -- set_determinism_env_var_defaults() fills the canonical
+# default. A set-but-invalid value fails hard.
+#   - ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``: TE reads it as ``int(value)``; only
+#     ``"0"`` means deterministic (any nonzero int enables non-deterministic
+#     algos). See ``megatron/core/extensions/transformer_engine.py``.
+#   - ``CUBLAS_WORKSPACE_CONFIG``: NVIDIA docs list ``:4096:8`` (4x4MiB) and
+#     ``:16:8`` (8x16KiB) as the two deterministic workspace configurations;
+#     any other value breaks reproducibility.
+ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
+    "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
+}
+
 
 def set_determinism_env_var_defaults() -> None:
     """Set defaults for the env vars required for bit-exact reproducibility.
@@ -89,11 +104,15 @@ def apply_determinism_to_args(args) -> None:
     1. Asserts every option in ``ARG_VALUES_REQUIRED_FOR_DETERMINISM`` holds
        its required value. This is a verification-only check — it never
        mutates ``args``.
-    2. Sets env-var defaults via :func:`set_determinism_env_var_defaults` — a user-supplied
-       value (e.g. an ``NCCL_ALGO`` exported by the launcher) survives the
-       setdefault, so this step does not second-guess the user's choice of
-       deterministic algo.
-    3. Calls ``torch.use_deterministic_algorithms(True)``.
+    2. Validates every determinism-relevant env var
+       (``NCCL_ALGO``, ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``,
+       ``CUBLAS_WORKSPACE_CONFIG``, ``MAMBA_DETERMINISTIC``): a launcher-set
+       value must be in the accepted set; an unset value falls through to
+       the setdefault in step 3.
+    3. Sets env-var defaults via :func:`set_determinism_env_var_defaults` — a user-supplied
+       value survives the setdefault, so this step does not second-guess the
+       user's (validated) choice of deterministic algo.
+    4. Calls ``torch.use_deterministic_algorithms(True)``.
 
     Incompatible options are rejected with an explicit error rather than
     silently overridden: the user must turn them off themselves so the
@@ -122,9 +141,11 @@ def apply_determinism_to_args(args) -> None:
     # and the bf16 parallelism matrix). Backend choice is left to TE's
     # default selection or to the launcher via ``NVTE_*_ATTN`` env vars.
 
-    # NCCL_ALGO sanity check on a launcher-supplied value. See
-    # :data:`ACCEPTED_NCCL_ALGO_TOKENS` for the accepted set and the rationale
-    # for each entry (and why ``Tree`` is excluded).
+    # Env-var validation. Same principle for all four: only fail if the
+    # launcher exported a value we haven't validated as deterministic; unset
+    # is fine (set_determinism_env_var_defaults() below fills the canonical
+    # default). NCCL_ALGO is handled specially -- it accepts comma-separated
+    # subsets, not exact matches.
     nccl_algo = os.environ.get("NCCL_ALGO")
     if nccl_algo is not None:
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
@@ -133,8 +154,26 @@ def apply_determinism_to_args(args) -> None:
             f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
         )
 
+    for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
+        val = os.environ.get(name)
+        assert val is None or val in accepted, (
+            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
+        )
+
+    # Mamba SSM auto-follows torch.are_deterministic_algorithms_enabled() when
+    # MAMBA_DETERMINISTIC is unset (see megatron/core/ssm/ops/determinism.py:
+    # use_deterministic_mode). Reject only an explicit non-deterministic
+    # override; unset is fine because torch.use_deterministic_algorithms(True)
+    # below flips the fallback on.
+    mamba = os.environ.get("MAMBA_DETERMINISTIC")
+    if mamba:  # empty string falls through to the SSM default too
+        assert mamba[0] == "1", (
+            f"MAMBA_DETERMINISTIC={mamba!r} disables Mamba SSM determinism under "
+            "--deterministic-mode. Unset it or set to '1'."
+        )
+
     # Apply env vars. ``setdefault`` preserves any launcher-set value that just
-    # passed validation; the default of ``Ring`` only kicks in when nothing was set.
+    # passed validation; the canonical defaults only kick in when nothing was set.
     set_determinism_env_var_defaults()
 
     # Torch global state last — all assertions have already passed.
