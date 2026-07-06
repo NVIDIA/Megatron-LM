@@ -2649,19 +2649,19 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 if not self.moe_ncclep_static_shape:
                     warnings.warn(
-                        'overlap_moe_expert_parallel_comm with ncclep and moe_ncclep_static_shape=False: '
-                        'get_permuted_hidden_states_by_experts does a device-to-host sync that serializes '
-                        'the 1F1B overlap (correct, but loses the overlap benefit). Set '
-                        'moe_ncclep_static_shape=True for the overlapped path (needs the fused op on '
-                        'sm100+).'
+                        'overlap_moe_expert_parallel_comm with ncclep and '
+                        'moe_ncclep_static_shape=False: get_permuted_hidden_states_by_experts '
+                        'does a device-to-host sync that serializes the 1F1B overlap (correct, '
+                        'but loses the overlap benefit). Set moe_ncclep_static_shape=True for '
+                        'the overlapped path (needs the fused op on sm100+).'
                     )
                 assert not (
                     self.fine_grained_activation_offloading
                     and 'expert_fc1' in (self.offload_modules or [])
                 ), (
                     "overlap_moe_expert_parallel_comm with ncclep does not support offloading "
-                    "'expert_fc1': it forces expert FC1 to save the raw bf16 input, which the overlap "
-                    'path eagerly frees.'
+                    "'expert_fc1': it forces expert FC1 to save the raw bf16 input, which the "
+                    'overlap path eagerly frees.'
                 )
 
             if self.cuda_graph_impl != "none":
