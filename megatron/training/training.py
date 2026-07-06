@@ -1818,6 +1818,12 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    if should_fire(callback_manager, "on_setup_start"):
+        callback_manager.fire(
+            "on_setup_start",
+            CallbackContext(model=None, user_state=callback_manager.user_state),
+        )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
@@ -3281,6 +3287,8 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3627,6 +3635,19 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        if should_fire(callback_manager, "on_log"):
+            log_fragments: list[str] = []
+            callback_manager.fire(
+                "on_log",
+                CallbackContext(
+                    model=model,
+                    user_state=callback_manager.user_state,
+                    timers_to_log=timers_to_log,
+                    log_fragments=log_fragments,
+                ),
+            )
+            log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
         # OTel: emit training metrics at log interval (export rank only). Loss and
@@ -4917,6 +4938,8 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    model=model,
+                    callback_manager=callback_manager,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5061,6 +5084,17 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
+    if should_fire(callback_manager, "on_train_end"):
+        callback_manager.fire(
+            "on_train_end",
+            CallbackContext(
+                model=model,
+                user_state=callback_manager.user_state,
+                optimizer=optimizer,
+                scheduler=opt_param_scheduler,
+            ),
+        )
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         # Deregister NCCL user-buffer memory pools before exit.
@@ -5098,17 +5132,6 @@ def train(
     # own traces (there is no umbrella left to parent them). The sys.exit() path above
     # ends the block via _end_otel_job_spans() instead.
     _end_otel_train_span()
-
-    if should_fire(callback_manager, "on_train_end"):
-        callback_manager.fire(
-            "on_train_end",
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                optimizer=optimizer,
-                scheduler=opt_param_scheduler,
-            ),
-        )
 
     return iteration, num_floating_point_operations_so_far
 

@@ -84,10 +84,12 @@ class TestCallback:
         mock_context = Mock(spec=CallbackContext)
 
         # None of these should raise
+        callback.on_setup_start(mock_context)
         callback.on_data_init_start(mock_context)
         callback.on_train_start(mock_context)
         callback.on_train_step_start(mock_context)
         callback.on_train_step_end(mock_context)
+        callback.on_log(mock_context)
         callback.on_train_end(mock_context)
         callback.on_eval_start(mock_context)
         callback.on_eval_step_start(mock_context)
@@ -482,10 +484,12 @@ class TestValidEvents:
     def test_valid_events_contains_expected_events(self):
         """VALID_EVENTS contains all expected event names."""
         expected = {
+            "on_setup_start",
             "on_data_init_start",
             "on_train_start",
             "on_train_step_start",
             "on_train_step_end",
+            "on_log",
             "on_train_end",
             "on_eval_start",
             "on_eval_step_start",
