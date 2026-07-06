@@ -23,7 +23,7 @@ try:
     import modelopt.torch.utils.distributed as dist
 
     has_nvidia_modelopt = True
-except (ModuleNotFoundError, ImportError):
+except ImportError:
     has_nvidia_modelopt = False
 
 logger = logging.getLogger(__name__)
