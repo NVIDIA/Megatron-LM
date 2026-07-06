@@ -166,6 +166,152 @@ def load(
         return common_state_dict
 
 
+def _prepare_async_load_common(
+    sharded_state_dict: ShardedStateDict,
+    checkpoint_dir: str,
+    sharded_strategy: Optional[TorchDistLoadShardedStrategy],
+    required_strategy_attr: str,
+):
+    """Shared preamble of the async-load entrypoints.
+
+    Mirrors :func:`load` up to the sharded-strategy dispatch. The async path
+    skips the strict-mode / access-integrity validation (which is itself
+    collective) and behaves like ``StrictHandling.ASSUME_OK_UNEXPECTED``.
+
+    Returns: tuple of (sharded_strategy, common_state_dict, sharded_state_dict,
+        sh_ten_factories).
+    """
+    verify_checkpoint(checkpoint_dir)
+    if sharded_strategy is None:
+        sharded_strategy = TorchDistLoadShardedStrategy()
+    if not hasattr(sharded_strategy, required_strategy_attr):
+        raise TypeError(
+            f"sharded_strategy {type(sharded_strategy).__name__} does not implement "
+            f"{required_strategy_attr}."
+        )
+
+    force_all_tensors_to_non_fp8(sharded_state_dict)
+
+    common_state_dict = load_common(checkpoint_dir)
+
+    sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
+        sharded_state_dict
+    )
+    merge(common_state_dict, nonpersistent_state_dict)
+
+    sharded_state_dict, _ = extract_sharded_base(sharded_state_dict)
+
+    return sharded_strategy, common_state_dict, sharded_state_dict, sh_ten_factories
+
+
+def _wrap_plan_finalize_into_common(prepared_plan, common_state_dict, sh_ten_factories):
+    """Rebind ``prepared_plan.finalize_fn`` to return the full merged state dict
+    (common + loaded + factory merges), matching what :func:`load` returns."""
+    inner_finalize_fn = prepared_plan.finalize_fn
+
+    def finalize_into_common() -> StateDict:
+        loaded_state_dict = inner_finalize_fn()
+        # Shallow copy: protects the top-level mapping so the plan can be
+        # replayed; each plan is finalized at most once per read.
+        merged = dict(common_state_dict)
+        merge(merged, loaded_state_dict)
+        return apply_factory_merges(merged, sh_ten_factories)
+
+    prepared_plan.finalize_fn = finalize_into_common
+    return prepared_plan
+
+
+def prepare_async_load(
+    sharded_state_dict: ShardedStateDict,
+    checkpoint_dir: str,
+    sharded_strategy: Optional[TorchDistLoadShardedStrategy] = None,
+):
+    """Run the plan phase of an async load; pair with :func:`start_async_load_from_plan`.
+
+    The returned plan caches the collective DCP planning work, so repeated
+    reloads of the same checkpoint only pay for disk reads.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict of the existing model
+            populated with ShardedTensors, used as a loading mapping.
+        checkpoint_dir (str): directory with the checkpoint.
+        sharded_strategy (TorchDistLoadShardedStrategy, optional): configures
+            loading behavior for sharded tensors.
+
+    Returns: an AsyncLoadPlan.
+    """
+    sharded_strategy, common_state_dict, sharded_state_dict, sh_ten_factories = (
+        _prepare_async_load_common(
+            sharded_state_dict, checkpoint_dir, sharded_strategy, "prepare_async_load"
+        )
+    )
+
+    prepared_plan = sharded_strategy.prepare_async_load(sharded_state_dict, checkpoint_dir)
+    return _wrap_plan_finalize_into_common(prepared_plan, common_state_dict, sh_ten_factories)
+
+
+def prepare_async_load_reusing_topology(
+    sharded_state_dict: ShardedStateDict,
+    checkpoint_dir: str,
+    template_plan,
+    sharded_strategy: Optional[TorchDistLoadShardedStrategy] = None,
+):
+    """Collective-free counterpart of :func:`prepare_async_load`.
+
+    Reuses the collective planning work cached in ``template_plan`` and only
+    performs local per-checkpoint setup. The caller must guarantee that
+    ``sharded_state_dict`` has the same structure and parallel topology as the
+    one used to build ``template_plan``.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict of the existing model
+            populated with ShardedTensors, used as a loading mapping.
+        checkpoint_dir (str): directory with the checkpoint.
+        template_plan (AsyncLoadPlan): plan built by :func:`prepare_async_load`
+            for a checkpoint with identical topology.
+        sharded_strategy (TorchDistLoadShardedStrategy, optional): configures
+            loading behavior for sharded tensors.
+
+    Returns: an AsyncLoadPlan.
+    """
+    sharded_strategy, common_state_dict, sharded_state_dict, sh_ten_factories = (
+        _prepare_async_load_common(
+            sharded_state_dict,
+            checkpoint_dir,
+            sharded_strategy,
+            "prepare_async_load_reusing_topology",
+        )
+    )
+
+    prepared_plan = sharded_strategy.prepare_async_load_reusing_topology(
+        sharded_state_dict, checkpoint_dir, template_plan
+    )
+    return _wrap_plan_finalize_into_common(prepared_plan, common_state_dict, sh_ten_factories)
+
+
+def start_async_load_from_plan(prepared_plan, call_idx: int = 0):
+    """Spawn the async read thread for a previously prepared plan.
+
+    Args:
+        prepared_plan (AsyncLoadPlan): plan built by :func:`prepare_async_load`
+            or :func:`prepare_async_load_reusing_topology`.
+        call_idx (int, optional): sequence number validated across ranks at
+            finalization. Defaults to 0.
+
+    Returns: an AsyncLoadRequest; call ``maybe_finalize()`` to obtain the
+        loaded state dict.
+    """
+    from .strategies.async_load_utils import spawn_async_read
+
+    return spawn_async_read(
+        storage_reader=prepared_plan.storage_reader,
+        final_local_plan=prepared_plan.final_local_plan,
+        worker_planner=prepared_plan.worker_planner,
+        finalize_fn=prepared_plan.finalize_fn,
+        call_idx=call_idx,
+    )
+
+
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
 

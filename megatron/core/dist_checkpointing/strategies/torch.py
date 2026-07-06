@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
+
+    from .async_load_utils import AsyncLoadPlan, AsyncLoadRequest
 else:
     CheckpointMetadataCache = Any
     NVRxAsyncRequest = Any
@@ -918,6 +920,217 @@ class TorchDistLoadShardedStrategy:
         )
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
         return mcore_state_dict
+
+    def _setup_async_load_state(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """Local (collective-free) setup shared by the async-load plan phases.
+
+        Mirrors :meth:`load` up to the DCP dispatch.
+
+        Returns: tuple of (pyt_state_dict, planner, storage_reader, finalize_fn).
+        """
+        flexible_shape_sharded_tensors = [
+            sh_ten
+            for sh_ten in nested_values(sharded_state_dict)
+            if isinstance(sh_ten, ShardedTensor) and not sh_ten.allow_shape_mismatch
+        ]
+        allow_shape_mismatch_sharded_tensors = {
+            sh_ten.key: sh_ten
+            for sh_ten in nested_values(sharded_state_dict)
+            if isinstance(sh_ten, ShardedTensor) and sh_ten.allow_shape_mismatch
+        }
+
+        orig_sharded_state_dict = sharded_state_dict
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
+
+        storage_reader = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+        planner = MCoreLoadPlanner(
+            shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+            allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+            flatten_state_dict=False,
+            flatten_sharded_tensors=False,
+        )
+
+        def _finalize() -> StateDict:
+            mcore_state_dict = {k: _unwrap_pyt_sharded_tensor(v) for k, v in pyt_state_dict.items()}
+            mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+                mcore_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+            )
+            _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
+            return mcore_state_dict
+
+        return pyt_state_dict, planner, storage_reader, _finalize
+
+    def prepare_async_load(
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+    ) -> "AsyncLoadPlan":
+        """Run the plan phase of an async load and return a reusable plan.
+
+        Performs the collective DCP planning (metadata read, plan exchange,
+        destination tensor resolution). The returned plan can be cached and
+        replayed with :meth:`start_async_load_from_plan` for every reload of
+        the same checkpoint, skipping the plan phase entirely.
+
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict with mapping
+                information to instruct loading
+            checkpoint_dir (Path): checkpoint directory
+
+        Returns: an AsyncLoadPlan.
+        """
+        from torch.distributed.checkpoint.utils import _DistWrapper
+
+        from .async_load_utils import AsyncLoadPlan
+
+        pyt_state_dict, planner, storage_reader, finalize_fn = self._setup_async_load_state(
+            sharded_state_dict, checkpoint_dir
+        )
+
+        # Replicate torch.distributed.checkpoint's load plan phase.
+        storage_reader.reset()
+        dist_wrapper = _DistWrapper(group=None, use_dist=True, coordinator_rank=0)
+        use_collectives = True
+        metadata: Optional[Metadata] = None
+
+        def local_step():
+            nonlocal use_collectives
+            nonlocal metadata
+            try:
+                metadata = storage_reader.read_metadata()
+            except Exception:
+                logger.info("Global metadata is not found. Falling back to rank local metadata.")
+
+            if (
+                not metadata
+                and "kwargs" in inspect.signature(storage_reader.read_metadata).parameters
+            ):
+                try:
+                    metadata = storage_reader.read_metadata(rank=dist_wrapper.rank)
+                    use_collectives = False
+                except Exception:
+                    logger.info("Rank local metadata is not found.")
+
+            assert metadata is not None
+            planner.set_up_planner(pyt_state_dict, metadata, dist_wrapper.is_coordinator)
+
+            if "kwargs" in inspect.signature(storage_reader.set_up_storage_reader).parameters:
+                storage_reader.set_up_storage_reader(
+                    metadata,
+                    dist_wrapper.is_coordinator,
+                    rank=dist_wrapper.rank,
+                    use_collectives=use_collectives,
+                )
+            else:
+                storage_reader.set_up_storage_reader(metadata, dist_wrapper.is_coordinator)
+
+            local_plan = planner.create_local_plan()
+            local_plan = storage_reader.prepare_local_plan(local_plan)
+            return local_plan
+
+        def global_step(all_local_plans):
+            all_local_plans = planner.create_global_plan(all_local_plans)
+            all_local_plans = storage_reader.prepare_global_plan(all_local_plans)
+            return all_local_plans
+
+        central_plan = dist_wrapper.reduce_scatter("plan", local_step, global_step)
+        final_local_plan = planner.finish_plan(central_plan)
+        self.cached_global_metadata = metadata
+
+        # The worker thread reuses the planner (bound to pyt_state_dict during
+        # set_up_planner) so that sharded read items resolve into the correct
+        # narrowed destination sub-slices.
+        return AsyncLoadPlan(
+            storage_reader=storage_reader,
+            final_local_plan=final_local_plan,
+            metadata=metadata,
+            worker_state_dict=pyt_state_dict,
+            worker_planner=planner,
+            finalize_fn=finalize_fn,
+        )
+
+    def start_async_load_from_plan(
+        self, prepared_plan: "AsyncLoadPlan", call_idx: int = 0
+    ) -> "AsyncLoadRequest":
+        """Spawn the read thread for a previously prepared plan.
+
+        No collectives and no metadata reads, so it is safe to call while
+        other work (e.g. a forward pass) is in flight on the main thread.
+
+        Args:
+            prepared_plan (AsyncLoadPlan): plan built by :meth:`prepare_async_load`.
+            call_idx (int, optional): sequence number validated across ranks at
+                finalization. Defaults to 0.
+
+        Returns: an AsyncLoadRequest handle.
+        """
+        from .async_load_utils import spawn_async_read
+
+        return spawn_async_read(
+            storage_reader=prepared_plan.storage_reader,
+            final_local_plan=prepared_plan.final_local_plan,
+            worker_planner=prepared_plan.worker_planner,
+            finalize_fn=prepared_plan.finalize_fn,
+            call_idx=call_idx,
+        )
+
+    def prepare_async_load_reusing_topology(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        template_plan: "AsyncLoadPlan",
+    ) -> "AsyncLoadPlan":
+        """Build an AsyncLoadPlan reusing a template plan's collective work.
+
+        For loading multiple checkpoints that share the exact same state dict
+        structure and parallel topology: reuses ``template_plan.final_local_plan``
+        (built collectively by :meth:`prepare_async_load`) and only performs the
+        local per-checkpoint setup. The caller is responsible for the topology
+        actually matching; a mismatch may raise during the read or load wrong
+        shards.
+
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict with mapping
+                information to instruct loading
+            checkpoint_dir (Path): checkpoint directory
+            template_plan (AsyncLoadPlan): plan built by :meth:`prepare_async_load`
+                for a checkpoint with identical topology
+
+        Returns: an AsyncLoadPlan bound to this checkpoint's destination tensors.
+        """
+        from .async_load_utils import AsyncLoadPlan
+
+        pyt_state_dict, planner, storage_reader, finalize_fn = self._setup_async_load_state(
+            sharded_state_dict, checkpoint_dir
+        )
+
+        storage_reader.reset()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        metadata = storage_reader.read_metadata()
+
+        # is_coordinator=False everywhere: no collective is taking place, the
+        # planner state is only needed so resolve_tensor maps read items back
+        # to this checkpoint's pyt_state_dict.
+        planner.set_up_planner(pyt_state_dict, metadata, is_coordinator=False)
+
+        if "kwargs" in inspect.signature(storage_reader.set_up_storage_reader).parameters:
+            storage_reader.set_up_storage_reader(
+                metadata, is_coordinator=False, rank=rank, use_collectives=False
+            )
+        else:
+            storage_reader.set_up_storage_reader(metadata, False)
+
+        self.cached_global_metadata = metadata
+
+        return AsyncLoadPlan(
+            storage_reader=storage_reader,
+            final_local_plan=template_plan.final_local_plan,
+            metadata=metadata,
+            worker_state_dict=pyt_state_dict,
+            worker_planner=planner,
+            finalize_fn=finalize_fn,
+        )
 
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
         """Uses tensors metadata stored in the metadata file."""
