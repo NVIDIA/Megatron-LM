@@ -10,17 +10,17 @@ from typing import Any
 
 import torch
 
-from .torch import TorchDistLoadShardedStrategy
-from ..serialization import load, load_common_state_dict, save
-from ..validation import StrictHandling
-
 from megatron.core import mpu
 from megatron.core.safe_globals import safe_load_from_bytes
 
+from ..serialization import load, load_common_state_dict, save
+from ..validation import StrictHandling
+from .torch import TorchDistLoadShardedStrategy
+
 try:
     import modelopt
-    import modelopt.torch.utils.distributed as dist
     import modelopt.torch.opt as mto
+    import modelopt.torch.utils.distributed as dist
 
     has_nvidia_modelopt = True
 except (ModuleNotFoundError, ImportError):
