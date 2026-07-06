@@ -16,7 +16,7 @@ MODEL_ARGS:
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --log-interval: 1
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1

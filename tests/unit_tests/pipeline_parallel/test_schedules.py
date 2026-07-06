@@ -4,7 +4,6 @@ import os
 
 import pytest
 import torch
-import torch.distributed as dist
 from packaging import version
 from pytest_mock import mocker
 
@@ -19,24 +18,15 @@ from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, create_embedding_groups
 
 rank = Utils.rank
 
 
-def _populate_embedding_and_position_groups(pp_group):
-    """Create *new* embedding-related process groups from *pp_group* ranks."""
+def _populate_embedding_and_position_groups(grid):
+    """Create *new* embedding-related process groups from *grid*'s PP partition."""
 
-    pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-
-    pos_embd_ranks = [pp_ranks[0]]
-    embd_ranks = [pp_ranks[0]]
-    if pp_ranks[-1] != pp_ranks[0]:
-        embd_ranks.append(pp_ranks[-1])
-
-    pos_embd_pg = dist.new_group(ranks=pos_embd_ranks)
-    embd_pg = dist.new_group(ranks=embd_ranks)
-
+    embd_pg, pos_embd_pg = create_embedding_groups(grid)
     return pos_embd_pg, embd_pg
 
 
@@ -575,7 +565,7 @@ def test_forward_backward_pipelining_without_interleaving_with_custom_pgs(mocker
 
     pp_group = grid.create_pg("pp")
     p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
-    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pp_group)
+    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(grid)
     pos_embd_pg = pos_embd_pg if is_pp_first_stage(pp_group) else None
     embd_pg = embd_pg if (is_pp_last_stage(pp_group) or is_pp_first_stage(pp_group)) else None
     dp_cp_group = grid.create_pg(["dp", "cp"])
@@ -671,7 +661,7 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
     grid = HyperCommGrid([1, 1, 4, 2], ["tp", "cp", "pp", "dp"])
     pp_group = grid.create_pg("pp")
     p2p_communicator = P2PCommunicator(pp_group=pp_group, config=config)
-    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pp_group)
+    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(grid)
     pos_embd_pg = pos_embd_pg if is_pp_first_stage(pp_group) else None
     embd_pg = embd_pg if (is_pp_last_stage(pp_group) or is_pp_first_stage(pp_group)) else None
 
@@ -736,7 +726,7 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
     pp_group = grid.create_pg("pp")
     tp_group = grid.create_pg("tp")
     cp_group = grid.create_pg("cp")
-    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pp_group)
+    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(grid)
     dp_cp_group = grid.create_pg(["dp", "cp"])
 
     pg_collection = ProcessGroupCollection()

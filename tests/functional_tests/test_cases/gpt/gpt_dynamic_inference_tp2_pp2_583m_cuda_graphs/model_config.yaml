@@ -20,7 +20,7 @@ MODEL_ARGS:
   --no-use-tokenizer-model-from-checkpoint-args: true
   --timing-log-level: 0
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --log-interval: 1
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2

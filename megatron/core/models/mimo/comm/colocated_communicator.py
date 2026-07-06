@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.parallel_state import create_split_groups
 
 
 @dataclass
@@ -89,9 +90,10 @@ class ColocatedBridgeCommunicator:
                 scale=self.scale,
                 rank_to_pos=self.rank_to_src_pos,
             )
-            self.gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.gather_group_ranks, backend='nccl'
-            )
+            # Collective (all-gather) subgroups: one ``split_group`` over the
+            # world PG, inheriting the world's cuda backend. Do not hardcode
+            # "nccl" -- that would pin a stock-NCCL child under an nccl2 world.
+            self.gather_pg = create_split_groups(self.gather_group_ranks)
         elif self.dest_dp_size > self.src_dp_size:
             self.direction = BridgeDirection.FAN_OUT
             self.scale = self.dest_dp_size // self.src_dp_size
@@ -101,9 +103,7 @@ class ColocatedBridgeCommunicator:
                 scale=self.scale,
                 rank_to_pos=self.rank_to_dest_pos,
             )
-            self.gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.gather_group_ranks, backend='nccl'
-            )
+            self.gather_pg = create_split_groups(self.gather_group_ranks)
         else:
             self.direction = BridgeDirection.EQUAL
             self.scale = 1

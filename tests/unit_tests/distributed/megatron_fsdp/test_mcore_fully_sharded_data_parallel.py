@@ -33,7 +33,7 @@ from tests.unit_tests.distributed.megatron_fsdp.utils import (
     pretrain_forward_backward,
     set_manual_seed,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 # Test model for testing FSDP
@@ -198,8 +198,7 @@ class TestFullyShardedDataParallel:
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -502,8 +501,7 @@ class TestFullyShardedDataParallel:
             pytest.skip("nccl_ub requires PyTorch 2.7.0 or later")
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()

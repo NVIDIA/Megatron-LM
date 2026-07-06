@@ -12,7 +12,7 @@ MODEL_ARGS:
   --eval-iters: 0
   --manual-gc: true
   --use-mcore-models: true
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   # parallelism settings
   --sequence-parallel: true
   --tensor-model-parallel-size: 2

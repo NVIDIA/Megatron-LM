@@ -30,6 +30,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from megatron.core.parallel_state import create_split_groups
+
 logger = logging.getLogger(__name__)
 
 
@@ -443,43 +445,31 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
 def _create_ep_groups(ep_size):
     """Create EP-style groups: consecutive blocks of *ep_size* ranks."""
     world = dist.get_world_size()
-    rank = dist.get_rank()
     assert world % ep_size == 0, f"world_size ({world}) not divisible by ep_size ({ep_size})"
-    my_group = None
-    for start in range(0, world, ep_size):
-        ranks = list(range(start, start + ep_size))
-        g = dist.new_group(ranks)
-        if rank in ranks:
-            my_group = g
-    return my_group
+    return create_split_groups(
+        [list(range(start, start + ep_size)) for start in range(0, world, ep_size)],
+        group_desc="SNIFF_EP_GROUP",
+    )
 
 
 def _create_dp_groups(ep_size):
     """Create DP-style groups: ranks sharing the same offset within EP blocks."""
     world = dist.get_world_size()
-    rank = dist.get_rank()
     assert world % ep_size == 0
-    my_group = None
-    for offset in range(ep_size):
-        ranks = list(range(offset, world, ep_size))
-        g = dist.new_group(ranks)
-        if rank in ranks:
-            my_group = g
-    return my_group
+    return create_split_groups(
+        [list(range(offset, world, ep_size)) for offset in range(ep_size)],
+        group_desc="SNIFF_DP_GROUP",
+    )
 
 
 def _create_tp_groups(tp_size):
     """Create TP-style groups: consecutive blocks of *tp_size* ranks."""
     world = dist.get_world_size()
-    rank = dist.get_rank()
     assert world % tp_size == 0, f"world_size ({world}) not divisible by tp_size ({tp_size})"
-    my_group = None
-    for start in range(0, world, tp_size):
-        ranks = list(range(start, start + tp_size))
-        g = dist.new_group(ranks)
-        if rank in ranks:
-            my_group = g
-    return my_group
+    return create_split_groups(
+        [list(range(start, start + tp_size)) for start in range(0, world, tp_size)],
+        group_desc="SNIFF_TP_GROUP",
+    )
 
 
 def main():
@@ -503,12 +493,24 @@ def main():
     p.add_argument("--skip-reducescatter", action="store_true")
     p.add_argument("--skip-alltoall", action="store_true")
     p.add_argument("--skip-sendrecv", action="store_true")
+    p.add_argument(
+        "--distributed-backend", type=str, default="nccl2", choices=["nccl2", "nccl"],
+        help="CUDA backend for the sniff-test world PG. 'nccl' selects the stock "
+             "ProcessGroupNCCL baseline; 'nccl2' (default) selects the in-tree nccl2 backend.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    # Device-qualified and eagerly device-bound, mirroring
+    # megatron/training/initialize.py: the subgroups below are built with
+    # ``split_group``, which requires a device-bound parent, and the cpu:gloo
+    # backend gives any CPU collective somewhere to land.
+    dist.init_process_group(
+        backend=f"cpu:gloo,cuda:{args.distributed_backend}",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()

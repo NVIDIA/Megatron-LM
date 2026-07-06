@@ -6,6 +6,7 @@ import torch
 from packaging import version
 
 import megatron.core.nccl_allocator as nccl_allocator
+import megatron.core.parallel_state as ps
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -42,7 +43,12 @@ class TestNCCLAllocator:
         torch.cuda.set_device(device)
 
         # Default process group and backend
-        pg = torch.distributed.new_group(ranks=list(range(world_size)), backend="nccl")
+        # split_group over the world PG, inheriting the world's cuda backend.
+        # Do not hardcode "nccl": that would pin a stock ProcessGroupNCCL child
+        # under an nccl2 world and silently stop exercising nccl2 here.
+        pg = ps.create_split_groups(
+            [list(range(world_size))], group_desc="NCCL_ALLOCATOR_TEST_GROUP"
+        )
 
         nccl_allocator.init()
 
@@ -78,7 +84,12 @@ class TestNCCLAllocator:
         device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
 
-        pg = torch.distributed.new_group(ranks=list(range(world_size)), backend="nccl")
+        # split_group over the world PG, inheriting the world's cuda backend.
+        # Do not hardcode "nccl": that would pin a stock ProcessGroupNCCL child
+        # under an nccl2 world and silently stop exercising nccl2 here.
+        pg = ps.create_split_groups(
+            [list(range(world_size))], group_desc="NCCL_ALLOCATOR_TEST_GROUP"
+        )
 
         nccl_allocator.init()
 

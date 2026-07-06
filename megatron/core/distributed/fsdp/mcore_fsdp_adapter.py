@@ -370,12 +370,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 ep_group = getattr(pg_collection, 'ep', None)
 
         if tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
-            tp_group = single_rank_group
+            tp_group = _new_single_rank_group()
 
         if expt_tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
-            expt_tp_group = single_rank_group
+            expt_tp_group = _new_single_rank_group()
 
         # Extract AG groups from pg_collection for explicit passing
         dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
@@ -465,6 +463,38 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
+
+
+def _new_single_rank_group():
+    """Build a degenerate 1-rank process group containing only this rank.
+
+    Used as a stand-in when the caller supplies no TP / expert-TP group.
+
+    This is deliberately a *members-only* ``new_group`` rather than a
+    ``split_group``:
+
+    * Every rank passes a different ``ranks`` list (``[my_rank]``), so this is
+      not a covering-partition collective. Routing it through ``split_group``
+      would impose a new world-wide rendezvous that the current code does not
+      require, and would deadlock if ``tp_group``/``expt_tp_group`` were
+      populated on some ranks but not others.
+    * A 1-rank group gains nothing from ``ncclCommSplit``.
+    * ``use_local_synchronization=True`` is mandatory on an ``nccl2`` world:
+      without it ``new_group`` takes the eager no-color-split path
+      (``performNocolorSplit``), which ``nccl2`` does not implement. It also
+      switches the group name from the ``_world.group_count`` counter (which is
+      identical on every rank, so all the per-rank 1-rank groups would share a
+      single PrefixStore namespace) to a hash of ``[my_rank]``, which is unique
+      per rank.
+
+    The backend is inherited from the world PG, so this follows whichever cuda
+    backend the world was initialized with (stock ``nccl`` or ``nccl2``).
+    """
+    return parallel_state.create_group(
+        ranks=[dist.get_rank()],
+        use_local_synchronization=True,
+        group_desc="SINGLE_RANK_GROUP",
+    )
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):

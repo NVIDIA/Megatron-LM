@@ -354,7 +354,17 @@ def build_expert_device_mesh():
 
     expt_dp_group = parallel_state.get_expert_data_parallel_group()
     expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
-    expt_tp_group = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    # Degenerate 1-rank placeholder TP group. Every rank passes a different
+    # ranks list, so this is a members-only new_group (no split_group): with
+    # use_local_synchronization=True there are no non-members to drive through
+    # new_group's eager no-color-split path, which nccl2 does not implement,
+    # and the group name is hashed from [my_rank] instead of the (rank-identical)
+    # _world.group_count, so the per-rank groups get distinct PrefixStores.
+    expt_tp_group = parallel_state.create_group(
+        ranks=[torch.distributed.get_rank()],
+        use_local_synchronization=True,
+        group_desc="SINGLE_RANK_GROUP",
+    )
     return DeviceMesh.from_group(
         [expt_dp_group, expt_tp_group],
         device_type="cuda",

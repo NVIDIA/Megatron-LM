@@ -32,7 +32,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 class HeterogenousTransformerLayer(TransformerLayer):
@@ -265,8 +265,7 @@ class TestTransformerBlockWithProcessGroups:
 
         # Create custom process groups
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
@@ -412,8 +411,7 @@ class TestTransformerBlockWithProcessGroups:
 
         # Create custom process groups
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Create HyperCommGrid with dimensions mlp_tp, attn_cp, attn_tp (reversed from device mesh order)
         grid = HyperCommGrid(
@@ -626,8 +624,7 @@ class TestTransformerBlockWithProcessGroups:
         model_parallel_cuda_manual_seed(123)
 
         # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         if reverse_tp_dp_order:
             # Create HyperCommGrid with dimensions ep, pp, tp, dp (reversed from device mesh order)

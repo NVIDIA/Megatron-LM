@@ -567,9 +567,22 @@ def test_expert_all_gather_group():
     expt_dp_group = ps.get_expert_data_parallel_group()
     expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
 
-    # Create AG groups for both regular and expert parameters
-    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
-    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
+    # Create AG groups for both regular and expert parameters. These are extra
+    # communicators over exactly the same ranks as their parent, so they are made
+    # by splitting the parent group with a single (full-size) colour rather than
+    # by an eager new_group: new_group over an nccl2 world drives non-member ranks
+    # through performNocolorSplit, which nccl2 does not implement, and hardcoding
+    # backend='nccl' would pin a stock ProcessGroupNCCL child under an nccl2 world.
+    dp_cp_ag_group = torch.distributed.split_group(
+        parent_pg=dp_cp_group,
+        split_ranks=[list(range(dp_cp_group.size()))],
+        group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
+    )
+    expt_dp_ag_group = torch.distributed.split_group(
+        parent_pg=expt_dp_group,
+        split_ranks=[list(range(expt_dp_group.size()))],
+        group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
+    )
 
     # Create ProcessGroupCollection with AG groups
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()

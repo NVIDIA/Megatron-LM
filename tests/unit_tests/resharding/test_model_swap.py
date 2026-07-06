@@ -25,7 +25,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, create_embedding_groups
 
 try:
     import nvshmem.core
@@ -70,12 +70,10 @@ def _build_pg_collection(
     tp_ep_pp_group = grid.create_pg(["tp", "ep", "pp"])
     dp_cp_group = grid.create_pg(["cp", "dp"])
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
-    embd_group_ranks = mpu.default_embedding_ranks(dist.get_process_group_ranks(pp_group))
-    embd_group = dist.new_group(ranks=embd_group_ranks)
-    pos_embd_group_ranks = mpu.default_position_embedding_ranks(
-        dist.get_process_group_ranks(pp_group)
-    )
-    pos_embd_group = dist.new_group(ranks=pos_embd_group_ranks)
+    # One split_group per family over the grid's full PP partition rather than a
+    # new_group over this rank's slice: an eager new_group would drive non-member
+    # ranks through performNocolorSplit, unimplemented in nccl2.
+    embd_group, pos_embd_group = create_embedding_groups(grid)
     return ProcessGroupCollection(
         tp=tp_group,
         cp=cp_group,

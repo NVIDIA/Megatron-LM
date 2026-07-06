@@ -12,7 +12,7 @@ from megatron.core.inference.communication_utils import (
     send_to_next_pipeline_rank,
 )
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 class TestCommunicationWithCustomPPGroup:
@@ -53,8 +53,7 @@ class TestCommunicationWithCustomPPGroup:
         )
 
         # Initialize torch.distributed if not already initialized
-        if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Note: HyperCommGrid uses minor-to-major order (tp, pp), which is reverse of device mesh
         grid = HyperCommGrid([tp_size, pp_size], ["tp", "pp"])
@@ -111,8 +110,7 @@ class TestCommunicationWithCustomPPGroup:
         dist.barrier()
 
         # Initialize torch.distributed if not already initialized
-        if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')
+        ensure_distributed_initialized()
 
         # Note: HyperCommGrid uses minor-to-major order (tp, pp), which is reverse of device mesh
         grid = HyperCommGrid([tp_size, pp_size], ["tp", "pp"])

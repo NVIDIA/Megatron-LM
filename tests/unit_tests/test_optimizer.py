@@ -12,6 +12,7 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+import megatron.core.parallel_state as ps
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
@@ -1240,7 +1241,9 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
 
     # Test 3: Missing expt_dp attribute in pg_collection
     pg_collection_no_expt_dp = ProcessGroupCollection()
-    pg_collection_no_expt_dp.dp = torch.distributed.new_group()
+    pg_collection_no_expt_dp.dp = ps.create_split_groups(
+        [list(range(torch.distributed.get_world_size()))], group_desc="DUMMY_DP_GROUP"
+    )
     # Missing required 'expt_dp' attribute
 
     with pytest.raises(ValueError, match="expt_dp process group is required"):
@@ -1252,7 +1255,9 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
 
     # Test 4: Missing intra_dist_opt and mp attribute in pg_collection
     pg_collection_complete = ProcessGroupCollection()
-    pg_collection_complete.dp = torch.distributed.new_group()
+    pg_collection_complete.dp = ps.create_split_groups(
+        [list(range(torch.distributed.get_world_size()))], group_desc="DUMMY_DP_GROUP"
+    )
     pg_collection_complete.expt_dp = None  # Explicitly set to None as allowed
 
     # Missing required 'intra_dist_opt' attribute

@@ -38,7 +38,7 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, create_embedding_groups
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -87,7 +87,6 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
         dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
         rank_offset=offset,
-        backend="nccl",
     )
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
@@ -128,12 +127,24 @@ def get_pg_collection(grid):
     return pg_collection
 
 
+def _embedding_cache_key(grid):
+    """Cache key for a grid's embedding groups: its whole PP partition.
+
+    Keyed on the full partition, not on this rank's slice, so the key is
+    identical on every rank and the create/hit sequence below stays in lockstep.
+    """
+    return tuple(tuple(r) for r in grid.get_rank_enum("pp"))
+
+
 def create_all_embedding_groups(grids):
     """Create embedding PGs for all grids upfront.
 
-    dist.new_group is a collective — ALL ranks must call it, even non-members.
+    Group creation is a collective — ALL ranks must call it, even non-members.
     We create all embedding groups in a consistent order across all ranks to
-    avoid hangs from asymmetric new_group calls.
+    avoid hangs from asymmetric calls. Each family is built with a single
+    ``split_group`` over the grid's full PP partition; a per-PP-group
+    ``new_group`` would instead drive non-member ranks through
+    ``performNocolorSplit``, which the ``nccl2`` backend does not implement.
 
     Args:
         grids: List of all HyperCommGrids that need embedding groups.
@@ -143,35 +154,27 @@ def create_all_embedding_groups(grids):
         if not pp_group:
             continue
 
-        pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-        cache_key = tuple(pp_ranks)
+        cache_key = _embedding_cache_key(grid)
 
         if cache_key not in _embedding_pg_cache:
-            pos_embd_ranks = [pp_ranks[0]]
-            embd_ranks = [pp_ranks[0]]
-            if pp_ranks[-1] != pp_ranks[0]:
-                embd_ranks.append(pp_ranks[-1])
-            _embedding_pg_cache[cache_key] = (
-                dist.new_group(ranks=pos_embd_ranks),
-                dist.new_group(ranks=embd_ranks),
-            )
+            embd_pg, pos_embd_pg = create_embedding_groups(grid)
+            _embedding_pg_cache[cache_key] = (pos_embd_pg, embd_pg)
 
 
-def add_embedding_groups(pg_collection, is_language_model=False):
+def add_embedding_groups(pg_collection, grid, is_language_model=False):
     """Add cached embedding groups to a process group collection.
 
     Must call create_all_embedding_groups() first to ensure PGs exist.
 
     Args:
         pg_collection: ProcessGroupCollection to add embedding groups to.
+        grid: The HyperCommGrid the collection was derived from.
         is_language_model: If True, set embd group for word embedding sync.
     """
     if not pg_collection.pp:
         return pg_collection
 
-    pp_ranks = sorted(dist.get_process_group_ranks(pg_collection.pp))
-    cache_key = tuple(pp_ranks)
-    pos_embd_pg, embd_pg = _embedding_pg_cache[cache_key]
+    pos_embd_pg, embd_pg = _embedding_pg_cache[_embedding_cache_key(grid)]
 
     pg_collection.pos_embd = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
 
@@ -190,7 +193,7 @@ def add_embedding_groups(pg_collection, is_language_model=False):
 
 def get_pg_collection_with_embedding_groups(grid, is_language_model=False):
     """Get ProcessGroupCollection with embedding groups (PGs must be pre-created)."""
-    return add_embedding_groups(get_pg_collection(grid), is_language_model=is_language_model)
+    return add_embedding_groups(get_pg_collection(grid), grid, is_language_model=is_language_model)
 
 
 def is_rank_in_grid(grid):

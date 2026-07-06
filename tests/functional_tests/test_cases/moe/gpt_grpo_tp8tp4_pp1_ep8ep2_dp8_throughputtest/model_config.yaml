@@ -77,7 +77,7 @@ MODEL_ARGS:
   --max-position-embeddings: 256
 
   # Training settings
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --transformer-impl: transformer_engine
   --bf16: true
   --attention-backend: flash

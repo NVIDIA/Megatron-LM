@@ -23,7 +23,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 def _create_transformer_block(
@@ -126,7 +126,6 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         shape=[tp, cp, pp, dp],
         dim_names=["tp", "cp", "pp", "dp"],
         rank_offset=offset,
-        backend="nccl",
     )
     _ = grid.create_pg(["tp"])
     _ = grid.create_pg(["cp"])
@@ -275,8 +274,7 @@ class TestBridgeCommunicator:
     @classmethod
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+        ensure_distributed_initialized()
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 

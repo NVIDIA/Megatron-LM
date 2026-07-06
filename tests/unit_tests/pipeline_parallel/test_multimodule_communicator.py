@@ -21,7 +21,7 @@ from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     destroy_all_grids,
     get_transformer_block_and_grid,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, ensure_distributed_initialized
 
 
 class TestMultiModulePipelineCommunicator:
@@ -29,8 +29,7 @@ class TestMultiModulePipelineCommunicator:
     @classmethod
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+        ensure_distributed_initialized()
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 

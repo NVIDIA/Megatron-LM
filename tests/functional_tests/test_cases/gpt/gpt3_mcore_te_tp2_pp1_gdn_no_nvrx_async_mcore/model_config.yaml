@@ -57,7 +57,7 @@ MODEL_ARGS:
   --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
   --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --split: 949,50,1
-  --distributed-backend: nccl
+  --distributed-backend: nccl2
   --lr: 0.00015
   --lr-decay-style: cosine
   --min-lr: 1.0e-5

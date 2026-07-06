@@ -2,7 +2,6 @@
 
 import inspect
 import os
-from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +11,6 @@ from packaging import version
 from pytest import approx
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
-from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -29,7 +27,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, create_embedding_groups
 
 
 class TestGPTModel:
@@ -400,12 +398,10 @@ class TestGPTModelWithCustomPG:
         cp_group = grid.create_pg("cp")
         pp_group = grid.create_pg("pp")
         ep_group = grid.create_pg("ep")
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
-        )
+        # One split_group over the grid's full PP partition rather than a
+        # new_group over this rank's slice: an eager new_group would drive
+        # non-member ranks through performNocolorSplit, unimplemented in nccl2.
+        embd_group, _ = create_embedding_groups(grid)
         pg_collection = ProcessGroupCollection(
             tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group
         )

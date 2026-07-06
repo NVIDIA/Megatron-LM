@@ -26,7 +26,7 @@ from megatron.core.process_groups_config import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, create_embedding_groups
 
 # ============================================================================
 # Helper Functions
@@ -42,7 +42,6 @@ def create_hypercomm_grid(offset=0, tp=1, pp=1, dp=1):
         shape=[tp, 1, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
         dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
         rank_offset=offset,
-        backend="nccl",
     )
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
@@ -80,23 +79,25 @@ def get_pg_collection(grid):
 _embedding_pg_cache: dict = {}
 
 
-def add_embedding_groups(pg_collection):
-    """Add embedding groups to process group collection."""
+def add_embedding_groups(pg_collection, grid):
+    """Add embedding groups to process group collection.
+
+    The embedding families are built from *grid*'s full PP partition with one
+    ``split_group`` collective each, not with a ``new_group`` per PP group: an
+    eager ``new_group`` sends non-member ranks through ``performNocolorSplit``,
+    which the ``nccl2`` backend does not implement. The cache is keyed on the
+    whole partition (identical on every rank), so the create/hit sequence stays
+    in lockstep across ranks.
+    """
     if not pg_collection.pp:
         return pg_collection
 
-    pp_ranks = sorted(dist.get_process_group_ranks(pg_collection.pp))
-    cache_key = tuple(pp_ranks)
+    pp_enum = grid.get_rank_enum("pp")
+    cache_key = tuple(tuple(r) for r in pp_enum)
 
     if cache_key not in _embedding_pg_cache:
-        pos_embd_ranks = [pp_ranks[0]]
-        embd_ranks = [pp_ranks[0]]
-        if pp_ranks[-1] != pp_ranks[0]:
-            embd_ranks.append(pp_ranks[-1])
-        _embedding_pg_cache[cache_key] = (
-            dist.new_group(ranks=pos_embd_ranks),
-            dist.new_group(ranks=embd_ranks),
-        )
+        embd, pos_embd = create_embedding_groups(grid)
+        _embedding_pg_cache[cache_key] = (pos_embd, embd)
 
     pos_embd_pg, embd_pg = _embedding_pg_cache[cache_key]
 
@@ -160,7 +161,7 @@ def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size):
     grid = create_hypercomm_grid(offset=grid_offset, tp=tp, pp=pp, dp=dp)
 
     if grid.rank_offset <= rank < grid.rank_offset + grid.size:
-        pg_collection = add_embedding_groups(get_pg_collection(grid))
+        pg_collection = add_embedding_groups(get_pg_collection(grid), grid)
         module = create_transformer_block(hidden_size, pg_collection)
     else:
         pg_collection = None
