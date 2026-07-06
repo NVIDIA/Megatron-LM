@@ -6,9 +6,9 @@ from typing import Optional, Tuple, Union
 
 import modelopt.torch.opt as mto
 import torch.nn as nn
-from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 
 from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.strategies.modelopt import restore_sharded_modelopt_state
 from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
