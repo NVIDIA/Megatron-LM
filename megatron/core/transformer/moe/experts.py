@@ -848,7 +848,11 @@ class TEGroupedMLP(MegatronModule):
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
                         if k in sub_sd:
                             sub_sd[k] = apply_swiglu_sharded_factory(
-                                sub_sd[k], new_sharded_offsets, singleton_local_shards
+                                sub_sd[k],
+                                new_sharded_offsets,
+                                singleton_local_shards,
+                                tp_group=self.tp_group,
+                                dp_group=metadata['dp_cp_group'],
                             )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
