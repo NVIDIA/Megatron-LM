@@ -691,12 +691,24 @@ class FSDPModule:
 
                     pending_post_unshard.append(param_group)
                     for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-                        if buffer_runs and buffer_runs[-1][0] is weight_buffer.dp_group:
-                            buffer_runs[-1][1].append(weight_buffer)
+                        if (
+                            buffer_runs
+                            and buffer_runs[-1][0] is weight_buffer.dp_group
+                            and buffer_runs[-1][1] == weight_buffer.dtype
+                            and buffer_runs[-1][2] == weight_buffer.device
+                        ):
+                            buffer_runs[-1][3].append(weight_buffer)
                         else:
-                            buffer_runs.append((weight_buffer.dp_group, [weight_buffer]))
+                            buffer_runs.append(
+                                (
+                                    weight_buffer.dp_group,
+                                    weight_buffer.dtype,
+                                    weight_buffer.device,
+                                    [weight_buffer],
+                                )
+                            )
 
-                for dp_group, weight_buffers in buffer_runs:
+                for dp_group, _, _, weight_buffers in buffer_runs:
                     _unshard_weight_buffers(dp_group, weight_buffers, async_op=async_op)
 
                 for param_group in pending_post_unshard:
