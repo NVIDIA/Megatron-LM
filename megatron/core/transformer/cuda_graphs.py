@@ -21,6 +21,7 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.packed_seq_params import split_packed_seq_params_for_cuda_graph
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -1668,6 +1669,33 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(
+    layer,
+    sample_kwargs,
+    sample_packed_seq_params,
+):
+    """Add flattened ``PackedSeqParams`` Tensor inputs to TE graph sample kwargs."""
+    if sample_packed_seq_params is None:
+        return
+
+    tensor_kwargs, static_metadata = split_packed_seq_params_for_cuda_graph(
+        sample_packed_seq_params
+    )
+    duplicate_keys = set(sample_kwargs) & set(tensor_kwargs)
+    assert not duplicate_keys, (
+        "PackedSeqParams CUDA graph Tensor kwargs overlap with existing sample kwargs: "
+        f"{', '.join(sorted(duplicate_keys))}."
+    )
+    assert hasattr(layer, '_set_te_cuda_graph_packed_seq_params_static_metadata'), (
+        "Transformer layers using TE CUDA graph packed sequence samples must support "
+        "PackedSeqParams static metadata."
+    )
+    layer._set_te_cuda_graph_packed_seq_params_static_metadata(
+        static_metadata, tensor_kwargs.keys()
+    )
+    sample_kwargs.update(tensor_kwargs)
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1678,7 +1706,14 @@ class TECudaGraphHelper:
     """
 
     def __init__(
-        self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
+        self,
+        model,
+        config,
+        seq_length,
+        micro_batch_size,
+        optimizers=[],
+        pg_collection=None,
+        sample_packed_seq_params=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
@@ -1692,11 +1727,16 @@ class TECudaGraphHelper:
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
         self.model = model
+        assert sample_packed_seq_params is None or is_te_min_version("1.10.0"), (
+            "TE CUDA graph packed_seq_params support requires Transformer Engine >= 1.10.0 "
+            "because packed-sequence Tensor fields are passed as keyword arguments."
+        )
         self.config = config
         self.seq_length = seq_length
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
+        self.sample_packed_seq_params = sample_packed_seq_params
         if self.pg_collection is None:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.tp_group = self.pg_collection.tp
@@ -1925,6 +1965,9 @@ class TECudaGraphHelper:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                    _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(
+                        layer, static_inputs, self.sample_packed_seq_params
+                    )
                 _sample_kwargs = static_inputs
             elif contains_self_attn:
                 _sample_args = (

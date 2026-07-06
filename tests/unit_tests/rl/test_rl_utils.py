@@ -167,6 +167,49 @@ class TestRLUtils:
         set_global_variables(args, False)
         return args
 
+    def test_get_rl_packed_seq_params_for_cuda_graph_without_sequence_packing(self):
+        params = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=8, device=torch.device("cpu"), sequence_packing=False
+        )
+
+        assert params.qkv_format == 'thd'
+        assert params.max_seqlen_q == 8
+        assert params.max_seqlen_kv == 8
+        assert params.total_tokens == 8
+        assert params.cu_seqlens_kv is params.cu_seqlens_q
+        assert params.cu_seqlens_q.dtype == torch.int32
+        assert params.cu_seqlens_q.device.type == "cpu"
+        assert torch.equal(params.cu_seqlens_q, torch.tensor([0, 8], dtype=torch.int32))
+        assert torch.equal(params.seq_idx, torch.zeros((1, 8), dtype=torch.int32))
+
+    def test_get_rl_packed_seq_params_for_cuda_graph_with_sequence_packing(self):
+        params = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=8,
+            device=torch.device("cpu"),
+            sequence_packing=True,
+            max_sequences_per_bin=3,
+        )
+
+        expected_cu_seqlens = torch.tensor([0, 8, 8, 8, 8], dtype=torch.int32)
+        assert params.qkv_format == 'thd'
+        assert params.max_seqlen_q == 8
+        assert params.max_seqlen_kv == 8
+        assert params.total_tokens == 8
+        assert params.cu_seqlens_kv is params.cu_seqlens_q
+        assert params.cu_seqlens_q.dtype == torch.int32
+        assert params.cu_seqlens_q.device.type == "cpu"
+        assert params.cu_seqlens_q.shape == (5,)
+        assert torch.equal(params.cu_seqlens_q, expected_cu_seqlens)
+        assert torch.equal(params.seq_idx, torch.zeros((1, 8), dtype=torch.int32))
+
+    def test_get_rl_packed_seq_params_for_cuda_graph_requires_max_sequences_per_bin(self):
+        with pytest.raises(AssertionError, match="max_sequences_per_bin is required"):
+            rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+                seq_length=8,
+                device=torch.device("cpu"),
+                sequence_packing=True,
+            )
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
 

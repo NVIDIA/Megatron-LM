@@ -1,9 +1,28 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Mapping, MutableMapping
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+
+CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX = "_packed_seq_params_"
+
+PACKED_SEQ_PARAMS_CUDA_GRAPH_TENSOR_FIELDS = (
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+)
+
+PACKED_SEQ_PARAMS_CUDA_GRAPH_STATIC_FIELDS = (
+    "qkv_format",
+    "max_seqlen_q",
+    "max_seqlen_kv",
+    "local_cp_size",
+    "cp_group",
+)
 
 
 @dataclass
@@ -65,3 +84,92 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def _cuda_graph_packed_seq_params_key(field_name: str, prefix: str) -> str:
+    return f"{prefix}{field_name}"
+
+
+def split_packed_seq_params_for_cuda_graph(
+    packed_seq_params: PackedSeqParams | None,
+    prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+) -> tuple[dict[str, Tensor | None], dict[str, object]]:
+    """Split ``PackedSeqParams`` into graph Tensor inputs and static metadata.
+
+    Transformer Engine CUDA graph inputs must be tensors or ``None``. ``PackedSeqParams`` mixes
+    dynamic Tensor fields, such as cumulative sequence lengths, with static metadata, such as THD
+    format and max sequence lengths. This helper keeps only the fields TE attention consumes;
+    Mamba-only fields such as ``total_tokens`` and ``seq_idx`` stay outside this graph boundary.
+    """
+    if packed_seq_params is None:
+        return {}, {}
+
+    tensor_kwargs = {}
+    for field_name in PACKED_SEQ_PARAMS_CUDA_GRAPH_TENSOR_FIELDS:
+        value = getattr(packed_seq_params, field_name)
+        if value is not None and not isinstance(value, Tensor):
+            raise TypeError(
+                f"PackedSeqParams.{field_name} must be a Tensor or None for CUDA graphs, "
+                f"got {type(value).__name__}."
+            )
+        if value is not None:
+            tensor_kwargs[_cuda_graph_packed_seq_params_key(field_name, prefix)] = value
+
+    static_metadata = {}
+    for field_name in PACKED_SEQ_PARAMS_CUDA_GRAPH_STATIC_FIELDS:
+        value = getattr(packed_seq_params, field_name)
+        if isinstance(value, Tensor):
+            raise TypeError(
+                f"PackedSeqParams.{field_name} is static CUDA graph metadata and must not be "
+                "a Tensor."
+            )
+        static_metadata[field_name] = value
+
+    return tensor_kwargs, static_metadata
+
+
+def has_packed_seq_params_cuda_graph_kwargs(
+    kwargs: Mapping[str, object],
+    prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+) -> bool:
+    """Return whether ``kwargs`` contains flattened ``PackedSeqParams`` Tensor fields."""
+    return any(
+        _cuda_graph_packed_seq_params_key(field_name, prefix) in kwargs
+        for field_name in PACKED_SEQ_PARAMS_CUDA_GRAPH_TENSOR_FIELDS
+    )
+
+
+def build_packed_seq_params_from_cuda_graph_kwargs(
+    kwargs: MutableMapping[str, object],
+    static_metadata: Mapping[str, object] | None,
+    prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+    remove_from_kwargs: bool = True,
+) -> PackedSeqParams | None:
+    """Rebuild ``PackedSeqParams`` from flattened CUDA graph kwargs.
+
+    Args:
+        kwargs: Graph kwargs that may contain flattened packed-sequence Tensor fields.
+        static_metadata: Non-Tensor metadata produced by
+            :func:`split_packed_seq_params_for_cuda_graph`.
+        prefix: Prefix used for flattened Tensor fields.
+        remove_from_kwargs: Whether to pop consumed flattened fields from ``kwargs``.
+    """
+    packed_seq_params_kwargs = dict(static_metadata or {})
+    found_tensor_field = False
+    for field_name in PACKED_SEQ_PARAMS_CUDA_GRAPH_TENSOR_FIELDS:
+        key = _cuda_graph_packed_seq_params_key(field_name, prefix)
+        if key not in kwargs:
+            continue
+        found_tensor_field = True
+        value = kwargs.pop(key) if remove_from_kwargs else kwargs[key]
+        if value is not None and not isinstance(value, Tensor):
+            raise TypeError(
+                f"Flattened PackedSeqParams field {key} must be a Tensor or None, "
+                f"got {type(value).__name__}."
+            )
+        packed_seq_params_kwargs[field_name] = value
+
+    if not packed_seq_params_kwargs and not found_tensor_field:
+        return None
+
+    return PackedSeqParams(**packed_seq_params_kwargs)

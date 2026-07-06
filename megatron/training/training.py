@@ -3625,12 +3625,21 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        cuda_graph_sample_packed_seq_params = None
+        if has_rl_utils and args.perform_rl_step:
+            cuda_graph_sample_packed_seq_params = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+                seq_length=args.seq_length,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                sequence_packing=args.rl_use_sequence_packing,
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+            )
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            sample_packed_seq_params=cuda_graph_sample_packed_seq_params,
         )
 
     # Run training iterations till done.
