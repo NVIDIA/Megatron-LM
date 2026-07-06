@@ -310,6 +310,10 @@ class LoggerConfig:
     log_memory_interval: int | None = None
     """Report memory interval."""
 
+    log_per_layer_profiling: bool = False
+    """If set, enable measured per-layer forward timing and memory profiling.
+    Requires log_memory_interval; hooks are installed only on logged steps."""
+
     log_device_memory_used: bool = False
     """Log device memory used (as reported by nvidia-smi)."""
 

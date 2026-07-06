@@ -23,7 +23,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.per_layer_profiling import PerLayerProfiler
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -320,16 +319,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
-        self.per_layer_profiler = (
-            PerLayerProfiler(
-                self.layers,
-                layer_offset=get_transformer_layer_offset(
-                    self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
-                ),
-            )
-            if self.config.log_per_layer_resource_usage
-            else None
-        )
 
     def _build_layers(self):
         # Transformer layers.
@@ -376,6 +365,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+
+        # Per-layer measured profiler. Created only when enabled (zero overhead
+        # otherwise); hooks are installed lazily per logged step by start_step.
+        from megatron.core.transformer.per_layer_profiling import PerLayerProfiler
+
+        self.per_layer_profiler = PerLayerProfiler(
+            enabled=getattr(self.config, "log_per_layer_profiling", False)
+        )
+        for local_idx, layer in enumerate(self.layers):
+            self.per_layer_profiler.register_layer(layer, local_idx)
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
