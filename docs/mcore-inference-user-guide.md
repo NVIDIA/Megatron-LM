@@ -1,47 +1,48 @@
 # Megatron Core Inference User Guide
 
-A practical guide to running inference with **Megatron Core (MCore)** using the
-**dynamic** inference path. This is the recommended and actively-developed
-inference stack in Megatron-LM. The legacy **static** engine is being
-deprecated — new work should target the dynamic path described here.
+A practical guide to running inference with Megatron Core (MCore) using the
+dynamic inference path. This is the recommended and actively developed
+inference stack in Megatron-LM.
+
+The legacy static engine is deprecated. New work should target the dynamic path described here.
 
 ---
 
 ## Table of Contents
 
-1. [What Megatron Inference Is For](#1-what-megatron-inference-is-for)
-2. [Rollout Performance](#2-rollout-performance)
-3. [Supported Features](#3-supported-features)
-4. [Basic Usage: The High-Level API](#4-basic-usage-the-high-level-api)
-   - [4.1 The two classes](#41-the-two-classes-megatronllm-and-megatronasyncllm)
-   - [4.2 Direct mode vs. coordinator (indirect) mode](#42-direct-mode-vs-coordinator-indirect-mode)
-   - [4.3 Sync offline batch generation](#43-sync-offline-batch-generation)
-   - [4.4 Async generation](#44-async-generation)
-   - [4.5 Sampling parameters](#45-sampling-parameters)
-   - [4.6 Engine configuration](#46-engine-configuration)
-   - [4.7 Reading results](#47-reading-results)
-   - [4.8 Lifecycle controls](#48-lifecycle-controls)
-5. [Online Serving: OpenAI-Compatible Server](#5-online-serving-openai-compatible-server)
-6. [Advanced Usage: Customizing the Pipeline](#6-advanced-usage-customizing-the-pipeline)
-   - [6.1 Pipeline anatomy](#61-pipeline-anatomy)
-   - [6.2 Customizing the TextGenerationController](#62-customizing-the-textgenerationcontroller)
-   - [6.3 Customizing the DynamicInferenceContext](#63-customizing-the-dynamicinferencecontext)
-   - [6.4 Driving the engine directly](#64-driving-the-engine-directly)
-7. [Examples Directory](#7-examples-directory)
-8. [Known Limitations](#8-known-limitations)
-9. [Roadmap and Future Work](#9-roadmap-and-future-work)
-10. [See Also](#10-see-also)
+- [What Megatron Inference Is For](#what-megatron-inference-is-for)
+- [Rollout Performance](#rollout-performance)
+- [Supported Features](#supported-features)
+- [Basic Usage: The High-Level API](#basic-usage-the-high-level-api)
+   - [The two classes](#the-two-classes-megatronllm-and-megatronasyncllm)
+   - [Direct Mode Compared to Coordinator (Indirect) Mode](#direct-mode-compared-to-coordinator-indirect-mode)
+   - [Sync offline batch generation](#sync-offline-batch-generation)
+   - [Async generation](#async-generation)
+   - [Sampling parameters](#sampling-parameters)
+   - [Engine configuration](#engine-configuration)
+   - [Reading results](#reading-results)
+   - [Lifecycle controls](#lifecycle-controls)
+- [OpenAI-Compatible HTTP Server](#openai-compatible-http-server)
+- [Customizing the Pipeline](#customizing-the-pipeline)
+   - [Pipeline anatomy](#pipeline-anatomy)
+   - [Customizing the TextGenerationController](#customizing-the-textgenerationcontroller)
+   - [Customizing the DynamicInferenceContext](#customizing-the-dynamicinferencecontext)
+   - [Driving the engine directly](#driving-the-engine-directly)
+- [Examples Directory](#examples-directory)
+- [Known Limitations](#known-limitations)
+- [Roadmap and Future Work](#roadmap-and-future-work)
+- [Additional Resources](#additional-resources)
 
 ---
 
-## 1. What Megatron Inference Is For
+## What Megatron Inference Is For
 
-Megatron Inference is built **primarily as the generation engine for
-reinforcement learning (RL)**, not as a standalone serving engine. Its design
-center is the RL loop, where a model alternates between **training** and
-**rollout** phases inside the same process. (A rollout is typically generation
-plus sandboxing / environment infrastructure; Megatron Inference provides the
-**generation** portion.)
+Megatron Inference is built primarily as the generation engine for
+*reinforcement learning (RL)*, not as a standalone serving engine. Its design
+center is the RL loop, where a model alternates between *training* and
+*rollout* phases inside the same process. A rollout is typically generation
+plus sandboxing or environment infrastructure. Megatron Inference provides the
+*generation* portion.
 
 This focus drives the major design benefits:
 
@@ -49,32 +50,32 @@ This focus drives the major design benefits:
   numerical mismatch between the framework that *trains* the policy and the one
   that *generates* rollouts. Running both in MCore removes the cross-framework
   portion of this gap and makes the remaining numerical mismatch far easier to
-  control (see batch-invariant kernels below).
+  control (refer to batch-invariant kernels below).
 - **No model conversion.** Because generation runs on the same MCore model,
-  there is **no Hugging Face ↔ MCore conversion** step between training and
-  generation, providing **day-0 inference** for any model trainable in Megatron
+  there is *no Hugging Face to MCore conversion* step between training and
+  generation, providing *day-0 inference* for any model that is trainable in Megatron
   Core.
-- **Inexpensive training ↔ inference transitions.** Tight coupling enables
+- **Inexpensive training to inference transitions.** This is because tight coupling enables
   in-place weight refit and shared memory management, drastically cutting
   re-initialization cost relative to standing up an external inference engine
   each rollout.
 - **Colocated and non-colocated deployments.** Megatron Inference supports
-  **weight refit / resharding between training and inference**, so the same
+  *weight refit and resharding between training and inference*, so the same
   weights can be moved between the two phases under different parallelism
-  layouts. This covers both **colocated** setups (training and inference share
-  the same GPUs) and **non-colocated** setups (training and inference run on
+  layouts. This covers both *colocated* setups (where training and inference share
+  the same GPUs) and *non-colocated* setups (where training and inference run on
   separate resources), with the engine resharding weights to the inference-time
   parallel configuration during the swap.
 - **First-class parallelism reuse.** Inference reuses Megatron Core's existing
-  TP / EP / PP parallelism infrastructure directly.
+  tensor parallelism (TP), expert parallelism (EP), and pipeline parallelism (PP) infrastructure directly.
 
 ---
 
-## 2. Rollout Performance
+## Rollout Performance
 
 Megatron Inference is optimized for the generation (rollout) phase of the RL
-loop. Its rollout performance is **on par with popular inference frameworks**,
-so you get the training/inference-consistency benefits of staying in MCore
+loop. Its rollout performance is *on par with popular inference frameworks*,
+so you get the training and inference consistency benefits of staying in MCore
 without giving up generation speed.
 
 The plots below show a sample comparison of decode step times against vLLM
@@ -91,51 +92,50 @@ async scheduling is merged, and add a prefill-perf analysis section. -->
 
 <img src="images/inference_performance/super-performance.png" alt="Sample rollout decode step times — Nemotron 3 Super" width="600">
 
-The takeaway: you are not trading away rollout performance to gain the
-training/inference consistency benefits of MCore inference.
+You do not trade away rollout performance to gain the training and inference consistency benefits of MCore inference.
 
 ---
 
-## 3. Supported Features
+## Supported Features
 
 | Area | Features |
 |---|---|
-| **Batching** | Dynamic / in-flight batching with vectorized bookkeeping; dynamic suspend/resume and request eviction for high input-rate regimes |
+| **Batching** | Dynamic or in-flight batching with vectorized bookkeeping, dynamic suspend and resume, and request eviction for high input-rate regimes |
 | **Chunked prefill** | Chunked-prefill scheduling with decode piggybacking, so long prompts don't stall in-flight decodes |
-| **Attention / KV cache** | Optimized PagedAttention; prefix caching (with LRU / ref-zero eviction and prefix-aware coordinator routing) |
+| **Attention and KV cache** | Optimized PagedAttention with prefix caching (LRU and ref-zero eviction, prefix-aware coordinator routing) |
 | **CUDA graphs** | Full-model CUDA graphs for prefill, decode, and mixed batches |
-| **Speculative decoding** | MTP-based speculative decoding (with fused MTP bookkeeping + MTP CUDA graphs) |
+| **Speculative decoding** | Multi-Token Prediction (MTP)-based speculative decoding (with fused MTP bookkeeping and MTP CUDA graphs) |
 | **Serving** | OpenAI-compatible HTTP server with chat templates, tool calling, and reasoning parsers |
 | **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher (notably faster than the all-to-all dispatchers other frameworks use) plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs |
-| **Parallelism** | Data-parallel coordinator with full multi-node support; tensor model parallelism with low-latency comm primitives; expert model parallelism |
-| **Model families** | GPT-style dense models, MoE models, and Mamba / hybrid (SSM + attention) models |
-| **Precision** | Low-precision functionality (e.g. MXFP8) using latency-optimized inference kernels |
-| **RL** | Weight refit / resharding between training ↔ inference, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments; batch-invariant kernels for train/inference log-prob consistency |
-| **Sampling** | Temperature / top-k / top-p, stop words, log-probs, top-N log-probs; pluggable torch or FlashInfer sampling backend |
+| **Parallelism** | Data-parallel coordinator with full multi-node support, tensor model parallelism with low-latency comm primitives, and expert model parallelism |
+| **Model families** | GPT-style dense models, MoE models, and Mamba and hybrid (SSM and attention) models |
+| **Precision** | Low-precision functionality (for example, MXFP8) using latency-optimized inference kernels |
+| **RL** | Weight refit and resharding between training and inference, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments. Batch-invariant kernels for training and inference log-prob consistency |
+| **Sampling** | Temperature, top-k, top-p, stop words, log-probs, and top-N log-probs. Pluggable torch or FlashInfer sampling backend |
 
-> **Batch-invariant kernels (train/inference log-prob consistency).** Standard
-> GEMM/attention/norm kernels can produce slightly different numerics depending
+> **Batch-invariant kernels (training and inference log-prob consistency).** Standard
+> GEMM, attention, and norm kernels can produce slightly different numerics depending
 > on batch composition, which shows up as log-prob mismatch between training and
-> inference — a real source of error and instability in RL. Megatron Inference
-> offers **batch-invariant kernels** whose outputs do not depend on how requests
-> are batched, so per-token log-probs match between the training and inference
-> forward passes. **This is currently supported only for non-MoE (dense)
-> models.** Note this is enabled via `batch_invariant_mode` on the model's
-> `TransformerConfig` — it is **not** an `InferenceConfig` field, so it must be
-> set when you build the model, not on the engine config.
+> inference. This mismatch is a real source of error and instability in RL. Megatron Inference
+> offers *batch-invariant kernels* whose outputs do not depend on how requests are
+> batched, so per-token log-probs match between the training and inference forward
+> passes. *This is currently supported only for non-MoE (dense) models.* Note this
+> is enabled through `batch_invariant_mode` on the model's `TransformerConfig` — it
+> is *not* an `InferenceConfig` field, so it must be set when you build the model,
+> not on the engine config.
 
-Many of these are toggled through `InferenceConfig` — see
-[Section 4.6](#46-engine-configuration).
+Many of these are toggled through `InferenceConfig`. Refer to the
+[Engine configuration](#engine-configuration).
 
 ---
 
-## 4. Basic Usage: The High-Level API
+## Basic Usage: The High-Level API
 
-The high-level API lives in
+The API lives in
 [`megatron/core/inference/apis/`](../megatron/core/inference/apis/) and gives
-you a **vLLM-style `generate(prompts, sampling_params)` interface**. It hides
-the underlying pipeline (`DynamicInferenceContext` → `GPTInferenceWrapper` →
-`TextGenerationController` → `DynamicInferenceEngine`) so you do not have to
+you a *vLLM-style* `generate(prompts, sampling_params)` interface. It hides
+the underlying pipeline (`DynamicInferenceContext` to `GPTInferenceWrapper` to
+`TextGenerationController` to `DynamicInferenceEngine`) so that you do not have to
 wire it up by hand.
 
 ```python
@@ -147,36 +147,43 @@ from megatron.core.inference.apis import (
 )
 ```
 
-### 4.1 The two classes: `MegatronLLM` and `MegatronAsyncLLM`
+### The two classes: `MegatronLLM` and `MegatronAsyncLLM`
 
 | Class | Use it when | Key methods |
 |---|---|---|
 | **`MegatronLLM`** | Synchronous offline batch generation (the common RL-rollout case). | `generate`, `pause`/`unpause`/`suspend`/`resume`, `shutdown`/`wait_for_shutdown`; context manager (`with ... as llm:`) |
-| **`MegatronAsyncLLM`** | Asyncio-native generation and **HTTP serving** via `serve(...)`. | `async generate`, async lifecycle controls, `serve(serve_config)`; async context manager (`async with ... as llm:`) |
+| **`MegatronAsyncLLM`** | Asyncio-native generation and *HTTP serving* through `serve(...)`. | `async generate`, async lifecycle controls, `serve(serve_config)`; async context manager (`async with ... as llm:`) |
 
-Both expose the underlying building blocks through read-only properties —
-`llm.engine`, `llm.context`, `llm.controller`, `llm.is_primary_rank` — which is
-the seam used for [advanced customization](#6-advanced-usage-customizing-the-pipeline).
+Both expose the underlying building blocks as read-only properties. Use these for [advanced customization](#customizing-the-pipeline):
+
+- `llm.engine`
+- `llm.context`
+- `llm.controller`
+- `llm.is_primary_rank`
 
 **Caller responsibilities (before construction):**
 
 - Call `initialize_megatron(...)` to perform full Megatron distributed setup.
-- Build the model and call **`model.eval()`** — the API does *not* toggle model
+- Build the model and call `model.eval()`. The API does *not* toggle model
   state.
 - Have a tokenizer ready.
 
-### 4.2 Direct mode vs. coordinator (indirect) mode
+### Direct Mode Compared to Coordinator (Indirect) Mode
 
-#### Direct mode (`use_coordinator=False`)
+Megatron Inference supports two operating modes. Direct mode is simpler but limited. Coordinator mode adds a routing layer that enables serving, expert parallelism, and lifecycle controls.
 
-- **Every rank is treated as primary** and runs the engine synchronously.
-- **You own data sharding** — you decide which prompts go to which
+#### Direct Mode (`use_coordinator=False`)
+
+Direct mode is the simplest configuration for offline batch generation:
+
+- *Every rank is treated as primary* and runs the engine synchronously.
+- *You own data sharding*, which means that you decide the prompts that are assigned to which
   data-parallel replica and call `generate` on each.
-- Simplest path for offline batch generation when you already shard the data
+- The simplest path for offline batch generation when you already shard the data
   yourself (typical for many RL rollout setups).
-- Lifecycle controls (`pause`/`suspend`/...) are **not available** and raise
+- Lifecycle controls (`pause`/`suspend`/...) are *not available* and raise
   `RuntimeError`.
-- **Not allowed with expert parallelism** (`EP > 1`) — EP routing requires the
+- *Not allowed with expert parallelism* (`EP > 1`). This is because EP routing requires the
   coordinator.
 
 ```python
@@ -192,13 +199,15 @@ with MegatronLLM(
         print(r.generated_text)
 ```
 
-#### Coordinator mode (`use_coordinator=True`)
+#### Coordinator Mode (`use_coordinator=True`)
 
-- A background data-parallel **coordinator routes requests across DP
-  replicas** for you; an `InferenceClient` on **global rank 0** submits work.
-- **Required** for: HTTP serving (`serve`), expert parallelism (`EP > 1`), and
+Coordinator mode adds a background routing layer and is required for serving and advanced features:
+
+- A background data-parallel *coordinator routes requests across DP
+  replicas* for you. An `InferenceClient` on *global rank 0* submits work.
+- *Required* for: HTTP serving (`serve`), expert parallelism (`EP > 1`), and
   the lifecycle controls (`pause`/`unpause`/`suspend`/`resume`).
-- `generate` may only be called on the **primary rank** (rank 0); worker ranks
+- `generate` may only be called on the *primary rank* (rank 0). Worker ranks
   block until shutdown propagates.
 - Internally spins up a daemon-thread event loop so the engine's asyncio
   primitives don't collide with your loop.
@@ -214,8 +223,8 @@ with MegatronLLM(
         results = llm.generate(prompts, SamplingParams(num_tokens_to_generate=64))
 ```
 
-> **Mode/class compatibility:** `MegatronAsyncLLM` **requires
-> `use_coordinator=True`** (direct async is rejected at `__init__`).
+> **Mode and class compatibility:** `MegatronAsyncLLM` *requires
+> `use_coordinator=True`* (direct async is rejected at `__init__`).
 > `MegatronLLM` supports both. So the three supported combinations are:
 > sync+direct, sync+coordinator, async+coordinator.
 
@@ -228,7 +237,7 @@ with MegatronLLM(
 | `pause`/`suspend`/`resume` | ❌ | ✅ |
 | `MegatronAsyncLLM` | ❌ | ✅ |
 
-### 4.3 Sync offline batch generation
+### Sync Offline Batch Generation
 
 The runnable end-to-end script is
 [`examples/inference/offline_inference.py`](../examples/inference/offline_inference.py).
@@ -237,7 +246,7 @@ A minimal version:
 ```python
 from megatron.core.inference.apis import MegatronLLM, SamplingParams
 
-# Assumes initialize_megatron(...) already ran and model.eval() was called.
+# Assumes that initialize_megatron(...) already ran and that model.eval() was called.
 with MegatronLLM(
     model=model,
     tokenizer=tokenizer,
@@ -252,22 +261,24 @@ with MegatronLLM(
         print(r.generated_text)
 ```
 
-`generate` accepts a single prompt or a batch, as **strings or pre-tokenized
-token-id lists**:
+`generate` accepts a single prompt or a batch, as *strings or pre-tokenized
+token-id lists*:
 
-- `"a single string"` → returns a 1-element list
-- `["a", "b"]` → returns a list in input order
-- `[1, 2, 3]` → a single token-id prompt
-- `[[1, 2], [3, 4]]` → a batch of token-id prompts
+- `"a single string"`: returns a 1-element list
+- `["a", "b"]`: returns a list in input order
+- `[1, 2, 3]`: a single token-id prompt
+- `[[1, 2], [3, 4]]`: a batch of token-id prompts
 
-`MegatronLLM.generate` **always returns a `list[DynamicInferenceRequest]`**,
+`MegatronLLM.generate` *always* returns a `list[DynamicInferenceRequest]`,
 even for single-prompt input.
 
-### 4.4 Async generation
+### Async Generation
 
-`MegatronAsyncLLM` mirrors the sync API with `await`. Note the deliberate
-asymmetry: async `generate` returns a **single** request for single input and a
-**list** for batched input.
+`MegatronAsyncLLM` mirrors the sync API with `await`. There is a deliberate
+asymmetry:
+
+* async `generate` returns a *single* request for single input
+* *list* for batched input
 
 ```python
 import asyncio
@@ -289,9 +300,9 @@ async def main():
 asyncio.run(main())
 ```
 
-### 4.5 Sampling parameters
+### Sampling Parameters
 
-`SamplingParams` is per-`generate`-call and controls decoding behavior:
+`SamplingParams` controls decoding behavior for each `generate` call:
 
 | Field | Meaning |
 |---|---|
@@ -301,7 +312,7 @@ asyncio.run(main())
 | `top_p` | Nucleus sampling threshold (`0.0` = disabled) |
 | `termination_id` | Token id that stops generation (commonly the EOD token) |
 | `stop_words` | List of strings that stop generation when produced |
-| `return_log_probs` | Return prompt + generated log-probs |
+| `return_log_probs` | Return prompt and generated log-probs |
 | `skip_prompt_log_probs` | Skip prompt log-probs (only generated) |
 | `top_n_logprobs` | Return top-N log-probs per position |
 | `add_BOS` | Prepend BOS when tokenizing |
@@ -315,31 +326,31 @@ sp = SamplingParams(
 )
 ```
 
-> **RL note:** for log-probs to be materialized correctly, set
+> **RL note:** For log-probs to be materialized correctly, set
 > `InferenceConfig.materialize_only_last_token_logits=False` when you request
 > `return_log_probs`.
 
-### 4.6 Engine configuration
+### Engine Configuration
 
-`InferenceConfig` configures the engine/KV-cache/CUDA-graph behavior and is
+`InferenceConfig` configures the engine, KV-cache, and CUDA-graph behavior and is
 where most features are turned on. Construct it directly, or derive it from
-model + CLI args via
+model and CLI args using the function
 `megatron.inference.utils.get_inference_config_from_model_and_args`. Frequently
 used fields:
 
 | Field | Purpose |
 |---|---|
-| `max_sequence_length` | Max prompt + output length you expect |
+| `max_sequence_length` | Max prompt and output length you expect |
 | `buffer_size_gb` | GPU memory reserved for the KV cache |
 | `block_size_tokens` | KV-cache block (page) size |
-| `max_requests` / `max_tokens` | Caps on concurrent requests / tokens per forward pass |
+| `max_requests` / `max_tokens` | Caps on concurrent requests or tokens per forward pass |
 | `enable_chunked_prefill` | Chunked prefill (piggybacking) |
-| `enable_prefix_caching` | Prefix caching + `prefix_caching_eviction_policy` / `prefix_caching_coordinator_policy` |
+| `enable_prefix_caching` | Prefix caching and `prefix_caching_eviction_policy` or `prefix_caching_coordinator_policy` |
 | `num_speculative_tokens` | MTP-based speculative decoding |
 | `num_cuda_graphs`, `cuda_graph_*` | CUDA-graph capture controls |
 | `sampling_backend` | `'torch'` (default) or `'flashinfer'` |
-| `mamba_inference_state_config`, `mamba_memory_ratio` | Hybrid/Mamba model state |
-| `kv_cache_management_mode`, `unified_memory_level` | Suspend/resume memory handling (`persist` / `offload` / `recompute`) |
+| `mamba_inference_state_config`, `mamba_memory_ratio` | Hybrid or Mamba model state |
+| `kv_cache_management_mode`, `unified_memory_level` | Suspend or resume memory handling (`persist` / `offload` / `recompute`) |
 
 ```python
 from megatron.core.inference.config import InferenceConfig
@@ -352,23 +363,20 @@ inference_config = InferenceConfig(
 )
 ```
 
-### 4.7 Reading results
+### Reading Results
 
-`generate` returns `DynamicInferenceRequest` objects. The fields you'll use
-most:
+`generate` returns `DynamicInferenceRequest` objects. The most commonly used fields are:
 
-| Field | Contents |
-|---|---|
-| `generated_text` | Decoded output string |
-| `generated_tokens` | Output token ids |
-| `prompt` / `prompt_tokens` | Echoed prompt text / token ids |
-| `prompt_log_probs`, `generated_log_probs` | Log-probs (when requested) |
-| `ttft` | Time-to-first-token (seconds) |
-| `status` | Terminal request status |
+- `generated_text`: Decoded output string
+- `generated_tokens`: Output token-ids
+- `prompt` / `prompt_tokens`: Echoed prompt text and token ids
+- `prompt_log_probs`, `generated_log_probs`: Log-probs (when requested)
+- `ttft`: Time-to-first-token (seconds)
+- `status`: Terminal request status
 
-### 4.8 Lifecycle controls
+### Lifecycle Controls
 
-In **coordinator mode**, you can drive the engine's state machine — important
+In *coordinator mode*, you can drive the engine's state machine. This is important
 for the RL loop where you alternate generation and training:
 
 - `pause()` / `unpause()` — halt and resume scheduling.
@@ -380,19 +388,21 @@ for the RL loop where you alternate generation and training:
 These raise `RuntimeError` in direct mode. The context-manager exit calls
 `shutdown()` for you.
 
-`suspend()` / `resume()` are also the hook for **weight refit / resharding**
+`suspend()` / `resume()` are also the hook for *weight refit or resharding*
 between training and inference: suspend the engine (optionally offloading the
-KV cache), refit/reshard the updated weights into the inference parallel layout,
-then resume. This is what enables both **colocated** (training and inference on
-the same GPUs) and **non-colocated** (separate resources) RL deployments.
+KV cache), refit or reshard the updated weights into the inference parallel layout,
+then resume. This is what enables both *colocated* (training and inference on
+the same GPUs) and *non-colocated* (separate resources) RL deployments.
 
 ---
 
-## 5. Online Serving: OpenAI-Compatible Server
+## OpenAI-Compatible HTTP Server
 
-`MegatronAsyncLLM.serve(...)` starts an **OpenAI-compatible HTTP frontend** on
-the primary rank (global rank 0), exposing `/v1/completions` and
-`/v1/chat/completions`. Serving **requires coordinator mode**.
+Megatron Inference can serve requests over HTTP using the OpenAI API format. This section explains how to start the server and query it.
+
+`MegatronAsyncLLM.serve(...)` starts the HTTP frontend on the primary rank
+(global rank 0), exposing `/v1/completions` and `/v1/chat/completions`.
+Serving *requires coordinator mode*.
 
 The runnable script is
 [`examples/inference/launch_inference_server.py`](../examples/inference/launch_inference_server.py),
@@ -423,7 +433,7 @@ asyncio.run(main())
 response/reasoning/tool parsers), `verbose` (`False` — per-request logging),
 `frontend_replicas` (`4` — HTTP frontend processes on the primary rank).
 
-Launch with the wrapper:
+To launch the server using the wrapper:
 
 ```bash
 bash examples/inference/run_inference_server.sh \
@@ -432,7 +442,7 @@ bash examples/inference/run_inference_server.sh \
     --checkpoint /path/to/nemotron-3b-hybrid-moe
 ```
 
-When ready, you'll see:
+To verify that the server is ready, verify that you receive the following output:
 
 ```
 INFO:root:Inference co-ordinator is ready to receive requests!
@@ -465,21 +475,23 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> The dynamic server currently returns `"model": "EMPTY"` and does **not**
-> validate the request `model` field — pass anything you like. See
-> [Known Limitations](#8-known-limitations).
+> The dynamic server returns `"model": "EMPTY"` and does *not*
+> validate the request `model` field. You can pass anything you like. Refer to
+> [Known Limitations](#known-limitations).
 
 ---
 
-## 6. Advanced Usage: Customizing the Pipeline
+## Customizing the Pipeline
 
-When you need step-level scheduling control, a custom sampling/forward-step
-integration, or to migrate an existing pipeline, you can drop below the
-high-level API and assemble (or subclass) the components yourself.
+`MegatronLLM` and `MegatronAsyncLLM` cover most use cases. For more control, you can assemble or subclass the underlying components directly. Common reasons to do this include:
 
-### 6.1 Pipeline anatomy
+- Implementing step-level scheduling control.
+- Adding custom sampling or logit processing.
+- Migrating an existing pipeline to Megatron Inference.
 
-The high-level API builds this pipeline for you:
+### Pipeline Anatomy
+
+`MegatronLLM` and `MegatronAsyncLLM` build the following pipeline for you:
 
 ```
 DynamicInferenceContext   # KV cache, paging, scheduling/bookkeeping state
@@ -491,9 +503,9 @@ TextGenerationController   # tokenize → forward → sample → detokenize
 DynamicInferenceEngine     # add_request / step loop, coordinator integration
 ```
 
-You can reach any of these from a constructed `llm` via `llm.context`,
-`llm.controller`, and `llm.engine`. Or build them explicitly — exactly what the
-high-level API does internally:
+You can reach any of these from a constructed `llm` through `llm.context`,
+`llm.controller`, and `llm.engine`. Or build them explicitly, which is exactly
+what `MegatronLLM` and `MegatronAsyncLLM` do internally:
 
 ```python
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -511,17 +523,17 @@ controller = TextGenerationController(wrapped_model, tokenizer)
 engine = DynamicInferenceEngine(controller, context)
 ```
 
-### 6.2 Customizing the `TextGenerationController`
+### Customizing the `TextGenerationController`
 
-The `TextGenerationController` owns the tokenize → forward → **sample** →
-detokenize path. Subclass it to inject custom behavior, then pass your instance
-to the engine. Useful override points include:
+The `TextGenerationController` manages tokenization, the forward pass, sampling, and detokenization. To inject custom behavior, subclass it and pass your instance to the engine.
 
-- `sample_from_logits(...)` — custom sampling / logit processing (constrained
+Override these methods to customize the pipeline:
+
+- `sample_from_logits(...)`: custom sampling or logit processing (constrained
   decoding, custom penalties, grammar masks).
-- `tokenize_prompt(...)` / `detokenize_generations(...)` — custom
-  tokenization / detokenization.
-- `generate_output_tokens_dynamic_batch(...)` — custom batch forward-step
+- `tokenize_prompt(...)` / `detokenize_generations(...)`: custom
+  tokenization or detokenization.
+- `generate_output_tokens_dynamic_batch(...)`: custom batch forward-step
   integration.
 
 ```python
@@ -535,25 +547,28 @@ controller = MyController(wrapped_model, tokenizer)
 engine = DynamicInferenceEngine(controller, context)
 ```
 
-### 6.3 Customizing the `DynamicInferenceContext`
+### Customizing the `DynamicInferenceContext`
 
 The `DynamicInferenceContext` holds the KV cache, paging, and the
-scheduling/bookkeeping state. For hybrid / SSM models it also manages the
-recurrent Mamba (SSM) state alongside the attention KV cache, sized via
-`mamba_inference_state_config` / `mamba_memory_ratio`. (Gated delta-net (GDN)
-layers are not yet supported in inference — see
-[Known Limitations](#8-known-limitations).) Configure it through
-`InferenceConfig` (buffer size, block size, prefix caching, chunked prefill,
-CUDA graphs, suspend/resume memory mode, Mamba/SSM state — see
-[Section 4.6](#46-engine-configuration)). For deeper changes — custom KV-cache
-layouts, eviction, or scheduling — subclass the context and pass it into the
-wrapper and engine.
+scheduling and bookkeeping state. For hybrid and SSM models it also manages the
+recurrent Mamba (SSM) state alongside the attention KV cache, that is sized using the
+`mamba_inference_state_config` and `mamba_memory_ratio`.
 
-### 6.4 Driving the engine directly
+Gated delta-net (GDN)
+layers are not supported in inference. Refer to
+[Known Limitations](#known-limitations).
+
+Configure it through `InferenceConfig`, which controls buffer size, block size,
+prefix caching, chunked prefill, CUDA graphs, suspend and resume memory mode,
+and Mamba/SSM state. Refer to [Engine configuration](#engine-configuration).
+
+To customize KV-cache layouts, eviction policies, or scheduling logic, subclass the context and pass it into the wrapper and engine.
+
+### Driving the Engine Directly
 
 For full step-level control, skip `generate` and drive the engine's
-`add_request` / `step_modern` loop yourself. This is how you implement custom
-arrival schedules, batch-drain modes, or suspend/resume policies:
+`add_request` and `step_modern` loops yourself. This is how you implement custom
+arrival schedules, batch-drain modes, or suspend and resume policies:
 
 ```python
 engine.add_request(request_id, prompt_text, sampling_params)
@@ -565,28 +580,28 @@ while engine.has_unfinished_requests():
 ```
 
 The fully worked manual-stepping example is
-[`examples/inference/advanced/gpt_dynamic_inference.py`](../examples/inference/advanced/gpt_dynamic_inference.py)
-(arrival scheduling, batch-drain, suspend/resume, CUDA-graph bucketing,
-log-probs, JSON dumping). For explicit coordinator + `InferenceClient`
-lifecycle management, see
+[`examples/inference/advanced/gpt_dynamic_inference.py`](../examples/inference/advanced/gpt_dynamic_inference.py).
+It demonstrates arrival scheduling, batch-drain, suspend and resume, CUDA-graph
+bucketing, log-probs, and JSON dumping. For explicit coordinator with `InferenceClient`
+lifecycle management, refer to
 [`gpt_dynamic_inference_with_coordinator.py`](../examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py).
 
 ---
 
-## 7. Examples Directory
+## Examples Directory
 
 Everything above is runnable from
 [`examples/inference/`](../examples/inference/):
 
-| Path | What it shows |
+| Path | Description |
 |---|---|
-| [`offline_inference.py`](../examples/inference/offline_inference.py) | Batched offline generation through the high-level API. Covers all 3 supported mode combos via `--mode sync|async` and `--use-coordinator`. |
+| [`offline_inference.py`](../examples/inference/offline_inference.py) | Batched offline generation through the high-level API. Covers all three supported mode combinations using `--mode sync|async` and `--use-coordinator`. |
 | [`run_offline_inference.sh`](../examples/inference/run_offline_inference.sh) | Shell wrapper for a Qwen 2.5-1.5B offline-inference config. |
-| [`launch_inference_server.py`](../examples/inference/launch_inference_server.py) | OpenAI-compatible HTTP server via `MegatronAsyncLLM.serve(...)`. |
+| [`launch_inference_server.py`](../examples/inference/launch_inference_server.py) | OpenAI-compatible HTTP server using `MegatronAsyncLLM.serve(...)`. |
 | [`run_inference_server.sh`](../examples/inference/run_inference_server.sh) | Shell wrapper for a Nemotron-6 3B hybrid-MoE server config. |
-| [`utils.py`](../examples/inference/utils.py) | Shared helpers (`Request`, `build_requests`, output formatting, JSON dump). |
+| [`utils.py`](../examples/inference/utils.py) | Shared helpers including `Request`, `build_requests`, output formatting, and JSON dump. |
 | [`advanced/gpt_dynamic_inference.py`](../examples/inference/advanced/gpt_dynamic_inference.py) | Manual `add_request`/`step_modern` stepping. |
-| [`advanced/gpt_dynamic_inference_with_coordinator.py`](../examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py) | Explicit coordinator + `InferenceClient` lifecycle. |
+| [`advanced/gpt_dynamic_inference_with_coordinator.py`](../examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py) | Explicit coordinator and `InferenceClient` lifecycle. |
 
 Run the offline example across modes:
 
@@ -608,13 +623,13 @@ All supported modes produce numerically identical generated text.
 
 ---
 
-## 8. Known Limitations
+## Known Limitations
 
 - **MLA models are not supported.**
 - **Vision-language (VLM) / multimodal models are not supported.** Only
   text-in/text-out generation is supported today.
 - **Gated delta-net (GDN) layers are not yet supported in inference.** The
-  dynamic context raises `NotImplementedError` if a model contains GDN layers;
+  dynamic context raises `NotImplementedError` if a model contains GDN layers.
   Mamba (SSM) and attention hybrid layers are supported.
 - **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
   internal asyncio primitives that suspended waiters still reference) or
@@ -622,37 +637,37 @@ All supported modes produce numerically identical generated text.
   blocks `--inference-repeat-n > 1` together with `--use-coordinator`. Direct-mode
   reset is safe.
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role`
-  override on `ServeConfig`; control placement via the launcher (e.g. torchrun
+  override on `ServeConfig`. Control placement through the launcher (for example, torchrun
   rank-0 placement).
 - **Server returns `"model": "EMPTY"`.** The HTTP frontend doesn't echo or
   validate a configured model name and exposes no `GET /v1/models` endpoint.
-  Clients may pass any `model` value; it is ignored.
+  Clients may pass any `model` value. It is ignored.
 
-See [`megatron/core/inference/README.md`](../megatron/core/inference/README.md)
+Refer to [`megatron/core/inference/README.md`](../megatron/core/inference/README.md)
 for the detailed root-cause notes behind each limitation.
 
 ---
 
-## 9. Roadmap and Future Work
+## Roadmap and Future Work
 
 **API and serving:**
 
-- **Dynamic streaming** — offline streaming via `engine.async_step()` and HTTP
+- **Dynamic streaming** — offline streaming through `engine.async_step()` and HTTP
   streaming of partial outputs.
-- **Weight-update APIs** — `suspend_for_refit()` /
-  `update_weights_from_collective()` / `resume_after_refit()` wrapping the
-  resharding/refit primitives for RL weight swaps between rollout steps, across
+- **Weight-update APIs** — `suspend_for_refit()`,
+  `update_weights_from_collective()`, and `resume_after_refit()` wrapping the
+  resharding or refit primitives for RL weight swaps between rollout steps, across
   both colocated and non-colocated deployments.
 - **`megatron serve` CLI** — a single-binary launcher mirroring `vllm serve`,
-  with single-node and multi-node / headless modes.
+  with single-node and multi-node or headless modes.
 - **Config-based model construction** — `MegatronLLM(model="...")` with model
-  recipes and checkpoint resolution, removing manual model building.
+  recipes and checkpoint resolution. Use to remove manual model building.
 - **Simplified inference API** overall.
 
 **Models and performance:**
 
-- **Disaggregated inference** (prefill/decode separation).
-- **FlashInfer integration** for attention / Mamba kernels (sampling is already
+- **Disaggregated inference** (prefill and decode separation).
+- **FlashInfer integration** for attention and Mamba kernels (sampling is already
   integrated).
 - **Async dynamic context update** — moves bookkeeping off the critical path.
 - **All2Allv-based token dispatcher** for MoE.
@@ -662,9 +677,9 @@ for the detailed root-cause notes behind each limitation.
 
 ---
 
-## 10. See Also
+## Additional Resources
 
-- API reference / mental model: [`megatron/core/inference/README.md`](../megatron/core/inference/README.md)
+- API reference and mental model documentation: [`megatron/core/inference/README.md`](../megatron/core/inference/README.md)
 - Examples overview: [`examples/inference/README.md`](../examples/inference/README.md)
 - Low-level engine source: [`megatron/core/inference/`](../megatron/core/inference/)
 - High-level API source: [`megatron/core/inference/apis/`](../megatron/core/inference/apis/)
