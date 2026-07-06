@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -332,6 +332,12 @@ class GPTModel(LanguageModule):
                     f"input_ids shape {input_ids.shape}"
                 )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
@@ -474,20 +480,23 @@ class GPTModel(LanguageModule):
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         off_interface.init_chunk_handler(
+            pp_rank=self.pg_collection.pp.rank(),
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
+                off_interface.mark_not_offload(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
 
     def preprocess_for_paged_stash(self):
