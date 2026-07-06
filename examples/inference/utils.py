@@ -401,7 +401,9 @@ def dump_inference_results_to_json(
         lifetime_prefill_token_count (int): Total prefill tokens processed.
         async_sched_step_count (int): Number of async scheduling decode steps.
         async_sched_compaction_step_count (int): Number of async scheduling decode
-            steps where post-forward compaction discarded finished rows.
+            steps that discarded speculative rows for finished requests. This
+            includes identity-prefix and all-finished cases that require no GPU
+            gather.
     """
     if not args.output_path:
         return
@@ -442,9 +444,7 @@ def dump_inference_results_to_json(
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
     json_results["async_sched_step_count"] = async_sched_step_count
-    json_results["async_sched_compaction_step_count"] = (
-        async_sched_compaction_step_count
-    )
+    json_results["async_sched_compaction_step_count"] = async_sched_compaction_step_count
 
     print(f' Saving results to {args.output_path}')
     with open(args.output_path, "w") as fp:

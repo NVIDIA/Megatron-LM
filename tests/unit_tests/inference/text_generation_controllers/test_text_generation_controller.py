@@ -33,7 +33,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    DecodeForwardPrimer,
+    AsyncScheduleLogitsState,
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
@@ -249,18 +249,12 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=True, cuda_graph_request_count=None
-    )
+    controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
-    controller._sampled_tokens_cpu_buffer = torch.empty(context.max_requests, dtype=torch.int64)
+    controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
+        context.max_requests, dtype=torch.int64
+    )
     return controller
-
-
-def _set_nested_attr(obj, attr_path, value):
-    for attr in attr_path.split(".")[:-1]:
-        obj = getattr(obj, attr)
-    setattr(obj, attr_path.split(".")[-1], value)
 
 
 @pytest.mark.parametrize("total_request_count", [0, 2])
@@ -274,24 +268,24 @@ def test_validate_async_sched_support_for_step_success(total_request_count):
 
 
 @pytest.mark.parametrize(
-    "attr_path, value",
+    "unsupported_case",
     [
-        ("context.config.materialize_only_last_token_logits", False),
-        ("controller.num_speculative_tokens", 1),
-        ("context.is_hybrid_model", True),
-        ("context.enable_prefix_caching", True),
-        ("context.paused_request_count", 1),
-        ("context.chunked_prefill_request_id", 0),
-        ("model_config.expert_model_parallel_size", 2),
-        ("model_config.num_moe_experts", 4),
-        ("model_config.moe_enable_routing_replay", True),
-        ("context.request_metadata", {"top_k": torch.tensor([1, 0])}),
-        ("context.request_metadata", {"top_p": torch.tensor([0.0, 0.5])}),
-        ("context.request_metadata", {"return_log_probs": torch.tensor([False, True])}),
-        ("context.request_metadata", {"top_n_logprobs": torch.tensor([0, 1])}),
+        "materialize_all_logits",
+        "speculative_tokens",
+        "hybrid_model",
+        "prefix_caching",
+        "paused_request",
+        "chunked_prefill",
+        "expert_parallelism",
+        "moe_model",
+        "routing_replay",
+        "non_greedy_top_k",
+        "non_greedy_top_p",
+        "log_probs",
+        "top_n_logprobs",
     ],
 )
-def test_validate_async_sched_support_for_step_errors(attr_path, value):
+def test_validate_async_sched_support_for_step_errors(unsupported_case):
     context = _make_async_sched_context(total_request_count=2)
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
@@ -300,11 +294,32 @@ def test_validate_async_sched_support_for_step_errors(attr_path, value):
         moe_enable_routing_replay=False,
     )
     controller = _make_async_sched_controller(context, model_config)
-    target = SimpleNamespace(context=context, controller=controller, model_config=model_config)
-    if attr_path == "context.request_metadata":
-        context.request_metadata.update(value)
-    else:
-        _set_nested_attr(target, attr_path, value)
+    if unsupported_case == "materialize_all_logits":
+        context.config.materialize_only_last_token_logits = False
+    elif unsupported_case == "speculative_tokens":
+        controller.num_speculative_tokens = 1
+    elif unsupported_case == "hybrid_model":
+        context.is_hybrid_model = True
+    elif unsupported_case == "prefix_caching":
+        context.enable_prefix_caching = True
+    elif unsupported_case == "paused_request":
+        context.paused_request_count = 1
+    elif unsupported_case == "chunked_prefill":
+        context.chunked_prefill_request_id = 0
+    elif unsupported_case == "expert_parallelism":
+        model_config.expert_model_parallel_size = 2
+    elif unsupported_case == "moe_model":
+        model_config.num_moe_experts = 4
+    elif unsupported_case == "routing_replay":
+        model_config.moe_enable_routing_replay = True
+    elif unsupported_case == "non_greedy_top_k":
+        context.request_metadata["top_k"] = torch.tensor([1, 0])
+    elif unsupported_case == "non_greedy_top_p":
+        context.request_metadata["top_p"] = torch.tensor([0.0, 0.5])
+    elif unsupported_case == "log_probs":
+        context.request_metadata["return_log_probs"] = torch.tensor([False, True])
+    elif unsupported_case == "top_n_logprobs":
+        context.request_metadata["top_n_logprobs"] = torch.tensor([0, 1])
 
     with pytest.raises(RuntimeError, match="Async scheduling"):
         controller._validate_async_sched_support_for_step()
@@ -322,26 +337,26 @@ def test_validate_async_sched_support_for_step_errors(attr_path, value):
 def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expected_compaction):
     controller = _make_async_sched_controller()
     controller._enable_cuda_graph = enable_cuda_graph
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=True, cuda_graph_request_count=8, forward_done_event="forward"
+    controller._async_sched_logits = AsyncScheduleLogitsState(
+        is_valid=True, cuda_graph_request_count=8, ready_event="forward"
     )
-    controller._record_async_sched_event = mock.Mock(return_value="compaction")
+    controller._record_fresh_async_sched_event = mock.Mock(return_value="compaction")
     logits = torch.arange(12).reshape(1, 4, 3)
     controller._all_logits_cuda = logits.clone()
 
     compaction_done_event = controller._compact_async_sched_logits(survivor_idxs)
 
     if survivor_idxs.numel() == 0:
-        assert not controller._decode_forward_primer.is_primed
+        assert not controller._async_sched_logits.is_valid
         assert compaction_done_event is None
-        controller._record_async_sched_event.assert_not_called()
+        controller._record_fresh_async_sched_event.assert_not_called()
         return
 
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
-        assert controller._decode_forward_primer.forward_done_event == "forward"
+        assert controller._async_sched_logits.ready_event == "forward"
         assert compaction_done_event is None
-        controller._record_async_sched_event.assert_not_called()
+        controller._record_fresh_async_sched_event.assert_not_called()
         return
 
     expected_logits = logits[:, survivor_idxs, :]
@@ -352,9 +367,9 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
         assert controller._all_logits_cuda.shape == logits.shape
     else:
         assert torch.equal(controller._all_logits_cuda, expected_logits)
-    assert controller._decode_forward_primer.is_primed
-    assert controller._decode_forward_primer.cuda_graph_request_count == 8
-    assert controller._decode_forward_primer.forward_done_event == "compaction"
+    assert controller._async_sched_logits.is_valid
+    assert controller._async_sched_logits.cuda_graph_request_count == 8
+    assert controller._async_sched_logits.ready_event == "compaction"
     assert compaction_done_event == "compaction"
 
 
@@ -403,12 +418,10 @@ def test_run_async_sched_forward_records_primer_and_returns_event(
     context = _make_async_sched_context()
     context.using_cuda_graph_this_step.return_value = using_cuda_graph
     controller = _make_async_sched_controller(context)
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=False, cuda_graph_request_count=None
-    )
+    controller._async_sched_logits = AsyncScheduleLogitsState()
     controller._all_logits_cuda = torch.empty(0)
     controller._dynamic_step_forward_logits = mock.Mock()
-    controller._record_async_sched_event = mock.Mock(return_value="forward_done")
+    controller._record_fresh_async_sched_event = mock.Mock(return_value="forward_done")
     input_ids = torch.tensor([[10, 11]])
     position_ids = torch.tensor([[0, 1]])
 
@@ -425,27 +438,21 @@ def test_run_async_sched_forward_records_primer_and_returns_event(
         forward_done_event = controller._run_async_sched_forward(input_ids, position_ids)
 
     controller._dynamic_step_forward_logits.assert_called_once_with(input_ids, position_ids)
-    controller._record_async_sched_event.assert_called_once_with(controller._all_logits_cuda)
+    controller._record_fresh_async_sched_event.assert_called_once_with(controller._all_logits_cuda)
     assert forward_done_event == "forward_done"
-    assert controller._decode_forward_primer.is_primed
+    assert controller._async_sched_logits.is_valid
     assert (
-        controller._decode_forward_primer.cuda_graph_request_count
-        == expected_cuda_graph_request_count
+        controller._async_sched_logits.cuda_graph_request_count == expected_cuda_graph_request_count
     )
-    assert controller._decode_forward_primer.forward_done_event == "forward_done"
+    assert controller._async_sched_logits.ready_event == "forward_done"
 
 
-@pytest.mark.parametrize(
-    "total_request_count, is_primed, expected_result, expected_forward_count",
-    [(0, True, False, 0), (2, True, True, 0), (2, False, True, 1)],
-)
-def test_run_async_sched_forward_primer(
-    total_request_count, is_primed, expected_result, expected_forward_count
-):
-    context = _make_async_sched_context(total_request_count=total_request_count)
+@pytest.mark.parametrize("is_valid", [False, True])
+def test_run_async_sched_forward_primer(is_valid):
+    context = _make_async_sched_context(total_request_count=2)
     controller = _make_async_sched_controller(context)
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=is_primed, forward_done_event="forward"
+    controller._async_sched_logits = AsyncScheduleLogitsState(
+        is_valid=is_valid, ready_event="forward" if is_valid else None
     )
     input_ids = torch.tensor([[10, 11]])
     position_ids = torch.tensor([[0, 1]])
@@ -454,30 +461,29 @@ def test_run_async_sched_forward_primer(
 
     result = controller._run_async_sched_forward_primer()
 
-    assert result is expected_result
-    assert controller._run_async_sched_forward.call_count == expected_forward_count
-    if expected_forward_count:
-        controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
-    else:
+    assert result is (not is_valid)
+    if is_valid:
         controller._dynamic_step_context_init.assert_not_called()
-    if total_request_count == 0:
-        assert not controller._decode_forward_primer.is_primed
-        assert controller._decode_forward_primer.forward_done_event is None
+        controller._run_async_sched_forward.assert_not_called()
+    else:
+        controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
 
 
 def test_async_sched_step_returns_none_without_active_requests():
     context = _make_async_sched_context(total_request_count=0)
     context.active_token_count = 0
     controller = _make_async_sched_controller(context)
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=True, cuda_graph_request_count=8
+    controller._async_sched_logits = AsyncScheduleLogitsState(
+        is_valid=True, cuda_graph_request_count=8, ready_event="forward"
     )
     controller._validate_async_sched_support_for_step = mock.Mock()
 
     result = asyncio.run(controller._run_async_sched_step(overlap=False))
 
     assert result is None
-    assert not controller._decode_forward_primer.is_primed
+    assert not controller._async_sched_logits.is_valid
+    assert controller._async_sched_logits.cuda_graph_request_count is None
+    assert controller._async_sched_logits.ready_event is None
     controller._validate_async_sched_support_for_step.assert_called_once_with()
 
 
@@ -496,10 +502,23 @@ def test_run_async_sched_sample_reuses_gpu_buffer():
 
 
 @pytest.mark.internal
+def test_async_sched_event_records_and_synchronizes_cuda_work():
+    controller = _make_async_sched_controller()
+
+    assert controller._record_fresh_async_sched_event(torch.empty(1)) is None
+
+    event = controller._record_fresh_async_sched_event(torch.empty(1, device="cuda"))
+    controller._synchronize_async_sched_event(event)
+    controller._synchronize_async_sched_event(None)
+
+    assert isinstance(event, torch.cuda.Event)
+
+
+@pytest.mark.internal
 def test_copy_async_sched_sample_to_cpu_uses_reusable_buffer_and_copy_stream():
     controller = _make_async_sched_controller(_make_async_sched_context(total_request_count=3))
     sampled_tokens_gpu = torch.tensor([1, 2, 3], dtype=torch.int64, device="cuda")
-    controller._sampled_tokens_cpu_buffer = torch.empty(
+    controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         3, dtype=torch.int64, device="cpu", pin_memory=True
     )
     controller._async_sched_sample_source_ready_event = torch.cuda.Event()
@@ -511,7 +530,10 @@ def test_copy_async_sched_sample_to_cpu_uses_reusable_buffer_and_copy_stream():
     )
     sample_ready_event.synchronize()
 
-    assert sampled_tokens_cpu_view.data_ptr() == controller._sampled_tokens_cpu_buffer.data_ptr()
+    assert (
+        sampled_tokens_cpu_view.data_ptr()
+        == controller._async_sched_sampled_tokens_cpu_buffer.data_ptr()
+    )
     assert torch.equal(sampled_tokens_cpu_view, sampled_tokens_gpu.cpu())
 
 
@@ -530,7 +552,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
     context = _make_async_sched_context(total_request_count=3)
     context.request_metadata["termination_id"] = torch.tensor(termination_ids)
     controller = _make_async_sched_controller(context)
-    controller._wait_async_sched_event = mock.Mock()
+    controller._synchronize_async_sched_event = mock.Mock()
 
     expected_mask = (sample_tokens != context.request_metadata["termination_id"]).byte()
     expected_finished_ids = context.request_ids[expected_mask == 0].clone()
@@ -547,16 +569,16 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
     assert torch.equal(result.sampled_tokens_cpu, sample_tokens)
     assert result.compaction_done_event == expected_compaction_event
     if expected_wait:
-        controller._wait_async_sched_event.assert_called_once_with("forward")
+        controller._synchronize_async_sched_event.assert_called_once_with("forward")
     else:
-        controller._wait_async_sched_event.assert_not_called()
+        controller._synchronize_async_sched_event.assert_not_called()
     context.commit_sampled_tokens.assert_called_once()
     context.resolve_requests.assert_called_once()
     assert torch.equal(context.resolve_requests.call_args.args[0], expected_mask)
 
 
 @pytest.mark.parametrize(
-    "overlap, is_primed, expected_call_order",
+    "overlap, has_valid_logits, expected_call_order",
     [
         (
             False,
@@ -574,6 +596,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
                 "wait:forward",
                 "resolve",
                 "wait:compaction",
+                "yield",
             ],
         ),
         (
@@ -589,6 +612,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
                 "wait:sample",
                 "wait:bookkeeping",
                 "resolve",
+                "yield",
             ],
         ),
         (
@@ -606,33 +630,34 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
                 "wait:sample",
                 "wait:bookkeeping",
                 "resolve",
+                "yield",
             ],
         ),
     ],
 )
-def test_async_sched_step_order(overlap, is_primed, expected_call_order):
+def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     sampled_tokens_cpu = sample_tokens.clone()
     input_ids = torch.tensor([[101, 102, 103]])
     position_ids = torch.tensor([[0, 1, 2]])
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
-    controller._decode_forward_primer = DecodeForwardPrimer(
-        is_primed=is_primed,
-        cuda_graph_request_count=7 if is_primed else None,
-        forward_done_event="current" if is_primed else None,
+    controller._async_sched_logits = AsyncScheduleLogitsState(
+        is_valid=has_valid_logits,
+        cuda_graph_request_count=7 if has_valid_logits else None,
+        ready_event="current" if has_valid_logits else None,
     )
     controller._validate_async_sched_support_for_step = mock.Mock()
     call_order = []
 
     def run_primer():
-        if not is_primed:
+        if not has_valid_logits:
             call_order.append("primer")
-            controller._decode_forward_primer.mark_primed(7, "current")
-        return True
+            controller._async_sched_logits.set_pending(7, "current")
+        return not has_valid_logits
 
     controller._run_async_sched_forward_primer = mock.Mock(side_effect=run_primer)
-    controller._wait_async_sched_event = mock.Mock(
+    controller._synchronize_async_sched_event = mock.Mock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
     controller._run_async_sched_prepare = mock.Mock(
@@ -659,18 +684,110 @@ def test_async_sched_step_order(overlap, is_primed, expected_call_order):
             sampled_tokens_cpu=sampled_tokens_cpu,
             active_request_ids=context.request_ids.long(),
             finished_request_ids=torch.tensor([11], dtype=torch.int32),
-            survivor_idxs=torch.tensor([0, 2], dtype=torch.int64),
             compaction_done_event="compaction",
         )
     )
 
-    result = asyncio.run(controller._run_async_sched_step(overlap=overlap))
+    async def yield_to_event_loop(_delay):
+        call_order.append("yield")
+
+    with mock.patch(
+        "megatron.core.inference.text_generation_controllers."
+        "text_generation_controller.asyncio.sleep",
+        side_effect=yield_to_event_loop,
+    ):
+        result = asyncio.run(controller._run_async_sched_step(overlap=overlap))
 
     assert result["sample"].tolist() == sample_tokens.tolist()
     assert result["cuda_graph_request_count"] == 7
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
     assert call_order == expected_call_order
+
+
+@pytest.mark.parametrize(
+    "termination_ids, expected_mask, expected_finished_ids, expected_compaction_count",
+    [
+        ([99, 99, 99], [1, 1, 1], [], 0),
+        ([99, 2, 99], [1, 0, 1], [11], 1),
+        ([99, 99, 3], [1, 1, 0], [12], 1),
+    ],
+)
+def test_async_sched_step_wires_sampling_through_resolution(
+    termination_ids, expected_mask, expected_finished_ids, expected_compaction_count
+):
+    context = _make_async_sched_context(total_request_count=3)
+    context.request_metadata["termination_id"] = torch.tensor(termination_ids)
+    context.resolve_requests.side_effect = lambda mask: context.request_ids[mask == 0].clone()
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.zeros(1, 3, 5)
+    sampled_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
+    for row, token in enumerate(sampled_tokens.tolist()):
+        controller._all_logits_cuda[0, row, token] = 10.0
+
+    input_ids_gpu_view = torch.empty(3, dtype=torch.int64)
+    position_ids_gpu_view = torch.empty(3, dtype=torch.int64)
+    controller._run_async_sched_prepare = mock.Mock(
+        return_value=(input_ids_gpu_view, position_ids_gpu_view)
+    )
+    controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
+    controller._synchronize_async_sched_event = mock.Mock()
+    controller._record_fresh_async_sched_event = mock.Mock(return_value="compaction")
+
+    def run_forward(*_args):
+        controller._async_sched_logits.set_pending(None, "forward")
+        return "forward"
+
+    controller._run_async_sched_forward = mock.Mock(side_effect=run_forward)
+
+    result = asyncio.run(controller._run_async_sched_step(overlap=False))
+
+    assert torch.equal(result["sample"], sampled_tokens)
+    assert result["finished_request_ids"].tolist() == expected_finished_ids
+    context.copy_async_sched_input_tokens_to_gpu.assert_called_once()
+    assert torch.equal(
+        context.copy_async_sched_input_tokens_to_gpu.call_args.args[0], sampled_tokens
+    )
+    context.commit_sampled_tokens.assert_called_once()
+    assert torch.equal(context.commit_sampled_tokens.call_args.args[0], sampled_tokens)
+    assert context.resolve_requests.call_args.args[0].tolist() == expected_mask
+    assert context.async_sched_step_count == 1
+    assert context.async_sched_compaction_step_count == expected_compaction_count
+
+
+def test_async_sched_step_yields_after_resolution_outside_inference_mode():
+    context = _make_async_sched_context(total_request_count=1)
+    controller = _make_async_sched_controller(context)
+    sampled_tokens = torch.tensor([1], dtype=torch.int64)
+    controller._run_async_sched_prepare = mock.Mock(
+        return_value=(torch.empty(1, dtype=torch.int64), torch.empty(1, dtype=torch.int64))
+    )
+    controller._run_async_sched_sample = mock.Mock(return_value=sampled_tokens)
+    controller._copy_async_sched_sample_to_cpu = mock.Mock(return_value=(sampled_tokens, None))
+    controller._run_async_sched_publish_bookkeeping = mock.Mock(return_value=None)
+    controller._run_async_sched_forward = mock.Mock(return_value=None)
+    controller._run_async_sched_resolve = mock.Mock(
+        return_value=SimpleNamespace(
+            sampled_tokens_cpu=sampled_tokens,
+            active_request_ids=context.request_ids.long(),
+            finished_request_ids=torch.empty(0, dtype=torch.int32),
+            compaction_done_event=None,
+        )
+    )
+    observed = []
+
+    async def run_step():
+        asyncio.get_running_loop().call_soon(
+            lambda: observed.append(
+                (context.async_sched_step_count, torch.is_inference_mode_enabled())
+            )
+        )
+        return await controller._run_async_sched_step(overlap=True)
+
+    result = asyncio.run(run_step())
+
+    assert result["sample"].tolist() == [1]
+    assert observed == [(1, False)]
 
 
 @pytest.mark.parametrize(

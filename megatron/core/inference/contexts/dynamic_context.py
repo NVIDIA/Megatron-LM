@@ -2141,7 +2141,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
             transfer_bookkeeping_to_gpu (bool): Whether to publish the prepared
-                CPU bookkeeping snapshot to GPU before returning.
+                CPU bookkeeping snapshot to GPU before returning. Legacy
+                callers publish immediately; async scheduling binds the GPU
+                views here and publishes their values later.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
@@ -2412,9 +2414,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
-        Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
+        Legacy steps call this from initialize_attention_state(). Async
+        scheduling instead delays publication until after preparation and the
+        GPU sample-to-input copy. All copies use non_blocking=True with pinned
+        CPU memory. CUDA stream ordering guarantees the forward pass sees
+        completed transfers.
 
         The bookkeeping fields are backed by one contiguous pinned CPU buffer
         and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
@@ -2501,8 +2505,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
 
         Async scheduling keeps sampled tokens GPU-resident for the next decode
-        forward. CPU bookkeeping is still prepared normally, but forward input
-        IDs are patched directly from the sampled CUDA tensor.
+        forward. CPU bookkeeping is prepared independently and published later;
+        this direct GPU copy populates the live input-ID view without waiting
+        for the sample's CPU copy.
 
         Args:
             sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
@@ -3471,6 +3476,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def commit_sampled_tokens(self, sampled_tokens_cpu: Tensor) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
+
+        This updates the CPU source of truth used by resolution. Async
+        scheduling has already copied the same samples into the live GPU input
+        view for the speculative forward.
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
