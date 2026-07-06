@@ -195,7 +195,7 @@ functional:configure:
         job: functional:configure
     strategy: depend
   variables:
-    RO_API_TOKEN: $PROJECT_ACCESS_TOKEN_MCORE
+    RO_API_TOKEN: $PAT
     CONTAINER_TAG: $CI_PIPELINE_ID
     CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
