@@ -774,16 +774,31 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return success, grad_norm, num_zeros_in_grad
 
 
-def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_groups) -> None:
+def _strip_module_prefix(name: str) -> str:
+    """Strip wrapper ``module.`` prefixes (DDP/Float16Module) off a dotted param name."""
+    while name.startswith('module.'):
+        name = name[len('module.') :]
+    return name
+
+
+def _backfill_gtp_sharded_param_map(
+    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+) -> None:
     """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
 
     WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
-    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). A GTP_remat
-    weight whose model entry is a gathered+split factory (Mamba ``in_proj``) exposes the *gathered*
-    tensor, not the per-shard ``GTPShardedParam``, so it fails to match and is absent from the
-    map -- the generic conversion below would then KeyError on it. This backfills the same
-    per-shard ShardedTensor every other GTP_remat weight already gets, so its optimizer state is
-    saved per-shard.
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). Two GTP_remat
+    cases break that match:
+      1. Native-FP8 GTP weights: the model entry's data is a *dequantized BF16 copy* of the param
+         (make_tp_sharded_tensor_for_checkpoint). The copy carries a ``_gtp_dequant_src`` backlink
+         to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
+         ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
+         replica_id.
+      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
+         tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
+         ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
+         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
+         loudly instead of writing colliding shards across EP groups.
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
@@ -794,20 +809,66 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
     """
     try:
         from megatron.core.tensor_parallel.gtp import (
-            GTPShardedParam,
+            is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
-    # Groups sourced lazily (below) only when a GTP param is found, so GTP-free models on
-    # explicit grids (e.g. MiMo) never require the global MPU groups to be initialized.
+    # is_gtp_param matches both the legacy BF16 slice params and native-FP8 GTP params.
+    unmatched = [
+        (param_id, p)
+        for param_id, p in enumerate(chain.from_iterable(float16_groups))
+        if param_id not in id_to_sharded_param_map and is_gtp_param(p)
+    ]
+    if not unmatched:
+        return
+
+    from ..dist_checkpointing.dict_utils import nested_values
+    from ..dist_checkpointing.mapping import ShardedTensor
+
+    # Index the model's own entries by (a) the dequantized-copy backlink and (b) checkpoint key.
+    src_id_to_entry = {}
+    key_to_entry = {}
+    if model_sharded_state_dict is not None:
+        for entry in nested_values(model_sharded_state_dict):
+            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            if src is not None:
+                src_id_to_entry[id(src)] = entry
+            key = getattr(entry, 'key', None)
+            if key is not None:
+                # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
+                key_to_entry[key] = None if key in key_to_entry else entry
+
+    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
+    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
     tp_group = None
     dp_cp_gtp_remat_group = None
-    for param_id, p in enumerate(chain.from_iterable(float16_groups)):
-        # Skip params that already matched, and any non-GTP param (those always match).
-        if param_id in id_to_sharded_param_map or not isinstance(p, GTPShardedParam):
+    for param_id, p in unmatched:
+        # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
+        entry = src_id_to_entry.get(id(p))
+        if entry is None:
+            name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
+            candidate = key_to_entry.get(name)
+            # Reuse only a plain ShardedTensor with this shard's local shape; a factory
+            # (gathered data, e.g. Mamba in_proj) must take the per-shard rebuild below.
+            if (
+                candidate is not None
+                and isinstance(candidate, ShardedTensor)
+                and tuple(candidate.data.shape) == tuple(p.shape)
+            ):
+                entry = candidate
+        if entry is not None:
+            id_to_sharded_param_map[param_id] = entry
             continue
+        # Case 2: rebuild. Not EP-aware -- an expert param rebuilt here would collide across
+        # expert-parallel groups (duplicate writers), so it must have matched above.
+        if not getattr(p, 'allreduce', True):
+            raise ValueError(
+                f"GTP expert-parallel param '{getattr(p, '_debug_name', '')}' (id {param_id}) "
+                "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
+                "write duplicate shards across expert-parallel groups)."
+            )
         if tp_group is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
             # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
@@ -817,14 +878,14 @@ def _backfill_gtp_sharded_param_map(id_to_sharded_param_map: dict, float16_group
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
-        entry = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
             {key: p},
             prefix='',
             tensor_parallel_layers_axis_map={key: 0},
             tp_group=tp_group,
             dp_cp_group=dp_cp_gtp_remat_group,
         )
-        id_to_sharded_param_map[param_id] = entry[key]
+        id_to_sharded_param_map[param_id] = rebuilt[key]
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -1017,7 +1078,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
         )
 
-        _backfill_gtp_sharded_param_map(id_to_sharded_param_map, self.float16_groups)
+        _backfill_gtp_sharded_param_map(
+            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
+        )
 
         # Convert fp32_from_fp16_params
         assert len(state_dict['fp32_from_fp16_params']) == len(

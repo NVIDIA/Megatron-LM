@@ -18,8 +18,12 @@ from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
+    get_expert_gtp_weight_remat_rank,
+    get_expert_gtp_weight_remat_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
+    get_gtp_weight_remat_rank,
+    get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
@@ -91,6 +95,10 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+# GTP_remat weight-init trackers: shards init per-rank, so each peer must draw DIFFERENT values;
+# registered only when the axis is active (see model_parallel_cuda_manual_seed).
+_GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
+_EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
 
 
 def _get_cuda_rng_state(
@@ -211,6 +219,11 @@ def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_gtp_remat_rng_tracker_name(is_expert=False):
+    """Get the (E)GTP_remat weight-init rng tracker name (per-(E)GTP-rank distinct draws)."""
+    return _EXPERT_GTP_REMAT_RNG_TRACKER_NAME if is_expert else _GTP_REMAT_RNG_TRACKER_NAME
 
 
 class CudaRNGStatesTracker:
@@ -482,6 +495,19 @@ def model_parallel_cuda_manual_seed(
 
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
+
+    # GTP_remat weight-init states: shards are initialized per-rank (GTP-agnostic init), so peers
+    # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
+    # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
+    # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
+    gtp_remat_rank = get_gtp_weight_remat_rank()
+    if get_gtp_weight_remat_world_size() > 1:
+        gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
+    egtp_remat_rank = get_expert_gtp_weight_remat_rank()
+    if get_expert_gtp_weight_remat_world_size() > 1:
+        egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):

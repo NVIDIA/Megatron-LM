@@ -50,9 +50,9 @@ from megatron.core.utils import (
 )
 
 if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp import GTPShardedParam
+    from megatron.core.tensor_parallel.gtp import is_gtp_param
 else:
-    GTPShardedParam = None
+    is_gtp_param = None
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -1371,14 +1371,13 @@ class MambaMixer(MegatronModule):
         # (strip the trailing pad rows from the gathered tail) and fall through to the same
         # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
         in_proj_gtp_remat_size = getattr(self.in_proj, "gtp_remat_size", 1)
-        if (
-            in_proj_gtp_remat_size > 1
-            and HAVE_GTP
-            and isinstance(self.in_proj.weight, GTPShardedParam)
-        ):
-            gtp_shard = self.in_proj.weight
-            gtp_remat_group = gtp_shard.group
-            local = gtp_shard.data.contiguous()
+        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
+            gtp_remat_group = self.in_proj.weight.group
+            # in_proj.weight was already built at the sharded size by the submodule
+            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
+            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
+            # full TP-local size so the [z|x|B|C|dt] split below matches a non-GTP run.
+            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
                 dtype=local.dtype,
@@ -1421,15 +1420,11 @@ class MambaMixer(MegatronModule):
         # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj
         # note): the checkpoint stores the FULL TP-local in_proj.weight (pad stripped) under the
         # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
-        # rows with no padding. To reload into the live GTPShardedParam we must mirror init
+        # rows with no padding. To reload into the live GTP param we must mirror init
         # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
         # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP_remat_size=1 has no
         # pad/slice.
-        if (
-            in_proj_gtp_remat_size > 1
-            and HAVE_GTP
-            and isinstance(self.in_proj.weight, GTPShardedParam)
-        ):
+        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
             factory = sharded_state_dict[f"{prefix}in_proj.weight"]
             gtp_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
             gtp_local_size = self.in_proj.weight.data.size(0)

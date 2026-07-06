@@ -33,7 +33,7 @@ if not HAVE_GTP:
 
 import transformer_engine.pytorch as te
 
-from megatron.core.tensor_parallel.gtp import GTPShardedParam
+from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _requires_multi_gpu,
@@ -300,8 +300,11 @@ def _worker_layernorm_linear(rank, world_size, port, tp_size, gtp_remat_size):
         parallel_mode="column",
         device="cuda",
         tp_group=tp_group,
-        gtp_remat_group=gtp_remat_group,
     )
+    # TE has no GTP construction hook; gtp_remat_size (the forward-gather gate) is stamped
+    # post-init and the TP-sharded weight is sliced into a GTPShardedParam on the Megatron side.
+    layer.gtp_remat_size = gtp_remat_group.size()
+    wrap_module_params_gtp(layer, layer.weight_names, gtp_remat_group)
     assert isinstance(
         layer.weight, GTPShardedParam
     ), f"rank {rank}: LayerNormLinear.weight should be GTPShardedParam"

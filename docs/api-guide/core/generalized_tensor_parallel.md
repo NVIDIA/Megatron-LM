@@ -18,7 +18,7 @@ Core implementation: `megatron/core/tensor_parallel/generalized_tensor_paralleli
 1. [Features](#1-features)
    - 1.1 [Fine-grained, per-weight materialization & gradient reduction](#11-fine-grained-per-weight-materialization--gradient-reduction)
    - 1.2 [CUDA graph compatibility](#12-cuda-graph-compatibility)
-   - 1.3 [Low-precision quantize-then-gather](#13-low-precision-quantize-then-gather)
+   - 1.3 [Low-precision gather (native FP8 param)](#13-low-precision-gather-native-fp8-param)
    - 1.4 [Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
    - 1.5 [Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
    - 1.6 [Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
@@ -67,36 +67,36 @@ CG compatibility is designed-in from day one, not retrofitted. The entire sync /
 - **Drains at CG / eager boundary**: `_drain_gtp_side_streams()` before eager MoE expert compute. Inside bwd capture, two-phase drain: Phase 1 joins the within-graph cascade and records `bwd_completion_event` (next runner unblocks); Phase 2 calls `wait_async_comms(GRAPHED)` to drain the chain-tail handle and re-joins side streams (queued after the event so it doesn't delay the next runner).
 - **Side-stream registration**: the `(GRAPHED, gtp_remat_group)` ag/rs streams are materialized at runner init (`_register_gtp_side_streams`) so they are captured before the first forward.
 
-### 1.3 Low-precision quantize-then-gather
+### 1.3 Low-precision gather (native FP8 param)
 
-Wire bandwidth scales with the **quantized** size, not BF16 size — GTP_remat composes with low-precision training rather than fighting it.
+Wire bandwidth scales with the **quantized** size, not BF16 size — GTP_remat composes with low-precision training rather than fighting it. There are two weight representations:
 
-- **FP8 / MXFP8**: quantize kernel runs per microbatch on the local shard with no GTP_remat-group amax reduction (FP8 amax allreduce is the standard DP-group one in `reduce_and_update_fp8_tensors`, unchanged by GTP_remat). On subsequent microbatches, `skip_weight_cast=True` reuses the quantized buffer.
-- **NVFP4** (4-bit, block-scaled): amax reduced across the GTP_remat group before scaling so ranks share a consistent scale for the full weight; custom `_all_gather_nvfp4` handles rowwise + columnwise views and interleaved layout. Post-processing (re-assemble interleaved data, re-pad `scale_inv`, transition to `GEMM_READY`) is deferred into `_NVFP4AllGatherAsyncHandle.wait()` so it stays off the critical path.
-- **Coalesced NCCL**: `grouped_gather_along_first_dim` uses `torch.distributed._coalescing_manager` to batch E experts' AGs into a single NCCL op. `BatchedNVFP4AllGatherAsyncHandle` wraps per-expert post-processing.
-- **Padding**: at construction the **full tensor** is padded along dim0 to a multiple of `pad_for_alignment × gtp_remat_size`, then sharded equally across the group. After all-gather, the padding ends up contiguous at the tail, so stripping is a single trailing slice (`tensor[:-pad_length]`) — no per-shard reshuffle, and the design naturally supports `pad_length` large enough to span multiple ranks' shards when the unpadded dim0 is small.
+- **Native FP8 param — MXFP8 + `--fp8-param-gather` (the default low-precision path; the two are always paired, see §2.1).** The GTP_remat shard **is** a native `MXFP8Tensor` built at construction (§3.1), with **no BF16 weight kept and no per-microbatch quantize**. The distributed optimizer maintains the FP8 shard directly (the FP32 master → FP8 write happens once per optimizer step, off the forward critical path), and the forward simply **all-gathers the FP8 shard** (no cast on the forward path). The forward selects the rowwise (fwd) / columnwise (bwd) MXFP8 representation via a *separate* gather-quantizer copy (`_gtp_gather_quantizer`), leaving the param's own quantizer untouched for the optimizer's write path.
+- **BF16 GTP_remat (no FP8 params).** The BF16 shard is all-gathered as-is. (Per-forward BF16→FP8 casting for GTP weights has been removed with the move to native FP8 params, so `mxfp8` GTP requires `--fp8-param-gather`.)
+- **NVFP4** (4-bit, block-scaled) previously cast the BF16 shard to NVFP4 each forward (with GTP_remat-group amax reduction) before gathering; that per-forward-cast path was removed alongside native-FP8 params, so **NVFP4 GTP_remat is currently unsupported pending a native NVFP4-param path** (tracked separately). The comm-volume figures below still describe NVFP4 for reference.
+- **Coalesced NCCL**: `grouped_gather_along_first_dim` uses `torch.distributed._coalescing_manager` to batch E experts' AGs into a single NCCL op.
+- **Padding**: for the TE wrappers both representations allocate the shard **already padded** (`out_features` rounded up to a multiple of `pad_for_alignment × gtp_remat_size`, divided by `gtp_remat_size`) — see the GTP-agnostic init in §3.1. (Megatron-local linears, which still build the full weight and slice it post-init, pad the full tensor first.) Either way the padding ends up contiguous at the tail after all-gather, so stripping is a single trailing slice (`tensor[:-pad_length]`) — no per-shard reshuffle, and `pad_length` may span multiple ranks' shards when the unpadded dim0 is small.
 
 #### Per-microbatch schedule
 
 ```
-Steady-state fwd (NVFP4):
-    default: ──GEMM(W_0)──quant+amax(W_1)──GEMM(W_1)──quant+amax(W_2)──GEMM(W_2)──...
+Steady-state fwd (MXFP8 native FP8 param / BF16):
+    default: ──GEMM(W_0)───────────────────GEMM(W_1)───────────────────GEMM(W_2)──...
     ag_str:                       [AG_issue W_1]            [AG_issue W_2]
+                              (no per-microbatch quantize: the FP8 shard is
+                               maintained by the optimizer; BF16 gathers as-is)
 
-Steady-state fwd (FP8 / MXFP8):
-    default: ──GEMM(W_0)────quant(W_1)─────GEMM(W_1)────quant(W_2)─────GEMM(W_2)──...
-    ag_str:                       [AG_issue W_1]            [AG_issue W_2]
-                              (no GTP_remat-group amax allreduce)
-
-Steady-state bwd (all recipes):
+Steady-state bwd (MXFP8 / BF16):
     default: ──bwd GEMMs(W_i)──...
     ag_str:               [AG_issue W_{i-1}]
-                          (bwd reuses fwd's quantized buffer; no quant, no amax)
+                          (columnwise view of the same FP8 shard; no quant)
+
+Steady-state fwd (NVFP4, per-forward-cast path — currently unsupported for GTP):
+    default: ──GEMM(W_0)──quant+amax(W_1)──GEMM(W_1)──quant+amax(W_2)──GEMM(W_2)──...
+    ag_str:                       [AG_issue W_1]            [AG_issue W_2]
 ```
 
-quant+amax run sequentially with surrounding compute on the default stream; only the `dist.all_gather` issue is wrapped in `with torch.cuda.stream(ag_stream)`. The NCCL kernel runs on c10d's private ncclStream and overlaps with the next GEMM until it reaches its wait.
-
-For NVFP4 the per-microbatch prefetch cost is **two** NCCL ops on the GTP_remat ncclStream (amax allreduce + AG) serialized on the same communicator. FP8 and MXFP8 incur only the AG; their standard DP-group amax allreduce in `reduce_and_update_fp8_tensors` is unchanged by GTP_remat. BF16 skips quant entirely.
+For the native-FP8 (MXFP8) and BF16 paths the forward all-gather is a **single** NCCL op per weight on the GTP_remat ncclStream, with no per-microbatch quantize or GTP_remat-group amax on the critical path (the standard DP-group FP8 amax allreduce in `reduce_and_update_fp8_tensors` is unchanged by GTP_remat). Only the `dist.all_gather` issue is wrapped in `with torch.cuda.stream(ag_stream)`; the NCCL kernel runs on c10d's private ncclStream and overlaps with the next GEMM until it reaches its wait. (The NVFP4 line — two ops: amax allreduce + AG — describes the removed per-forward-cast path, retained for reference.)
 
 #### Communication volume breakdown
 
@@ -110,7 +110,7 @@ Per-microbatch per-weight comm budget (assuming bf16 wgrad reduce-scatter):
 
 How to read the columns:
 - `Per-elem` = `Data B/elem + Scale_inv B/elem` — wire cost of one quantized weight buffer (data + scale_inv together).
-- `Fwd AG` and `Bwd AG` each carry the quantized buffer once, so they equal `Per-elem`. Bwd reuses fwd's `self.quantized` buffer — no re-quantize, no AR(amax).
+- `Fwd AG` and `Bwd AG` each carry the quantized buffer once, so they equal `Per-elem`. Bwd all-gathers the same FP8 shard (columnwise view) — no re-quantize, no AR(amax).
 - `Wgrad RS (bf16)` = 2.0 B/elem — gradient is reduce-scattered in bf16 regardless of weight precision.
 - `Fwd AR(amax)` is a separate NCCL collective: NVFP4 needs it (one fp32 scalar per tensor → ~0 B/elem volume but a fixed launch latency); MXFP8 doesn't (microscale-only).
 - `Total B/elem` = `Fwd AG + Bwd AG + Wgrad RS` — amax AR is omitted because its volume is essentially 0.
@@ -126,10 +126,10 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 
 ### 1.5 Opt-in, minimally invasive integration
 
-- Single integration seam: the `gtp_remat_group` kwarg accepted by TE's `Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear` primitives — no framework-level refactor required. Mcore supplies it per linear class (next bullet), so callers and upper-level modules never thread it.
+- **Single integration seam that stays out of TE's construction path: TE takes no GTP argument at all.** Mcore builds the plain TE linear with an already-sharded `out_features` and attaches the GTP surface *after* construction — no framework-level refactor, and callers never thread a group. See §3.1 for the mechanism.
 - **Opt-in by linear class — sharding stays per-weight.** Materialization and gradient reduction remain at individual-weight granularity (each wrapped weight is its own `GTPShardedParam`, gathered/reduce-scattered per-weight, per-call — §1.1). What is class-based is only *which* linears opt in: GTP_remat wraps the tensor-parallel TE linear classes that resolve a shard group internally — `TEColumnParallelLinear` / `TERowParallelLinear` / `TELayerNormColumnParallelLinear` (dense) and `TEGroupedLinear` (routed experts) — so the upper-level modules thread no `gtp_remat_group` argument. The base `TELinear` (e.g. the duplicated MoE latent-proj MLPs) and small replicated tensors (LayerNorm γ/β, biases, Mamba `dt_bias`/`A_log`/`D`/`conv1d`, MoE router) stay full — no NCCL launch latency for params where the all-gather wouldn't amortize. The split is visible in §3.2's *dense non-GTP_remat* vs *dense GTP_remat* membership.
 - `classify_gtp_chains(model)` walks `named_parameters()` once at init and sets `chain_id` on every `GTPShardedParam` based on the current `cuda_graph_modules`.
-- Turning it off is a no-op: when `gtp_remat_group.size() == 1`, `wrap_module_params_gtp` short-circuits; when `gtp_weight_remat_size == 1`, the GTP_remat path in `layers.py` is skipped entirely.
+- Turning it off is a no-op: when the resolved group is `None` / size 1, `_gtp_pre_init` leaves `out_features` unsharded and `_gtp_attach_post_init` short-circuits (as does `wrap_module_params_gtp` for the Megatron-local linears); when `gtp_weight_remat_size == 1`, the GTP_remat path in `layers.py` is skipped entirely.
 - User-tunable knobs (`GTPConfig.pad_for_alignment`, `weight_prefetch`, `check_param_states`) plus a debug-name tagger (`tag_gtp_params_with_names`) for readable link-table output.
 
 ### 1.6 Optimizer-agnostic (Adam + Muon)
@@ -137,7 +137,8 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 GTP_remat runs under both the standard **Adam** `DistributedOptimizer` and **Muon** (the `LayerWiseDistributedOptimizer`), DCP save/load included:
 
 - **Adam** shards optimizer state over the gtp_remat/egtp_remat-excluded replicate group, like any GTP_remat run (§3.2).
-- **Muon** keeps matrix params *whole* (Newton–Schulz needs the full 2D weight). A GTP_remat-replicated whole param (e.g. MoE router, latent-proj MLPs) then lands on one checkpoint key shared by all GTP_remat peers, so the LayerWise optimizer folds `gtp_rank` into its `replica_id` — exactly one peer writes (the optimizer-state analog of the model-side fold in §3.3). Mamba `in_proj` (a gathered+split factory on the model side) saves its optimizer state per-shard via a small backfill helper.
+- **Muon** keeps matrix params *whole* (Newton–Schulz needs the full 2D weight). A GTP_remat-replicated whole param (e.g. MoE router, latent-proj MLPs) then lands on one checkpoint key shared by all GTP_remat peers, so the LayerWise optimizer folds `gtp_rank` into its `replica_id` — exactly one peer writes (the optimizer-state analog of the model-side fold in §3.3).
+- **Native-FP8 optimizer-state matching (Muon path).** The save-side dequantize (§3.3) hands DCP a *fresh* BF16 tensor, which breaks the id-based optimizer-param → model-`ShardedTensor` match for every native-FP8 GTP_remat weight. The dequantized copy carries a `_gtp_dequant_src` backlink to the live FP8 param, and `_backfill_gtp_sharded_param_map` reuses the model's **own** entry (backlink first, tagged-name second) — preserving its full offsets (expert axes included) and `replica_id`. Only truly-unmatched params (Mamba `in_proj`, a gathered+split factory) take the per-shard rebuild, which refuses expert-parallel params rather than emit EP-colliding shards.
 
 Neither path adds a GTP_remat-specific checkpoint format or call site.
 
@@ -193,6 +194,13 @@ GTP_remat is enabled through two CLI flags on Megatron's training launcher; ever
 > `gtp_weight_remat_size` / `expert_gtp_weight_remat_size` config fields are derived from them and
 > have no CLI flag.
 
+**Low precision (MXFP8).** GTP_remat + `--fp8-recipe mxfp8` **requires** both `--fp8-param-gather`
+and `--reuse-grad-buf-for-mxfp8-param-ag` (`arguments.py` asserts this). GTP keeps no BF16 weight
+under MXFP8 — the weight is a native FP8 param the optimizer maintains (§1.3, §3.1) — so
+`--fp8-param-gather` is mandatory; and because MXFP8 params cannot be mapped into the contiguous
+param buffer (TE's `replace_raw_data` does not support the MXFP8 tile-scaling layout), the param
+all-gather must reuse the grad buffer (`--reuse-grad-buf-for-mxfp8-param-ag`).
+
 ### 2.2 High-priority streams (Blackwell and later)
 
 Required on GB200 / GB300 so the GTP_remat comm streams get the SM priority needed for AG/RS overlap with compute:
@@ -229,7 +237,7 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP_remat enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, fp8_param_gather=False)
+  weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False)
 ```
 
 ### 2.4 Tuning knobs
@@ -241,7 +249,7 @@ update_gtp_config(
     pad_for_alignment=16,         # NVFP4: 16, MXFP8: 32, BF16: any; auto-set in training.py
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
-    fp8_param_gather=False,       # Companion to Megatron's --fp8-param-gather; currently asserted off
+    calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
 )
 ```
 
@@ -255,18 +263,25 @@ update_gtp_config(
 
 ### 3.1 GTP_remat architecture (Mcore ↔ TE integration)
 
-![GTP_remat / Mcore-TE integration architecture](../../images/generalized_tensor_parallel/0525_gtp_mcore_te_architecture.png)
+![GTP_remat / Mcore-TE integration architecture](../../images/generalized_tensor_parallel/0703_gtp_mcore_te_architecture.png)
 
-TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`) and the low-precision tensor types (FP8 / MXFP8 / NVFP4). Megatron-LM owns the GTP_remat scheduling state — the prefetch chain, the ticket-based buffer cache, the per-param AG/RS state machines, the GRAPHED/UNGRAPHED chain split, and the DDP integration. The two are bridged by:
+TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`) and the low-precision tensor types (FP8 / MXFP8 / NVFP4). Megatron-LM owns **all** GTP_remat state and weight setup — the parameter sharding, the prefetch chain, the ticket-based buffer cache, the per-param AG/RS state machines, the GRAPHED/UNGRAPHED chain split, and the DDP integration.
 
-1. The `gtp_remat_group` kwarg that Mcore's `extensions/transformer_engine.py` threads into the TE constructors when `is_te_min_version("2.17.0")`.
-2. The hook registry (`register_gtp_hooks`), called by TE's `module/base.py` at `reset_parameters` time to slice each weight into a `GTPShardedParam` along `out_features`.
-3. The `_register_gtp_side_streams` / drain calls that synchronize TE's quantize + GEMM kernels with the side stream that owns the AG/RS NCCL ops.
+**TE construction is fully GTP-agnostic — TE takes no GTP argument and carries no GTP construction hooks.** Mcore builds the plain TE module with an already-sharded `out_features` (`_gtp_pre_init`), so TE's `reset_parameters` initializes exactly this rank's shard, and all GTP wiring is attached *after* construction (`extensions/transformer_engine.py:_gtp_attach_post_init`). The two are bridged by exactly two things:
+
+1. **Post-init attach only.** `_gtp_attach_post_init` stamps `module.gtp_remat_size` (the forward/backward all-gather gate that TE's `_Linear` reads) and attaches the `GTPShardedParam` scheduling surface (`all_gather_and_prefetch` etc.) onto the weight. TE itself never slices, gathers, or even names GTP.
+2. The `_register_gtp_side_streams` / drain calls that synchronize TE's GEMM kernels with the side stream that owns the AG/RS NCCL ops.
+
+**One init path, both precisions.** Because `out_features` is pre-sharded, plain TE builds this rank's shard directly — a **native `MXFP8Tensor`** under `fp8_model_init` (`mxfp8` + `--fp8-param-gather`, always paired, see §2.1) or a plain **BF16** shard otherwise — with **no full weight ever materialized** in either case. `_gtp_attach_post_init` then, via `attach_gtp_to_presharded_module`: for FP8, reclasses the shard in place to a cached `GTP_<Fp8TensorClass>` subclass (keeps `is_float8tensor(param)` True → buffer-resident, distributed-optimizer FP8 path); for BF16, re-registers the shard as a `GTPShardedParam` (no slice — it is already shard-sized). The optimizer then maintains the shard end-to-end and the forward all-gathers it with **no per-microbatch re-quantize** (see §1.3).
+
+> **Per-GTP-rank weight init.** Since each rank initializes its own shard rather than slicing a shared full-weight draw, GTP-sharded weights must draw *distinct* random values per GTP_remat peer — otherwise the gathered weight would be `gtp_remat_size` identical blocks. `model_parallel_cuda_manual_seed` registers dedicated `gtp-remat-rng` / `egtp-remat-rng` tracker states (offset per GTP/EGTP rank) that `_gtp_pre_init` routes weight init through (via TE's `rng_tracker_name`); replicated params keep the shared trackers (identical across peers by design). These trackers are added only when the axis is active, so non-GTP runs keep a byte-identical tracker set and checkpoint RNG payload.
+
+> **Note — Megatron-local linears** (`ColumnParallelLinear` etc. in `tensor_parallel/layers.py`, not TE modules) still build the full weight and slice it post-init via `wrap_module_params_gtp`; that path is unchanged.
 
 #### What the flags do under the hood
 
 1. `parallel_state.initialize_model_parallel(...)` treats GTP_remat/EGTP_remat as **first-class orthogonal axes** (`world_size = TP*GTP_remat*CP*DP`, and the expert grid `= ETP*EP*EGTP_remat*PP*expert_dp`). It builds the shard groups `_GTP_WEIGHT_REMAT_GROUP` (size = `--tensor-parallel-num-weight-shards / --tensor-model-parallel-size`) and `_EXPERT_GTP_WEIGHT_REMAT_GROUP` (size = `--expert-tensor-parallel-num-weight-shards / --expert-tensor-parallel-size`). DP and gtp_remat are **orthogonal by default**: `get_data_parallel_group()` returns the replicate axis (what DDP and the optimizer shard over), and `with_gtp_remat=True` returns the combined DP × gtp_remat axis for data-distribution callers.
-2. Megatron's `extensions/transformer_engine.py` decides per linear *class* whether to GTP_remat-shard, so no `gtp_remat_group` argument is threaded through the upper-level module APIs (attention, Mamba, MLP, embedding, MTP). The tensor-parallel dense wrappers — `TEColumnParallelLinear` / `TERowParallelLinear` / `TELayerNormColumnParallelLinear` — resolve the active dense group from `parallel_state` via `utils.get_gtp_weight_remat_group(...)`; the routed-expert wrapper `TEGroupedLinear` uses `pg_collection.expt_gtp_remat`. The resolved group is injected as the `gtp_remat_group=` kwarg into the TE constructor (`None` / size-1 ⇒ unsharded; the hook registry from the bridge list above then slices each sharded weight). The base `te.Linear` wrapper (e.g. the duplicated MoE latent projections) is given no group and stays full. See [Class hierarchy: which linears shard](#class-hierarchy-which-linears-shard) for the full class map.
+2. Megatron's `extensions/transformer_engine.py` decides per linear *class* whether to GTP_remat-shard, so no `gtp_remat_group` argument is threaded through the upper-level module APIs (attention, Mamba, MLP, embedding, MTP). The tensor-parallel dense wrappers — `TEColumnParallelLinear` / `TERowParallelLinear` / `TELayerNormColumnParallelLinear` — resolve the active dense group from `parallel_state` via `utils.get_gtp_weight_remat_group(...)`; the routed-expert wrapper `TEGroupedLinear` uses `pg_collection.expt_gtp_remat`. When the resolved group is `None` / size-1 the module is left unsharded; otherwise `_gtp_pre_init` pre-shards `out_features` and `_gtp_attach_post_init` attaches the GTP surface onto this rank's shard (native FP8 by reclass, BF16 by re-register — see the one-init-path description above). The base `te.Linear` wrapper (e.g. the duplicated MoE latent projections) is given no group and stays full. See [Class hierarchy: which linears shard](#class-hierarchy-which-linears-shard) for the full class map.
 3. DDP treats GTP_remat shards as ordinary params: they go into the same dense / expert buffers as everything else, reduced over the replicate group (the default `intra_dp_cp_group` / `intra_expt_dp_group`). The gtp_remat axis is completed elsewhere — GTP_remat shards by their reduce-scatter, replicated (non-GTP_remat) params by an all-reduce in `finalize_model_grads` — with mean-vs-sum scaling chosen by `calculate_per_token_loss`. See §3.2 for the full scheme.
 4. Optimizer state is sharded over the same replicate group; clip-by-global-norm reduces squared norms over the dist-opt grad-stats group, which spans the full world (including the gtp_remat/egtp_remat axis), with replicated non-GTP_remat params counted once per gtp_remat/egtp_remat axis to avoid over-counting.
 5. `classify_gtp_chains(model)` runs once after model build (in `training.py`'s `get_model`) and wires each `GTPShardedParam` into a `GRAPHED` or `UNGRAPHED` prefetch chain based on the active `cuda_graph_modules`.
@@ -282,7 +297,7 @@ The figure visualizes the per-class split from the list above: green = resolves 
 Two distinct pools with explicit lifecycle rules:
 
 - **`GTPWeightCache`** (AG/RS output buffers) — ticket-based, keyed on `(shape, dtype, fwd, expert_idx, reduce_scatter)`. Same-shape buffers across layers are shared. Tickets persistent; buffer allocated lazily on first `get()`; addresses stable across iterations for CG replay.
-- **`_wgrad_buf_pool`** (UNGRAPHED wgrad input recycling) — tagged with `_from_gtp_wgrad_pool=True` at `_wgrad_pool_get`. `_wgrad_pool_put` no-ops on foreign buffers (fresh allocs from Megatron `layers.py` or aten F.embedding bwd) → caching allocator handles those. Prevents the pool from accumulating untagged buffers each iter.
+- **`_wgrad_buf_pool`** (wgrad-GEMM output recycling) — holds the **full, unsharded** wgrad-GEMM output buffer (shape `_unsharded_shape`, dtype `main_grad.dtype` — fp32 when `grad_reduce_in_fp32`, else bf16). The TE backward writes the wgrad into it via `main_grad_func = weight.get_wgrad_tensor` (it is a *scratch*, distinct from the sharded `param.main_grad`); `wgrad_reduce_scatter` then reduce-scatters it down to the shard and the buffer is returned here. This is a full-weight-shaped fp32/bf16 transient — one of the larger per-weight buffers — and is **precision-independent** (wgrad is always computed in high precision), so it is identical in BF16 vs MXFP8 runs. Buffers are tagged `_from_gtp_wgrad_pool=True` at `_wgrad_pool_get`; `_wgrad_pool_put` no-ops on foreign buffers (fresh allocs from Megatron `layers.py` or aten F.embedding bwd) → caching allocator handles those, so the pool never accumulates untagged buffers.
 
 #### Overlap design summary
 
@@ -406,7 +421,7 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
-**Post-load cache invalidation.** DCP loads weights with in-place writes to `.data`, which leaves the per-shard low-precision cache (`self.quantized`) stale. `reset_gtp_quantize_cache(model)` is called after load (and RL checkpoint reload) so the first forward after resume re-quantizes from the freshly loaded BF16 weight instead of reusing the pre-load cast.
+**Pre-save forced param-sync (native-FP8 shard preservation).** Before a save (and around any `disable_forward_pre_hook(param_sync=True)`, e.g. pre-eval), the training loop force-syncs DDP params. That sync's `_post_param_sync` copy-back sources `param_data` — which under `--reuse-grad-buf-for-mxfp8-param-ag` is stale grad scratch at that point (the per-iteration refill from fp32 masters has not run). Non-GTP fp8 weights are rebuilt from masters at the next iteration start, but a GTP_remat shard is *persistent, self-owned* state consumed by GTP's own gather — the stale write collapses its MXFP8 scale and spikes the next iteration's loss. `gtp_preserve_native_fp8_shards` (wrapped around both forced-sync entry points in `training.py`) snapshots and restores the shard's FP8 planes, making the forced sync a no-op for GTP_remat weights at any DP size.
 
 ## 4. Testing
 
@@ -430,7 +445,8 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
-| `test_gtp_dcp.py` | Distributed-checkpoint sharding (§3.3): TP×GTP_remat composite/cross-axis offsets, alignment-pad `allow_shape_mismatch`, cross-topology reshard metadata, quantize-cache reset, and replicated-param `replica_id` over the gtp_remat-inclusive group (save-path duplicate-writer guard). |
-| `test_gtp_muon_dcp.py` | GTP_remat + Muon (LayerWise) optimizer-state checkpoint roundtrip (§1.6): `replica_id` fold for GTP_remat-replicated whole params (router, latent-proj). |
+| `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. |
+| `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
+| `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 
 All tests require ≥ 4 GPUs and the GTP_remat-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.

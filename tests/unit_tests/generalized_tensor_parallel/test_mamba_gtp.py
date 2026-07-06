@@ -17,7 +17,7 @@ from megatron.core.tensor_parallel.gtp import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
 
-from transformer_engine.pytorch import fp8_autocast
+from transformer_engine.pytorch import fp8_autocast, fp8_model_init
 
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
@@ -82,7 +82,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     LR = 0.01
     STEPS = 10
     dtype = torch.bfloat16
-    recipe = MXFP8BlockScaling()
+    recipe = MXFP8BlockScaling()  # native-FP8 Phase 3 (Phases 1-2 run in BF16)
 
     def make_config():
         return TransformerConfig(
@@ -97,7 +97,6 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
             params_dtype=dtype,
             hidden_dropout=0.0,
             bias_dropout_fusion=False,
-            fp8='e4m3',
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
         )
@@ -120,7 +119,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         )
 
     def run_step(layers, x):
-        with fp8_autocast(enabled=True, fp8_recipe=recipe):
+        with fp8_autocast(enabled=False):
             for layer in layers:
                 x = layer(x)
         return x.mean()
@@ -232,20 +231,113 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
                     p.grad.zero_()
 
     ps.destroy_model_parallel()
+    GTPShardedParam._chain_state = {}
+    FP8GlobalStateManager.reset()
+
+    # -------------------------------------------------------------------------
+    # Phase 3: GTP_remat=4 (DP=1), NATIVE MXFP8 weights (--fp8-param-gather path).
+    # in_proj/out_proj are built under fp8_model_init -> native MXFP8 GTP shards. FP8 params can't
+    # be updated in place, so this leg keeps an FP32 master and re-quantizes each step via
+    # gtp_native_fp8_load_context (same copy_ mechanism as checkpoint load). Loss must track the
+    # BF16 baseline within MXFP8 noise; a frozen/miswired FP8 weight flattens or diverges it.
+    # -------------------------------------------------------------------------
+    from megatron.core.fp8_utils import is_float8tensor
+    from megatron.core.tensor_parallel.gtp import gtp_native_fp8_load_context, is_gtp_param
+
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=4
+    )
+    model_parallel_cuda_manual_seed(42)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat']
+    )
+    config = make_config()
+    with fp8_model_init(enabled=True, recipe=recipe):
+        layers_fp8 = make_mamba_stack(config, pg_collection)
+    for layer in layers_fp8:
+        layer.cuda()
+
+    # Verify native-FP8 GTP is truly active: some weight must be a native FP8 GTP shard.
+    native_fp8 = [p for p in layers_fp8.parameters() if is_gtp_param(p) and is_float8tensor(p)]
+    assert len(native_fp8) > 0, "No native-FP8 GTP weight found in fp8_model_init mamba stack"
+
+    # Init: FP32 master per param = the gtp_rank shard of the saved baseline weights (padded to the
+    # native-FP8 shard size); FP8 params re-quantized from their master via the load context.
+    masters = {}
+    with torch.no_grad(), gtp_native_fp8_load_context(layers_fp8):
+        for name, p in layers_fp8.named_parameters():
+            full = saved_weights[name]
+            if is_gtp_param(p):
+                shard = p.shape[0]  # native-FP8 shard may include GTP alignment pad rows
+                aligned = shard * gtp_remat_size
+                if full.shape[0] < aligned:
+                    full = torch.nn.functional.pad(full, (0, 0, 0, aligned - full.shape[0]))
+                m = full[gtp_rank * shard : (gtp_rank + 1) * shard].float().clone()
+            else:
+                m = full.float().clone()
+            masters[name] = m
+            p.copy_(m.to(dtype))  # BF16->FP8 (inside the load context) or plain BF16 copy
+    for p in layers_fp8.parameters():
+        if is_gtp_param(p):
+            p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
+
+    fp8_losses = []
+    for step in range(STEPS):
+        for p in layers_fp8.parameters():
+            if is_gtp_param(p):
+                p.main_grad.zero_()
+
+        torch.manual_seed(step)
+        x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
+        dist.broadcast(x, src=0)
+
+        with fp8_autocast(enabled=True, fp8_recipe=recipe):
+            y = x
+            for layer in layers_fp8:
+                y = layer(y)
+        loss = y.mean()
+        if rank == 0:
+            fp8_losses.append(loss.item())
+        loss.backward()
+
+        # Update FP32 masters (same math as bf16 Phase 2), then re-quantize FP8 shards from them.
+        with torch.no_grad():
+            for name, p in layers_fp8.named_parameters():
+                if is_gtp_param(p):
+                    masters[name].sub_((LR / gtp_remat_size) * p.main_grad.float())
+                elif p.grad is not None:
+                    masters[name].sub_(LR * p.grad.float())
+                    p.grad.zero_()
+            with gtp_native_fp8_load_context(layers_fp8):
+                for name, p in layers_fp8.named_parameters():
+                    p.copy_(masters[name].to(dtype))
+
+    ps.destroy_model_parallel()
     ps.initialize_model_parallel()
     GTPShardedParam._chain_state = {}
+    FP8GlobalStateManager.reset()
 
     # -------------------------------------------------------------------------
     # Compare per-step loss trajectories on rank 0
     # -------------------------------------------------------------------------
     if rank == 0:
         _assert_loss_trajectories_match(baseline_losses, gtp_losses, STEPS)
+        # Native-FP8 leg tracks the baseline within MXFP8 noise (looser than the bf16-vs-bf16 tol).
+        import torch as _torch
+
+        diff = (_torch.tensor(fp8_losses) - _torch.tensor(baseline_losses)).abs().max().item()
+        assert diff < 0.2, (
+            f"Native-FP8 GTP mamba loss diverges from BF16 baseline "
+            f"(max per-step |diff|={diff:.4f}; fp8: {fp8_losses[0]:.3f}->{fp8_losses[-1]:.3f}, "
+            f"bf16: {baseline_losses[0]:.3f}->{baseline_losses[-1]:.3f})."
+        )
 
 
 class TestMambaGTPCorrectness:
     def test_mamba_gtp_loss_trajectory_matches_baseline(self):
-        """GTP Mamba per-step losses must match no-GTP baseline (atol=1e-5, rtol=1e-5; MXFP8, Nemotron3-Super)."""
-        _requires_mxfp8()
+        """GTP Mamba per-step losses must match the no-GTP baseline for BOTH bf16 (Phase 2) and
+        native-MXFP8 (Phase 3) weight-remat, within bf16 reduction / mxfp8 quantization noise."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
+        _requires_mxfp8()  # Phase 3 builds native-FP8 mamba weights (fp8_model_init)
         _run_distributed(_worker_mamba_gtp_correctness, 4)

@@ -519,28 +519,24 @@ class TestGTPGradCorrectness:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_idog_span, 4)
 
-    def test_gtp2_dp2_grad_matches_dp4_baseline(self):
-        """GTP2xDP2 reduced grad must match no-GTP_remat DP4 (non-dist-opt main_grad)."""
-        if torch.cuda.device_count() < 4:
-            pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker, 4)
+    @pytest.mark.parametrize("per_token_loss", [False, True])
+    def test_gtp2_dp2_grad_matches_dp4_baseline(self, per_token_loss):
+        """GTP2xDP2 reduced grad must match no-GTP_remat DP4 (non-dist-opt main_grad).
 
-    def test_gtp2_dp2_grad_matches_dp4_baseline_per_token_loss(self):
-        """Same as above but with calculate_per_token_loss=True.
-
-        Per-token-loss disables DDP's 1/dp pre-scaling and normalizes by 1/total_global_tokens,
-        so the gtp_remat axis must be SUM-reduced (plain reduce-scatter + SUM finalize), NOT the
-        1/gtp MEAN used otherwise. A regression to an unconditional mean shrinks every gtp grad by
-        1/gtp and this test catches it (GTP2xDP2 sum-grad must still match the DP4 sum-grad).
-        GTP_CONFIG is a process-global, so set it for this test and always reset it.
+        per_token_loss=True disables DDP's 1/dp pre-scaling and normalizes by
+        1/total_global_tokens, so the gtp_remat axis must be SUM-reduced (plain reduce-scatter +
+        SUM finalize), NOT the 1/gtp MEAN used otherwise. A regression to an unconditional mean
+        shrinks every gtp grad by 1/gtp and the per_token_loss case catches it (GTP2xDP2 sum-grad
+        must still match the DP4 sum-grad). GTP_CONFIG is a process-global, so set it for the run
+        and always reset it.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         from megatron.core.tensor_parallel.gtp import update_gtp_config
 
-        update_gtp_config(calculate_per_token_loss=True)
+        update_gtp_config(calculate_per_token_loss=per_token_loss)
         try:
-            _run_distributed(_worker, 4, True)
+            _run_distributed(_worker, 4, per_token_loss)
         finally:
             update_gtp_config(calculate_per_token_loss=False)
 

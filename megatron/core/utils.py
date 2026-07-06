@@ -976,16 +976,17 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
-    # GTP: a GTPShardedParam additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
     # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
     from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     if HAVE_GTP:
-        from megatron.core.tensor_parallel.gtp import GTPShardedParam
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp import dequantize_gtp_native_fp8, is_gtp_param
 
-        if isinstance(tensor, GTPShardedParam):
+        if is_gtp_param(tensor):
             gtp_rank = get_pg_rank(tensor.group)
             gtp_remat_size = get_pg_size(tensor.group)
             if tp_axis == 0:
@@ -1005,6 +1006,19 @@ def make_tp_sharded_tensor_for_checkpoint(
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
 
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
@@ -1039,12 +1053,12 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
     if HAVE_GTP:
-        from megatron.core.tensor_parallel.gtp import GTPShardedParam
+        from megatron.core.tensor_parallel.gtp import is_gtp_param
 
-        assert not isinstance(tensor, GTPShardedParam), (
-            f"GTPShardedParam '{key}' reached make_sharded_tensor_for_checkpoint (the replicated "
-            "path); route GTP-sharded weights through make_tp_sharded_tensor_for_checkpoint or "
-            "make_sharded_tensors_for_checkpoint instead."
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
         )
 
     # Pop group parameters from kwargs

@@ -1493,12 +1493,22 @@ def validate_args(args, defaults={}):
             "--dist-ckpt-optim-fully-reshardable)."
         )
 
-        # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
-        # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
-        if getattr(args, 'fp8_param_gather', False):
-            from megatron.core.tensor_parallel.gtp import update_gtp_config
-
-            update_gtp_config(fp8_param_gather=True)
+        # GTP with the mxfp8 recipe requires --fp8-param-gather: GTP keeps no bf16 weight and
+        # relies on the optimizer maintaining the fp8 shard (the forward all-gathers fp8 and does
+        # not re-quantize). Without fp8-param-gather the fp8 forward weight would never be updated.
+        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            assert getattr(args, 'fp8_param_gather', False), (
+                "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
+                "GTP does not keep or re-quantize a bf16 weight)."
+            )
+            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
+            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
+            # all-gather must reuse the grad buffer instead.
+            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
+                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
+                "(MXFP8 params keep their own quantized storage; mapping them into the param "
+                "buffer via replace_raw_data is unsupported)."
+            )
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:

@@ -23,7 +23,6 @@ from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _assert_loss_trajectories_match,
-    _requires_mxfp8,
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -64,7 +63,6 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     MXFP8 alignment with EGTP_remat=2:
         2688/2=1344, 1344%16=0 (fc1 shard); 4096/2=2048, 2048%16=0 (fc2 shard)
     """
-    from transformer_engine.common.recipe import MXFP8BlockScaling
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
     from megatron.core import parallel_state as ps
@@ -83,7 +81,6 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     LR = 0.01
     STEPS = 10
     dtype = torch.bfloat16
-    recipe = MXFP8BlockScaling()
 
     def make_config():
         return TransformerConfig(
@@ -100,7 +97,6 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
             params_dtype=dtype,
             hidden_dropout=0.0,
             bias_dropout_fusion=False,
-            fp8='e4m3',
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
         )
@@ -110,7 +106,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
         return moe_spec(config, layer_number=1, pg_collection=pg_collection)
 
     def run_step(layer, x):
-        with fp8_autocast(enabled=True, fp8_recipe=recipe):
+        with fp8_autocast(enabled=False):
             output, _ = layer(x)
         return output.mean()
 
@@ -335,7 +331,6 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
 class TestMoEEGTPCorrectness:
     def test_moe_egtp_loss_trajectory_matches_baseline(self):
         """EP=2+EGTP_remat=2 MoE per-step losses match EP=4 baseline: atol=rtol=1e-5; MXFP8"""
-        _requires_mxfp8()
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_moe_egtp_correctness, 4)

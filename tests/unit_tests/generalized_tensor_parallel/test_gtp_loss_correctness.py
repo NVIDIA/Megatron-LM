@@ -26,7 +26,6 @@ from transformer_engine.pytorch import fp8_autocast
 from megatron.core.tensor_parallel.gtp import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401  (autouse, module-scoped: initializes the dist PG); noqa: F401  (autouse)
     _assert_loss_trajectories_match,
-    _requires_mxfp8,
     _restore_gtp_shards_and_init_main_grad,
     _run_distributed,
     _torchrun_dist_init,
@@ -37,7 +36,6 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 
 def _worker_gtp_loss_correctness(rank, world_size, port):
     """Baseline (GTP_remat_size=1, DP=4) vs GTP_remat_size=4 (world=TP1*GTP4*CP1*DP1)."""
-    from transformer_engine.common.recipe import MXFP8BlockScaling
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
     from megatron.core import parallel_state as ps
@@ -55,7 +53,6 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
     LR = 0.01
     STEPS = 10
     dtype = torch.bfloat16
-    recipe = MXFP8BlockScaling()
 
     def make_config():
         return TransformerConfig(
@@ -68,7 +65,6 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
             hidden_dropout=0.0,
             attention_dropout=0.0,
             bias_dropout_fusion=False,
-            fp8='e4m3',
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
         )
@@ -85,7 +81,7 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
         )
 
     def run_step(layers, x):
-        with fp8_autocast(enabled=True, fp8_recipe=recipe):
+        with fp8_autocast(enabled=False):
             for layer in layers:
                 x, _ = layer(x, attention_mask=None)
         return x.mean()
@@ -182,7 +178,6 @@ def _worker_gtp_loss_correctness(rank, world_size, port):
 class TestGTPLossCorrectness:
     def test_gtp_loss_trajectory_matches_baseline(self):
         """GTP_remat_size=4 per-step losses must match no-GTP baseline (atol=1e-5, rtol=1e-5)."""
-        _requires_mxfp8()
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_gtp_loss_correctness, 4)

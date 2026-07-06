@@ -9,7 +9,7 @@ import io
 import os
 import pickle
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
@@ -382,25 +382,69 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
-def _maybe_setup_gtp_remat_group(module, gtp_remat_group, extra_kwargs):
-    """Wire an active GTP_remat group (size > 1) into TE's extra_kwargs; set module.gtp_remat_size.
+def _gtp_pre_init(
+    module, output_size, gtp_remat_group, extra_kwargs, *, is_expert=False, rng_via_kwarg=True
+):
+    """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
+    RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
+    """
+    from megatron.core.tensor_parallel.gtp import gtp_remat_shard_dim0
+    from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
 
-    No-op when GTP is inactive (gtp_remat_group None/size 1); module.gtp_remat_size unset.
-    Only the column/row/layernorm-column TE linears resolve a group and pass it here; the base
-    TELinear (used e.g. for duplicated MoE latent projections) leaves it None => unsharded.
+    shard_out, pad_length = gtp_remat_shard_dim0(output_size, gtp_remat_group)
+    gtp_ctx = (gtp_remat_group, pad_length, gtp_remat_group.size(), output_size)
+
+    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
+    if rng_via_kwarg:
+        extra_kwargs["rng_tracker_name"] = tracker_name
+    else:
+        module.rng_tracker_name = tracker_name
+    return shard_out, gtp_ctx
+
+
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+    """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
+
+    ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
+    """
+    from megatron.core.tensor_parallel.gtp import attach_gtp_to_presharded_module
+
+    gtp_remat_group, pad_length, gtp_remat_size, logical_out_features = gtp_ctx
+    module.gtp_remat_size = gtp_remat_size  # the TE-fork forward all-gather gate
+    # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in
+    # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
+    # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
+    module.out_features = logical_out_features
+    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+
+
+@contextmanager
+def _init_gtp_remat_context(
+    module,
+    output_size,
+    gtp_remat_group,
+    extra_kwargs,
+    *,
+    is_expert=False,
+    is_grouped=False,
+    rng_via_kwarg=True,
+):
+    """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
+    GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
+        yield output_size
         return
-    from megatron.core.tensor_parallel.gtp import HAVE_GTP
-
-    assert HAVE_GTP, (
-        "GTP requires TransformerEngine >= 2.17. "
-        "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
+    out_features, gtp_ctx = _gtp_pre_init(
+        module,
+        output_size,
+        gtp_remat_group,
+        extra_kwargs,
+        is_expert=is_expert,
+        rng_via_kwarg=rng_via_kwarg,
     )
-    module.gtp_remat_size = get_pg_size(gtp_remat_group)
-    extra_kwargs["gtp_remat_group"] = (
-        gtp_remat_group if torch.distributed.is_initialized() else None
-    )
+    yield out_features
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -917,9 +961,11 @@ class TELinear(te.pytorch.Linear):
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
         )
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self, output_size, gtp_remat_group, extra_kwargs, is_expert=is_expert
+        )
 
-        _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
-        with init_quant_context:
+        with init_quant_context, init_gtp_remat_context as output_size:
             super().__init__(
                 in_features=input_size,
                 out_features=output_size,
@@ -1126,7 +1172,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
         gtp_remat_group = get_gtp_weight_remat_group(is_expert=is_expert)
-        _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1135,11 +1180,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
         )
+        # Yield a separate gtp_output_size: the logical output_size is reused below for cpu-init
+        # (divide(output_size, tp_size)), so it must stay unsharded.
+        # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self, output_size, gtp_remat_group, extra_kwargs, rng_via_kwarg=False
+        )
 
-        with init_quant_context:
+        with init_quant_context, init_gtp_remat_context as gtp_output_size:
             super().__init__(
                 in_features=input_size,
-                out_features=output_size,
+                out_features=gtp_output_size,
                 eps=self.config.layernorm_epsilon,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
@@ -2034,7 +2085,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
-            _maybe_setup_gtp_remat_group(self, gtp_remat_group, extra_kwargs)
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False
@@ -2049,8 +2099,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             init_quant_context = _get_fp8_model_init_for_quant_params(
                 self.te_quant_params, torch.is_grad_enabled()
             )
+            init_gtp_remat_context = _init_gtp_remat_context(
+                self, output_size, gtp_remat_group, extra_kwargs, is_expert=True, is_grouped=True
+            )
 
-            with init_quant_context:
+            with init_quant_context, init_gtp_remat_context as output_size:
                 super().__init__(
                     num_gemms=num_gemms,
                     in_features=input_size,

@@ -28,7 +28,6 @@ import logging
 import math
 import os
 import re
-import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -188,7 +187,7 @@ def classify_gtp_chains(model) -> None:
     """
     conflicts = []
     for name, param in model.named_parameters():
-        if not isinstance(param, GTPShardedParam):
+        if not is_gtp_param(param):
             continue
         target = _classify_param_chain(name).value
         if param.prefetch_initialized and param.chain_id != target:
@@ -313,9 +312,6 @@ class GTPConfig:
     # (handle.wait + main_grad.add_) in a later bwd's cascade walk, overlapping RS with
     # compute. False: every wgrad RS is synchronous + inline (no overlap).
     async_reduction: bool = True
-    # GTP companion to --fp8-param-gather: optimizer casts FP32 master directly into
-    # GTPShardedParam.quantized; forward reuses the cached FP8 (BF16->FP8 off critical path).
-    fp8_param_gather: bool = False
     # Mirrors config.calculate_per_token_loss. When True, DDP applies NO 1/dp pre-scaling
     # (gradient_scaling_factor=1.0) and finalize_model_grads normalizes every gradient by
     # 1/total_global_tokens instead. In that mode the gtp_remat axis must be SUM-reduced (plain
@@ -343,8 +339,25 @@ def tag_gtp_params_with_names(model):
     instead of raw tensor ids.
     """
     for name, param in model.named_parameters():
-        if isinstance(param, GTPShardedParam):
+        if is_gtp_param(param):
             param._debug_name = name
+
+
+def gtp_remat_shard_dim0(dim0, gtp_remat_group):
+    """Return ``(shard_dim0, pad_length)`` for allocating a dim-0 GTP weight-remat shard."""
+    gtp_remat_size = gtp_remat_group.size()
+    if GTP_CONFIG.pad_for_alignment > 0:
+        alignment = GTP_CONFIG.pad_for_alignment * gtp_remat_size
+        pad_length = (alignment - dim0 % alignment) % alignment
+    else:
+        assert dim0 % gtp_remat_size == 0, (
+            f"gtp_remat_shard_dim0: dim0={dim0} not divisible by gtp_remat_size={gtp_remat_size}. "
+            "Enable padding (GTP_CONFIG.pad_for_alignment > 0) or make dim-0 a multiple of the "
+            "GTP group size."
+        )
+        pad_length = 0
+    padded = dim0 + pad_length
+    return padded // gtp_remat_size, pad_length
 
 
 def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
@@ -405,12 +418,208 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
     _GTP_PARAMS.append(gtp_shard)
 
 
-def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):
-    """Shard and re-register module params as GTPShardedParam.
+def _gtp_wrap_bf16_shard(module, name, param):
+    """Re-register a BF16 pre-sharded weight as a :class:`GTPShardedParam`.
 
-    Two call paths: (1) Megatron-style modules (ColumnParallelLinear, etc.) — full post-init
-    slice; (2) TE modules — per-param body no-ops, since the reset_parameters hook already
-    produced GTPShardedParam instances.
+    The weight already IS this rank's shard (built pre-sharded), so — unlike the post-init path
+    :func:`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
+    Returns the new param (also swapped into the module).
+    """
+    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+    gtp_shard = GTPShardedParam(param.data)
+    copy_tensor_model_parallel_attributes(gtp_shard, param)
+    delattr(module, name)
+    module._parameters[name] = gtp_shard
+    return gtp_shard
+
+
+def _gtp_reclass_native_fp8_shard(param):
+    """Reclass a native-FP8 pre-sharded weight into a GTP subclass in place (buffer-resident).
+
+    The dynamic ``GTP_<Fp8TensorClass>`` subclass carries GTPShardedParam's gather/RS methods while
+    keeping ``is_float8tensor`` True (so DDP/distopt keep it buffer-resident) and TE's forward can
+    call ``weight.all_gather_and_prefetch()``. The param IS this rank's FP8 shard (``quantized`` is
+    itself; never re-quantized). Returns the same (mutated) param.
+    """
+    # Preserve the param's own _quantizer (used by TE ops + the optimizer copy_->quantize_ update);
+    # _init_gtp_runtime_attrs clears it, so stash/restore.
+    native_quantizer = getattr(param, "_quantizer", None)
+    param.__class__ = _gtp_native_fp8_subclass(type(param))
+    _init_gtp_runtime_attrs(param)
+    param._gtp_native_fp8 = True
+    param._quantizer = native_quantizer
+    # Gather uses a SEPARATE quantizer copy for its per-direction set_usage; reusing the param's own
+    # would leave rowwise=False after a bwd gather, freezing the rowwise data the forward reads. The
+    # copy also keeps MXFP8 scales compact for byte-concat scale all-gather.
+    gather_q = None
+    if native_quantizer is not None:
+        gather_q = native_quantizer.copy()
+        gather_q.internal = False
+        gather_q.optimize_for_gemm = not isinstance(gather_q, MXFP8Quantizer)
+    param._gtp_gather_quantizer = gather_q
+    param.quantized = param
+    return param
+
+
+def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=False):
+    """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring."""
+    weight_names = getattr(module, "weight_names", ["weight"])
+    new_weights = []
+    for idx, name in enumerate(weight_names):
+        param = getattr(module, name, None)
+        if param is None or is_gtp_param(param):
+            continue
+        if isinstance(param, QuantizedTensor):
+            gtp_param = _gtp_reclass_native_fp8_shard(param)
+        else:
+            gtp_param = _gtp_wrap_bf16_shard(module, name, param)
+        gtp_param.pad_length = pad_length
+        _gtp_attach_attrs(gtp_param, gtp_remat_group, is_grouped=is_grouped, expert_idx=idx)
+        new_weights.append(gtp_param)
+    if is_grouped and new_weights:
+        new_weights[0].weight_list = new_weights
+
+
+# Cache of dynamic ``GTP_<Fp8TensorClass>`` subclasses, keyed by the FP8 base class.
+_GTP_NATIVE_FP8_SUBCLASSES: Dict[type, type] = {}
+
+# GTPShardedParam members NOT copied into the dynamic ``GTP_<Fp8Class>`` subclass (and why):
+#   - __new__ / __init__: construction hooks — we only *reclass* an existing FP8 instance, never
+#     construct one; GTP attrs are set afterwards by _init_gtp_runtime_attrs.
+#   - __torch_function__: keep the FP8 tensor's OWN tensor dispatch, not GTPShardedParam's.
+#   - __dict__ / __weakref__ / __module__ / __doc__ / __qualname__ / __slots__: per-class machinery
+#     for GTPShardedParam itself; copying it would corrupt the new subclass's identity/layout.
+_GTP_SUBCLASS_SKIP = frozenset(
+    {
+        "__new__",
+        "__init__",
+        "__torch_function__",
+        "__dict__",
+        "__weakref__",
+        "__module__",
+        "__doc__",
+        "__qualname__",
+        "__slots__",
+    }
+)
+
+
+def _gtp_native_fp8_subclass(base_cls: type) -> type:
+    """Cached ``base_cls`` subclass + GTPShardedParam's methods (isinstance(base_cls) kept True).
+
+    CRITICAL: skip names already in the FP8 MRO — a GTPShardedParam method shadowing one TE needs
+    (e.g. get_data_tensors) silently freezes optimizer updates.
+    """
+    sub = _GTP_NATIVE_FP8_SUBCLASSES.get(base_cls)
+    if sub is None:
+        base_mro_names = set()
+        for klass in base_cls.__mro__:
+            base_mro_names.update(vars(klass).keys())
+        ns = {
+            k: v
+            for k, v in vars(GTPShardedParam).items()
+            if k not in _GTP_SUBCLASS_SKIP and k not in base_mro_names
+        }
+        # Share the (class-level) prefetch chain-state dicts with GTPShardedParam.
+        ns["_chain_state"] = GTPShardedParam._chain_state
+        ns["_recompute_chain_state"] = GTPShardedParam._recompute_chain_state
+        sub = type(f"GTP_{base_cls.__name__}", (base_cls,), ns)
+        _GTP_NATIVE_FP8_SUBCLASSES[base_cls] = sub
+    return sub
+
+
+def is_gtp_param(param) -> bool:
+    """True if ``param`` is a GTP weight-remat shard (BF16 or native-FP8)."""
+    return getattr(param, "is_gtp_weight_remat", False)
+
+
+def dequantize_gtp_native_fp8(param):
+    """Dequantize a native-FP8 GTP param to a plain BF16 tensor (used at the checkpoint boundary).
+
+    TE's ``tex.dequantize`` dispatches on the *exact* FP8 class and rejects our dynamic
+    ``GTP_<Fp8TensorClass>`` subclass, so restore the base FP8 class for the call and reclass after.
+    """
+    from megatron.core.fp8_utils import dequantize_fp8_tensor
+
+    sub_cls = type(param)
+    base_cls = sub_cls.__mro__[1]  # _gtp_native_fp8_subclass builds type("GTP_X", (base_cls,), ...)
+    param.__class__ = base_cls
+    try:
+        return dequantize_fp8_tensor(param)
+    finally:
+        param.__class__ = sub_cls
+
+
+@contextmanager
+def gtp_native_fp8_load_context(module):
+    """Restore the base FP8 class on native-FP8 GTP params under ``module`` for a load copy.
+
+    ``load_state_dict`` does ``param.copy_(bf16)`` -> TE ``convert_and_update_tensor``, whose
+    ``IsMXFP8Tensor`` C++ check rejects our dynamic subclass (the load-side twin of
+    :func:`dequantize_gtp_native_fp8`). Presenting the base class lets TE re-quantize into the FP8
+    storage; instance attrs live in ``__dict__`` and survive the swap, so the GTP surface persists.
+    """
+    from megatron.core.fp8_utils import is_float8tensor
+
+    swapped = []
+    for param in module.parameters(recurse=True):
+        if getattr(param, "is_gtp_weight_remat", False) and is_float8tensor(param):
+            sub_cls = type(param)
+            base_cls = sub_cls.__mro__[1]
+            if base_cls is not sub_cls:
+                param.__class__ = base_cls
+                swapped.append((param, sub_cls))
+    try:
+        yield
+    finally:
+        for param, sub_cls in swapped:
+            param.__class__ = sub_cls
+
+
+@contextmanager
+def gtp_preserve_native_fp8_shards(model_chunks):
+    """Snapshot + restore native-FP8 GTP shards around a forced DDP param-sync (a no-op for them).
+
+    The pre-save ``force_param_sync`` copy-back re-quantizes the shard from stale near-zero
+    param_data — the mantissa barely moves, but the E8M0 scale collapses, so the dequantized weight
+    collapses. GTP gathers this shard via its own path (not the DDP DP-gather), so nothing
+    re-materializes it before the next forward → spike, until the optimizer re-quantizes from the
+    fp32 master. We snapshot all four FP8 planes (rowwise/columnwise data + scales) first and
+    restore them, making the forced sync a no-op for GTP shards.
+    """
+    from megatron.core.fp8_utils import is_float8tensor
+
+    chunks = model_chunks if isinstance(model_chunks, (list, tuple)) else [model_chunks]
+    planes = ("_rowwise_data", "_columnwise_data", "_rowwise_scale_inv", "_columnwise_scale_inv")
+    saved = []
+    for chunk in chunks:
+        for param in chunk.parameters(recurse=True):
+            if not (getattr(param, "is_gtp_weight_remat", False) and is_float8tensor(param)):
+                continue
+            snap = {
+                p: getattr(param, p).detach().clone()
+                for p in planes
+                if getattr(param, p, None) is not None
+            }
+            saved.append((param, snap))
+    try:
+        yield
+    finally:
+        for param, snap in saved:
+            for name, tensor in snap.items():
+                cur = getattr(param, name, None)
+                if cur is not None and cur.shape == tensor.shape:
+                    cur.copy_(tensor)
+
+
+def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):
+    """Shard and re-register module params as GTPShardedParam (post-init slice).
+
+    Called post-init for Megatron-style local modules (ColumnParallelLinear, etc.), which build
+    the full weight and slice it here. TE modules do NOT use this path — they are constructed
+    already-shard-sized (GTP-agnostic init) and wired via :func:`attach_gtp_to_presharded_module`.
+    Params that are already GTP are skipped.
     """
     if gtp_remat_group.size() == 1:
         return
@@ -420,8 +629,8 @@ def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=Non
         if param is None:
             continue
 
-        # TE-side hook already sliced this one.
-        if isinstance(param, GTPShardedParam):
+        # Already a GTP param (TE-side slice, or native-FP8 attach) — skip.
+        if is_gtp_param(param):
             continue
 
         # delete the original parameter, which will be replaced by an GTP sharded one
@@ -434,38 +643,6 @@ def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=Non
 
     if is_grouped:
         allweights = [getattr(module, name) for name in weight_names]
-        allweights[0].weight_list = allweights
-
-
-def gtp_slice_in_reset_parameters(module, name, param, expert_idx=0):
-    """Slice + attach attrs for one param, between init_fn(param) and the optional
-    quantizer(param) in TransformerEngineBaseModule.reset_parameters.
-
-    Only fires for params in module.weight_names (GEMM weights); layer-norm gammas, biases,
-    etc. stay full-size. Returns the new GTPShardedParam, or None (GTP not active here).
-    """
-    gtp_remat_group = getattr(module, "_gtp_remat_group", None)
-    if gtp_remat_group is None or gtp_remat_group.size() == 1:
-        return None
-    weight_names = getattr(module, "weight_names", None)
-    if weight_names is None or name not in weight_names:
-        return None
-    is_grouped = bool(getattr(module, "_gtp_is_grouped", False))
-    gtp_shard = _gtp_slice_one_param(param, gtp_remat_group, name=name)
-    _gtp_attach_attrs(gtp_shard, gtp_remat_group, is_grouped=is_grouped, expert_idx=expert_idx)
-    return gtp_shard
-
-
-def gtp_finalize_module_in_reset_parameters(module, weight_names):
-    """GroupedLinear-only: attach weight_list to expert 0's shard for batched all-gather
-    (no-op when module._gtp_is_grouped is False)."""
-    if not getattr(module, "_gtp_is_grouped", False):
-        return
-    gtp_remat_group = getattr(module, "_gtp_remat_group", None)
-    if gtp_remat_group is None or gtp_remat_group.size() == 1:
-        return
-    allweights = [getattr(module, n) for n in weight_names]
-    if allweights:
         allweights[0].weight_list = allweights
 
 
@@ -495,6 +672,74 @@ class GTPShardHandle:
                     w._set_state(GTPWeightState.DATA_READY)
 
         _inflight_comm_params.discard(self.gtp_shards[0])
+
+
+def _init_gtp_runtime_attrs(obj):
+    """Initialize the full GTP runtime-state attribute surface on ``obj``.
+
+    Shared by :meth:`GTPShardedParam.__init__` (legacy BF16 slice path) and
+    :func:`attach_gtp_to_presharded_module` (native-FP8 reclass path), so both param-class
+    representations carry identical state. chain_id/group are set by the caller afterward.
+    """
+    # Canonical flag — also set on distopt's main_param copy so both kinds
+    # of param can be classified via a single attribute check.
+    obj.is_gtp_weight_remat = True
+    # all gather
+    obj.state = GTPWeightState.NONE
+    obj._ag_ticket_fwd = None
+    obj._ag_ticket_bwd = None
+    obj._prefetch_handle = None
+    obj._need_weight_prefetch = True
+    # Per-direction prefetch opt-outs (default True). The embedding weight needs no bwd AG
+    # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
+    # sets this False for embedding.word_embeddings.weight.
+    obj._need_weight_prefetch_bwd = True
+    obj.ag_event = torch.cuda.Event(external=True)
+    # DDP backward hook (set by register_grad_accum_hook); invoked after
+    # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
+    obj._grad_accum_hook = None
+    # Quantization. For native-FP8 GTP the reclass path overwrites _quantizer with the tensor's
+    # own MXFP8 quantizer and points quantized at self; BF16 GTP leaves both unset.
+    obj._quantizer = None
+    obj.quantized = None
+    # Prefetching linked list
+    obj.prefetch_initialized = False
+    obj.next_w = None
+    obj.prev_w = None
+    # Recompute-forward prefetch chain: a SEPARATE chain (own slot) for weights re-gathered
+    # rowwise during an activation-recompute forward in backward. Distinct from the
+    # state/_prefetch_handle/ag_event above so it never clobbers the concurrent columnwise
+    # dgrad lifecycle. Self-populates from the first backward's recompute gathers.
+    obj._recompute_initialized = False
+    obj._recompute_next = None
+    obj._recompute_prev = None
+    obj._recompute_prefetch_handle = None
+    obj._recompute_ag_event = torch.cuda.Event(external=True)
+    obj._recompute_already_drained = False
+    # Chain identity (GRAPHED/UNGRAPHED). Defaults to UNGRAPHED; classify_gtp_chains(model)
+    # walks the model at init (after set_cuda_graph_modules) and reclassifies on param name +
+    # active cuda_graph_modules.
+    obj.chain_id = GTPChain.UNGRAPHED.value
+    # Grouped gemm
+    obj.is_routed_expert = False
+    obj.expert_idx = None
+    obj.group = None
+    obj.weight_list = None
+    # Reduce-scatter state (set during wgrad_reduce_scatter)
+    obj.rs_state = GTPWeightState.NONE
+    obj._wgrad_rs_handle = None
+    obj.rs_event = torch.cuda.Event(external=True)
+    obj._rs_ticket = None
+    # Padding
+    obj.pad_length = 0
+    # Debug
+    obj._debug_name = ""
+    # Hot-path caches (populated lazily on first use).  chain_id/group are
+    # set after init, so we can't resolve streams eagerly here.
+    obj._cached_ag_stream = None
+    obj._cached_rs_stream = None
+    obj._cached_dtypes = None
+    obj._cached_gtp_remat_group = None
 
 
 class GTPShardedParam(torch.nn.Parameter):
@@ -560,7 +805,7 @@ class GTPShardedParam(torch.nn.Parameter):
             # ``.dtype``. So surface its raw storage dtype (e.g. uint8) tagged with the quantized
             # class to make the FP8 all-gather unambiguous.
             q = getattr(param, "quantized", None)
-            if getattr(param, "did_cast_to_low_precision", False) and q is not None:
+            if getattr(param, "_gtp_native_fp8", False) and q is not None:
                 raw = getattr(q, "_rowwise_data", None)
                 if raw is None:
                     raw = getattr(q, "_data", None)
@@ -596,106 +841,7 @@ class GTPShardedParam(torch.nn.Parameter):
     def __init__(self, tensor, *args, **kwargs):
         del tensor, args, kwargs
         super().__init__()
-
-        # Canonical flag — also set on distopt's main_param copy so both kinds
-        # of param can be classified via a single attribute check.
-        self.is_gtp_weight_remat = True
-
-        # all gather
-        self.state = GTPWeightState.NONE
-        self._ag_ticket_fwd = None
-        self._ag_ticket_bwd = None
-        self._prefetch_handle = None
-        self._need_weight_prefetch = True
-        # Per-direction prefetch opt-outs (default True). The embedding weight needs no bwd AG
-        # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
-        # sets this False for embedding.word_embeddings.weight.
-        self._need_weight_prefetch_bwd = True
-        self.ag_event = torch.cuda.Event(external=True)
-        # DDP backward hook (set by register_grad_accum_hook); invoked after
-        # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
-        self._grad_accum_hook = None
-        # Quantization
-        self._quantizer = None
-        self.did_cast_to_low_precision = False
-        self.quantized = None
-        # Prefetching linked list
-        self.prefetch_initialized = False
-        self.next_w = None
-        self.prev_w = None
-        # Recompute-forward prefetch chain: a SEPARATE chain (own slot) for weights re-gathered
-        # rowwise during an activation-recompute forward in backward. Distinct from the
-        # state/_prefetch_handle/ag_event above so it never clobbers the concurrent columnwise
-        # dgrad lifecycle. Self-populates from the first backward's recompute gathers.
-        self._recompute_initialized = False
-        self._recompute_next = None
-        self._recompute_prev = None
-        self._recompute_prefetch_handle = None
-        self._recompute_ag_event = torch.cuda.Event(external=True)
-        self._recompute_already_drained = False
-        # Chain identity (GRAPHED/UNGRAPHED). Defaults to UNGRAPHED; classify_gtp_chains(model)
-        # walks the model at init (after set_cuda_graph_modules) and reclassifies on param name +
-        # active cuda_graph_modules.
-        self.chain_id = GTPChain.UNGRAPHED.value
-        # Grouped gemm
-        self.is_routed_expert = False
-        self.expert_idx = None
-        self.group = None
-        self.weight_list = None
-        # Reduce-scatter state (set during wgrad_reduce_scatter)
-        self.rs_state = GTPWeightState.NONE
-        self._wgrad_rs_handle = None
-        self.rs_event = torch.cuda.Event(external=True)
-        self._rs_ticket = None
-        # Padding
-        self.pad_length = 0
-        # Debug
-        self._debug_name = ""
-        # Hot-path caches (populated lazily on first use).  chain_id/group are
-        # set after __init__, so we can't resolve streams eagerly here.
-        self._cached_ag_stream = None
-        self._cached_rs_stream = None
-        self._cached_quantizers = None
-        self._cached_dtypes = None
-        self._cached_gtp_remat_group = None
-
-    def setup(self, weight_quantizer=None):
-        """Set quantizer and create quantized shard."""
-
-        if self._quantizer is None:
-
-            def _configure_quantizer(q, group):
-                q = q.copy()
-                if hasattr(q, "with_amax_reduction"):
-                    q.with_amax_reduction = True
-                    q.amax_reduction_group = group
-                q.internal = False
-                # MXFP8 scales must stay compact (unswizzled) so per-shard scale_inv can be
-                # all-gathered by byte concatenation. GEMM-swizzled scales from independent
-                # shards don't compose into a valid swizzled layout for the full tensor.
-                q.optimize_for_gemm = not isinstance(q, MXFP8Quantizer)
-                return q
-
-            weights = (
-                self.weight_list
-                if self.is_routed_expert and self.weight_list is not None
-                else [self]
-            )
-            for quantizer, weight in zip(weight_quantizer, weights):
-                if quantizer is None:
-                    continue
-
-                weight._quantizer = _configure_quantizer(quantizer, weight.group)
-                # This init quantize is the only allocation of the quantized storage
-                # (re-quantize writes in place), so route it via _graphed_alloc.
-                with _graphed_alloc(getattr(weight, "chain_id", GTPChain.UNGRAPHED.value)):
-                    weight.quantized = weight._quantizer.quantize(weight.get_padded_shard())
-                weight.quantized.is_routed_expert = getattr(weight, "is_routed_expert", False)
-                # fp8_param_gather: the init quantize already produced a valid FP8 cache from
-                # the BF16 shard; flag did_cast so iter-0 forward short-circuits and skips the
-                # redundant BF16->FP8 cast.
-                if GTP_CONFIG.fp8_param_gather:
-                    weight.did_cast_to_low_precision = True
+        _init_gtp_runtime_attrs(self)
 
     @property
     def _weights(self):
@@ -759,29 +905,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 reduce_scatter,
             )
         return (self._unsharded_shape_padded, dtype, self.expert_idx, reduce_scatter)
-
-    def _quantize_if_needed(self, skip_weight_cast=False, cast_noop_flag=None):
-        """Re-quantize sharded weight into existing buffer. Returns quantized weight or self."""
-        if self._quantizer is None:
-            self.did_cast_to_low_precision = False
-            return self
-
-        # fp8_param_gather fast-path: optimizer already filled self.quantized;
-        # reuse it and keep BF16->FP8 off the forward critical path.
-        if GTP_CONFIG.fp8_param_gather and self.did_cast_to_low_precision:
-            return self.quantized
-
-        self._quantizer.set_usage(rowwise=True, columnwise=True)
-        if skip_weight_cast is False or cast_noop_flag is not None:
-            tex.quantize(
-                tensor=self.get_padded_shard(),
-                quantizer=self._quantizer,
-                output=self.quantized,
-                noop=cast_noop_flag,
-            )
-        self.did_cast_to_low_precision = True
-
-        return self.quantized
 
     def _strip_padding(self, tensor):
         if self.pad_length == 0:
@@ -854,32 +977,29 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in weights:
                 w._set_state(new_state)
 
-        # 2. Prepare: quantize, set usage direction.
-        fp8_pg_hit = GTP_CONFIG.fp8_param_gather and self.did_cast_to_low_precision
+        # 2. Set FP8 usage direction (rowwise for fwd, columnwise for bwd) on the GATHER
+        #    quantizer copy — NEVER on the param's own quantizer: the optimizer's
+        #    copy_ -> quantize_ update writes whichever usages the param quantizer has enabled,
+        #    so leaving it rowwise=False after a bwd gather would freeze the rowwise (fwd) data.
+        #    No re-quantize here: with mxfp8 + --fp8-param-gather the shard already IS a native
+        #    FP8 tensor. BF16 GTP carries no quantizer and gathers the BF16 shard as-is.
+        native_fp8 = getattr(self, "_gtp_native_fp8", False)
+        quantizers = [getattr(w, "_gtp_gather_quantizer", None) for w in weights]
+        if native_fp8:
+            for q in quantizers:
+                q.set_usage(rowwise=fwd, columnwise=not fwd)
 
-        if not fp8_pg_hit:
-            for w in weights:
-                w._quantize_if_needed(skip_weight_cast, cast_noop_flag)
-
-        for w in weights:
-            if w.did_cast_to_low_precision:
-                w._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
-
-        # 3. Build gather inputs.
-        # quantizers / dtypes / gtp_remat_group are stable post-construction — cache on the anchor
-        # (self == weights[0]) to avoid rebuilding lists each call. w.quantized is NOT cached
-        # (it can rebind).
-        quantizers = self._cached_quantizers
-        if quantizers is None:
-            quantizers = [w._quantizer for w in weights]
-            self._cached_quantizers = quantizers
-        if weights[0].did_cast_to_low_precision:
+        # 3. Build gather inputs. The gather collective takes the per-weight quantizers so it can
+        #    reconstruct the gathered FP8 tensor's scale/metadata (None for BF16 GTP).
+        if native_fp8:
             gather_weights = [w.quantized for w in weights]
         else:
             gather_weights = list(w.get_padded_shard() for w in weights)
 
         # 4. Cache checkout — use pooled buffers for both async and sync gathers
-        #    to avoid allocating fresh memory each iteration.
+        #    to avoid allocating fresh memory each iteration. gather-buffer dtypes are stable
+        #    post-construction (FP8 quantizer dtype for native-FP8 shards, else the BF16 dtype),
+        #    so cache them on the anchor (self == weights[0]) instead of rebuilding each call.
         dtypes = self._cached_dtypes
         if dtypes is None:
             dtypes = [q.dtype if q is not None else w.dtype for q, w in zip(quantizers, weights)]
@@ -1204,8 +1324,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
             cache = get_global_GTP_cache()
 
-            # Set the fwd ag buffer
-            quantizers = [w._quantizer for w in self._weights]
+            # Set the fwd ag buffer (gather quantizer copy — the param's own quantizer is
+            # reserved for the optimizer's update path; see attach_gtp_to_presharded_module).
+            quantizers = [getattr(w, "_gtp_gather_quantizer", None) for w in self._weights]
             dtypes = [
                 q.dtype if q is not None else w.dtype for q, w in zip(quantizers, self._weights)
             ]
@@ -1565,11 +1686,13 @@ class GTPWeightCache:
         # Route GRAPHED-chain buffers into the CG mempool at creation (see _graphed_alloc).
         with _graphed_alloc(getattr(param, "chain_id", GTPChain.UNGRAPHED.value)):
             if not isinstance(dtype, torch.dtype):
-                quantizer = param._quantizer
+                # Use the gather quantizer copy: mutating the param's own quantizer usage
+                # would corrupt the optimizer's quantize_ update direction (frozen weights).
+                quantizer = getattr(param, "_gtp_gather_quantizer", None) or param._quantizer
                 assert quantizer is not None
-                param._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
+                quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
 
-                buf = param._quantizer.make_empty(
+                buf = quantizer.make_empty(
                     out_shape, dtype=torch.bfloat16, device=torch.cuda.current_device()
                 )
             else:
@@ -1832,18 +1955,6 @@ def reset_gtp_state():
     GTPShardedParam._recompute_chain_state.clear()
 
 
-def reset_gtp_quantize_cache(model):
-    """Invalidate the per-shard low-precision cache after a checkpoint load.
-
-    DCP load copies new data into GTPShardedParam.data in-place, leaving a stale FP8/MXFP8/NVFP4
-    buffer in self.quantized. Call once after load so the next forward re-quantizes from the
-    freshly-loaded weight.
-    """
-    for param in model.parameters():
-        if isinstance(param, GTPShardedParam):
-            param.did_cast_to_low_precision = False
-
-
 # ------------------------------------------------------------------------
 # Distributed-checkpointing helpers
 # ------------------------------------------------------------------------
@@ -1865,10 +1976,9 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
 ):
     """GTP-aware analogue of make_sharded_tensors_for_checkpoint.
 
-    Detects GTP sharding per-tensor (isinstance(tensor, GTPShardedParam)). Non-GTP tensors keep
-    the vanilla offsets exactly; GTP tensors layer the GTP axis-0 split on top. No-op (delegates
-    to the vanilla helper) when no tensor is a GTPShardedParam, so this is zero-cost when GTP is
-    inactive.
+    Per-tensor (is_gtp_param): GTP tensors layer the axis-0 GTP split on the vanilla offsets (FP8
+    shards dequantized to BF16 for save); non-GTP tensors delegate to the vanilla helper unchanged,
+    so this is zero-cost when GTP is inactive.
     """
     from megatron.core.transformer.utils import (  # noqa: E402
         make_sharded_object_for_checkpoint,
@@ -1882,7 +1992,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     )
 
     # Fast path: no GTP-sharded params → defer to vanilla helper, same output.
-    if not any(isinstance(t, GTPShardedParam) for t in state_dict.values()):
+    if not any(is_gtp_param(t) for t in state_dict.values()):
         return make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
@@ -1900,7 +2010,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     tp_size = get_pg_size(tp_group)
     # All GTP params in this state_dict share the same gtp_remat_group (set by the
     # wrap hook at module init), so pick it off the first GTP shard.
-    gtp_remat_group = next(t.group for t in state_dict.values() if isinstance(t, GTPShardedParam))
+    gtp_remat_group = next(t.group for t in state_dict.values() if is_gtp_param(t))
     gtp_rank = get_pg_rank(gtp_remat_group)
     gtp_remat_size = get_pg_size(gtp_remat_group)
 
@@ -1917,7 +2027,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     sharded_state_dict = {}
     for layer_name, tensor in state_dict.items():
         layer_key = f"{prefix}{layer_name}"
-        is_gtp_weight_remat = isinstance(tensor, GTPShardedParam)
+        is_gtp_weight_remat = is_gtp_param(tensor)
 
         if layer_name.endswith(extra_state_suffix):
             # ShardedObject (extra_state metadata): GTP-REPLICATED across the GTP group. Fold
@@ -1970,27 +2080,3 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
         )
 
     return sharded_state_dict
-
-
-# Wire GTP into TE's hook registry at import time, so any later
-# ``te.Linear(gtp_remat_group=...)`` routes through the hooks below. If TE is too old to
-# expose ``register_gtp_hooks``, GTP silently no-ops (the warning surfaces that).
-try:
-    from transformer_engine.pytorch.module.base import (  # noqa: E402
-        register_gtp_hooks as _te_register_gtp_hooks,
-    )
-
-    _te_register_gtp_hooks(
-        slice_fn=gtp_slice_in_reset_parameters,
-        finalize_fn=gtp_finalize_module_in_reset_parameters,
-        wrap_fn=wrap_module_params_gtp,
-    )
-except ImportError:
-    warnings.warn(
-        "megatron.core.tensor_parallel.gtp: TransformerEngine does not expose register_gtp_hooks; "
-        "GTP will be a no-op for te.Linear / te.LayerNormLinear / te.GroupedLinear. "
-        "GTP requires TransformerEngine >= 2.17 (planned release). "
-        "Upgrade TransformerEngine to a build that includes the GTP hook registry.",
-        RuntimeWarning,
-        stacklevel=2,
-    )

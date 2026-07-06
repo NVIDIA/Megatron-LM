@@ -96,7 +96,7 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     writers for one shard and rejects the save.
 
     FIX: fold the (e)gtp_remat rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
-    params (``GTPShardedParam``) are offset-sharded and excluded -- each shard already has a
+    params (``is_gtp_param``) are offset-sharded and excluded -- each shard already has a
     distinct offset, hence a unique writer.
 
     Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
@@ -105,7 +105,7 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     """
     gtp_fold: Dict[str, Tuple[int, int]] = {}
     try:
-        from megatron.core.tensor_parallel.gtp import HAVE_GTP, GTPShardedParam
+        from megatron.core.tensor_parallel.gtp import HAVE_GTP, is_gtp_param
     except ImportError:
         return gtp_fold
     if not HAVE_GTP:
@@ -124,7 +124,7 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
 
     for model_chunk in model_chunks:
         for name, p in model_chunk.named_parameters():
-            if isinstance(p, GTPShardedParam):
+            if is_gtp_param(p):
                 continue
             grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
             if grp is None or grp.size() <= 1:

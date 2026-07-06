@@ -2,35 +2,29 @@
 
 """Unit tests for Generalized Tensor Parallelism (GTP).
 
+Scope: sharding math, module wiring, and behavior/regression guards. End-to-end fwd/bwd/loss/grad,
+fp8, and checkpoint correctness live in the integration tests (test_gtp_loss_correctness,
+test_gtp_grad_correctness, test_attention_gtp, test_mamba_gtp, test_moe_egtp,
+test_gtp_fp8_param_gather, test_gtp_dcp), so low-level plumbing smoke tests are not duplicated here.
+
 Test groups
 -----------
-1.  TestGTPWeightState           - state-machine transitions (single-process)
-2.  TestGTPWeightCache           - coat-check buffer pool + reserve/get/release semantics (single-process)
-3.  TestGTPSharding              - wrap_module_params_gtp: shard content + padding (multi-GPU)
-4.  TestWrapModuleParams         - wrap_module_params_gtp: param replacement + weight_list (multi-GPU)
-5.  TestLinearGTP                - Linear forward/backward numerical correctness (multi-GPU)
-6.  TestLayerNormLinearGTP       - LayerNormLinear forward/backward smoke test (multi-GPU)
-7.  TestGroupedLinearGTP         - GroupedLinear forward/backward smoke test (multi-GPU)
-8.  TestGTPPrefetchChain         - linked-list next_w/prev_w wiring (multi-GPU)
-9.  TestGTPWgradRS               - wgrad reduce-scatter shape + multi-layer deferred path (multi-GPU)
-10. TestGTPMicrobatches          - output consistency across microbatches (multi-GPU)
-11. TestNVFP4LinearGTP           - Linear + NVFP4 recipe: quantized shard setup, fwd/bwd (multi-GPU)
-12. TestNVFP4GroupedLinearGTP    - GroupedLinear + NVFP4 recipe: coalesced AG + fwd/bwd (multi-GPU)
-13. TestMXFP8LinearGTP           - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding (multi-GPU)
-14. TestGTPConfig                - update_gtp_config: valid/invalid keys (single-process)
-15. TestGTPShardedParamProperties - shape computations, get_padded_shard, _strip_padding (single-process)
-16. TestGTPCacheKey              - _get_cache_key: expert vs non-expert, fwd vs bwd (single-process)
-17. TestTagGTPParamsWithNames    - _debug_name population on GTPShardedParam (single-process)
-18. TestGTPGroupSizeOne          - wrap_module_params_gtp no-op when gtp_remat_group.size()==1 (single-process)
-19. TestGTPPrefetchDisabled      - weight_prefetch=False: single-pass forward still works (multi-GPU)
-20. TestFuseWgradAccumulation    - fuse_wgrad_accumulation=True: wgrad→main_grad (multi-GPU)
-21. TestGTPGradAccumHook         - main_grad updated after reduce-scatter backward (multi-GPU)
-22. TestWaitAsyncCommsFallback   - wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
-23. TestGTPDDPBucketAlignment    - GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
-24. TestGTPDDPGradReadyWiring    - GTP params drive DDP grad-ready via the manual hook after wgrad add, not autograd (multi-GPU)
+- TestGTPSharding            - wrap_module_params_gtp: shard content + padding
+- TestWrapModuleParams       - wrap_module_params_gtp: param replacement + weight_list
+- TestLinearGTP / TestLayerNormLinearGTP / TestGroupedLinearGTP - single-layer fwd/bwd
+- TestGTPPrefetchChain       - linked-list next_w/prev_w wiring
+- TestGTPWgradRS             - wgrad reduce-scatter shape + multi-layer deferred path
+- TestGTPMicrobatches        - output consistency across microbatches
+- TestMXFP8LinearGTP         - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding
+- TestGTPGroupSizeOne        - wrap_module_params_gtp no-op when gtp_remat_group.size()==1
+- TestGTPPrefetchDisabled    - weight_prefetch=False single-pass forward
+- TestFuseWgradAccumulation  - fuse_wgrad_accumulation=True: wgrad -> main_grad
+- TestGTPGradAccumHook       - main_grad updated after reduce-scatter backward
+- TestWaitAsyncCommsFallback - inline-accumulation fallback when _wgrad_rs_handle is None
+- TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
+- TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 
-Multi-GPU tests skip when ``torch.distributed.get_world_size()`` doesn't match the required
-world size (4 for everything in this file).
+Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
 
 import pytest
@@ -44,22 +38,16 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
 
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import NVFP4BlockScaling
 from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-    GTPWeightCache,
-    GTPWeightState,
-)
 from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
     _requires_multi_gpu,
     _requires_mxfp8,
-    _requires_nvfp4,
     _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -79,149 +67,6 @@ class _FakeGroup:
 
     def rank(self):
         return self._rank
-
-
-# ---------------------------------------------------------------------------
-# 1. GTPWeightState - state-machine transition tests
-# ---------------------------------------------------------------------------
-
-
-class TestGTPWeightState:
-
-    @staticmethod
-    def _param():
-        return GTPShardedParam(torch.zeros(4, 4))
-
-    def test_full_cycle(self):
-        p = self._param()
-        assert p.state == GTPWeightState.NONE
-        p._set_state(GTPWeightState.ASYNC_WAIT)
-        p._set_state(GTPWeightState.DATA_READY)
-        p._set_state(GTPWeightState.NONE)
-        assert p.state == GTPWeightState.NONE
-
-    def test_sync_path_cycle(self):
-        """NONE → DATA_READY_SYNC → NONE (sync all-gather path)."""
-        p = self._param()
-        p._set_state(GTPWeightState.DATA_READY_SYNC)
-        p._set_state(GTPWeightState.NONE)
-        assert p.state == GTPWeightState.NONE
-
-    def test_rs_state_full_cycle(self):
-        """RS state machine: NONE → ASYNC_WAIT → DATA_READY → NONE."""
-        p = self._param()
-        assert p.rs_state == GTPWeightState.NONE
-        p._set_rs_state(GTPWeightState.ASYNC_WAIT)
-        p._set_rs_state(GTPWeightState.DATA_READY)
-        p._set_rs_state(GTPWeightState.NONE)
-        assert p.rs_state == GTPWeightState.NONE
-
-
-# ---------------------------------------------------------------------------
-# 2. GTPWeightCache - coat-check buffer pool tests
-# ---------------------------------------------------------------------------
-
-
-class TestGTPWeightCache:
-
-    def _param(self, shape=(8, 4), gtp_remat_size=2):
-        p = GTPShardedParam(torch.zeros(*shape))
-        p.group = _FakeGroup(size=gtp_remat_size)
-        p.expert_idx = None
-        p.pad_length = 0
-        p._quantizer = None
-        return p
-
-    def test_reserve_returns_ticket(self):
-        cache = GTPWeightCache()
-        p = self._param()
-        ticket = cache.reserve(p, torch.bfloat16, fwd=True)
-        assert isinstance(ticket, int)
-
-    def test_reserve_get_roundtrip(self):
-        cache = GTPWeightCache()
-        p = self._param()
-        ticket = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf = cache.get(ticket)
-        assert buf is not None
-        # get() returns same buf on second call (buf cached in slot)
-        buf2 = cache.get(ticket)
-        assert buf2 is buf
-
-    def test_buffer_reused_after_release(self):
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        cache.release(t1)
-        # Reserve a new ticket, buf should come from pool
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf1 is buf2, "Buffer should be reused from pool after release"
-        cache.release(t2)
-
-    def test_two_simultaneous_reserves_are_distinct(self):
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf1 is not buf2, "Concurrent reserves must get distinct buffers"
-
-    def test_tickets_are_unique(self):
-        """Each reserve() call returns a new unique ticket."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        assert t1 != t2, "Each reserve() must return a unique ticket"
-
-    def test_invalid_ticket_raises(self):
-        cache = GTPWeightCache()
-        with pytest.raises(KeyError):
-            cache.get(9999)
-
-    def test_different_shapes_use_distinct_pool_slots(self):
-        cache = GTPWeightCache()
-        p1 = self._param(shape=(8, 4))
-        p2 = self._param(shape=(16, 4))
-        t1 = cache.reserve(p1, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        t2 = cache.reserve(p2, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf1.shape != buf2.shape
-        cache.release(t1)
-        cache.release(t2)
-
-    def test_without_release_pool_stays_empty(self):
-        """Without release(), subsequent reserves allocate fresh buffers."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        # Do NOT release t1 — pool stays empty
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf2 is not buf1, "Without release, a fresh buffer must be allocated"
-
-    def test_release_invalid_ticket_raises(self):
-        cache = GTPWeightCache()
-        with pytest.raises(KeyError):
-            cache.release(9999)
-
-    def test_fwd_bwd_tickets_are_distinct(self):
-        """fwd=True and fwd=False reserves always receive distinct ticket IDs."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t_fwd = cache.reserve(p, torch.bfloat16, fwd=True)
-        t_bwd = cache.reserve(p, torch.bfloat16, fwd=False)
-        assert t_fwd != t_bwd
-
-
-# ---------------------------------------------------------------------------
-# 3. GTP_remat weight sharding: shard content and alignment padding
-# ---------------------------------------------------------------------------
 
 
 def _worker_sharding_aligned(rank, world_size, port):
@@ -287,7 +132,7 @@ class TestGTPSharding:
 
 
 # ---------------------------------------------------------------------------
-# 4. wrap_module_params_gtp: param replacement and GroupedLinear weight_list
+# wrap_module_params_gtp: param replacement and GroupedLinear weight_list
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +168,7 @@ class TestWrapModuleParams:
 
 
 # ---------------------------------------------------------------------------
-# 5. Linear forward/backward numerical correctness
+# Linear forward/backward numerical correctness
 # ---------------------------------------------------------------------------
 
 
@@ -383,7 +228,7 @@ class TestLinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 6. LayerNormLinear forward/backward smoke test
+# LayerNormLinear forward/backward smoke test
 # ---------------------------------------------------------------------------
 
 
@@ -394,13 +239,12 @@ def _worker_layernorm_linear(rank, world_size, port):
     gtp_remat_group = dist.new_group(list(range(world_size)))
 
     layer = te.LayerNormLinear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_remat_group=gtp_remat_group,
+        in_features=in_f, out_features=out_f, bias=False, params_dtype=dtype, device="cuda"
     )
+    # TE construction is GTP-agnostic: gtp_remat_size (forward-gather gate) is stamped and the
+    # BF16 weight is sliced post-init (Megatron side).
+    layer.gtp_remat_size = gtp_remat_group.size()
+    wrap_module_params_gtp(layer, layer.weight_names, gtp_remat_group)
     assert isinstance(layer.weight, GTPShardedParam)
 
     inp = torch.randn(seq, batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
@@ -421,7 +265,7 @@ class TestLayerNormLinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 7. GroupedLinear forward/backward smoke test
+# GroupedLinear forward/backward smoke test
 # ---------------------------------------------------------------------------
 
 
@@ -458,7 +302,7 @@ class TestGroupedLinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 8. Prefetch chain: next_w / prev_w wiring after first forward pass
+# Prefetch chain: next_w / prev_w wiring after first forward pass
 # ---------------------------------------------------------------------------
 
 
@@ -515,7 +359,7 @@ class TestGTPPrefetchChain:
 
 
 # ---------------------------------------------------------------------------
-# 9. Wgrad reduce-scatter: shape and deferred async path
+# Wgrad reduce-scatter: shape and deferred async path
 # ---------------------------------------------------------------------------
 
 
@@ -575,7 +419,7 @@ class TestGTPWgradRS:
 
 
 # ---------------------------------------------------------------------------
-# 10. Multiple microbatches: output must be consistent when weight unchanged
+# Multiple microbatches: output must be consistent when weight unchanged
 # ---------------------------------------------------------------------------
 
 
@@ -607,170 +451,64 @@ class TestGTPMicrobatches:
 
 
 # ---------------------------------------------------------------------------
-# 11. NVFP4 + GTP_remat: Linear forward/backward, quantized shard setup
+# MXFP8 + GTP_remat: Linear forward/backward, quantized shard setup
 # ---------------------------------------------------------------------------
 
 
-def _worker_nvfp4_linear(rank, world_size, port):
-    """Verify that GTP Linear correctly quantizes, all-gathers, and computes with NVFP4."""
-    torch.manual_seed(0)
-    # batch=32: NVFP4 wgrad GEMM (K=batch) requires K divisible by 32
-    batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
-    dtype = torch.bfloat16
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+def _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe):
+    """Build a native-FP8 GTP te.Linear the gtp-agnostic way.
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
-    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
-    dist.broadcast(inp, src=0)
-
-    # Forward under NVFP4 recipe - triggers setup() and NVFP4 quantization
-    recipe = NVFP4BlockScaling()
-    with fp8_autocast(enabled=True, fp8_recipe=recipe):
-        out = layer(inp, is_first_microbatch=True)
-
-    # After the first forward pass setup() must have created a quantized shard
-    w = layer.weight
-    assert w.quantized is not None, "NVFP4 quantized shard must be set after setup()"
-    assert isinstance(
-        w.quantized, QuantizedTensor
-    ), f"weight.quantized should be QuantizedTensor, got {type(w.quantized)}"
-
-    assert out.shape == (batch, out_f), f"unexpected output shape {out.shape}"
-    assert torch.isfinite(out).all(), "NVFP4 GTP output has non-finite values"
-
-    # Second microbatch reuses cached quantized weight (skip_weight_cast path)
-    with fp8_autocast(enabled=True, fp8_recipe=recipe):
-        out2 = layer(inp.detach(), is_first_microbatch=False)
-    assert torch.isfinite(out2).all(), "NVFP4 GTP second-microbatch output has non-finite values"
-
-
-def _worker_nvfp4_linear_unaligned(rank, world_size, port):
-    """Verify NVFP4 GTP when out_features is not aligned to 16*world_size (padding path).
-
-    out_f is chosen to be divisible by 8 (satisfies NVFP4 GEMM alignment) but not by
-    16*world_size (so padding is needed). The last GTP rank receives a shard that is
-    zero-padded to reach the shard_size boundary. After all-gather, _strip_padding
-    removes the padded rows from the gathered weight before the GEMM, so the output
-    has the original out_f columns.
+    Mirrors megatron/core/extensions/transformer_engine.py: pass the pre-sharded
+    out_features to a STOCK te.Linear under fp8_model_init (TE inits+quantizes a native
+    MXFP8 shard with no GTP awareness), then attach the GTP wiring post-init.
     """
-    torch.manual_seed(0)
-    alignment = 16 * world_size  # 64 for world_size=4
-    # Choose out_f divisible by 8 (NVFP4 GEMM constraint) but not by 64 (GTP_remat alignment).
-    # With out_f=56: pad_length=8, shard_size=16, last rank gets 8 rows padded to 16.
-    out_f = alignment - 8  # 56 for world_size=4
-    in_f = 64
-    batch = 32
-    dtype = torch.bfloat16
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    from transformer_engine.pytorch import fp8_model_init
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
-    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
-    dist.broadcast(inp, src=0)
+    from megatron.core.tensor_parallel.gtp import (
+        attach_gtp_to_presharded_module,
+        gtp_remat_shard_dim0,
+    )
 
-    with fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
-        out = layer(inp, is_first_microbatch=True)
-
-    # After _strip_padding removes the padded rows, output has out_f (not padded) cols.
-    assert out.shape == (batch, out_f), f"unexpected output shape {out.shape}"
-    assert torch.isfinite(out).all(), "NVFP4 GTP (unaligned) output has non-finite values"
-
-
-class TestNVFP4LinearGTP:
-    def test_forward_backward(self):
-        _requires_nvfp4()
-        _requires_multi_gpu(4)
-        _run_distributed(_worker_nvfp4_linear, 4)
-
-    def test_forward_unaligned_padding(self):
-        _requires_nvfp4()
-        _requires_multi_gpu(4)
-        _run_distributed(_worker_nvfp4_linear_unaligned, 4)
-
-
-# ---------------------------------------------------------------------------
-# 12. NVFP4 + GTP_remat: GroupedLinear forward/backward (coalesced batched all-gather)
-# ---------------------------------------------------------------------------
-
-
-def _worker_nvfp4_grouped_linear(rank, world_size, port, num_gemms):
-    """Verify NVFP4 GTP with GroupedLinear (uses grouped_gather_along_first_dim)."""
-    torch.manual_seed(0)
-    # NVFP4 split_quantize constraints: in_f % 128 == 0, tokens_per_expert % 64 == 0
-    # (Hadamard transform requirement), and K=tokens_per_expert % 32 == 0 for wgrad.
-    in_f, out_f, total_tokens = 128, 256, num_gemms * 64
-    dtype = torch.bfloat16
-    gtp_remat_group = dist.new_group(list(range(world_size)))
-
-    layer = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
-    assert isinstance(layer.weight0, GTPShardedParam)
-
-    m_splits = [total_tokens // num_gemms] * num_gemms
-    m_splits[-1] += total_tokens - sum(m_splits)
-
-    inp = torch.randn(total_tokens, in_f, dtype=dtype, device="cuda", requires_grad=True)
-    dist.broadcast(inp, src=0)
-
-    with fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
-        out = layer(inp, m_splits=m_splits, is_first_microbatch=True)
-
-    assert out.shape == (total_tokens, out_f), f"unexpected output shape {out.shape}"
-    assert torch.isfinite(out).all(), "NVFP4 GroupedLinear GTP output has non-finite values"
-
-    # All expert weight shards should be quantized after setup()
-    for i in range(num_gemms):
-        name = f"weight{i}"
-        w = getattr(layer, name)
-        assert isinstance(w, GTPShardedParam)
-        assert w.quantized is not None, f"{name}.quantized not set after NVFP4 setup()"
-        assert isinstance(
-            w.quantized, QuantizedTensor
-        ), f"{name}.quantized should be QuantizedTensor, got {type(w.quantized)}"
-
-    for i in range(num_gemms):
-        w = getattr(layer, f"weight{i}")
-        w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
-    out.sum().backward()
-    assert inp.grad is not None and inp.grad.shape == inp.shape
-
-
-class TestNVFP4GroupedLinearGTP:
-    @pytest.mark.parametrize("num_gemms", [2, 4])
-    def test_forward_backward(self, num_gemms):
-        _requires_nvfp4()
-        _requires_multi_gpu(4)
-        _run_distributed(_worker_nvfp4_grouped_linear, 4, num_gemms)
-
-
-# ---------------------------------------------------------------------------
-# 13. MXFP8 + GTP_remat: Linear forward/backward, quantized shard setup
-# ---------------------------------------------------------------------------
+    shard_out, pad_length = gtp_remat_shard_dim0(out_f, gtp_remat_group)
+    with fp8_model_init(enabled=True, recipe=recipe):
+        layer = te.Linear(
+            in_features=in_f, out_features=shard_out, bias=False, params_dtype=dtype, device="cuda"
+        )
+    layer.gtp_remat_size = gtp_remat_group.size()
+    attach_gtp_to_presharded_module(layer, gtp_remat_group, pad_length)
+    return layer
 
 
 def _worker_mxfp8_linear(rank, world_size, port):
-    """Verify that GTP Linear correctly quantizes, all-gathers, and computes with MXFP8."""
+    """Verify GTP Linear with a native MXFP8 param: all-gather + GEMM + backward.
+
+    mxfp8 always implies --fp8-param-gather: the weight is built as a native FP8 shard at
+    construction (no BF16 source, no per-forward cast).
+    """
     from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    from megatron.core.tensor_parallel.gtp import update_gtp_config
 
     torch.manual_seed(0)
     # batch=32: MXFP8 wgrad GEMM (K=batch) requires K divisible by MXFP8_BLOCK_SCALING_SIZE=32
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
+    recipe = MXFP8BlockScaling()
+    layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    # The weight IS the native FP8 shard: a QuantizedTensor with the GTP surface attached.
+    w = layer.weight
+    assert isinstance(w, QuantizedTensor), f"weight should be QuantizedTensor, got {type(w)}"
+    assert w.quantized is w, "native-FP8 GTP: self.quantized must be the param itself"
+    assert getattr(w, "is_gtp_weight_remat", False), "GTP surface missing on native param"
+    assert w.shape[0] * world_size == out_f, "weight must be dim-0 sharded"
+
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
-    # Forward under MXFP8 recipe - triggers setup() and MXFP8 quantization
-    recipe = MXFP8BlockScaling()
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out = layer(inp, is_first_microbatch=True)
-
-    # After the first forward pass setup() must have created a quantized shard
-    w = layer.weight
-    assert w.quantized is not None, "MXFP8 quantized shard must be set after setup()"
-    assert isinstance(
-        w.quantized, QuantizedTensor
-    ), f"weight.quantized should be QuantizedTensor, got {type(w.quantized)}"
 
     assert out.shape == (batch, out_f), f"unexpected output shape {out.shape}"
     assert torch.isfinite(out).all(), "MXFP8 GTP output has non-finite values"
@@ -781,37 +519,40 @@ def _worker_mxfp8_linear(rank, world_size, port):
     assert inp.grad is not None
     assert inp.grad.shape == inp.shape
 
-    # Second microbatch reuses cached quantized weight (skip_weight_cast path)
+    # Second microbatch reuses the same native FP8 weight
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out2 = layer(inp.detach(), is_first_microbatch=False)
-    assert torch.isfinite(out2).all(), "MXFP8 GTP second-microbatch output has non-finite values"
+    assert torch.isfinite(out2).all(), "MXFP8 GTP second-microbatch output has non-finite"
 
 
 def _worker_mxfp8_linear_unaligned(rank, world_size, port):
-    """Verify MXFP8 GTP when out_features is not aligned to 16*world_size (padding path).
+    """Verify native-FP8 MXFP8 GTP when out_features needs padding.
 
     MXFP8 requires tensor dims divisible by 32, so shard_size (= M_padded / world_size)
     must be a multiple of 32. With world_size=4 this requires M_padded % 128 == 0.
-    out_f=120 gives M_padded=128, shard_size=32 (32 % 32 == 0). The last rank has
-    24 real rows zero-padded to 32. After all-gather, _strip_padding removes the padded
-    rows before the GEMM, so the output has the original out_f columns.
+    out_f=120 gives M_padded=128, shard_size=32 (32 % 32 == 0). The last rank's shard
+    holds 24 real rows zero-padded to 32. After all-gather, _strip_padding removes the
+    padded rows before the GEMM, so the output has the original out_f columns.
     """
     from transformer_engine.common.recipe import MXFP8BlockScaling
 
+    from megatron.core.tensor_parallel.gtp import update_gtp_config
+
     torch.manual_seed(0)
     # out_f=120: M_padded=128, shard_size=32, last rank has 24 rows padded to 32.
-    # 120 is divisible by 8 (GEMM constraint), not by 64 (GTP_remat alignment → padding needed).
     out_f = 120
     in_f = 64
     batch = 32
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
+    recipe = MXFP8BlockScaling()
+    layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
+    assert layer.weight.pad_length == 8, f"expected pad 8, got {layer.weight.pad_length}"
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
-    with fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+    with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out = layer(inp, is_first_microbatch=True)
 
     # After _strip_padding removes the padded rows, output has out_f (not padded) cols.
@@ -832,217 +573,7 @@ class TestMXFP8LinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 14. GTPConfig / update_gtp_config
-# ---------------------------------------------------------------------------
-
-
-class TestGTPConfig:
-
-    def test_update_pad_for_alignment(self):
-        original = gtp_module.GTP_CONFIG.pad_for_alignment
-        try:
-            gtp_module.update_gtp_config(pad_for_alignment=8)
-            assert gtp_module.GTP_CONFIG.pad_for_alignment == 8
-        finally:
-            gtp_module.update_gtp_config(pad_for_alignment=original)
-
-    def test_update_weight_prefetch(self):
-        original = gtp_module.GTP_CONFIG.weight_prefetch
-        try:
-            gtp_module.update_gtp_config(weight_prefetch=False)
-            assert gtp_module.GTP_CONFIG.weight_prefetch is False
-        finally:
-            gtp_module.update_gtp_config(weight_prefetch=original)
-
-    def test_invalid_key_raises(self):
-        with pytest.raises(ValueError, match="Unknown GTP config option"):
-            gtp_module.update_gtp_config(nonexistent_key=123)
-
-
-# ---------------------------------------------------------------------------
-# 15. GTPShardedParam properties - shape computations and padding
-# ---------------------------------------------------------------------------
-
-
-class TestGTPShardedParamProperties:
-
-    def _make_param(self, shape, pad_length=0, group_size=4, group_rank=0):
-        p = GTPShardedParam(torch.zeros(*shape))
-        p.group = _FakeGroup(size=group_size, rank=group_rank)
-        p.pad_length = pad_length
-        p.expert_idx = None
-        return p
-
-    # --- _unsharded_shape_padded ---
-
-    def test_unsharded_shape_padded_no_padding(self):
-        # shape=(8, 4), group_size=4 → 8*4=32 rows, no padding
-        p = self._make_param((8, 4), pad_length=0, group_size=4, group_rank=2)
-        assert p._unsharded_shape_padded == (32, 4)
-
-    def test_unsharded_shape_padded_last_rank_with_padding(self):
-        # Local shard includes its slice of padding rows: 16 rows per rank,
-        # pad_length=1 marks 1 of those (on the last rank) as pad → padded
-        # unsharded shape = 16 * 4 = 64.  pad_length is global metadata, the
-        # same value lives on every rank's shard.
-        p = self._make_param((16, 32), pad_length=1, group_size=4, group_rank=3)
-        assert p._unsharded_shape_padded == (64, 32)
-
-    def test_unsharded_shape_padded_non_last_rank_with_padding(self):
-        # Non-last rank: pad_length is the same global value, same formula.
-        p = self._make_param((16, 32), pad_length=1, group_size=4, group_rank=0)
-        assert p._unsharded_shape_padded == (64, 32)
-
-    # --- _unsharded_shape ---
-
-    def test_unsharded_shape_no_padding(self):
-        p = self._make_param((8, 4), pad_length=0, group_size=4, group_rank=0)
-        assert p._unsharded_shape == (32, 4)
-
-    def test_unsharded_shape_strips_padding(self):
-        # Local 16 rows × 4 ranks = 64 padded; pad_length=1 → unsharded = 63.
-        p = self._make_param((16, 32), pad_length=1, group_size=4, group_rank=3)
-        assert p._unsharded_shape == (63, 32)
-
-    # --- get_padded_shard ---
-
-    def test_get_padded_shard_identity_when_no_padding(self):
-        p = self._make_param((6, 4), pad_length=0)
-        result = p.get_padded_shard()
-        assert result is p  # identity - no copy needed
-
-    def test_get_padded_shard_identity_non_last_rank(self):
-        # pad_length > 0 but not the padded last rank → no padding added
-        p = self._make_param((16, 4), pad_length=1, group_size=4, group_rank=0)
-        result = p.get_padded_shard()
-        assert result is p
-
-    def test_get_padded_shard_identity_last_rank(self):
-        # Under current semantics the local shard already contains its share
-        # of padding (slicer F.pads with zeros before slicing), so
-        # get_padded_shard() is the identity on the last rank too.
-        p = self._make_param((8, 4), pad_length=2, group_size=4, group_rank=3)
-        assert p.get_padded_shard() is p
-
-    # --- _strip_padding ---
-
-    def test_strip_padding_identity_no_padding(self):
-        p = self._make_param((8, 4), pad_length=0)
-        t = torch.randn(32, 4)
-        assert p._strip_padding(t) is t
-
-    def test_strip_padding_plain_tensor(self):
-        # Gathered weight [32, 4] with pad_length=1 → strip 1 row → [31, 4]
-        p = self._make_param((7, 4), pad_length=1, group_size=4, group_rank=0)
-        t = torch.randn(32, 4)
-        result = p._strip_padding(t)
-        assert result.shape == (31, 4)
-        assert torch.equal(result, t[:-1])
-
-    def test_strip_padding_multi_row(self):
-        # pad_length=4 strips 4 rows
-        p = self._make_param((12, 8), pad_length=4, group_size=4, group_rank=0)
-        t = torch.ones(64, 8)
-        result = p._strip_padding(t)
-        assert result.shape == (60, 8)
-
-
-# ---------------------------------------------------------------------------
-# 16. _get_cache_key - expert vs non-expert, fwd vs bwd
-# ---------------------------------------------------------------------------
-
-
-class TestGTPCacheKey:
-
-    def _param(self, shape=(16, 32), expert_idx=None):
-        p = GTPShardedParam(torch.zeros(*shape))
-        p.group = _FakeGroup(size=4)
-        p.expert_idx = expert_idx
-        p.pad_length = 0
-        return p
-
-    def test_non_expert_key_same_for_fwd_bwd(self):
-        """Non-routed params produce the same cache key for fwd and bwd."""
-        p = self._param(expert_idx=None)
-        assert p._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False) == p._get_cache_key(
-            torch.bfloat16, fwd=False, reduce_scatter=False
-        )
-
-    def test_expert_key_differs_fwd_bwd(self):
-        """For quantized (non-torch.dtype) recipes, expert fwd vs bwd keys differ."""
-        p = self._param(expert_idx=0)
-        # _get_cache_key differentiates fwd/bwd only for non-torch.dtype objects
-        # (e.g. quantized recipe dtype descriptors).  Use a mock to trigger that path.
-        mock_dtype = "fp8"
-        assert p._get_cache_key(mock_dtype, fwd=True, reduce_scatter=False) != p._get_cache_key(
-            mock_dtype, fwd=False, reduce_scatter=False
-        )
-
-    def test_different_expert_idx_different_keys(self):
-        """Two experts with same shape but different indices get distinct keys."""
-        p0 = self._param(expert_idx=0)
-        p1 = self._param(expert_idx=1)
-        assert p0._get_cache_key(
-            torch.bfloat16, fwd=True, reduce_scatter=False
-        ) != p1._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
-
-    def test_same_expert_idx_same_key(self):
-        """Same-shaped experts with the same idx share a cache key (cross-layer buffer reuse)."""
-        p_l0 = self._param(expert_idx=0)
-        p_l1 = self._param(expert_idx=0)
-        assert p_l0._get_cache_key(
-            torch.bfloat16, fwd=True, reduce_scatter=False
-        ) == p_l1._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
-
-    def test_different_dtypes_different_keys(self):
-        p = self._param()
-        assert p._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False) != p._get_cache_key(
-            torch.float32, fwd=True, reduce_scatter=False
-        )
-
-    def test_rs_key_differs_from_ag_key(self):
-        """reduce_scatter=True key must differ from reduce_scatter=False key."""
-        p = self._param()
-        assert p._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False) != p._get_cache_key(
-            torch.bfloat16, fwd=True, reduce_scatter=True
-        )
-
-
-# ---------------------------------------------------------------------------
-# 17. tag_gtp_params_with_names - _debug_name population
-# ---------------------------------------------------------------------------
-
-
-class TestTagGTPParamsWithNames:
-
-    def test_debug_name_populated_for_gtp_param(self):
-        """GTPShardedParam._debug_name is set to the dotted parameter path."""
-        model = nn.Linear(4, 8, bias=False)
-        w = GTPShardedParam(torch.randn(8, 4))
-        w.group = _FakeGroup()
-        model._parameters["weight"] = w
-
-        gtp_module.tag_gtp_params_with_names(model)
-        assert w._debug_name == "weight", f"Expected 'weight', got '{w._debug_name}'"
-
-    def test_nested_module_debug_name(self):
-        """Nested module produces a dotted debug name."""
-        outer = nn.Sequential(nn.Linear(4, 8, bias=False))
-        w = GTPShardedParam(torch.randn(8, 4))
-        w.group = _FakeGroup()
-        outer._modules["0"]._parameters["weight"] = w
-
-        gtp_module.tag_gtp_params_with_names(outer)
-        assert w._debug_name == "0.weight", f"Expected '0.weight', got '{w._debug_name}'"
-
-    def test_non_gtp_params_are_skipped(self):
-        """Plain nn.Parameter instances are silently ignored."""
-        model = nn.Linear(4, 8)
-        gtp_module.tag_gtp_params_with_names(model)  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# 18. wrap_module_params_gtp is a no-op when gtp_remat_group.size() == 1
+# wrap_module_params_gtp is a no-op when gtp_remat_group.size() == 1
 # ---------------------------------------------------------------------------
 
 
@@ -1060,7 +591,7 @@ class TestGTPGroupSizeOne:
 
 
 # ---------------------------------------------------------------------------
-# 19. weight_prefetch=False: forward still produces correct output
+# weight_prefetch=False: forward still produces correct output
 # ---------------------------------------------------------------------------
 
 
@@ -1095,7 +626,7 @@ class TestGTPPrefetchDisabled:
 
 
 # ---------------------------------------------------------------------------
-# 20. fuse_wgrad_accumulation=True: wgrad is accumulated into main_grad
+# fuse_wgrad_accumulation=True: wgrad is accumulated into main_grad
 # ---------------------------------------------------------------------------
 
 
@@ -1129,7 +660,7 @@ class TestFuseWgradAccumulation:
 
 
 # ---------------------------------------------------------------------------
-# 21. _grad_accum_hook is called after reduce-scatter
+# _grad_accum_hook is called after reduce-scatter
 # ---------------------------------------------------------------------------
 
 
@@ -1161,7 +692,7 @@ class TestGTPGradAccumHook:
 
 
 # ---------------------------------------------------------------------------
-# 22. wait_async_comms(finalize_after_drain=True) inline-accumulation fallback
+# wait_async_comms(finalize_after_drain=True) inline-accumulation fallback
 # ---------------------------------------------------------------------------
 
 
@@ -1292,7 +823,7 @@ class TestWaitAsyncCommsFallback:
 
 
 # ---------------------------------------------------------------------------
-# 23. GTP_remat DDP bucket alignment: distributed optimizer bucket-end assertion
+# GTP_remat DDP bucket alignment: distributed optimizer bucket-end assertion
 # ---------------------------------------------------------------------------
 
 
@@ -1422,7 +953,7 @@ class TestGTPDDPBucketAlignment:
 
 
 # ---------------------------------------------------------------------------
-# 24. GTP_remat DDP grad-ready wiring: register_grad_ready must fire AFTER the wgrad add
+# GTP_remat DDP grad-ready wiring: register_grad_ready must fire AFTER the wgrad add
 # ---------------------------------------------------------------------------
 
 

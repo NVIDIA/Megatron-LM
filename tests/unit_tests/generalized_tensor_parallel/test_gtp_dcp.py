@@ -23,11 +23,12 @@ from megatron.core.tensor_parallel.gtp import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp_remat,
-    reset_gtp_quantize_cache,
     update_gtp_config,
     wrap_module_params_gtp,
 )
-from tests.unit_tests.test_utilities import Utils  # noqa: E402
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
+    _torchrun_dist_init,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -42,19 +43,42 @@ def _no_pad_alignment():
     update_gtp_config(pad_for_alignment=orig)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init():
-    Utils.initialize_model_parallel()
-    yield
-    Utils.destroy_model_parallel()
-
-
 def _require_world_size(n):
     if dist.get_world_size() != n:
         pytest.skip(
             f"Requires world_size={n}, got {dist.get_world_size()} "
             f"(launch with torchrun --nproc-per-node={n})"
         )
+
+
+# Many workers need the same TP/GTP subgroups. Memoize by rank-set so the process holds a
+# handful of communicators instead of re-creating (and leaking) one per worker.
+_GROUP_CACHE = {}
+
+
+def _cached_new_group(ranks):
+    """Memoized ``dist.new_group`` keyed by rank-set (see note above)."""
+    key = tuple(ranks)
+    if key not in _GROUP_CACHE:
+        _GROUP_CACHE[key] = dist.new_group(list(ranks))
+    return _GROUP_CACHE[key]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _precreate_subgroups(_torchrun_dist_init):
+    """Create the shared TP/GTP subgroups once, on all ranks, in a fixed order.
+
+    ``dist.new_group`` is a world-collective: every rank must create every subgroup in the same
+    order, even ranks that are not members. The workers' readable ``new_group([0,1]) if rank in
+    (0,1) else new_group([2,3])`` idiom only calls it on member ranks, which collides disjoint
+    groups on PyTorch's call-order tag and hangs NCCL bootstrap on the first real collective.
+    Pre-creating here makes every later ``_cached_new_group`` a cache hit, so that idiom stays
+    correct. (Metadata-only groups never bootstrap NCCL, so they were never exposed.)
+    """
+    if dist.is_initialized() and dist.get_world_size() == 4:
+        for ranks in ([0, 1], [2, 3], [0, 2], [1, 3], [0, 1, 2, 3]):
+            _cached_new_group(ranks)
+    yield
 
 
 def _make_gtp_shard(out_features, in_features, gtp_remat_group, dtype=torch.bfloat16):
@@ -74,6 +98,161 @@ def _make_gtp_shard(out_features, in_features, gtp_remat_group, dtype=torch.bflo
     return mod.weight  # now a GTPShardedParam
 
 
+def _make_native_fp8_gtp_shard(per_tp_out, in_f, gtp_remat_group, recipe):
+    """Build a native-FP8 GTP weight the production way (extensions/transformer_engine.py):
+    pass the pre-sharded out_features into a stock ``fp8_model_init`` ``te.Linear`` so TE inits a
+    native MXFP8 shard, attach the GTP surface post-init, then run one FP8 forward to populate the
+    rowwise/columnwise FP8 data. Returns the reclassed ``GTP_<Fp8Tensor>`` weight."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch import fp8_autocast, fp8_model_init
+
+    from megatron.core.tensor_parallel.gtp import (
+        attach_gtp_to_presharded_module,
+        gtp_remat_shard_dim0,
+    )
+
+    shard_out, pad = gtp_remat_shard_dim0(per_tp_out, gtp_remat_group)
+    with fp8_model_init(enabled=True, recipe=recipe):
+        lin = te.Linear(in_f, shard_out, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    lin.gtp_remat_size = gtp_remat_group.size()
+    attach_gtp_to_presharded_module(lin, gtp_remat_group, pad)
+    with fp8_autocast(enabled=True, fp8_recipe=recipe):
+        _ = lin(torch.randn(32, in_f, dtype=torch.bfloat16, device="cuda"))
+    return lin.weight
+
+
+def _worker_native_fp8_dcp_save(rank, world_size, port):
+    """Native-FP8 GTP weight: DCP save must emit a *dequantized BF16* ShardedTensor with the full
+    (TP x GTP_remat) global shape and correct composite axis-0 offset — not the raw FP8 bytes
+    under a fake BF16 dtype, and not the sharded-as-full metadata.
+
+    Regression guard for the a55b save crash: recognition gates used isinstance(GTPShardedParam),
+    which misses the native-FP8 GTP_<Fp8Tensor> subclass, and TE's tex.dequantize does not
+    recognize that subclass either (dequantize_gtp_native_fp8 restores the base class).
+    """
+    from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
+
+    _requires_mxfp8()
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    from megatron.core.fp8_utils import is_float8tensor
+
+    # TP=2, GTP_remat=2 (4 ranks). MXFP8 needs dims % 32, so use fp8-valid sizes.
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    full_out, in_f = 128, 128
+    tp_size, gtp_remat_size = 2, 2
+    per_tp_out = full_out // tp_size  # 64
+    per_shard_out = per_tp_out // gtp_remat_size  # 32 (== MXFP8 block size)
+
+    recipe = MXFP8BlockScaling()
+    w = _make_native_fp8_gtp_shard(per_tp_out, in_f, gtp_remat_group, recipe)
+    # The live weight is a native FP8 GTP param (a QuantizedTensor subclass), sharded.
+    assert is_float8tensor(w), "weight should be a native FP8 tensor"
+    assert getattr(w, "is_gtp_weight_remat", False), "GTP surface missing"
+    assert type(w).__name__.startswith("GTP_"), type(w).__name__
+    assert tuple(w.shape) == (per_shard_out, in_f)
+
+    sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {"weight": w},
+        prefix="",
+        tensor_parallel_layers_axis_map={"weight": 0},
+        sharded_offsets=(),
+        tp_group=tp_group,
+        dp_cp_group=_cached_new_group(list(range(world_size))),
+    )
+    st = sharded["weight"]
+    assert isinstance(st, ShardedTensor), type(st)
+
+    # Saved data must be dequantized BF16 — not raw FP8 bytes under a fake dtype.
+    assert st.data.dtype == torch.bfloat16, f"expected bf16 saved data, got {st.data.dtype}"
+    assert not is_float8tensor(st.data), "checkpoint data must be dequantized, not FP8"
+    assert tuple(st.data.shape) == (per_shard_out, in_f)
+
+    # Full (TP x GTP) global shape + composite axis-0 offset (not sharded-as-full).
+    assert st.global_shape[0] == full_out, (st.global_shape, full_out)
+    tp_rank, gtp_rank = rank // 2, rank % 2
+    assert st.global_offset[0] == (tp_rank * gtp_remat_size + gtp_rank) * per_shard_out, (
+        rank,
+        st.global_offset,
+    )
+
+    # The live param must be untouched by the save (class restored, still native FP8).
+    assert is_float8tensor(w) and type(w).__name__.startswith(
+        "GTP_"
+    ), "dequantize must not mutate the live param's class"
+
+
+def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
+    """Load-side mirror of the save dequantize: copying the (dequantized BF16) checkpoint value
+    back into a live native-FP8 GTP weight must go through ``gtp_native_fp8_load_context``.
+
+    Regression guard for the a55b load crash: ``module.load_state_dict`` does ``param.copy_(bf16)``,
+    which routes into TE ``convert_and_update_tensor`` -> C++ ``IsMXFP8Tensor(dst.ptr())``. That
+    exact-class check rejects the dynamic ``GTP_<Fp8Tensor>`` subclass, so the copy raises unless
+    the base FP8 class is presented for the duration. Assert: (1) the raw copy raises; (2) under
+    the context it succeeds and the reclassed live weight dequantizes to the loaded values.
+    """
+    from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
+
+    _requires_mxfp8()
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch import fp8_autocast, fp8_model_init
+
+    from megatron.core.fp8_utils import is_float8tensor
+    from megatron.core.tensor_parallel.gtp import (
+        attach_gtp_to_presharded_module,
+        dequantize_gtp_native_fp8,
+        gtp_native_fp8_load_context,
+        gtp_remat_shard_dim0,
+    )
+
+    # This test exercises a single-rank concern (the __class__ swap during copy_), so use the
+    # default WORLD group as the gtp_remat_group rather than dist.new_group subgroups — the
+    # latter's secondary NCCL socket bootstrap is flaky on some multi-node allocations and would
+    # mask the fp8 copy behavior under test.
+    gtp_remat_group = dist.group.WORLD
+    per_tp_out, in_f = 128, 128  # MXFP8 needs dims % 32; shard = 128/world(4) = 32
+    recipe = MXFP8BlockScaling()
+
+    import transformer_engine.pytorch as te
+
+    shard_out, pad = gtp_remat_shard_dim0(per_tp_out, gtp_remat_group)
+    with fp8_model_init(enabled=True, recipe=recipe):
+        lin = te.Linear(in_f, shard_out, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    lin.gtp_remat_size = gtp_remat_group.size()
+    attach_gtp_to_presharded_module(lin, gtp_remat_group, pad)
+    with fp8_autocast(enabled=True, fp8_recipe=recipe):
+        _ = lin(torch.randn(32, in_f, dtype=torch.bfloat16, device="cuda"))
+
+    assert is_float8tensor(lin.weight) and type(lin.weight).__name__.startswith("GTP_")
+
+    # The dequantized BF16 payload a DCP load would hand back for this shard.
+    target_bf16 = torch.randn(shard_out, in_f, dtype=torch.bfloat16, device="cuda")
+
+    # (1) Without the context, copy_ into the subclass raises in TE's C++ quantizer.
+    # Mirror production's _load_from_state_dict, which copies under no_grad.
+    raised = False
+    try:
+        with torch.no_grad():
+            lin.weight.copy_(target_bf16)
+    except Exception as e:  # noqa: BLE001
+        raised = True
+        assert "MXFP8" in str(e) or "IsMXFP8Tensor" in str(e), str(e)
+    assert raised, "copy_ into GTP_<Fp8Tensor> unexpectedly succeeded without the load context"
+
+    # (2) Under the context the copy succeeds; the reclassed weight holds the loaded values.
+    with torch.no_grad(), gtp_native_fp8_load_context(lin):
+        lin.weight.copy_(target_bf16)
+    assert is_float8tensor(lin.weight) and type(lin.weight).__name__.startswith(
+        "GTP_"
+    ), "load context must reclass back to the GTP subclass"
+    loaded = dequantize_gtp_native_fp8(lin.weight)
+    # MXFP8 round-trip is lossy; check it tracks the target (not the pre-copy garbage).
+    rel = (loaded - target_bf16).abs().max() / target_bf16.abs().max().clamp_min(1e-6)
+    assert rel < 0.2, f"loaded weight does not match checkpoint values (max rel {rel:.3f})"
+
+
 def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
     """TP=2, GTP_remat=2 (4 ranks total). Weight is GTPShardedParam.
 
@@ -82,8 +261,8 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
     gtp_remat_size. We mimic that by starting with a per-TP-rank tensor of size
     ``full // tp_size`` and letting wrap_module_params_gtp slice it.
     """
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-    tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
     full_out_features = 8
     tp_size, gtp_remat_size = 2, 2
@@ -103,7 +282,7 @@ def _worker_helper_offsets_tp_eq_gtp_axis(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -127,8 +306,8 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
     Per-TP-rank tensor: (full_out, full_in/tp_size). GTP_remat further shards
     axis 0 to (full_out/gtp_remat_size, full_in/tp_size).
     """
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-    tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
     full_out, full_in = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -144,7 +323,7 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 1},  # row-parallel
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     tp_rank = rank // 2
@@ -166,7 +345,7 @@ def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
 
     Per-TP-rank shape under column-parallel TP=2: (full_out//tp_size, in).
     """
-    tp_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    tp_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
 
     full_out, in_features, tp_size = 8, 4, 2
     per_tp_out = full_out // tp_size
@@ -182,7 +361,7 @@ def _worker_helper_no_op_no_gtp_remat(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0, "bias": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     # tp_group is [0,1] for ranks 0,1 and [2,3] for ranks 2,3 here — local tp_rank = rank % 2
     tp_rank = rank % 2
@@ -206,7 +385,7 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
     in_features = 4
 
     # All 4 ranks form a single GTP_remat group.
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = _cached_new_group(list(range(world_size)))
     weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
 
     # No padding ⇒ local shape is exactly dim0 / 4 = 288
@@ -222,8 +401,8 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
-        tp_group=dist.new_group([rank]),  # trivial 1-rank TP group
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        tp_group=_cached_new_group([rank]),  # trivial 1-rank TP group
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert (
@@ -254,7 +433,7 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     dim0_padded = dim0_unpadded + pad
     per_shard = dim0_padded // gtp_remat_size
 
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = _cached_new_group(list(range(world_size)))
     weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
 
     assert weight.shape == (
@@ -272,8 +451,8 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
-        tp_group=dist.new_group([rank]),
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        tp_group=_cached_new_group([rank]),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     # Helper saves the padded global. ``allow_shape_mismatch=True`` is what
@@ -308,7 +487,7 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     )
     per_shard = dim0_padded // gtp_remat_size
 
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = _cached_new_group(list(range(world_size)))
     weight = _make_gtp_shard(dim0_unpadded, in_features, gtp_remat_group)
 
     sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
@@ -316,8 +495,8 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
         prefix="",
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
-        tp_group=dist.new_group([rank]),
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        tp_group=_cached_new_group([rank]),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     # 1. The saved global covers >= unpadded original size.
@@ -344,7 +523,7 @@ def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
     update_gtp_config(pad_for_alignment=0)
     dim0 = 16
     in_features = 4
-    gtp_remat_group = dist.new_group(list(range(world_size)))
+    gtp_remat_group = _cached_new_group(list(range(world_size)))
 
     def _build(prefix):
         weight = _make_gtp_shard(dim0, in_features, gtp_remat_group)
@@ -353,8 +532,8 @@ def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
             prefix=prefix,
             tensor_parallel_layers_axis_map={"weight": 0},
             sharded_offsets=(),
-            tp_group=dist.new_group([rank]),
-            dp_cp_group=dist.new_group(list(range(world_size))),
+            tp_group=_cached_new_group([rank]),
+            dp_cp_group=_cached_new_group(list(range(world_size))),
         )["layer.weight"]
 
     save_st = _build("layer.")
@@ -363,24 +542,6 @@ def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
     assert save_st.global_offset == load_st.global_offset
     assert save_st.local_shape == load_st.local_shape
     assert save_st.replica_id == load_st.replica_id
-
-
-def _worker_reset_quantize_cache(rank, world_size, port):
-    """`reset_gtp_quantize_cache` must flip did_cast_to_low_precision back to False."""
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-
-    class _Dummy(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16, device="cuda"))
-
-    mod = _Dummy()
-    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
-    p = mod.weight
-    p.did_cast_to_low_precision = True
-
-    reset_gtp_quantize_cache(mod)
-    assert p.did_cast_to_low_precision is False
 
 
 def _worker_helper_offsets_ep_egtp(rank, world_size, port):
@@ -393,7 +554,7 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
 
     rank → (ep_rank, egtp_rank): 0→(0,0) 1→(0,1) 2→(1,0) 3→(1,1).
     """
-    egtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    egtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
 
     ep_size, egtp_remat_size, num_gemms = 2, 2, 1
     ep_rank = rank // 2
@@ -416,8 +577,8 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         # EP prepends the global-expert axis; EGTP_remat shards out_features below it.
         sharded_offsets=((0, global_expert_idx, num_global_experts),),
-        tp_group=dist.new_group([rank]),  # no TP in this case
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        tp_group=_cached_new_group([rank]),  # no TP in this case
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -445,8 +606,8 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
     """
     from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-    tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
     full_vocab, hidden = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -463,7 +624,7 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
         allow_shape_mismatch=True,  # how VocabParallelEmbedding calls it
         prepend_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
     tp_rank = rank // 2
@@ -485,8 +646,8 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     """
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
-    tp_group = dist.new_group([0, 2]) if rank in (0, 2) else dist.new_group([1, 3])
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
     full_out, in_features = 8, 4
     tp_size, gtp_remat_size = 2, 2
@@ -501,7 +662,7 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
         tensor_parallel_layers_axis_map={"weight": 0},
         sharded_offsets=(),
         tp_group=tp_group,
-        dp_cp_group=dist.new_group(list(range(world_size))),
+        dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["layer.weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -524,14 +685,14 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
     """
     from megatron.core.utils import make_sharded_tensor_for_checkpoint
 
-    gtp_remat_group = dist.new_group([0, 1]) if rank in (0, 1) else dist.new_group([2, 3])
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
     weight = _make_gtp_shard(4, 4, gtp_remat_group)
     with pytest.raises(AssertionError):
         make_sharded_tensor_for_checkpoint(
             weight,
             "weight",
-            tp_group=dist.new_group([rank]),
-            dp_cp_group=dist.new_group(list(range(world_size))),
+            tp_group=_cached_new_group([rank]),
+            dp_cp_group=_cached_new_group(list(range(world_size))),
         )
 
 
@@ -876,6 +1037,14 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_helper_offsets_tp_eq_gtp_axis(dist.get_rank(), 4, None)
 
+    def test_native_fp8_dcp_save(self):
+        _require_world_size(4)
+        _worker_native_fp8_dcp_save(dist.get_rank(), 4, None)
+
+    def test_native_fp8_dcp_load_copy(self):
+        _require_world_size(4)
+        _worker_native_fp8_dcp_load_copy(dist.get_rank(), 4, None)
+
     def test_dual_offsets_cross_axis(self):
         _require_world_size(4)
         _worker_helper_offsets_tp_neq_gtp_axis(dist.get_rank(), 4, None)
@@ -903,10 +1072,6 @@ class TestGtpDcpHelper:
     def test_no_op_no_gtp_remat(self):
         _require_world_size(4)
         _worker_helper_no_op_no_gtp_remat(dist.get_rank(), 4, None)
-
-    def test_reset_quantize_cache(self):
-        _require_world_size(4)
-        _worker_reset_quantize_cache(dist.get_rank(), 4, None)
 
     def test_inproj_no_pad(self):
         _require_world_size(4)

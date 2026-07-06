@@ -296,23 +296,6 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
-def reset_gtp_quantize_cache_after_load(model):
-    """Invalidate GTP's per-shard low-precision cache after a checkpoint load.
-
-    GTP keeps a per-shard low-precision cache (``self.quantized``) that survives the
-    in-place writes to ``.data`` performed by DCP load. Reset it so the first forward
-    after resume re-quantizes from the freshly-loaded BF16 weight instead of reusing
-    the stale pre-load cast (which otherwise spikes lm-loss for one iteration before
-    normal training overwrites the cache). No-op when GTP is unavailable.
-    """
-    if not HAVE_GTP:
-        return
-    from megatron.core.tensor_parallel.gtp import reset_gtp_quantize_cache
-
-    for m in model:
-        reset_gtp_quantize_cache(m)
-
-
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -2188,7 +2171,6 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
-        reset_gtp_quantize_cache_after_load(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -2945,16 +2927,30 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
+def _gtp_shard_preserve_ctx(model_chunks):
+    # A forced DDP param-sync is redundant for native-FP8 GTP shards (already materialized in
+    # param.data) and harmful: its _post_param_sync copy-back overwrites the shard with the stale
+    # grad-scratch param_data, collapsing the MXFP8 scale (the post-save/eval loss spike).
+    # Preserve those shards across any forced sync so it is a no-op for them (all DP sizes).
+    if not HAVE_GTP:
+        return nullcontext()
+    from megatron.core.tensor_parallel.gtp import gtp_preserve_native_fp8_shards
+
+    return gtp_preserve_native_fp8_shards(model_chunks)
+
+
 def disable_forward_pre_hook(model_chunks, param_sync=True):
-    for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
-        model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+    with _gtp_shard_preserve_ctx(model_chunks) if param_sync else nullcontext():
+        for model_chunk in model_chunks:
+            assert isinstance(model_chunk, DDP)
+            model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
 def force_param_sync(model_chunks: list[DDP]) -> None:
-    for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
-        model_chunk.start_param_sync(force_sync=True)
+    with _gtp_shard_preserve_ctx(model_chunks):
+        for model_chunk in model_chunks:
+            assert isinstance(model_chunk, DDP)
+            model_chunk.start_param_sync(force_sync=True)
 
 
 def save_checkpoint_and_time(
@@ -3343,7 +3339,6 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
-            reset_gtp_quantize_cache_after_load(model)
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
             # Reload RL training checkpoint weights
@@ -3359,7 +3354,6 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
-            reset_gtp_quantize_cache_after_load(model)
 
             args.no_load_optim = no_load_optim
 
