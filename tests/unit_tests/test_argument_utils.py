@@ -713,6 +713,8 @@ def _make_ddp_args(**overrides):
         "accumulate_allreduce_grads_in_fp32": False,
         "check_for_nan_in_loss_and_grad": False,
         "check_for_large_grads": False,
+        "ddp_num_buckets": None,
+        "ddp_bucket_size": None,
         "ddp_pad_buckets_for_high_nccl_busbw": False,
         "ddp_reduce_scatter_with_fp32_accumulation": False,
         "ddp_param_name_patterns_for_fp32_local_accumulation": [],
@@ -721,6 +723,8 @@ def _make_ddp_args(**overrides):
         "megatron_fsdp_main_grads_dtype": None,
         "megatron_fsdp_grad_comm_dtype": None,
         "use_precision_aware_optimizer": False,
+        "use_megatron_fsdp": False,
+        "cuda_graph_impl": "none",
     }
     defaults.update(overrides)
     return Namespace(**defaults)
