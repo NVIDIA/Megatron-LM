@@ -56,7 +56,7 @@ def get_jobs_per_bridge(pipeline_id: int, type_of_job: str):
 @click.option(
     "--check-for",
     required=True,
-    type=click.Choice(["unit-tests", "integration-tests", "functional-tests"]),
+    type=click.Choice(["unit-tests", "integration-tests", "functional-tests", "smoke-tests"]),
 )
 @click.option("--pipeline-context", required=True, type=str)
 @click.option("--pipeline-created-at", required=True, type=str)
@@ -69,6 +69,13 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
 
     if check_for == "functional-tests":
         bridges = get_jobs_per_bridge(pipeline_id, "functional:run_")
+
+    if check_for == "smoke-tests":
+        bridges = get_jobs_per_bridge(pipeline_id, "functional:smoke-")
+        if all(job.status == "success" for jobs in bridges.values() for job in jobs):
+            logger.info("All smoke tests passed, skipping Slack notification")
+            return
+
     pipeline_created_at_day = pd.Timestamp(pipeline_created_at).strftime("%Y-%m-%d")
 
     messages = []

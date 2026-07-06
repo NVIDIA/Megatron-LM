@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -27,7 +27,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -474,20 +474,23 @@ class GPTModel(LanguageModule):
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         off_interface.init_chunk_handler(
+            pp_rank=self.pg_collection.pp.rank(),
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
+                off_interface.mark_not_offload(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
 
     def preprocess_for_paged_stash(self):
@@ -665,11 +668,18 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
+            if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,

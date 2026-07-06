@@ -24,6 +24,7 @@ skill keyword — infer it from the artifact you read.
 
 - All PRs must be created as **drafts**. Use `gh pr create --draft` or the GitHub UI draft option.
 - Never push branches directly to `https://github.com/NVIDIA/Megatron-LM`. You must push your branch to a personal fork (e.g. `https://github.com/<your-username>/Megatron-LM`), then open a PR from the fork's branch against `NVIDIA/Megatron-LM`.
+- Commit PR changes with both `-s` and `-S`: `-s` adds the required `Signed-off-by` trailer, and `-S` signs the commit so copy-pr-bot and `/ok to test` can verify the pushed commit without manually specifying the SHA.
 - Read @docs/developer/contribute.md for the full contribution policy, including code style, commit message conventions, and issue guidelines.
 
 ### Code Quality
