@@ -14,10 +14,12 @@ class PackedAudioEmbeddings:
 
     @property
     def cu_seqlens(self) -> torch.Tensor:
+        """Return cumulative sequence lengths with a leading zero (int32)."""
         lengths = self.lengths.to(dtype=torch.int32, device=self.embeddings.device)
         return torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
 
     def pad_to_lengths(self, target_lengths: torch.Tensor) -> "PackedAudioEmbeddings":
+        """Zero-pad each packed embedding up to the given per-source target lengths."""
         target_lengths = target_lengths.to(dtype=torch.int32, device=self.embeddings.device)
         lengths = self.lengths.to(dtype=torch.int32, device=self.embeddings.device)
         target_lengths = torch.maximum(target_lengths, lengths)

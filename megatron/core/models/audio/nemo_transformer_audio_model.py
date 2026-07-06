@@ -40,23 +40,29 @@ class NemoTransformerAudioConfig:
 
     @property
     def output_embedding_dim(self) -> int:
+        """Return the encoder output embedding dimension (``d_model``)."""
         return self.d_model
 
     @property
     def encoder_time_stride(self) -> int:
+        """Return the time downsampling factor of the pre-encode stage."""
         if self.pre_encode in ("conv", "depth_conv"):
             return 4
         return self.subsampling_factor
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NemoTransformerAudioConfig":
+        """Build a config from a dict, keeping only keys that match config fields."""
         valid = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in data.items() if k in valid}
         return cls(**kwargs)
 
 
 class NemoTransformerAudioModel(MegatronModule):
-    """Audio encoder matching LLaVA expectations: forward(features, mask) -> (B, T', H), bool mask."""
+    """Audio encoder matching LLaVA expectations.
+
+    ``forward(features, mask)`` returns ``(B, T', H)`` embeddings and a bool mask.
+    """
 
     def __init__(self, config: NemoTransformerAudioConfig) -> None:
         super().__init__(config=config)
@@ -212,6 +218,7 @@ class NemoTransformerAudioModel(MegatronModule):
     def forward(
         self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode mel features into ``(B, T', H)`` embeddings and a validity mask."""
         if input_features.ndim != 3:
             raise ValueError(
                 f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}"
@@ -249,6 +256,7 @@ class NemoTransformerAudioModel(MegatronModule):
     def forward_packed(
         self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> PackedAudioEmbeddings:
+        """Encode mel features into packed (padding-free) audio embeddings."""
         if input_features.ndim != 3:
             raise ValueError(
                 f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}"

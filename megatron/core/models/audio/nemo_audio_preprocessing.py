@@ -137,6 +137,7 @@ def _create_mel_filterbank(
 
 
 def normalize_batch(x: torch.Tensor, seq_len: torch.Tensor, normalize_type):
+    """Normalize features per the given normalize_type, respecting per-sample seq_len."""
     x_mean = None
     x_std = None
     if normalize_type == "per_feature":
@@ -159,8 +160,11 @@ def normalize_batch(x: torch.Tensor, seq_len: torch.Tensor, normalize_type):
         )
         if safe_to_check and torch.any(seq_len == 1).item():
             raise ValueError(
-                "normalize_batch with `per_feature` normalize_type received a tensor of length 1. This will result "
-                "in torch.std() returning nan. Make sure your audio length has enough samples for a single feature "
+                "normalize_batch with `per_feature` normalize_type received a tensor of length 1. "
+                "This will result "
+                "in torch.std() returning nan. Make sure your audio length has enough samples "
+                "for a "
+                "single feature "
                 "(ex. at least `hop_length` for Mel Spectrograms)."
             )
         time_steps = (
@@ -204,6 +208,7 @@ def normalize_batch(x: torch.Tensor, seq_len: torch.Tensor, normalize_type):
 
 
 def splice_frames(x: torch.Tensor, frame_splicing: int) -> torch.Tensor:
+    """Concatenate ``frame_splicing`` time-shifted copies of ``x`` along the feature dim."""
     seq = [x]
     for n in range(1, frame_splicing):
         seq.append(torch.cat([x[:, :, :n], x[:, :, n:]], dim=2))
@@ -259,7 +264,8 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
             )
         if window_stride and n_window_stride:
             raise ValueError(
-                f"{self} received both window_stride and n_window_stride. Only one should be specified."
+                f"{self} received both window_stride and n_window_stride. "
+                "Only one should be specified."
             )
         if window_size:
             n_window_size = int(window_size * self._sample_rate)
@@ -274,16 +280,20 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
             or n_window_stride <= 0
         ):
             raise ValueError(
-                f"{self} got an invalid value for either n_window_size or n_window_stride. Both must be positive ints."
+                f"{self} got an invalid value for either n_window_size or n_window_stride. "
+                "Both must be positive ints."
             )
         if exact_pad and n_window_stride % 2 == 1:
             raise NotImplementedError(
-                f"{self} received exact_pad == True, but hop_size was odd. If audio_length % hop_size == 0. Then the "
-                "returned spectrogram would not be of length audio_length // hop_size. Please use an even hop_size."
+                f"{self} received exact_pad == True, but hop_size was odd. "
+                "If audio_length % hop_size == 0. Then the "
+                "returned spectrogram would not be of length audio_length // hop_size. "
+                "Please use an even hop_size."
             )
         if log_zero_guard_type not in ["add", "clamp"]:
             raise ValueError(
-                f"{self} received {log_zero_guard_type} for the log_zero_guard_type parameter. It must be either "
+                f"{self} received {log_zero_guard_type} for the log_zero_guard_type parameter. "
+                "It must be either "
                 "'add' or 'clamp'."
             )
 
@@ -345,9 +355,11 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
 
     @property
     def filter_banks(self) -> torch.Tensor:
+        """Return the mel filterbank buffer."""
         return self.fb
 
     def input_example(self, max_batch: int = 8, max_dim: int = 32000, min_length: int = 200):
+        """Return example (signals, lengths) tensors for tracing/export."""
         dev = self.filter_banks.device
         signals = torch.randn(size=[max_batch, max_dim], device=dev)
         lengths = torch.randint(low=min_length, high=max_dim, size=[max_batch], device=dev)
@@ -355,6 +367,7 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
         return signals, lengths
 
     def get_seq_len(self, seq_len: torch.Tensor) -> torch.Tensor:
+        """Compute the number of output frames for the given input sample lengths."""
         pad_amount = (
             self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
         )
@@ -362,6 +375,7 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
         return seq_len.to(dtype=torch.long)
 
     def log_zero_guard_value_fn(self, x: torch.Tensor):
+        """Resolve the log zero-guard value, handling the 'tiny'/'eps' string presets."""
         if isinstance(self.log_zero_guard_value, str):
             if self.log_zero_guard_value == "tiny":
                 return torch.finfo(x.dtype).tiny
@@ -369,13 +383,15 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
                 return torch.finfo(x.dtype).eps
             else:
                 raise ValueError(
-                    f"{self} received {self.log_zero_guard_value} for the log_zero_guard_type parameter. It must be "
+                    f"{self} received {self.log_zero_guard_value} for the log_zero_guard_type "
+                    "parameter. It must be "
                     "either a number, 'tiny', or 'eps'"
                 )
         else:
             return self.log_zero_guard_value
 
     def stft(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the complex short-time Fourier transform of the input signal."""
         window = (
             self.window.to(dtype=torch.float, device=x.device) if self.window is not None else None
         )
@@ -394,6 +410,7 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
     def get_features(
         self, input_signal: torch.Tensor, length: torch.Tensor, linear_spec: bool = False
     ):
+        """Compute (log-)mel or linear spectrogram features and their output lengths."""
         x = input_signal
         seq_len_time = length
         seq_len_unfixed = self.get_seq_len(length)
@@ -464,6 +481,7 @@ class AudioToMelSpectrogramPreprocessor(nn.Module):
 
     @torch.no_grad()
     def forward(self, input_signal: torch.Tensor, length: torch.Tensor):
+        """Extract features and cast them to the module's configured dtype."""
         processed_signal, processed_length = self.get_features(
             input_signal.to(torch.float32), length
         )

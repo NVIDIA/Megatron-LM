@@ -6,6 +6,7 @@
 # file can be diffed against the NeMo source. `flash_attn_func` is imported lazily so this
 # module imports without flash-attn installed.
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -15,6 +16,8 @@ from torch.nn import GELU as TorchGELU
 from torch.nn import Conv1d
 from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.checkpoint import checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 def _flash_attn_func(*args, **kwargs):
@@ -55,6 +58,8 @@ def _resolve_attn_impl(impl: str) -> str:
 
 @dataclass
 class GPTConfig:
+    """Configuration for a GPT-style transformer (vendored NeMo helper)."""
+
     vocab_size: int = 50257
     context_length: int = 1024
     emb_dim: int = 768
@@ -67,6 +72,8 @@ class GPTConfig:
 
 @dataclass
 class TransformerEncoderConfig:
+    """Configuration for the audio TransformerEncoder and its blocks."""
+
     n_mels: int = 80
     d_model: int = 512
     n_heads: int = 12
@@ -123,20 +130,26 @@ def _causal_disallow_mask(
 
 
 class FeedForward(nn.Module):
+    """Two-layer position-wise feed-forward network with a 4x hidden expansion and GELU."""
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), TorchGELU(), nn.Linear(4 * dim, dim))
 
     def forward(self, x):
+        """Apply the feed-forward network to ``x``."""
         return self.ffn(x)
 
 
 class GELU(nn.Module):
+    """Tanh-approximation GELU activation (vendored NeMo helper)."""
+
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
+        """Apply the tanh-approximation GELU to ``x``."""
         return (
             0.5
             * x
@@ -150,6 +163,8 @@ class GELU(nn.Module):
 
 
 class LayerNorm(nn.Module):
+    """Layer normalization with learnable scale and shift (upcasts to fp32 internally)."""
+
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
@@ -157,6 +172,7 @@ class LayerNorm(nn.Module):
         self.shift = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
+        """Normalize ``x`` over its last dimension and apply scale and shift."""
         # Cast to fp32 for numerically stable mean/var, then back to original dtype.
         # Original NeMo source used `torch.autocast('cuda', ...)`; we manually upcast so this
         # also works on CPU (e.g. unit tests).
@@ -169,6 +185,7 @@ class LayerNorm(nn.Module):
 
 
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    """Precompute the rotary position embedding cosine and sine tables."""
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
     # Compute the inverse frequencies
@@ -196,6 +213,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
 
 
 def apply_rope(x, cos, sin):
+    """Apply rotary position embeddings to ``x`` using precomputed cos and sin tables."""
     # x: (batch_size, num_heads, seq_len, head_dim)
     batch_size, num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
@@ -217,6 +235,8 @@ def apply_rope(x, cos, sin):
 
 
 class MultiHeadAttentionWithFA(nn.Module):
+    """Multi-head attention using the flash-attention ``flash_attn_func`` backend."""
+
     def __init__(
         self,
         dim_in,
@@ -241,6 +261,7 @@ class MultiHeadAttentionWithFA(nn.Module):
         self.out_proj = nn.Linear(self.d_out, self.d_out)
 
     def forward(self, x):
+        """Run flash-attention over ``x`` and project the result."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -330,6 +351,7 @@ class MultiHeadAttentionWithTE(nn.Module):
         self.te_attn = te_dpa_cls(**te_kwargs)
 
     def forward(self, x, lengths=None, packed_seq_params=None, **_):
+        """Run TE attention in THD layout, packing/unpacking as needed, and project."""
         if packed_seq_params is not None:
             x_packed = x.reshape(-1, x.shape[-1])
             cu_q = packed_seq_params.cu_seqlens_q
@@ -390,6 +412,8 @@ class MultiHeadAttentionWithTE(nn.Module):
 
 
 class MultiHeadAttentionWithSDPA(nn.Module):
+    """Multi-head attention using PyTorch ``scaled_dot_product_attention``."""
+
     def __init__(
         self,
         dim_in,
@@ -421,6 +445,7 @@ class MultiHeadAttentionWithSDPA(nn.Module):
             self.k_norm = nn.LayerNorm(self.head_dim)
 
     def forward(self, x, attn_mask=None, use_cache=False):
+        """Run scaled-dot-product attention over ``x`` and project the result."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -462,6 +487,8 @@ class MultiHeadAttentionWithSDPA(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
+    """Multi-head attention with an explicit softmax and optional KV cache."""
+
     def __init__(
         self,
         dim_in,
@@ -502,6 +529,7 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("cache_v", None, persistent=False)
 
     def forward(self, x, use_cache=False):
+        """Run masked multi-head attention over ``x``, optionally using the KV cache."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -557,11 +585,14 @@ class MultiHeadAttention(nn.Module):
         return output
 
     def reset_cache(self):
+        """Clear the cached keys and values."""
         self.cache_k = None
         self.cache_v = None
 
 
 class TransformerBlock(nn.Module):
+    """Single transformer encoder block: attention, feed-forward, and residual norms."""
+
     def __init__(self, cfg: TransformerEncoderConfig):
         super().__init__()
         self.cfg = cfg
@@ -608,6 +639,7 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward(self.cfg.d_model)
 
     def forward(self, x, attn_mask=None, lengths=None, packed_seq_params=None, use_cache=False):
+        """Apply attention and feed-forward sublayers with residual connections."""
         pre_norm = self.pre_norm(x)
 
         if self.attn_impl == "te":
@@ -638,6 +670,8 @@ class TransformerBlock(nn.Module):
 
 
 class ConvSubsampling(nn.Module):
+    """Convolutional subsampling that reduces the temporal dimension by 4x."""
+
     def __init__(self, n_mels: int = 80, d_model: int = 512):
         super().__init__()
         self.conv1 = Conv1d(n_mels, d_model, kernel_size=3, padding=1)
@@ -648,6 +682,7 @@ class ConvSubsampling(nn.Module):
         self.gelu = TorchGELU()
 
     def forward(self, x, length):
+        """Subsample ``x`` by 4x and return the features and updated lengths."""
         x = self.conv1(x)
         x = self.gelu(x)
         x = self.conv2(x)
@@ -678,6 +713,7 @@ class DepthwiseConvSubsampling(nn.Module):
         self.gelu = TorchGELU()
 
     def forward(self, x, length):
+        """Subsample ``x`` by 4x via depthwise separable convs and update lengths."""
         x = self.conv1(x)
         x = self.gelu(x)
         x = self.dw_conv2(x)
@@ -738,6 +774,8 @@ class NGPTStackingSubsampling(torch.nn.Module):
 
 
 class TransformerEncoder(nn.Module):
+    """Audio transformer encoder: subsampling front-end followed by a transformer stack."""
+
     def __init__(
         self,
         n_mels: int = 80,
@@ -922,10 +960,9 @@ class TransformerEncoder(nn.Module):
             inf_count = torch.isinf(x).sum().item()
             valid = x[~(torch.isnan(x) | torch.isinf(x))]
             abs_max = valid.abs().max().item() if valid.numel() > 0 else float('nan')
-            print(
+            logger.error(
                 f"[NaN DEBUG] {name}: NaN={nan_count}, Inf={inf_count}, "
-                f"abs_max={abs_max:.6f}, shape={list(x.shape)}",
-                flush=True,
+                f"abs_max={abs_max:.6f}, shape={list(x.shape)}"
             )
             raise RuntimeError(f"[NaN DEBUG] NaN/Inf detected at '{name}'. Stopping training.")
 
@@ -937,9 +974,11 @@ class TransformerEncoder(nn.Module):
                 reset()
 
     def freeze(self):
+        """Disable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze(self, partial=False):
+        """Enable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = True
