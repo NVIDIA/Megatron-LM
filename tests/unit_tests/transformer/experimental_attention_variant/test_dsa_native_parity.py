@@ -2220,6 +2220,63 @@ def test_cudnn_indexer_backward_head_padding_slices_to_actual_heads():
     torch.testing.assert_close(grad_w, w)
 
 
+def test_cudnn_sparse_indexer_backward_chunks_sequence_and_preserves_scaling(monkeypatch):
+    calls = []
+
+    class FakeDSA:
+        @staticmethod
+        def indexer_backward_wrapper(
+            q_indexer,
+            weights,
+            k_indexer,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale,
+            loss_coeff,
+            grad_loss,
+            block_I,
+        ):
+            del attn_score, index_score, topk_indices, sm_scale, grad_loss, block_I
+            call_value = len(calls) + 1
+            calls.append((q_indexer.size(1), loss_coeff))
+            return {
+                "d_index_q": torch.full_like(q_indexer, call_value),
+                "d_weights": torch.full_like(weights, call_value),
+                "d_index_k": torch.full_like(k_indexer, call_value),
+            }
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_CUDA_GRID_Y_MAX", 2)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_SPARSE_INDEXER_BACKWARD_CHUNK_ROWS", 2)
+
+    q = torch.zeros((1, 5, 2, 4), dtype=torch.bfloat16)
+    weights = torch.zeros((1, 5, 2), dtype=torch.bfloat16)
+    k = torch.zeros((1, 3, 4), dtype=torch.bfloat16)
+    scores = torch.zeros((1, 5, 4), dtype=torch.float32)
+    indices = torch.zeros((1, 5, 4), dtype=torch.int32)
+    grad_q, grad_w, grad_k = dsa_cudnn_kernels._run_sparse_indexer_backward(
+        q,
+        weights,
+        k,
+        scores,
+        scores.clone(),
+        indices,
+        loss_coeff=10.0,
+        grad_loss=torch.ones((), dtype=torch.float32),
+        block_i=128,
+    )
+
+    assert calls == [(2, 4.0), (2, 4.0), (1, 2.0)]
+    torch.testing.assert_close(
+        grad_q[:, :, 0, 0], torch.tensor([[1, 1, 2, 2, 3]], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        grad_w[:, :, 0], torch.tensor([[1, 1, 2, 2, 3]], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(grad_k, torch.full_like(k, 6))
+
+
 def test_cudnn_flash_mla_sm100_uses_smallest_supported_head_padding(monkeypatch):
     monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: (10, 0))
 

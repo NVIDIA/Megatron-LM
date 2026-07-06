@@ -136,6 +136,8 @@ _INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
 _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
+_CUDA_GRID_Y_MAX = 65535
+_SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -877,12 +879,6 @@ def _indexer_topk_single_packed_cp_segments(
             return_topk_scores,
             bottom_right_key_start=key_start + rel_start,
         )
-        valid = (topk_indices >= 0) & (topk_indices < seq_lens.view(1, -1, 1))
-        topk_indices = torch.where(valid, topk_indices, torch.full_like(topk_indices, -1))
-        if topk_scores is not None:
-            topk_scores = torch.where(
-                valid, topk_scores, torch.full_like(topk_scores, torch.finfo(torch.float32).min)
-            )
         topk_indices, topk_scores = _pad_topk_result(topk_indices, topk_scores, topk_k)
         indices_chunks.append(topk_indices)
         if return_topk_scores:
@@ -1543,6 +1539,59 @@ def _pad_sparse_backward_topk(
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
+def _run_sparse_indexer_backward(
+    q_idx_bshd: Tensor,
+    w_bsh: Tensor,
+    k_idx_bsd: Tensor,
+    attn_score: Tensor,
+    index_score: Tensor,
+    topk_indices: Tensor,
+    *,
+    loss_coeff: float,
+    grad_loss: Tensor,
+    block_i: int,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Run cuDNN sparse indexer backward within CUDA's grid-Y limit."""
+    sq = q_idx_bshd.size(1)
+    if sq <= _CUDA_GRID_Y_MAX:
+        result = _cudnn_dsa.indexer_backward_wrapper(
+            q_idx_bshd,
+            w_bsh,
+            k_idx_bsd,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale=_INDEXER_SOFTMAX_SCALE,
+            loss_coeff=loss_coeff,
+            grad_loss=grad_loss,
+            block_I=block_i,
+        )
+        return result["d_index_q"], result["d_weights"], result["d_index_k"]
+
+    grad_q = torch.empty_like(q_idx_bshd)
+    grad_w = torch.empty_like(w_bsh)
+    grad_k = torch.zeros_like(k_idx_bsd, dtype=torch.float32)
+    for row_start in range(0, sq, _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS):
+        row_end = min(row_start + _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS, sq)
+        chunk_rows = row_end - row_start
+        result = _cudnn_dsa.indexer_backward_wrapper(
+            q_idx_bshd[:, row_start:row_end].contiguous(),
+            w_bsh[:, row_start:row_end].contiguous(),
+            k_idx_bsd,
+            attn_score[:, row_start:row_end].contiguous(),
+            index_score[:, row_start:row_end].contiguous(),
+            topk_indices[:, row_start:row_end].contiguous(),
+            sm_scale=_INDEXER_SOFTMAX_SCALE,
+            loss_coeff=loss_coeff * chunk_rows / sq,
+            grad_loss=grad_loss,
+            block_I=block_i,
+        )
+        grad_q[:, row_start:row_end].copy_(result["d_index_q"])
+        grad_w[:, row_start:row_end].copy_(result["d_weights"])
+        grad_k.add_(result["d_index_k"].float())
+    return grad_q, grad_w, grad_k.to(dtype=k_idx_bsd.dtype)
+
+
 def _pad_attn_target_heads(q_attn_bshd: Tensor, lse: Tensor) -> Tuple[Tensor, Tensor, int]:
     """Pad local query heads to cuDNN sparse-score-recompute MMA constraints."""
     actual_heads = q_attn_bshd.size(2)
@@ -1821,24 +1870,23 @@ def _compute_sparse_indexer_loss_and_grads(
     attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd = _pad_sparse_backward_topk(
         attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd, block_i
     )
-    ig = _cudnn_dsa.indexer_backward_wrapper(
+    grad_q_bshd, grad_w_bsh, grad_k_bsd = _run_sparse_indexer_backward(
         q_idx_bshd_for_bwd,
         w_bsh_for_bwd,
         k_idx_bsd,
         attn_score_for_bwd,
         index_score_for_bwd,
         topk_indices_for_bwd,
-        sm_scale=_INDEXER_SOFTMAX_SCALE,
         loss_coeff=indexer_loss_coeff,
         grad_loss=unit_grad_loss,
-        block_I=block_i,
+        block_i=block_i,
     )
 
     grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
-        ig["d_index_q"], ig["d_weights"], actual_indexer_heads
+        grad_q_bshd, grad_w_bsh, actual_indexer_heads
     )
     precomputed_grad_q_indexer = grad_q_bshd.permute(1, 0, 2, 3).contiguous()
-    precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
+    precomputed_grad_k_indexer = grad_k_bsd.permute(1, 0, 2).contiguous()
     precomputed_grad_weights = grad_w_bsh.permute(1, 0, 2).contiguous()
     return (
         indexer_loss,
