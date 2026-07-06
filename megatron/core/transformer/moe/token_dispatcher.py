@@ -1068,20 +1068,23 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
-        equalize_thd_token_counts = (
+        if (
             self.config.sequence_packing_scheduler is not None
             or self.config.moe_hybridep_pad_variable_tokens
-        )
-        if equalize_thd_token_counts:
-            if self.config.sequence_packing_scheduler is not None and (
-                torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling()
-            ):
-                # CUDA graph path: routing_map has already been padded to a static
-                # length upstream (CUDA graph + sequence packing implies
-                # cu_seqlens_q_padded -> max_seqlen_per_dp_cp_rank), so num_tokens
-                # is identical across the EP communication group. Skip the
-                # all_reduce + .item() during both dynamo tracing and stream
-                # capture, and use the local value directly.
+        ):
+            pad_alignment = self.config.pad_packed_seq_alignment
+            has_static_token_count = (
+                self.config.sequence_packing_scheduler is not None
+                and pad_alignment is not None
+                and (
+                    pad_alignment == "max"
+                    or pad_alignment == self.config.max_seqlen_per_dp_cp_rank
+                )
+            )
+            if has_static_token_count:
+                # The sequence-packing path has already padded every rank to the
+                # same configured maximum. This is a data invariant independent
+                # of Dynamo tracing or CUDA graph capture state.
                 padded_num_tokens = num_tokens
             else:
                 # Use the actual tp_ep max so all ranks in the MoE communication
@@ -1098,7 +1101,7 @@ class _HybridEPManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        if equalize_thd_token_counts and padded_num_tokens > num_tokens:
+        if padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             routing_map = torch.cat(
                 [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
