@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 import math
 import warnings
@@ -306,6 +307,9 @@ class TransformerConfig(ModelParallelConfig):
         None
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
 
     ####################
     # DSA
@@ -1477,6 +1481,30 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.experimental_attention_variant == "dsv4_hybrid" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+
+        if self.context_parallel_size > 1:
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.cp_partition_mode != "contiguous"
+            ):
+                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+            if (
+                self.experimental_attention_variant != "dsv4_hybrid"
+                and self.cp_partition_mode != "zigzag"
+            ):
+                raise ValueError(
+                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                )
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1570,10 +1598,23 @@ class TransformerConfig(ModelParallelConfig):
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
                 sm = torch.cuda.get_device_capability()
-                assert sm[0] >= 10, (
-                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                assert sm[0] >= 9, (
+                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
+                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if (
+                    sm[0] == 9
+                    and uses_ratio4_indexer
+                    and indexer_loss_enabled
+                    and not self.dsa_indexer_use_sparse_loss
+                ):
+                    raise ValueError(
+                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
+                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
+                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                    )
 
                 _flash_mla_available = True
                 try:
@@ -1602,6 +1643,31 @@ class TransformerConfig(ModelParallelConfig):
                         f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
                         f"PyTorch fallback."
                     )
+
+                if (
+                    self.context_parallel_size > 1 or self.dynamic_context_parallel
+                ) and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or disable DSA kernel fusion."
+                        )
 
         if (
             self.gdn_pre_gated_delta_rule_fusion
