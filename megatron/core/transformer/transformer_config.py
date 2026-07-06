@@ -884,12 +884,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
-    moe_deepep_num_sms: int = 20
-    """Number of SMs to use for DeepEP."""
+    moe_flex_dispatcher_num_sms: Optional[int] = None
+    """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
+    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
+    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+
+    moe_deepep_num_sms: Optional[int] = None
+    """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
+    default 20). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
     moe_hybridep_num_sms: Optional[int] = None
-    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
-    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
+    """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for HybridEP (None uses the
+    default from DeepEP). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
     moe_hybridep_num_blocks_permute: Optional[int] = None
     """Number of CUDA thread blocks for the permute part in HybridEP.
@@ -903,10 +909,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
-
-    moe_ncclep_num_sms: int = 0
-    """Number of SMs to use for NCCL EP (the max_num_sms passed to TransformerEngine's
-    ep_bootstrap). 0 lets TransformerEngine/NCCL choose the default."""
 
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
@@ -1562,6 +1564,27 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
+
+        # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
+        # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
+        # moe_flex_dispatcher_num_sms takes precedence) and warn.
+        _deprecated_num_sms = {
+            name: getattr(self, name)
+            for name in ("moe_deepep_num_sms", "moe_hybridep_num_sms")
+            if getattr(self, name) is not None
+        }
+        if _deprecated_num_sms:
+            warnings.warn(
+                f"{', '.join(_deprecated_num_sms)} is deprecated. "
+                "Use moe_flex_dispatcher_num_sms instead."
+            )
+            if self.moe_flex_dispatcher_num_sms is None:
+                if len(set(_deprecated_num_sms.values())) > 1:
+                    raise ValueError(
+                        f"Conflicting deprecated SM-count knobs {_deprecated_num_sms}; set a "
+                        "single moe_flex_dispatcher_num_sms instead."
+                    )
+                self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

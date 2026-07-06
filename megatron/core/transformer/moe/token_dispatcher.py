@@ -1098,8 +1098,8 @@ class _HybridEPManager(_DispatchManager):
                 probs=self.token_probs,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
-                num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
-                num_sms_combine_api=self.config.moe_hybridep_num_sms,
+                num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
+                num_sms_combine_api=self.config.moe_flex_dispatcher_num_sms,
                 num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                 num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                 num_permuted_tokens=self.num_permuted_tokens,
@@ -1220,7 +1220,10 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        # None -> 20 (DeepEP's historical mcore default when moe_flex_dispatcher_num_sms is unset).
+        set_deepep_num_sms(
+            config.moe_flex_dispatcher_num_sms if config.moe_flex_dispatcher_num_sms is not None else 20
+        )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1534,7 +1537,11 @@ class _NCCLEPManager(_DispatchManager):
             max_tokens_per_rank=self._max_tokens_per_rank,
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
-            num_sms=self.config.moe_ncclep_num_sms,
+            num_sms=(
+                self.config.moe_flex_dispatcher_num_sms
+                if self.config.moe_flex_dispatcher_num_sms is not None
+                else 0
+            ),
             zero_copy=False,
         )
         self._bootstrapped = True
@@ -1559,7 +1566,7 @@ class _NCCLEPManager(_DispatchManager):
         )
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]
-        topk_idx = self.token_indices.to(torch.int64)
+        topk_idx = self.token_indices
         topk_weights = self.token_probs.float()
         # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_capacity_per_rank, H]
         #   tokens_per_expert: [num_local_experts]
