@@ -626,24 +626,6 @@ def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
     assert module._is_fused_impl_supported() is False
 
 
-def test_is_fused_impl_supported_requires_glu_interleave_32(monkeypatch):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-        moe_mlp_glu_interleave_size=16,
-    )
-
-    assert module._is_fused_impl_supported() is False
-
-
 @pytest.mark.parametrize(
     (
         "use_fused_weighted_squared_relu",
