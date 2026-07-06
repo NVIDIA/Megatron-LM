@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -442,10 +430,7 @@ class DataParallelBuffer:
         return True
 
     def _move_data_to(
-        self,
-        target_device: torch.device,
-        pin_memory: bool = False,
-        non_blocking: bool = True,
+        self, target_device: torch.device, pin_memory: bool = False, non_blocking: bool = True
     ) -> None:
         """Move ``self.data`` to *target_device*, optionally using pinned memory.
 
@@ -584,9 +569,7 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self,
-        bind_params: bool = False,
-        stream: Optional[torch.cuda.Stream] = None,
+        self, bind_params: bool = False, stream: Optional[torch.cuda.Stream] = None
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
@@ -607,9 +590,7 @@ class DataParallelBuffer:
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             torch.distributed.all_gather_into_tensor(
-                output_tensor=full_buffer,
-                input_tensor=shard_buffer,
-                group=self.dp_group,
+                output_tensor=full_buffer, input_tensor=shard_buffer, group=self.dp_group
             )
 
         if bind_params:

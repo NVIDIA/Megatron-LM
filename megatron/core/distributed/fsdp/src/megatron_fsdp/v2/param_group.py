@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Parameter Group for FSDP
@@ -112,6 +100,7 @@ class ParameterGroup:
         self._init_buffers()
 
     def set_allocator(self, allocator: BucketAllocator) -> None:
+        """Replace the allocator used by every buffer in this parameter group."""
         self.allocator = allocator
         for buffer in (
             self.model_weight_buffer,
@@ -284,10 +273,7 @@ class ParameterGroup:
         # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
         # so the first reduce_grad after either event overwrites instead of
         # accumulating — no stale data from uninitialised or zeroed buffers.
-        self.main_grad_buffer.reduce_grad(
-            overwrite_grad=self._grad_buffer_is_fresh,
-            stream=stream,
-        )
+        self.main_grad_buffer.reduce_grad(overwrite_grad=self._grad_buffer_is_fresh, stream=stream)
         self._grad_buffer_is_fresh = False
 
     def release_grad_buffer(self):
@@ -312,8 +298,8 @@ class ParameterGroup:
         if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
             return
         if any(
-            [getattr(p, "grad", None) is not None for p in self.dist_params] +
-            [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
+            [getattr(p, "grad", None) is not None for p in self.dist_params]
+            + [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
         ):
             return
         self.main_grad_buffer.data = None
@@ -417,11 +403,13 @@ class ParameterGroup:
             dist_param = self.dist_params[i]
             if dist_param is not None:
                 if self.main_weight_buffer is not None:
-                    data = self.main_weight_buffer.get_item(self.param_idx[param],
-                                                            as_shard=is_param_shard)
+                    data = self.main_weight_buffer.get_item(
+                        self.param_idx[param], as_shard=is_param_shard
+                    )
                 elif self.model_weight_buffer is not None:
-                    data = self.model_weight_buffer.get_item(self.param_idx[param],
-                                                             as_shard=is_param_shard)
+                    data = self.model_weight_buffer.get_item(
+                        self.param_idx[param], as_shard=is_param_shard
+                    )
                 else:
                     continue
                 object.__setattr__(dist_param._local_tensor, 'data', data)
@@ -442,8 +430,12 @@ class ParameterGroup:
         Returns True if any buffer was moved (views were rebuilt).
         """
         moved = False
-        for buf in (self.model_weight_buffer, self.main_weight_buffer,
-                    self.main_grad_buffer, self.transpose_weight_buffer):
+        for buf in (
+            self.model_weight_buffer,
+            self.main_weight_buffer,
+            self.main_grad_buffer,
+            self.transpose_weight_buffer,
+        ):
             if buf is not None and buf._ensure_data_on_gpu():
                 moved = True
         if moved:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Lazy main_grad_buffer Design for Megatron FSDP v2
 
 ## 1. Motivation

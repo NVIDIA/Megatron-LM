@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Silent CUDA Graph inside Megatron FSDP v2 — Design
 
 > **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental

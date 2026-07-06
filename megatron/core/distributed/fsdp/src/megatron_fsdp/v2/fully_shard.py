@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Public fully_shard API for Megatron-FSDP2.
@@ -22,7 +10,6 @@ The implementation is split across:
 
 from typing import Callable, Optional
 
-import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
@@ -113,11 +100,7 @@ def fully_shard(
             for m in module.modules()
             if isinstance(m, FSDPModule) and m is not module
         )
-    ) and sharding_strategy in (
-        "optim",
-        "optim_grads",
-        "optim_grads_params",
-    )
+    ) and sharding_strategy in ("optim", "optim_grads", "optim_grads_params")
     bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
@@ -144,9 +127,7 @@ def fully_shard(
     )
     _register_forward_hook(module)
     _register_backward_pre_hook(
-        module,
-        fine_grained=fine_grained_hooks,
-        skip_final_callback=skip_final_backward_callback,
+        module, fine_grained=fine_grained_hooks, skip_final_callback=skip_final_backward_callback
     )
     # When delay_wgrad_compute is enabled, skip the autograd post-backward
     # hook.  Per-layer reshard+reduce_grad still fires via set_fsdp_reshard_hooks
