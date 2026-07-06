@@ -13,6 +13,7 @@ ENV_VARS:
   NVTE_FWD_LAYERNORM_SM_MARGIN: 20
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.8,roundup_power2_divisions:true,max_non_split_rounding_mb:1024
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
@@ -140,6 +141,10 @@ MODEL_ARGS:
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
   --dist-ckpt-strictness: log_all
+  --async-save: true
+  --async-strategy: nvrx
+  --async-ckpt-use-cpu-shm: true
+  --use-persistent-ckpt-worker: true
   --save-interval: 200
   --save-retain-interval: 2000
 
