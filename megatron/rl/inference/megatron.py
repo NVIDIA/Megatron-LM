@@ -28,6 +28,7 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
+from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
 
+        # RL needs log probs, but not prompt log probs.
+        args.return_log_probs = True
+        args.skip_prompt_log_probs = True
+
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
@@ -126,7 +131,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        concurrency_limit = (
+            args.grpo_prompts_per_step
+            * args.grpo_group_size
+            * get_rl_parallel_generation_tasks(args)
+        )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,
