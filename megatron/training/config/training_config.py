@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -58,6 +57,21 @@ class TrainingConfig:
     """Interval (in iterations) to run GPU performance sniff tests (GEMMs, all-to-all, send/recv).
     Flags any rank whose throughput differs from the mean by more than one standard deviation.
     If not specified, sniff tests are not run."""
+
+    report_theoretical_flops: bool = False
+    """Print and write an operator-level theoretical FLOPs report at startup."""
+
+    theoretical_flops_output_dir: str = "./flops_analysis"
+    """Directory for theoretical FLOPs artifacts."""
+
+    theoretical_flops_verbose: bool = False
+    """Print all operator entries in the theoretical FLOPs startup report."""
+
+    capture_te_attention_backend: bool = True
+    """When reporting theoretical FLOPs, enable TE attention backend debug logging if unset."""
+
+    reconcile_trace_after_profile: bool = True
+    """When reporting theoretical FLOPs, reconcile PyTorch profiler traces after the profile window."""
 
     train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""

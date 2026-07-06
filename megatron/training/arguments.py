@@ -106,6 +106,11 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     else:
         validate_args(args, args_defaults)
 
+    if getattr(args, "report_theoretical_flops", False):
+        from megatron.training.theoretical_flops_usage import set_te_attention_debug_env_if_needed
+
+        set_te_attention_debug_env_if_needed(args)
+
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(args)

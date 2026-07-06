@@ -1096,6 +1096,20 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.report_theoretical_flops:
+        from megatron.training.theoretical_flops_usage import (
+            report_theoretical_flops,
+            set_te_attention_debug_env_if_needed,
+        )
+
+        set_te_attention_debug_env_if_needed(args)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            report_theoretical_flops(
+                args,
+                num_microbatches=get_num_microbatches(),
+                verbose=args.theoretical_flops_verbose,
+            )
+
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
@@ -3105,6 +3119,21 @@ def post_training_step_callbacks(
             prof.stop()
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
+            if (
+                args.report_theoretical_flops
+                and args.reconcile_trace_after_profile
+                and args.pytorch_profiler_collect_shapes
+            ):
+                from megatron.training.trace_reconciliation import (
+                    format_reconciliation_summary,
+                    reconcile_trace_vs_theory,
+                )
+
+                result = reconcile_trace_vs_theory(
+                    args,
+                    rank=torch.distributed.get_rank(),
+                )
+                print(format_reconciliation_summary(result), flush=True)
         else:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
@@ -3553,7 +3582,9 @@ def train(
         else:
             et = None
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            from megatron.training.trace_reconciliation import get_torch_profile_dir
+
+            profile_dir = get_torch_profile_dir(args)
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
@@ -3569,6 +3600,17 @@ def train(
             execution_trace_observer=et,
         )
         prof.start()
+
+    te_attention_log_capture = None
+    te_backend_context_captured = False
+    if (
+        args.report_theoretical_flops
+        and args.capture_te_attention_backend
+        and torch.distributed.get_rank() == 0
+    ):
+        from megatron.training.theoretical_flops_usage import TeAttentionLogCapture
+
+        te_attention_log_capture = TeAttentionLogCapture()
 
     start_iteration = iteration
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
@@ -3738,6 +3780,23 @@ def train(
                 p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
+            if (
+                te_attention_log_capture is not None
+                and not te_backend_context_captured
+                and not skipped_iter
+            ):
+                runtime_context_update = te_attention_log_capture.maybe_capture(
+                    capture_step=iteration + 1
+                )
+                if runtime_context_update is not None:
+                    from megatron.training.theoretical_flops_usage import (
+                        update_theoretical_flops_json_runtime_context,
+                    )
+
+                    update_theoretical_flops_json_runtime_context(args, runtime_context_update)
+                    te_backend_context_captured = True
+                    te_attention_log_capture.close()
+                    te_attention_log_capture = None
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
             # Fault delay timing can start at the end of iteration N. Self-firing faults
@@ -4001,6 +4060,9 @@ def train(
     # Shutdown RL profiler and export summary
     if args.rl_profile:
         shutdown_rl_profiler()
+
+    if te_attention_log_capture is not None:
+        te_attention_log_capture.close()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:

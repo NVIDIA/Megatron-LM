@@ -1,0 +1,44 @@
+{
+  "entries": [
+    {
+      "global_flops": 13194139533312,
+      "operator": "qkv_projection",
+      "sequence_sharded": false,
+      "shape": "(m,n,k)=(8192, 4096, 2048)"
+    },
+    {
+      "global_flops": 6597069766656,
+      "operator": "output_projection",
+      "sequence_sharded": true,
+      "shape": "(m,n,k)=(8192, 2048, 2048)"
+    },
+    {
+      "global_flops": 13194139533312,
+      "operator": "(gqa)core_attn(sbhd)",
+      "sequence_sharded": false,
+      "shape": "(mbs=2, seq=4096, h=16, qk_d=128, v_d=128) (causal)"
+    },
+    {
+      "global_flops": 39582418599936,
+      "operator": "fc1",
+      "sequence_sharded": false,
+      "shape": "(m,n,k)=(8192, 12288, 2048)"
+    },
+    {
+      "global_flops": 19791209299968,
+      "operator": "fc2",
+      "sequence_sharded": true,
+      "shape": "(m,n,k)=(8192, 2048, 6144)"
+    },
+    {
+      "global_flops": 25769803776000,
+      "operator": "logits",
+      "sequence_sharded": false,
+      "shape": "(m,n,k)=(8192, 32000, 2048)"
+    }
+  ],
+  "reference_total_flops": 118128780509184,
+  "runtime_context": {
+    "te_selected_backend": null
+  }
+}
