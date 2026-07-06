@@ -226,8 +226,8 @@ class TextGenerationController:
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
-        self._async_sched_sample_source_ready_event = torch.cuda.Event()
-        self._async_sched_sample_ready_event = torch.cuda.Event()
+        self._async_sched_sample_gpu_ready_event = torch.cuda.Event()
+        self._async_sched_sample_cpu_ready_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
 
         # Sampling backend: provides the sampling kernel.
@@ -1889,13 +1889,11 @@ class TextGenerationController:
 
         buffer = self._async_sched_sampled_tokens_cpu_buffer
         sample_cpu = buffer[: sampled_tokens_gpu.numel()]
-        current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
-        self._async_sched_sample_source_ready_event.record(current_stream)
         with torch.cuda.stream(self._async_sched_copy_stream):
-            self._async_sched_copy_stream.wait_event(self._async_sched_sample_source_ready_event)
+            self._async_sched_copy_stream.wait_event(self._async_sched_sample_gpu_ready_event)
             sample_cpu.copy_(sampled_tokens_gpu, non_blocking=True)
-            self._async_sched_sample_ready_event.record(self._async_sched_copy_stream)
-        return sample_cpu, self._async_sched_sample_ready_event
+            self._async_sched_sample_cpu_ready_event.record(self._async_sched_copy_stream)
+        return sample_cpu, self._async_sched_sample_cpu_ready_event
 
     def _build_async_sched_request_state(
         self, sampled_tokens_cpu: Tensor
@@ -1930,7 +1928,7 @@ class TextGenerationController:
         return active_request_ids, finished_request_ids, active_request_mask, survivor_idxs
 
     def _run_async_sched_sample(self) -> Tensor:
-        """Sample active requests into the stable GPU sample buffer.
+        """Sample active requests and record when their GPU tokens are ready.
 
         Returns:
             Tensor: GPU token samples for the active requests.
@@ -1946,6 +1944,9 @@ class TextGenerationController:
             dim=-1,
             out=sampled_tokens_gpu,
         )
+        if sampled_tokens_gpu.is_cuda:
+            current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
+            self._async_sched_sample_gpu_ready_event.record(current_stream)
         range_pop()
 
         # Return the sampling result.
@@ -2145,14 +2146,14 @@ class TextGenerationController:
             # Populate the next forward's input-ID view directly from GPU samples.
             context.copy_async_sched_input_tokens_to_gpu(sampled_tokens_gpu)
 
-            # Start D2H after sampling and the input-ID copy complete.
-            sampled_tokens_cpu_view, sample_ready_event = self._copy_async_sched_sample_to_cpu(
+            # Start D2H after sampling; it may overlap the GPU input-ID copy.
+            sampled_tokens_cpu_view, sample_cpu_ready_event = self._copy_async_sched_sample_to_cpu(
                 sampled_tokens_gpu
             )
 
             # Serial mode needs the CPU sample before proceeding.
             if not overlap:
-                self._synchronize_async_sched_event(sample_ready_event)
+                self._synchronize_async_sched_event(sample_cpu_ready_event)
 
             # Publish positions and metadata without overwriting GPU-resident input IDs.
             range_push("async_sched_transfer_bookkeeping_to_gpu")
@@ -2176,7 +2177,7 @@ class TextGenerationController:
 
             # Resolution reads the CPU sample and mutates the H2D source buffer.
             if overlap:
-                self._synchronize_async_sched_event(sample_ready_event)
+                self._synchronize_async_sched_event(sample_cpu_ready_event)
                 self._synchronize_async_sched_event(bookkeeping_done_event)
 
             # Resolve N while forward N+1 continues unless finished resources are needed.

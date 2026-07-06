@@ -549,6 +549,21 @@ def test_run_async_sched_sample_reuses_gpu_buffer():
 
 
 @pytest.mark.internal
+def test_run_async_sched_sample_records_gpu_ready_event():
+    context = _make_async_sched_context(total_request_count=3)
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.zeros(1, 3, 5, device="cuda")
+    controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sample_gpu_ready_event = mock.Mock()
+
+    controller._run_async_sched_sample()
+
+    controller._async_sched_sample_gpu_ready_event.record.assert_called_once_with(
+        torch.cuda.current_stream()
+    )
+
+
+@pytest.mark.internal
 def test_async_sched_event_records_and_synchronizes_cuda_work():
     controller = _make_async_sched_controller()
 
@@ -568,14 +583,15 @@ def test_copy_async_sched_sample_to_cpu_uses_reusable_buffer_and_copy_stream():
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         3, dtype=torch.int64, device="cpu", pin_memory=True
     )
-    controller._async_sched_sample_source_ready_event = torch.cuda.Event()
-    controller._async_sched_sample_ready_event = torch.cuda.Event()
+    controller._async_sched_sample_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_sample_cpu_ready_event = torch.cuda.Event()
     controller._async_sched_copy_stream = torch.cuda.Stream()
+    controller._async_sched_sample_gpu_ready_event.record(torch.cuda.current_stream())
 
-    sampled_tokens_cpu_view, sample_ready_event = controller._copy_async_sched_sample_to_cpu(
+    sampled_tokens_cpu_view, sample_cpu_ready_event = controller._copy_async_sched_sample_to_cpu(
         sampled_tokens_gpu
     )
-    sample_ready_event.synchronize()
+    sample_cpu_ready_event.synchronize()
 
     assert (
         sampled_tokens_cpu_view.data_ptr()
