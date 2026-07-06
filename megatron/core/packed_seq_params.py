@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-
 CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX = "_packed_seq_params_"
 
 PACKED_SEQ_PARAMS_CUDA_GRAPH_TENSOR_FIELDS = (
@@ -91,8 +90,7 @@ def _cuda_graph_packed_seq_params_key(field_name: str, prefix: str) -> str:
 
 
 def split_packed_seq_params_for_cuda_graph(
-    packed_seq_params: PackedSeqParams | None,
-    prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+    packed_seq_params: PackedSeqParams | None, prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX
 ) -> tuple[dict[str, Tensor | None], dict[str, object]]:
     """Split ``PackedSeqParams`` into graph Tensor inputs and static metadata.
 
@@ -129,8 +127,7 @@ def split_packed_seq_params_for_cuda_graph(
 
 
 def has_packed_seq_params_cuda_graph_kwargs(
-    kwargs: Mapping[str, object],
-    prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+    kwargs: Mapping[str, object], prefix: str = CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX
 ) -> bool:
     """Return whether ``kwargs`` contains flattened ``PackedSeqParams`` Tensor fields."""
     return any(

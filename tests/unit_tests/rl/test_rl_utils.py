@@ -184,10 +184,7 @@ class TestRLUtils:
 
     def test_get_rl_packed_seq_params_for_cuda_graph_with_sequence_packing(self):
         params = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
-            seq_length=8,
-            device=torch.device("cpu"),
-            sequence_packing=True,
-            max_sequences_per_bin=3,
+            seq_length=8, device=torch.device("cpu"), sequence_packing=True, max_sequences_per_bin=3
         )
 
         expected_cu_seqlens = torch.tensor([0, 8, 8, 8, 8], dtype=torch.int32)
@@ -205,9 +202,7 @@ class TestRLUtils:
     def test_get_rl_packed_seq_params_for_cuda_graph_requires_max_sequences_per_bin(self):
         with pytest.raises(AssertionError, match="max_sequences_per_bin is required"):
             rl_utils.get_rl_packed_seq_params_for_cuda_graph(
-                seq_length=8,
-                device=torch.device("cpu"),
-                sequence_packing=True,
+                seq_length=8, device=torch.device("cpu"), sequence_packing=True
             )
 
     def test_rl_granularity_defaults(self):

@@ -228,10 +228,7 @@ def test_transformer_layer_rejects_replay_with_overlapping_flattened_kwargs():
 
     with pytest.raises(AssertionError, match="overlap"):
         layer._flatten_te_cuda_graph_packed_seq_params(
-            {
-                existing_key: torch.IntTensor([0]),
-                "packed_seq_params": packed_seq_params,
-            }
+            {existing_key: torch.IntTensor([0]), "packed_seq_params": packed_seq_params}
         )
 
 
@@ -244,9 +241,7 @@ def test_te_cuda_graph_sample_kwargs_include_flattened_packed_seq_params():
     attention_mask = torch.zeros(1, 1, 16, 16, dtype=torch.bool)
     sample_kwargs = {"attention_mask": attention_mask}
 
-    _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(
-        layer, sample_kwargs, packed_seq_params
-    )
+    _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(layer, sample_kwargs, packed_seq_params)
 
     assert sample_kwargs["attention_mask"] is attention_mask
     assert set(expected_tensor_kwargs).issubset(sample_kwargs)
@@ -272,9 +267,7 @@ def test_te_cuda_graph_sample_kwargs_noop_without_packed_seq_params():
 def test_te_cuda_graph_sample_kwargs_reject_overlapping_flattened_keys():
     layer = _TransformerLayerCudaGraphStub()
     packed_seq_params = _make_packed_seq_params()
-    sample_kwargs = {
-        f"{CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX}cu_seqlens_q": torch.IntTensor([0])
-    }
+    sample_kwargs = {f"{CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX}cu_seqlens_q": torch.IntTensor([0])}
 
     with pytest.raises(AssertionError, match="overlap"):
         _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(

@@ -1670,9 +1670,7 @@ def _layer_is_graphable(layer, config):
 
 
 def _add_packed_seq_params_to_te_cuda_graph_sample_kwargs(
-    layer,
-    sample_kwargs,
-    sample_packed_seq_params,
+    layer, sample_kwargs, sample_packed_seq_params
 ):
     """Add flattened ``PackedSeqParams`` Tensor inputs to TE graph sample kwargs."""
     if sample_packed_seq_params is None:
