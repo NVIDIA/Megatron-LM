@@ -2,30 +2,20 @@
 
 """Reusable helpers for enabling bit-exact-reproducible execution.
 
-Mirrors the split that ``megatron-bridge`` uses for the same purpose:
+Two entry points:
 
-* :func:`set_determinism_env_var_defaults` — env-var setdefaults that must happen
-  BEFORE the first cuBLAS / Transformer Engine kernel invocation in the
-  process. Equivalent to bridge's
-  ``PerfEnvPlugin._set_determinism_env_vars`` (``scripts/performance/perf_plugins.py``).
-* :func:`apply_determinism_to_args` — config-level overrides applied to a
-  parsed ``args`` Namespace. Equivalent to bridge's
-  ``apply_determinism_overrides`` (``recipes/utils/determinism_utils.py``)
-  but works on the ``args`` produced by Megatron-LM's argparser.
-
-Callers:
-
-* CLI training (``pretrain_*.py``) goes through ``validate_args`` which
-  calls :func:`apply_determinism_to_args` when ``--deterministic-mode`` is
-  passed.
-* Test suite (``tests/unit_tests/determinism/``) and standalone profiling
-  scripts call :func:`set_determinism_env_var_defaults` directly at import time —
-  they don't have an ``args`` Namespace.
+* :func:`apply_determinism_env` — validate env-var settings and setdefault
+  the canonical values. Must run BEFORE the first cuBLAS / Transformer
+  Engine kernel invocation.
+* :func:`apply_determinism_to_args` — validate a parsed ``args`` Namespace,
+  call :func:`apply_determinism_env` on ``os.environ``, and flip
+  ``torch.use_deterministic_algorithms(True)``.
 """
 
 from __future__ import annotations
 
 import os
+from typing import MutableMapping
 
 import torch
 
@@ -55,16 +45,12 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
 # ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
 # order is not user-controllable and its multi-node inter-tree topology can
 # vary across runs without a pinned topology file, so we cannot vouch for it.
-#
-# Exposed as ``frozenset`` so external pre-submit validators (e.g. a Slurm
-# launcher that pre-validates a user-supplied ``nccl_algo`` string) can reuse
-# it without duplicating the list.
 ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
 
 # Env vars whose valid deterministic values are a small fixed exact-match set
 # (unlike NCCL_ALGO which accepts comma-separated subsets of tokens). An unset
-# value is fine -- set_determinism_env_var_defaults() fills the canonical
-# default. A set-but-invalid value fails hard.
+# value is fine -- apply_determinism_env() fills the canonical default. A
+# set-but-invalid value fails hard.
 #   - ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``: TE reads it as ``int(value)``; only
 #     ``"0"`` means deterministic (any nonzero int enables non-deterministic
 #     algos). See ``megatron/core/extensions/transformer_engine.py``.
@@ -77,23 +63,55 @@ ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
 }
 
 
-def set_determinism_env_var_defaults() -> None:
-    """Set defaults for the env vars required for bit-exact reproducibility.
+def apply_determinism_env(env: MutableMapping[str, str]) -> None:
+    """Validate every determinism env var in ``env``, then setdefault the canonical values.
 
-    Only fills in values the launcher has not already exported (``setdefault``);
-    an env var that is already set is left untouched.
+    Semantics per key:
+
+    * ``NCCL_ALGO`` — if set, each comma-separated token must be in
+      :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
+    * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
+      if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
+    * ``MAMBA_DETERMINISTIC`` — if set (non-empty), must start with ``'1'``;
+      unset auto-follows :func:`torch.are_deterministic_algorithms_enabled`.
+
+    After validation, ``setdefault`` fills every key in
+    :data:`DETERMINISM_ENV_VAR_DEFAULTS` that has not been set — a value the
+    caller has already set wins.
 
     These env vars are captured by their respective libraries at first use
     (NCCL at communicator init, cuBLAS at handle creation, TE at first
     attention forward), so the call must happen BEFORE any of those events.
-    Uses ``setdefault`` so any value the launcher has already exported
-    wins — defense in depth: in the test process pytest may import another
-    module that triggers CUDA-context creation before this package loads,
-    in which case the Python-side setdefault is too late and the launcher's
-    shell-side export is what actually takes effect.
     """
+    # NCCL_ALGO subset check.
+    nccl_algo = env.get("NCCL_ALGO")
+    if nccl_algo is not None:
+        tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
+        assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
+            f"NCCL_ALGO={nccl_algo!r}: each token must be in "
+            f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
+        )
+
+    # Exact-match env vars: reject only if the caller supplied a value we
+    # haven't validated as deterministic; unset is fine.
+    for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
+        val = env.get(name)
+        assert val is None or val in accepted, (
+            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
+        )
+
+    # Mamba SSM auto-follows torch when MAMBA_DETERMINISTIC is unset; only
+    # reject an explicit non-deterministic override.
+    mamba = env.get("MAMBA_DETERMINISTIC")
+    if mamba:
+        assert mamba[0] == "1", (
+            f"MAMBA_DETERMINISTIC={mamba!r} disables Mamba SSM determinism under "
+            "--deterministic-mode. Unset it or set to '1'."
+        )
+
+    # setdefault preserves any launcher-set value that just passed validation.
     for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
-        os.environ.setdefault(k, v)
+        env.setdefault(k, v)
 
 
 def apply_determinism_to_args(args) -> None:
@@ -104,22 +122,15 @@ def apply_determinism_to_args(args) -> None:
     1. Asserts every option in ``ARG_VALUES_REQUIRED_FOR_DETERMINISM`` holds
        its required value. This is a verification-only check — it never
        mutates ``args``.
-    2. Validates every determinism-relevant env var
-       (``NCCL_ALGO``, ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``,
-       ``CUBLAS_WORKSPACE_CONFIG``, ``MAMBA_DETERMINISTIC``): a launcher-set
-       value must be in the accepted set; an unset value falls through to
-       the setdefault in step 3.
-    3. Sets env-var defaults via :func:`set_determinism_env_var_defaults` — a user-supplied
-       value survives the setdefault, so this step does not second-guess the
-       user's (validated) choice of deterministic algo.
-    4. Calls ``torch.use_deterministic_algorithms(True)``.
+    2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
+       every determinism-relevant env var (``NCCL_ALGO``,
+       ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
+       ``MAMBA_DETERMINISTIC``) and setdefaults the canonical values.
+    3. Calls ``torch.use_deterministic_algorithms(True)``.
 
     Incompatible options are rejected with an explicit error rather than
     silently overridden: the user must turn them off themselves so the
-    deterministic run matches the config they asked for. The assertion runs
-    FIRST so a malformed or incompatible args Namespace fails fast without
-    leaving the process in a half-deterministic state (env vars set but
-    torch global state untouched).
+    deterministic run matches the config they asked for.
     """
     # Verification only — read each option's effective value and never flip it,
     # so a default that drifts to a bad value breaks the run instead of silently
@@ -133,48 +144,12 @@ def apply_determinism_to_args(args) -> None:
         not mismatched
     ), f"--deterministic-mode requires: {', '.join(mismatched)}. Adjust these options to continue."
 
-    # NB: ``--use-flash-attn`` is intentionally NOT rejected under
-    # --deterministic-mode. FlashAttention is deterministic on supported
-    # configs (modern TE + Hopper/Blackwell); the bit-exact correctness
-    # suite covers it across recipes (see
-    # ``tests/unit_tests/determinism/correctness/test_fp8_determinism.py``
-    # and the bf16 parallelism matrix). Backend choice is left to TE's
-    # default selection or to the launcher via ``NVTE_*_ATTN`` env vars.
+    # --use-flash-attn is intentionally NOT rejected: TE's FlashAttention is
+    # deterministic on supported configs and is covered by the bit-exact
+    # correctness suite.
 
-    # Env-var validation. Same principle for all four: only fail if the
-    # launcher exported a value we haven't validated as deterministic; unset
-    # is fine (set_determinism_env_var_defaults() below fills the canonical
-    # default). NCCL_ALGO is handled specially -- it accepts comma-separated
-    # subsets, not exact matches.
-    nccl_algo = os.environ.get("NCCL_ALGO")
-    if nccl_algo is not None:
-        tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
-        assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
-            f"NCCL_ALGO={nccl_algo!r} must be a comma-separated subset of "
-            f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
-        )
-
-    for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
-        val = os.environ.get(name)
-        assert val is None or val in accepted, (
-            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
-        )
-
-    # Mamba SSM auto-follows torch.are_deterministic_algorithms_enabled() when
-    # MAMBA_DETERMINISTIC is unset (see megatron/core/ssm/ops/determinism.py:
-    # use_deterministic_mode). Reject only an explicit non-deterministic
-    # override; unset is fine because torch.use_deterministic_algorithms(True)
-    # below flips the fallback on.
-    mamba = os.environ.get("MAMBA_DETERMINISTIC")
-    if mamba:  # empty string falls through to the SSM default too
-        assert mamba[0] == "1", (
-            f"MAMBA_DETERMINISTIC={mamba!r} disables Mamba SSM determinism under "
-            "--deterministic-mode. Unset it or set to '1'."
-        )
-
-    # Apply env vars. ``setdefault`` preserves any launcher-set value that just
-    # passed validation; the canonical defaults only kick in when nothing was set.
-    set_determinism_env_var_defaults()
+    # Delegate env-var validation + setdefault to the single-source helper.
+    apply_determinism_env(os.environ)
 
     # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)

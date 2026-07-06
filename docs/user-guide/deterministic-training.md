@@ -23,16 +23,16 @@ When enabled, Megatron applies the env vars and config overrides below via `mega
 
 ## Environment variables
 
-Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `set_determinism_env_var_defaults()` fills the canonical default (except `MAMBA_DETERMINISTIC`, which the Mamba SSM helper auto-detects from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
+Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC`, which the Mamba SSM helper auto-detects from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
 
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
-| `NCCL_ALGO` | comma-separated subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version |
+| `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version |
 | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | `0` | Forces Transformer Engine to use deterministic algorithms |
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
 | `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Mamba SSM auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected |
 
-If you override `NCCL_ALGO`, the value must be a comma-separated subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
+If you override `NCCL_ALGO`, the value must be a subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
 
 ## Config requirements
 
