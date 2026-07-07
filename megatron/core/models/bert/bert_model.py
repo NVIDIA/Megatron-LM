@@ -49,6 +49,11 @@ class BertModel(LanguageModule):
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
         vp_stage (int): Virtual pipeline stage.
+        apply_lm_head (bool): Whether to transform the encoder's final hidden states with
+            ``BertLMHead`` (dense + GeLU + LayerNorm) before the vocabulary projection.
+            Defaults to True. Set to False for architectures whose output projection is
+            applied directly to the encoder output (e.g. models with their own final norm),
+            bypassing BERT's dense+GeLU+LayerNorm transform.
     """
 
     def __init__(
@@ -70,6 +75,7 @@ class BertModel(LanguageModule):
         return_embeddings=False,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        apply_lm_head: bool = True,
     ):
         super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
@@ -92,6 +98,7 @@ class BertModel(LanguageModule):
         self.add_binary_head = add_binary_head
         self.return_embeddings = return_embeddings
         self.vp_stage = vp_stage
+        self.apply_lm_head = apply_lm_head
 
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
@@ -129,7 +136,7 @@ class BertModel(LanguageModule):
         # Output
         if post_process:
             # TODO: Make sure you are passing in the mpu_vocab_size properly
-            self.lm_head = BertLMHead(config.hidden_size, config)
+            self.lm_head = BertLMHead(config.hidden_size, config) if self.apply_lm_head else None
 
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
@@ -375,7 +382,9 @@ class BertModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        hidden_states_after_lm_head = self.lm_head(hidden_states=hidden_states)
+        hidden_states_after_lm_head = (
+            self.lm_head(hidden_states=hidden_states) if self.lm_head is not None else hidden_states
+        )
         logits, _ = self.output_layer(hidden_states_after_lm_head, weight=output_weight)
 
         binary_logits = None

@@ -11,6 +11,7 @@ from megatron.core.models.bert.bert_layer_specs import (
     get_bert_layer_with_transformer_engine_spec,
     get_bert_layer_with_transformer_engine_submodules,
 )
+from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
@@ -91,6 +92,47 @@ class TestBertModel:
         assert logits[0].shape[0] == micro_batch_size
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
+
+    @pytest.mark.internal
+    def test_apply_lm_head_default_creates_bert_lm_head(self):
+        assert isinstance(self.bert_model.lm_head, BertLMHead)
+
+    @pytest.mark.internal
+    def test_apply_lm_head_false_bypasses_head(self):
+        config: TransformerConfig = self.bert_model.config
+        sequence_length = self.bert_model.max_sequence_length
+        micro_batch_size = 2
+
+        bert_model = BertModel(
+            config=config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=sequence_length,
+            apply_lm_head=False,
+        )
+        assert bert_model.lm_head is None
+        bert_model.cuda()
+
+        encoder_output = {}
+        bert_model.encoder.register_forward_hook(
+            lambda module, args, output: encoder_output.setdefault('hidden_states', output)
+        )
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
+
+        logits = bert_model.forward(input_ids=input_ids, attention_mask=attention_mask)
+
+        assert logits[0].shape[0] == micro_batch_size
+        assert logits[0].shape[1] == sequence_length
+        assert logits[0].shape[2] == bert_model.vocab_size
+
+        # With apply_lm_head=False, the output_layer must be applied directly to the
+        # encoder's hidden states, without BertLMHead's dense+GeLU+LayerNorm transform.
+        expected_logits, _ = bert_model.output_layer(encoder_output['hidden_states'])
+        torch.testing.assert_close(logits[0], expected_logits.transpose(0, 1).contiguous())
 
 
 class TestBertModelAttentionDimensions:
