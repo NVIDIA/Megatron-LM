@@ -133,6 +133,8 @@ class Router(ABC, MegatronModule):
     def set_layer_number(self, layer_number: int):
         """Set the layer number for the router."""
         self.layer_number = layer_number
+        if getattr(self, "router_replay", None) is not None:
+            self.router_replay.layer_number = layer_number
 
 
 class TopKRouter(Router):
