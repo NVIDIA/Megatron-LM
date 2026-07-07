@@ -29,6 +29,9 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
 # ---------------------------------------------------------------------------
@@ -1525,6 +1528,11 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         max_seqlen_q: int,
         indexer_layout: Tuple[Tensor, Tensor, Tensor],
         q_padding_mask: Optional[Tensor] = None,
+        local_k_indexer: Optional[Tensor] = None,
+        local_compressed_kv: Optional[Tensor] = None,
+        cp_group=None,
+        compressed_kv_start: int = 0,
+        indexer_rank_map: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -1674,6 +1682,19 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_k_indexer = torch.zeros_like(k_indexer)
             saved_grad_weights = torch.zeros_like(weights)
 
+        if cp_group is not None:
+            if local_k_indexer is None or local_compressed_kv is None:
+                raise RuntimeError("CP backward overlap requires both local compressed tensors.")
+            if indexer_rank_map is None:
+                indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
+            ctx.local_k_indexer_rows = local_k_indexer.shape[0]
+            ctx.local_compressed_kv_rows = local_compressed_kv.shape[0]
+        elif indexer_rank_map is None:
+            indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
+
+        ctx.cp_group = cp_group
+        ctx.compressed_kv_start = int(compressed_kv_start)
+        ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
         ctx.save_for_backward(
             query,
             kv_full,
@@ -1684,6 +1705,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_q_indexer,
             saved_grad_k_indexer,
             saved_grad_weights,
+            indexer_rank_map,
         )
         ctx.softmax_scale = softmax_scale
 
@@ -1703,9 +1725,37 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_q_indexer,
             saved_grad_k_indexer,
             saved_grad_weights,
+            indexer_rank_map,
         ) = ctx.saved_tensors
 
+        cp_group = ctx.cp_group
+        indexer_reduce_scatter = None
+        grad_k_indexer = saved_grad_k_indexer * grad_loss
+        if cp_group is not None:
+            if ctx.indexer_grad_is_sequence_major:
+                global_rows = ctx.local_k_indexer_rows * cp_group.size()
+                grad_k_indexer_rank_major = grad_k_indexer.new_zeros(
+                    (global_rows, *grad_k_indexer.shape[1:])
+                )
+                valid_rows = indexer_rank_map >= 0
+                rank_rows = indexer_rank_map.clamp_min(0).long()
+                mask_shape = (valid_rows.shape[0],) + (1,) * (grad_k_indexer.ndim - 1)
+                grad_k_indexer_rank_major.index_add_(
+                    0, rank_rows, grad_k_indexer * valid_rows.view(mask_shape)
+                )
+            else:
+                grad_k_indexer_rank_major = grad_k_indexer
+
+            # This gradient is saved by the indexer-loss forward, so its RS can
+            # run while sparse-attention backward produces the compressed-KV grad.
+            nvtx_range_push("dsv4_cp_indexer_k_reduce_scatter_launch")
+            indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
+                grad_k_indexer_rank_major, group=cp_group
+            )
+            nvtx_range_pop("dsv4_cp_indexer_k_reduce_scatter_launch")
+
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
+        nvtx_range_push("dsv4_cp_sparse_attention_backward")
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
             kv_full,
@@ -1717,14 +1767,45 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )
+        nvtx_range_pop("dsv4_cp_sparse_attention_backward")
+
+        compressed_kv_reduce_scatter = None
+        grad_local_k_indexer = None
+        grad_local_compressed_kv = None
+        if cp_group is not None:
+            grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
+            expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
+            if grad_compressed_kv.shape[0] != expected_rows:
+                raise RuntimeError(
+                    "Compressed-KV gradient has an unexpected CP-global shape: "
+                    f"got {grad_compressed_kv.shape[0]} rows, expected {expected_rows}."
+                )
+            nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_launch")
+            compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
+                grad_compressed_kv, group=cp_group
+            )
+            nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
+
+        # These local branches do not consume either reduce-scatter result.
+        # Queue their kernels before waiting for the compressed-KV gradient.
+        nvtx_range_push("dsv4_cp_local_indexer_grads")
+        grad_q_indexer = saved_grad_q_indexer * grad_loss
+        grad_weights = saved_grad_weights * grad_loss
+        nvtx_range_pop("dsv4_cp_local_indexer_grads")
+
+        if cp_group is not None:
+            grad_local_k_indexer = indexer_reduce_scatter.wait()
+            grad_local_compressed_kv = compressed_kv_reduce_scatter.wait()
+            grad_k_indexer = None
+
         return (
             attn_bwd["dq"],
             attn_bwd["dkv"],
             attn_bwd["d_sink"],
             None,
-            saved_grad_q_indexer * grad_loss,
-            saved_grad_k_indexer * grad_loss,
-            saved_grad_weights * grad_loss,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
             None,
             None,
             None,
@@ -1733,6 +1814,11 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            grad_local_k_indexer,
+            grad_local_compressed_kv,
             None,
             None,
             None,

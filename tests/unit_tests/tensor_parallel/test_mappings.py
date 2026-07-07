@@ -168,6 +168,41 @@ def test_GatherFromSequenceParallelRegion():
 
 
 @pytest.mark.internal
+def test_AsyncGatherFromSequenceParallelRegion():
+    Utils.initialize_model_parallel(4, 1)
+    input_data = (torch.ones(4).cuda() * Utils.rank).requires_grad_(True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    handle = mappings.async_gather_from_sequence_parallel_region(input_data, group=tp_group)
+    output_data = handle.wait()
+    expected_output = torch.concat(
+        (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
+    ).cuda()
+    if Utils.rank >= 4:
+        expected_output = expected_output + 4
+    assert torch.equal(output_data, expected_output)
+    assert handle.wait() is output_data
+
+    output_data.sum().backward()
+    assert torch.equal(input_data.grad, torch.ones_like(input_data) * 4)
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_AsyncReduceScatterAlongFirstDim():
+    Utils.initialize_model_parallel(4, 1)
+    group_rank = Utils.rank % 4
+    input_data = torch.ones(16, device="cuda") * group_rank
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    handle = mappings.async_reduce_scatter_along_first_dim(input_data, group=tp_group)
+    output_data = handle.wait()
+    assert torch.equal(output_data, torch.full_like(output_data, 6))
+    assert handle.wait() is output_data
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 def test_ReduceScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.vstack(

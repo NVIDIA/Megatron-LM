@@ -348,6 +348,51 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
             return (_split_along_first_dim(grad_output, ctx.group), None, None, None, None)
 
 
+class _AsyncCollectiveHandle:
+    """Awaitable tensor result of an asynchronous collective."""
+
+    def __init__(self):
+        self.tensor = None
+        self.work = None
+        # Keep a temporary contiguous input alive until NCCL has consumed it.
+        self._input_buffer = None
+
+    def wait(self):
+        """Wait at the first consumer and return the collective output."""
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+            self._input_buffer = None
+        return self.tensor
+
+
+class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
+    """Launch an equal-split first-dimension all-gather without waiting for it."""
+
+    @staticmethod
+    def forward(ctx, input_, group, tensor_parallel_output_grad, handle):
+        """Launch the forward all-gather and publish its work through ``handle``."""
+        ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
+        ctx.group = group
+
+        dim_size = list(input_.size())
+        dim_size[0] *= group.size()
+        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        input_buffer = input_.contiguous()
+        handle._input_buffer = input_buffer
+        handle.work = dist_all_gather_func(output, input_buffer, group=group, async_op=True)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Preserve the synchronous gather's reduce-scatter backward semantics."""
+        if ctx.tensor_parallel_output_grad:
+            grad_input = _reduce_scatter_along_first_dim(grad_output, ctx.group)
+        else:
+            grad_input = _split_along_first_dim(grad_output, ctx.group)
+        return grad_input, None, None, None
+
+
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
@@ -527,6 +572,54 @@ def gather_from_sequence_parallel_region(
     return _GatherFromSequenceParallelRegion.apply(
         input_, group, tensor_parallel_output_grad, output_split_sizes, use_global_buffer
     )
+
+
+def async_gather_from_sequence_parallel_region(
+    input_, tensor_parallel_output_grad=True, group=None
+):
+    """Launch an equal-split AG and return a handle whose ``wait`` yields its tensor.
+
+    The caller must wait before the gathered tensor's first use. The returned
+    tensor retains the same autograd contract as
+    :func:`gather_from_sequence_parallel_region`: its backward either
+    reduce-scatters or splits along the first dimension.
+    """
+    group = get_tensor_model_parallel_group_if_none(group)
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+    handle.tensor = _GatherFromSequenceParallelRegionAsync.apply(
+        input_, group, tensor_parallel_output_grad, handle
+    )
+    return handle
+
+
+def async_reduce_scatter_along_first_dim(input_, group=None):
+    """Launch an equal-split first-dimension reduce-scatter and return a handle.
+
+    This helper is intended for custom backward implementations that have
+    independent work to execute before the reduced local gradient is consumed.
+    The caller must invoke ``wait`` before using the returned tensor.
+    """
+    group = get_tensor_model_parallel_group_if_none(group)
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+
+    dim_size = list(input_.size())
+    assert (
+        dim_size[0] % group.size() == 0
+    ), "First dimension of the tensor should be divisible by tensor parallel size"
+    dim_size[0] //= group.size()
+
+    handle.tensor = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    handle._input_buffer = input_.contiguous()
+    handle.work = dist_reduce_scatter_func(
+        handle.tensor, handle._input_buffer, group=group, async_op=True
+    )
+    return handle
 
 
 def reduce_scatter_to_sequence_parallel_region(
