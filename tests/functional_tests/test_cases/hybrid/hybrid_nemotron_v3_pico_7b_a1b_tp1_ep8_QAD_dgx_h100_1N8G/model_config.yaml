@@ -71,16 +71,18 @@ BEFORE_SCRIPT: |
     --finetune \
     --auto-detect-ckpt-format \
     --distributed-timeout-minutes 30 \
-    --export-default-te-spec \
     --export-quant-cfg MAMBA_MOE_NVFP4_CONSERVATIVE_CFG \
     --calib-dataset-path-or-name cnn_dailymail \
     --calib-size 256 \
     --calib-batch-size 8 \
-    --skip-generate
+    --skip-generate \
+    --export-te-mcore-model
+  #--export-default-te-spec         # TODO(aanoosheh): undo once TE fix is released
   echo -e "\n=== Stage 1 complete ===\n"
 MODEL_ARGS:
   # KD teacher/config
-  --export-default-te-spec: true
+  --export-te-mcore-model: true
+  #--export-default-te-spec: true   # TODO(aanoosheh): undo once TE fix is released
   --export-kd-teacher-load: ${MODEL_BF16_CKPT}
   --auto-detect-ckpt-format: true
   --finetune: true
@@ -123,10 +125,10 @@ MODEL_ARGS:
   --sft-tokenizer-prompt-format: identity
   --bf16: true
   # Parallelism
-  --tensor-model-parallel-size: 2
-  --expert-model-parallel-size: 8
+  --tensor-model-parallel-size: 1     # TODO(aanoosheh): can change to 2 once TE fix is released
+  --expert-model-parallel-size: 4     # TODO(aanoosheh): can change to 8 once TE fix is released
   --expert-tensor-parallel-size: 1
-  --pipeline-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2   # TODO(aanoosheh): can change to 1 once TE fix is released
   --sequence-parallel: true
   # Infrastructure
   --attention-backend: fused
