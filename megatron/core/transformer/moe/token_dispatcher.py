@@ -1077,8 +1077,7 @@ class _HybridEPManager(_DispatchManager):
                 self.config.sequence_packing_scheduler is not None
                 and pad_alignment is not None
                 and (
-                    pad_alignment == "max"
-                    or pad_alignment == self.config.max_seqlen_per_dp_cp_rank
+                    pad_alignment == "max" or pad_alignment == self.config.max_seqlen_per_dp_cp_rank
                 )
             )
             if not has_static_token_count:
