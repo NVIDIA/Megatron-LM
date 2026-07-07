@@ -1171,9 +1171,16 @@ def _collect_rollout_pipeline_metrics() -> dict:
     # WeightedMultiTask work distribution (agent_slots / agent_pgts).
     dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)
     if dist:
+        # An env_id can appear more than once in the config (e.g. an active
+        # entry plus an evaluation-only twin with zero weight). Sum per
+        # env_id so the zero twin does not overwrite the active entry.
+        per_env: dict = {}
         for env_id, groups, pgt, slots in zip(
             dist["env_ids"], dist["agent_groups"], dist["agent_pgts"], dist["agent_slots"]
         ):
+            g, p, s = per_env.get(env_id, (0, 0, 0.0))
+            per_env[env_id] = (g + groups, p + pgt, s + slots)
+        for env_id, (groups, pgt, slots) in per_env.items():
             metrics[f"{env_id}_agent_groups"] = groups
             metrics[f"{env_id}_agent_pgts"] = pgt
             metrics[f"{env_id}_agent_slots"] = slots
@@ -1200,6 +1207,17 @@ def maybe_log_training_metrics(
     tb_writer = get_tensorboard_writer()
     if tb_writer:
         tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+
+    # Pipeline instrumentation lives on rank 0 (the only rank that drives
+    # rollout generation), while the wandb writer lives on the last rank.
+    # Collect on rank 0 and broadcast so the writer rank can log it. This is
+    # a collective, so it must run on every rank before the early return.
+    pipeline_metrics = _collect_rollout_pipeline_metrics()
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        payload = [pipeline_metrics]
+        dist.broadcast_object_list(payload, src=0)
+        pipeline_metrics = payload[0]
+
     if not wandb_writer:
         return
 
@@ -1259,10 +1277,10 @@ def maybe_log_training_metrics(
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
 
-    # Snapshot per-pipeline instrumentation (queue sizes, gate state,
-    # per-stage timings) and the multi-task work distribution. Reads happen
-    # while the asyncio loop is idle so there is no concurrent writer.
-    metrics.update(_collect_rollout_pipeline_metrics())
+    # Per-pipeline instrumentation (queue sizes, gate state, per-stage
+    # timings) and the multi-task work distribution, collected on rank 0
+    # and broadcast above.
+    metrics.update(pipeline_metrics)
 
     wandb_writer.log(metrics, step=current_iteration)
 
