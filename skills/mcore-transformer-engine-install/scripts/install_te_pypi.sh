@@ -101,6 +101,36 @@ phase_trap() {
   fi
 }
 
+print_cuda_version_alignment() {
+  local prefix="${1:-}"
+  local nvcc_cuda=""
+  local torch_cuda=""
+
+  nvcc_cuda="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\),.*/\1/p' | head -1 || true)"
+  torch_cuda="$("${PYTHON_BIN}" - <<'PY'
+import torch
+
+print(torch.version.cuda or "")
+PY
+)"
+
+  if [[ -z "${nvcc_cuda}" || -z "${torch_cuda}" ]]; then
+    return 0
+  fi
+
+  local nvcc_major nvcc_minor torch_major torch_minor
+  IFS=. read -r nvcc_major nvcc_minor _ <<< "${nvcc_cuda}"
+  IFS=. read -r torch_major torch_minor _ <<< "${torch_cuda}"
+
+  if [[ "${nvcc_major}" != "${torch_major}" ]]; then
+    echo "${prefix}WARNING: nvcc CUDA ${nvcc_cuda} and PyTorch CUDA ${torch_cuda} have different major versions."
+    echo "${prefix}Set CUDA_PATH/PATH to a CUDA ${torch_cuda} toolkit or choose a matching --torch-backend before building Transformer Engine."
+  elif [[ "${nvcc_minor:-0}" != "${torch_minor:-0}" ]]; then
+    echo "${prefix}Note: nvcc CUDA ${nvcc_cuda} and PyTorch CUDA ${torch_cuda} differ."
+    echo "${prefix}CUDA minor-version compatibility is often acceptable, but matching them improves reproducibility."
+  fi
+}
+
 trap phase_trap EXIT
 
 while [[ $# -gt 0 ]]; do
@@ -322,6 +352,7 @@ PY
   echo "  CUDA_PATH: ${CUDA_PATH}"
   echo "  nvcc:"
   nvcc --version | sed 's/^/    /'
+  print_cuda_version_alignment "  "
   echo "  venv site-packages: ${VENV_SITE}"
   echo "  CUDNN_PATH: ${CUDNN_PATH:-<not set>}"
   echo "  NVIDIA include dirs:"
@@ -376,6 +407,7 @@ echo "Using NVTE_CUDA_ARCHS=${NVTE_CUDA_ARCHS}"
 echo "Using TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 echo "Using MAX_JOBS=${MAX_JOBS}"
 echo "Using NVTE_BUILD_THREADS_PER_JOB=${NVTE_BUILD_THREADS_PER_JOB}"
+print_cuda_version_alignment
 if [[ -n "${INSTALL_EXTRAS}" ]]; then
   echo "Installing Megatron editable extras: ${INSTALL_EXTRAS}"
 else
