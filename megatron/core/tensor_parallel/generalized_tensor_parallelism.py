@@ -343,6 +343,53 @@ def tag_gtp_params_with_names(model):
             param._debug_name = name
 
 
+def configure_gtp_remat_from_recipe(
+    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False
+):
+    """
+    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
+    Must be called once BEFORE model construction.
+    """
+    # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
+    # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
+    # param-state debug asserts, so keep them off for GTP runs.
+    update_gtp_config(
+        calculate_per_token_loss=calculate_per_token_loss, check_param_states=False
+    )
+    if fp4:
+        update_gtp_config(pad_for_alignment=16)
+    elif fp8_recipe == "mxfp8":
+        update_gtp_config(pad_for_alignment=32)
+    elif fp8:
+        update_gtp_config(pad_for_alignment=16)
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
+
+
+def classify_gtp_remat_chains(
+    model, *, cuda_graph_modules=None, moe_shared_expert_overlap=False, cuda_graph_impl="none"
+):
+    """
+    Tag and classify every GTP param's prefetch chain (GRAPHED vs UNGRAPHED).
+    Must be called once AFTER model build + DDP wrap and before the first forward (which
+    lazily builds chain links).
+    """
+    cg_modules = (
+        {getattr(s, "name", str(s)) for s in cuda_graph_modules} if cuda_graph_modules else None
+    )
+    set_cuda_graph_modules(
+        cg_modules,
+        moe_shared_expert_overlap=moe_shared_expert_overlap,
+        cuda_graph_impl=cuda_graph_impl,
+    )
+    # Clear stale process-global chain state so a rebuilt model starts fresh.
+    reset_gtp_state()
+    for model_module in model if isinstance(model, list) else [model]:
+        tag_gtp_params_with_names(model_module)
+        classify_gtp_chains(model_module)
+
+
 def gtp_remat_shard_dim0(dim0, gtp_remat_group):
     """Return ``(shard_dim0, pad_length)`` for allocating a dim-0 GTP weight-remat shard."""
     gtp_remat_size = gtp_remat_group.size()
@@ -564,7 +611,7 @@ def gtp_native_fp8_load_context(module):
 
     swapped = []
     for param in module.parameters(recurse=True):
-        if getattr(param, "is_gtp_weight_remat", False) and is_float8tensor(param):
+        if is_gtp_param(param) and is_float8tensor(param):
             sub_cls = type(param)
             base_cls = sub_cls.__mro__[1]
             if base_cls is not sub_cls:
@@ -575,42 +622,6 @@ def gtp_native_fp8_load_context(module):
     finally:
         for param, sub_cls in swapped:
             param.__class__ = sub_cls
-
-
-@contextmanager
-def gtp_preserve_native_fp8_shards(model_chunks):
-    """Snapshot + restore native-FP8 GTP shards around a forced DDP param-sync (a no-op for them).
-
-    The pre-save ``force_param_sync`` copy-back re-quantizes the shard from stale near-zero
-    param_data — the mantissa barely moves, but the E8M0 scale collapses, so the dequantized weight
-    collapses. GTP gathers this shard via its own path (not the DDP DP-gather), so nothing
-    re-materializes it before the next forward → spike, until the optimizer re-quantizes from the
-    fp32 master. We snapshot all four FP8 planes (rowwise/columnwise data + scales) first and
-    restore them, making the forced sync a no-op for GTP shards.
-    """
-    from megatron.core.fp8_utils import is_float8tensor
-
-    chunks = model_chunks if isinstance(model_chunks, (list, tuple)) else [model_chunks]
-    planes = ("_rowwise_data", "_columnwise_data", "_rowwise_scale_inv", "_columnwise_scale_inv")
-    saved = []
-    for chunk in chunks:
-        for param in chunk.parameters(recurse=True):
-            if not (getattr(param, "is_gtp_weight_remat", False) and is_float8tensor(param)):
-                continue
-            snap = {
-                p: getattr(param, p).detach().clone()
-                for p in planes
-                if getattr(param, p, None) is not None
-            }
-            saved.append((param, snap))
-    try:
-        yield
-    finally:
-        for param, snap in saved:
-            for name, tensor in snap.items():
-                cur = getattr(param, name, None)
-                if cur is not None and cur.shape == tensor.shape:
-                    cur.copy_(tensor)
 
 
 def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):

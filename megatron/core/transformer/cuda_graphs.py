@@ -67,7 +67,6 @@ except ImportError:
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp import (
-        GTP_CONFIG,
         GTPChain,
         get_ag_stream,
         get_rs_stream,
@@ -78,7 +77,6 @@ else:
     # Placeholders so static analysis does not flag these GTP-only symbols as
     # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
     # gtp_remat at runtime.
-    GTP_CONFIG = None
     GTPChain = None
     get_ag_stream = None
     get_rs_stream = None
@@ -479,10 +477,6 @@ class _CudagraphGlobalRecord:
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
 
-        gtp_active = any(r[0].gtp_remat for r in cls.cudagraph_record)
-        if gtp_active:
-            # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
-            GTP_CONFIG.check_param_states = False
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()

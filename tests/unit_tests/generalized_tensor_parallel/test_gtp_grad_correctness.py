@@ -30,7 +30,7 @@ from megatron.core.tensor_parallel.gtp import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
 
-from megatron.core.tensor_parallel.gtp import GTPShardedParam
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _run_distributed,
     _torchrun_dist_init,
@@ -532,7 +532,7 @@ class TestGTPGradCorrectness:
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
-        from megatron.core.tensor_parallel.gtp import update_gtp_config
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
         update_gtp_config(calculate_per_token_loss=per_token_loss)
         try:

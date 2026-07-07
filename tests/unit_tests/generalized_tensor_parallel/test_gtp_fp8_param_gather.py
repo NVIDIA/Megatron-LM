@@ -81,7 +81,9 @@ class TestGTPFp8ParamGather:
         finally:
             harness.teardown_method(None)
             # Restore GTP_CONFIG defaults mutated by the mxfp8 arg setup.
-            from megatron.core.tensor_parallel.gtp import update_gtp_config
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                update_gtp_config,
+            )
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
@@ -134,7 +136,9 @@ class TestGTPFp8ParamGather:
             )
         finally:
             harness.teardown_method(None)
-            from megatron.core.tensor_parallel.gtp import update_gtp_config
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                update_gtp_config,
+            )
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
@@ -149,9 +153,10 @@ class TestGTPFp8ParamGather:
         Runs GTP+mxfp8+fp8-param-gather twice with identical seeds — once driving the production
         save path mid-training (force_param_sync + sharded_state_dict), once without — and requires
         matching loss trajectories. overlap_param_gather=True makes should_disable_forward_pre_hook
-        True so force_param_sync actually runs; that forced DDP fp8 param-gather is what (pre-fix)
-        collapsed the GTP native-FP8 shard's MXFP8 scale, spiking the next step (seen at a55b).
-        Guards a save side-effect test_gtp_dcp can't see (it never trains after saving).
+        True so force_param_sync actually runs; passing the optimizer copies FP32 masters into the
+        param buffer first, so the copy-back re-quantizes the GTP native-FP8 shard from masters (not
+        stale grad scratch). Guards the historical post-save loss spike (seen at a55b) — a save
+        side-effect test_gtp_dcp can't see (it never trains after saving).
         """
         if torch.cuda.device_count() < 2:
             pytest.skip("Requires at least 2 CUDA devices for GTP weight-remat=2")
@@ -189,6 +194,8 @@ class TestGTPFp8ParamGather:
                 f"weights. saved-run around first save: {loss_saved[4:8].tolist()}"
             )
         finally:
-            from megatron.core.tensor_parallel.gtp import update_gtp_config
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                update_gtp_config,
+            )
 
             update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)

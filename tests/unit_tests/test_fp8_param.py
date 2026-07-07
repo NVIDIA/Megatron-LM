@@ -350,12 +350,13 @@ class TestFP8Param:
 
             if i in save_at_steps:
                 # Mirror production save_checkpoint_and_time: when the forward pre-hook is disabled
-                # for the save, a forced param-sync runs first. That is the path that (pre-fix)
-                # corrupts native-FP8 GTP shards; force_param_sync guards it with
-                # gtp_preserve_native_fp8_shards. Exercise it so the save-perturbation test is a
-                # real regression test for the post-save loss spike.
+                # for the save, a forced param-sync runs first. Passing the optimizer makes it copy
+                # the FP32 masters into the param buffer before the copy-back re-quantizes, so
+                # native-FP8 GTP shards are refreshed from masters (not stale grad scratch).
+                # Exercise it so the save-perturbation test is a real regression test for the
+                # post-save loss spike.
                 if should_disable_forward_pre_hook(args):
-                    force_param_sync(gpt_model)
+                    force_param_sync(gpt_model, optimizer=optimizer)
                 _ = gpt_model[0].sharded_state_dict()
 
             # Capture CUDA graphs after warmup if helper is provided.

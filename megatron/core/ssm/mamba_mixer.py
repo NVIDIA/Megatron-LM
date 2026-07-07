@@ -8,7 +8,7 @@
 import inspect
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
 import torch

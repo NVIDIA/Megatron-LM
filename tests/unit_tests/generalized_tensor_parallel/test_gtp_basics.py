@@ -42,7 +42,10 @@ from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-from megatron.core.tensor_parallel.gtp import GTPShardedParam, wrap_module_params_gtp
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    GTPShardedParam,
+    wrap_module_params_gtp,
+)
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -487,7 +490,7 @@ def _worker_mxfp8_linear(rank, world_size, port):
     """
     from transformer_engine.common.recipe import MXFP8BlockScaling
 
-    from megatron.core.tensor_parallel.gtp import update_gtp_config
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
     torch.manual_seed(0)
     # batch=32: MXFP8 wgrad GEMM (K=batch) requires K divisible by MXFP8_BLOCK_SCALING_SIZE=32
@@ -536,7 +539,7 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     """
     from transformer_engine.common.recipe import MXFP8BlockScaling
 
-    from megatron.core.tensor_parallel.gtp import update_gtp_config
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
     torch.manual_seed(0)
     # out_f=120: M_padded=128, shard_size=32, last rank has 24 rows padded to 32.

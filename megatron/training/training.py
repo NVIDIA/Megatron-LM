@@ -149,7 +149,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -1712,25 +1712,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
-    # Configure GTP padding alignment based on quantization recipe before model construction.
-    if (
-        getattr(args, 'gtp_weight_remat_size', 1) > 1
-        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
-    ):
-        from megatron.core.tensor_parallel.gtp import update_gtp_config
-
-        # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
-        update_gtp_config(
-            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False)
-        )
-
-        if getattr(args, 'fp4', None) is not None:
-            update_gtp_config(pad_for_alignment=16)
-        elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
-            update_gtp_config(pad_for_alignment=32)
-        elif getattr(args, 'fp8', None) is not None:
-            update_gtp_config(pad_for_alignment=16)
-
     # Build model.
     def build_model():
         if (
@@ -1778,38 +1759,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if not isinstance(model, list):
         model = [model]
-
-    # Classify each GTP param into its prefetch chain (GRAPHED vs UNGRAPHED)
-    # from args.cuda_graph_modules + moe_shared_expert_overlap. Must run after
-    # model build, before the first forward (which lazily builds chain links).
-    if (
-        getattr(args, 'gtp_weight_remat_size', 1) > 1
-        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
-    ):
-        from megatron.core.tensor_parallel.gtp import (
-            GTP_CONFIG,
-            classify_gtp_chains,
-            reset_gtp_state,
-            set_cuda_graph_modules,
-            tag_gtp_params_with_names,
-        )
-
-        _raw_modules = getattr(args, 'cuda_graph_modules', None) or []
-        _cg_modules = {getattr(s, 'name', str(s)) for s in _raw_modules} if _raw_modules else None
-        _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
-        # cuda_graph_impl lets the classifier tell "CG disabled" from "full-iteration /
-        # graph-every-layer" — both have empty cuda_graph_modules.
-        set_cuda_graph_modules(
-            _cg_modules,
-            moe_shared_expert_overlap=_mse_overlap,
-            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
-        )
-        # Clear stale process-global chain state so a rebuilt model starts fresh.
-        reset_gtp_state()
-        for model_module in model:
-            tag_gtp_params_with_names(model_module)
-            classify_gtp_chains(model_module)
-        print_rank_0(f"GTP_remat enabled. {GTP_CONFIG}")
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
@@ -2092,8 +2041,34 @@ def setup_model_and_optimizer(
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
             return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
 
+    # Configure GTP weight-remat padding/loss reduction before model construction (pad
+    # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
+    # also covers the config-container builder path, which does not call get_model.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp import configure_gtp_remat_from_recipe
+
+        configure_gtp_remat_from_recipe(
+            fp4=getattr(args, 'fp4', None) is not None,
+            fp8_recipe=getattr(args, 'fp8_recipe', None),
+            fp8=getattr(args, 'fp8', None) is not None,
+            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+        )
+
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+
+    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # first forward. Placed here (not in get_model) so it also covers the config-container
+    # builder path.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains(
+            model,
+            cuda_graph_modules=getattr(args, 'cuda_graph_modules', None),
+            moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
 
     if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
@@ -2212,7 +2187,9 @@ def setup_model_and_optimizer(
             and args.ckpt_format == "torch_dist",
             tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
             pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-            dp_cp_group=ckpt_pgc.dp_cp if ckpt_pgc is not None else None,
+            # Replica_id must match the save path (see save_checkpoint_and_time): use the
+            # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+            dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
             dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
@@ -2977,30 +2954,6 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
-# def _gtp_shard_preserve_ctx(model_chunks):
-#     # A forced DDP param-sync is redundant for native-FP8 GTP shards (already materialized in
-#     # param.data) and harmful: its _post_param_sync copy-back overwrites the shard with the stale
-#     # grad-scratch param_data, collapsing the MXFP8 scale (the post-save/eval loss spike).
-#     # Preserve those shards across any forced sync so it is a no-op for them (all DP sizes).
-#     if not HAVE_GTP:
-#         return nullcontext()
-#     from megatron.core.tensor_parallel.gtp import gtp_preserve_native_fp8_shards
-
-#     return gtp_preserve_native_fp8_shards(model_chunks)
-
-
-# def disable_forward_pre_hook(model_chunks, param_sync=True):
-#     with _gtp_shard_preserve_ctx(model_chunks) if param_sync else nullcontext():
-#         for model_chunk in model_chunks:
-#             assert isinstance(model_chunk, DDP)
-#             model_chunk.disable_forward_pre_hook(param_sync=param_sync)
-
-
-# def force_param_sync(model_chunks: list[DDP]) -> None:
-#     with _gtp_shard_preserve_ctx(model_chunks):
-#         for model_chunk in model_chunks:
-#             assert isinstance(model_chunk, DDP)
-#             model_chunk.start_param_sync(force_sync=True)
 def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
     if param_sync and optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()

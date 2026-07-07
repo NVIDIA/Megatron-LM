@@ -19,7 +19,7 @@ if not HAVE_GTP:
 
 from transformer_engine.pytorch import fp8_autocast, fp8_model_init
 
-from megatron.core.tensor_parallel.gtp import GTPShardedParam
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _assert_loss_trajectories_match,
     _requires_mxfp8,

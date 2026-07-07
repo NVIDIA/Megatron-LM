@@ -128,7 +128,11 @@ class TestGTPMuonDCP:
         os.environ['MEGATRON_GTP_FORCE_ENABLE'] = '1'
         from megatron.core import parallel_state as ps
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
-        from megatron.core.tensor_parallel.gtp import GTP_CONFIG, GTPShardedParam, update_gtp_config
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+            GTP_CONFIG,
+            GTPShardedParam,
+            update_gtp_config,
+        )
         from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
 
         Utils.initialize_model_parallel(1, 1)  # bootstrap torch.distributed + model parallel
@@ -237,7 +241,7 @@ class TestGTPMuonDCP:
         from megatron.core import parallel_state as ps
         from megatron.core.fp8_utils import is_float8tensor
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
-        from megatron.core.tensor_parallel.gtp import (
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
             GTP_CONFIG,
             is_gtp_param,
             tag_gtp_params_with_names,

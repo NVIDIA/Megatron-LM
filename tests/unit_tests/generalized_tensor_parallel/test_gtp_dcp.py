@@ -13,20 +13,51 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
 
-from megatron.core.tensor_parallel.gtp import (  # noqa: E402
+import transformer_engine.pytorch as te  # noqa: E402
+from transformer_engine.common.recipe import MXFP8BlockScaling  # noqa: E402
+from transformer_engine.pytorch import fp8_autocast, fp8_model_init  # noqa: E402
+
+from megatron.core.dist_checkpointing.mapping import (  # noqa: E402
+    ShardedObject,
+    ShardedTensorFactory,
+    is_main_replica,
+)
+from megatron.core.extensions.transformer_engine import (  # noqa: E402
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+)
+from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
+from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
+from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
+from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp_remat,
     update_gtp_config,
     wrap_module_params_gtp,
 )
+from megatron.core.tensor_parallel.gtp import (  # noqa: E402
+    attach_gtp_to_presharded_module,
+    dequantize_gtp_native_fp8,
+    gtp_native_fp8_load_context,
+    gtp_remat_shard_dim0,
+)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
+from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
+from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402
+from megatron.core.utils import get_pg_size, make_tp_sharded_tensor_for_checkpoint  # noqa: E402
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
+    _requires_mxfp8,
     _torchrun_dist_init,
 )
 
@@ -66,14 +97,11 @@ def _cached_new_group(ranks):
 
 @pytest.fixture(scope="module", autouse=True)
 def _precreate_subgroups(_torchrun_dist_init):
-    """Create the shared TP/GTP subgroups once, on all ranks, in a fixed order.
+    """Pre-create the shared TP/GTP subgroups once, on all ranks, in a fixed order.
 
-    ``dist.new_group`` is a world-collective: every rank must create every subgroup in the same
-    order, even ranks that are not members. The workers' readable ``new_group([0,1]) if rank in
-    (0,1) else new_group([2,3])`` idiom only calls it on member ranks, which collides disjoint
-    groups on PyTorch's call-order tag and hangs NCCL bootstrap on the first real collective.
-    Pre-creating here makes every later ``_cached_new_group`` a cache hit, so that idiom stays
-    correct. (Metadata-only groups never bootstrap NCCL, so they were never exposed.)
+    ``dist.new_group`` is a world-collective (all ranks must call it in the same order); the
+    per-member ``new_group([0,1]) if rank in (0,1) else ...`` idiom collides disjoint groups on
+    the call-order tag and hangs NCCL. Pre-creating makes every later ``_cached_new_group`` a hit.
     """
     if dist.is_initialized() and dist.get_world_size() == 4:
         for ranks in ([0, 1], [2, 3], [0, 2], [1, 3], [0, 1, 2, 3]):
@@ -103,14 +131,6 @@ def _make_native_fp8_gtp_shard(per_tp_out, in_f, gtp_remat_group, recipe):
     pass the pre-sharded out_features into a stock ``fp8_model_init`` ``te.Linear`` so TE inits a
     native MXFP8 shard, attach the GTP surface post-init, then run one FP8 forward to populate the
     rowwise/columnwise FP8 data. Returns the reclassed ``GTP_<Fp8Tensor>`` weight."""
-    import transformer_engine.pytorch as te
-    from transformer_engine.pytorch import fp8_autocast, fp8_model_init
-
-    from megatron.core.tensor_parallel.gtp import (
-        attach_gtp_to_presharded_module,
-        gtp_remat_shard_dim0,
-    )
-
     shard_out, pad = gtp_remat_shard_dim0(per_tp_out, gtp_remat_group)
     with fp8_model_init(enabled=True, recipe=recipe):
         lin = te.Linear(in_f, shard_out, bias=False, params_dtype=torch.bfloat16, device="cuda")
@@ -122,20 +142,12 @@ def _make_native_fp8_gtp_shard(per_tp_out, in_f, gtp_remat_group, recipe):
 
 
 def _worker_native_fp8_dcp_save(rank, world_size, port):
-    """Native-FP8 GTP weight: DCP save must emit a *dequantized BF16* ShardedTensor with the full
-    (TP x GTP_remat) global shape and correct composite axis-0 offset — not the raw FP8 bytes
-    under a fake BF16 dtype, and not the sharded-as-full metadata.
-
-    Regression guard for the a55b save crash: recognition gates used isinstance(GTPShardedParam),
-    which misses the native-FP8 GTP_<Fp8Tensor> subclass, and TE's tex.dequantize does not
-    recognize that subclass either (dequantize_gtp_native_fp8 restores the base class).
+    """Native-FP8 GTP weight: DCP save must emit a dequantized BF16 ShardedTensor with the full
+    (TP x GTP_remat) global shape and correct composite axis-0 offset -- not raw FP8 bytes under
+    a fake BF16 dtype (a55b save-crash guard: recognition gates / TE tex.dequantize miss the
+    native-FP8 GTP_<Fp8Tensor> subclass; dequantize_gtp_native_fp8 restores the base class).
     """
-    from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
-
     _requires_mxfp8()
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
-    from megatron.core.fp8_utils import is_float8tensor
 
     # TP=2, GTP_remat=2 (4 ranks). MXFP8 needs dims % 32, so use fp8-valid sizes.
     gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
@@ -184,28 +196,12 @@ def _worker_native_fp8_dcp_save(rank, world_size, port):
 
 
 def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
-    """Load-side mirror of the save dequantize: copying the (dequantized BF16) checkpoint value
-    back into a live native-FP8 GTP weight must go through ``gtp_native_fp8_load_context``.
-
-    Regression guard for the a55b load crash: ``module.load_state_dict`` does ``param.copy_(bf16)``,
-    which routes into TE ``convert_and_update_tensor`` -> C++ ``IsMXFP8Tensor(dst.ptr())``. That
-    exact-class check rejects the dynamic ``GTP_<Fp8Tensor>`` subclass, so the copy raises unless
-    the base FP8 class is presented for the duration. Assert: (1) the raw copy raises; (2) under
-    the context it succeeds and the reclassed live weight dequantizes to the loaded values.
+    """Copying a BF16 checkpoint value back into a live native-FP8 GTP weight must go through
+    ``gtp_native_fp8_load_context`` (a55b load-crash guard: TE's exact-class MXFP8 check rejects
+    the dynamic ``GTP_<Fp8Tensor>`` subclass). Assert the raw copy raises but succeeds under the
+    context, and the reclassed weight dequantizes to the loaded values.
     """
-    from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
-
     _requires_mxfp8()
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-    from transformer_engine.pytorch import fp8_autocast, fp8_model_init
-
-    from megatron.core.fp8_utils import is_float8tensor
-    from megatron.core.tensor_parallel.gtp import (
-        attach_gtp_to_presharded_module,
-        dequantize_gtp_native_fp8,
-        gtp_native_fp8_load_context,
-        gtp_remat_shard_dim0,
-    )
 
     # This test exercises a single-rank concern (the __class__ swap during copy_), so use the
     # default WORLD group as the gtp_remat_group rather than dist.new_group subgroups — the
@@ -214,8 +210,6 @@ def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
     gtp_remat_group = dist.group.WORLD
     per_tp_out, in_f = 128, 128  # MXFP8 needs dims % 32; shard = 128/world(4) = 32
     recipe = MXFP8BlockScaling()
-
-    import transformer_engine.pytorch as te
 
     shard_out, pad = gtp_remat_shard_dim0(per_tp_out, gtp_remat_group)
     with fp8_model_init(enabled=True, recipe=recipe):
@@ -412,17 +406,9 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
 
 
 def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
-    """Same in_proj layout but with a dim-0 size that requires GTP_remat padding.
-
-    z=512, x=512, B=64, C=64, dt=8 → dim0=1160. With gtp_remat_size=4 and
-    pad_for_alignment=16, alignment block = 64; 1160 % 64 = 8 so 56 pad
-    rows are appended. Padded dim0 = 1216, per-rank shard = 304 (uniform
-    across all 4 ranks; the pad rows live at the tail of rank-3's slice).
-
-    The helper today saves the *padded* global shape (1216) — round-trip is
-    correct under save_gtp_remat_size == load_gtp_remat_size. This test pins that
-    behaviour and serves as a regression for the future "unpadded global"
-    fix.
+    """in_proj with a dim-0 size needing GTP_remat padding (dim0=1160, gtp_remat_size=4,
+    pad_for_alignment=16 -> 56 pad rows -> padded 1216, per-rank shard 304). Pins that the
+    padded global shape round-trips when save_gtp_remat_size == load_gtp_remat_size.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160  # z(512) + x(512) + B(64) + C(64) + dt(8)
@@ -604,8 +590,6 @@ def _worker_helper_embedding_offsets(rank, world_size, port):
     GTP_remat axis-0 split. TP=2, GTP_remat=2, tp_axis=0 → composite axis-0 offset, same as the
     column-parallel case.
     """
-    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
-
     gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
     tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
@@ -644,8 +628,6 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     GTP_remat-composite offset — i.e. it delegates to the GTP_remat-aware path not the vanilla
     TP-only one. TP=2, GTP_remat=2, column-parallel (tp_axis=0).
     """
-    from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-
     gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
     tp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
 
@@ -697,34 +679,10 @@ def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
 
 
 def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
-    """End-to-end ``MambaMixer.sharded_state_dict`` under GTP_remat: the GTP_remat-REPLICATED
-    directly-owned params (A_log / dt_bias / D / conv1d.*) must get conflict-free
-    replica_ids — distinct across every rank holding the same chunk, with exactly
-    one "main" (writer) replica — so DCP elects a single writer per chunk.
-
-    With TP=1 these params are full on every rank, so all ``world_size`` replicas
-    of each must have unique replica_ids and exactly one writer. This is the
-    invariant the gtp_rank replica_id fixup defends; it must hold whether or not
-    that fixup runs (the gtp-inclusive dp_cp rank already disambiguates peers).
+    """MambaMixer.sharded_state_dict under GTP_remat: replicated directly-owned params
+    (A_log / dt_bias / D / conv1d.*) must get conflict-free replica_ids -- unique across the
+    peers holding each chunk, exactly one writer -- so DCP elects a single writer per chunk.
     """
-    from megatron.core import parallel_state as ps
-    from megatron.core.dist_checkpointing.mapping import (
-        ShardedObject,
-        ShardedTensorFactory,
-        is_main_replica,
-    )
-    from megatron.core.extensions.transformer_engine import (
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-    )
-    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-    from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
     GTP_remat = 2  # world=4 -> tp1 * gtp2 * dp2 (exercises both gtp_remat peers and replicate DP)
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -801,23 +759,10 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
 def _worker_replicated_param_needs_gtp_inclusive_dp_cp(rank, world_size, port):
     """Regression for the checkpoint-save duplicate-writer bug in save_checkpoint_and_time.
 
-    A REPLICATED param (identical on every gtp_remat peer) is checkpointed with replica_id
-    ``(0, tp_rank, get_pg_rank(metadata['dp_cp_group']))``. save_checkpoint_and_time threads that
-    group from the model's ProcessGroupCollection. It MUST be the gtp_remat-INCLUSIVE group
-    (``pg.dp_cp_gtp_remat``): with the gtp-excluded replicate group (``pg.dp_cp``) the gtp_remat
-    peers collapse to the same replica_id -> multiple writers -> dist_checkpointing.save
-    validation failure (the TP1 x GTP_remat save crash). This guards the group *selection*
-    that save_checkpoint_and_time makes (the leaf logic is covered by the workers above, which
-    hardcode the full group).
-
-    world=4 -> tp1 * gtp2 * dp2: replicate group has 2 ranks (dp), full group has 4.
+    A REPLICATED param's replica_id must use the gtp_remat-INCLUSIVE group (``pg.dp_cp_gtp_remat``);
+    the gtp-excluded ``pg.dp_cp`` collapses gtp_remat peers to one replica_id -> multiple writers
+    -> save validation failure. world=4 -> tp1*gtp2*dp2 (replicate=2 ranks, inclusive=4).
     """
-    from megatron.core import parallel_state as ps
-    from megatron.core.dist_checkpointing.mapping import is_main_replica
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-    from megatron.core.utils import get_pg_size
-
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
@@ -873,10 +818,6 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
     """
     from collections import defaultdict
 
-    from megatron.core import parallel_state as ps
-    from megatron.core.dist_checkpointing.mapping import is_main_replica
-    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
-
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
@@ -927,26 +868,13 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     fix restores a ShardedTensor with local_shape == the optimizer param shape, which
     make_sharded_optimizer_tensor then accepts.
     """
-    from megatron.core import parallel_state as ps
     from megatron.core.dist_checkpointing.optimizer import (
         get_param_id_to_sharded_param_map,
         make_sharded_optimizer_tensor,
     )
-    from megatron.core.extensions.transformer_engine import (
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-    )
-    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-    from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-    from megatron.core.tensor_parallel.gtp import (
-        make_sharded_tensors_for_checkpoint_with_gtp_remat,
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         tag_gtp_params_with_names,
     )
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.core.transformer.transformer_config import TransformerConfig
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -1014,6 +942,71 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     GTPShardedParam._chain_state = {}
 
 
+def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt_base):
+    """Save->load roundtrip: save and load must use the gtp_remat-INCLUSIVE replica group.
+
+    Loading with the gtp_remat-EXCLUDING ``pg.dp_cp`` collides replica_ids across gtp_remat
+    peers -> DCP 'Invalid access pattern' (the a55b load failure). world=4 -> tp1*gtp2*dp2.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
+        )
+        # The two group choices must differ under GTP_remat, else the test is moot.
+        assert (
+            get_pg_size(pg.dp_cp_gtp_remat) == get_pg_size(pg.dp_cp) * 2
+        ), f"full={get_pg_size(pg.dp_cp_gtp_remat)} replicate={get_pg_size(pg.dp_cp)}"
+
+        # A GTP-replicated param: byte-identical on every rank (like decoder.final_norm.weight).
+        replicated = torch.nn.Parameter(
+            torch.arange(32, dtype=torch.bfloat16, device="cuda").reshape(8, 4)
+        )
+
+        def _sd(dp_cp_group):
+            return make_sharded_tensors_for_checkpoint(
+                {"w": replicated},
+                prefix="",
+                tensor_parallel_layers_axis_map={},
+                tp_group=pg.tp,
+                dp_cp_group=dp_cp_group,
+            )
+
+        # Negative invariant (uniform, no failed collective): under the gtp_remat-EXCLUDING
+        # replicate group the gtp_remat peers collapse to the same replica_id -> >1 main writer
+        # for the identical element. That is exactly what makes DCP load-validation raise the
+        # a55b 'Invalid access pattern'. (validate_sharding_integrity raises on rank 0 only, so a
+        # real failed load() can't be asserted cleanly across ranks; we assert the root condition.)
+        rids_excl = [None] * world_size
+        dist.all_gather_object(rids_excl, tuple(_sd(pg.dp_cp)["w"].replica_id))
+        rids_incl = [None] * world_size
+        dist.all_gather_object(rids_incl, tuple(_sd(pg.dp_cp_gtp_remat)["w"].replica_id))
+        if rank == 0:
+            assert (
+                sum(is_main_replica(r) for r in rids_excl) > 1
+            ), f"gtp-excluding dp_cp must collide across gtp_remat peers (the bug): {rids_excl}"
+            assert (
+                sum(is_main_replica(r) for r in rids_incl) == 1
+            ), f"gtp-inclusive group must elect exactly one writer: {rids_incl}"
+
+        # Positive end-to-end roundtrip through the real DCP save/load with the gtp_remat-inclusive
+        # group (what save_checkpoint_and_time and the fixed load_checkpoint both thread): save and
+        # load must agree on this group, and the replicated data must round-trip intact.
+        with TempNamedDir(ckpt_base / 'gtp_dcp_roundtrip', sync=True) as ckpt_dir:
+            save(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
+            loaded = load(_sd(pg.dp_cp_gtp_remat), ckpt_dir)
+            assert torch.equal(loaded["w"].cpu(), replicated.detach().cpu()), loaded["w"]
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -1032,6 +1025,12 @@ class TestGtpDcpHelper:
     def test_replicated_param_needs_gtp_inclusive_dp_cp(self):
         _require_world_size(4)
         _worker_replicated_param_needs_gtp_inclusive_dp_cp(dist.get_rank(), 4, None)
+
+    def test_save_load_roundtrip_needs_gtp_inclusive_group(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_save_load_roundtrip_needs_gtp_inclusive_group(
+            dist.get_rank(), 4, tmp_path_dist_ckpt
+        )
 
     def test_composite_offset_same_axis(self):
         _require_world_size(4)

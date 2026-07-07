@@ -398,6 +398,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"{mpu.get_tensor_model_parallel_world_size()}"
             )
             print_rank_0(
+                f"> initialized gtp weight remat with size "
+                f"{mpu.get_gtp_weight_remat_world_size()}"
+            )
+            print_rank_0(
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )

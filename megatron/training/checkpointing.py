@@ -840,14 +840,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 tensor_rank, tp_group,
                 mpu.get_tensor_model_parallel_rank, mpu.get_tensor_model_parallel_world_size,
             )
-            gtp_remat_rank, gtp_remat_size_to_print = _rank_and_size(
-                gtp_remat_rank, gtp_remat_group,
-                mpu.get_gtp_weight_remat_rank, mpu.get_gtp_weight_remat_world_size,
-            )
             pipeline_mp_rank, pp_size_to_print = _rank_and_size(
                 pipeline_rank, pp_group,
                 mpu.get_pipeline_model_parallel_rank, mpu.get_pipeline_model_parallel_world_size,
             )
+            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
+            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
                 prev_iteration = 0

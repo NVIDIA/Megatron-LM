@@ -475,6 +475,14 @@ def is_hybrid_model(args):
     return args.hybrid_layer_pattern is not None
 
 
+def is_gtp_remat_active(args):
+    """Returns True if GTP weight-remat is enabled on the decoder or expert axis."""
+    return (
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
+    )
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""

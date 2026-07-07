@@ -36,7 +36,7 @@ if not HAVE_GTP:
 import transformer_engine.pytorch as te
 
 from megatron.core.extensions.transformer_engine import _gtp_pre_init
-from megatron.core.tensor_parallel.gtp import (
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTP_CONFIG,
     GTPShardedParam,
     update_gtp_config,
