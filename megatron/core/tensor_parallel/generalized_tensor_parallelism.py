@@ -1462,13 +1462,16 @@ class GTPShardedParam(torch.nn.Parameter):
         # backward dgrad to reuse (skips the redundant sync re-gather). Its buffer is
         # pinned (reserve() sets slot.pin) so no other same-shape gather can overwrite it.
         # Guards: forward (not recompute), output layer, BF16 (native-FP8 gathers
-        # rowwise fwd vs columnwise bwd — different data), not full-iteration CG.
+        # rowwise fwd vs columnwise bwd — different data). Full-iteration CG is safe:
+        # the whole step is one capture session, so the recorded fwd AG rewrites the
+        # pinned (fixed-address, never-pooled) buffer on every replay, ordered before
+        # the dgrad read via the output layer's own fwd GEMM on the main stream; the
+        # Python retain/consume handshake runs only at capture and mirrors eager.
         if (
             fwd
             and not in_recompute
             and self._reuse_fwd_weight_in_bwd
             and not getattr(self, "_gtp_native_fp8", False)
-            and not _FULL_ITERATION
         ):
             self._retained_fwd_weight = result
 
