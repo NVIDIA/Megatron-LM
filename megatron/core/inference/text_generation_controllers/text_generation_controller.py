@@ -2122,6 +2122,9 @@ class TextGenerationController:
             self._async_sched_logits.clear()
             return None
 
+        # -------------------------------------------------------------------------
+        # Primer
+        # -------------------------------------------------------------------------
         # Launch the forward primer if no existing logits state can be reused.
         primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
@@ -2135,11 +2138,17 @@ class TextGenerationController:
             elif primer_launched:
                 self._synchronize_async_sched_event(primer_bookkeeping_done_event)
 
+            # -------------------------------------------------------------------------
+            # Prepare
+            # -------------------------------------------------------------------------
             # Prepare CPU state and live GPU views without publishing bookkeeping yet.
             range_push("prepare_requests")
             input_ids_gpu_view, position_ids_gpu_view = self._run_async_sched_prepare()
             range_pop()
 
+            # -------------------------------------------------------------------------
+            # Sample
+            # -------------------------------------------------------------------------
             # Enqueue sampling behind the current logits-producing work.
             sampled_tokens_gpu = self._run_async_sched_sample()
 
@@ -2155,6 +2164,9 @@ class TextGenerationController:
             if not overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
 
+            # -------------------------------------------------------------------------
+            # Forward
+            # -------------------------------------------------------------------------
             # Publish positions and metadata without overwriting GPU-resident input IDs.
             range_push("async_sched_transfer_bookkeeping_to_gpu")
             bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
@@ -2175,6 +2187,9 @@ class TextGenerationController:
             if not overlap:
                 self._synchronize_async_sched_event(forward_done_event)
 
+            # -------------------------------------------------------------------------
+            # Resolve
+            # -------------------------------------------------------------------------
             # Resolution reads the CPU sample and mutates the H2D source buffer.
             if overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
