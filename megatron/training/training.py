@@ -73,7 +73,7 @@ from megatron.core.optimizer import (
     ParamKey,
     get_megatron_optimizer,
     get_mup_config_overrides,
-    get_standard_config_overrides,
+    get_optimizer_overrides_from_config,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -1952,7 +1952,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
+    config_overrides = get_optimizer_overrides_from_config(config=config)
 
     return config, config_overrides
 

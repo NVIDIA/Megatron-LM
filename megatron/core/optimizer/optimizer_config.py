@@ -2,7 +2,7 @@
 
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -164,6 +164,14 @@ class OptimizerConfig:
 
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
+
+    overrides_config: Optional[Dict[str, Any]] = None
+    """Serialized per-parameter optimizer overrides.
+
+    Each named entry contains a ``param_key`` selector and a ``param_group_override`` mapping.
+    Numeric values are expected to be resolved by the caller before constructing this config. When
+    provided, this mapping replaces the standard parameter-group overrides.
+    """
 
     ##############
     # Precision

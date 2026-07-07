@@ -1,8 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import re
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -126,6 +128,133 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
+
+
+def get_optimizer_overrides_from_config(
+    config: OptimizerConfig,
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Build optimizer overrides from ``OptimizerConfig.overrides_config``.
+
+    When ``overrides_config`` is unset, this returns :func:`get_standard_config_overrides`.
+    Otherwise, the configured mapping is authoritative: it maps descriptive group names to a
+    ``param_key`` selector and a ``param_group_override``. Selectors support the serializable
+    ``ParamKey`` name globs and parameter attributes, plus optional positive and negative name
+    regexes. Regexes use :func:`re.search` semantics, and an exclusion always vetoes a positive
+    match.
+
+    Example::
+
+        overrides_config = {
+            "hidden": {
+                "param_key": {"name": ["*.linear_fc1.weight", "*.linear_fc2.weight"]},
+                "param_group_override": {
+                    "max_lr": 1.0e-3,
+                    "min_lr": 1.0e-5,
+                    "eps": 1.0e-12,
+                    "wd_mult": 1.0,
+                },
+            }
+        }
+
+    Args:
+        config (OptimizerConfig): Optimizer configuration containing parsed override data.
+
+    Returns:
+        Dict[ParamKey, ParamGroupOverride]: Configured optimizer overrides.
+    """
+
+    def as_mapping(value: Any, path: str) -> Mapping[str, Any]:
+        if isinstance(value, Mapping):
+            return value
+        if hasattr(value, "__dict__"):
+            return vars(value)
+        raise TypeError(f"{path} must be a mapping, got {type(value).__name__}")
+
+    def as_tuple(value: Any, path: str) -> Tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            return tuple(value)
+        raise TypeError(f"{path} must be a string or sequence of strings")
+
+    if config.overrides_config is None:
+        return get_standard_config_overrides(config)
+
+    configured_groups = as_mapping(config.overrides_config, "overrides_config")
+    allowed_param_key_fields = {"name", "attr", "name_regex", "exclude_name_regex"}
+    allowed_override_fields = set(ParamGroupOverride.__annotations__)
+    overrides: Dict[ParamKey, ParamGroupOverride] = {}
+
+    for group_name, raw_group in configured_groups.items():
+        group_path = f"overrides_config.{group_name}"
+        group = as_mapping(raw_group, group_path)
+        unknown_group_fields = set(group) - {"param_key", "param_group_override"}
+        if unknown_group_fields:
+            raise ValueError(f"{group_path} has unsupported fields: {sorted(unknown_group_fields)}")
+        if "param_key" not in group or "param_group_override" not in group:
+            raise ValueError(f"{group_path} requires param_key and param_group_override")
+
+        key_config = as_mapping(group["param_key"], f"{group_path}.param_key")
+        unknown_key_fields = set(key_config) - allowed_param_key_fields
+        if unknown_key_fields:
+            raise ValueError(
+                f"{group_path}.param_key has unsupported fields: {sorted(unknown_key_fields)}"
+            )
+
+        names = as_tuple(key_config.get("name"), f"{group_path}.param_key.name")
+        attrs = as_tuple(key_config.get("attr"), f"{group_path}.param_key.attr")
+        name_regexes = as_tuple(key_config.get("name_regex"), f"{group_path}.param_key.name_regex")
+        exclude_name_regexes = as_tuple(
+            key_config.get("exclude_name_regex"), f"{group_path}.param_key.exclude_name_regex"
+        )
+        if not (names or attrs or name_regexes):
+            raise ValueError(f"{group_path}.param_key requires a positive selector")
+
+        try:
+            include_regexes = tuple(re.compile(pattern) for pattern in name_regexes)
+            exclude_regexes = tuple(re.compile(pattern) for pattern in exclude_name_regexes)
+        except re.error as error:
+            raise ValueError(f"{group_path}.param_key has invalid regex: {error}") from error
+
+        if include_regexes or exclude_regexes:
+            positive_key = ParamKey(name=names, attr=attrs)
+
+            def matches(
+                param,
+                name,
+                positive_key=positive_key,
+                include_regexes=include_regexes,
+                exclude_regexes=exclude_regexes,
+            ):
+                positive = positive_key.matches(param, name) or any(
+                    pattern.search(name) for pattern in include_regexes
+                )
+                return positive and not any(pattern.search(name) for pattern in exclude_regexes)
+
+            param_key = ParamKey(
+                with_name_predicate=ParamWithNamePredicate(name=f"config:{group_name}", fn=matches)
+            )
+        else:
+            param_key = ParamKey(name=names, attr=attrs)
+
+        override_config = as_mapping(
+            group["param_group_override"], f"{group_path}.param_group_override"
+        )
+        unknown_override_fields = set(override_config) - allowed_override_fields
+        if unknown_override_fields:
+            raise ValueError(
+                f"{group_path}.param_group_override has unsupported fields: "
+                f"{sorted(unknown_override_fields)}"
+            )
+        if not override_config:
+            raise ValueError(f"{group_path}.param_group_override must not be empty")
+        if param_key in overrides:
+            raise ValueError(f"{group_path} duplicates an earlier param_key selector")
+        overrides[param_key] = ParamGroupOverride(**override_config)
+
+    return overrides
 
 
 def get_mup_config_overrides(
@@ -1016,7 +1145,7 @@ def get_megatron_optimizer(
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:
-        config_overrides = get_standard_config_overrides(config)
+        config_overrides = get_optimizer_overrides_from_config(config)
 
     check_config_overrides_consistency(config, config_overrides)
 

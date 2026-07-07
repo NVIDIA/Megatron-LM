@@ -34,6 +34,7 @@ class ParamGroupOverride(TypedDict, total=False):
     start_wd: float
     end_wd: float
     wd_mult: float
+    eps: float
     optimizer: str
 
 

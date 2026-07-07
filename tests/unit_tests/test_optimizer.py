@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +25,7 @@ from megatron.core.optimizer import (
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
+    get_optimizer_overrides_from_config,
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -125,6 +127,139 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+def test_get_optimizer_overrides_from_config_mapping():
+    config = OptimizerConfig(
+        overrides_config={
+            "expert_output": {
+                "param_key": {"name": ["*.experts.*.linear_fc2.weight"]},
+                "param_group_override": {
+                    "max_lr": 2.5e-4,
+                    "min_lr": 2.5e-6,
+                    "eps": 1.0e-12,
+                    "wd_mult": 4.0,
+                },
+            },
+            "norm_not_qk": {
+                "param_key": {
+                    "name_regex": r"layernorm\.weight$",
+                    "exclude_name_regex": r"\.(?:q|k)_layernorm\.",
+                },
+                "param_group_override": {"max_lr": 1.0e-3, "wd_mult": 0.0},
+            },
+        }
+    )
+
+    overrides = get_optimizer_overrides_from_config(config)
+    assert len(overrides) == 2
+    expert_key = next(key for key in overrides if key.name)
+    norm_key = next(key for key in overrides if key.with_name_predicate)
+    parameter = torch.nn.Parameter(torch.empty(4))
+    assert expert_key.matches(parameter, "decoder.experts.0.linear_fc2.weight")
+    assert not expert_key.matches(parameter, "decoder.linear_fc2.weight")
+    assert norm_key.matches(parameter, "decoder.input_layernorm.weight")
+    assert not norm_key.matches(parameter, "decoder.q_layernorm.weight")
+    assert overrides[expert_key] == {
+        "max_lr": 2.5e-4,
+        "min_lr": 2.5e-6,
+        "eps": 1.0e-12,
+        "wd_mult": 4.0,
+    }
+
+
+def test_get_optimizer_overrides_from_config_falls_back_to_standard_overrides():
+    config = OptimizerConfig()
+
+    assert get_optimizer_overrides_from_config(config) == get_standard_config_overrides(config)
+
+
+def test_get_optimizer_overrides_from_config_parsed_namespace():
+    config = OptimizerConfig(
+        overrides_config=SimpleNamespace(
+            hidden=SimpleNamespace(
+                param_key=SimpleNamespace(name="*.linear_fc1.weight"),
+                param_group_override=SimpleNamespace(max_lr=1.0e-3),
+            )
+        )
+    )
+
+    overrides = get_optimizer_overrides_from_config(config)
+    key, override = next(iter(overrides.items()))
+    assert key.name == ("*.linear_fc1.weight",)
+    assert override == {"max_lr": 1.0e-3}
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_optimizer_overrides_from_config_applies_group_values(mock_get_world_size):
+    model = torch.nn.Module()
+    model.expert_output = torch.nn.Linear(4, 4, bias=False)
+    model.layernorm = torch.nn.LayerNorm(4)
+    config = OptimizerConfig(
+        lr=1.0e-3,
+        min_lr=1.0e-5,
+        overrides_config={
+            "expert_output": {
+                "param_key": {"name_regex": r"expert_output\.weight$"},
+                "param_group_override": {
+                    "max_lr": 2.5e-4,
+                    "min_lr": 2.5e-6,
+                    "eps": 1.0e-12,
+                    "wd_mult": 4.0,
+                },
+            },
+            "layernorm_gain": {
+                "param_key": {"name_regex": r"layernorm\.weight$"},
+                "param_group_override": {"wd_mult": 2.0},
+            },
+        },
+    )
+    overrides = get_optimizer_overrides_from_config(config)
+
+    param_groups = _get_param_groups([model], config, overrides)
+    expert_group = next(
+        group
+        for group in param_groups
+        if any(param is model.expert_output.weight for param in group["params"])
+    )
+
+    assert expert_group["max_lr"] == 2.5e-4
+    assert expert_group["min_lr"] == 2.5e-6
+    assert expert_group["eps"] == 1.0e-12
+    assert expert_group["wd_mult"] == 4.0
+    layernorm_group = next(
+        group
+        for group in param_groups
+        if any(param is model.layernorm.weight for param in group["params"])
+    )
+    assert layernorm_group["wd_mult"] == 2.0
+
+
+@pytest.mark.parametrize(
+    ("overrides_config", "message"),
+    [
+        ({"bad": {"param_key": {"name": "*.weight"}, "unknown": {}}}, "unsupported fields"),
+        (
+            {"bad": {"param_key": {"name_regex": "["}, "param_group_override": {"max_lr": 1.0e-3}}},
+            "invalid regex",
+        ),
+        (
+            {
+                "bad": {
+                    "param_key": {"name": "*.weight"},
+                    "param_group_override": {"not_an_override": 1.0},
+                }
+            },
+            "unsupported fields",
+        ),
+    ],
+)
+def test_get_optimizer_overrides_from_config_rejects_invalid_config(overrides_config, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        get_optimizer_overrides_from_config(OptimizerConfig(overrides_config=overrides_config))
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
