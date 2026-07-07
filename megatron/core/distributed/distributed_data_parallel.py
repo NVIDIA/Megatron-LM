@@ -475,7 +475,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
+                if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
                     # GTP_remat params legitimately have grad=None (async RS writes wgrad straight
                     # into main_grad), so skip the assertion for them.
                     if not getattr(param, 'is_gtp_weight_remat', False):
