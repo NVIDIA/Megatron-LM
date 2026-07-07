@@ -166,13 +166,17 @@ class SharedExpertMLP(MLP):
             # The overlapped version is splitted into some separated functions and is put inside
             # the token dispatcher. These functions should be called in this order and no one can
             # be skipped:
-            #     pre_forward_comm(input)
+            #     register_input(input)   # at the MoE layer, before any latent projection
+            #     pre_forward_comm()      # launched by the token dispatcher
             #     linear_fc1_forward_and_act()
             #     linear_fc2_forward()
             #     post_forward_comm()
             #     output = get_output()
             #
             # We use cached intermediate results to avoid messy arg passing in the dispatcher.
+            # _fc1_full_input holds the full-hidden input registered by the MoE layer; it is
+            # consumed (and cleared) by pre_forward_comm.
+            self._fc1_full_input = None
             self.cached_fc1_input = None
             self.cached_fc2_input = None
             self.cached_fc2_output = None
@@ -219,13 +223,36 @@ class SharedExpertMLP(MLP):
         """Wait for the current stream to complete."""
         self.stream.wait_stream(torch.cuda.current_stream())
 
+    def register_input(self, input):
+        """Capture the full-hidden input for the overlapped shared expert forward.
+
+        Split out from ``pre_forward_comm`` so the input can be registered at the MoE layer
+        (before any latent projection, where the full-hidden tensor is available), while the
+        actual communication launch stays in the token dispatcher. This unifies the latent and
+        non-latent overlap paths. State-neutral: it does not advance the overlap state machine.
+        """
+        assert (
+            self.config.moe_shared_expert_overlap
+        ), "register_input requires --moe-shared-expert-overlap to be set"
+        assert self._overlap_state == SharedExpertState.IDLE, (
+            f"register_input must be called from IDLE state, "
+            f"but current state is {self._overlap_state.name}"
+        )
+        self._fc1_full_input = input
+
     @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
-    def pre_forward_comm(self, input, wait_current_stream=True):
+    def pre_forward_comm(self, wait_current_stream=True):
         """
         All Gather for SP before forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
+        The input must be registered in advance via ``register_input``.
         """
+        assert (
+            self._fc1_full_input is not None
+        ), "pre_forward_comm requires register_input to be called first"
+        input = self._fc1_full_input
+        self._fc1_full_input = None
         if wait_current_stream:
             self.wait_current_stream()
         with torch.cuda.stream(self.stream):
