@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 from typing import Any
 
 import numpy as np
@@ -124,7 +125,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return rollout
 
-    async def _agenerate(
+    async def get_rollout_response(
         self,
         request: RolloutRequest | GroupedRolloutRequest | EvaluationRequest,
         inference_request: InferenceRequest,
@@ -139,7 +140,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        response = await self._agenerate(request, inference_request)
+        response = await self.get_rollout_response(request, inference_request)
 
         return await self._rollout_from_response(request, response, golden)
 
@@ -154,10 +155,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        async def build_rollout(response: InferenceResponse) -> Rollout:
-            return await self._rollout_from_response(request, response, golden)
-
-        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+        return GroupRolloutParams(
+            inference_request=inference_request,
+            build_rollout=functools.partial(self._rollout_from_response, request, golden=golden),
+        )
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
@@ -167,7 +168,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        response = await self._agenerate(request, inference_request)
+        response = await self.get_rollout_response(request, inference_request)
         response_text = response.response.content
 
         result = RewardEvaluationResult(

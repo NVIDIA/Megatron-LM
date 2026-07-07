@@ -3,8 +3,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import AsyncIterator, Awaitable, Callable, Generic, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -103,8 +102,7 @@ class RolloutGroup(AgentBaseModel):
 GroupedRollouts = list[RolloutGroup]
 
 
-@dataclass
-class GroupRolloutParams:
+class GroupRolloutParams(NamedTuple):
     """Returned by agent.prepare_group_rollout.
 
     One instance is created per group call and reused for all rollouts in that group.
@@ -162,12 +160,12 @@ class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
 class Agent(ABC, AgentBaseModel):
 
     @abstractmethod
-    async def _agenerate(
+    async def get_rollout_response(
         self,
         request: "RolloutRequest | GroupedRolloutRequest | EvaluationRequest",
         inference_request: InferenceRequest,
     ) -> InferenceResponse:
-        """Run a single inference call. Subclasses implement how."""
+        """Obtain the model response for a single rollout. Subclasses implement how."""
         ...
 
 
@@ -216,8 +214,7 @@ class TokenizedRolloutGenerator(Agent, ABC):
         )
 
 
-@dataclass(frozen=True)
-class _GranularityConfig:
+class _GranularityConfig(NamedTuple):
     submission: SubmissionGranularity
     consumption: ConsumptionGranularity
     num_groups_per_batch: int
@@ -232,7 +229,7 @@ class _GranularityConfig:
         )
 
     @property
-    def consume_in_batch_order(self) -> bool:
+    def prevent_dataset_reorder(self) -> bool:
         return self.consumption == "B"
 
     @staticmethod
@@ -284,12 +281,12 @@ class _SubmissionGate:
             self.release_calls += 1
 
 
-@dataclass
-class _InferWorkItem:
+class _InferWorkItem(NamedTuple):
     """One rollout's worth of work flowing from prepare to infer.
 
-    Timestamps are wall-clock monotonic seconds, filled in by each stage
-    as the item moves through the pipeline. Zero means "not yet reached".
+    Timestamps are wall-clock monotonic seconds: `prepared_at` is stamped at
+    construction and `infer_dequeued_at` is filled in via `_replace` when an
+    infer worker dequeues the item. Zero means "not yet reached".
     """
 
     group_id: int
@@ -301,14 +298,12 @@ class _InferWorkItem:
     infer_dequeued_at: float = 0.0
 
 
-@dataclass
-class _InferredItem:
+class _InferredItem(NamedTuple):
     """One rollout post-inference, flowing from infer to assemble."""
 
     item: _InferWorkItem
     response: InferenceResponse
     inferred_at: float = 0.0
-    assemble_dequeued_at: float = 0.0
 
 
 class _RolloutPipeline:
@@ -328,6 +323,16 @@ class _RolloutPipeline:
             capacity=parallel_generation_tasks,
             submission=self.gran_policy.submission,
         )
+        rollouts_per_submission_unit = {
+            "R": 1,
+            "G": request.rollouts_per_group,
+            "B": self.gran_policy.num_groups_per_batch * request.rollouts_per_group,
+        }[self.gran_policy.submission]
+        self.num_infer_workers = parallel_generation_tasks * rollouts_per_submission_unit
+        if not request.streaming:
+            self.num_infer_workers = min(
+                self.num_infer_workers, request.num_groups * request.rollouts_per_group
+            )
         self.output_queue_maxsize = buffer_size if request.streaming else 0
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
@@ -336,7 +341,7 @@ class _RolloutPipeline:
         # stage_assemble). Held here so metric collection can report its size.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
         # Pending groups waiting for their batch to fill in stage_consume
-        # (only populated when consume_in_batch_order is True).
+        # (only populated when prevent_dataset_reorder is True).
         self._consume_pending: dict[int, list[RolloutGroup]] = {}
         # Per-group "output entry" times, keyed by (batch_id, index_in_batch),
         # so stage_consume can compute output_queue_dwell when yielding.
@@ -366,7 +371,7 @@ class _RolloutPipeline:
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
-                    params: GroupedRolloutRequest = await self.agent.prepare_group_rollout(self.request)
+                    params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
 
                     for rollout_idx in range(self.request.rollouts_per_group):
                         await self.gate.acquire_for("R")
@@ -385,29 +390,33 @@ class _RolloutPipeline:
             self.infer_queue.shutdown()
 
     async def stage_infer(self) -> None:
-        """Dispatch inference work into child tasks."""
-        in_flight: set[asyncio.Task[None]] = set()
+        """Run a persistent pool of inference workers, spawned once per pipeline."""
+        workers = [
+            asyncio.create_task(self._infer_worker()) for _ in range(self.num_infer_workers)
+        ]
         try:
-            while True:
-                try:
-                    item = await self.infer_queue.get()
-                except asyncio_QueueShutDown:
-                    break
-                item.infer_dequeued_at = time.monotonic()
-                if item.prepared_at:
-                    self.infer_queue_dwell.append(item.infer_dequeued_at - item.prepared_at)
-                task = asyncio.create_task(self._infer_one(item))
-                in_flight.add(task)
-                task.add_done_callback(in_flight.discard)
-            await asyncio.gather(*in_flight, return_exceptions=True)
+            await asyncio.gather(*workers, return_exceptions=True)
         finally:
-            for task in in_flight:
-                task.cancel()
+            for worker in workers:
+                worker.cancel()
             self.assemble_queue.shutdown()
+
+    async def _infer_worker(self) -> None:
+        while True:
+            try:
+                item = await self.infer_queue.get()
+            except asyncio_QueueShutDown:
+                return
+            item = item._replace(infer_dequeued_at=time.monotonic())
+            if item.prepared_at:
+                self.infer_queue_dwell.append(item.infer_dequeued_at - item.prepared_at)
+            await self._infer_one(item)
 
     @trace_async_exceptions(verbose=True)
     async def _infer_one(self, item: _InferWorkItem) -> None:
-        response = await self.agent._agenerate(self.request, item.params.inference_request)
+        response = await self.agent.get_rollout_response(
+            self.request, item.params.inference_request
+        )
         inferred_at = time.monotonic()
         self.gate.release_after("inferred")
         if item.infer_dequeued_at:
@@ -426,11 +435,9 @@ class _RolloutPipeline:
                     inferred = await self.assemble_queue.get()
                 except asyncio_QueueShutDown:
                     break
-                inferred.assemble_dequeued_at = time.monotonic()
+                dequeued_at = time.monotonic()
                 if inferred.inferred_at:
-                    self.assemble_queue_dwell.append(
-                        inferred.assemble_dequeued_at - inferred.inferred_at
-                    )
+                    self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
                 bucket = pending.setdefault(inferred.item.group_id, [])
                 bucket.append(inferred)
                 if len(bucket) < self.request.rollouts_per_group:
@@ -442,6 +449,11 @@ class _RolloutPipeline:
                 )
                 self.gate.release_after("assembled")
                 self.assembled_count += 1
+                # NOTE: this filter is currently non-functional dead code:
+                # _GranularityConfig._validate rejects filter_groups_with_same_reward
+                # at pipeline construction, so `keep` is always True. Kept for a
+                # future PR that regenerates dropped groups instead of
+                # under-delivering to the caller.
                 keep = (
                     not self.request.filter_groups_with_same_reward
                     or np.std([rollout.reward for rollout in rollouts]) > 1e-6
@@ -471,7 +483,7 @@ class _RolloutPipeline:
         self.yielded_count += 1
 
     async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
-        if not self.gran_policy.consume_in_batch_order:
+        if not self.gran_policy.prevent_dataset_reorder:
             while True:
                 try:
                     group = await self.output_queue.get()
