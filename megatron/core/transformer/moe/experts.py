@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import inspect
@@ -18,6 +18,7 @@ from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
@@ -265,7 +266,9 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1:
+        use_mxfp8 = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.mxfp8
+        use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
+        if self.offload_expert_fc1 and not (use_mxfp8 or use_nvfp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -610,9 +613,10 @@ class TEGroupedMLP(MegatronModule):
             stash_context = nullcontext()
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
-        with off_interface(
+        fused_group_mlp_manager = off_interface(
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
-        ) as permuted_local_hidden_states:
+        )
+        with fused_group_mlp_manager as permuted_local_hidden_states:
             forced_released_tensors = (
                 [permuted_local_hidden_states] if fine_grained_activation_offloading else []
             )
@@ -624,10 +628,9 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,  # Scaled activation
                     tokens_per_expert,  # FC2
                 )
-        if fine_grained_activation_offloading:
-            output = off_interface.group_commit(
-                output, name=offload_name, forced_released_tensors=forced_released_tensors
-            )
+        output = fused_group_mlp_manager.group_offload(
+            output, forced_released_tensors=forced_released_tensors
+        )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
@@ -695,18 +698,20 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
+        expert_fc1_manager = off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
+        )
+        with expert_fc1_manager as permuted_local_hidden_states:
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
-        if self.offload_expert_fc1:
-            fc1_output = off_interface.group_commit(
-                fc1_output,
-                name="expert_fc1",
-                forced_released_tensors=[permuted_local_hidden_states],
-            )
+        fc1_output = expert_fc1_manager.group_offload(
+            fc1_output,
+            forced_released_tensors=[permuted_local_hidden_states],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
+
+        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
@@ -785,12 +790,12 @@ class TEGroupedMLP(MegatronModule):
 
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
@@ -798,10 +803,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        if self.offload_moe_act:
-            output = off_interface.group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
-            )
+        output = moe_act_manager.group_offload(
+            output,
+            forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
