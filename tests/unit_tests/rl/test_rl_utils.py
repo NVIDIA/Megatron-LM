@@ -251,10 +251,7 @@ class TestRLUtils:
         )
 
         result = rl_utils.get_rollout_generator(
-            args,
-            inference_interface=ReturnsRaw(),
-            n_prompts=n_prompts,
-            samples_per_group=4,
+            args, inference_interface=ReturnsRaw(), n_prompts=n_prompts, samples_per_group=4
         )
 
         assert result is rollout_generator
