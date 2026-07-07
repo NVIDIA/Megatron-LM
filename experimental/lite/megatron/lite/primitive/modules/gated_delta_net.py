@@ -432,6 +432,7 @@ class GatedDeltaNet(nn.Module):
             a.reshape(batch, seq_len, self.num_v_heads_local),
         )
 
+    @jit_fuser
     def _prepare_qkv(
         self, qkv: torch.Tensor, gate, beta, alpha, batch: int, seq_len: int
     ):
@@ -440,9 +441,8 @@ class GatedDeltaNet(nn.Module):
             batch, seq_len, 2 * self.num_k_heads_local, self.dk
         )
         value = value.reshape(batch, seq_len, self.num_v_heads_local, self.dv)
+        query_key = self._l2norm(query_key.contiguous())
         query, key = query_key.split(self.num_k_heads_local, dim=2)
-        query = self._l2norm(query.contiguous())
-        key = self._l2norm(key.contiguous())
         if self.v_heads_per_k_head > 1:
             query = query.repeat_interleave(self.v_heads_per_k_head, dim=2)
             key = key.repeat_interleave(self.v_heads_per_k_head, dim=2)
@@ -455,10 +455,13 @@ class GatedDeltaNet(nn.Module):
             alpha.contiguous(),
         )
 
-    def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    @jit_fuser
+    def _l2norm(x: torch.Tensor) -> torch.Tensor:
         return l2norm(x)
 
     @staticmethod
+    @jit_fuser
     def _compute_g_and_beta(A_log, dt_bias, alpha, beta):
         g = -A_log.exp() * F.softplus(alpha.float() + dt_bias)
         return g, beta.sigmoid()
