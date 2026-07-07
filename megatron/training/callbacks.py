@@ -152,11 +152,11 @@ class Callback:
         pass
 
     def on_train_step_start(self, context: CallbackContext) -> None:
-        """Called at the top of each outer iteration, before the step."""
+        """Called at the start of each training step."""
         pass
 
     def on_train_step_end(self, context: CallbackContext) -> None:
-        """Called once per outer iteration after the step (empty loss_dict when skip_train)."""
+        """Called after each training step completes."""
         pass
 
     def on_log(self, context: CallbackContext) -> None:
