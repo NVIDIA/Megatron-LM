@@ -219,6 +219,8 @@ class HybridStack(MegatronModule):
             )
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
+        # Avoid modifying the original object so users don't get surprised about their `submodules`
+        # being modified underneath them.
         submodules = copy.deepcopy(submodules)
         mla_spec = submodules.mla_layer
         # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
