@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import os
 import warnings
 from copy import deepcopy
 from enum import Enum
@@ -430,10 +429,19 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     def _get_fused_grouped_swiglu_recipe(self):
         """Create the TE recipe used to select the fused grouped MLP kernel."""
         if self._fused_grouped_swiglu_recipe is None:
-            if os.getenv("FP4_RECIPE", "") == "nvfp4":
+            fp4_recipe = getattr(self.config.fp4_recipe, "value", self.config.fp4_recipe)
+            fp8_recipe = getattr(self.config.fp8_recipe, "value", self.config.fp8_recipe)
+            if self.config.fp4 and fp4_recipe == "nvfp4":
                 self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
-            else:
+            elif self.config.fp8 and fp8_recipe == "mxfp8":
                 self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+            else:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires fp4_recipe='nvfp4' or "
+                    f"fp8_recipe='mxfp8', but got fp4={self.config.fp4}, "
+                    f"fp4_recipe={self.config.fp4_recipe}, fp8={self.config.fp8}, "
+                    f"fp8_recipe={self.config.fp8_recipe}."
+                )
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
