@@ -351,21 +351,25 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         for event in cuda_events
         if "nccl" in event.name.lower() and "allgather" in event.name.lower()
     ]
-    compute_events = [
+    # GEMM device-kernel names vary across CUDA/cuBLAS versions and GPU archs
+    # (e.g. "*gemm*", "cutlass*", "cublas*", and cuBLASLt's Hopper "nvjet_sm90_*").
+    gemm_events = [
         event
         for event in cuda_events
-        if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas"))
+        if any(
+            token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet")
+        )
     ]
     assert all_gather_events, [event.name for event in cuda_events]
-    assert compute_events, [event.name for event in cuda_events]
+    assert gemm_events, [event.name for event in cuda_events]
 
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
-    compute_streams = {event.device_resource_id for event in compute_events}
+    gemm_streams = {event.device_resource_id for event in gemm_events}
     assert len(all_gather_streams) == 1
-    assert all_gather_streams.isdisjoint(compute_streams)
+    assert all_gather_streams.isdisjoint(gemm_streams)
 
     overlap_count = sum(
-        any(_events_overlap(all_gather_event, compute_event) for compute_event in compute_events)
+        any(_events_overlap(all_gather_event, gemm_event) for gemm_event in gemm_events)
         for all_gather_event in all_gather_events
     )
     # This profiles a full forward/backward iteration, so backward all-gathers are
