@@ -15,7 +15,7 @@ from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Protocol, runtime_checkable
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
@@ -262,6 +262,22 @@ def _clone_nested_tensors(value: Any) -> Any:
             "Sets of tensors are unsupported in cudagraph helpers; use list/tuple instead"
         )
     return value
+
+
+@runtime_checkable
+class CudaGraphGeneratorProvider(Protocol):
+    """Contract for a graphed module that samples from a private RNG generator.
+
+    A module implementing `cuda_graph_generators` declares generators that are used
+    inside its captured region but are not part of the global RNG tracker (e.g. an
+    inference sampling backend's own generator). `_CudaGraphRunner.create_fwd_graph`
+    registers them with the graph so their philox offset advances on replay instead
+    of being frozen at capture time.
+    """
+
+    def cuda_graph_generators(self) -> Iterable[torch.Generator]:
+        """Return the private RNG generators used inside the captured region."""
+        ...
 
 
 def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Generator:
@@ -850,6 +866,16 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fwd_graph.register_generator_state(
                     _ensure_generator_state_is_cudagraph_safe(gen)
                 )
+
+            # A graphed module may draw from a private generator not tracked by the
+            # global RNG tracker (e.g. an inference sampling backend's own generator).
+            # Register it so its philox offset advances on replay instead of being frozen
+            # at capture. Inert for modules that do not implement the contract.
+            if isinstance(self.base_module, CudaGraphGeneratorProvider):
+                for gen in self.base_module.cuda_graph_generators():
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(gen)
+                    )
 
         args_to_clear_buffers = []
 

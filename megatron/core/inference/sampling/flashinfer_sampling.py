@@ -38,6 +38,15 @@ class FlashInferSampling(Sampling):
                 inline_capture=True,
             )
 
+    def cuda_graph_generators(self):
+        """RNG generators used inside the captured `sample_kernel` region.
+
+        `CudaGraphManager` registers these with the graph so their philox offset stays
+        live across replays; otherwise every replay would draw identical random numbers.
+        Satisfies the `CudaGraphGeneratorProvider` contract in `cuda_graphs`.
+        """
+        return (self._rng,)
+
     def sample_kernel(
         self,
         logits: Tensor,

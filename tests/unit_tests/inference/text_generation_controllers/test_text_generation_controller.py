@@ -31,12 +31,14 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeForwardPrimer,
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.transformer.cuda_graphs import CudaGraphGeneratorProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
@@ -710,6 +712,69 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.all(
             sampled_logits >= expected_min_values
         ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
+
+    def test_flashinfer_sampling_satisfies_generator_contract(self):
+        """FlashInferSampling exposes, via the CUDA-graph generator contract, the exact
+        generator its kernel draws from — so graph capture can register it graph-safe."""
+        rng = torch.Generator()
+        rng.manual_seed(7)
+        sampling = FlashInferSampling(vocab_size=32, rng=rng, config=None, enable_cuda_graph=False)
+
+        assert isinstance(sampling, CudaGraphGeneratorProvider)
+        generators = tuple(sampling.cuda_graph_generators())
+        assert len(generators) == 1
+        assert generators[0] is rng
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_flashinfer_sampling_kernel_rng_advances_under_graph(self):
+        """The FlashInfer sampling kernel produces varying draws across graph replays
+        once its generator (exposed via the contract) is registered with the graph."""
+        flashinfer = pytest.importorskip("flashinfer")
+
+        device = torch.device("cuda")
+        rng = torch.Generator(device=device)
+        rng.manual_seed(0)
+        sampling = FlashInferSampling(
+            vocab_size=128, rng=rng, config=None, enable_cuda_graph=False
+        )
+
+        n, vocab = 64, 128
+        # Uniform, unfiltered (top_k=vocab, top_p=1.0) so sampling is fully RNG-driven and
+        # two graph-safe replays are overwhelmingly unlikely to coincide.
+        probs = torch.full((n, vocab), 1.0 / vocab, device=device)
+        top_k = torch.full((n,), vocab, device=device, dtype=torch.int32)
+        top_p = torch.full((n,), 1.0, device=device)
+        out = torch.empty(n, dtype=torch.int64, device=device)
+
+        def draw():
+            out.copy_(
+                flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, top_k, top_p, generator=rng
+                )
+            )
+
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            for _ in range(3):
+                draw()
+        torch.cuda.current_stream().wait_stream(warmup)
+
+        graph = torch.cuda.CUDAGraph()
+        for gen in sampling.cuda_graph_generators():
+            graph.register_generator_state(gen)
+        with torch.cuda.graph(graph):
+            draw()
+
+        graph.replay()
+        torch.cuda.synchronize()
+        first = out.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        second = out.clone()
+        assert not torch.equal(
+            first, second
+        ), "FlashInfer sampling drew identical tokens across replays (frozen RNG)"
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(

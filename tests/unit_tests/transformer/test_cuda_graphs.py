@@ -31,6 +31,7 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
+    CudaGraphGeneratorProvider,
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
@@ -379,6 +380,92 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
         assert cfg.cuda_graph_modules == []
         assert cfg.cuda_graph_scope is None
+
+
+class TestCudaGraphGeneratorProvider:
+    """The `CudaGraphGeneratorProvider` contract: a graphed module can declare private
+    RNG generators to register with the graph so they advance (rather than freeze) on
+    replay. See `_CudaGraphRunner.create_fwd_graph`."""
+
+    def test_provider_detected_by_structural_typing(self):
+        class _WithGenerators:
+            def __init__(self, generator):
+                self._rng = generator
+
+            def cuda_graph_generators(self):
+                return (self._rng,)
+
+        gen = torch.Generator()
+        module = _WithGenerators(gen)
+        assert isinstance(module, CudaGraphGeneratorProvider)
+        assert tuple(module.cuda_graph_generators()) == (gen,)
+
+    def test_non_provider_module_is_ignored(self):
+        class _PlainModule:
+            pass
+
+        assert not isinstance(_PlainModule(), CudaGraphGeneratorProvider)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_registered_generator_advances_across_replays(self):
+        """A provider's generator, once registered, advances on every replay; an
+        identical unregistered generator stays frozen at its captured state."""
+
+        class _SamplingModule:
+            def __init__(self, generator):
+                self._rng = generator
+
+            def cuda_graph_generators(self):
+                return (self._rng,)
+
+        def capture(draw_fn, generators):
+            warmup = torch.cuda.Stream()
+            warmup.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup):
+                for _ in range(3):
+                    draw_fn()
+            torch.cuda.current_stream().wait_stream(warmup)
+            graph = torch.cuda.CUDAGraph()
+            for gen in generators:
+                graph.register_generator_state(gen)
+            with torch.cuda.graph(graph):
+                draw_fn()
+            return graph
+
+        def replay_twice(graph, out):
+            graph.replay()
+            torch.cuda.synchronize()
+            first = out.clone()
+            graph.replay()
+            torch.cuda.synchronize()
+            return first, out.clone()
+
+        device = torch.device("cuda")
+
+        # Registered (graph-safe): draws must vary across replays.
+        reg_gen = torch.Generator(device=device)
+        reg_gen.manual_seed(1234)
+        module = _SamplingModule(reg_gen)
+        assert isinstance(module, CudaGraphGeneratorProvider)
+        reg_out = torch.empty(64, device=device)
+        reg_graph = capture(
+            lambda: reg_out.copy_(torch.rand(64, device=device, generator=reg_gen)),
+            module.cuda_graph_generators(),
+        )
+        first, second = replay_twice(reg_graph, reg_out)
+        assert not torch.equal(first, second), "registered generator did not advance on replay"
+
+        # Control: identical setup without registration stays frozen.
+        ctrl_gen = torch.Generator(device=device)
+        ctrl_gen.manual_seed(1234)
+        ctrl_out = torch.empty(64, device=device)
+        ctrl_graph = capture(
+            lambda: ctrl_out.copy_(torch.rand(64, device=device, generator=ctrl_gen)), ()
+        )
+        ctrl_first, ctrl_second = replay_twice(ctrl_graph, ctrl_out)
+        assert torch.equal(
+            ctrl_first, ctrl_second
+        ), "unregistered generator advanced; the control assumption is invalid"
 
 
 class TestParallelTransformerBlockCudagraphs:
