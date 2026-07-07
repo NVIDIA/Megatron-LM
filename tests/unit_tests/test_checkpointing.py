@@ -7,7 +7,6 @@ from unittest import mock
 
 import pytest
 import torch
-import torch.distributed
 import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -239,8 +238,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         save_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
-
-        torch.distributed.barrier()  # Ensure all ranks have finished saving before checking files.
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
