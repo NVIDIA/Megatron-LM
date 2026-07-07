@@ -355,13 +355,6 @@ def _warn_missing_statistics_log_dir():
         _STATS_LOG_DIR_WARNING_SHOWN = True
 
 
-def _get_activation_log_interval(args):
-    activation_log_interval = getattr(args, 'activation_log_interval', None)
-    if activation_log_interval is not None:
-        return activation_log_interval
-    return getattr(args, 'tensorboard_log_interval', None)
-
-
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -2317,18 +2310,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    activation_log_interval = _get_activation_log_interval(args)
+    activation_raw_moment_interval = getattr(args, 'log_activation_raw_moments_by_layer', 0)
+    dgrad_raw_moment_interval = getattr(args, 'log_dgrad_raw_moments_by_layer', 0)
     log_activation_raw_moments_in_this_iteration = (
-        getattr(args, 'log_activation_raw_moments_by_layer', False)
+        activation_raw_moment_interval > 0
         and iteration is not None
-        and activation_log_interval is not None
-        and (iteration + 1) % activation_log_interval == 0
+        and (iteration + 1) % activation_raw_moment_interval == 0
     )
     log_dgrad_raw_moments_in_this_iteration = (
-        getattr(args, 'log_dgrad_raw_moments_by_layer', False)
+        dgrad_raw_moment_interval > 0
         and iteration is not None
-        and activation_log_interval is not None
-        and (iteration + 1) % activation_log_interval == 0
+        and (iteration + 1) % dgrad_raw_moment_interval == 0
     )
     if (
         log_activation_raw_moments_in_this_iteration or log_dgrad_raw_moments_in_this_iteration
@@ -2460,11 +2452,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    grad_raw_moment_interval = getattr(args, 'log_grad_raw_moments_by_param', 0)
     if (
         optimizer is not None
-        and getattr(args, 'log_grad_raw_moments_by_param', False)
+        and grad_raw_moment_interval > 0
         and iteration is not None
-        and (iteration + 1) % args.tensorboard_log_interval == 0
+        and (iteration + 1) % grad_raw_moment_interval == 0
     ):
         optimizer.request_grad_raw_moments_by_param(
             model, expert_model_parallel_group=_get_expert_model_parallel_group(pg_collection)
@@ -3904,12 +3897,16 @@ def train(
         else:
             loss_scale = 1.0
         params_norm = None
+        param_raw_moment_interval = getattr(args, 'log_param_raw_moments_by_param', 0)
+        grad_raw_moment_interval = getattr(args, 'log_grad_raw_moments_by_param', 0)
+        activation_raw_moment_interval = getattr(args, 'log_activation_raw_moments_by_layer', 0)
+        dgrad_raw_moment_interval = getattr(args, 'log_dgrad_raw_moments_by_layer', 0)
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         if (
-            getattr(args, 'log_param_raw_moments_by_param', False)
-            and iteration % args.tensorboard_log_interval == 0
+            param_raw_moment_interval > 0
+            and iteration % param_raw_moment_interval == 0
         ):
             param_raw_moments_by_param = calc_params_raw_moments_by_param(
                 model,
@@ -3926,8 +3923,8 @@ def train(
                     param_raw_moments_by_param,
                 )
         if (
-            getattr(args, 'log_grad_raw_moments_by_param', False)
-            and iteration % args.tensorboard_log_interval == 0
+            grad_raw_moment_interval > 0
+            and iteration % grad_raw_moment_interval == 0
             and optimizer is not None
         ):
             grad_raw_moments_by_param = optimizer.consume_grad_raw_moments_by_param()
@@ -3944,11 +3941,9 @@ def train(
                     args.consumed_train_samples,
                     grad_raw_moments_by_param,
                 )
-        activation_log_interval = _get_activation_log_interval(args)
         if (
-            getattr(args, 'log_activation_raw_moments_by_layer', False)
-            and activation_log_interval is not None
-            and iteration % activation_log_interval == 0
+            activation_raw_moment_interval > 0
+            and iteration % activation_raw_moment_interval == 0
         ):
             activation_raw_moments_by_layer = consume_activation_raw_moments_by_layer()
             statistics_log_dir = _get_statistics_log_dir(args)
@@ -3962,9 +3957,8 @@ def train(
                     activation_raw_moments_by_layer,
                 )
         if (
-            getattr(args, 'log_dgrad_raw_moments_by_layer', False)
-            and activation_log_interval is not None
-            and iteration % activation_log_interval == 0
+            dgrad_raw_moment_interval > 0
+            and iteration % dgrad_raw_moment_interval == 0
         ):
             dgrad_raw_moments_by_layer = consume_dgrad_raw_moments_by_layer()
             statistics_log_dir = _get_statistics_log_dir(args)

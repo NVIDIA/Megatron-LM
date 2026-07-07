@@ -1,9 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn as nn
 
+from megatron.training.arguments import _validate_raw_moment_logging_args
 from megatron.training.raw_moment_logging import RawMomentLogger
+
+_RAW_MOMENT_LOGGING_FLAGS = (
+    'log_param_raw_moments_by_param',
+    'log_grad_raw_moments_by_param',
+    'log_activation_raw_moments_by_layer',
+    'log_dgrad_raw_moments_by_layer',
+)
 
 
 class _LinearBlock(nn.Module):
@@ -47,6 +58,39 @@ class _OutputLayerModel(nn.Module):
 
 def _values_dict(values):
     return {name: moments for name, moments in values}
+
+
+def _raw_moment_logging_args():
+    return SimpleNamespace(
+        use_megatron_fsdp=False,
+        use_torch_fsdp2=False,
+        log_param_raw_moments_by_param=0,
+        log_grad_raw_moments_by_param=0,
+        log_activation_raw_moments_by_layer=0,
+        log_dgrad_raw_moments_by_layer=0,
+    )
+
+
+@pytest.mark.parametrize('logging_flag', _RAW_MOMENT_LOGGING_FLAGS)
+@pytest.mark.parametrize('fsdp_flag', ('use_megatron_fsdp', 'use_torch_fsdp2'))
+def test_raw_moment_logging_rejects_fsdp(logging_flag, fsdp_flag):
+    args = _raw_moment_logging_args()
+    setattr(args, logging_flag, 1)
+    setattr(args, fsdp_flag, True)
+
+    with pytest.raises(ValueError, match='Raw-moment statistics logging is not supported'):
+        _validate_raw_moment_logging_args(args)
+
+
+@pytest.mark.parametrize('logging_flag', _RAW_MOMENT_LOGGING_FLAGS)
+@pytest.mark.parametrize('disabled_interval', (0, -1))
+@pytest.mark.parametrize('fsdp_flag', ('use_megatron_fsdp', 'use_torch_fsdp2'))
+def test_disabled_raw_moment_logging_allows_fsdp(logging_flag, disabled_interval, fsdp_flag):
+    args = _raw_moment_logging_args()
+    setattr(args, logging_flag, disabled_interval)
+    setattr(args, fsdp_flag, True)
+
+    _validate_raw_moment_logging_args(args)
 
 
 def test_activation_raw_moments_accumulate_by_module_site():
