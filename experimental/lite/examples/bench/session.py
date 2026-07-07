@@ -206,7 +206,7 @@ def run_pretrain_session(
             )
             trace = StepTrace(
                 step=step,
-                loss=float(result.metrics.get("loss", 0.0)),
+                loss=float(result.metrics.get("loss", result.model_output.loss) or 0.0),
                 grad_norm=float(grad_norm),
                 step_ms=elapsed_ms,
                 peak_mem_gb=_peak_memory_gb(cfg.device),

@@ -1257,8 +1257,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and self.config.moe_n_hash_layers > 0
             and getattr(self.mlp.router, 'is_hash_layer', False)
         ):
+            input_ids_shape = (
+                (1, self.config.max_seqlen_per_dp_cp_rank)
+                if self._is_thd_cuda_graph()
+                else (micro_batch_size, seq_length)
+            )
             static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, seq_length), dtype=torch.long, device=torch.cuda.current_device()
+                input_ids_shape, dtype=torch.long, device=torch.cuda.current_device()
             )
         return static_inputs
 
@@ -1321,6 +1326,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
+            cp_partition_mode=self.config.cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
@@ -1896,18 +1902,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             requires_grad=hs.requires_grad,
             device=hs.device,
         )
-
-        # Add input_ids for hash-based MoE routing under CUDA graphs.
-        # Only add for layers that actually use hash routing,
-        # since other layers (e.g. on later PP stages) receive input_ids=None.
-        if (
-            self.is_moe_layer
-            and self.config.moe_n_hash_layers > 0
-            and getattr(self.mlp.router, 'is_hash_layer', False)
-        ):
-            static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, seq_length), dtype=torch.long, device=torch.cuda.current_device()
-            )
 
         return static_inputs
 

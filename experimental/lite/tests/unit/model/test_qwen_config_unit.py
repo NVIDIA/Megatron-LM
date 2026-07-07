@@ -89,8 +89,8 @@ def test_qwen35_config_from_text_config_splits_mtp_layer_types():
     assert cfg.mrope_section == [1, 1, 0]
 
 
-def test_qwen_lite_protocols_build_configs_from_hf_dicts():
-    pytest.importorskip("transformer_engine.pytorch")
+def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_import_stub):
+    transformer_engine_import_stub()
 
     from megatron.lite.model.qwen3_5.lite import protocol as qwen35_protocol
     from megatron.lite.model.qwen3_moe.lite import protocol as qwen3_protocol

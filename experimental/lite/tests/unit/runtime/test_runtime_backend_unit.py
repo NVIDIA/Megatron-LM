@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from megatron.lite.runtime import create_runtime
@@ -18,11 +19,50 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _pipeline_callbacks,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
 
 pytestmark = pytest.mark.mlite
+
+
+def test_runtime_returns_loss_separately_from_microbatch_metrics():
+    model = nn.Linear(1, 1, bias=False)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={"forward_step": lambda module, batch: {"value": module(batch["x"])}},
+    )
+    batches = iter([{"x": torch.ones(1, 1), "micro": i} for i in range(2)])
+    result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        batches,
+        lambda out, batch: (out["value"].sum(), {"micro": batch["micro"]}),
+        num_microbatches=2,
+    )
+
+    assert result.metrics == {"micro": [0, 1]}
+    assert result.model_output.loss is not None
+
+
+def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
+    context = LossContext(source_batch="source")
+    seen = []
+    forward, loss = _pipeline_callbacks(
+        lambda _model, batch: seen.append((batch, get_loss_context()))
+        or {"loss": torch.tensor(1.0)},
+        lambda out, batch, ctx: (out["loss"], {"batch": batch, "source": ctx.source_batch}),
+    )
+
+    output = forward(None, ("wrapped", context))
+    with use_loss_context(context):
+        forward(None, "presplit")
+    _, metrics = loss(output, "presplit", context)
+
+    assert seen == [("wrapped", context), ("presplit", context)]
+    assert metrics == {"batch": "presplit", "source": "source"}
 
 
 def test_runtime_config_defaults_to_mlite_backend():

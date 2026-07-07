@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import torch
 
 from transformer_engine.pytorch.cpp_extensions import general_gemm
+from transformer_engine.pytorch.module import base as te_module_base
 from transformer_engine.pytorch.permutation import moe_permute as fused_permute
 from transformer_engine.pytorch.permutation import (
     moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
@@ -33,7 +34,10 @@ def _te_general_gemm(
     bias: torch.Tensor | None = None,
     grad: bool = False,
 ):
+    if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
+        return None
     kwargs = dict(
+        workspace=get_workspace(),
         out_dtype=out_dtype,
         quantization_params=None,
         gelu=None,

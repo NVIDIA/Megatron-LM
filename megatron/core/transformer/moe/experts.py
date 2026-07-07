@@ -577,6 +577,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
+        ops.register_forward_hook(self._make_fused_impl_post_forward_hook())
 
         return ops
 
@@ -604,6 +605,27 @@ class TEGroupedMLP(MegatronModule):
                         )
 
         return forward_pre_hook
+
+    def _make_fused_impl_post_forward_hook(self) -> Callable:
+        """Forward submodule hooks to the fused output.
+
+        Megatron FSDP uses GroupedLinear forward hooks to attach parameter
+        all-gathers immediately before backward. The op fuser bypasses the
+        GroupedLinear module calls, so attach those hooks to the fused MLP output.
+        """
+
+        def forward_post_hook(_module, _inputs, output):
+            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+                for hook_id, hook in submodule._forward_hooks.items():
+                    if hook_id in submodule._forward_hooks_with_kwargs:
+                        ret = hook(submodule, (), {}, output)
+                    else:
+                        ret = hook(submodule, (), output)
+                    if ret is not None:
+                        output = ret
+            return output
+
+        return forward_post_hook
 
     def _fused_forward(
         self,

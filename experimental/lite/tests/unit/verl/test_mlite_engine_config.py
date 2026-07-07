@@ -2,9 +2,11 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
+from megatron.lite.runtime.contracts import LossContext
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -47,6 +49,27 @@ def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
+
+
+@pytest.mark.parametrize("num_microbatches", [1, 4])
+def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
+    engine = _engine(engine_config=_engine_config())
+    weight = torch.nn.Parameter(torch.tensor(1.0))
+    outputs = []
+    engine._build_verl_model_output = lambda **_kwargs: {"log_probs": weight * 3}
+    engine.get_data_parallel_group = lambda: None
+
+    hook = engine._make_runtime_loss_fn(
+        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        num_microbatches=num_microbatches,
+        output_lst=outputs,
+    )
+    for _ in range(num_microbatches):
+        loss, _ = hook({}, object(), LossContext(source_batch=object()))
+        (loss / num_microbatches).backward()
+
+    torch.testing.assert_close(weight.grad, torch.tensor(3.0))
+    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:

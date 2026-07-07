@@ -132,6 +132,11 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     return model(**kwargs)
 
 
+def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
+    labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
+    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
+
+
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
@@ -278,7 +283,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         parallel_state=ps,
         optimizer=optimizer,
         finalize_grads=finalize_grads,
-        forward_step=_forward_step,
+        forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         extras={
             "model_cfg": model_cfg,
             # Lite's router uses megatron.lite's MoEAuxLossAutoScaler; hand the

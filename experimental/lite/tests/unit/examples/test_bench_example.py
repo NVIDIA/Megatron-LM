@@ -8,8 +8,10 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+import torch
+
 from megatron.lite.runtime.contracts.config import ParallelConfig
-from megatron.lite.runtime.contracts.data import ForwardResult
+from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 _LITE_ROOT = str(Path(__file__).resolve().parents[3])
@@ -136,7 +138,7 @@ class _FakeRuntime:
 
     def forward_backward(self, handle, data, loss_fn, *, num_microbatches: int = 1):
         self.loss += 1
-        return ForwardResult(metrics={"loss": float(self.loss)})
+        return ForwardResult(model_output=ModelOutputs(loss=torch.tensor(float(self.loss))))
 
     def optimizer_step(self, handle):
         return True, 3.5, 0

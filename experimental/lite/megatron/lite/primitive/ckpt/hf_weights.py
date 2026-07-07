@@ -23,6 +23,28 @@ import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
 
+try:
+    from torch.distributed.tensor import DTensor
+except Exception:  # pragma: no cover - older torch without DTensor
+    DTensor = None  # type: ignore[assignment]
+
+
+def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Reconstruct a plain local tensor from an FSDP2 ``DTensor`` parameter.
+
+    FSDP2 (``fully_shard``) stores parameters as ``DTensor`` sharded over the
+    data-parallel mesh, while manual TP/EP sharding leaves each rank holding its
+    own local shard as a regular tensor. The HF export gather (``_gather_dense`` /
+    ``_gather_expert``) and the downstream rollout weight sender both assume plain
+    ``torch.Tensor`` inputs; handing them a ``DTensor`` raises
+    ``aten.copy_.default: got mixed torch.Tensor and DTensor``. ``full_tensor()``
+    gathers the FSDP shards back into the full (TP/EP-local) tensor; non-DTensor
+    params (dist_opt backend) pass through untouched.
+    """
+    if DTensor is not None and isinstance(tensor, DTensor):
+        return tensor.full_tensor()
+    return tensor
+
 
 @runtime_checkable
 class HFWeights(Protocol):
@@ -406,7 +428,7 @@ def export_hf_weights(
             )
             for name, param in base_chunk.named_parameters():
                 gname = to_global_layer_name(name, layer_map)
-                tensor = param.data.detach()
+                tensor = _materialize_dtensor(param.data.detach())
 
                 gathered_one: dict[str, torch.Tensor] = {}
                 if spec.is_expert(gname):
@@ -454,7 +476,7 @@ def export_hf_weights(
         )
         for name, param in base_chunk.named_parameters():
             gname = to_global_layer_name(name, layer_map)
-            t = param.data.detach()
+            t = _materialize_dtensor(param.data.detach())
 
             if spec.is_expert(gname):
                 _gather_expert(gname, t, spec, ps, gathered)
@@ -555,10 +577,17 @@ def _gather_expert_group(
                 ).cpu()
                 return
 
-            stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
-            ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-            dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
-            out[packed_name] = torch.cat(ep_gathered, dim=0).cpu()
+            sample = prepared[0][2]
+            packed = torch.empty((spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu")
+            for batch_start in range(0, len(prepared), 4):
+                batch = prepared[batch_start : batch_start + 4]
+                stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
+                ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
+                dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+                for ep_rank, ep_tensor in enumerate(ep_gathered):
+                    for batch_idx, (local_idx, _, _) in enumerate(batch):
+                        packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx].copy_(ep_tensor[batch_idx])
+            out[packed_name] = packed
             return
 
     if ps.ep_size <= 1 or ps.ep_group is None:

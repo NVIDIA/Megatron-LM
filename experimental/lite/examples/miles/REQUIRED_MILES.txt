@@ -1,0 +1,11 @@
+radixark/miles source reference for this example.
+
+Repository: https://github.com/radixark/miles
+Branch: main
+Commit: 55c8d8b22f82a5afa0db69b758e5df281c6f8f2d
+
+The runtime patch relies on miles.ray.actor_group importing
+miles.backends.megatron_utils.actor.MegatronTrainRayActor inside actor
+allocation, and on miles.ray.train_actor.TrainRayActor exposing init, train,
+save_model, update_weights, sleep, wake_up, connect_actor_critic, and
+_get_parallel_config.

@@ -70,6 +70,7 @@ def save_dist_opt_checkpoint(
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
     os.makedirs(checkpoint_dir, exist_ok=True)
+    metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if save_model or save_optimizer else {}
     state_dict: dict[str, Any] = {"step": int(step)}
     if save_model:
@@ -79,7 +80,7 @@ def save_dist_opt_checkpoint(
         patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=step)
         try:
             state_dict["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), metadata=_DISTOPT_METADATA
+                _single_or_all_model_state(model_sd), metadata=metadata
             )
         finally:
             _restore_state_dict_patches(patches)
@@ -87,7 +88,7 @@ def save_dist_opt_checkpoint(
         state_dict,
         checkpoint_dir,
         validate_access_integrity=False,
-        content_metadata=_DISTOPT_METADATA,
+        content_metadata=metadata,
     )
 
 
@@ -101,6 +102,7 @@ def load_dist_opt_checkpoint(
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
+    metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
@@ -109,7 +111,7 @@ def load_dist_opt_checkpoint(
         patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
         try:
             load_sd["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), is_loading=True, metadata=_DISTOPT_METADATA
+                _single_or_all_model_state(model_sd), is_loading=True, metadata=metadata
             )
         finally:
             _restore_state_dict_patches(patches)
@@ -259,6 +261,14 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
             yield from visit(child)
 
     yield from visit(optimizer)
+
+
+def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
+    dist_opts = tuple(_iter_distributed_optimizers(optimizer))
+    return {
+        **_DISTOPT_METADATA,
+        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
+    }
 
 
 def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:
