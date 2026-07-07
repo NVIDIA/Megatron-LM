@@ -343,8 +343,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         batch = self.get_batch()
         model, optimizer, _ = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(
@@ -455,8 +454,7 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, single_weight)
@@ -597,8 +595,7 @@ class TestMoESingleGroupedWeightNumerics:
             )
 
             model, optimizer, _ = setup_model_and_optimizer(
-                model_type=ModelType.encoder_or_decoder,
-                model_provider_func=self.model_provider,
+                model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
             )
             assert len(model) == 1
             self.assert_storage_path_is_exercised(
