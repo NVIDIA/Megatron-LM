@@ -250,9 +250,9 @@ def classify_gtp_chains(model) -> None:
         # Output-layer fwd->bwd weight reuse: its bwd dgrad re-gathers the same full
         # weight the forward AG just produced, so retain+reuse it and drop the redundant
         # synchronous bwd all-gather. Name-based opt-in mirrors the embedding opt-out
-        # above; the BF16 (not did_cast) guard in all_gather_and_prefetch auto-disables it
-        # under MXFP8 (fwd rowwise vs bwd columnwise differ). Tied embeddings are an
-        # "embedding..."-named param, so this stays False there.
+        # above; the BF16 (not native-FP8) guard in all_gather_and_prefetch auto-disables
+        # it when fwd/bwd gather different data (rowwise vs columnwise scaling). Tied
+        # embeddings are an "embedding..."-named param, so this stays False there.
         if "output_layer" in name:
             param._reuse_fwd_weight_in_bwd = True
     if conflicts:
