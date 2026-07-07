@@ -81,12 +81,37 @@ class ModelConfig:
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
-        Dynamically imports the builder from the string path.
+
+        When ModelOpt is enabled (``args.modelopt_enabled``), the legacy ModelOpt
+        builder is used instead of this config's own builder. Otherwise, dynamically
+        imports and returns the builder from the ``builder`` ClassVar's string path.
         """
+        if self._is_modelopt_enabled():
+            from megatron.post_training.model_builder import ModelOptModelBuilder
+
+            return ModelOptModelBuilder
+
         module_path, class_name = self.builder.rsplit(".", 1)
         module = importlib.import_module(module_path)
         builder_cls = getattr(module, class_name)
         return builder_cls
+
+    @staticmethod
+    def _is_modelopt_enabled() -> bool:
+        """Whether the ModelOpt builder override is active.
+
+        Imports are local: ``megatron.post_training`` pulls in ``megatron.training``,
+        which would circularly import this module if done at module scope. Swallows the
+        "args not initialized" case so config construction/introspection works outside a
+        training run (e.g. unit tests).
+        """
+        from megatron.training import get_args
+
+        try:
+            args = get_args()
+        except AssertionError:
+            return False
+        return getattr(args, "modelopt_enabled", False)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize config to dictionary for saving.

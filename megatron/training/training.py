@@ -2029,12 +2029,7 @@ def setup_model_and_optimizer(
 
             cfg = cfg_container
             model_config = cfg.model
-            if getattr(args, "modelopt_enabled", False):
-                from megatron.post_training.model_builder import ModelOptModelBuilder
-
-                builder_cls = ModelOptModelBuilder
-            else:
-                builder_cls = model_config.get_builder_cls()
+            builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
