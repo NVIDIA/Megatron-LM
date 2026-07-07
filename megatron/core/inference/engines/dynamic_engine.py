@@ -1215,7 +1215,44 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        # --- VLM: expand image tokens and run vision encoder ---
+        if imgs is not None or num_tiles is not None or imgs_sizes is not None:
+            request = self._build_vlm_request(
+                request_id=request_id,
+                prompt_str=prompt_str,
+                tokens=tokens,
+                sampling_params=sampling_params,
+                imgs=imgs,
+                num_tiles=num_tiles,
+                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                imgs_sizes=imgs_sizes,
+            )
+        else:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt=prompt_str,
+                prompt_tokens=tokens,
+                sampling_params=sampling_params,
+                block_size_tokens=self.context.block_size_tokens,
+                enable_prefix_caching=self.context.enable_prefix_caching,
+            )
+
+        return self._add_request(request)
+
+    def _build_vlm_request(
+        self,
+        *,
+        request_id: int,
+        prompt_str: Optional[str],
+        tokens: Tensor,
+        sampling_params: Optional[SamplingParams],
+        imgs: Optional[Tensor],
+        num_tiles: Optional[Tensor],
+        num_img_embeddings_per_tile: int,
+        imgs_sizes: Optional[Tensor],
+    ) -> DynamicVLMInferenceRequest:
+        """Expand image tokens, run the vision encoder, register per-request
+        image data on the context, and return a DynamicVLMInferenceRequest.
+        """
         device = torch.cuda.current_device()
         if imgs is not None:
             imgs = imgs.to(device=device)
@@ -1224,7 +1261,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if imgs_sizes is not None:
             imgs_sizes = imgs_sizes.to(device=device)
 
-        # Determine if we have images to process
         is_dynamic_resolution = imgs_sizes is not None and imgs is not None
         total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
@@ -1234,7 +1270,6 @@ class DynamicInferenceEngine(AbstractEngine):
         image_embeddings: Optional[Tensor] = None
 
         if has_images:
-            # Expand <image> tokens to padding (-1) and build index mask.
             token_list: List[List[int]] = [tokens.tolist()]
             expanded_tokens_list, mask_list = (
                 self.controller.inference_wrapped_model.expand_image_tokens(
@@ -1260,41 +1295,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 )
 
-        # Store per-request VLM data in the context (no-op dicts when text-only).
         self.context.add_vlm_request_data(
             request_id,
             image_embeddings=image_embeddings,
             image_token_mask=mask_tensor,
         )
 
-        # Initialize request.
-        if has_images:
-            request = DynamicVLMInferenceRequest(
-                request_id=request_id,
-                prompt=prompt_str,
-                prompt_tokens=tokens,
-                sampling_params=sampling_params,
-                block_size_tokens=self.context.block_size_tokens,
-                enable_prefix_caching=self.context.enable_prefix_caching,
-                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-                imgs=imgs,
-                num_tiles=num_tiles,
-                decoder_seq_length=0,
-                image_embeddings=image_embeddings,
-                image_token_mask=mask_tensor,
-            )
-        else:
-            request = DynamicInferenceRequest(
-                request_id=request_id,
-                prompt=prompt_str,
-                prompt_tokens=tokens,
-                sampling_params=sampling_params,
-                block_size_tokens=self.context.block_size_tokens,
-                enable_prefix_caching=self.context.enable_prefix_caching,
-            )
-
-        # Add request.
-        return self._add_request(request)
+        return DynamicVLMInferenceRequest(
+            request_id=request_id,
+            prompt=prompt_str,
+            prompt_tokens=tokens,
+            sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            enable_prefix_caching=self.context.enable_prefix_caching,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            decoder_seq_length=0,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
+        )
 
     def post_process_requests(
         self,

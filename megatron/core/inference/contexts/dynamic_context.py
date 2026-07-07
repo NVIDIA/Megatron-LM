@@ -4201,12 +4201,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
 
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_request_ids = self.request_ids[active_slice].tolist()
+        active_query_lengths = self.request_query_lengths[active_slice].tolist()
+
         segments: List[Tensor] = []
         cumulative_offset = 0
-        for row_idx in range(self.paused_request_count, self.total_request_count):
-            request_id = int(self.request_ids[row_idx].item())
-            query_len = int(self.request_query_lengths[row_idx].item())
-
+        for request_id, query_len in zip(active_request_ids, active_query_lengths):
             per_request_mask = self._request_to_image_token_mask.get(request_id, None)
             if per_request_mask is None:
                 seg = torch.full(
@@ -4248,9 +4249,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns tensor of shape [total_image_tokens, 1, hidden] or None.
         """
+        active_request_ids = self.request_ids[
+            self.paused_request_count : self.total_request_count
+        ].tolist()
+
         parts: List[Tensor] = []
-        for row_idx in range(self.paused_request_count, self.total_request_count):
-            request_id = int(self.request_ids[row_idx].item())
+        for request_id in active_request_ids:
             emb = self._request_to_image_embeddings.get(request_id, None)
             if emb is not None:
                 parts.append(emb.reshape(-1, emb.shape[-1]))
