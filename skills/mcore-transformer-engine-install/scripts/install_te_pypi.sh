@@ -10,7 +10,7 @@ build parallelism.
 
 Run from the Megatron-LM repository root:
   bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
-    --torch-backend cu128 --cuda-arch a100
+    --torch-backend cu128
 
 Options:
   --python VERSION        Python version for uv venv (default: 3.12)
@@ -19,10 +19,11 @@ Options:
   --torch-version VERSION PyTorch version to install (default: 2.10.0)
   --te-version VERSION    Transformer Engine PyPI version (default: 2.11.0)
   --te-spec SPEC          Full TE spec (default: transformer_engine[pytorch]==TE_VERSION)
-  --cuda-arch ARCH        b200, gb200, rtx-pro-6000, h100, l4, l40s, a100, sm120, sm100, sm90, sm89, sm80, or auto
+  --cuda-arch ARCH        Override target GPU: b200, gb200, rtx-pro-6000, h100, l4, l40s, a100, sm120, sm100, sm90, sm89, sm80, or auto (default: auto)
   --extras EXTRAS         Editable Megatron extras, excluding te (default: none; use training for training deps)
   --max-jobs N            Native build parallelism (default: 4)
   --repo-root PATH        Megatron-LM repository root (default: current git root)
+  --preflight             Bootstrap venv/PyTorch, print CUDA/TE build checks, then exit before Megatron/TE install
   --no-smoke              Skip the CUDA Transformer Engine smoke test
   -h, --help              Show this help
 
@@ -43,6 +44,7 @@ CUDA_ARCH="${CUDA_ARCH:-auto}"
 INSTALL_EXTRAS="${INSTALL_EXTRAS:-}"
 MAX_JOBS="${MAX_JOBS:-4}"
 RUN_SMOKE=1
+RUN_PREFLIGHT=0
 REPO_ROOT="${REPO_ROOT:-}"
 PHASE_ACTIVE=""
 
@@ -143,6 +145,10 @@ while [[ $# -gt 0 ]]; do
       REPO_ROOT="$2"
       shift 2
       ;;
+    --preflight|--dry-run-checks)
+      RUN_PREFLIGHT=1
+      shift
+      ;;
     --no-smoke)
       RUN_SMOKE=0
       shift
@@ -231,7 +237,6 @@ print("gpu:", torch.cuda.get_device_name(0), "capability:", torch.cuda.get_devic
 PY
 
 phase_end "torch-bootstrap" 0
-phase_start "megatron+te-install"
 
 VENV_SITE="$("${PYTHON_BIN}" - <<'PY'
 import site
@@ -300,6 +305,69 @@ export NVTE_BUILD_THREADS_PER_JOB="${NVTE_BUILD_THREADS_PER_JOB:-1}"
 export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-pytorch}"
 export NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS:-${DEFAULT_NVTE_CUDA_ARCHS}}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-${DEFAULT_TORCH_CUDA_ARCH_LIST}}"
+
+print_preflight_summary() {
+  echo "Preflight summary:"
+  echo "  repo root: ${REPO_ROOT}"
+  echo "  venv: ${VENV_PATH}"
+  echo "  python: $("${PYTHON_BIN}" --version 2>&1)"
+  echo "  torch backend: ${TORCH_BACKEND}"
+  echo "  requested torch: ${TORCH_VERSION}"
+  "${PYTHON_BIN}" - <<'PY'
+import torch
+
+print(f"  installed torch: {torch.__version__} cuda: {torch.version.cuda}")
+print(f"  gpu[0]: {torch.cuda.get_device_name(0)} capability: {torch.cuda.get_device_capability(0)}")
+PY
+  echo "  CUDA_PATH: ${CUDA_PATH}"
+  echo "  nvcc:"
+  nvcc --version | sed 's/^/    /'
+  echo "  venv site-packages: ${VENV_SITE}"
+  echo "  CUDNN_PATH: ${CUDNN_PATH:-<not set>}"
+  echo "  NVIDIA include dirs:"
+  local found_include=0
+  for INCLUDE_DIR in "${VENV_SITE}"/nvidia/*/include; do
+    if [[ -d "${INCLUDE_DIR}" ]]; then
+      echo "    ${INCLUDE_DIR}"
+      found_include=1
+    fi
+  done
+  if [[ "${found_include}" -eq 0 ]]; then
+    echo "    <none>"
+  fi
+  echo "  NVIDIA lib dirs:"
+  local found_lib=0
+  for LIB_DIR in "${VENV_SITE}"/nvidia/*/lib; do
+    if [[ -d "${LIB_DIR}" ]]; then
+      echo "    ${LIB_DIR}"
+      found_lib=1
+    fi
+  done
+  if [[ "${found_lib}" -eq 0 ]]; then
+    echo "    <none>"
+  fi
+  echo "  NVTE_FRAMEWORK: ${NVTE_FRAMEWORK}"
+  echo "  NVTE_CUDA_ARCHS: ${NVTE_CUDA_ARCHS}"
+  echo "  TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
+  echo "  MAX_JOBS: ${MAX_JOBS}"
+  echo "  NVTE_BUILD_THREADS_PER_JOB: ${NVTE_BUILD_THREADS_PER_JOB}"
+  echo "  TE spec: ${TE_SPEC}"
+  if [[ -n "${INSTALL_EXTRAS}" ]]; then
+    echo "  Megatron editable extras: ${INSTALL_EXTRAS}"
+  else
+    echo "  Megatron editable extras: <none>"
+  fi
+  echo "  free disk:"
+  df -h "${REPO_ROOT}" | sed 's/^/    /'
+}
+
+if [[ "${RUN_PREFLIGHT}" -eq 1 ]]; then
+  print_preflight_summary
+  echo "Preflight complete. Megatron editable install and Transformer Engine native build were not run."
+  exit 0
+fi
+
+phase_start "megatron+te-install"
 
 echo "Using CUDA_PATH=${CUDA_PATH}"
 echo "Using CUDNN_PATH=${CUDNN_PATH:-<not set>}"

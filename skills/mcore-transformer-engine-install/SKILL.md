@@ -29,6 +29,9 @@ For text-only Transformer Engine install questions, give these facts first:
   native code locally and can take 10-15+ minutes or
   longer depending on CPU resources, memory, cache state, and build
   parallelism.
+- Use `install_te_pypi.sh --preflight` when checking CUDA, PyTorch, visible GPU
+  capability, selected TE architecture flags, cuDNN paths, disk space, or build
+  parallelism before starting the native TE build.
 - Run a CUDA TE smoke test immediately after install.
 
 Official TE install prerequisites to check before long debugging loops: Linux or
@@ -43,15 +46,23 @@ From the Megatron-LM repo root on a CUDA host:
 ```bash
 bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
   --torch-backend cu128 \
-  --cuda-arch h100
+  --preflight
 ```
 
-Use `--cuda-arch b200` for B200/GB200 Blackwell GPUs,
-`--cuda-arch rtx-pro-6000` for RTX PRO Blackwell proxy hosts,
-`--cuda-arch l4` for L4/L40S, `--cuda-arch a100` for A100, or omit it to let
-the helper detect the first visible GPU after PyTorch is installed. B200/GB200
+```bash
+bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
+  --torch-backend cu128
+```
+
+By default, the helper detects the first visible GPU after PyTorch is installed
+and sets `NVTE_CUDA_ARCHS` and `TORCH_CUDA_ARCH_LIST` from
+`torch.cuda.get_device_capability(0)`. Use `--cuda-arch b200`,
+`--cuda-arch rtx-pro-6000`, `--cuda-arch h100`, `--cuda-arch l4`, or
+`--cuda-arch a100` only when you need to override detection for a benchmark,
+cross-target build, or multi-GPU host where GPU 0 is not the target. B200/GB200
 maps to `NVTE_CUDA_ARCHS=100` and `TORCH_CUDA_ARCH_LIST=10.0`; RTX PRO
-Blackwell maps to `NVTE_CUDA_ARCHS=120` and `TORCH_CUDA_ARCH_LIST=12.0`.
+Blackwell maps to `NVTE_CUDA_ARCHS=120` and `TORCH_CUDA_ARCH_LIST=12.0`;
+H100 maps to `90`/`9.0`; L4/L40S maps to `89`/`8.9`; A100 maps to `80`/`8.0`.
 Blackwell requires CUDA 12.8+. Use `--te-version` to bump the pinned PyPI
 Transformer Engine version after the smoke test is validated. The default TE spec is
 `transformer_engine[pytorch]==2.11.0`.
@@ -63,9 +74,11 @@ editable without extras, install pinned PyPI `transformer_engine[pytorch]` with
 `transformer_engine.pytorch.Linear` smoke test. It prints a pre-build notice
 because the PyPI TE install can still compile locally and can take 10-15+
 minutes depending mostly on CPU resources, memory, cache state, and build
-parallelism. Add `--extras training` only when the environment needs optional
-training dependencies such as tokenizers, Transformers, W&B, or related runtime
-packages.
+parallelism. `--preflight` stops after the torch/bootstrap phase and prints the
+CUDA/PyTorch/GPU/header/path/disk/build settings that will be used before
+Megatron editable install or TE native compilation starts. Add `--extras
+training` only when the environment needs optional training dependencies such
+as tokenizers, Transformers, W&B, or related runtime packages.
 
 ## Manual Flow
 
@@ -114,13 +127,24 @@ uv pip install --no-config --python .venv/bin/python -e .
 # Optional: add training dependencies when needed.
 uv pip install --no-config --python .venv/bin/python -e ".[training]"
 
-# SM120 GPU example for RTX PRO Blackwell. Use 10.0/100 for B200/GB200,
-# 9.0/90 for H100, 8.9/89 for L4/L40S, or 8.0/80 for A100.
+read -r NVTE_CUDA_ARCHS TORCH_CUDA_ARCH_LIST < <(.venv/bin/python - <<'PY'
+import torch
+
+major, minor = torch.cuda.get_device_capability(0)
+print(f"{major}{minor} {major}.{minor}")
+PY
+)
+
 MAX_JOBS=4 NVTE_BUILD_THREADS_PER_JOB=1 NVTE_FRAMEWORK=pytorch \
-  NVTE_CUDA_ARCHS=120 TORCH_CUDA_ARCH_LIST=12.0 \
+  NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
   uv pip install --no-config --python .venv/bin/python --no-build-isolation \
     "transformer_engine[pytorch]==2.11.0"
 ```
+
+Override `NVTE_CUDA_ARCHS` and `TORCH_CUDA_ARCH_LIST` manually only when you
+need a fixed target, such as `100`/`10.0` for B200/GB200, `120`/`12.0` for
+RTX PRO Blackwell, `90`/`9.0` for H100, `89`/`8.9` for L4/L40S, or `80`/`8.0`
+for A100.
 
 Smoke test:
 
