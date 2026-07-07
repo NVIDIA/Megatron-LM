@@ -11,9 +11,30 @@ from megatron.core.models.backends import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.moe.router import InferenceTopKRouter
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MlpBuilder
+
+
+def _build_shared_experts(
+    *,
+    config: TransformerConfig,
+    pg_collection: ProcessGroupCollection | None,
+    gate: bool,
+    submodules: MLPSubmodules,
+    name: str | None = None,
+):
+    """Build the shared expert implementation requested by the config."""
+    shared_expert_cls = (
+        FusedSharedExpertMLP
+        if getattr(config, "use_grouped_gemm_for_shared_expert", False)
+        else SharedExpertMLP
+    )
+    return shared_expert_cls(
+        config=config, submodules=submodules, gate=gate, pg_collection=pg_collection, name=name
+    )
 
 
 def get_moe_module_spec(
@@ -60,7 +81,7 @@ def get_moe_module_spec_for_backend(
 
     experts = backend.grouped_mlp_modules(moe_grouped_gemm is not None and moe_grouped_gemm)
     # shared experts spec
-    shared_experts = partial(SharedExpertMLP, submodules=mlp)
+    shared_experts = partial(_build_shared_experts, submodules=mlp)
 
     # MoE module spec
     return partial(
@@ -82,7 +103,7 @@ def get_inference_optimized_moe_spec() -> MlpBuilder:
 
     experts = backend.grouped_mlp_modules(True)
     shared_experts = partial(
-        SharedExpertMLP,
+        _build_shared_experts,
         submodules=MLPSubmodules(
             linear_fc1=backend.column_parallel_linear(),
             linear_fc2=backend.row_parallel_linear(),
