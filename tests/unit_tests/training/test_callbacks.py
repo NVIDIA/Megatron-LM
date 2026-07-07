@@ -87,11 +87,8 @@ class TestCallback:
         callback.on_setup_start(mock_context)
         callback.on_data_init_start(mock_context)
         callback.on_train_start(mock_context)
-        callback.on_microbatch_change(mock_context)
-        callback.on_train_iteration_start(mock_context)
         callback.on_train_step_start(mock_context)
         callback.on_train_step_end(mock_context)
-        callback.on_train_iteration_end(mock_context)
         callback.on_log(mock_context)
         callback.on_train_end(mock_context)
         callback.on_eval_start(mock_context)
@@ -102,7 +99,6 @@ class TestCallback:
         callback.on_test_step_start(mock_context)
         callback.on_test_step_end(mock_context)
         callback.on_test_end(mock_context)
-        callback.on_pretrain_end(mock_context)
 
     def test_subclass_can_override_methods(self):
         """Subclasses can override specific methods."""
@@ -491,11 +487,8 @@ class TestValidEvents:
             "on_setup_start",
             "on_data_init_start",
             "on_train_start",
-            "on_microbatch_change",
-            "on_train_iteration_start",
             "on_train_step_start",
             "on_train_step_end",
-            "on_train_iteration_end",
             "on_log",
             "on_train_end",
             "on_eval_start",
@@ -506,7 +499,6 @@ class TestValidEvents:
             "on_test_step_start",
             "on_test_step_end",
             "on_test_end",
-            "on_pretrain_end",
         }
         assert VALID_EVENTS == expected
 

@@ -1533,17 +1533,6 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if should_fire(callback_manager, "on_pretrain_end"):
-        callback_manager.fire(
-            "on_pretrain_end",
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                optimizer=optimizer,
-                scheduler=opt_param_scheduler,
-            ),
-        )
-
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
@@ -2878,9 +2867,6 @@ def training_log(
                 CallbackContext(
                     model=model,
                     user_state=callback_manager.user_state,
-                    writer=writer,
-                    wandb_writer=wandb_writer,
-                    iteration=iteration,
                     timers_to_log=timers_to_log,
                     log_fragments=log_fragments,
                 ),
@@ -3725,16 +3711,6 @@ def train(
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if should_fire(callback_manager, "on_microbatch_change"):
-                callback_manager.fire(
-                    "on_microbatch_change",
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                        optimizer=optimizer,
-                        scheduler=opt_param_scheduler,
-                    ),
-                )
             if args.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
@@ -3787,15 +3763,14 @@ def train(
 
         args.curr_iteration = iteration
 
-        if should_fire(callback_manager, "on_train_iteration_start"):
+        if should_fire(callback_manager, "on_train_step_start"):
             callback_manager.fire(
-                "on_train_iteration_start",
+                "on_train_step_start",
                 CallbackContext(
                     model=model,
                     user_state=callback_manager.user_state,
                     optimizer=optimizer,
                     scheduler=opt_param_scheduler,
-                    iteration=iteration,
                 ),
             )
 
@@ -3835,17 +3810,6 @@ def train(
         else:
             ft_integration.on_training_step_start()
 
-            if should_fire(callback_manager, "on_train_step_start"):
-                callback_manager.fire(
-                    "on_train_step_start",
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                        optimizer=optimizer,
-                        scheduler=opt_param_scheduler,
-                    ),
-                )
-
             (
                 loss_dict,
                 skipped_iter,
@@ -3861,20 +3825,6 @@ def train(
                 p2p_communicator=p2p_communicator,
             )
 
-            if should_fire(callback_manager, "on_train_step_end"):
-                callback_manager.fire(
-                    "on_train_step_end",
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                        optimizer=optimizer,
-                        scheduler=opt_param_scheduler,
-                        loss_dict=loss_dict,
-                        grad_norm=grad_norm,
-                        skipped_iter=bool(skipped_iter),
-                    ),
-                )
-
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
@@ -3885,6 +3835,25 @@ def train(
                 fault_injector_config, iteration
             ):
                 setup_fault_injection(fault_injector_config)
+
+        # One per-iteration end hook, at loop level so it fires for inference-only
+        # (skip_train) iterations too, and before should_exit so the exiting iteration
+        # still gets it. loss_dict/grad_norm are empty/zero when skip_train; callbacks
+        # read args.skip_train to tell whether a gradient step ran.
+        if should_fire(callback_manager, "on_train_step_end"):
+            callback_manager.fire(
+                "on_train_step_end",
+                CallbackContext(
+                    model=model,
+                    user_state=callback_manager.user_state,
+                    optimizer=optimizer,
+                    scheduler=opt_param_scheduler,
+                    loss_dict=loss_dict,
+                    grad_norm=grad_norm,
+                    skipped_iter=bool(skipped_iter),
+                ),
+            )
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3941,20 +3910,6 @@ def train(
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
-
-        if should_fire(callback_manager, "on_train_iteration_end"):
-            callback_manager.fire(
-                "on_train_iteration_end",
-                CallbackContext(
-                    model=model,
-                    user_state=callback_manager.user_state,
-                    optimizer=optimizer,
-                    scheduler=opt_param_scheduler,
-                    loss_dict=loss_dict,
-                    grad_norm=grad_norm,
-                    skipped_iter=bool(skipped_iter),
-                ),
-            )
 
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)

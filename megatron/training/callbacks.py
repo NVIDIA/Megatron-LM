@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
@@ -49,11 +49,8 @@ VALID_EVENTS: frozenset[str] = frozenset(
         "on_setup_start",
         "on_data_init_start",
         "on_train_start",
-        "on_microbatch_change",
-        "on_train_iteration_start",
         "on_train_step_start",
         "on_train_step_end",
-        "on_train_iteration_end",
         "on_log",
         "on_train_end",
         "on_eval_start",
@@ -64,7 +61,6 @@ VALID_EVENTS: frozenset[str] = frozenset(
         "on_test_step_start",
         "on_test_step_end",
         "on_test_end",
-        "on_pretrain_end",
     }
 )
 
@@ -85,7 +81,6 @@ class CallbackContext:
         grad_norm: Gradient norm. Available in on_train_step_end if computed.
         skipped_iter: Whether the iteration was skipped. Available in on_train_step_end.
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
-        writer / wandb_writer / iteration: Logging handles. Available in on_log.
         timers_to_log: Mutable timer-name list; append to include extra timers. In on_log.
         log_fragments: Mutable list; append strings to extend the stdout log line. In on_log.
 
@@ -93,10 +88,9 @@ class CallbackContext:
         All events: model (None in on_setup_start), user_state
         Training events: optimizer, scheduler
         on_data_init_start: optimizer, scheduler
-        on_train_iteration_start: optimizer, scheduler, iteration
-        on_train_step_end, on_train_iteration_end: loss_dict, grad_norm, skipped_iter
+        on_train_step_end: loss_dict, grad_norm, skipped_iter
         on_eval_end, on_test_end: total_loss_dict
-        on_log: writer, wandb_writer, iteration, timers_to_log, log_fragments
+        on_log: timers_to_log, log_fragments
     """
 
     # Always available (model is None in on_setup_start, before it is built)
@@ -116,9 +110,6 @@ class CallbackContext:
     total_loss_dict: dict[str, torch.Tensor] | None = None
 
     # on_log
-    writer: Any | None = None
-    wandb_writer: Any | None = None
-    iteration: int | None = None
     timers_to_log: list[str] | None = None
     log_fragments: list[str] | None = None
 
@@ -160,24 +151,12 @@ class Callback:
         """Called after model.train(), before training loop begins."""
         pass
 
-    def on_microbatch_change(self, context: CallbackContext) -> None:
-        """Called mid-loop when the microbatch count changes."""
-        pass
-
-    def on_train_iteration_start(self, context: CallbackContext) -> None:
+    def on_train_step_start(self, context: CallbackContext) -> None:
         """Called at the top of each outer iteration, before the step."""
         pass
 
-    def on_train_step_start(self, context: CallbackContext) -> None:
-        """Called at the start of each training step."""
-        pass
-
     def on_train_step_end(self, context: CallbackContext) -> None:
-        """Called after each training step completes."""
-        pass
-
-    def on_train_iteration_end(self, context: CallbackContext) -> None:
-        """Called once per outer iteration after the step, at sequence accounting."""
+        """Called once per outer iteration after the step (empty loss_dict when skip_train)."""
         pass
 
     def on_log(self, context: CallbackContext) -> None:
@@ -218,10 +197,6 @@ class Callback:
 
     def on_test_end(self, context: CallbackContext) -> None:
         """Called after the test loop completes."""
-        pass
-
-    def on_pretrain_end(self, context: CallbackContext) -> None:
-        """Called at the very end of pretrain(), after final validation/test."""
         pass
 
 
@@ -299,11 +274,8 @@ class CallbackManager:
                 - "on_setup_start"
                 - "on_data_init_start"
                 - "on_train_start"
-                - "on_microbatch_change"
-                - "on_train_iteration_start"
                 - "on_train_step_start"
                 - "on_train_step_end"
-                - "on_train_iteration_end"
                 - "on_log"
                 - "on_train_end"
                 - "on_eval_start"
@@ -314,7 +286,6 @@ class CallbackManager:
                 - "on_test_step_start"
                 - "on_test_step_end"
                 - "on_test_end"
-                - "on_pretrain_end"
             fn: Callback function with signature (CallbackContext) -> None.
 
         Raises:
