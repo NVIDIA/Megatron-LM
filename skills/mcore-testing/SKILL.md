@@ -4,7 +4,7 @@ description: Test system for Megatron-LM. Covers test layout, recipe YAML struct
 license: Apache-2.0
 when_to_use: Adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Testing Guide
