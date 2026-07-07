@@ -15,7 +15,16 @@
 """Experimental Megatron-FSDP implementation."""
 
 from .dbuffer import DBuffer
-from .fully_shard import fully_shard
+from .fully_shard import fully_shard, microbatch
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
-__all__ = ["DBuffer", "Flat", "Partial", "Placement", "Placements", "Replicate", "fully_shard"]
+__all__ = [
+    "DBuffer",
+    "Flat",
+    "Partial",
+    "Placement",
+    "Placements",
+    "Replicate",
+    "fully_shard",
+    "microbatch",
+]
