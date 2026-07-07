@@ -29,6 +29,10 @@ For text-only Transformer Engine install questions, give these facts first:
   native code locally and can take 10-15+ minutes or
   longer depending on CPU resources, memory, cache state, and build
   parallelism.
+- In automated installs and benchmarks, run the helper in the foreground. If
+  logs must be saved, use `set -o pipefail` with `tee`; avoid backgrounding the
+  install and polling with fixed `sleep` intervals because that inflates wall
+  time and command count after the build has already finished.
 - Use `install_te_pypi.sh --preflight` when checking CUDA, PyTorch, visible GPU
   capability, selected TE architecture flags, cuDNN paths, disk space, or build
   parallelism before starting the native TE build.
@@ -53,6 +57,20 @@ bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
 bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
   --torch-backend cu128
 ```
+
+For automation that needs a log artifact, keep the install on the foreground
+critical path:
+
+```bash
+set -o pipefail
+bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
+  --torch-backend cu128 2>&1 | tee artifacts/te-install.log
+```
+
+Do not background the helper and poll it with coarse fixed sleeps unless the
+execution environment has a hard command timeout. If backgrounding is
+unavoidable, poll at a short interval and check the exit file immediately after
+each sleep before running the smoke test.
 
 By default, the helper detects the first visible GPU after PyTorch is installed
 and sets `NVTE_CUDA_ARCHS` and `TORCH_CUDA_ARCH_LIST` from
