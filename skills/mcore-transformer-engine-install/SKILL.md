@@ -1,6 +1,6 @@
 ---
 name: mcore-transformer-engine-install
-description: Bare-metal CUDA installation and smoke testing for Transformer Engine with Megatron-LM. Use when installing Megatron with a pinned PyPI Transformer Engine version, debugging transformer-engine native builds, testing B200/GB200/H100/L4/L40S/A100 CUDA installs outside the NGC container, handling missing cmake/ninja/NCCL/cuDNN headers, or validating that transformer_engine.pytorch works with Megatron Core.
+description: Bare-metal CUDA installation and smoke testing for Transformer Engine with Megatron-LM. Use when installing Megatron with a pinned PyPI Transformer Engine version, debugging transformer-engine native builds, testing B200/GB200/RTX PRO Blackwell/H100/L4/L40S/A100 CUDA installs outside the NGC container, handling missing cmake/ninja/NCCL/cuDNN headers, or validating that transformer_engine.pytorch works with Megatron Core.
 ---
 
 # MCore Transformer Engine Install
@@ -46,12 +46,14 @@ bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
   --cuda-arch h100
 ```
 
-Use `--cuda-arch b200` for B200/GB200 Blackwell GPUs, `--cuda-arch l4` for
-L4/L40S, `--cuda-arch a100` for A100, or omit it to let the helper detect the
-first visible GPU after PyTorch is installed. B200/GB200 maps to
-`NVTE_CUDA_ARCHS=100` and `TORCH_CUDA_ARCH_LIST=10.0`; Blackwell requires CUDA
-12.8+. Use `--te-version` to bump the pinned PyPI Transformer Engine version
-after the smoke test is validated. The default TE spec is
+Use `--cuda-arch b200` for B200/GB200 Blackwell GPUs,
+`--cuda-arch rtx-pro-6000` for RTX PRO Blackwell proxy hosts,
+`--cuda-arch l4` for L4/L40S, `--cuda-arch a100` for A100, or omit it to let
+the helper detect the first visible GPU after PyTorch is installed. B200/GB200
+maps to `NVTE_CUDA_ARCHS=100` and `TORCH_CUDA_ARCH_LIST=10.0`; RTX PRO
+Blackwell maps to `NVTE_CUDA_ARCHS=120` and `TORCH_CUDA_ARCH_LIST=12.0`.
+Blackwell requires CUDA 12.8+. Use `--te-version` to bump the pinned PyPI
+Transformer Engine version after the smoke test is validated. The default TE spec is
 `transformer_engine[pytorch]==2.11.0`.
 
 The helper performs the full sequence: create `.venv`, install CUDA PyTorch and
@@ -112,9 +114,10 @@ uv pip install --no-config --python .venv/bin/python -e .
 # Optional: add training dependencies when needed.
 uv pip install --no-config --python .venv/bin/python -e ".[training]"
 
-# SM100 GPU. Use 9.0/90 for H100, 8.9/89 for L4/L40S, or 8.0/80 for A100.
+# SM120 GPU example for RTX PRO Blackwell. Use 10.0/100 for B200/GB200,
+# 9.0/90 for H100, 8.9/89 for L4/L40S, or 8.0/80 for A100.
 MAX_JOBS=4 NVTE_BUILD_THREADS_PER_JOB=1 NVTE_FRAMEWORK=pytorch \
-  NVTE_CUDA_ARCHS=100 TORCH_CUDA_ARCH_LIST=10.0 \
+  NVTE_CUDA_ARCHS=120 TORCH_CUDA_ARCH_LIST=12.0 \
   uv pip install --no-config --python .venv/bin/python --no-build-isolation \
     "transformer_engine[pytorch]==2.11.0"
 ```
