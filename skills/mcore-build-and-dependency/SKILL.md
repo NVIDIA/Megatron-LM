@@ -20,12 +20,19 @@ up front before the longer workflow:
 
 - Run dependency work inside the Megatron-LM CI container, not on the host.
 - The container venv is `/opt/venv`, already on `PATH`.
-- Default `dev` uses `docker/.ngc_version.dev` and the `dev` uv group; `lts`
-  uses `docker/.ngc_version.lts` and the `lts` uv group. The `container::lts`
-  PR label selects the LTS path; otherwise CI uses `dev`.
-- Install commands inside the container: `uv sync --locked --group dev --group test`,
-  `uv sync --locked --only-group linting`, or
-  `uv sync --locked --group lts --group test`.
+- Default `dev` uses `docker/.ngc_version.dev` and the `dev` extra; `lts`
+  uses `docker/.ngc_version.lts` and `docker/lts/requirements.txt`. The
+  `container::lts` PR label selects the LTS path; otherwise CI uses `dev`.
+- Source-install smoke tests outside the CI container use `uv pip install -e ...`
+  in a disposable environment. Bootstrap PyTorch with `uv pip install
+  --no-config ...` first so the CI override does not suppress it. Do not present
+  `uv sync` as the generic source install command.
+- Transformer Engine bare-metal installs are CUDA-native builds. Use
+  `mcore-transformer-engine-install` for pinned PyPI TE install, fork testing,
+  and TE-specific smoke-test failures.
+- CI/container install commands use `uv sync --locked`, for example
+  `uv sync --locked --extra dev --all-groups` or
+  `uv sync --locked --only-group linting`.
 - Dependency edits use `uv add <package>` followed by `uv lock`, both inside
   the container.
 - `docker/Dockerfile.ci.dev` has `main` and `jet` stages. The `jet` stage needs
@@ -160,21 +167,24 @@ srun \
 
 ## Dependency Management
 
-Dependencies are declared in `pyproject.toml`. The venv lives at `/opt/venv`
-inside the container (already on `PATH`).
+Dependencies are declared in `pyproject.toml`. The CI/container venv lives at
+`/opt/venv` inside the container (already on `PATH`).
 
-> **All `uv` operations must be run inside the container.**
-> Never run `uv sync` / `uv pip install` on the host.
+> **All dependency maintenance and `uv sync` / `uv lock` operations must be run
+> inside the container.** Source-install smoke tests may use
+> `uv pip install -e ...` in a disposable local or Colab environment.
 
-### uv Dependency Groups
+### uv Extras and Dependency Groups
 
-| Group | Purpose |
-|-------|---------|
-| `training` | Runtime training extras |
-| `dev` | Full dev environment (TransformerEngine, ModelOpt, …) |
-| `test` | pytest, coverage, nemo-run |
-| `linting` | ruff, black, isort, pylint |
-| `build` | Cython, pybind11, nvidia-mathdx |
+| Name | Type | Purpose |
+|------|------|---------|
+| `training` | extra | Runtime training extras |
+| `dev` | extra | Full dev environment (ModelOpt, resiliency, datasets, …) |
+| `te` | extra | Transformer Engine source build |
+| `ssm` | extra | Mamba SSM and causal conv source builds |
+| `test` | dependency group | pytest, coverage, nemo-run |
+| `linting` | dependency group | ruff, black, isort, pylint |
+| `build` | dependency group | Cython, pybind11, nvidia-mathdx |
 
 > The previous `lts` extra has been emptied. LTS deps are pinned in
 > `docker/lts/requirements.txt` rather than `pyproject.toml`. Do not add new
@@ -184,7 +194,7 @@ Install commands (inside the container):
 
 ```bash
 # Full dev + test environment
-uv sync --locked --group dev --group test
+uv sync --locked --extra dev --all-groups
 
 # Linting only
 uv sync --locked --only-group linting
