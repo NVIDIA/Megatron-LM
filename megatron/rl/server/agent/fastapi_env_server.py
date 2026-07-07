@@ -151,11 +151,6 @@ class FastAPIEnvServer(EnvironmentServer):
         for rollout in rollouts:
             yield rollout
 
-    async def rollout(self, request: RolloutRequest) -> TokenRollout:
-        assert (
-            False
-        ), "Calling rollout on FastAPIEnvServer is not supported, use get_reward_rollouts"
-
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
         assert isinstance(
             request.inference_interface, InferenceServer

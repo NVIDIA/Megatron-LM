@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import functools
 from typing import Any
 
@@ -132,17 +133,19 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     ) -> InferenceResponse:
         return await request.inference_interface.agenerate(inference_request)
 
-    async def rollout(self, request: RolloutRequest) -> Rollout:
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
+        assert isinstance(
+            request.inference_interface, ReturnsRaw
+        ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        prompt, golden = await self.get_prompt(validation=request.validation)
+        async def _single_rollout() -> Rollout:
+            params = await self.prepare_group_rollout(request)
+            response = await self.get_rollout_response(request, params.inference_request)
+            return await params.build_rollout(response)
 
-        inference_request = request.inference_interface.prepare_request(
-            prompt, request.generation_args
+        return list(
+            await asyncio.gather(*[_single_rollout() for _ in range(request.num_rollouts)])
         )
-
-        response = await self.get_rollout_response(request, inference_request)
-
-        return await self._rollout_from_response(request, response, golden)
 
     async def prepare_group_rollout(
         self,

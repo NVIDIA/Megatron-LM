@@ -165,11 +165,6 @@ class WeightedMultiTask(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )
 
-    async def rollout(self, request: RolloutRequest) -> Rollout:
-        raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
-        )
-
     async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(
             "WeightedMultiTask delegates to sub-agents; get_rollout_response is not used."

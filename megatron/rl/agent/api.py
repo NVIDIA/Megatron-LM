@@ -173,16 +173,7 @@ class RolloutGenerator(Agent, ABC):
     """An agent that produces Rollout objects containing rollout string and associated reward."""
 
     @abstractmethod
-    async def rollout(self, request: RolloutRequest) -> Rollout: ...
-
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        return await asyncio.gather(
-            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
-        )
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]: ...
 
 
 class ContrastiveRolloutGenerator(Agent, ABC):
@@ -202,16 +193,7 @@ class TokenizedRolloutGenerator(Agent, ABC):
     """
 
     @abstractmethod
-    async def rollout(self, request: RolloutRequest) -> TokenRollout: ...
-
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        return await asyncio.gather(
-            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
-        )
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]: ...
 
 
 class _GranularityConfig(NamedTuple):
