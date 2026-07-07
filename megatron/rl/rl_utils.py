@@ -1127,7 +1127,6 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
             f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
             f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
-            f"{env_id}_pipeline_output_queue_maxsize": pipeline.output_queue_maxsize,
             f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
             f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
             f"{env_id}_pipeline_gate_capacity": gate.capacity,

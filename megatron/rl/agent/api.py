@@ -313,7 +313,6 @@ class _RolloutPipeline:
         self,
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
-        buffer_size: int,
         parallel_generation_tasks: int,
     ) -> None:
         self.agent = agent
@@ -333,10 +332,12 @@ class _RolloutPipeline:
             self.num_infer_workers = min(
                 self.num_infer_workers, request.num_groups * request.rollouts_per_group
             )
-        self.output_queue_maxsize = buffer_size if request.streaming else 0
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
-        self.output_queue = asyncio_Queue(maxsize=self.output_queue_maxsize)
+        # Unbounded: flow control is owned entirely by the submission gate.
+        # Bounding this queue would add a second backpressure that silently
+        # clamps the run-ahead configured via --rl-generation-lag.
+        self.output_queue = asyncio_Queue()
         # Buffer of pending groups (incomplete groups being filled by
         # stage_assemble). Held here so metric collection can report its size.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -517,7 +518,6 @@ class GroupedRolloutGenerator(Agent, ABC):
     """An interface to return grouped Rollout objects to support algorithms like GRPO."""
 
     parallel_generation_tasks: int = 512
-    buffer_size: int = 10
 
     def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -546,7 +546,6 @@ class GroupedRolloutGenerator(Agent, ABC):
         pipeline = _RolloutPipeline(
             agent=self,
             request=request,
-            buffer_size=self.buffer_size,
             parallel_generation_tasks=self.parallel_generation_tasks,
         )
         # Expose the live pipeline for observability; rl_utils reads its
