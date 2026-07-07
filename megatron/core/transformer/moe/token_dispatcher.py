@@ -22,6 +22,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
+    alloc_ep_symm_buffer,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     nccl_ep_combine,
@@ -1423,6 +1424,14 @@ class _NCCLEPManager(_DispatchManager):
     lazily on the first dispatch, when the local token count is known.
     """
 
+    # Zero-copy: 3 shared symm buffers, allocated once and reused across all layers/microbatches
+    # (class-level so every per-layer manager shares one set). Forward token buffer holds both the
+    # dispatch output and the expert output (combine input); backward token buffer holds the
+    # combine-backward grad.
+    _zc_fwd_token_buf = None
+    _zc_bwd_token_buf = None
+    _zc_recv_topk_weights_buf = None
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -1455,10 +1464,17 @@ class _NCCLEPManager(_DispatchManager):
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
-        if config.moe_ncclep_use_symm_mem:
-            raise NotImplementedError(
-                "moe_ncclep_use_symm_mem (symm-mem / zero-copy EP payload buffers) is not "
-                "supported yet."
+        self.use_symm_mem = config.moe_ncclep_use_symm_mem
+        # The shared pre-allocated static symm buffers are the FP8/FP4 zero-copy path,
+        # As in FP8/FP4 paths the TE only saves the quantized tensors for backward,
+        # recv_tokens stays transient so we can reuse 
+        # TODO: bf16 zero-copy would instead let EpBuffer allocate from an
+        # internal symm pool, so it does NOT use these static buffers.
+        self._use_static_symm_bufs = self.use_symm_mem and bool(config.fp8 or config.fp4)
+        if self.use_symm_mem and not (config.fp8 or config.fp4):
+            raise ValueError(
+                "moe_ncclep_use_symm_mem (zero-copy symm-mem EP) requires FP8 or FP4 "
+                "(config.fp8 / config.fp4); bf16 zero-copy is not supported yet."
             )
         if self.static_shape:
             if torch.cuda.get_device_capability()[0] < 10:
@@ -1543,8 +1559,20 @@ class _NCCLEPManager(_DispatchManager):
                 if self.config.moe_flex_dispatcher_num_sms is not None
                 else 0
             ),
-            zero_copy=False,
+            zero_copy=self.use_symm_mem,
         )
+        if self._use_static_symm_bufs and _NCCLEPManager._zc_fwd_token_buf is None:
+            # Collective rendezvous -> must run before capture (rides this first-dispatch eager
+            # warmup, like the bootstrap above). Allocated once, shared across all managers.
+            assert (
+                not torch.cuda.is_current_stream_capturing()
+            ), "zero-copy symm buffers must be allocated before CUDA-graph capture"
+            rc, h = self._recv_capacity, self.hidden_dim
+            _NCCLEPManager._zc_fwd_token_buf = alloc_ep_symm_buffer((rc, h), torch.bfloat16, self.group)
+            _NCCLEPManager._zc_bwd_token_buf = alloc_ep_symm_buffer((rc, h), torch.bfloat16, self.group)
+            _NCCLEPManager._zc_recv_topk_weights_buf = alloc_ep_symm_buffer(
+                (rc,), torch.float32, self.group
+            )
         self._bootstrapped = True
 
     def dispatch(
@@ -1556,7 +1584,8 @@ class _NCCLEPManager(_DispatchManager):
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
-        # Fresh buffer per dispatch; held until the matching combine consumes it.
+        # Fresh buffer per dispatch; held until the matching combine consumes it. Zero-copy injects
+        # the 3 shared static symm buffers so construction allocates no symm memory (CG-capturable).
         self._buffer = new_nccl_ep_buffer(
             top_k=self.router_topk,
             max_tokens_per_rank=self._max_tokens_per_rank,
@@ -1564,6 +1593,9 @@ class _NCCLEPManager(_DispatchManager):
             hidden_dim=self.hidden_dim,
             num_local_experts=self.num_local_experts,
             alignment=self.alignment,
+            dispatch_recv_tokens=_NCCLEPManager._zc_fwd_token_buf,
+            combine_grad_expert_out=_NCCLEPManager._zc_bwd_token_buf,
+            dispatch_recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
         )
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]
@@ -1576,7 +1608,9 @@ class _NCCLEPManager(_DispatchManager):
             self._buffer, hidden_states, topk_idx, topk_weights
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-        self.dispatched_probs = dispatched_probs
+        # Zero-copy: dispatched_probs aliases the shared recv_topk_weights symm buffer, which the
+        # next layer's dispatch reuses; copy it out so it stays valid through this layer's backward.
+        self.dispatched_probs = dispatched_probs.clone() if self._use_static_symm_bufs else dispatched_probs
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1684,6 +1718,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
             )
+
+    def get_expert_zero_copy_buffers(self):
+        """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
+        experts write the fc2 output / fc1 dgrad into, so combine (fwd) and dispatch (bwd) read and
+        scatter them one-sided. ``(None, None)`` for every other backend/mode.
+
+        Returned detached: the op-fuser calls requires_grad_() on its output and returns that object,
+        so handing it the persistent buffer would permanently mark the shared classvar as requiring
+        grad and break the next layer's reuse. The detached view shares storage (zero-copy intact).
+        """
+
+        def _detached(name):
+            buf = getattr(self._comm_manager, name, None)
+            return buf.detach() if buf is not None else None
+
+        return _detached("_zc_fwd_token_buf"), _detached("_zc_bwd_token_buf")
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

@@ -546,8 +546,20 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            get_zc_buffers = getattr(self.token_dispatcher, "get_expert_zero_copy_buffers", None)
+            output_buffer, grad_input_buffer = (
+                get_zc_buffers() if get_zc_buffers is not None else (None, None)
+            )
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)

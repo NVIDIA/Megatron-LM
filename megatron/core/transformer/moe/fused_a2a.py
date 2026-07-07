@@ -666,6 +666,11 @@ def nccl_ep_finalize():
 
 if HAVE_TE_EP:
 
+    def alloc_ep_symm_buffer(shape, dtype, ep_group):
+        """Allocate one NCCL symm-mem buffer (collective rendezvous). Not CUDA-graph capturable;
+        the caller must invoke this before capture."""
+        return te_ep.symm_mem_alloc(shape, dtype, ep_group)
+
     def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
@@ -673,11 +678,15 @@ if HAVE_TE_EP:
         hidden_dim,
         num_local_experts,
         alignment=0,
+        dispatch_recv_tokens=None,
+        combine_grad_expert_out=None,
+        dispatch_recv_topk_weights=None,
     ):
         """Build a fresh TE EpBuffer for one dispatch/combine pair.
 
-        The buffer owns handle_mem (the routing table dispatch writes and combine reads) and
-        the receive buffers; a new one is built per dispatch and dropped after combine.
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads); a new one
+        is built per dispatch and dropped after combine. In zero-copy mode the caller passes the 3
+        shared symm buffers so construction allocates no symm memory (stays CUDA-graph capturable).
         """
         return te_ep.EpBuffer(
             top_k=top_k,
@@ -686,6 +695,9 @@ if HAVE_TE_EP:
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
+            dispatch_recv_tokens=dispatch_recv_tokens,
+            combine_grad_expert_out=combine_grad_expert_out,
+            dispatch_recv_topk_weights=dispatch_recv_topk_weights,
         )
 
     def nccl_ep_dispatch(buffer, tokens, topk_idx, topk_weights):
@@ -733,6 +745,7 @@ if HAVE_TE_EP:
         return te_ep.ep_combine(buffer, expert_out, num_local_tokens=num_local_tokens)
 
 else:
+    alloc_ep_symm_buffer = None
     new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None
