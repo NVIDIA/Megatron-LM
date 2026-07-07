@@ -23,4 +23,5 @@ data-preparation
 training-examples
 parallelism-guide
 features/index
+hybrid-model-migration
 ```
