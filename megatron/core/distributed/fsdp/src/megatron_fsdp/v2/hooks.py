@@ -399,6 +399,8 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             param.grad_added_to_main_grad = False
             if param_group.sharding_strategy in ("optim_grads_params", "optim_grads"):
                 param.overwrite_main_grad = True
+        if module._fsdp_state.enable_full_iteration_cuda_graph:
+            param_group._init_dist_grads()
         # CUDA graph + TE wgrad fusion: during graph capture the eager backward
         # runs once and TE sets grad_added_to_main_grad=True on each param it
         # writes to.  Under replay only the GPU kernel runs — the Python-side
@@ -406,7 +408,11 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
         # buffer and its full unsharded fetch-buffer BEFORE capture so that
         # memory addresses are fixed across replay iterations.  Without this,
         # TE would write to stale or uninitialised buffer addresses on replay.
-        if module._fsdp_state.enable_cuda_graph and param_group.main_grad_buffer is not None:
+        if (
+            not module._fsdp_state.enable_full_iteration_cuda_graph
+            and module._fsdp_state.enable_cuda_graph
+            and param_group.main_grad_buffer is not None
+        ):
             param_group._init_dist_grads()
             param_group.main_grad_buffer.fetch_buffer()
 

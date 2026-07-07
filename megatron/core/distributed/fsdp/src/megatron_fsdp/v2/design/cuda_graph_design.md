@@ -408,3 +408,18 @@ plumbing is needed and the FSDP grad path stays CUDA-graph-agnostic.
 | RNG state | Handled by `make_graphed_callables` internally |
 | Slot state | Automatic (fixed per-key slots after `plan()`) |
 
+## 12. Full-iteration optimizer-gradient storage
+
+The default-off `enable_full_iteration_cuda_graph` mode preserves only the
+optimizer-facing gradient objects that cross the full-iteration graph boundary.
+Transient full weight and gradient buffers allocate and reshard inside capture;
+the CUDA graph private pool provides stable replay addresses and lifetime reuse.
+
+- `_pre_backward_setup()` pre-allocates local dist grads before capture.
+- `_maybe_free_grad_data()` keeps optimizer-facing local gradient storage resident.
+- FSDP and optimizer zero-grad preserve optimizer-facing `grad`/`decoupled_grad`
+  identities and clear their local storage in place.
+- Full-iteration mode uses `StorageFreeingBucketAllocator`; `TracePoolAllocator`
+  remains available for explicit and per-module CUDA graph modes.
+
+All behavior is gated by `enable_full_iteration_cuda_graph=False` by default.

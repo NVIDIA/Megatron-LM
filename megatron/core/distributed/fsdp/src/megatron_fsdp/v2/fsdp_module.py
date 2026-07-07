@@ -34,6 +34,7 @@ class _FSDPState:
         self._is_root = True
         self._post_backward_callback_queued = False
         self.enable_cuda_graph: bool = False
+        self.enable_full_iteration_cuda_graph: bool = False
 
 
 @dataclass
@@ -521,6 +522,7 @@ class FSDPModule:
         enable_async_reduce_grad,
         bucket_allocator: BucketAllocator,
         enable_cuda_graph: bool = False,
+        enable_full_iteration_cuda_graph: bool = False,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -576,12 +578,15 @@ class FSDPModule:
             bucket_allocator=bucket_allocator,
         )
         setattr(self, "_fsdp_state", _FSDPState())
+        self._fsdp_state.enable_full_iteration_cuda_graph = enable_full_iteration_cuda_graph
         setattr(self, "_fsdp_root_context", root_context)
 
         module_idx = 0
         for name, module in named_forward_modules:
+            module._fsdp_state.enable_full_iteration_cuda_graph = enable_full_iteration_cuda_graph
             for param_group in module._fsdp_param_groups:
                 param_group.set_allocator(root_context.bucket_allocator)
+                param_group.enable_full_iteration_cuda_graph = enable_full_iteration_cuda_graph
 
             if module is not self:
                 module._fsdp_state._is_root = False
@@ -808,6 +813,8 @@ class FSDPModule:
                     continue
                 if param_group.mp_policy.use_decoupled_grad:
                     setattr(dist_param, "decoupled_grad", dist_grad)
+                    if param_group.enable_full_iteration_cuda_graph and dist_grad is not None:
+                        setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
                     if dist_param.grad is not None:
                         del dist_param.grad
                 else:
@@ -816,6 +823,8 @@ class FSDPModule:
                         f"dist grad dtype {dist_grad.dtype}"
                     )
                     setattr(dist_param, "grad", dist_grad)
+                    if param_group.enable_full_iteration_cuda_graph and dist_grad is not None:
+                        setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None
 

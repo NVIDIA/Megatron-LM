@@ -189,6 +189,25 @@ After the first call, `_init_dist_grads()` is a no-op. Subsequent calls just
 do the reduce as before. `overwrite_grad=False` ensures proper accumulation
 across micro-batches.
 
+### Full-iteration CUDA graph
+
+`enable_full_iteration_cuda_graph=True` is an explicit exception to the normal
+lazy-freeing policy for optimizer-facing gradients. The full-iteration wrapper
+captures forward/backward but runs the optimizer outside the graph, so the local
+gradient shard and `decoupled_grad` object must keep stable identities.
+
+- `_pre_backward_setup()` allocates dist grads before capture.
+- `_maybe_free_grad_data()` keeps optimizer-facing gradient storage alive.
+- `zero_grad()` keeps optimizer-facing objects and clears local storage in place.
+- Optimizer zero-grad keeps marked `grad`/`decoupled_grad` DTensors and zeroes
+  their local storage.
+- Full unsharded weight and gradient buffers remain transient. They allocate and
+  reshard inside capture, so the CUDA graph private pool owns their stable replay
+  addresses and reuses non-overlapping lifetimes.
+
+The flag defaults to `False`, so eager and per-module CUDA graph paths retain
+their normal lazy allocation/free behavior.
+
 ### Activation recomputation
 
 During recomputation, the forward pre-hook fires again. `_maybe_free_grad_data()`
