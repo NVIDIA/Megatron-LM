@@ -42,9 +42,9 @@ def load_common(checkpoint_dir: str):
     try:
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
-            return msc.torch.load(load_path, map_location='cpu', weights_only=False)
+            return msc.torch.load(load_path, map_location='cpu')
         else:
-            return torch.load(load_path, map_location='cpu', weights_only=False)
+            return torch.load(load_path, map_location='cpu')
     except FileNotFoundError as e:
         err_msg = f'Common file {load_path} does not exist'
         if MultiStorageClientFeature.is_enabled():

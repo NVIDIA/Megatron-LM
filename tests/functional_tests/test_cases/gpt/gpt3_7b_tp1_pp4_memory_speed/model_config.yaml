@@ -28,7 +28,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --tokenizer-type: NullTokenizer
-  --vocab-size: 131072
+  --vocab-size: 131073
   --mock-data: true
   --split: 949,50,1
   --distributed-backend: nccl

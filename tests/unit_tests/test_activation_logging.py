@@ -25,12 +25,21 @@ def simple_model():
 class TestMakeTpeHook:
     """Tests for _make_tpe_hook regex layer extraction."""
 
-    def test_extracts_layer_number(self, logger):
+    def test_extracts_decoder_layer_number(self, logger):
         hook = logger._make_tpe_hook("chunk0", "decoder.layers.3.mlp.experts.linear_fc1")
         assert hook is not None
         fake_tpe = [128, 64, 96, 80]
         hook(None, (torch.zeros(1), fake_tpe), {}, torch.zeros(1))
-        assert logger._tpe_records["3"] == [fake_tpe]
+        assert logger._decoder_tpe_records[3] == [fake_tpe]
+
+    def test_extracts_mtp_layer_number(self, logger):
+        hook = logger._make_tpe_hook(
+            "chunk0", "mtp.layers.0.mtp_model_layer.layers.1.mlp.experts.linear_fc1"
+        )
+        assert hook is not None
+        fake_tpe = [50, 50]
+        hook(None, (torch.zeros(1), fake_tpe), {}, torch.zeros(1))
+        assert logger._mtp_tpe_records[(0, 1)] == [fake_tpe]
 
     def test_returns_none_for_non_matching_name(self, logger, caplog):
         with caplog.at_level(logging.WARNING):
@@ -43,9 +52,10 @@ class TestSaveTpe:
     """Tests for save_tpe JSONL output."""
 
     def test_creates_jsonl(self, tmp_path, logger):
-        logger._tpe_records["3"].append([128, 64, 96, 80])
-        logger._tpe_records["3"].append([100, 90, 110, 70])
-        logger._tpe_records["7"].append([200, 200])
+        logger._decoder_tpe_records[3].append([10, 20])
+        logger._decoder_tpe_records[3].append([30, 40])
+        logger._decoder_tpe_records[7].append([50, 60])
+        logger._mtp_tpe_records[(0, 1)].append([70, 80])
 
         logger.save_tpe(iteration=100)
 
@@ -55,15 +65,16 @@ class TestSaveTpe:
 
         records = [json.loads(line) for line in filepath.read_text().strip().split("\n")]
         assert records == [
-            {"iter": 100, "layer": 3, "tpe": [[128, 64, 96, 80], [100, 90, 110, 70]]},
-            {"iter": 100, "layer": 7, "tpe": [[200, 200]]},
+            {"iter": 100, "block": "decoder", "layer": 3, "tpe": [[10, 20], [30, 40]]},
+            {"iter": 100, "block": "decoder", "layer": 7, "tpe": [[50, 60]]},
+            {"iter": 100, "block": "mtp", "mtp_idx": 0, "layer": 1, "tpe": [[70, 80]]},
         ]
 
     def test_appends_across_calls(self, tmp_path, logger):
-        logger._tpe_records["0"].append([10, 20])
+        logger._decoder_tpe_records[0].append([10, 20])
         logger.save_tpe(iteration=100)
 
-        logger._tpe_records["0"].append([30, 40])
+        logger._decoder_tpe_records[0].append([30, 40])
         logger.save_tpe(iteration=200)
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0

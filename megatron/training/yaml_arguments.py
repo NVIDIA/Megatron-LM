@@ -9,7 +9,13 @@ import os
 import re
 import torch
 import types
-import yaml
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 from itertools import chain, starmap
 from types import SimpleNamespace
@@ -28,8 +34,9 @@ def env_constructor(loader, node):
         assert os.environ.get(group) is not None, f"environment variable {group} in yaml not found"
         value = value.replace(f"${{{group}}}", os.environ.get(group))
     return value
-yaml.add_implicit_resolver("!pathex", env_pattern)
-yaml.add_constructor("!pathex", env_constructor)
+if HAVE_YAML:
+    yaml.add_implicit_resolver("!pathex", env_pattern)
+    yaml.add_constructor("!pathex", env_constructor)
 
 
 str_dtype_to_torch = {
@@ -103,6 +110,13 @@ def validate_yaml(args, defaults={}):
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
@@ -188,8 +202,6 @@ def validate_yaml(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -321,7 +333,6 @@ def validate_yaml(args, defaults={}):
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
         if args.model_parallel.tensor_model_parallel_size > 1:
             assert args.model_parallel.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
@@ -424,11 +435,19 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to load YAML arguments. "
+            "Install via `pip install pyyaml`."
+        )
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
+        config_namespace._is_global_batch_size_explicitly_specified = (
+            getattr(config_namespace, "global_batch_size", None) is not None
+        )
         return config_namespace
 

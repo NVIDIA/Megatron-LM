@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Convert a GPTModel DSA checkpoint to a MambaModel-compatible checkpoint.
+"""Convert a GPTModel DSA checkpoint to a HybridModel-compatible checkpoint.
 
 A GPTModel with ``--experimental-attention-variant dsa`` uses one combined
-TransformerLayer per model layer (attention + MLP).  The equivalent MambaModel
+TransformerLayer per model layer (attention + MLP).  The equivalent HybridModel
 with pattern ``D-D-...`` stores them as two separate layers:
 
 * Layer 2N   – DSA attention (TransformerLayer: input_layernorm + MLASelfAttention)
 * Layer 2N+1 – MLP          (MLPLayer: fused-norm MLP)
 
 This script loads a GPTModel Distributed Checkpoint (DCP), remaps the state-dict
-keys, and saves a new DCP that can be loaded by MambaModel.
+keys, and saves a new DCP that can be loaded by HybridModel.
 
 Usage
 -----
@@ -43,14 +43,14 @@ from typing import Dict
 
 
 def _remap_key(key: str, num_gpt_layers: int) -> str:
-    """Return the MambaModel state-dict key corresponding to *key* from GPTModel.
+    """Return the HybridModel state-dict key corresponding to *key* from GPTModel.
 
     Args:
         key: A key from the GPTModel state dict.
         num_gpt_layers: Total number of GPT decoder layers (across all PP stages).
 
     Returns:
-        The remapped key for MambaModel.
+        The remapped key for HybridModel.
 
     Raises:
         ValueError: If an unexpected sub-key is encountered in a decoder layer.
@@ -58,7 +58,7 @@ def _remap_key(key: str, num_gpt_layers: int) -> str:
     layer_prefix = "decoder.layers."
     final_ln_prefix = "decoder.final_layernorm."
 
-    # Final layernorm name differs between TransformerBlock and MambaStack
+    # Final layernorm name differs between TransformerBlock and HybridStack
     if key.startswith(final_ln_prefix):
         return "decoder.final_norm." + key[len(final_ln_prefix):]
 
@@ -96,11 +96,11 @@ def _remap_state_dict(
 
 
 def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
-    """Load a GPTModel DCP checkpoint, remap keys, and save as MambaModel DCP.
+    """Load a GPTModel DCP checkpoint, remap keys, and save as HybridModel DCP.
 
     Args:
         input_path: Path to the GPTModel DCP checkpoint directory.
-        output_path: Destination directory for the MambaModel DCP checkpoint.
+        output_path: Destination directory for the HybridModel DCP checkpoint.
         num_gpt_layers: Number of GPT decoder layers in the original model.
     """
     try:
@@ -139,7 +139,7 @@ def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
 
         output_path.mkdir(parents=True, exist_ok=True)
         torch_save_to_dcp(str(tmp_mamba), str(output_path))
-        print(f"MambaModel DCP checkpoint saved to: {output_path}")
+        print(f"HybridModel DCP checkpoint saved to: {output_path}")
 
     finally:
         for tmp in (tmp_flat, output_path.parent / "_tmp_mamba_flat.pt"):
@@ -149,7 +149,7 @@ def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert GPTModel DSA checkpoint to MambaModel-compatible format."
+        description="Convert GPTModel DSA checkpoint to HybridModel-compatible format."
     )
     parser.add_argument(
         "--input", required=True, type=Path,
@@ -157,7 +157,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", required=True, type=Path,
-        help="Destination path for the MambaModel DCP checkpoint.",
+        help="Destination path for the HybridModel DCP checkpoint.",
     )
     parser.add_argument(
         "--num-gpt-layers", required=True, type=int,

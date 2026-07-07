@@ -417,6 +417,53 @@ def test_merge_preserves_precomputed_block_hashes():
 
 
 # ============================================================================
+# Test 5c: Merge tolerates sparse tpot across checkpoints
+# ============================================================================
+
+
+def test_merge_with_unpopulated_tpot_in_later_segment():
+    """Regression test: merge() must not crash when a post-checkpoint sub-request
+    never observed a logging step and therefore has an empty tpot list while the
+    pre-checkpoint sub-request has populated entries.
+
+    The dynamic engine populates `tpot` lazily, only on logging steps
+    (`step_time > 0`). A request that gets evicted then finishes within fewer
+    than `logging_step_interval` decode steps after recompute will produce a
+    record whose later sub-request never accumulated any tpot samples, while
+    earlier sub-requests did. `merge()` must concatenate what's there without
+    erroring on the empty segment.
+    """
+    # Pre-checkpoint sub-request: lived through a logging step, so tpot has data.
+    req1 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
+    )
+    req1.generated_tokens.extend([100, 101])
+    req1.tpot = [0.10, 0.11]
+
+    # Post-checkpoint sub-request: recomputed but never saw a logging step
+    # before finishing, so tpot is left at its default.
+    req2 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 100, 101], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=8),
+    )
+    req2.generated_tokens.extend([200])
+
+    record = DynamicInferenceRequestRecord()
+    record.requests.append(req1)
+    record.requests.append(req2)
+
+    merged = record.merge()
+
+    # The pre-checkpoint segment's measurements must survive the merge,
+    # and the empty post-checkpoint segment must contribute nothing.
+    assert merged.tpot == [0.10, 0.11]
+    assert merged.generated_tokens == [100, 101, 200]
+
+
+# ============================================================================
 # Test 6: TTFT Calculation from Event Timestamps
 # ============================================================================
 

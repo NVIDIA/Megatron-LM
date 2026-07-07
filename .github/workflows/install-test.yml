@@ -29,7 +29,7 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
@@ -75,6 +75,12 @@ jobs:
         uses: ./FW-CI-templates/.github/actions/check-imports
         with:
           package-name: megatron.core
+          python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
+
+      - name: Check imports for megatron.training
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: megatron.training
           python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
   uv-test-pytorch:

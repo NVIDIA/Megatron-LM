@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 
@@ -54,7 +56,7 @@ def get_jobs_per_bridge(pipeline_id: int, type_of_job: str):
 @click.option(
     "--check-for",
     required=True,
-    type=click.Choice(["unit-tests", "integration-tests", "functional-tests"]),
+    type=click.Choice(["unit-tests", "integration-tests", "functional-tests", "smoke-tests"]),
 )
 @click.option("--pipeline-context", required=True, type=str)
 @click.option("--pipeline-created-at", required=True, type=str)
@@ -67,6 +69,13 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
 
     if check_for == "functional-tests":
         bridges = get_jobs_per_bridge(pipeline_id, "functional:run_")
+
+    if check_for == "smoke-tests":
+        bridges = get_jobs_per_bridge(pipeline_id, "functional:smoke-")
+        if all(job.status == "success" for jobs in bridges.values() for job in jobs):
+            logger.info("All smoke tests passed, skipping Slack notification")
+            return
+
     pipeline_created_at_day = pd.Timestamp(pipeline_created_at).strftime("%Y-%m-%d")
 
     messages = []
@@ -85,7 +94,9 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
             f":doctorge: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: {len(unsuccessful_jobs)} of {total_num_jobs} failed."
         )
         if TAG_TEAM:
-            messages.append(f"cc {TEAM_SLUG}: Critical event, please react as soon as possible.")
+            messages.append(
+                f"cc {TEAM_SLUG} <!subteam^S0A7B4U1T3P> <@U09TX0DHZ97>: Critical event, please react as soon as possible."
+            )
 
         for job in unsuccessful_jobs:
             messages.append(
@@ -93,6 +104,10 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
             )
 
     messages.append("===============================================")
+
+    if not WEBHOOK_URL:
+        logger.info("No webhook URL configured, skipping Slack notification")
+        return
 
     for message in messages:
         response = slack_sdk.webhook.WebhookClient(WEBHOOK_URL).send(text=message)

@@ -96,8 +96,8 @@ options=" \
        --eval-iters 32 \
        --bf16 \
        --use-mcore-models \
-       --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+       --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
        --no-create-attention-mask-in-dataloader \
        --tensorboard-dir ${TENSORBOARD_DIR}"
 
-torchrun --nproc_per_node 8 ../../pretrain_mamba.py ${options}
+torchrun --nproc_per_node 8 ../../pretrain_hybrid.py ${options}

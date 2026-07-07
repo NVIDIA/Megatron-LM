@@ -8,7 +8,7 @@ from functools import partial
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -24,6 +24,7 @@ from megatron.rl.rl_utils import (
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -392,7 +393,7 @@ if __name__ == "__main__":
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
         if is_hybrid_model(args):
-            return mamba_builder(
+            return hybrid_builder(
                 args,
                 pre_process,
                 post_process,
@@ -410,13 +411,19 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_inference_args,
         args_defaults={},
     )
+    if is_hybrid_model(args):
+        model_cfg = hybrid_config_from_args(args)
+    else:
+        model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
+        full_config,
         None,  # we don't need to build any datasets for RL training
-        partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        partial(model_provider, _model_builder),
     )

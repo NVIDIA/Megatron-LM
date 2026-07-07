@@ -37,8 +37,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -121,9 +121,9 @@ class TestPrefixCachingCudaGraphs:
                 add_bias_linear=True,
                 is_hybrid_model=True,
             )
-            model = MambaModel(
+            model = HybridModel(
                 config=config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=VOCAB_SIZE,
                 max_sequence_length=MAX_SEQ_LEN,
                 parallel_output=True,
@@ -147,7 +147,7 @@ class TestPrefixCachingCudaGraphs:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, mamba_config, num_cuda_graphs):
         """Build an engine with prefix caching and optional CUDA graphs."""
@@ -164,8 +164,12 @@ class TestPrefixCachingCudaGraphs:
             use_cuda_graphs_for_non_decode_steps=True,
         )
         if mamba_config is not None:
+            # max_requests is not capped here, so it auto-derives from the KV buffer
+            # size. The Mamba cache budget must cover the per-step extraction scratch
+            # (which scales with max_requests) on top of the durable cache.
+            # max_requests is left uncapped to preserve this test's CUDA-graph buckets.
             inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=0.05
+                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=2.0
             )
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
@@ -343,9 +347,9 @@ class TestHybridChunkedPrefillIntermediateState:
             add_bias_linear=True,
             is_hybrid_model=True,
         )
-        model = MambaModel(
+        model = HybridModel(
             config=config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -367,7 +371,7 @@ class TestHybridChunkedPrefillIntermediateState:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(
         self,
@@ -394,9 +398,12 @@ class TestHybridChunkedPrefillIntermediateState:
             max_requests=128,
         )
         if enable_prefix_caching:
+            # The Mamba cache budget must cover both the durable cache and the
+            # per-step extraction scratch (which scales with max_requests), so it
+            # needs enough headroom to fit the scratch and still leave durable slots.
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-                prefix_caching_mamba_gb=0.05,
+                prefix_caching_mamba_gb=0.2,
             )
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens

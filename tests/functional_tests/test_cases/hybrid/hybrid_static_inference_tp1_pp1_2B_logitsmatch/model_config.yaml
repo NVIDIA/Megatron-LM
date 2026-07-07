@@ -22,7 +22,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --expert-model-parallel-size: 1
   --use-mcore-models: true
-  --model-provider: mamba
+  --model-provider: hybrid
   --init-method-std: 0.0198
   --untie-embeddings-and-output-weights: true
   --disable-bias-linear: true
@@ -33,7 +33,7 @@ MODEL_ARGS:
   --num-attention-heads: 16
   --kv-channels: 128
   --hybrid-layer-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
-  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
   --normalization: RMSNorm
   --swiglu: true
   --attention-dropout: 0.0

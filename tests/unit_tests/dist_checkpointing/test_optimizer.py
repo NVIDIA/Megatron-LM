@@ -589,7 +589,7 @@ class TestDistributedOptimizer:
             ) as ckpt_dir_B,
         ):
             # Init model and optimizer with "src" bucket padding
-            with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
+            with patch('megatron.core.optimizer.param_layout.math.lcm') as lcm_mock:
                 lcm_mock.return_value = src_bucket_pad_divisor
 
                 model_A, optimizer_A = setup_model_and_optimizer(
@@ -615,7 +615,7 @@ class TestDistributedOptimizer:
                 parallel_state.get_model_parallel_group()
             )
             # Init model and optimizer with "dest" bucket padding
-            with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
+            with patch('megatron.core.optimizer.param_layout.math.lcm') as lcm_mock:
                 lcm_mock.return_value = dest_bucket_pad_divisor
 
                 model_B, optimizer_B = setup_model_and_optimizer(

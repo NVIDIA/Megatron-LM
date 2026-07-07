@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -51,6 +52,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
+        """Prepare gradients for all active module optimizers."""
         found_inf = False
         for opt in self._active_optimizers:
             found_inf |= opt.prepare_grads()
@@ -72,6 +74,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
+        """Run one optimizer step across all active module optimizers."""
         found_inf = self.prepare_grads()
         # Synchronize found_inf across all ranks to prevent deadlock:
         # if encoder ranks detect inf but LLM ranks don't, the early return
@@ -104,22 +107,31 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
+        """Step active optimizers after gradients have been prepared."""
         success = True
         for opt in self._active_optimizers:
             success &= opt.step_with_ready_grads()
         return success
 
     def zero_grad(self, set_to_none: bool = True):
+        """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
     def get_loss_scale(self) -> torch.Tensor:
+        """Return the loss scale tensor from the first active optimizer."""
         if self._active_optimizers:
             return self._active_optimizers[0].get_loss_scale()
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        return sum(opt.count_zeros() for opt in self._active_optimizers)
+        """Count zero gradients per module (world-MAX so disjoint grids agree), then sum."""
+        module_counts = torch.zeros(len(self.module_infos), device="cuda", dtype=torch.int64)
+        for index, (_, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer is not None:
+                module_counts[index] = info.optimizer.count_zeros()
+        torch.distributed.all_reduce(module_counts, op=torch.distributed.ReduceOp.MAX)
+        return int(module_counts.sum().item())
 
     @property
     def param_groups(self) -> List[dict]:
@@ -132,6 +144,7 @@ class MimoOptimizer(MegatronOptimizer):
     # Checkpointing
 
     def state_dict(self):
+        """Return per-module optimizer state dicts."""
         return {
             name: info.optimizer.state_dict() if info.is_active and info.optimizer else None
             for name, info in self.module_infos.items()
@@ -153,6 +166,7 @@ class MimoOptimizer(MegatronOptimizer):
 
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
+                _restore_param_state_sharding_type(sub_sd)
                 _restore_grad_scaler(sub_sd)
 
             info.optimizer.load_state_dict(module_sd)
@@ -175,14 +189,17 @@ class MimoOptimizer(MegatronOptimizer):
                 ):
                     suffix = f'.{idx}' if idx > 0 else ''
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
+                    _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
 
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
                 sharded_state[name] = module_sd
             else:
                 sharded_state[name] = {}
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
+        """Reload model parameters in all active module optimizers."""
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
 
@@ -218,6 +235,8 @@ def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
             replica_id=replica_id,
         )
         del opt_sub['param_groups']
+        if not opt_sub:
+            del sub_sd['optimizer']
 
 
 def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
@@ -226,6 +245,18 @@ def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
         sub_sd[f'_mimo_grad_scaler{suffix}'] = ShardedObject(
             f'optimizer.mimo.{module_name}{suffix}.grad_scaler',
             sub_sd.pop('grad_scaler'),
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+
+
+def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
+    """Save: extract param_state_sharding_type into a ShardedObject."""
+    if 'param_state_sharding_type' in sub_sd:
+        sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
+            f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
+            sub_sd.pop('param_state_sharding_type'),
             (1,),
             (0,),
             replica_id=replica_id,
@@ -253,7 +284,21 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
         )
     for loaded_g, current_g in zip(loaded_pg, current_pg):
         loaded_g['params'] = current_g['params']
-    sub_sd['optimizer']['param_groups'] = loaded_pg
+    # `sub_sd['optimizer']` may be absent on load: when the per-module state_dict
+    # produced by DistributedOptimizer.state_dict() only contains `param_groups`
+    # under the 'optimizer' key, `_extract_param_groups` removes it at save time
+    # and the resulting empty dict can be dropped during dist_checkpointing
+    # common-state save/load. Use setdefault so the restored param_groups land
+    # in the right place regardless.
+    sub_sd.setdefault('optimizer', {})['param_groups'] = loaded_pg
+
+
+def _restore_param_state_sharding_type(sub_sd):
+    """Load: restore param_state_sharding_type from ShardedObject key."""
+    for k in list(sub_sd.keys()):
+        if k.startswith('_mimo_param_state_sharding_type'):
+            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
+            break
 
 
 def _restore_grad_scaler(sub_sd):
@@ -267,67 +312,43 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Includes pp_rank so only one PP stage writes the metadata,
-    and dp_rank so only dp_rank=0 writes (others are replicas).
+    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    module's parallelism group is the main replica; all other ranks
+    in the same module are non-main replicas of the same object.
     """
     assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'tp') and pg_collection.tp is not None
+    ), "pg_collection.tp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
+    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
+
+
+_EXPERT_VIEW = "expert"
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
-    """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
+    """Derive the optimizer's ProcessGroupCollection from a populated HyperCommGrid.
 
-    Only fetches process groups required by the optimizer. Assumes all groups
-    are pre-created in the grid via grid.create_pg() - does not create any new groups.
-
-    The following groups must be pre-created in the grid before calling this function:
-        grid.create_pg(["dp"])
-        grid.create_pg(["dp", "cp"])
-        grid.create_pg(["tp"])
-        grid.create_pg(["pp"])
-        grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
-
-    Args:
-        grid: HyperCommGrid with pre-created process groups.
-
-    Returns:
-        ProcessGroupCollection containing optimizer-required groups:
-        - dp: Data parallel group
-        - dp_cp: Data parallel with context parallel
-        - tp: Tensor parallel group
-        - mp: Model parallel group (tp × pp)
-        - tp_ep_pp: Expert tensor-model-pipeline group
-        - expt_dp: Expert data parallel group
+    Dense groups come from the base view; expert-parallel groups (tp_ep_pp, expt_dp) come from
+    the grid's dedicated expert view -- expert parallelism is always factored into a separate
+    view (expt_tp/ep/expt_dp), never the base view. All groups must be pre-created on the grid.
     """
     pg = ProcessGroupCollection()
-
-    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
-
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
-
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
-
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
+    # Distributed-optimizer grad-stats group spans the dense shards (mirrors the topology PGC).
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg
 
 
@@ -346,7 +367,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = grid.is_current_rank_in_grid()
 
         optimizer = None
-        pg_collection = _get_pg_collection_for_optimizer(grid)
+        pg_collection = None
 
         if is_active:
             if module_name == lang_key:
@@ -355,6 +376,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
+                pg_collection = _get_pg_collection_for_optimizer(grid)
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
