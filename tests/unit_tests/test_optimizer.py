@@ -326,6 +326,46 @@ def test_chained_optimizer():
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
 
 
+def test_chained_optimizer_file_state_dict_round_trip(tmp_path):
+    """Torch checkpoint files preserve state from every chained optimizer."""
+
+    class MockOptimizer:
+        def __init__(self, state_dict):
+            self.config = None
+            self.model_chunks = []
+            self.is_stub_optimizer = False
+            self.optimizer = self
+            self.param_groups = [{'params': []}]
+            self._state_dict = state_dict
+
+        def state_dict(self):
+            return self._state_dict
+
+        def load_state_dict(self, state_dict):
+            self._state_dict = state_dict
+
+    state_dicts = [
+        {'optimizer': {'state': {'layer_wise': 'state'}, 'param_groups': []}},
+        {'optimizer': {'state': {'distributed': 'state'}, 'param_groups': []}},
+    ]
+    checkpoint_path = tmp_path / f'optimizer_{os.getpid()}.pt'
+
+    ChainedOptimizer(
+        [MockOptimizer(state_dict) for state_dict in state_dicts]
+    ).save_state_dict_to_file(checkpoint_path)
+
+    restored = ChainedOptimizer(
+        [
+            MockOptimizer({'optimizer': {'state': {}, 'param_groups': []}}),
+            MockOptimizer({'optimizer': {'state': {}, 'param_groups': []}}),
+        ]
+    )
+    restored.load_state_dict_from_file(checkpoint_path)
+
+    assert torch.load(checkpoint_path) == state_dicts
+    assert restored.state_dict() == state_dicts
+
+
 def test_chained_optimizer_get_parameters():
     """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
 
