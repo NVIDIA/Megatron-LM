@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
+    _dist_opt_checkpoint_metadata,
     _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
@@ -25,6 +26,22 @@ from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
+
+
+@pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
+def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
+    opts = [
+        SimpleNamespace(
+            data_parallel_group_gloo=group,
+            sharded_state_dict=lambda: None,
+            gbuf_ranges={},
+            buffers=[],
+            optimizer=object(),
+        )
+        for group in groups
+    ]
+    metadata = _dist_opt_checkpoint_metadata(SimpleNamespace(chained_optimizers=opts))
+    assert metadata["distrib_optim_fully_reshardable_mem_efficient"] is expected
 
 
 def _assert_state_equal(actual, expected) -> None:

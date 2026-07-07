@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import fnmatch
 import functools
 import logging
@@ -1006,6 +1007,17 @@ class _ParamAndGradBuffer:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
 
+        self._is_layer_wise_buffer = bool(
+            self.params and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        # Bake the per-buffer DistOpt decision into this buffer's ddp_config (single source of
+        # truth; bucket groups inherit it): a LayerWise (Muon) buffer on the compact decoupled
+        # layout disables DistributedOptimizer, while sibling buffers keep the model-level setting.
+        if self._is_layer_wise_buffer and not getattr(
+            self.ddp_config, "use_layer_wise_param_layout", True
+        ):
+            self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
+
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
@@ -1053,6 +1065,27 @@ class _ParamAndGradBuffer:
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
 
         assert self.numel_unpadded <= self.numel
+
+        # Diagnostic: log persistent buffer size vs. unpadded payload so the cost of any
+        # optimizer-driven padding (e.g. the LayerWise shard-aligned ``dp_size * max(shard_load)``
+        # layout) is visible per buffer. Emit at INFO only when it is interesting — a
+        # LayerWise-managed buffer or one that actually carries padding — and DEBUG otherwise, so
+        # ordinary (zero-padding) buffers do not spam non-experimental runs.
+        _padding = self.numel - self.numel_unpadded
+        _pad_frac = _padding / max(self.numel_unpadded, 1)
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO if (self._is_layer_wise_buffer or _padding > 0) else logging.DEBUG,
+            f"ParamAndGradBuffer layout: param_dtype={self.param_dtype} "
+            f"grad_dtype={self.grad_dtype} dp_world_size={self.data_parallel_world_size} "
+            f"layerwise={self._is_layer_wise_buffer} "
+            f"distopt={self.ddp_config.use_distributed_optimizer} "
+            f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
+            f"padding={_padding} ({_pad_frac:.1%})",
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
+
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:
@@ -1565,22 +1598,72 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
+    # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
+    # all-reduce otherwise), so buckets merged into one group must agree on the effective
+    # per-buffer ``use_distributed_optimizer``. The decoupled LayerWise layout
+    # (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
+    # ``use_distributed_optimizer=False`` while sibling buffers keep True; the no-fp8 Case 2 below
+    # keeps every bucket in its own group so they never mix, but the merging Cases 1/3 must assert
+    # consistency.
+    _ddp_config = buffers[0].ddp_config
+    _decouple = not getattr(_ddp_config, "use_layer_wise_param_layout", True)
+
+    def _bucket_distopt(bucket):
+        """This bucket's effective ``use_distributed_optimizer``."""
+        is_lw = bool(
+            bucket.params_list
+            and getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        if _decouple and is_lw:
+            return False
+        return _ddp_config.use_distributed_optimizer
+
+    def _merged_use_distributed_optimizer(merge_buckets):
+        values = {_bucket_distopt(bucket) for bucket in merge_buckets}
+        assert len(values) == 1, (
+            "Cannot merge buckets with differing effective use_distributed_optimizer into one "
+            "bucket group. This happens when the decoupled LayerWise layout "
+            "(use_layer_wise_param_layout=False) mixes LayerWise (all-reduce) and non-LayerWise "
+            "(reduce-scatter) buffers under a merging bucketing strategy (e.g. the fp8 merge "
+            "path). Disable bucket merging for the decoupled LayerWise path."
+        )
+        return values.pop()
+
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True
+    # (e.g. disable_bucketing / non-first VPP chunks). A bucket group performs a single
+    # collective type, so when the decoupled LayerWise layout (use_layer_wise_param_layout=False)
+    # mixes LayerWise (all-reduce, non-DistOpt) and non-LayerWise (reduce-scatter, DistOpt)
+    # buffers in one chunk, we cannot
+    # merge them into a single group. Split by the effective per-bucket use_distributed_optimizer
+    # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
+    # to exactly one group, identical to the previous behavior.
     if force_single_bucket_group:
-        buckets = []
-        ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
+        ordered_distopt_values = []
+        buckets_by_distopt = {}
+        # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
+        ddp_config_by_distopt = {}
         for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
+            distopt = buffer.ddp_config.use_distributed_optimizer
+            ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
+            for bucket in buffer.buckets:
+                if distopt not in buckets_by_distopt:
+                    buckets_by_distopt[distopt] = []
+                    ordered_distopt_values.append(distopt)
+                buckets_by_distopt[distopt].append(bucket)
 
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
+        return [
+            _ParamAndGradBucketGroup(
+                buckets_by_distopt[distopt],
+                ddp_config_by_distopt[distopt],
+                data_parallel_group,
+                data_parallel_world_size,
+            )
+            for distopt in ordered_distopt_values
+        ]
 
     if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
@@ -1599,11 +1682,12 @@ def partition_buckets(
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
+        # Track each non-fp8 bucket with its buffer's (authoritative) ddp_config.
+        non_fp8_buckets = []  # list of (bucket, ddp_config)
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
+                    non_fp8_buckets.append((bucket, buffer.ddp_config))
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1617,17 +1701,17 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
+                            fp8_buffer.ddp_config,
                             buffer.data_parallel_group,
                             buffer.data_parallel_world_size,
                         )
                     )
                     if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
+                        for non_fp8_bucket, non_fp8_ddp_config in non_fp8_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
+                                    non_fp8_ddp_config,
                                     buffer.data_parallel_group,
                                     buffer.data_parallel_world_size,
                                 )
@@ -1635,14 +1719,19 @@ def partition_buckets(
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + non_fp8_buckets
+                    group_buckets = [bucket] + [b for b, _ in non_fp8_buckets]
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
+            # Merged buckets must share the fp8 group's effective use_distributed_optimizer.
+            assert (
+                _merged_use_distributed_optimizer(group_buckets)
+                == fp8_buffer.ddp_config.use_distributed_optimizer
+            )
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
+                    fp8_buffer.ddp_config,
                     buffer.data_parallel_group,
                     buffer.data_parallel_world_size,
                 )
