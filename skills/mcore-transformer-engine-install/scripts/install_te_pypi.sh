@@ -19,7 +19,7 @@ Options:
   --torch-version VERSION PyTorch version to install (default: 2.10.0)
   --te-version VERSION    Transformer Engine PyPI version (default: 2.11.0)
   --te-spec SPEC          Full TE spec (default: transformer_engine[pytorch]==TE_VERSION)
-  --cuda-arch ARCH        h100, l4, l40s, a100, sm90, sm89, sm80, or auto
+  --cuda-arch ARCH        b200, gb200, h100, l4, l40s, a100, sm100, sm90, sm89, sm80, or auto
   --extras EXTRAS         Editable Megatron extras, excluding te (default: none; use training for training deps)
   --max-jobs N            Native build parallelism (default: 4)
   --repo-root PATH        Megatron-LM repository root (default: current git root)
@@ -260,6 +260,10 @@ if [[ -d "${VENV_SITE}/nvidia/cudnn" ]]; then
 fi
 
 case "${CUDA_ARCH}" in
+  b200|gb200|sm100)
+    DEFAULT_NVTE_CUDA_ARCHS=100
+    DEFAULT_TORCH_CUDA_ARCH_LIST=10.0
+    ;;
   h100|sm90)
     DEFAULT_NVTE_CUDA_ARCHS=90
     DEFAULT_TORCH_CUDA_ARCH_LIST=9.0
@@ -282,7 +286,7 @@ PY
 )
     ;;
   *)
-    echo "Unsupported --cuda-arch '${CUDA_ARCH}'. Use h100, l4, l40s, a100, sm90, sm89, sm80, or auto." >&2
+    echo "Unsupported --cuda-arch '${CUDA_ARCH}'. Use b200, gb200, h100, l4, l40s, a100, sm100, sm90, sm89, sm80, or auto." >&2
     exit 2
     ;;
 esac

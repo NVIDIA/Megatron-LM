@@ -15,7 +15,7 @@ Options:
   --python VERSION        Python version for uv venv (default: 3.12)
   --venv PATH             Virtualenv path (default: .venv)
   --torch-backend BACKEND uv torch backend, e.g. cu128 or cu130 (default: cu128)
-  --cuda-arch ARCH        h100, l4, l40s, a100, sm90, sm89, sm80, or auto
+  --cuda-arch ARCH        b200, gb200, h100, l4, l40s, a100, sm100, sm90, sm89, sm80, or auto
   --extras EXTRAS         Editable install extras (default: training,te)
   --max-jobs N            Native build parallelism (default: 4)
   --repo-root PATH        Megatron-LM repository root (default: current git root)
@@ -152,6 +152,10 @@ if [[ -d "${VENV_SITE}/nvidia/cudnn" ]]; then
 fi
 
 case "${CUDA_ARCH}" in
+  b200|gb200|sm100)
+    DEFAULT_NVTE_CUDA_ARCHS=100
+    DEFAULT_TORCH_CUDA_ARCH_LIST=10.0
+    ;;
   h100|sm90)
     DEFAULT_NVTE_CUDA_ARCHS=90
     DEFAULT_TORCH_CUDA_ARCH_LIST=9.0
@@ -174,7 +178,7 @@ PY
 )
     ;;
   *)
-    echo "Unsupported --cuda-arch '${CUDA_ARCH}'. Use h100, l4, l40s, a100, sm90, sm89, sm80, or auto." >&2
+    echo "Unsupported --cuda-arch '${CUDA_ARCH}'. Use b200, gb200, h100, l4, l40s, a100, sm100, sm90, sm89, sm80, or auto." >&2
     exit 2
     ;;
 esac
