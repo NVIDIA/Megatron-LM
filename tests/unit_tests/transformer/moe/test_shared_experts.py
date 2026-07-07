@@ -126,6 +126,10 @@ def _fake_shared_expert(**config_kwargs):
         moe_shared_expert_glu_interleave_size=32,
         delay_wgrad_compute=False,
         sequence_parallel=False,
+        fp4=False,
+        fp4_recipe="nvfp4",
+        fp8=True,
+        fp8_recipe="mxfp8",
     )
     for key, value in config_kwargs.items():
         setattr(config, key, value)
