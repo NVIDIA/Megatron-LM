@@ -895,10 +895,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             async_save_request.add_finalize_fn(iter_finalize_fn)
         else:
             iter_finalize_fn()
-            # Add a barrier so that all ranks wait for finalization to
-            # complete before returning from this function.
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
 
     # Additional callback for one_logger (last rank)
     if not torch.distributed.is_initialized() \
@@ -948,6 +944,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
+
+    if not args.async_save:
+        # Add a barrier so that all ranks wait for finalization to complete
+        # before returning from this function.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     ft_integration.on_checkpointing_end(is_async_finalization=args.async_save)
 
