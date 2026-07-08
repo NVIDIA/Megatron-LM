@@ -3,52 +3,116 @@
 import asyncio
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from megatron.rl.agent.api import (
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     Rollout,
     RolloutGenerator,
+    RolloutRequest,
 )
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
-from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
+
+
+class MockInferenceInterface(ReturnsRaw):
+    """Mock raw-text inference interface with configurable per-prompt delays."""
+
+    num_slow_calls: int = 0
+    active_requests: int = 0
+    max_active_requests: int = 0
+
+    async def base_generate(self, request):
+        prompt = request.prompt[0].content
+        idx = int(prompt.removeprefix("t"))
+        self.active_requests += 1
+        self.max_active_requests = max(self.max_active_requests, self.active_requests)
+        try:
+            if idx < self.num_slow_calls:
+                await asyncio.sleep(0.03)
+            else:
+                await asyncio.sleep(0)
+            return InferenceResponse(
+                response=LLMChatMessage(role="assistant", content=prompt),
+                raw_text=prompt,
+                finish_reason="stop",
+                policy_epoch=[(0, 0)],
+                kv_cache_epoch=[(0, 0)],
+                num_evictions=0,
+            )
+        finally:
+            self.active_requests -= 1
 
 
 class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     """Mock generator with configurable per-call delays."""
 
-    def __init__(self, env_id="test", num_slow_calls=0, **kwargs):
+    def __init__(self, env_id="test", **kwargs):
         super().__init__(**kwargs)
         self.env_id = env_id
-        self.num_slow_calls = num_slow_calls
         self._call_count = 0
-        self.submission_gate_seen = False
+        self.prepare_group_rollout_calls = 0
 
-    async def rollout(self, request):
+    async def get_reward_rollouts(self, request):
         raise NotImplementedError
 
-    async def group_rollout(self, request, submission_gate=None):
-        if submission_gate is not None:
-            self.submission_gate_seen = True
+    async def get_rollout_response(self, request, inference_request):
+        return await request.inference_interface.agenerate(inference_request)
+
+    async def prepare_group_rollout(self, request):
         idx = self._call_count
         self._call_count += 1
-        if idx < self.num_slow_calls:
-            await asyncio.sleep(0.03)
-        else:
-            await asyncio.sleep(0)
-        return [
-            Rollout(
-                trajectory=[f"t{idx}"],
-                reward=float(idx),
+        self.prepare_group_rollout_calls += 1
+        inference_request = request.inference_interface.prepare_request(
+            f"t{idx}", request.generation_args
+        )
+
+        async def build_rollout(response):
+            response_idx = int(response.response.content.removeprefix("t"))
+            return Rollout(
+                trajectory=[response.raw_text],
+                reward=float(response_idx),
                 env_id=self.env_id,
-                policy_epoch=[[(0, 0)]],
-                kv_cache_epoch=[[(0, 0)]],
-                num_evictions=[0],
+                policy_epoch=[response.policy_epoch],
+                kv_cache_epoch=[response.kv_cache_epoch],
+                num_evictions=[response.num_evictions],
             )
-            for _ in range(request.rollouts_per_group)
-        ]
+
+        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+
+
+class CountingRewardAgent(RewardOnlyAgent):
+    """Minimal RewardOnlyAgent: prompts t0, t1, ... and reward = echoed index."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.env_id = "reward-test"
+        self._prompt_count = 0
+
+    async def get_prompt(self, validation):
+        idx = self._prompt_count
+        self._prompt_count += 1
+        return f"t{idx}", {"idx": idx}
+
+    async def get_reward(self, response, golden, finish_reason):
+        return float(int(response.removeprefix("t")) == golden["idx"])
+
+
+class TestRewardRollouts:
+    @pytest.mark.asyncio
+    async def test_get_reward_rollouts_matches_per_rollout_composition(self):
+        agent = CountingRewardAgent()
+        request = RolloutRequest(num_rollouts=4, inference_interface=MockInferenceInterface())
+        rollouts = await agent.get_reward_rollouts(request)
+        assert len(rollouts) == 4
+        assert sorted(r.trajectory[0] for r in rollouts) == ["t0", "t1", "t2", "t3"]
+        assert all(r.reward == 1.0 for r in rollouts)
+        assert all(r.env_id == "reward-test" for r in rollouts)
 
 
 class TestGroupedRollouts:
@@ -63,6 +127,31 @@ class TestGroupedRollouts:
         with pytest.raises(ValidationError) as exc_info:
             GroupedRolloutRequest(**request_kwargs)
         assert any(error["loc"] == (field,) for error in exc_info.value.errors())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "num_groups, submission_granularity, consumption_granularity",
+        [
+            pytest.param(1, "B", "B", id="num_groups_1_batch"),
+            pytest.param(4, "G", "G", id="num_groups_gt_1_group"),
+            pytest.param(4, "R", "B", id="num_groups_gt_1_rollout"),
+        ],
+    )
+    async def test_filter_groups_with_same_reward_rejected(
+        self, num_groups, submission_granularity, consumption_granularity
+    ):
+        gen = MockGenerator(parallel_generation_tasks=8)
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            filter_groups_with_same_reward=True,
+            submission_granularity=submission_granularity,
+            consumption_granularity=consumption_granularity,
+        )
+        with pytest.raises(AssertionError, match="filter_groups_with_same_reward"):
+            async for _ in gen.get_grouped_rollouts(request):
+                pass
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -123,11 +212,11 @@ class TestGroupedRollouts:
         expected_batch_ids,
         expected_trajectories,
     ):
-        gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
+        gen = MockGenerator(parallel_generation_tasks=8)
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=1,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            inference_interface=MockInferenceInterface(num_slow_calls=num_slow_calls),
             streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
@@ -147,12 +236,13 @@ class TestGroupedRollouts:
             assert trajectories[: len(expected_trajectories)] == expected_trajectories
 
     @pytest.mark.asyncio
-    async def test_rollout_submission_granularity_passes_submission_gate(self):
+    async def test_rollout_submission_granularity_limits_inference_concurrency(self):
         gen = MockGenerator(parallel_generation_tasks=2)
+        inference_interface = MockInferenceInterface(num_slow_calls=100)
         request = GroupedRolloutRequest(
             num_groups=1,
-            rollouts_per_group=2,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            rollouts_per_group=4,
+            inference_interface=inference_interface,
             streaming=True,
             submission_granularity="R",
             consumption_granularity="B",
@@ -164,8 +254,8 @@ class TestGroupedRollouts:
             break
 
         assert len(groups) == 1
-        assert len(groups[0]) == 2
-        assert gen.submission_gate_seen
+        assert len(groups[0]) == 4
+        assert inference_interface.max_active_requests <= gen.parallel_generation_tasks
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -199,7 +289,7 @@ class TestGroupedRollouts:
         request = GroupedRolloutRequest(
             num_groups=4,
             rollouts_per_group=1,
-            inference_interface=MagicMock(spec=ReturnsRaw),
+            inference_interface=MockInferenceInterface(),
             streaming=False,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
@@ -220,3 +310,41 @@ class TestGroupedRollouts:
         assert [agent.parallel_generation_tasks for agent in mt.agents] == (
             expected_parallel_generation_tasks
         )
+
+    @pytest.mark.parametrize(
+        "num_groups, all_envs_active",
+        [
+            pytest.param(1, False, id="num_groups_1_starves_an_env"),
+            pytest.param(8, True, id="trainer_batch_size_keeps_all_envs_active"),
+        ],
+    )
+    def test_multi_env_distribution_requires_num_groups_above_one(
+        self, num_groups, all_envs_active
+    ):
+        """Regression for the removed ``num_groups=1`` streaming override.
+
+        With multiple weighted environments, ``num_groups=1`` hands the single
+        group to one environment and leaves the other with zero groups. It also
+        collapses ``agent_slots`` (computed without remainder distribution) to all
+        zeros, so ``np.gcd.reduce`` is 0 and the per-agent slot counts become
+        ``nan`` -- which stalls ``get_grouped_rollouts``. Keeping ``num_groups`` at
+        the trainer batch size (> 1) keeps every environment active with a valid,
+        non-zero slot count.
+        """
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+
+        agent_groups = mt._distribute_counts(num_groups)
+        agent_slots = mt._distribute_counts(num_groups, distribute_remainder=False)
+
+        assert all(groups > 0 for groups in agent_groups) is all_envs_active
+        if all_envs_active:
+            assert min(agent_slots) > 0
+            assert np.gcd.reduce(agent_slots) > 0
+        else:
+            assert min(agent_groups) == 0
+            assert all(slots == 0 for slots in agent_slots)
+            assert np.gcd.reduce(agent_slots) == 0
