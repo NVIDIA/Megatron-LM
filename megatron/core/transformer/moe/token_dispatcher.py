@@ -1057,9 +1057,8 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
-        # THD sequence packing can produce different token counts per rank.
-        # HybridEP dispatch expects equal per-rank input sizes, so metadata and
-        # hidden states are padded to the group-wide max and trimmed in combine.
+        # When runtime token equalization is enabled, HybridEP metadata and hidden
+        # states are padded to the group-wide max and trimmed again in combine.
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
@@ -1068,30 +1067,16 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
-        if (
-            self.config.sequence_packing_scheduler is not None
-            or self.config.moe_hybridep_pad_variable_tokens
-        ):
-            pad_alignment = self.config.pad_packed_seq_alignment
-            has_static_token_count = (
-                self.config.sequence_packing_scheduler is not None
-                and pad_alignment is not None
-                and (
-                    pad_alignment == "max" or pad_alignment == self.config.max_seqlen_per_dp_cp_rank
-                )
+        if self.config.moe_hybridep_pad_variable_tokens:
+            # Use the actual tp_ep max so all ranks in the MoE communication
+            # group pass the same token count to HybridEP.
+            max_num_tokens_across_ep = torch.tensor(
+                [num_tokens], device=routing_map.device, dtype=torch.long
             )
-            if not has_static_token_count:
-                # Use the actual tp_ep max so all ranks in the MoE communication
-                # group pass the same token count to HybridEP.
-                max_num_tokens_across_ep = torch.tensor(
-                    [num_tokens], device=routing_map.device, dtype=torch.long
-                )
-                torch.distributed.all_reduce(
-                    max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
-                )
-                padded_num_tokens = int(max_num_tokens_across_ep.item())
-            # Otherwise, the sequence-packing path has already padded every rank
-            # to the same configured maximum, so the local token count can be used.
+            torch.distributed.all_reduce(
+                max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+            )
+            padded_num_tokens = int(max_num_tokens_across_ep.item())
             padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
