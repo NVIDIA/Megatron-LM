@@ -304,6 +304,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
+            "enable_full_iteration_cuda_graph": config.cuda_graph_impl == "full_iteration",
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
             "fine_grained_hooks": config.overlap_moe_expert_parallel_comm,
             "skip_backward_callback": config.delay_wgrad_compute,

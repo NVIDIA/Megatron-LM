@@ -423,3 +423,5 @@ the CUDA graph private pool provides stable replay addresses and lifetime reuse.
   remains available for explicit and per-module CUDA graph modes.
 
 All behavior is gated by `enable_full_iteration_cuda_graph=False` by default.
+The MCore FSDP adapter enables it when
+`TransformerConfig.cuda_graph_impl == "full_iteration"`.
