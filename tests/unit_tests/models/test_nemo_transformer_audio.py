@@ -99,11 +99,16 @@ def _write_fake_nemo_archive(
 
 
 class TestNemoTransformerAudioModel:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="TransformerEngine attention requires CUDA"
+    )
     def test_forward_shapes_conv_subsample(self):
-        model = NemoTransformerAudioModel(_MIN_CFG)
+        model = NemoTransformerAudioModel(_MIN_CFG).cuda()
 
-        input_features = torch.randn(2, 40, _MIN_CFG.n_mels)
-        attention_mask = torch.tensor([[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool)
+        input_features = torch.randn(2, 40, _MIN_CFG.n_mels).cuda()
+        attention_mask = torch.tensor(
+            [[True] * 40, [True] * 28 + [False] * 12], dtype=torch.bool
+        ).cuda()
 
         hidden_states, output_mask = model(input_features, attention_mask)
 
@@ -112,12 +117,15 @@ class TestNemoTransformerAudioModel:
         assert output_mask[0].all()
         assert output_mask[1].sum().item() == 7
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="TransformerEngine attention requires CUDA"
+    )
     def test_encoder_stride_frames_keep_dummy_audio_nonempty(self):
-        model = NemoTransformerAudioModel(_MIN_CFG)
+        model = NemoTransformerAudioModel(_MIN_CFG).cuda()
         dummy_frames = _MIN_CFG.encoder_time_stride
 
-        input_features = torch.zeros(1, dummy_frames, _MIN_CFG.n_mels)
-        attention_mask = torch.ones(1, dummy_frames, dtype=torch.bool)
+        input_features = torch.zeros(1, dummy_frames, _MIN_CFG.n_mels).cuda()
+        attention_mask = torch.ones(1, dummy_frames, dtype=torch.bool).cuda()
 
         hidden_states, output_mask = model(input_features, attention_mask)
 
@@ -504,8 +512,11 @@ class TestNemoTransformerAudioTokenEstimator:
         assert est.estimate(36) == 5
         assert est.estimate(35) == 4
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="TransformerEngine attention requires CUDA"
+    )
     def test_matches_nemo_conv_subsample_output_lengths(self):
-        model = NemoTransformerAudioModel(_MIN_CFG)
+        model = NemoTransformerAudioModel(_MIN_CFG).cuda()
         estimator = NemoTransformerAudioTokenEstimator(
             stack_factor=1,
             encoder_time_stride=_MIN_CFG.encoder_time_stride,
@@ -513,25 +524,30 @@ class TestNemoTransformerAudioTokenEstimator:
         )
 
         for num_frames in range(1, 17):
-            input_features = torch.randn(1, num_frames, _MIN_CFG.n_mels)
-            attention_mask = torch.ones(1, num_frames, dtype=torch.bool)
+            input_features = torch.randn(1, num_frames, _MIN_CFG.n_mels).cuda()
+            attention_mask = torch.ones(1, num_frames, dtype=torch.bool).cuda()
             _, output_mask = model(input_features, attention_mask)
 
             assert estimator.estimate(num_frames) == output_mask.sum().item()
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="TransformerEngine attention requires CUDA"
+    )
     def test_matches_nemo_stacking_subsample_per_sample_ceil_lengths(self):
         cfg = NemoTransformerAudioConfig(
             **{**_MIN_CFG.__dict__, "pre_encode": "stacking", "subsampling_factor": 8}
         )
-        model = NemoTransformerAudioModel(cfg)
+        model = NemoTransformerAudioModel(cfg).cuda()
         estimator = NemoTransformerAudioTokenEstimator(
             stack_factor=1, encoder_time_stride=cfg.encoder_time_stride, pre_encode=cfg.pre_encode
         )
 
         input_lengths = torch.tensor([293, 300], dtype=torch.long)
         padded_num_frames = 302
-        input_features = torch.randn(2, padded_num_frames, cfg.n_mels)
-        attention_mask = torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
+        input_features = torch.randn(2, padded_num_frames, cfg.n_mels).cuda()
+        attention_mask = (
+            torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
+        ).cuda()
         _, output_mask = model(input_features, attention_mask)
 
         expected = [estimator.estimate(int(num_frames)) for num_frames in input_lengths.tolist()]
@@ -546,19 +562,24 @@ class TestNemoTransformerAudioTokenEstimator:
         assert est.estimate(293) == 19
         assert est.estimate(293, padded_num_frames=302) == 19
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="TransformerEngine attention requires CUDA"
+    )
     def test_stacking_lengths_cover_partial_tail_frames(self):
         cfg = NemoTransformerAudioConfig(
             **{**_MIN_CFG.__dict__, "pre_encode": "stacking", "subsampling_factor": 8}
         )
-        model = NemoTransformerAudioModel(cfg)
+        model = NemoTransformerAudioModel(cfg).cuda()
         estimator = NemoTransformerAudioTokenEstimator(
             stack_factor=1, encoder_time_stride=cfg.encoder_time_stride, pre_encode=cfg.pre_encode
         )
 
         input_lengths = torch.tensor([2597, 546, 2331, 1876], dtype=torch.long)
         padded_num_frames = 3000
-        input_features = torch.randn(len(input_lengths), padded_num_frames, cfg.n_mels)
-        attention_mask = torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
+        input_features = torch.randn(len(input_lengths), padded_num_frames, cfg.n_mels).cuda()
+        attention_mask = (
+            torch.arange(padded_num_frames).unsqueeze(0) < input_lengths.unsqueeze(1)
+        ).cuda()
         _, output_mask = model(input_features, attention_mask)
 
         expected = [estimator.estimate(int(num_frames)) for num_frames in input_lengths.tolist()]

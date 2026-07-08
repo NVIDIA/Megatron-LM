@@ -91,7 +91,7 @@ class TestAudioProjectionWithModelParallel:
         )
         self.projector = AudioProjection(
             config=config,
-            submodules=get_mlp_module_spec(use_te=False).submodules,
+            submodules=get_mlp_module_spec(use_te=False).keywords['submodules'],
             projector_type="affine",
             input_size=24,
             stack_factor=2,
