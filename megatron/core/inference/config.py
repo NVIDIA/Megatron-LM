@@ -100,9 +100,6 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
-
     LOAD_BALANCED = "load_balanced"
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
