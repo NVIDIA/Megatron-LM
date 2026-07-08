@@ -48,7 +48,7 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
-from megatron.training.distillation.utils_logits import (
+from megatron.training.distillation.utils import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
     LOGPROBS_FORMAT_VERSION,
