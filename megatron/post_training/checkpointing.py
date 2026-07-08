@@ -17,11 +17,10 @@ from modelopt.torch.opt.plugins.mcore_dist_checkpointing import (
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.serialization import _legacy_common_state_exists
-from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
+from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0
-
 from .utils import print_distributed_quant_summary
 
 logger = logging.getLogger(__name__)
