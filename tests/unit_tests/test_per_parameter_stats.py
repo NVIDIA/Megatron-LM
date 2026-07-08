@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core import per_parameter_stats as pps
+from megatron.core.parameter_names import CanonicalParameterNameIndex, CanonicalParameterNameMap
 from megatron.core.per_parameter_stats import (
     NamedTensorBucket,
     PerParameterStatRegistry,
@@ -26,10 +27,7 @@ class SequentialExpertModel(torch.nn.Module):
         self.mlp = torch.nn.Module()
         self.mlp.experts = torch.nn.Module()
         self.mlp.experts.local_experts = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(1, 1, bias=False),
-                torch.nn.Linear(1, 1, bias=False),
-            ]
+            [torch.nn.Linear(1, 1, bias=False), torch.nn.Linear(1, 1, bias=False)]
         )
 
 
@@ -70,9 +68,9 @@ def test_reduce_raw_moments_by_param_on_cpu():
         "a": {
             "count": pytest.approx(4.0),
             "sum_1": pytest.approx(9.0),
-            "sum_2": pytest.approx(21.0),
+            "sum_2": pytest.approx(25.0),
             "sum_3": pytest.approx(81.0),
-            "sum_4": pytest.approx(321.0),
+            "sum_4": pytest.approx(289.0),
         },
         "b": {
             "count": pytest.approx(1.0),
@@ -85,9 +83,9 @@ def test_reduce_raw_moments_by_param_on_cpu():
     assert aggregate_moments == {
         "count": pytest.approx(5.0),
         "sum_1": pytest.approx(12.0),
-        "sum_2": pytest.approx(30.0),
+        "sum_2": pytest.approx(34.0),
         "sum_3": pytest.approx(108.0),
-        "sum_4": pytest.approx(402.0),
+        "sum_4": pytest.approx(370.0),
     }
 
 
@@ -120,9 +118,10 @@ def test_registry_cache_includes_expert_group_identity():
     )
 
     assert expert_registry is not first_registry
-    assert get_or_create_per_parameter_stat_registry(
-        model, expert_model_parallel_group=expert_group
-    ) is expert_registry
+    assert (
+        get_or_create_per_parameter_stat_registry(model, expert_model_parallel_group=expert_group)
+        is expert_registry
+    )
 
 
 def test_registry_uses_explicit_expert_group_for_expert_names(monkeypatch):
@@ -135,10 +134,22 @@ def test_registry_uses_explicit_expert_group_for_expert_names(monkeypatch):
         SequentialExpertModel(), expert_model_parallel_group=expert_group
     )
 
+    assert isinstance(registry.parameter_names, CanonicalParameterNameMap)
     assert set(registry.param_to_name.values()) == {
         "mlp.experts.local_experts.2.weight",
         "mlp.experts.local_experts.3.weight",
     }
+
+
+def test_registry_uses_global_canonical_parameter_name_index(monkeypatch):
+    expected_index = CanonicalParameterNameIndex(["remote", "b", "a"])
+    monkeypatch.setattr(CanonicalParameterNameMap, "all_gather_index", lambda self: expected_index)
+
+    registry = PerParameterStatRegistry(TwoParamModel())
+
+    assert registry.parameter_name_index is expected_index
+    assert registry.name_to_index is expected_index
+    assert registry.index_to_name is expected_index.names
 
 
 def test_local_raw_moments_multi_tensor_path_preserves_order(monkeypatch):

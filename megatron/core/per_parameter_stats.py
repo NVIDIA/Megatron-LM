@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -17,11 +16,9 @@ except ImportError:
     multi_tensor_applier = None
     multi_tensor_raw_moments = None
 
+from megatron.core.parameter_names import CanonicalParameterNameMap
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
-_LAYER_NAME_PATTERN = re.compile(r"layers\.(\d+)")
-_GROUPED_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.linear_fc\d\.weight)(\d+)(.*)$")
-_SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.local_experts\.)(\d+)(\..*)$")
 RAW_MOMENT_FIELDS = ("count", "sum_1", "sum_2", "sum_3", "sum_4")
 _RAW_MOMENTS_DTYPE = torch.float32
 _MULTI_TENSOR_RAW_MOMENTS_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
@@ -61,9 +58,15 @@ class PerParameterStatRegistry:
             self.expert_model_parallel_rank,
             self.expert_model_parallel_size,
         )
-        self.param_to_name = self._build_local_param_to_name()
-        self.name_to_index = self._build_name_to_index()
-        self.index_to_name = sorted(self.name_to_index, key=self.name_to_index.get)
+        self.parameter_names = CanonicalParameterNameMap(
+            self.model_chunks,
+            expert_parallel_rank=self.expert_model_parallel_rank,
+            expert_parallel_size=self.expert_model_parallel_size,
+        )
+        self.parameter_name_index = self.parameter_names.all_gather_index()
+        self.param_to_name = dict(self.parameter_names.items())
+        self.name_to_index = self.parameter_name_index
+        self.index_to_name = self.parameter_name_index.names
 
     def name_for_param(self, param: torch.nn.Parameter) -> str:
         """Return the canonical name for ``param``."""
@@ -73,31 +76,6 @@ class PerParameterStatRegistry:
     def num_params(self) -> int:
         """Number of globally known parameters."""
         return len(self.name_to_index)
-
-    def _build_local_param_to_name(self) -> dict[torch.nn.Parameter, str]:
-        param_to_name = {}
-        num_experts = _get_num_moe_experts(self.model_chunks)
-        expert_offset = _get_local_expert_offset(
-            num_experts, self.expert_model_parallel_rank, self.expert_model_parallel_size
-        )
-        for model_chunk in self.model_chunks:
-            for local_name, param in model_chunk.named_parameters():
-                param_to_name[param] = _canonical_param_name(
-                    model_chunk, local_name, param, num_experts, expert_offset
-                )
-        return param_to_name
-
-    def _build_name_to_index(self) -> dict[str, int]:
-        local_names = list(self.param_to_name.values())
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            gathered_names = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered_names, local_names)
-            all_names = set()
-            for names in gathered_names:
-                all_names.update(names)
-        else:
-            all_names = set(local_names)
-        return {name: idx for idx, name in enumerate(sorted(all_names))}
 
 
 def get_or_create_per_parameter_stat_registry(
@@ -109,8 +87,8 @@ def get_or_create_per_parameter_stat_registry(
     if not unwrapped_model_chunks:
         raise ValueError("Cannot build a per-parameter stat registry for an empty model list.")
 
-    expert_model_parallel_rank, expert_model_parallel_size = (
-        _get_expert_model_parallel_rank_size(expert_model_parallel_group)
+    expert_model_parallel_rank, expert_model_parallel_size = _get_expert_model_parallel_rank_size(
+        expert_model_parallel_group
     )
     cache_key = _registry_cache_key(
         unwrapped_model_chunks,
@@ -315,56 +293,6 @@ def raw_moment_row_to_dict(row: Sequence[float]) -> dict[str, float]:
     return {field: float(row[idx]) for idx, field in enumerate(RAW_MOMENT_FIELDS)}
 
 
-def _canonical_param_name(
-    model_chunk: torch.nn.Module,
-    local_name: str,
-    param: torch.nn.Parameter,
-    num_experts: int | None,
-    expert_offset: int,
-) -> str:
-    name = _global_layer_param_name(model_chunk, local_name, param)
-    return _global_expert_param_name(name, num_experts, expert_offset)
-
-
-def _global_layer_param_name(
-    model_chunk: torch.nn.Module, local_name: str, param: torch.nn.Parameter
-) -> str:
-    if "mtp" in local_name or _LAYER_NAME_PATTERN.search(local_name) is None:
-        return local_name
-
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    for module in model_chunk.modules():
-        if not isinstance(module, TransformerLayer):
-            continue
-        for module_param in module.parameters():
-            if module_param is param:
-                return _LAYER_NAME_PATTERN.sub(f"layers.{module.layer_number - 1}", local_name)
-    return local_name
-
-
-def _global_expert_param_name(
-    local_name: str, num_experts: int | None, expert_offset: int
-) -> str:
-    if not num_experts:
-        return local_name
-
-    if expert_offset == 0:
-        return local_name
-
-    grouped_match = _GROUPED_EXPERT_PATTERN.match(local_name)
-    if grouped_match is not None:
-        prefix, local_expert_index, suffix = grouped_match.groups()
-        return f"{prefix}{int(local_expert_index) + expert_offset}{suffix}"
-
-    sequential_match = _SEQUENTIAL_EXPERT_PATTERN.match(local_name)
-    if sequential_match is not None:
-        prefix, local_expert_index, suffix = sequential_match.groups()
-        return f"{prefix}{int(local_expert_index) + expert_offset}{suffix}"
-
-    return local_name
-
-
 def _get_expert_model_parallel_rank_size(
     expert_model_parallel_group: torch.distributed.ProcessGroup | None,
 ) -> tuple[int, int]:
@@ -384,19 +312,3 @@ def _registry_cache_key(
         expert_model_parallel_rank,
         expert_model_parallel_size,
     )
-
-
-def _get_local_expert_offset(
-    num_experts: int | None, expert_parallel_rank: int, expert_parallel_size: int
-) -> int:
-    if not num_experts or expert_parallel_size <= 1:
-        return 0
-    local_experts = num_experts // expert_parallel_size
-    return expert_parallel_rank * local_experts
-
-
-def _get_num_moe_experts(model_chunks: Sequence[torch.nn.Module]) -> int | None:
-    if not model_chunks:
-        return None
-    config = getattr(model_chunks[0], "config", None)
-    return getattr(config, "num_moe_experts", None)
