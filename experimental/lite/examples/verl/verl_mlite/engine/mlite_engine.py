@@ -25,7 +25,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite.compat import load_verl_engine_api
+from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -35,6 +35,8 @@ except Exception:  # pragma: no cover - older VERL without Metric
     _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
+
+_patch_bucketed_weight_sender()
 
 BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
     load_verl_engine_api()
