@@ -89,11 +89,6 @@ The converter maps parameters by occurrence, not merely by numeric layer index:
 | MLP or MoE from GPT layer *i* | The *i*-th `-` or `E` layer |
 | Embedding and output weights | Copied without changing their model role |
 | `decoder.final_layernorm` | Renamed to `decoder.final_norm` |
-| No GPT equivalent | Every `M` layer is initialized from scratch |
-
-Adding `M` symbols is therefore not an architecture-preserving migration. The
-converter retains the source attention and MLP weights, but creates fresh
-Mamba-2 parameters for the added positions.
 
 ### Check the prerequisites
 
@@ -101,9 +96,6 @@ The source must use one of these distributed-checkpoint formats:
 
 - `torch_dist`
 - `fsdp_dtensor`
-
-Legacy `mp_rank_XX/model_optim_rng.pt` checkpoints are not supported. Convert a
-legacy checkpoint to `torch_dist` before running this tool.
 
 Prefer a top-level checkpoint root containing
 `latest_checkpointed_iteration.txt` as `--load-dir`. If `--load-dir` points
@@ -131,7 +123,7 @@ The following example converts a four-layer dense GPT model. Its equivalent
 HybridModel has the eight-layer pattern `*-*-*-*-`:
 
 ```bash
-python tools/checkpoint/gpt_hybrid_conversion.py \
+uv run python tools/checkpoint/gpt_hybrid_conversion.py \
     --direction gpt-to-hybrid \
     --load-dir /path/to/gpt-checkpoints \
     --save-dir /path/to/hybrid-checkpoints \
@@ -145,29 +137,6 @@ detects the source backend and writes the same backend. `--reset-iterations`
 resets the checkpoint iteration, consumed-sample counters, and cached
 `train_iters` and `train_samples`; omit it when the new run must retain that
 schedule metadata.
-
-If the target pattern contains `M`, pass dimensions that match the subsequent
-training configuration:
-
-```bash
-python tools/checkpoint/gpt_hybrid_conversion.py \
-    --direction gpt-to-hybrid \
-    --load-dir /path/to/gpt-checkpoints \
-    --save-dir /path/to/hybrid-checkpoints \
-    --hybrid-layer-pattern 'M*-M*-M*-M*-' \
-    --d-model 4096 \
-    --mamba-d-state 128 \
-    --mamba2-n-groups 8 \
-    --mamba2-head-dim 64 \
-    --d-conv 4 \
-    --reset-iterations
-```
-
-The converter currently creates Mamba-2-shaped tensors only. Do not select
-Mamba 1 even though the CLI accepts `--mamba-version 1`. In addition,
-`2 * d_model` must be divisible by `--mamba2-head-dim`; the converter does not
-check this constraint. Keep `--d-conv 4` with the documented default Hybrid
-stack, because another convolution width requires a matching custom stack spec.
 
 The number of `*` positions and the number of `-` or `E` positions must both
 equal the source GPT layer count. The pattern validator rejects GDN, DSA, and
