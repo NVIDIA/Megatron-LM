@@ -563,6 +563,7 @@ class TestSerialization:
             fs_reader = FileSystemReader(ckpt_dir)
             original_metadata = fs_reader.read_metadata()
             assert set(original_metadata.state_dict_metadata.keys()) == {
+                'common_state/shard_0_1',
                 'keyA',
                 'prefix_key_to_remove',
             }
@@ -1021,12 +1022,14 @@ class TestNonStrictLoad:
                 'TenC',
                 'ObjA',
                 'ObjB',
+                'common_state',
             }
             assert set(sharded_metadata.keys()) == {
                 'TenA',
                 'TenB',
                 'TenC',
                 'ObjA/shard_0_1',
+                'common_state/shard_0_1',
                 *(f'ObjB/shard_0.{i}_1.8' for i in range(8)),
             }
 
