@@ -322,6 +322,20 @@ class TestMegatronFsdpFullyShard:
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
+        elif dp_shard_strategy == NO_SHARD and dp_outer_strategy == NO_SHARD:
+            # When both inner and outer DP are unsharded, the optimizer state is a
+            # fully-replicated DTensor. Starting with the PyTorch shipped in
+            # nvcr.io/nvidia/pytorch:26.06-py3, the Adam step's in-place
+            # `aten.lerp.Scalar` on a Replicate() DTensor raises
+            # "in-place operations that require placement changes are not supported".
+            # This is a PyTorch DTensor behavior change, not a Megatron-FSDP
+            # regression; skip until Megatron-FSDP's NO_SHARD optimizer path avoids
+            # the in-place op. See https://github.com/NVIDIA/Megatron-LM/issues/4611.
+            pytest.skip(
+                "Fully-unsharded ('no_shard'/'no_shard') optimizer step uses an in-place "
+                "lerp on a Replicate() DTensor, which is unsupported by the DTensor "
+                "dispatcher in PyTorch 26.06+."
+            )
         elif dp_outer_strategy == OPTIM and dp_shard_strategy != OPTIM_GRADS_PARAMS:
             # TODO(@shjwudp, @cspades): Requires various modifications to support.
             pytest.skip(
