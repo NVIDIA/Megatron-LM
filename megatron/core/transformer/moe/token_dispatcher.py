@@ -1465,11 +1465,9 @@ class _NCCLEPManager(_DispatchManager):
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
         self.use_symm_mem = config.moe_ncclep_use_symm_mem
-        # The shared pre-allocated static symm buffers are the FP8/FP4 zero-copy path,
-        # As in FP8/FP4 paths the TE only saves the quantized tensors for backward,
-        # recv_tokens stays transient so we can reuse 
-        # TODO: bf16 zero-copy would instead let EpBuffer allocate from an
-        # internal symm pool, so it does NOT use these static buffers.
+        # The shared pre-allocated static symm buffers are the FP8/FP4 zero-copy path.
+        # In FP8/FP4 the TE only saves the quantized tensors for backward, so recv_tokens stays
+        # transient and can be reused. bf16 zero-copy (EpBuffer symm-pool alloc) is future work.
         self._use_static_symm_bufs = self.use_symm_mem and bool(config.fp8 or config.fp4)
         if self.use_symm_mem and not (config.fp8 or config.fp4):
             raise ValueError(
