@@ -33,6 +33,7 @@ class CheckpointingConfig:
     sharded_backend_version: int = 1
     common_backend: str = 'torch'
     common_backend_version: int = 1
+    tensor_format: str = "ShardedTensor"
 
 
 def check_is_distributed_checkpoint(checkpoint_dir):
@@ -45,6 +46,22 @@ def check_is_distributed_checkpoint(checkpoint_dir):
         bool: True if `metadata.json` exists in the checkpoint and is a valid config.
     """
     return maybe_load_config(checkpoint_dir) is not None
+
+
+def check_is_dtensor_format(checkpoint_dir):
+    """Checks if the checkpoint is saved in DTensor format.
+
+    Args:
+        checkpoint_dir: checkpoint directory
+
+    Returns:
+        bool: True if the checkpoint is saved in DTensor format.
+    """
+    checkpoint_config = maybe_load_config(checkpoint_dir)
+    if checkpoint_config is None:
+        return False
+
+    return checkpoint_config.tensor_format == "DTensor"
 
 
 def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:

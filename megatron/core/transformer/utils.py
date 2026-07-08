@@ -100,6 +100,7 @@ def make_sharded_tensors_for_checkpoint(
     extra_state_suffix: str = '_extra_state',
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_dtensor_format: Optional[bool] = False,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -124,7 +125,6 @@ def make_sharded_tensors_for_checkpoint(
             parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     """
-
     if tensor_parallel_layers_axis_map is None:
         tensor_parallel_layers_axis_map = {}
 
@@ -138,12 +138,23 @@ def make_sharded_tensors_for_checkpoint(
         layer_key = f'{prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
-            # Compute replica_id when groups are provided
-            replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
-
-            sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
-                tensor, layer_key, sharded_offsets, replica_id=replica_id
-            )
+            if use_dtensor_format:
+                # For the DTensor format, extra states must have trivial global_shape=(1,).
+                # sharded_offsets encodes PP sharding, which would embed pp_size into
+                # global_shape (e.g. (2,) for pp=2) — not supported in the DTensor path.
+                # With PP, each pipeline stage owns different layer keys so there is no
+                # cross-rank key collision.  With TP, extra states are replicated, so
+                # saving from the coordinator rank is correct.
+                replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
+                sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
+                    tensor, layer_key, (), replica_id=replica_id
+                )
+            else:
+                # Compute replica_id when groups are provided
+                replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
+                sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
+                    tensor, layer_key, sharded_offsets, replica_id=replica_id
+                )
 
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
@@ -154,6 +165,7 @@ def make_sharded_tensors_for_checkpoint(
                 prepend_offsets=sharded_offsets,
                 tp_group=tp_group,
                 dp_cp_group=dp_cp_group,
+                use_dtensor_format=use_dtensor_format,
             )
 
         else:
@@ -163,6 +175,7 @@ def make_sharded_tensors_for_checkpoint(
                 prepend_offsets=sharded_offsets,
                 tp_group=tp_group,
                 dp_cp_group=dp_cp_group,
+                use_dtensor_format=use_dtensor_format,
             )
 
     return sharded_state_dict
@@ -256,7 +269,6 @@ def sharded_state_dict_default(
 
     # Guard for cases metadata is not provided
     metadata = ensure_metadata_has_dp_cp_group(metadata)
-
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
             prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
@@ -270,6 +282,7 @@ def sharded_state_dict_default(
             sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
     return module_sharded_sd
 
