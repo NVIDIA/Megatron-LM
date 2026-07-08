@@ -5,7 +5,8 @@
 import logging
 import os
 from argparse import Namespace
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
@@ -29,11 +30,41 @@ from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.models.gpt import GPTModelBuilder
+from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
+from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 
-class ModelOptModelBuilder(GPTModelBuilder):
-    """ModelBuilder adapter for the legacy ModelOpt model construction path."""
+@dataclass(kw_only=True)
+class ModelOptModelConfig(GPTModelConfig):
+    """Config for the legacy ModelOpt model construction path.
+
+    Identical to `GPTModelConfig` except for `builder` - construction still goes
+    through `gpt_config_from_args`, only the resolved builder class differs, since
+    ModelOpt-enabled runs need `ModelOptGPTModelBuilder` instead of `GPTModelBuilder`.
+    """
+
+    builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptGPTModelBuilder"
+
+
+@dataclass(kw_only=True)
+class ModelOptHybridModelConfig(HybridModelConfig):
+    """Config for the legacy ModelOpt model construction path, for hybrid models.
+
+    Identical to `HybridModelConfig` except for `builder` - construction still goes
+    through `hybrid_config_from_args`.
+    """
+
+    builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptHybridModelBuilder"
+
+
+class _ModelOptBuilderMixin:
+    """Shared `build_model()` override for the legacy ModelOpt model construction path.
+
+    `modelopt_gpt_hybrid_builder` dispatches on `args.export_model_type` internally, so
+    the same implementation covers both GPT and hybrid models - only the parent
+    `ModelBuilder` (and its `build_distributed_models()`) differs per config type, so
+    each gets its own concrete class below rather than sharing one tied to `GPTModelBuilder`.
+    """
 
     def build_model(
         self,
@@ -54,6 +85,15 @@ class ModelOptModelBuilder(GPTModelBuilder):
             vp_stage,
             pg_collection=pg_collection,
         )
+
+
+class ModelOptGPTModelBuilder(_ModelOptBuilderMixin, GPTModelBuilder):
+    """ModelBuilder adapter for the legacy ModelOpt model construction path."""
+
+
+class ModelOptHybridModelBuilder(_ModelOptBuilderMixin, HybridModelBuilder):
+    """ModelBuilder adapter for the legacy ModelOpt model construction path (hybrid)."""
+
 
 logger = logging.getLogger(__name__)
 
