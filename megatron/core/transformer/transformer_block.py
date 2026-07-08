@@ -25,8 +25,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
+    HyperConnectionContractModule,
     HyperConnectionModule,
-    learned_output_contract,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -391,16 +391,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
             if self.config.enable_hyper_connections:
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-                self.hc_head_scale = nn.Parameter(torch.ones(1))
-                nn.init.xavier_uniform_(self.hc_head_fn)
-                if self.config.sequence_parallel:
-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
-                    setattr(self.hc_head_base, 'sequence_parallel', True)
-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+                self.mhc_contract = HyperConnectionContractModule(self.config)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -956,14 +947,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 mhc_multistream = hidden_states
             # DSv4 introduced the new output contraction for mHC.
             # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            hidden_states = self.mhc_contract(hidden_states)
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -1080,10 +1064,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 )
 
         # Save bare parameters/buffers that are direct attributes of this block
-        # (e.g. hyper-connection learned weights: hc_head_fn, hc_head_base,
-        # hc_head_scale). The named_children loop above would silently drop
-        # these since they are not nn.Module children. Mirrors the handling in
-        # MegatronModule.sharded_state_dict.
+        # (not nn.Module children — the named_children loop above would silently
+        # drop them). mhc_contract is now a proper child module and is handled
+        # above; this catches any other bare params on the block itself.
         local_state_dict: dict = {}
         self._save_to_state_dict(local_state_dict, '', keep_vars=True)
         if local_state_dict:

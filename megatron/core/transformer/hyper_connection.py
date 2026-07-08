@@ -195,10 +195,9 @@ class HyperConnectionModule(MegatronModule):
         )
 
         init_alpha = config.mhc_init_gating_factor
-        # Learnable scaling factors (Eq. 5 in paper)
-        self.alpha_pre = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_post = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_res = nn.Parameter(torch.full((1,), init_alpha))
+        # Learnable scaling factors (Eq. 5 in paper): pre, post, res in one (3,) tensor
+        # matching HF checkpoint layout (attn_hc.scale / ffn_hc.scale).
+        self.scale = nn.Parameter(torch.full((3,), init_alpha))
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
@@ -246,9 +245,7 @@ class HyperConnectionModule(MegatronModule):
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
             setattr(self.mapping_proj.weight, 'sequence_parallel', True)
-            setattr(self.alpha_pre, 'sequence_parallel', True)
-            setattr(self.alpha_post, 'sequence_parallel', True)
-            setattr(self.alpha_res, 'sequence_parallel', True)
+            setattr(self.scale, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
 
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
@@ -280,9 +277,9 @@ class HyperConnectionModule(MegatronModule):
         """
         alpha_ = torch.cat(
             [
-                self.alpha_pre.expand(self.n),
-                self.alpha_post.expand(self.n),
-                self.alpha_res.expand(self.n * self.n),
+                self.scale[0:1].expand(self.n),
+                self.scale[1:2].expand(self.n),
+                self.scale[2:3].expand(self.n * self.n),
             ],
             dim=-1,
         )
@@ -319,9 +316,9 @@ class HyperConnectionModule(MegatronModule):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
                     x_2d,
                     self.mapping_proj.weight,
-                    self.alpha_pre,
-                    self.alpha_post,
-                    self.alpha_res,
+                    self.scale[0:1],
+                    self.scale[1:2],
+                    self.scale[2:3],
                     self.bias,
                     self.n,
                     self.norm_eps,
@@ -831,3 +828,37 @@ class HyperConnectionCheckpoint:
         """
         block_size = int(math.sqrt(num_streams * num_layers / (num_streams + 2)))
         return max(1, block_size)
+
+
+# DSv4 mHC output contraction: n residual streams → single stream.
+class HyperConnectionContractModule(MegatronModule):
+    """Encapsulates the DSv4 mHC output-contraction parameters and forward.
+
+    Parameters are named ``hc_head_fn`` / ``hc_head_base`` / ``hc_head_scale``
+    (matching their legacy flat checkpoint keys) so that owners only need to
+    strip the ``mhc_contract.`` prefix when remapping for backward-compatible
+    checkpoint loading via ``apply_prefix_mapping``.
+    """
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config)
+        hc_mult = config.num_residual_streams
+        hc_dim = config.hidden_size * hc_mult
+        self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+        self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+        self.hc_head_scale = nn.Parameter(torch.ones(1))
+        nn.init.xavier_uniform_(self.hc_head_fn)
+        if config.sequence_parallel:
+            setattr(self.hc_head_fn, 'sequence_parallel', True)
+            setattr(self.hc_head_base, 'sequence_parallel', True)
+            setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        return learned_output_contract(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_base,
+            self.hc_head_scale,
+            self.config.num_residual_streams,
+            self.config.layernorm_epsilon,
+        )

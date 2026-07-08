@@ -828,7 +828,7 @@ class TestMHCWithCudaGraph:
         )
         assert hc_modules_found, (
             "_get_submodules_under_cudagraphs does not include HyperConnectionModule. "
-            "Parameters like mapping_proj, alpha_pre/post/res will not be updated "
+            "Parameters like mapping_proj, scale, bias will not be updated "
             "during CUDA graph replay."
         )
 
