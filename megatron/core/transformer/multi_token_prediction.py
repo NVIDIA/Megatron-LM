@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.hyper_connection import HyperConnectionContractModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -1235,16 +1235,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         if self.mhc_enabled:
-            hc_mult = self.config.num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-            self.hc_head_scale = nn.Parameter(torch.ones(1))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            self.mhc_contract = HyperConnectionContractModule(self.config)
 
         self.offload_context = nullcontext()
 
@@ -1453,14 +1444,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         if self.mhc_enabled:
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            hidden_states = self.mhc_contract(hidden_states)
 
         # Layer norm before shared head layer.
         hidden_states = apply_module(self.final_layernorm)(hidden_states)

@@ -1765,11 +1765,11 @@ class TestMHCMTPIntegration:
             assert layer.eh_proj is None
             assert layer.e_proj.weight.shape == (h // tp, h)
             assert layer.h_proj.weight.shape == (h // tp, h)
-            assert layer.hc_head_fn.shape == (n, n * h)
-            assert layer.hc_head_base.shape == (n,)
-            assert layer.hc_head_scale.shape == (1,)
+            assert layer.mhc_contract.hc_head_fn.shape == (n, n * h)
+            assert layer.mhc_contract.hc_head_base.shape == (n,)
+            assert layer.mhc_contract.hc_head_scale.shape == (1,)
             if tp > 1:
-                assert getattr(layer.hc_head_fn, 'sequence_parallel', False)
+                assert getattr(layer.mhc_contract.hc_head_fn, 'sequence_parallel', False)
 
     def test_transformer_block_returns_tuple(self):
         """With mHC+MTP the block returns (contracted, multistream); without MTP just a tensor."""
