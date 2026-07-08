@@ -1178,6 +1178,15 @@ class TransformerConfig(ModelParallelConfig):
 
     Must be a positive integer when set."""
 
+    mhc_post_on_compute_stream: bool = False
+    """Run MLP-side mHC post-processing as a separate node on the compute stream.
+
+    This option only applies to mHC layers using MoE expert-parallel communication overlap.
+    When False, mHC post-processing remains part of the MoE combine node on the communication
+    stream. When True, the combine node completes communication and MoE post-processing first,
+    then a separate mHC post node runs on the existing compute stream.
+    """
+
     ####################
     # miscellaneous
     ####################
@@ -2151,6 +2160,16 @@ class TransformerConfig(ModelParallelConfig):
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
                 "to be disabled because explicit group replay is eager-only."
             )
+
+        if self.mhc_post_on_compute_stream:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "mhc_post_on_compute_stream requires enable_hyper_connections=True."
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "mhc_post_on_compute_stream requires overlap_moe_expert_parallel_comm=True."
+                )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
