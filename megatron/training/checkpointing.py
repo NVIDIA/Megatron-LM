@@ -951,7 +951,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-    ft_integration.on_checkpointing_end(is_async_finalization=args.async_save)
+    ft_integration.on_checkpointing_end(is_async_finalization=False)
 
 @_disable_gc()
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
