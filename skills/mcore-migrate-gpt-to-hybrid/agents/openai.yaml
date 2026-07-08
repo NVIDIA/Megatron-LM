@@ -1,4 +1,0 @@
-interface:
-  display_name: "Migrate GPTModel to HybridModel"
-  short_description: "Migrate GPTModel checkpoints and training"
-  default_prompt: "Use $mcore-migrate-gpt-to-hybrid to migrate this GPTModel checkpoint and training configuration to HybridModel."
