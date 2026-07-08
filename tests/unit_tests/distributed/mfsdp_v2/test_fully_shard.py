@@ -14,6 +14,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
@@ -243,6 +244,24 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
+
+
+def test_microbatch_scopes_child_contexts(distributed_setup):
+    """microbatch() should scope FSDP child contexts under an unwrapped parent."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
+    for layer in model:
+        fully_shard(layer, mesh=mesh, placements=_flat_placements())
+
+    with microbatch(model, is_last=False):
+        for layer in model:
+            assert not layer.context.is_last_microbatch
+
+    for layer in model:
+        assert layer.context.is_last_microbatch
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
