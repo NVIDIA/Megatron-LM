@@ -151,6 +151,22 @@ class TestFullyShardedDataParallel:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def test_fsdp_zero_sm_allgather_requires_dedicated_ag_group(self, monkeypatch):
+        monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            use_megatron_fsdp=True,
+            nccl_ub=True,
+            fsdp_zero_sm_allgather=True,
+        )
+        model = TestModel(input_dim=13, output_dim=17).cuda()
+        transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+
+        with pytest.raises(AssertionError, match="dedicated parameter all-gather process group"):
+            FullyShardedDataParallel(
+                config=transformer_config, ddp_config=fsdp_config, module=model
+            )
+
     def _build_fsdp_model(
         self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
     ):

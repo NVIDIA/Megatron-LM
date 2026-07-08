@@ -142,6 +142,9 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - **Only effective when using with Megatron-Core.**
     - Defaults to `False`.
     - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
+- `fsdp_zero_sm_allgather` enables NCCL zero-CTA all-gather for Megatron-FSDP parameter gathers. It requires `nccl_ub`, a dedicated all-gather process group, manual registration, and persistent double buffers. Parameter gather buffers are allocated from a dedicated symmetric NCCL memory pool; gradients, optimizer state, and main parameters remain in a separate non-symmetric pool because their rank-local layouts may differ.
+    - **Only effective when using with Megatron-Core.**
+    - Defaults to `False`.
 - `fsdp_manual_registration` will manually register the FSDP communication buffers with the NCCL user buffer. For symmetric registration with large models, the registration itself can take a significant amount of time. This option minimizes the number of registration calls to reduce the registration time. However, with this option enabled, you need to manually call the `ParamAndGradBuffer.manual_buffer_registration()` function after the first iteration. This is already implemented in the Megatron-LM training loop. In other use cases, users are expected to call this function themselves. 
     - This is an example of required modification in the training loop.
         ```python
@@ -162,7 +165,7 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
-- `maxpool_double_buffer` will use a max-pooling algorithm to build a sufficient pool of buffers that can support all layers of hybrid / asymmetrical model architectures like Nemotron.
+- `megatron_fsdp_max_pool_double_buffer` will use a max-pooling algorithm to build a sufficient pool of buffers that can support all layers of hybrid / asymmetrical model architectures like Nemotron.
     - Defaults to `False`. Highly-recommended for hybrid architectures when using `fsdp_double_buffer=True` to double-buffer every layer of the model.
 - `preproc_state_dict_for_dcp_ckpt` adds `model.state_dict()` and `optimizer.state_dict()` post-hooks that modify the model and optimizer state in preparation for `torch.distributed.checkpoint.{save,load}` ([Torch DCP](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) checkpointing. Specifically, it adds `__create_write_items__` and `__create_chunk_list__` methods to Tensors utilized by Torch DCP to redistribute parameters when saving and loading model and optimizer checkpoints. Can be deactivated should the user need a custom distributed checkpointing strategy.
     - Defaults to `True`.

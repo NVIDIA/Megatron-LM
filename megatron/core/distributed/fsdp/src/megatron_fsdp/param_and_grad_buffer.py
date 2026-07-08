@@ -102,8 +102,6 @@ except ImportError:
     except ImportError:
         nccl_allocator = None
 
-NCCL_MEMORY_POOL = None
-
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     """Alternate to ``assert`` when in the backward context to print the error
@@ -2113,6 +2111,8 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
+        self.nccl_memory_pool = None
+        self.nccl_weight_memory_pool = None
         if self.ddp_config.fsdp_zero_sm_allgather:
             assert self.ddp_config.nccl_ub, (
                 "Megatron-FSDP zero-SM all-gather requires NCCL user-buffer registration. "
@@ -2126,6 +2126,25 @@ class ParamAndGradBuffer:
                 "Megatron-FSDP zero-SM all-gather requires megatron.core.nccl_allocator "
                 "for symmetric NCCL memory allocation."
             )
+            assert (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                is not None
+            ), (
+                "Megatron-FSDP zero-SM all-gather requires a dedicated parameter "
+                "all-gather process group."
+            )
+            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
+                assert (
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=True, independent_all_gather=True
+                    )
+                    is not None
+                ), (
+                    "Megatron-FSDP zero-SM all-gather with expert parallelism requires "
+                    "a dedicated expert parameter all-gather process group."
+                )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -2135,13 +2154,19 @@ class ParamAndGradBuffer:
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
-            # Initialize the NCCL memory pool.
-            global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
-            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+            # Gradient and optimizer allocations can differ between ranks. Keep them out of
+            # the symmetric pool whose layout must match for zero-CTA parameter all-gather.
+            self.nccl_memory_pool = nccl_allocator.create_nccl_mem_pool(
+                symmetric=(
+                    not self.ddp_config.disable_symmetric_registration
+                    and not self.ddp_config.fsdp_zero_sm_allgather
+                )
             )
+            self.nccl_weight_memory_pool = self.nccl_memory_pool
+            if self.ddp_config.fsdp_zero_sm_allgather:
+                self.nccl_weight_memory_pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -2212,8 +2237,18 @@ class ParamAndGradBuffer:
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
         self.mem_alloc_context = self.get_mem_alloc_context(
-            groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
+            pool=self.nccl_memory_pool,
+            groups=self.ubr_groups,
+            symmetric=(
+                not self.ddp_config.disable_symmetric_registration
+                and not self.ddp_config.fsdp_zero_sm_allgather
+            ),
         )
+        self.weight_mem_alloc_context = self.mem_alloc_context
+        if self.ddp_config.fsdp_zero_sm_allgather:
+            self.weight_mem_alloc_context = self.get_mem_alloc_context(
+                pool=self.nccl_weight_memory_pool, groups=self.ubr_groups, symmetric=True
+            )
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -2244,7 +2279,7 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
-    def get_mem_alloc_context(self, groups=None, symmetric=True):
+    def get_mem_alloc_context(self, pool=None, groups=None, symmetric=True):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
@@ -2253,7 +2288,7 @@ class ParamAndGradBuffer:
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
-            global NCCL_MEMORY_POOL
+            assert pool is not None, "NCCL memory pool must be initialized before allocation"
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
@@ -2261,20 +2296,17 @@ class ParamAndGradBuffer:
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
                     return functools.partial(
-                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, pool
                     )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem,
-                        NCCL_MEMORY_POOL,
-                        group=groups[0],
-                        symmetric=symmetric,
+                        nccl_allocator.nccl_mem, pool, group=groups[0], symmetric=symmetric
                     )
                 else:
                     mem_alloc_context = functools.partial(
                         nccl_allocator.MultiGroupMemPoolAllocator,
-                        NCCL_MEMORY_POOL,
+                        pool,
                         groups=groups,
                         symmetric=symmetric,
                     )
@@ -2295,12 +2327,12 @@ class ParamAndGradBuffer:
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                        nccl_allocator.nccl_mem, pool, group=groups[0]
                     )
                 else:
                     # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
-                        MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
+                        MultiGroupUBRAllocator, pool, groups=groups
                     )
             else:
                 raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
@@ -2319,29 +2351,40 @@ class ParamAndGradBuffer:
 
         self.already_registered = True
 
-        global NCCL_MEMORY_POOL
         torch.cuda.synchronize()
         torch.distributed.barrier(async_op=False)
         torch.cuda.synchronize()
 
-        for group in self.ubr_groups:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+        pool_registrations = [
+            (
+                self.nccl_memory_pool,
+                (
+                    not self.ddp_config.disable_symmetric_registration
+                    and not self.ddp_config.fsdp_zero_sm_allgather
+                ),
+                "communication",
             )
-            nccl_allocator.register_mem_pool(
-                NCCL_MEMORY_POOL,
-                group,
-                symmetric=not self.ddp_config.disable_symmetric_registration,
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
-            )
+        ]
+        if self.nccl_weight_memory_pool is not self.nccl_memory_pool:
+            pool_registrations.append((self.nccl_weight_memory_pool, True, "weight"))
+
+        for pool, symmetric, pool_name in pool_registrations:
+            for group in self.ubr_groups:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registering {pool_name} mem pool to "
+                    f"group {group}, group.group_desc:{group.group_desc}, "
+                    f"group.size(): {group.size()}, symmetric:{symmetric}",
+                )
+                nccl_allocator.register_mem_pool(pool, group, symmetric=symmetric)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registered {pool_name} mem pool to "
+                    f"group {group}, group.group_desc:{group.group_desc}, "
+                    f"group.size(): {group.size()}, symmetric:{symmetric}",
+                )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -2747,7 +2790,7 @@ class ParamAndGradBuffer:
                     temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=self.weight_mem_alloc_context,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2763,7 +2806,7 @@ class ParamAndGradBuffer:
                         temporary_bucket_allocator=self.transpose_weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
-                        mem_alloc_context=self.mem_alloc_context,
+                        mem_alloc_context=self.weight_mem_alloc_context,
                         **main_buf_extra_kwargs,
                     )
 
@@ -2917,7 +2960,7 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
-                with self.mem_alloc_context():
+                with self.weight_mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wbuf,
@@ -2939,7 +2982,7 @@ class ParamAndGradBuffer:
 
             tbuf = group.transpose_weight_buffer
             if tbuf:
-                with self.mem_alloc_context():
+                with self.weight_mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
@@ -4506,6 +4549,19 @@ class AllGatherPipeline:
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
+            # A 1F1B schedule may issue this gather while the opposite pass still owns
+            # a pool slot. Include those live allocations when deciding whether another
+            # unit can be prefetched; otherwise each pass independently admits two units
+            # and overcommits the shared two-buffer pool.
+            for active_bucket_id in range(self.buffer.num_buckets):
+                active_bucket_key = self.get_bucket_key(active_bucket_id, bwd)
+                active_unit_id = parameter_groups[active_bucket_id].fsdp_unit_id
+                if (
+                    active_unit_id in self.buffer.double_buf_units
+                    and self.bucket_status[active_bucket_key] != BucketStatus.EMPTY
+                    and not self.bucket_can_be_released[active_bucket_key]
+                ):
+                    double_buf_units.add(active_unit_id)
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:

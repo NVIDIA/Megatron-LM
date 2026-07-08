@@ -150,10 +150,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
+            if ddp_config.fsdp_double_buffer:
+                assert ddp_config.megatron_fsdp_max_pool_double_buffer, (
+                    "1F1B overlap with FSDP double buffering requires "
+                    "megatron_fsdp_max_pool_double_buffer=True."
+                )
             assert config.cuda_graph_impl in ("none", "full_iteration"), (
                 "1F1B overlap with FSDP does not support per-layer CUDA graphs "
                 f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
