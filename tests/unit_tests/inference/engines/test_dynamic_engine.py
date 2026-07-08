@@ -916,6 +916,73 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_async_scheduling_flashinfer_sampling_graphs_match_torch(self) -> None:
+        """Async FlashInfer sampling graphs must match deterministic Torch sampling."""
+        pytest.importorskip("flashinfer")
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=1,
+            model_provider="gpt",
+            num_speculative_tokens=0,
+            num_cuda_graphs=1,
+            force_build_cuda_graphs=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        torch_env = self._run_test(
+            sampling_backend="torch", enable_async_scheduling=False, **common_kwargs
+        )
+        torch_tokens = [request.generated_tokens for request in torch_env.requests]
+        delete_cuda_graphs()
+        del torch_env
+
+        flashinfer_serial_env = self._run_test(
+            sampling_backend="flashinfer", enable_async_scheduling=False, **common_kwargs
+        )
+        flashinfer_serial_tokens = [
+            request.generated_tokens for request in flashinfer_serial_env.requests
+        ]
+        serial_sampling_manager = (
+            flashinfer_serial_env.engine.controller._sampling._sample_graph_manager
+        )
+        assert serial_sampling_manager is not None
+        assert serial_sampling_manager.cudagraph_runners
+        assert all(
+            runner.fwd_graph_recorded for runner in serial_sampling_manager.cudagraph_runners
+        )
+        assert all(runner.clone_outputs for runner in serial_sampling_manager.cudagraph_runners)
+        assert flashinfer_serial_tokens == torch_tokens
+        delete_cuda_graphs()
+        del flashinfer_serial_env
+
+        flashinfer_async_env = self._run_test(
+            sampling_backend="flashinfer", enable_async_scheduling=True, **common_kwargs
+        )
+        flashinfer_async_tokens = [
+            request.generated_tokens for request in flashinfer_async_env.requests
+        ]
+        async_controller = flashinfer_async_env.engine.controller
+        async_sampling_manager = async_controller._sampling._sample_graph_manager
+        assert (
+            async_controller._async_forward_launch_count > 0
+        ), async_controller._async_disable_reason
+        assert async_sampling_manager is not None
+        assert async_sampling_manager.cudagraph_runners
+        assert all(runner.fwd_graph_recorded for runner in async_sampling_manager.cudagraph_runners)
+        assert all(not runner.clone_outputs for runner in async_sampling_manager.cudagraph_runners)
+        assert flashinfer_async_tokens == flashinfer_serial_tokens == torch_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_max_sequence_length_clamp(self) -> None:
         """Clamp (not reject) when num_tokens_to_generate exceeds the remaining sequence budget."""
         test_config = DynamicEngineTestConfig(

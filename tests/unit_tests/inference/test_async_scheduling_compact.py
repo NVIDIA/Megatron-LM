@@ -8,7 +8,7 @@ import torch
 
 from megatron.core import utils as core_utils
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotAllocator
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -501,12 +501,17 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        config=SimpleNamespace(
+            materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.LEGACY
+        ),
         release_deferred_async_resources=lambda: events.append("release"),
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
+    controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = True
     controller._async_pending_cuda_graph_request_count = 2
@@ -521,7 +526,7 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
         row_indices=None, row_mapped=False
     )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._should_collect_dynamic_logprob_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
     controller._dynamic_step_sample_logits_to_next_input_ids = lambda: events.extend(
         ["sample", "copy"]
@@ -557,12 +562,17 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        config=SimpleNamespace(
+            materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.LEGACY
+        ),
         release_deferred_async_resources=lambda: events.append("release"),
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
+    controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = True
     controller._async_pending_cuda_graph_request_count = 2
@@ -577,7 +587,7 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
         row_indices=None, row_mapped=False
     )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._should_collect_dynamic_logprob_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = (
         lambda: events.append("precheck") or False
     )
@@ -616,9 +626,12 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         padded_active_request_count=2,
         is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        config=SimpleNamespace(
+            materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.LEGACY
+        ),
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
@@ -642,6 +655,8 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         inference_context=context,
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
+    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
+    controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = False
     controller._async_pending_cuda_graph_request_count = None
@@ -673,7 +688,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         any_launch_request=True,
         any_skip_request=False,
     )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._should_collect_dynamic_logprob_bookkeeping = lambda **_kwargs: False
     controller._dynamic_step_sample_logits_to_next_input_ids = lambda: events.extend(
         ["sample", "copy"]
     )
@@ -707,9 +722,12 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         padded_active_request_count=2,
         is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        config=SimpleNamespace(
+            materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.LEGACY
+        ),
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
@@ -736,6 +754,8 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         inference_context=context,
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
+    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
+    controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = False
     controller._async_pending_cuda_graph_request_count = None
@@ -765,7 +785,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         any_launch_request=True,
         any_skip_request=False,
     )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._should_collect_dynamic_logprob_bookkeeping = lambda **_kwargs: False
     controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
         ("copy", count)
@@ -936,7 +956,7 @@ def _make_async_gate_controller(active_request_count=2):
         ("pipeline_parallel", "pipeline parallel is unsupported"),
         ("mtp_presampling", "mtp pre-sampling graph is unsupported"),
         ("mtp_depth_mismatch", "not enough mtp heads"),
-        ("flashinfer", "sampling backend is unsupported"),
+        ("flashinfer", None),
         ("prefill", "not decode-only"),
         ("eager_step", "not using cuda graph"),
         ("empty", "no active requests"),
@@ -1000,13 +1020,13 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     ),
     [
         ([1, 1], [0.0, 0.0], [False, False], [0, 0], False, (False, False), True),
-        ([4, 1], [0.0, 0.0], [False, False], [0, 0], False, (True, False), True),
+        ([4, 1], [0.0, 0.0], [False, False], [0, 0], False, (True, False), False),
         ([1, 1], [0.0, 0.0], [True, False], [0, 0], True, (True, False), True),
         ([1, 1], [0.0, 0.0], [False, False], [2, 0], True, (True, False), True),
         ([1, 1], [0.0, 0.0], [False, False], [0, 0], True, (True, True), False),
     ],
 )
-def test_async_sampling_and_logprob_bookkeeping_matrix(
+def test_async_logprob_bookkeeping_ignores_sampling_mode(
     top_k, top_p, return_log_probs, top_n_logprobs, logprobs_seen, bookkeeping_state, expected
 ):
     controller, context = _make_async_gate_controller(active_request_count=2)
@@ -1021,7 +1041,7 @@ def test_async_sampling_and_logprob_bookkeeping_matrix(
     async_next_prepared, pending_forward_reused = bookkeeping_state
 
     assert (
-        controller._should_collect_dynamic_sampling_bookkeeping(
+        controller._should_collect_dynamic_logprob_bookkeeping(
             async_next_prepared=async_next_prepared, pending_forward_reused=pending_forward_reused
         )
         is expected
@@ -1429,7 +1449,6 @@ def test_dynamic_bookkeeping_marks_lifecycle_boundaries(
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = num_speculative_tokens
-    controller._request_sampling_rngs = {10: object(), 11: object(), 12: object()}
     controller._get_stop_word_finished_ids_callback = lambda _ids: stop_ids
     controller._async_finish_boundary_count = 0
     controller._async_mtp_finish_boundary_count = 0
@@ -1469,8 +1488,6 @@ def test_dynamic_bookkeeping_marks_lifecycle_boundaries(
     assert controller._async_evict_boundary_count == 1
     assert controller._async_finish_boundary_count == int(expected_finish_counter == "base")
     assert controller._async_mtp_finish_boundary_count == int(expected_finish_counter == "mtp")
-    for request_id in expected_finished:
-        assert request_id not in controller._request_sampling_rngs
 
 
 class _ReleaseRecordingAllocator:
@@ -1707,7 +1724,10 @@ def test_speculative_top_n_logprobs_zero_and_prefill_materialization_modes(
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MTP sampling test requires CUDA tensors")
 @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_last_token_logits):
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_row_mapped_mtp_sampling_uses_pending_forward_logits(
+    materialize_only_last_token_logits, use_graph
+):
     controller = object.__new__(TextGenerationController)
     stride = 3
     vocab_size = 5
@@ -1723,6 +1743,9 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
         paused_request_count=0,
         num_decode_requests=active_request_count,
         num_prefill_requests=0,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=12, prefill_req_count=0, decode_req_count=4
+        ),
         gpu_view=SimpleNamespace(
             request_in_prefill_status=torch.zeros(
                 active_request_count, dtype=torch.int32, device="cuda"
@@ -1731,23 +1754,39 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
         config=SimpleNamespace(
             materialize_only_last_token_logits=materialize_only_last_token_logits
         ),
-        using_cuda_graph_this_step=lambda: False,
+        using_cuda_graph_this_step=lambda: use_graph,
         speculative_required_logit_indices=lambda: torch.arange(
             active_request_count * stride, device="cuda"
         ),
     )
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._sampling_backend = "torch"
-    controller._enable_cuda_graph = False
+    controller._sampling_backend = "flashinfer" if use_graph else "torch"
+    controller._enable_cuda_graph = use_graph
     controller._all_logits_cuda = source_logits
+    controller._sampling_gather_indices_cuda = torch.empty(12, dtype=torch.long, device="cuda")
     controller.num_speculative_tokens = stride - 1
     controller.vocab_size = vocab_size
     captures = {}
 
-    def _sample(required_logits, request_in_prefill_status):
-        captures["required_logits"] = required_logits.detach().clone()
-        captures["request_in_prefill_status"] = request_in_prefill_status.detach().clone()
-        return torch.arange(active_request_count * stride, device="cuda"), None
+    class _Sampling:
+        def sample_speculative(
+            self,
+            logits,
+            num_decode,
+            num_prefill,
+            num_speculative_tokens,
+            _context,
+            *,
+            gather_indices=None,
+            eager=False,
+            cache_key=None,
+        ):
+            captures["logits"] = logits.detach().clone()
+            captures["gather_indices"] = gather_indices.detach().clone()
+            captures["counts"] = (num_decode, num_prefill, num_speculative_tokens)
+            captures["eager"] = eager
+            captures["cache_key"] = cache_key
+            return torch.arange(num_decode * stride + num_prefill, device="cuda")
 
     def _verify(output_tokens, input_tokens_required, *args):
         captures["input_tokens_required"] = input_tokens_required.detach().clone()
@@ -1760,7 +1799,7 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
     def _prepare(_num_decode_requests, _output_tokens, required_logit_indices, *_args):
         captures["prepared_required_indices"] = required_logit_indices.detach().clone()
 
-    controller._sample_speculative_logits = _sample
+    controller._sampling = _Sampling()
     controller._verify_speculative_tokens = _verify
     controller._prepare_speculative_tokens_for_next_forward_pass = _prepare
 
@@ -1769,40 +1808,19 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
         row_indices=torch.tensor([2, 0], device="cuda"),
     )
 
-    assert torch.equal(captures["required_logits"], source_logits.squeeze(0)[expected_indices])
-    assert torch.equal(
-        captures["request_in_prefill_status"], torch.zeros(2, dtype=torch.int32, device="cuda")
-    )
+    assert torch.equal(captures["logits"], source_logits.squeeze(0))
+    expected_gather_indices = torch.zeros(12 if use_graph else 6, dtype=torch.long, device="cuda")
+    expected_gather_indices[:6] = expected_indices
+    assert torch.equal(captures["gather_indices"], expected_gather_indices)
+    assert captures["counts"] == ((4 if use_graph else 2), 0, 2)
+    assert captures["eager"] is not use_graph
+    assert captures["cache_key"] == (("sample_speculative", 4, 0, True) if use_graph else None)
     assert torch.equal(captures["input_tokens_required"], torch.arange(6, device="cuda"))
     assert torch.equal(captures["prepared_required_indices"], expected_indices)
 
 
 @pytest.mark.internal
-def test_row_mapped_full_logits_sampling_uses_pending_decode_rows():
-    controller = object.__new__(TextGenerationController)
-    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
-
-    def _fail_last_token_logits(_logits):
-        pytest.fail("row-mapped decode reuse should gather pending rows before last_token_logits")
-
-    context = SimpleNamespace(
-        total_request_count=2,
-        paused_request_count=0,
-        padded_active_token_count=4,
-        config=SimpleNamespace(materialize_only_last_token_logits=False),
-        is_decode_only=lambda: True,
-        last_token_logits=_fail_last_token_logits,
-    )
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._all_logits_cuda = source_logits
-
-    result = controller._dynamic_step_required_token_logits(row_indices=torch.tensor([2, 0]))
-
-    assert torch.equal(result, source_logits.squeeze(0).index_select(0, torch.tensor([2, 0])))
-
-
-@pytest.mark.internal
-def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
+def test_row_mapped_greedy_sampling_uses_backend_and_current_request_order():
     controller = object.__new__(TextGenerationController)
     source_logits = torch.tensor(
         [[[0.0, 20.0, 0.0, 0.0], [0.0, 0.0, 30.0, 0.0], [0.0, 0.0, 0.0, 40.0]]]
@@ -1815,47 +1833,30 @@ def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
         is_decode_only=lambda: True,
         copy_async_prepared_decode_input_ids_from_samples=lambda *_args, **_kwargs: False,
         gpu_view=SimpleNamespace(token_to_input_ids=next_input_ids),
-        active_request_metadata={
-            "top_k": torch.tensor([1, 1], dtype=torch.int32),
-            "top_p": torch.tensor([0.0, 0.0], dtype=torch.float32),
-        },
     )
+
+    class _Sampling:
+        def sample_kernel(
+            self, logits, n, _context, *, gather_indices=None, eager=False, cache_key=None
+        ):
+            assert n == 2
+            assert eager
+            assert cache_key is None
+            return torch.argmax(logits.index_select(0, gather_indices), dim=-1)
+
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._all_logits_cuda = source_logits
-    controller._async_sample_values_cuda = torch.empty(2)
     controller._sampled_tokens_cuda = torch.empty(2, dtype=torch.long)
     controller._sampled_mtp_tokens_cuda = None
+    controller._sampling = _Sampling()
+    controller._sampling_backend = "torch"
+    controller._enable_cuda_graph = True
     controller.num_speculative_tokens = 0
 
-    controller._dynamic_step_sample_logits_greedy_to_next_input_ids(
-        row_indices=torch.tensor([2, 0])
-    )
+    controller._dynamic_step_sample_logits_to_next_input_ids(row_indices=torch.tensor([2, 0]))
 
     assert controller._sampled_tokens_cuda.tolist() == [3, 1]
     assert next_input_ids.tolist() == [3, 1]
-
-
-@pytest.mark.internal
-def test_decode_full_logits_sampling_uses_current_rows_after_async_prepare_without_row_map():
-    controller = object.__new__(TextGenerationController)
-    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
-
-    def _fail_last_token_logits(_logits):
-        pytest.fail("decode-only full logits should not use mutated last-token metadata")
-
-    context = SimpleNamespace(
-        total_request_count=2,
-        paused_request_count=0,
-        config=SimpleNamespace(materialize_only_last_token_logits=False),
-        is_decode_only=lambda: True,
-        last_token_logits=_fail_last_token_logits,
-    )
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._all_logits_cuda = source_logits
-
-    result = controller._dynamic_step_required_token_logits()
-
-    assert torch.equal(result, source_logits.squeeze(0)[:2])
 
 
 @pytest.mark.internal
@@ -1895,8 +1896,49 @@ def test_decode_full_logits_sampling_kernel_uses_contiguous_rows_after_async_pre
 
     assert captures["gather_indices"] is None
     assert captures["n"] == 4
-    assert captures["cache_key"] == ("sample", 4)
+    assert captures["cache_key"] == ("sample", 4, False)
     assert torch.equal(controller._sampled_tokens_cuda, torch.tensor([4, 3]))
+
+
+@pytest.mark.internal
+def test_row_mapped_graph_sampling_pads_gather_indices_and_reuses_gather_key():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.tensor(
+        [[[0.0, 20.0, 0.0, 0.0], [0.0, 0.0, 30.0, 0.0], [0.0, 0.0, 0.0, 40.0]]], device="cuda"
+    )
+    captures = {}
+
+    class _Sampling:
+        def sample_kernel(
+            self, logits, n, _context, *, gather_indices=None, eager=True, cache_key=None
+        ):
+            captures["gather_indices"] = gather_indices.detach().clone()
+            captures["eager"] = eager
+            captures["cache_key"] = cache_key
+            return torch.argmax(logits.index_select(0, gather_indices[:n]), dim=-1)
+
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_request_count=4,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        is_decode_only=lambda: True,
+        using_cuda_graph_this_step=lambda: True,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+    controller._sampled_tokens_cuda = torch.empty(2, dtype=torch.long, device="cuda")
+    controller._sampling_gather_indices_cuda = torch.empty(4, dtype=torch.long, device="cuda")
+    controller._sampling = _Sampling()
+    controller._sampling_backend = "flashinfer"
+    controller._enable_cuda_graph = True
+
+    controller._dynamic_step_sample_logits(row_indices=torch.tensor([2, 0], device="cuda"))
+
+    assert torch.equal(captures["gather_indices"], torch.tensor([2, 0, 0, 0], device="cuda"))
+    assert not captures["eager"]
+    assert captures["cache_key"] == ("sample", 4, True)
+    assert torch.equal(controller._sampled_tokens_cuda, torch.tensor([3, 1], device="cuda"))
 
 
 @pytest.mark.internal
@@ -1906,10 +1948,13 @@ def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits
     sampled_tokens = torch.tensor([4, 1], dtype=torch.long)
     captures = {}
 
-    def _calculate_log_probs(logits, new_tokens, only_last_token_logits=False):
+    sampling = object()
+
+    def _calculate_log_probs(logits, new_tokens, only_last_token_logits=False, sampling=None):
         captures["logits"] = logits.detach().clone()
         captures["new_tokens"] = new_tokens.detach().clone()
         captures["only_last_token_logits"] = only_last_token_logits
+        captures["sampling"] = sampling
         return [[-1.0], [-2.0]], logits.squeeze(0)
 
     context = SimpleNamespace(
@@ -1923,6 +1968,7 @@ def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._all_logits_cuda = source_logits
     controller._sampled_tokens_cuda = sampled_tokens
+    controller._sampling = sampling
     controller.num_speculative_tokens = 0
 
     log_probs, log_probs_tensor = controller._dynamic_step_calculate_log_probs(
@@ -1935,6 +1981,7 @@ def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits
     assert torch.equal(captures["logits"], expected_logits)
     assert torch.equal(captures["new_tokens"], sampled_tokens)
     assert captures["only_last_token_logits"]
+    assert captures["sampling"] is sampling
 
 
 @pytest.mark.internal

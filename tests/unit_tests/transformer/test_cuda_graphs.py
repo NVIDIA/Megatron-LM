@@ -1507,8 +1507,46 @@ class TestInlineCaptureManager:
         graph_out_2 = module.my_op(x)
         assert torch.equal(eager_out, graph_out_1)
         assert torch.equal(eager_out, graph_out_2)
+        assert graph_out_1.data_ptr() != graph_out_2.data_ptr()
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
+
+    @torch.inference_mode()
+    def test_static_outputs_are_reused_and_overwritten(self):
+        """Non-cloned graph output must alias static storage until the next replay."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+            clone_outputs=False,
+        )
+
+        first_output = module.my_op(torch.zeros(4, config.hidden_size, device="cuda"))
+        first_snapshot = first_output.clone()
+        second_output = module.my_op(torch.ones(4, config.hidden_size, device="cuda"))
+
+        assert first_output.data_ptr() == second_output.data_ptr()
+        assert torch.equal(first_output, second_output)
+        assert not torch.equal(first_snapshot, second_output)
+
+    def test_static_outputs_require_forward_only(self):
+        """Static graph outputs cannot participate in a captured backward pass."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+
+        with pytest.raises(AssertionError, match="require need_backward=False"):
+            CudaGraphManager(
+                config,
+                base_module=module,
+                function_name="my_op",
+                need_backward=True,
+                clone_outputs=False,
+            )
 
     @torch.inference_mode()
     def test_eager_bypass(self):

@@ -18,24 +18,33 @@ class FlashInferSampling(Sampling):
     """Fused FlashInfer sampling, with optional CUDA graph capture/replay."""
 
     def __init__(
-        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
+        self,
+        vocab_size: int,
+        rng: torch.Generator,
+        config=None,
+        enable_cuda_graph: bool = False,
+        return_static_graph_outputs: bool = False,
     ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng
+        self._sample_graph_manager = None
+        self._speculative_graph_manager = None
         if enable_cuda_graph and config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
+            self._sample_graph_manager = CudaGraphManager(
                 config,
                 self,
                 function_name="sample_kernel",
                 need_backward=False,
                 inline_capture=True,
+                clone_outputs=not return_static_graph_outputs,
             )
-            CudaGraphManager(
+            self._speculative_graph_manager = CudaGraphManager(
                 config,
                 self,
                 function_name="sample_speculative",
                 need_backward=False,
                 inline_capture=True,
+                clone_outputs=not return_static_graph_outputs,
             )
 
     def sample_kernel(
@@ -61,7 +70,8 @@ class FlashInferSampling(Sampling):
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
-            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
+            Sampled token ids of shape `[n]`. When configured for static graph outputs, the
+            returned storage is valid only until the same runner replays.
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
