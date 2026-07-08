@@ -19,10 +19,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core.inference.batch_dimensions_utils import (
-    CUDAGraphBatchDimensionBuilder,
-    InferenceBatchDimensions,
-)
 from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,

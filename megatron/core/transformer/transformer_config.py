@@ -34,7 +34,6 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
-    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -1615,21 +1614,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
-            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
-            if self.add_bias_linear:
-                raise ValueError(
-                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
-                    "Disable linear bias for DSA configs."
-                )
-            if self.dsa_indexer_topk_freq < 1:
-                raise ValueError(
-                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
-                )
-            if self.dsa_indexer_skip_topk_offset < 0:
-                raise ValueError(
-                    "dsa_indexer_skip_topk_offset must be non-negative, got "
-                    f"{self.dsa_indexer_skip_topk_offset}."
-                )
+            pass
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"

@@ -19,15 +19,10 @@ import torch.nn.functional as F
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.config import (
-    DistributedInitConfig, 
-    InferenceSetupConfig,
+    CheckpointConfig,
+    DistributedInitConfig,
     InferenceConfigContainer,
-    PretrainConfigContainer, 
-    SchedulerConfig, 
-    TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    InferenceSetupConfig,
     LoggerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
@@ -608,9 +603,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
     return _default_config_from_args(InferenceSetupConfig, args)
 
 
-def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
-) -> InferenceConfigContainer:
+def inference_cfg_container_from_args(args: Namespace, model_cfg=None) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that

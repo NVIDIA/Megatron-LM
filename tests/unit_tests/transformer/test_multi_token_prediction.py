@@ -21,6 +21,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
@@ -1949,7 +1950,7 @@ class TestMHCMTPIntegration:
                 vp_stage=vp_stage,
             )
 
-        gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+        gpt_model, _, _ = setup_model_and_optimizer(ModelType.encoder_or_decoder, model_provider)
 
         data = list(range(seq_length))
         tokens = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()

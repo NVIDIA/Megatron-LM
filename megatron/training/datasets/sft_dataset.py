@@ -6,8 +6,15 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import pandas as pd
 import torch
+
+try:
+    import pandas as pd
+
+    HAVE_PANDAS = True
+except ImportError:
+    pd = None
+    HAVE_PANDAS = False
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
@@ -209,10 +216,8 @@ class SFTDataset(MegatronDataset):
         # stack samples with different numbers of documents.  Trailing
         # entries are filled with pack_length; the merge helper strips
         # them later.
-        padded_cu_seqlens = torch.full(
-            (pack_length + 1,), pack_length, dtype=torch.int32,
-        )
-        padded_cu_seqlens[:cu_seqlens.numel()] = cu_seqlens
+        padded_cu_seqlens = torch.full((pack_length + 1,), pack_length, dtype=torch.int32)
+        padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
 
         return {
             'tokens': input_ids,
@@ -253,6 +258,7 @@ class MockSFTLowLevelDataset:
         self.format = kwargs.get("format", "thd")
 
         if mode == "file":
+            assert HAVE_PANDAS, "pandas is required to load sequence lengths from a file"
             self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":

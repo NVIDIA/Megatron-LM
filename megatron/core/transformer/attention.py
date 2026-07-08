@@ -42,7 +42,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
-from megatron.core.transformer.utils import is_layer_window_attention
+from megatron.core.transformer.utils import cat_with_oom_fallback, is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1446,7 +1446,8 @@ class Attention(MegatronModule, ABC):
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
+                output_gate=output_gate,
+                head_wise_gate=head_wise_gate_enabled,
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
