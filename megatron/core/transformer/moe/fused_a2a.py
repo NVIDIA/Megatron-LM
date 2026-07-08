@@ -609,11 +609,6 @@ try:
 except ImportError:
     HAVE_TE_EP = False
 
-_TE_EP_MISSING_MSG = (
-    "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
-    "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
-)
-
 
 def ensure_nccl_ep_bootstrapped(
     ep_group,
@@ -642,7 +637,10 @@ def ensure_nccl_ep_bootstrapped(
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
-        raise RuntimeError(_TE_EP_MISSING_MSG)
+        raise RuntimeError(
+            "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
+            "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
+        )
     if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
         return
     te_ep.ep_bootstrap(
