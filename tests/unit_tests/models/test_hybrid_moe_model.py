@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -213,7 +213,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shared_expert_gate": False,
+    "use_grouped_gemm_for_shared_expert": False,
     "moe_shared_expert_intermediate_size": 3712,
+    "moe_shared_expert_glu_interleave_size": None,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
@@ -310,6 +312,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
+    "delay_offload_until_cuda_graph": False,
+    "delta_offload_bytes_across_pp_ranks": 0,
+    "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
