@@ -4190,6 +4190,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         embeddings, or None when there are no active tokens. During
         decode-only steps (no image tokens consumed) returns all -1.
         """
+        # Text-only workloads never populate the per-request VLM dicts; short-
+        # circuit so the decode hot path doesn't pay for .tolist() / torch.cat.
+        if not self._request_to_image_token_mask:
+            return None
+
         if self.padded_active_token_count is None or self.padded_active_token_count == 0:
             return None
 
@@ -4249,6 +4254,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns tensor of shape [total_image_tokens, 1, hidden] or None.
         """
+        # Text-only workloads never populate the per-request VLM dicts; short-
+        # circuit so the decode hot path doesn't pay for .tolist() / torch.cat.
+        if not self._request_to_image_embeddings:
+            return None
+
         active_request_ids = self.request_ids[
             self.paused_request_count : self.total_request_count
         ].tolist()

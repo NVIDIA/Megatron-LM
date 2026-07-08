@@ -156,13 +156,23 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         batch_size = len(tokens)
         img_embeddings_per_tile = 0  # set below in the static-resolution branch
 
+        # Reject dynamic-resolution requests when the model does not expose
+        # the required attributes. Upstream LLaVAModel sets neither
+        # _dynamic_resolution nor _patch_dim / _class_token_len; without those,
+        # falling through to the static path would silently miscount tokens.
+        if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
+            raise NotImplementedError(
+                "Dynamic-resolution image expansion requires LLaVAModel "
+                "attributes (_dynamic_resolution, _patch_dim, _class_token_len) "
+                "not yet available upstream. Use num_tiles (static resolution) "
+                "or wait for the companion LLaVAModel changes."
+            )
+
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
             # Dynamic resolution: compute per-image embedding count from imgs_sizes
             patch_dim = module._patch_dim
             do_pixel_shuffle = module._pixel_shuffle
-            drop_class_token = module._drop_vision_class_token
-            class_token_len = module._class_token_len
 
             per_image_embeddings = []
             for i in range(imgs_sizes.shape[0]):
@@ -281,6 +291,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             self.model.module.module if hasattr(self.model.module, "module") else self.model.module
         )
 
+        # Reject dynamic-resolution requests when the model does not expose
+        # the required attributes (see expand_image_tokens for context).
+        if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
+            raise NotImplementedError(
+                "Dynamic-resolution vision-encoder forward requires "
+                "LLaVAModel._dynamic_resolution/_patch_dim, not yet available "
+                "upstream. Use num_tiles (static resolution) or wait for the "
+                "companion LLaVAModel changes."
+            )
+
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
@@ -374,12 +394,39 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
                     image_embeddings_flat = image_embeddings_flat.to(dtype=final_embedding.dtype)
 
+                    # Guard against count disagreement between expand_image_tokens
+                    # (which drove image_token_mask indices) and
+                    # _forward_vision_encoder (which produced image_embeddings).
+                    # Class-token handling or pixel-shuffle rounding differing
+                    # between the two would otherwise silently index out of bounds.
+                    if image_indices.numel() > 0:
+                        max_idx = int(image_indices.max().item())
+                        assert max_idx < image_embeddings_flat.shape[0], (
+                            f"image_indices max ({max_idx}) exceeds "
+                            f"image_embeddings_flat size "
+                            f"({image_embeddings_flat.shape[0]}); "
+                            f"expand_image_tokens count disagrees with "
+                            f"_forward_vision_encoder output"
+                        )
+
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
             # Transpose back to [seq_len, batch, embed_dim]
             final_embedding = final_embedding.transpose(0, 1).contiguous()
         else:
             final_embedding = None
+
+        # This engine plumbing ships without the LLaVAModel.forward_lm_only
+        # entry point. Any VLM caller upstream hits this guard rather than a
+        # confusing AttributeError. Text-only requests never reach here (the
+        # dispatch in _forward gates on image_token_mask).
+        if not hasattr(module, "forward_lm_only"):
+            raise NotImplementedError(
+                "Dynamic VLM forward requires LLaVAModel.forward_lm_only, "
+                "which is not yet available upstream. This PR ships engine "
+                "and wire plumbing; the LLaVAModel companion change lands "
+                "in a follow-up PR."
+            )
 
         output = module.forward_lm_only(
             combined_embeddings=final_embedding,

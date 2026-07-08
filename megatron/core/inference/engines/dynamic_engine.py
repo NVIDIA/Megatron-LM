@@ -1253,6 +1253,20 @@ class DynamicInferenceEngine(AbstractEngine):
         """Expand image tokens, run the vision encoder, register per-request
         image data on the context, and return a DynamicVLMInferenceRequest.
         """
+        # PP>1 needs a non-first-stage embedding recv path (the wrapper's
+        # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
+        # correct: non-first stages would see None embeddings but a non-None
+        # mask and silently skip image splicing.
+        pp_group = self.controller.pp_group
+        if pp_group is not None and torch.distributed.is_initialized():
+            pp_world_size = torch.distributed.get_world_size(pp_group)
+            if pp_world_size > 1:
+                raise NotImplementedError(
+                    "Dynamic VLM inference currently supports pipeline-parallel "
+                    "world size 1 only; PP>1 requires the non-first-stage "
+                    "embedding recv path which is not yet available upstream."
+                )
+
         device = torch.cuda.current_device()
         if imgs is not None:
             imgs = imgs.to(device=device)
