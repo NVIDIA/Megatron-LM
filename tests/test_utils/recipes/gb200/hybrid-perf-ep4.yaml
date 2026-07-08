@@ -43,5 +43,5 @@ products:
   - test_case: [hybrid_nanov3_3b_perf_gb200_4gpu]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_gb200]
