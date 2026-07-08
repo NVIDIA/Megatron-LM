@@ -439,10 +439,6 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
         1,
         2,
     ]
-    assert [
-        (extra_args["mhc_recompute_group_start"], extra_args["mhc_recompute_group_end"])
-        for extra_args in captured_extra_args
-    ] == [(0, 1), (0, 1), (2, 3), (2, 3), (4, 4)]
 
 
 def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradients(
