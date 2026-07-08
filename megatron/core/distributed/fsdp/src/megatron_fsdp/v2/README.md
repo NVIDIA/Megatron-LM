@@ -313,8 +313,8 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
 - **Temporary communication bucket lifecycle.** All temporary all-gather /
-  reduce-scatter buckets are allocated on the default CUDA stream and only
-  compute operations (all-gather, reduce-scatter) run on side streams
+  reduce-scatter buckets are allocated on the caller CUDA stream and only
+  communication collectives (all-gather, reduce-scatter) run on side streams
   (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
   allocation and compute, and between compute and free, guarantee ordering
   without ``record_stream``.  ``record_stream`` is intentionally avoided

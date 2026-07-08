@@ -6,7 +6,7 @@ import logging
 import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,27 +22,44 @@ from .utils import ParamGroupIdx, _replace_module_parameter
 logger = logging.getLogger(__name__)
 
 
-def _unshard_weight_buffers(dp_group, weight_buffers, *, async_op: bool) -> None:
-    """Unshard one same-process-group buffer run and order async completion."""
+def _unshard_weight_buffers(
+    dp_group,
+    weight_buffers,
+    *,
+    async_op: bool,
+    stream: torch.cuda.Stream,
+    caller_stream: torch.cuda.Stream,
+) -> None:
+    """Unshard one communication-compatible buffer run."""
+    # Allocate on the caller stream before entering the communication stream.
+    full_buffers = [weight_buffer.fetch_buffer(as_shard=False) for weight_buffer in weight_buffers]
+    if async_op:
+        stream.wait_stream(caller_stream)
+
     cm = (
         _coalescing_manager(dp_group, async_ops=async_op)
         if len(weight_buffers) > 1
         else nullcontext()
     )
-    with cm as coalescing_event:
-        for weight_buffer in weight_buffers:
-            weight_buffer.unshard(bind_params=True)
-    if async_op and coalescing_event is not None:
-        coalescing_event.wait()
+    with torch.cuda.stream(stream):
+        with cm as coalescing_event:
+            for weight_buffer in weight_buffers:
+                # The full buffer is already allocated, so only the collective
+                # is dispatched while the communication stream is current.
+                weight_buffer.unshard(bind_params=False, stream=stream)
+        if async_op and coalescing_event is not None:
+            coalescing_event.wait()
+
+    # Rebinding only updates tensor metadata and stays on the caller stream.
+    for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
+        weight_buffer._bind_buffer_to_params(full_buffer)
 
 
 def _select_unshard_stream(ctx, *, async_op: bool):
-    """Select the unshard stream and preserve caller-to-AG ordering."""
+    """Capture the caller stream before selecting the unshard stream."""
     caller_stream = torch.cuda.current_stream()
-    if not async_op:
-        return caller_stream
-    ctx.ag_stream.wait_stream(caller_stream)
-    return ctx.ag_stream
+    stream = ctx.ag_stream if async_op else caller_stream
+    return caller_stream, stream
 
 
 class _FSDPState:
@@ -110,6 +127,9 @@ class _FSDPRootContext:
 
     Used to enforce correct dependency between all-gather and compute.
     """
+
+    unshard_pending_post: Dict[int, Set[bool]] = field(default_factory=dict)
+    """Maps module_id -> forward/backward post-unshard phases awaiting completion."""
 
     enable_unshard_prefetch: bool = True
     """Whether to prefetch (pipeline) parameter unshard for upcoming modules."""
@@ -596,6 +616,7 @@ class FSDPModule:
             forward_order=forward_order,
             reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
+            unshard_pending_post={id(module): set() for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
@@ -659,7 +680,7 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
-        stream = _select_unshard_stream(ctx, async_op=async_op)
+        caller_stream, stream = _select_unshard_stream(ctx, async_op=async_op)
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
@@ -675,44 +696,47 @@ class FSDPModule:
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            # Coalesce consecutive all-gathers that use the same process group,
-            # then run mixed-precision post-processing on the same stream.
-            with torch.cuda.stream(stream):
-                pending_post_unshard = []
-                buffer_runs = []
+            # Build communication-compatible runs on the caller stream. The
+            # helper narrows the side-stream scope to collectives only.
+            buffer_runs = []
+            for param_names, param_group in module._named_param_groups:
+                # Optional NaN checking for debugging
+                if getattr(module, "_enable_nan_checks", False):
+                    for name, dist_param in zip(param_names, param_group.dist_params):
+                        assert not torch.isnan(
+                            dist_param._local_tensor
+                        ).any(), f"NaN detected in dist param for parameter {name}"
 
-                for param_names, param_group in module._named_param_groups:
-                    # Optional NaN checking for debugging
-                    if getattr(module, "_enable_nan_checks", False):
-                        for name, dist_param in zip(param_names, param_group.dist_params):
-                            assert not torch.isnan(
-                                dist_param._local_tensor
-                            ).any(), f"NaN detected in dist param for parameter {name}"
-
-                    pending_post_unshard.append(param_group)
-                    for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-                        if (
-                            buffer_runs
-                            and buffer_runs[-1][0] is weight_buffer.dp_group
-                            and buffer_runs[-1][1] == weight_buffer.dtype
-                            and buffer_runs[-1][2] == weight_buffer.device
-                        ):
-                            buffer_runs[-1][3].append(weight_buffer)
-                        else:
-                            buffer_runs.append(
-                                (
-                                    weight_buffer.dp_group,
-                                    weight_buffer.dtype,
-                                    weight_buffer.device,
-                                    [weight_buffer],
-                                )
+                for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+                    if (
+                        buffer_runs
+                        and buffer_runs[-1][0] is weight_buffer.dp_group
+                        and buffer_runs[-1][1] == weight_buffer.dtype
+                        and buffer_runs[-1][2] == weight_buffer.device
+                    ):
+                        buffer_runs[-1][3].append(weight_buffer)
+                    else:
+                        buffer_runs.append(
+                            (
+                                weight_buffer.dp_group,
+                                weight_buffer.dtype,
+                                weight_buffer.device,
+                                [weight_buffer],
                             )
+                        )
 
-                for dp_group, _, _, weight_buffers in buffer_runs:
-                    _unshard_weight_buffers(dp_group, weight_buffers, async_op=async_op)
+            for dp_group, _, _, weight_buffers in buffer_runs:
+                _unshard_weight_buffers(
+                    dp_group,
+                    weight_buffers,
+                    async_op=async_op,
+                    stream=stream,
+                    caller_stream=caller_stream,
+                )
 
-                for param_group in pending_post_unshard:
-                    param_group.post_unshard(bwd_pass=bwd_pass)
+            # Post-processing may launch Transformer Engine kernels. Defer it
+            # until this module's caller stream has waited for communication.
+            ctx.unshard_pending_post[id(module)].add(bwd_pass)
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -725,6 +749,12 @@ class FSDPModule:
         # all-gathers during activation recompute and prefetch re-entry.
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
+
+        pending_post = ctx.unshard_pending_post[id(self)]
+        if bwd_pass in pending_post:
+            for _, param_group in self._named_param_groups:
+                param_group.post_unshard(bwd_pass=bwd_pass)
+            pending_post.remove(bwd_pass)
 
         # Replace module parameters with unsharded versions
         for param_names, param_group in self._named_param_groups:
@@ -742,11 +772,18 @@ class FSDPModule:
         """Reshard parameters by replacing with sharded DTensors."""
         torch.cuda.nvtx.range_push("MFSDP reshard")
         ctx = self._fsdp_root_context
+        pending_post = ctx.unshard_pending_post[id(self)]
+        unshard_event = ctx.unshard_done_events[id(self)]
+        if pending_post and unshard_event is not None:
+            # A prefetched module may be skipped by control flow. Join its
+            # communication before releasing caller-owned temporary buffers.
+            unshard_event.wait()
         for param_names, param_group in self._named_param_groups:
             param_group.reshard()
             for name, dist_param in zip(param_names, param_group.dist_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
+        pending_post.clear()
         torch.cuda.nvtx.range_pop()
 
     def _wait_for_previous_async_reduce_grad(self):

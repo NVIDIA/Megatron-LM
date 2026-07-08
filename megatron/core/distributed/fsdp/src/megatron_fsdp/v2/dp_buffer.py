@@ -593,8 +593,6 @@ class DataParallelBuffer:
             torch.distributed.all_gather_into_tensor(
                 output_tensor=full_buffer, input_tensor=shard_buffer, group=self.dp_group
             )
-            if full_buffer.is_cuda:
-                full_buffer.record_stream(stream)
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
@@ -633,7 +631,7 @@ class DataParallelBuffer:
             If True, return only this rank's shard slice of the full buffer.
             Default (False) returns the full unsharded buffer.
 
-        Memory allocation always occurs on the default stream for deterministic
+        Memory allocation always occurs on the caller stream for deterministic
         caching-allocator behaviour.
         """
         if self.is_distributed:

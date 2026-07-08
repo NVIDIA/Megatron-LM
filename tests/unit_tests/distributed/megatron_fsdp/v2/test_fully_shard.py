@@ -326,13 +326,13 @@ class TestFullyShardBasic:
 
         captured_run_dtypes = []
 
-        def capture_unshard(dp_group, weight_buffers, *, async_op):
-            del dp_group, async_op
+        def capture_unshard(dp_group, weight_buffers, *, async_op, stream, caller_stream):
+            del dp_group, async_op, caller_stream
             captured_run_dtypes.append(
                 tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
             )
             for weight_buffer in weight_buffers:
-                weight_buffer.unshard(bind_params=True)
+                weight_buffer.unshard(bind_params=True, stream=stream)
 
         monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
 
@@ -346,6 +346,53 @@ class TestFullyShardBasic:
                 )
         finally:
             model.reshard()
+
+    def test_prefetch_defers_post_unshard_to_caller_stream(self, monkeypatch):
+        """Prefetch should allocate now but run post-processing when consumed."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=1).to(_device())
+        layer = model.layers[0]
+        fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+
+        ctx = model._fsdp_root_context
+        caller_stream = torch.cuda.current_stream()
+        allocation_streams = []
+        post_streams = []
+
+        allocator = ctx.bucket_allocator
+        original_allocate = allocator.allocate
+
+        def capture_allocate(*args, **kwargs):
+            allocation_streams.append(torch.cuda.current_stream())
+            return original_allocate(*args, **kwargs)
+
+        monkeypatch.setattr(allocator, "allocate", capture_allocate)
+        for param_group in layer._fsdp_param_groups:
+            original_post_unshard = param_group.post_unshard
+
+            def capture_post_unshard(bwd_pass=False, *, _original=original_post_unshard):
+                post_streams.append(torch.cuda.current_stream())
+                return _original(bwd_pass=bwd_pass)
+
+            monkeypatch.setattr(param_group, "post_unshard", capture_post_unshard)
+
+        try:
+            model.unshard(async_op=True)
+            assert False in ctx.unshard_pending_post[id(layer)]
+            assert not post_streams, "Prefetch must not run post-unshard processing"
+            assert allocation_streams
+            assert all(stream == caller_stream for stream in allocation_streams)
+
+            model.reshard()
+            layer.unshard(async_op=True)
+
+            assert False not in ctx.unshard_pending_post[id(layer)]
+            assert post_streams
+            assert all(stream == caller_stream for stream in post_streams)
+        finally:
+            model.reshard()
+            layer.reshard()
 
 
 # ------------------------------------------------------------------ #
