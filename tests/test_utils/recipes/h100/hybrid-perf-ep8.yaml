@@ -40,5 +40,5 @@ products:
   - test_case: [hybrid_nanov3_3b_perf]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
