@@ -8,6 +8,7 @@ from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -20,9 +21,20 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.core.post_training.modelopt.layers import Linear, Norm
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
+)
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_te_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -34,31 +46,36 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
     )
     prompt_length = model.max_sequence_length - 1
 
-    # load-context/first-output-token, step/generate
-    for offset in (0, prompt_length):
-        if offset == 0:
-            sequence_length = prompt_length
-        else:
-            sequence_length = 1
-        inference_context.sequence_len_offset = offset
+    with InferenceMode.active():
+        # load-context/first-output-token, step/generate
+        for offset in (0, prompt_length):
+            if offset == 0:
+                sequence_length = prompt_length
+            else:
+                sequence_length = 1
+            inference_context.sequence_len_offset = offset
 
-        data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+            data = list(range(sequence_length))
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            position_ids = (
+                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            )
+            attention_mask = torch.ones(
+                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+            ).cuda()
 
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-        )
+            logits = model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
 
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == model.vocab_size
+            assert logits.shape[0] == micro_batch_size
+            # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+            assert logits.shape[1] == 1
+            assert logits.shape[2] == model.vocab_size
 
 
 class TestModelOptGPTModel:
@@ -302,3 +319,67 @@ def test_get_hybrid_stack_modelopt_spec_use_default_te_spec():
     """Test that use_default_te_spec=True returns the standard hybrid_stack_spec."""
     spec = get_hybrid_stack_modelopt_spec(use_default_te_spec=True)
     assert spec is hybrid_stack_spec
+
+
+def test_get_hybrid_stack_modelopt_spec_local_feature_specs():
+    """The local ModelOpt HybridStack spec covers all HybridModel layer families."""
+    spec = get_hybrid_stack_modelopt_spec()
+    submodules = spec.submodules
+
+    gdn_layer = submodules.gdn_layer
+    assert gdn_layer.module is TransformerLayer
+    assert gdn_layer.submodules.input_layernorm is Norm
+    assert gdn_layer.submodules.self_attention.module is GatedDeltaNet
+    assert gdn_layer.submodules.self_attention.submodules.in_proj is ColumnParallelLinear
+    assert gdn_layer.submodules.self_attention.submodules.out_norm is Norm
+    assert gdn_layer.submodules.self_attention.submodules.out_proj is RowParallelLinear
+
+    dsa_layer = submodules.dsa_layer
+    assert dsa_layer.module is TransformerLayer
+    assert dsa_layer.submodules.input_layernorm is Norm
+    assert dsa_layer.submodules.self_attention.module is MLASelfAttention
+    assert dsa_layer.submodules.self_attention.submodules.q_layernorm is IdentityOp
+    assert dsa_layer.submodules.self_attention.submodules.kv_layernorm is IdentityOp
+    dsa_attention = dsa_layer.submodules.self_attention.submodules.core_attention
+    assert dsa_attention.module is DSAttention
+    indexer = dsa_attention.submodules.indexer
+    assert indexer.module is DSAIndexer
+    assert indexer.submodules.linear_wq_b is Linear
+    assert "parallel_mode" in inspect.signature(indexer.submodules.linear_wq_b).parameters
+    assert indexer.submodules.linear_wk is Linear
+    assert indexer.submodules.k_norm is Norm
+    assert indexer.submodules.linear_weights_proj is Linear
+
+    mtp_block_spec = submodules.mtp_block_spec
+    assert mtp_block_spec.module is MultiTokenPredictionBlock
+    mtp_layer_spec = mtp_block_spec.submodules.layer_specs[0]
+    assert mtp_layer_spec.module is MultiTokenPredictionLayer
+    assert mtp_layer_spec.submodules.enorm is Norm
+    assert mtp_layer_spec.submodules.hnorm is Norm
+    assert mtp_layer_spec.submodules.eh_proj is ColumnParallelLinear
+    assert mtp_layer_spec.submodules.layer_norm is Norm
+
+
+def test_get_hybrid_stack_modelopt_spec_remaps_gdn_layernorm():
+    """GDN local spec can load checkpoints saved from the fused TE GDN spec."""
+    spec = get_hybrid_stack_modelopt_spec(remap_te_layernorm=True)
+    assert spec.submodules.gdn_layer.submodules.sharded_state_dict_keys_map == {
+        'input_layernorm.': 'self_attention.in_proj.layer_norm_'
+    }
+
+
+def test_modelopt_linear_accepts_duplicated_parallel_mode():
+    """ModelOpt Linear supports duplicated TELinear-compatible construction."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=4, num_attention_heads=1, use_cpu_initialization=True
+    )
+    linear = Linear(
+        4, 4, config=config, init_method=config.init_method, bias=False, parallel_mode="duplicated"
+    )
+
+    assert linear.parallel_mode == "duplicated"
+    assert linear.tp_group is None
+    assert linear.weight.tensor_model_parallel is False
+
+    with pytest.raises(ValueError, match="only supports parallel_mode"):
+        Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")

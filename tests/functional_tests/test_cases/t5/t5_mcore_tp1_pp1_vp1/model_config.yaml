@@ -51,4 +51,10 @@ MODEL_ARGS:
   --deterministic-mode: true
   --ckpt-format: torch
   --log-memory-to-tensorboard: true
+  # Synchronous data loading: the default 2 persistent dataloader workers
+  # (pin_memory, no DataLoader timeout) can stall on the CI data mount, leaving
+  # the rank blocked in get_batch -> queue.get forever -> the other ranks time
+  # out in the grad all-reduce (600s NCCL watchdog). In-process loading removes
+  # the worker-queue hang surface; test data is tiny so perf impact is nil.
+  --num-workers: 0
 TEST_TYPE: regular

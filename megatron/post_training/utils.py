@@ -10,7 +10,7 @@ from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
 from megatron.core import parallel_state
-from megatron.training.utils import unwrap_model
+from megatron.core.utils import unwrap_model
 
 
 def modelopt_version_higher_than(target_version: str):
@@ -100,8 +100,8 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
 
 def print_distributed_quant_summary(model, msg=""):
     from megatron.core import parallel_state
+    from megatron.core.utils import unwrap_model
     from megatron.training import print_rank_0
-    from megatron.training.utils import unwrap_model
 
     unwrapped_model = unwrap_model(model)
     if isinstance(unwrapped_model, list):

@@ -80,7 +80,6 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        margs.use_legacy_models = False
         margs.transformer_impl = self.args.loader_transformer_impl
         if self.args.loader_transformer_impl == "local" and margs.normalization == "RMSNorm":
             margs.no_persist_layer_norm = True
@@ -454,7 +453,6 @@ class MegatronCheckpointLoaderBase:
         md.true_vocab_size = true_vocab_size
         md.make_vocab_size_divisible_by = self.margs.make_vocab_size_divisible_by
         md.checkpoint_args = self.checkpoint_args
-        md.use_legacy_models = self.margs.use_legacy_models
         return md
 
     def build_sys_argv(self):

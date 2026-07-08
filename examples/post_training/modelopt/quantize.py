@@ -1,11 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample Generate GPT."""
+"""Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
-import copy
 import functools
+import gc
 import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -16,11 +17,28 @@ import torch.distributed
 from tqdm import tqdm
 
 # NOTE: Needs to be before modelopt imports in case megatron.core is not installed.
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "../../../")))
 
 import modelopt.torch.quantization as mtq
+from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
+from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
+
+# modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to the
+# legacy local-JSONL + HF-dataset calibration path on 0.44 so this script works on both
+# releases.
+try:
+    from modelopt.torch.utils.plugins.megatron_calibration import (
+        get_megatron_calibration_dataloader,
+        get_megatron_calibration_forward_loop,
+    )
+
+    _HAS_SHARED_CALIB = True
+except ImportError:
+    _HAS_SHARED_CALIB = False
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -35,22 +53,23 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
-from megatron.core.utils import get_batch_on_this_cp_rank
+from utils import build_lm_batch_from_input_ids, get_hf_tokenizer
+
+from megatron.core import parallel_state
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    print_distributed_quant_summary,
-    report_current_memory_info,
-)
+from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
-from utils import get_hf_tokenizer
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
+
 
 QUANT_CFG_CHOICES = {}
 
@@ -78,18 +97,21 @@ def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title="ModelOpt text generation ptq")
     group.add_argument(
-        "--calib-size", type=int, default=512, help="Number of samples to use for ptq calibration."
+        "--calib-size",
+        type=int,
+        default=1024,
+        help="Number of samples to use for ptq calibration.",
     )
     group.add_argument(
         "--calib-dataset-path-or-name",
         type=str,
-        default="cnn_dailymail",
+        default="nemotron-post-training-dataset-v2",
         help="Path to local calibration dataset file (.jsonl) or HuggingFace dataset name.",
     )
     group.add_argument(
         "--calib-max-sequence-length",
         type=int,
-        default=512,
+        default=4096,
         help="Maximum sequence length for calibration.",
     )
     group.add_argument(
@@ -113,6 +135,12 @@ def add_text_generate_ptq_args(parser):
         help="Skip the post-quantization generate/validation step.",
     )
     group.add_argument(
+        "--generate-output-len",
+        type=int,
+        default=32,
+        help="Number of tokens to generate in the post-quantization validation step.",
+    )
+    group.add_argument(
         "--references",
         type=str,
         default="",
@@ -129,21 +157,60 @@ def add_text_generate_ptq_args(parser):
     )
     group.add_argument("--weight-only", action="store_true", help="Disable input quantization.")
     group.add_argument(
-        "--force-all-expert-routing",
+        "--recipe",
+        type=str,
+        default=None,
+        help=(
+            "PTQ recipe YAML file or name without suffix (e.g. "
+            "'general/ptq/nvfp4_default-fp8_kv', "
+            "'models/Nemotron-3-Super-120B-A12B/super-nvfp4'). "
+            "When set, --export-quant-cfg / --export-kv-cache-quant are ignored; "
+            "the recipe is authoritative for quant_cfg, algorithm, and KV cache config."
+        ),
+    )
+    group.add_argument(
+        "--sync-expert-weight-amax",
         action="store_true",
-        help="Forcing all experts to be routed during the calibration.",
+        help="Synchronize expert weight amax across experts.",
     )
     group.add_argument(
-        "--num-first-layers-to-skip-quant",
-        type=int,
+        "--auto-quantize-bits",
+        type=float,
         default=None,
-        help="Number of first layers to skip quantization.",
+        help=(
+            "Target effective bits for mtq.auto_quantize per-layer mixed-precision search "
+            "(e.g. 4.0, 4.8). When set, runs auto-quantize instead of plain mtq.quantize, "
+            "and --export-quant-cfg / --recipe are ignored."
+        ),
     )
     group.add_argument(
-        "--num-last-layers-to-skip-quant",
+        "--auto-quantize-formats",
+        type=str,
+        nargs="+",
+        default=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
+        help="Quantization format names (entries in mtq.config.choices) to search over.",
+    )
+    group.add_argument(
+        "--auto-quantize-method",
+        type=str,
+        default="gradient",
+        choices=["gradient", "kl_div"],
+        help="Method for auto_quantize sensitivity scoring.",
+    )
+    group.add_argument(
+        "--auto-quantize-score-size",
         type=int,
+        default=128,
+        help="Number of samples to use for sensitivity scoring in auto_quantize.",
+    )
+    group.add_argument(
+        "--auto-quantize-checkpoint",
+        type=str,
         default=None,
-        help="Number of last layers to skip quantization.",
+        help=(
+            "Optional path to save/restore the auto_quantize search state "
+            "(sensitivity scores, costs, calibration state) across runs."
+        ),
     )
     add_modelopt_args(parser)
     return parser
@@ -160,92 +227,96 @@ def check_arguments():
         print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
         args.moe_grouped_gemm = False
 
-
-def _is_first_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
-    if "layers." not in name:
-        return False
-    try:
-        layer_idx = int(name.split("layers.")[-1].split(".")[0])
-    except ValueError:
-        return False
-    return layer_idx < num_layers_to_disable
-
-
-def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
-    if "layers." not in name:
-        return False
-    try:
-        layer_idx = int(name.split("layers.")[-1].split(".")[0])
-    except ValueError:
-        return False
-    return layer_idx >= num_layers - num_layers_to_disable
-
-
-def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
-    """Get a config for `mtq.quantize` with first & last `num_layers_to_disable` layers disabled.
-
-    The layers to disable are the first & last `num_layers_to_disable` layers.
-    """
-    config = copy.deepcopy(config)
-    quant_cfg = config.get("quant_cfg", {})
-    quant_cfg.update(
-        {
-            functools.partial(
-                _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-            ): {"enable": False}
-        }
+    uses_calibration = args.auto_quantize_bits is not None or (
+        (args.export_quant_cfg is not None or args.recipe is not None) and not args.weight_only
     )
-    config["quant_cfg"] = quant_cfg
-    return config
+    if (
+        uses_calibration
+        and args.context_parallel_size > 1
+        and args.calib_max_sequence_length % (2 * args.context_parallel_size) != 0
+    ):
+        raise ValueError(
+            "--calib-max-sequence-length must be a multiple of 2 * "
+            "--context-parallel-size when context parallelism is enabled."
+        )
 
+    if args.auto_quantize_bits is not None and not _HAS_SHARED_CALIB:
+        raise RuntimeError(
+            "auto_quantize requires modelopt 0.46+. "
+            "Upgrade with: pip install nvidia-modelopt>=0.46"
+        )
 
-def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
-    """Get a config for `mtq.quantize` with last `num_layers_to_disable` layers disabled.
-
-    The layers to disable are the last `num_layers_to_disable` layers.
-    """
-    config = copy.deepcopy(config)
-    quant_cfg = config.get("quant_cfg", {})
-    quant_cfg.update(
-        {
-            functools.partial(
-                _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-            ): {"enable": False}
-        }
-    )
-    config["quant_cfg"] = quant_cfg
-    return config
+    if args.auto_quantize_bits is not None:
+        if args.export_quant_cfg is not None:
+            print_rank_0(
+                "WARNING: --auto-quantize-bits overrides --export-quant-cfg; the latter is ignored."
+            )
+            args.export_quant_cfg = None
+        if args.recipe is not None:
+            print_rank_0(
+                "WARNING: --auto-quantize-bits overrides --recipe; the latter is ignored."
+            )
+            args.recipe = None
+        if args.pipeline_model_parallel_size > 1:
+            raise ValueError(
+                "auto_quantize currently requires pipeline-model-parallel-size=1 because "
+                "ModelOpt needs additional support for pipeline parallelism."
+            )
+        for fmt in args.auto_quantize_formats:
+            if fmt not in QUANT_CFG_CHOICES:
+                raise ValueError(
+                    f"Unknown auto-quantize format '{fmt}'. Available: "
+                    f"{sorted(QUANT_CFG_CHOICES.keys())}"
+                )
 
 
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
+
+    if args.recipe is not None:
+        # YAML recipe is authoritative: skip predefined-config customizations and KV
+        # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
+        print_rank_0(f"Use recipe {args.recipe} for quantization")
+        recipe = load_recipe(args.recipe)
+        if not isinstance(recipe, ModelOptPTQRecipe):
+            raise TypeError(f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}")
+        if args.export_kv_cache_quant != "none":
+            print_rank_0(f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe.")
+        return recipe.quantize.model_dump()
+
     if args.export_quant_cfg not in QUANT_CFG_CHOICES:
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
-    fp8_config = {"enable": True, "num_bits": (4, 3), "axis": None}
+    if isinstance(mtq_config["quant_cfg"], dict):
+        # Normalize old dict format to new list format
+        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+
+    fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
         "enable": True,
+        "cfg": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+        },
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"]["*medusa_heads**"] = fp4_config
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
     if "AWQ" in args.export_quant_cfg:
-        weight_quantizer = mtq_config["quant_cfg"]["*weight_quantizer"]  # type: ignore
-        if isinstance(weight_quantizer, list):
-            weight_quantizer = weight_quantizer[0]
-        weight_quantizer["block_sizes"][-1] = 128
-
+        try:
+            weight_quantizer = mtq.find_quant_cfg_entry_by_path(mtq_config["quant_cfg"], "*weight_quantizer")
+            weight_quantizer["block_sizes"][-1] = 128
+        except KeyError:
+            weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
-        mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
+        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -257,20 +328,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        mtq_config["quant_cfg"]["*input_quantizer"] = {"enable": False}
-    if args.num_first_layers_to_skip_quant is not None:
-        mtq_config = get_first_layers_disabled_config(
-            mtq_config,
-            num_layers=args.num_layers,
-            num_layers_to_disable=args.num_first_layers_to_skip_quant,
-        )
-    if args.num_last_layers_to_skip_quant is not None:
-        mtq_config = get_last_layers_disabled_config(
-            mtq_config,
-            num_layers=args.num_layers,
-            num_layers_to_disable=args.num_last_layers_to_skip_quant,
-        )
-
+        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
     return mtq_config
 
 
@@ -294,6 +352,8 @@ def get_calib_dataloader(
             for i, line in enumerate(f):
                 if len(all_texts) == calib_size:
                     break
+                if not line.strip():
+                    continue
                 sample = json.loads(line)
 
                 # Extract text field from various possible keys
@@ -345,15 +405,92 @@ def get_calib_dataloader(
         )
 
 
+def auto_quantize_model(unwrapped_model, tokenizer):
+    """Run mtq.auto_quantize on the MCore model to search per-layer mixed precision.
+
+    Returns the search_state dict produced by mtq.auto_quantize.
+    """
+    args = get_args()
+
+    calib_dataloader = get_megatron_calibration_dataloader(
+        tokenizer,
+        dataset_name=args.calib_dataset_path_or_name,
+        num_samples=args.calib_size,
+        seq_length=args.calib_max_sequence_length,
+        batch_size=args.calib_batch_size,
+    )
+
+    def forward_step(model, batch):
+        return megatron_prefill(model, batch["input_ids"])
+
+    def forward_backward_step(model, batch):
+        lm_batch = build_lm_batch_from_input_ids(
+            batch,
+            cp_group=get_context_parallel_group(),
+        )
+        loss = model.forward(
+            input_ids=lm_batch["tokens"],
+            position_ids=lm_batch["position_ids"],
+            attention_mask=lm_batch["attention_mask"],
+            labels=lm_batch["labels"],
+            loss_mask=lm_batch["loss_mask"],
+            runtime_gather_output=True,
+        )
+        loss.mean().backward()
+
+    quantization_formats = [QUANT_CFG_CHOICES[fmt] for fmt in args.auto_quantize_formats]
+    disabled_layers = [
+        entry["quantizer_name"]
+        for entry in _default_disabled_quantizer_cfg
+        if "parent_class" not in entry
+    ]
+
+    dp_world_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    num_calib_steps = len(calib_dataloader)
+    score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
+    num_score_steps = min(
+        len(calib_dataloader),
+        max(math.ceil(args.auto_quantize_score_size / score_samples_per_step), 1),
+    )
+
+    print_rank_0(
+        f"Running mtq.auto_quantize: bits={args.auto_quantize_bits}, "
+        f"formats={args.auto_quantize_formats}, method={args.auto_quantize_method}, "
+        f"num_calib_steps={num_calib_steps}, num_score_steps={num_score_steps}"
+    )
+
+    _, search_state = mtq.auto_quantize(
+        unwrapped_model,
+        constraints={"effective_bits": args.auto_quantize_bits},
+        quantization_formats=quantization_formats,
+        data_loader=calib_dataloader,
+        forward_step=forward_step,
+        loss_func=None,
+        forward_backward_step=forward_backward_step,
+        disabled_layers=disabled_layers,
+        num_calib_steps=num_calib_steps,
+        num_score_steps=num_score_steps,
+        verbose=True,
+        method=args.auto_quantize_method,
+        checkpoint=args.auto_quantize_checkpoint,
+    )
+
+    if args.save is not None and torch.distributed.get_rank() == 0:
+        os.makedirs(args.save, exist_ok=True)
+        torch.save(
+            search_state,
+            os.path.join(args.save, f"auto_quantize_search_state_rank_{torch.distributed.get_rank()}.pth"),
+        )
+    return search_state
+
+
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_text_generate_ptq_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
-        },
-    )
+        })
+    initialize_megatron()
 
     check_arguments()
 
@@ -394,33 +531,56 @@ if __name__ == "__main__":
 
         for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=32)
+            # enable_kv_cache=False to avoid pre-allocating the static KV cache: this is a
+            # sanity-check generation, and the KV-cache allocation can OOM tight
+            # quantization runs on large MoE models.
+            generated_ids = megatron_generate(
+                model, tokens.input_ids.cuda(), osl=args.generate_output_len, enable_kv_cache=False
+            )
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _dataset_forward_loop_func(model):
-        dataloader = get_calib_dataloader(
-            dataset_path_or_name=args.calib_dataset_path_or_name,
-            tokenizer=tokenizer,
-            calib_size=args.calib_size,
-            max_sequence_length=args.calib_max_sequence_length,
-            use_random_offset=args.calib_use_random_offset,
+    if _HAS_SHARED_CALIB:
+        _dataset_forward_loop_func = get_megatron_calibration_forward_loop(
+            tokenizer,
+            dataset_name=args.calib_dataset_path_or_name,
+            num_samples=args.calib_size,
+            seq_length=args.calib_max_sequence_length,
             batch_size=args.calib_batch_size,
+            # pack=True uses Megatron pretraining-style global-stream document packing
+            # Leave to False for backward compatibility
+            pack=False,
         )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            sample = get_batch_on_this_cp_rank(sample)
-            simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
+    else:
+        def _dataset_forward_loop_func(model):
+            dataloader = get_calib_dataloader(
+                dataset_path_or_name=args.calib_dataset_path_or_name,
+                tokenizer=tokenizer,
+                calib_size=args.calib_size,
+                max_sequence_length=args.calib_max_sequence_length,
+                use_random_offset=args.calib_use_random_offset,
+                batch_size=args.calib_batch_size,
+            )
+            for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
+                sample = get_batch_on_this_cp_rank(
+                    sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                )
+                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
-    if args.force_all_expert_routing:
-        warnings.warn(
-            "--force-all-expert-routing will be deprecated in the next release and is no longer needed."
-        )
+    if args.auto_quantize_bits is not None:
+        print_rank_0("Running auto-quantize search...")
+        auto_quantize_model(unwrapped_model, tokenizer)
 
-    if args.export_quant_cfg is not None:
+        if args.compress:
+            mtq.compress(unwrapped_model)
+            print_rank_0("Weights are now compressed to low-bit!")
+
+        print_distributed_quant_summary(model, "Auto-Quantized Model:")
+    elif args.export_quant_cfg is not None or args.recipe is not None:
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
@@ -446,11 +606,9 @@ if __name__ == "__main__":
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
 
-    # Free calibration/quantization memory before generate
-    import gc
+    # Free calibration/quantization memory before generate (do this after saving in case it causes issues)
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Do this after saving in case it causes issues
     if not args.skip_generate:
         _custom_prompt_forward_loop_func(unwrapped_model)
