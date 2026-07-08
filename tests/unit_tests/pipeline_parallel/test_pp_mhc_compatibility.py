@@ -437,10 +437,7 @@ class TestTransformerBlockMHCBoundaries:
         n = 4
         s, b, C = 8, 2, 64
         cfg = _make_config(
-            hidden_size=C,
-            pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=n,
+            hidden_size=C, pp_size=2, enable_hyper_connections=True, num_residual_streams=n
         )
         x = torch.randn(s, b, C, device='cuda')
         block = _make_boundary_block(cfg, pre_process=True, input_tensor=x)
@@ -449,19 +446,14 @@ class TestTransformerBlockMHCBoundaries:
 
         assert expanded.shape == (s, b, n * C)
         for stream_idx in range(n):
-            torch.testing.assert_close(
-                expanded[:, :, stream_idx * C : (stream_idx + 1) * C], x
-            )
+            torch.testing.assert_close(expanded[:, :, stream_idx * C : (stream_idx + 1) * C], x)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_schedule_preprocess_helper_does_not_reexpand_non_first_pp_stage(self):
         n = 4
         s, b, C = 8, 2, 64
         cfg = _make_config(
-            hidden_size=C,
-            pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=n,
+            hidden_size=C, pp_size=2, enable_hyper_connections=True, num_residual_streams=n
         )
         received = torch.randn(s, b, n * C, device='cuda')
         block = _make_boundary_block(
@@ -478,10 +470,7 @@ class TestTransformerBlockMHCBoundaries:
         n = 4
         s, b, C = 8, 2, 64
         cfg = _make_config(
-            hidden_size=C,
-            pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=n,
+            hidden_size=C, pp_size=2, enable_hyper_connections=True, num_residual_streams=n
         )
         cfg.mtp_num_layers = 1
         multistream = torch.randn(s, b, n * C, device='cuda')
@@ -535,13 +524,9 @@ class TestTransformerBlockMHCBoundaries:
         contracted = torch.randn(8, 2, 64)
         loss = torch.randn(8, 2)
         decoder = SimpleNamespace(
-            layers=[],
-            postprocess_for_layer_schedule=MagicMock(return_value=contracted),
+            layers=[], postprocess_for_layer_schedule=MagicMock(return_value=contracted)
         )
-        gpt_model = SimpleNamespace(
-            decoder=decoder,
-            _postprocess=MagicMock(return_value=loss),
-        )
+        gpt_model = SimpleNamespace(decoder=decoder, _postprocess=MagicMock(return_value=loss))
         chunk_state = SimpleNamespace(
             input_ids=torch.ones(2, 8, dtype=torch.long),
             position_ids=torch.arange(8).repeat(2, 1),
