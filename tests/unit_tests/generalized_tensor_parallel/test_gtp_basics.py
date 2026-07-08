@@ -1152,6 +1152,10 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
     grad_data (corrupts reduce_scatter_with_fp32_accumulation). The fix routes grad-ready through
     register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
     wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
+
+    It also pins that the AccumulateGrad node is materialized and retained on the param: the
+    retained reference is what keeps the leaf on the capture stream for full-iteration
+    CUDA-graph capture.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -1190,6 +1194,21 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             assert (
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
+            # The AccumulateGrad node must also be materialized and RETAINED. Keeping a live
+            # strong reference across the warmup->capture boundary is what places the node on
+            # the capture stream; an un-retained node stays stranded on the default/legacy
+            # stream and aborts full-iteration CUDA-graph capture with
+            # cudaErrorStreamCaptureImplicit.
+            node = getattr(w, "_grad_accum_node", None)
+            assert node is not None, (
+                f"{name}.weight must retain its AccumulateGrad node "
+                "(required for full-iteration CUDA-graph capture)"
+            )
+            # Identity check: re-materializing must yield the same node, proving the retained
+            # reference is what keeps it alive (a dropped node would be recreated here).
+            assert (
+                node is w.expand_as(w).grad_fn.next_functions[0][0]
+            ), f"{name}.weight retained a stale/foreign AccumulateGrad node"
 
         # bias=False -> all params are GTP_remat -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (

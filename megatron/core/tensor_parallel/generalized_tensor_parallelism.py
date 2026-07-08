@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from packaging.version import Version
@@ -354,10 +354,22 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
+    # Join GTP's async AG/RS side streams back to the current stream. This is REQUIRED under
+    # full-iteration CUDA-graph capture: wait_async_comms() above runs real work on rs_stream
+    # (the RS wait, and main_grad.add_ via finalize_after_drain), forked from the capture stream
+    # via a recorded event. Without joining it back, capture_end sees an un-rejoined fork and
+    # fails with cudaErrorStreamCaptureUnjoined. The join is legal under capture — the per-layer
+    # CG path does the identical current_stream().wait_stream(side_stream) inside torch.cuda.graph()
+    # (see cuda_graphs._wait_side_streams) and captures fine.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
+    # The per-layer CG runner replay streams only exist in the eager / per-layer-CG path; under
+    # whole-step capture there are no runners, and get_gtp_runner_streams is a per-layer concept,
+    # so stop here while capturing.
+    if torch.cuda.is_current_stream_capturing():
+        return
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
     from megatron.core.transformer.cuda_graphs import get_gtp_runner_streams
 
@@ -1446,16 +1458,22 @@ class GTPShardedParam(torch.nn.Parameter):
         """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
-    def register_grad_accum_hook(self, grad_accum_node, hook):
+    def register_grad_accum_hook(
+        self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
+    ) -> None:
         """Register a DDP backward hook to call after the wgrad RS finalize.
 
         For GTP params autograd may receive None (async RS), so the normal grad-accumulator
         hook never fires; the integrator (Graphed.backward for captured chains, or the eager
         chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
-        register_grad_ready fires at the right time. grad_accum_node is accepted for API
-        compatibility but not retained — only the hook callable.
+        register_grad_ready fires at the right time. We retain grad_accum_node (the weight's
+        AccumulateGrad) here: keeping a live strong reference across the warmup->capture
+        boundary is what places the node on the capture stream for full-iteration CG — an
+        un-retained node stays stranded on the default stream and trips capture. It is NOT put
+        in DDP's grad_accs (that list is for autograd-hooked nodes) and is never .register_hook'd
+        — grad-ready is fired manually via _grad_accum_hook, not by autograd.
         """
-        del grad_accum_node
+        self._grad_accum_node = grad_accum_node
         self._grad_accum_hook = hook
 
     @staticmethod
