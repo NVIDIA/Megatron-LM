@@ -439,6 +439,7 @@ def gpt_config_from_args(
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptModelConfig`.
     """
+    assert issubclass(model_config_cls, GPTModelConfig)
 
     kwargs = {}
     if config is None:
@@ -454,7 +455,6 @@ def gpt_config_from_args(
 
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
-
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["position_embedding_type"] = args.position_embedding_type
@@ -490,6 +490,7 @@ def hybrid_config_from_args(
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptHybridModelConfig`.
     """
+    assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:
@@ -504,7 +505,6 @@ def hybrid_config_from_args(
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         kwargs["hybrid_stack_spec"] = import_module(args.spec)
-
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
