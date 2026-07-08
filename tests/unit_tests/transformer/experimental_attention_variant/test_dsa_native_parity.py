@@ -817,6 +817,11 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
     torch.testing.assert_close(topk_length, torch.tensor([[1, 2]], dtype=torch.int32))
 
 
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: AttributeError: module
+# 'cutlass.cute.core' has no attribute 'ThrMma'. Re-enable once the
+# kernel/build root cause is resolved.
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(monkeypatch):
     _skip_if_fused_dsa_unavailable()
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda *_args: 1)
