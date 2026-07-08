@@ -9,10 +9,11 @@ import torch.nn as nn
 from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 
 from megatron.core import dist_checkpointing
-from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
+from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0
+
 from .utils import print_distributed_quant_summary
 
 logger = logging.getLogger(__name__)
@@ -195,3 +196,24 @@ def load_modelopt_checkpoint(
         print_distributed_quant_summary(unwrapped_model[0])
     else:
         _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=strict, load_arg=load_arg)
+
+
+def load_kd_teacher_checkpoint(model) -> None:
+    """Load the teacher checkpoint for ModelOpt distillation if the model has one."""
+    args = get_args()
+    if not getattr(args, "export_kd_teacher_load", None):
+        return
+
+    teacher = unwrap_model(model[0]).teacher_model
+    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
+    # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
+    # set args.finetune to True while loading the teacher checkpoint.
+    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
+    args.finetune = True
+    if args.export_kd_teacher_ckpt_format is not None:
+        args.ckpt_format = args.export_kd_teacher_ckpt_format
+    try:
+        load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
+    finally:
+        args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+    print_rank_0("... teacher loaded successfully.")
