@@ -251,6 +251,9 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
+    controller._async_sched_sample_values_cuda = torch.empty(
+        context.max_requests, dtype=model_config.params_dtype
+    )
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -554,6 +557,7 @@ def test_run_async_sched_sample_records_gpu_ready_event():
     controller = _make_async_sched_controller(context)
     controller._all_logits_cuda = torch.zeros(1, 3, 5, device="cuda")
     controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sample_values_cuda = torch.empty(3, device="cuda")
     controller._async_sched_sample_gpu_ready_event = mock.Mock()
 
     controller._run_async_sched_sample()

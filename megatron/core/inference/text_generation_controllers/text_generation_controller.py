@@ -223,6 +223,9 @@ class TextGenerationController:
         # This buffer has a stable address across legacy-prefill, async-decode,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._async_sched_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -1939,10 +1942,10 @@ class TextGenerationController:
         # Sample.
         range_push("sampling")
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.argmax(
-            self._all_logits_cuda.squeeze(0)[:active_request_count].float(),
+        torch.max(
+            self._all_logits_cuda.squeeze(0)[:active_request_count],
             dim=-1,
-            out=sampled_tokens_gpu,
+            out=(self._async_sched_sample_values_cuda[:active_request_count], sampled_tokens_gpu),
         )
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
