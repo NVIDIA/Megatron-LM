@@ -743,6 +743,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+
+        plp = getattr(self, "_per_layer_profiler", None)
+        if plp is not None and plp.attached and isinstance(output, torch.Tensor):
+            from megatron.core.transformer.per_layer_profiling import mark_layer_boundary
+            output = mark_layer_boundary(output, self._per_layer_profiler_layer_idx, plp)
+            
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):

@@ -2,13 +2,17 @@
 
 """Unit tests for the pure-logic (CPU, no CUDA) parts of per-layer profiling.
 
-Covers aggregation and summarization only: ``_agg``, ``PerLayerProfileStats``
-record/reset, ``summarize_stats`` (including the PP local->global layer-index
-offset), ``_mib``, and ``log_per_layer_resource_usage`` return / rank gating.
+Covers aggregation and summarization: ``_agg``, ``PerLayerProfileStats``
+forward/backward record/reset, ``summarize_stats`` (including the PP
+local->global layer-index offset and the symmetric backward columns), ``_mib``,
+``log_per_layer_resource_usage`` return / rank gating, and the pure backward
+boundary-marker pairing in ``PerLayerProfiler._on_bwd_marker``.
 
 The CUDA-dependent paths (deferred events, memory_stats snapshots, hook
 attach/detach, flush) are intentionally not covered here; they are exercised by
-the functional tests on GPU. Everything below runs on CPU without a CUDA device.
+the functional tests on GPU. ``_on_bwd_marker`` is exercised with sentinel
+"events" so its pairing logic can be checked on CPU. Everything below runs on
+CPU without a CUDA device.
 """
 
 import pytest
@@ -17,6 +21,7 @@ from megatron.core.transformer.per_layer_profiling import (
     PerLayerProfiler,
     PerLayerProfileStats,
     _agg,
+    _MemSnapshot,
     _mib,
     log_per_layer_resource_usage,
     summarize_stats,
@@ -85,6 +90,35 @@ class TestPerLayerProfileStats:
         assert s.is_moe_layer is True
         assert s.layer_idx == 7
 
+    def test_record_bwd_appends_all_columns(self):
+        s = PerLayerProfileStats(layer_idx=0)
+        # backward delta is typically negative (activations freed while grads alloc).
+        s.record_bwd(
+            time_ms=5.0,
+            mem_delta_bytes=-100,
+            reserved_delta_bytes=-1000,
+            peak_after_bytes=80_000,
+            peak_rise_bytes=200,
+        )
+        assert s.bwd_time_ms == [5.0]
+        assert s.bwd_mem_allocated_delta_bytes == [-100]
+        assert s.bwd_mem_reserved_delta_bytes == [-1000]
+        assert s.bwd_mem_peak_after_bytes == [80_000]
+        assert s.bwd_mem_peak_rise_bytes == [200]
+        # backward samples do not bump num_samples (that counts forward passes).
+        assert s.num_samples == 0
+
+    def test_reset_clears_backward_too(self):
+        s = PerLayerProfileStats(layer_idx=0)
+        s.record_fwd(1.0, 100, 1000, 10_000, 5)
+        s.record_bwd(5.0, -100, -1000, 80_000, 200)
+        s.reset()
+        assert s.bwd_time_ms == []
+        assert s.bwd_mem_allocated_delta_bytes == []
+        assert s.bwd_mem_reserved_delta_bytes == []
+        assert s.bwd_mem_peak_after_bytes == []
+        assert s.bwd_mem_peak_rise_bytes == []
+
 
 # ---------------------------------------------------------------------------
 # summarize_stats  (build a profiler by hand, no CUDA)
@@ -101,9 +135,12 @@ def _make_profiler_with_samples() -> PerLayerProfiler:
     s0 = PerLayerProfileStats(layer_idx=0, is_moe_layer=False)
     s0.record_fwd(2.0, 100, 1000, 50_000, 10)
     s0.record_fwd(4.0, 300, 3000, 70_000, 30)  # time mean 3.0 / max 4.0
+    s0.record_bwd(6.0, -100, -1000, 75_000, 5)
+    s0.record_bwd(8.0, -300, -3000, 75_000, 0)  # bwd time mean 7.0 / max 8.0
 
     s1 = PerLayerProfileStats(layer_idx=1, is_moe_layer=True)
     s1.record_fwd(10.0, 500, 5000, 90_000, 40)
+    s1.record_bwd(20.0, -500, -5000, 95_000, 50)
 
     prof._stats = {0: s0, 1: s1}
     prof._global_peak_bytes = [70_000, 80_000]  # mean 75000 / max 80000
@@ -135,6 +172,18 @@ class TestSummarizeStats:
         assert l0["mem_reserved_delta_bytes"]["mean"] == pytest.approx(2000.0)
         assert l0["mem_peak_after_bytes"]["max"] == 70_000.0
         assert l0["mem_peak_rise_bytes"]["max"] == 30.0
+
+    def test_backward_aggregation(self):
+        out = summarize_stats(_make_profiler_with_samples())
+        l0 = out["layers"][0]
+        assert l0["bwd_num_samples"] == 2
+        assert l0["bwd_time_ms"]["mean"] == pytest.approx(7.0)
+        assert l0["bwd_time_ms"]["max"] == 8.0
+        # backward delta is negative and must not be clamped.
+        assert l0["bwd_mem_delta_bytes"]["mean"] == pytest.approx(-200.0)
+        assert l0["bwd_mem_reserved_delta_bytes"]["max"] == -1000.0
+        assert l0["bwd_mem_peak_after_bytes"]["max"] == 75_000.0
+        assert l0["bwd_mem_peak_rise_bytes"]["max"] == 5.0
 
     def test_moe_flag(self):
         out = summarize_stats(_make_profiler_with_samples())
@@ -192,3 +241,60 @@ class TestLogPerLayerResourceUsage:
         prof = _make_profiler_with_samples()
         summary = log_per_layer_resource_usage(prof, layer_offset=16, is_log_rank=False)
         assert set(summary["layers"].keys()) == {16, 17}
+
+
+# ---------------------------------------------------------------------------
+# PerLayerProfiler._on_bwd_marker  (pure pairing logic; sentinel "events")
+# ---------------------------------------------------------------------------
+def _empty_profiler_with_layers(n: int) -> PerLayerProfiler:
+    prof = PerLayerProfiler(enabled=False)
+    prof._stats = {i: PerLayerProfileStats(layer_idx=i) for i in range(n)}
+    return prof
+
+
+class TestOnBwdMarker:
+    """Adjacent boundary markers pair into per-layer backward intervals.
+
+    Uses string sentinels for CUDA events (never resolved here -- flush() does
+    that on GPU); we only assert which layer's ``_pending_bwd`` each pair lands
+    in. ``_MemSnapshot(0,0,0,0)`` stands in for the memory snapshot.
+    """
+
+    _SNAP = _MemSnapshot(0, 0, 0, 0)
+
+    def test_pairs_adjacent_and_covers_first_layer(self):
+        prof = _empty_profiler_with_layers(3)
+        # One micro-batch backward: markers fire in strictly decreasing local
+        # order, then the block-input marker (-1) closes layer 0.
+        for lid in (2, 1, 0, -1):
+            prof._on_bwd_marker(lid, f"evt{lid}", self._SNAP)
+        # Every layer closed exactly once; the -1 marker is what closes layer 0.
+        assert len(prof._stats[2]._pending_bwd) == 1
+        assert len(prof._stats[1]._pending_bwd) == 1
+        assert len(prof._stats[0]._pending_bwd) == 1
+
+    def test_interval_orders_start_before_end(self):
+        prof = _empty_profiler_with_layers(2)
+        for lid in (1, 0, -1):
+            prof._on_bwd_marker(lid, f"evt{lid}", self._SNAP)
+        # Layer 1 is bracketed by its own output marker (start) and layer 0's
+        # marker (end): (evt1, evt0, ...).
+        start, end, _, _ = prof._stats[1]._pending_bwd[0]
+        assert (start, end) == ("evt1", "evt0")
+
+    def test_no_cross_microbatch_pairing(self):
+        prof = _empty_profiler_with_layers(2)
+        # Two micro-batches; the jump back up to layer 1 (>= prev -1) must start
+        # a fresh pass, not pair across the boundary.
+        for _ in range(2):
+            for lid in (1, 0, -1):
+                prof._on_bwd_marker(lid, "e", self._SNAP)
+        assert len(prof._stats[1]._pending_bwd) == 2
+        assert len(prof._stats[0]._pending_bwd) == 2
+
+    def test_single_layer_stage_first_layer_covered(self):
+        prof = _empty_profiler_with_layers(1)
+        for lid in (0, -1):
+            prof._on_bwd_marker(lid, f"evt{lid}", self._SNAP)
+        # Even a single-layer stage gets its one layer closed by the -1 marker.
+        assert len(prof._stats[0]._pending_bwd) == 1
