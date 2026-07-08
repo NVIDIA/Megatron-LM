@@ -464,7 +464,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         mhc_recompute_manager = (
             CheckpointManager() if use_mhc_recompute and num_layers > 0 else None
         )
-        group_start = 0
         group_index = 0
 
         for layer_idx in range(num_layers):
@@ -472,15 +471,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 mhc_recompute_manager is not None
                 and (layer_idx == num_layers - 1 or (layer_idx + 1) % group_size == 0)
             )
-            group_end = min(group_start + group_size - 1, num_layers - 1)
             extra_args = {
                 "is_first_layer": layer_idx == 0,
                 "is_last_layer": layer_idx == num_layers - 1,
                 "mhc_recompute_manager": mhc_recompute_manager,
                 "is_last_layer_in_mhc_recompute_group": is_group_end,
                 "mhc_recompute_group_index": group_index,
-                "mhc_recompute_group_start": group_start,
-                "mhc_recompute_group_end": group_end,
             }
             layer_plan = TransformerLayerSchedulePlan(
                 module.layers[layer_idx],
@@ -493,7 +489,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self._transformer_layers.append(layer_plan)
 
             if is_group_end and layer_idx != num_layers - 1:
-                group_start = layer_idx + 1
                 group_index += 1
                 mhc_recompute_manager = CheckpointManager()
 
