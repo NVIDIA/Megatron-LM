@@ -159,6 +159,35 @@ def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[
     return torch.cat((cu_seqlens, dummy), dim=0)
 
 
+def _extend_last_padded_sequence(
+    cu_seqlens_padded: Optional[Tensor], padded_end: int
+) -> Optional[Tensor]:
+    """Extend the final padded sequence to ``padded_end`` without adding a boundary."""
+    if cu_seqlens_padded is None:
+        return None
+
+    assert (
+        cu_seqlens_padded.numel() >= 2
+    ), "Non-dummy THD tail padding requires at least one real sequence."
+    current_end = int(cu_seqlens_padded[-1].item())
+    assert (
+        current_end <= padded_end
+    ), f"THD padded endpoint ({current_end}) exceeds padding target ({padded_end})."
+    if current_end == padded_end:
+        return cu_seqlens_padded
+
+    extended = cu_seqlens_padded.clone()
+    extended[-1] = padded_end
+    return extended
+
+
+def _last_padded_sequence_length(cu_seqlens_padded: Optional[Tensor]) -> int:
+    """Return the physical length of the final sequence, or zero when unavailable."""
+    if cu_seqlens_padded is None or cu_seqlens_padded.numel() < 2:
+        return 0
+    return int((cu_seqlens_padded[-1] - cu_seqlens_padded[-2]).item())
+
+
 def _round_up_to_alignment(value: int, alignment: int) -> int:
     assert alignment > 0, f"Packed sequence padding alignment must be > 0, got {alignment}."
     return ((value + alignment - 1) // alignment) * alignment
@@ -377,8 +406,9 @@ def pad_sequence_for_thd(
         max_num_seqs: If set, pad cu_seqlens tensors to
             ``max_num_seqs + 1`` entries for static CUDA Graph inputs.
         pad_by_appending_dummy_seq: If true, represent the post-pack padding
-            tail as an extra dummy sequence in cu_seqlens metadata. Otherwise
-            leave all sequence boundaries unchanged.
+            tail as an extra dummy sequence in cu_seqlens metadata. Otherwise,
+            keep valid boundaries unchanged and extend the final padded
+            sequence boundary to cover the tail.
         padding_mask: Existing bool padding mask for already-packed tokens,
             with True marking padding positions.
         cp_group: Context-parallel process group for resolving local/global
@@ -395,8 +425,9 @@ def pad_sequence_for_thd(
         - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
           represented as an ordinary dummy sequence in cu_seqlens metadata.
           Existing valid/physical gaps remain intact.
-        - When false, only token-like tensors and padding_mask are extended;
-          the padding tail is intentionally absent from cu_seqlens metadata.
+        - When false, valid cu_seqlens remain unchanged while the final padded
+          endpoint is extended, treating the tail as padding of the last sequence.
+          With CP, callers must do this on the global tensors before slicing.
         - With zigzag context parallelism, a dummy tail must be divisible by
           twice the effective CP size, matching TE's THD partitioning requirement.
         - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
@@ -451,11 +482,16 @@ def pad_sequence_for_thd(
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
 
-    # Represent post-pack padding as a dummy sequence when requested. In
-    # non-dummy mode, leave every sequence boundary unchanged.
+    # Represent post-pack padding either as a dummy sequence or as physical
+    # padding attached to the final real sequence.
     target_cu_entries = None if max_num_seqs is None else max_num_seqs + 1
     has_dummy_padding_seq = pad_by_appending_dummy_seq and global_target_len > global_actual_T
+    has_non_dummy_padding_tail = (
+        not pad_by_appending_dummy_seq and global_target_len > global_actual_T
+    )
     dummy_seq_len = global_target_len - global_actual_T if has_dummy_padding_seq else 0
+    last_padded_q_len = 0
+    last_padded_kv_len = 0
 
     # Existing valid/padded differences describe physical gaps between real
     # sequences. Preserve that contract while adding an ordinary dummy sequence:
@@ -496,6 +532,27 @@ def pad_sequence_for_thd(
             cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, global_target_len)
         cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
         cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+    elif has_non_dummy_padding_tail:
+        # Keep compact valid-token coordinates unchanged. Only physical
+        # metadata grows, so the tail belongs to the final real sequence.
+        non_dummy_cp_size, _ = _resolve_thd_cp_geometry(
+            packed_seq_params, cp_group=cp_group, cp_size=cp_size, cp_rank=cp_rank
+        )
+        assert non_dummy_cp_size == 1, (
+            "Non-dummy THD tail padding with context parallelism must be applied "
+            "to global tensors before CP slicing."
+        )
+        if cu_seqlens_q_padded is None:
+            cu_seqlens_q_padded = cu_seqlens_q
+        if cu_seqlens_kv_padded is None:
+            cu_seqlens_kv_padded = cu_seqlens_kv
+        assert (
+            cu_seqlens_q_padded is not None or cu_seqlens_kv_padded is not None
+        ), "Non-dummy THD tail padding requires metadata for at least one real sequence."
+        cu_seqlens_q_padded = _extend_last_padded_sequence(cu_seqlens_q_padded, global_target_len)
+        cu_seqlens_kv_padded = _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        last_padded_q_len = _last_padded_sequence_length(cu_seqlens_q_padded)
+        last_padded_kv_len = _last_padded_sequence_length(cu_seqlens_kv_padded)
 
     # Pad cu_seqlens entry counts for static CUDA Graph inputs.
     if target_cu_entries is not None:
@@ -514,12 +571,20 @@ def pad_sequence_for_thd(
         max_seqlen_q=(
             global_target_len
             if target_cu_entries is not None
-            else max(packed_seq_params.max_seqlen_q, dummy_seq_len)
+            else max(
+                packed_seq_params.max_seqlen_q,
+                dummy_seq_len,
+                last_padded_q_len if has_non_dummy_padding_tail else 0,
+            )
         ),
         max_seqlen_kv=(
             global_target_len
             if target_cu_entries is not None
-            else max(packed_seq_params.max_seqlen_kv, dummy_seq_len)
+            else max(
+                packed_seq_params.max_seqlen_kv,
+                dummy_seq_len,
+                last_padded_kv_len if has_non_dummy_padding_tail else 0,
+            )
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
@@ -531,7 +596,7 @@ def pad_sequence_for_thd(
             else (
                 has_inter_sequence_padding
                 if has_dummy_padding_seq
-                else packed_seq_params.pad_between_seqs
+                else (True if has_non_dummy_padding_tail else packed_seq_params.pad_between_seqs)
             )
         ),
     )

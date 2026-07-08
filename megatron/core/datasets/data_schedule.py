@@ -631,7 +631,9 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
 
     cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
+    pad_by_appending_dummy_seq = getattr(config, 'pad_packed_seq_by_appending_dummy_seq', True)
     contiguous_cp_local_target_len = None
+    non_dummy_global_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
@@ -666,17 +668,66 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
+        # In non-dummy mode, the padding tail belongs to the final real
+        # sequence. Extend its global physical endpoint before CP slicing so
+        # both zigzag indices and contiguous rank origins see the padded layout.
+        if pad_alignment is not None and not pad_by_appending_dummy_seq:
+            cp_world = cp_group.size()
+            global_actual_len = int(batch['cu_seqlens_padded'][-1].item())
+            if target_len is not None:
+                local_target_len = target_len
+            elif contiguous_cp_local_target_len is not None:
+                local_target_len = contiguous_cp_local_target_len
+            else:
+                assert alignment is not None
+                local_rows = (global_actual_len + cp_world - 1) // cp_world
+                local_target_len = ((local_rows + alignment - 1) // alignment) * alignment
+
+            non_dummy_global_target_len = local_target_len * cp_world
+            assert global_actual_len <= non_dummy_global_target_len, (
+                f"Packed THD length ({global_actual_len}) exceeds global padding target "
+                f"({non_dummy_global_target_len})."
+            )
+            if cp_world > 1 and cp_partition_mode == "zigzag":
+                assert non_dummy_global_target_len % (2 * cp_world) == 0, (
+                    f"Zigzag THD padding target ({non_dummy_global_target_len}) must be "
+                    f"divisible by 2 * context_parallel_size ({2 * cp_world})."
+                )
+
+            if global_actual_len < non_dummy_global_target_len:
+                assert (
+                    batch['cu_seqlens_padded'].numel() >= 2
+                ), "Non-dummy THD tail padding requires at least one real sequence."
+                cu_seqlens_padded = batch['cu_seqlens_padded'].clone()
+                cu_seqlens_padded[-1] = non_dummy_global_target_len
+                batch['cu_seqlens_padded'] = cu_seqlens_padded
+
+                last_padded_seqlen = int((cu_seqlens_padded[-1] - cu_seqlens_padded[-2]).item())
+                old_max_seqlen = batch['max_seqlen']
+                old_max_value = (
+                    int(old_max_seqlen.item())
+                    if isinstance(old_max_seqlen, torch.Tensor)
+                    else int(old_max_seqlen)
+                )
+                new_max_value = max(old_max_value, last_padded_seqlen)
+                batch['max_seqlen'] = (
+                    torch.full_like(old_max_seqlen, new_max_value)
+                    if isinstance(old_max_seqlen, torch.Tensor)
+                    else new_max_value
+                )
+
     # Partition sequence tensors for context parallelism. Padding mask is needed
     # on every PP stage, while data tensors are only needed on first/last/MTP stages.
     if is_tp_rank_0:
         cp_slice_keys = ['padding_mask']
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-        partition_total_tokens = (
-            contiguous_cp_local_target_len * cp_group.size()
-            if contiguous_cp_local_target_len is not None
-            else None
-        )
+        if non_dummy_global_target_len is not None:
+            partition_total_tokens = non_dummy_global_target_len
+        elif contiguous_cp_local_target_len is not None:
+            partition_total_tokens = contiguous_cp_local_target_len * cp_group.size()
+        else:
+            partition_total_tokens = None
         get_cp_slice_for_thd(
             batch,
             cp_group,
@@ -826,9 +877,9 @@ def get_batch_on_this_rank_for_sequence_packing(
         pad_between_seqs=(True if not torch.equal(cu_seqlens, cu_seqlens_padded) else None),
     )
 
-    # Pad token-like tensors after CP slicing. In non-dummy mode the tail is
-    # deliberately absent from cu_seqlens metadata; dummy mode appends an
-    # ordinary sequence boundary that covers the tail.
+    # Dummy metadata is appended after CP slicing as an ordinary sequence.
+    # Non-dummy tensors and their final padded endpoint were extended before
+    # slicing; this call is then a no-op except for static cu_seqlens entries.
     if pad_alignment is not None:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
@@ -840,9 +891,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
-                pad_by_appending_dummy_seq=getattr(
-                    config, 'pad_packed_seq_by_appending_dummy_seq', True
-                ),
+                pad_by_appending_dummy_seq=pad_by_appending_dummy_seq,
                 padding_mask=padding_mask,
                 cp_group=cp_group,
             )

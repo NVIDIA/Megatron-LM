@@ -232,11 +232,30 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
 
 
 @pytest.mark.parametrize(
-    ("alignment", "cuda_graph_impl", "local_cp_size", "total_tokens", "local_target"),
-    [(4, "none", 2, 10, 8), (8, "transformer_engine", 2, 10, 8)],
+    (
+        "alignment",
+        "cuda_graph_impl",
+        "local_cp_size",
+        "total_tokens",
+        "local_target",
+        "pad_by_appending_dummy_seq",
+    ),
+    [
+        (4, "none", 1, 3, 4, False),
+        (4, "none", 2, 10, 8, False),
+        (8, "transformer_engine", 2, 10, 8, False),
+        (4, "none", 2, 10, 8, True),
+        (8, "transformer_engine", 2, 10, 8, True),
+    ],
 )
 def test_dsv4_thd_dynamic_cp_pads_before_slicing(
-    monkeypatch, alignment, cuda_graph_impl, local_cp_size, total_tokens, local_target
+    monkeypatch,
+    alignment,
+    cuda_graph_impl,
+    local_cp_size,
+    total_tokens,
+    local_target,
+    pad_by_appending_dummy_seq,
 ):
     """DSv4 padding must not change rank-local row origins after CP slicing."""
     cp_rank = local_cp_size - 1
@@ -252,7 +271,7 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         max_seqlen_per_dp_cp_rank=8,
         thd_max_packed_sequences=None,
         cuda_graph_impl=cuda_graph_impl,
-        pad_packed_seq_by_appending_dummy_seq=True,
+        pad_packed_seq_by_appending_dummy_seq=pad_by_appending_dummy_seq,
     )
     tokens = torch.arange(1, total_tokens + 1, dtype=torch.int64)
     batch = {
@@ -266,7 +285,9 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         "local_cp_size": torch.tensor([local_cp_size], dtype=torch.int32),
     }
     pad_input_lengths = []
+    slice_metadata = []
     real_pad_sequence_for_thd = data_schedule.pad_sequence_for_thd
+    real_get_cp_slice_for_thd = data_schedule.get_cp_slice_for_thd
 
     def record_padding(
         tokens, labels, loss_mask, position_ids, packed_seq_params, *, padding_mask, **_
@@ -287,6 +308,16 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         assert result[-1].shape[-1] == local_target
         return result
 
+    def record_slice(batch, cp_group, **kwargs):
+        slice_metadata.append(
+            (
+                batch['cu_seqlens'].clone(),
+                batch['cu_seqlens_padded'].clone(),
+                kwargs.get('partition_total_tokens'),
+            )
+        )
+        return real_get_cp_slice_for_thd(batch, cp_group, **kwargs)
+
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
     monkeypatch.setattr(
@@ -299,6 +330,7 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     )
     monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_: None)
     monkeypatch.setattr(data_schedule, "pad_sequence_for_thd", record_padding)
+    monkeypatch.setattr(data_schedule, "get_cp_slice_for_thd", record_slice)
     monkeypatch.setattr(
         parallel_state,
         "get_dynamic_data_context_parallel_groups",
@@ -325,7 +357,110 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     )
     assert packed_seq_params.local_cp_size == local_cp_size
     assert packed_seq_params.cp_partition_mode == "contiguous"
+    global_target = local_target * local_cp_size
+    if pad_by_appending_dummy_seq:
+        expected_final_cu = torch.tensor([0, total_tokens, global_target], dtype=torch.int32)
+        assert torch.equal(packed_seq_params.cu_seqlens_q, expected_final_cu)
+        assert torch.equal(packed_seq_params.cu_seqlens_q_padded, expected_final_cu)
+        assert packed_seq_params.max_seqlen_q == max(total_tokens, global_target - total_tokens)
+        assert packed_seq_params.pad_between_seqs is False
+    else:
+        assert torch.equal(
+            packed_seq_params.cu_seqlens_q, torch.tensor([0, total_tokens], dtype=torch.int32)
+        )
+        assert torch.equal(
+            packed_seq_params.cu_seqlens_q_padded,
+            torch.tensor([0, global_target], dtype=torch.int32),
+        )
+        assert packed_seq_params.max_seqlen_q == global_target
+        assert packed_seq_params.pad_between_seqs is True
     assert pad_input_lengths == [local_target]
+    assert len(slice_metadata) == 1
+    slice_valid, slice_padded, partition_total = slice_metadata[0]
+    assert torch.equal(slice_valid, torch.tensor([0, total_tokens], dtype=torch.int32))
+    expected_slice_padded_end = total_tokens if pad_by_appending_dummy_seq else global_target
+    assert torch.equal(
+        slice_padded, torch.tensor([0, expected_slice_padded_end], dtype=torch.int32)
+    )
+    assert partition_total == global_target
+
+
+def test_non_dummy_zigzag_padding_updates_metadata_before_cp_slice(monkeypatch):
+    """Zigzag CP indices must be generated from the globally padded layout."""
+    from megatron.core.datasets import data_schedule_utils
+
+    cp_size = 2
+    cp_rank = 0
+    total_tokens = 12
+    local_target = 8
+    dynamic_cp_group = _MockCPGroup(size=cp_size, rank=cp_rank)
+    pg_collection = SimpleNamespace(
+        tp=_MockCPGroup(size=1, rank=0),
+        pp=_MockCPGroup(size=1, rank=0),
+        cp=_MockCPGroup(size=cp_size, rank=cp_rank),
+    )
+    config = SimpleNamespace(
+        cp_partition_mode="zigzag",
+        pad_packed_seq_alignment=4,
+        max_seqlen_per_dp_cp_rank=local_target,
+        thd_max_packed_sequences=None,
+        cuda_graph_impl="none",
+        pad_packed_seq_by_appending_dummy_seq=False,
+    )
+    tokens = torch.arange(1, total_tokens + 1, dtype=torch.int64)
+    batch = {
+        "tokens": tokens.clone(),
+        "position_ids": torch.arange(total_tokens, dtype=torch.int64),
+        "labels": tokens + 100,
+        "loss_mask": torch.ones(total_tokens, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 4, total_tokens], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4, total_tokens], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+        "local_cp_size": torch.tensor([cp_size], dtype=torch.int32),
+    }
+
+    def get_padded_zigzag_indices(cu_seqlens, total, world_size, rank):
+        assert torch.equal(cu_seqlens, torch.tensor([0, 4, 16], dtype=torch.int32))
+        assert (total, world_size, rank) == (16, cp_size, cp_rank)
+        return torch.tensor([0, 3, 4, 5, 6, 13, 14, 15], dtype=torch.int64)
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_world_size",
+        lambda group=None: group.size() if group is not None else 1,
+    )
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda group=None: group.rank() if group is not None else 0
+    )
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_: None)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dynamic_data_context_parallel_groups",
+        lambda group_size: dynamic_cp_group,
+    )
+    monkeypatch.setattr(
+        data_schedule_utils, "get_thd_partitioned_indices", get_padded_zigzag_indices
+    )
+
+    result = get_batch_on_this_rank_for_sequence_packing(
+        data_iterator=iter([batch]), dynamic_cp=True, pg_collection=pg_collection, config=config
+    )
+
+    local_tokens, _, _, _, _, packed_seq_params, padding_mask = result
+    assert torch.equal(
+        local_tokens.squeeze(0), torch.tensor([1, 4, 5, 6, 7, 0, 0, 0], dtype=torch.int64)
+    )
+    assert torch.equal(
+        padding_mask.squeeze(0), torch.tensor([False, False, False, False, False, True, True, True])
+    )
+    assert torch.equal(packed_seq_params.cu_seqlens_q, torch.tensor([0, 4, 12], dtype=torch.int32))
+    assert torch.equal(
+        packed_seq_params.cu_seqlens_q_padded, torch.tensor([0, 4, 16], dtype=torch.int32)
+    )
+    assert packed_seq_params.max_seqlen_q == 12
+    assert packed_seq_params.pad_between_seqs is True
 
 
 def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
