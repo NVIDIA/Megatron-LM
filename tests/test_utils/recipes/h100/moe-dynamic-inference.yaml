@@ -65,20 +65,20 @@ products:
   - test_case: [gpt_dynamic_inference_cuda_graphs_pad_tp4_pp1_ep4_16B_logitsmatch]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_ep2_gptoss_20b_swa]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_chunked_prefill]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_h100]

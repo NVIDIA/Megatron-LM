@@ -61,5 +61,5 @@ products:
   - test_case: [gpt_dynamic_inference_tp2_pp2_ep2_gptoss_20b_swa]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_gb200]
