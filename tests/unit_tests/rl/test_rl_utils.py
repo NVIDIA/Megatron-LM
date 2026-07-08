@@ -205,6 +205,26 @@ class TestRLUtils:
                 seq_length=8, device=torch.device("cpu"), sequence_packing=True
             )
 
+    def test_get_rl_packed_seq_params_for_cuda_graph_edge_cases(self):
+        # Parametrize seq_length of 1 (single-token boundary condition)
+        params_single = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=1, device=torch.device("cpu"), sequence_packing=False
+        )
+        assert params_single.max_seqlen_q == 1
+        assert params_single.max_seqlen_kv == 1
+        assert params_single.total_tokens == 1
+        assert torch.equal(params_single.cu_seqlens_q, torch.tensor([0, 1], dtype=torch.int32))
+
+        # Parametrize sequence packing with max_sequences_per_bin > 1 (e.g. 4)
+        params_multi = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=8, device=torch.device("cpu"), sequence_packing=True, max_sequences_per_bin=4
+        )
+        assert params_multi.max_seqlen_q == 8
+        assert params_multi.max_seqlen_kv == 8
+        assert params_multi.total_tokens == 8
+        assert params_multi.cu_seqlens_q.shape == (6,)
+        assert torch.equal(params_multi.cu_seqlens_q, torch.tensor([0, 8, 8, 8, 8, 8], dtype=torch.int32))
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
 
