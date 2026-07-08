@@ -1246,6 +1246,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_mamba_chunks=self._max_mamba_chunks,
         )
 
+        # Double-buffered pinned shadows that source the async H2D in
+        # transfer_bookkeeping_to_gpu(). The working buffer above is mutated in
+        # place every step, so copying directly from it with non_blocking=True
+        # races the in-flight transfer; we snapshot it into an alternating
+        # shadow and copy from there instead. See transfer_bookkeeping_to_gpu()
+        # for the full rationale. CUDA events gate reuse of each shadow.
+        self._h2d_shadow_bufs = [
+            torch.empty(_total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True)
+            for _ in range(2)
+        ]
+        self._h2d_shadow_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._h2d_shadow_primed = [False, False]
+        self._h2d_shadow_idx = 0
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -2457,7 +2471,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        #
+        # Double-buffered async H2D: `self._cpu_bookkeeping_buf` is a pinned host
+        # buffer mutated in place on the very next step (the staging writes above
+        # plus `initialize_attention_state()`). A plain `non_blocking=True` copy
+        # straight from it races: the host overwrites bytes while the async H2D
+        # is still in flight, so the GPU reads corrupted bookkeeping (token/block
+        # indices) -> async `CUDA error: an illegal memory access`. The
+        # CUDA-graph warmup loop captures dimensions in a tight loop, making the
+        # race fire reliably.
+        #
+        # Instead of forcing the copy blocking (which stalls the host on the GPU
+        # every step), we snapshot the freshly-staged buffer into an alternating
+        # pinned shadow and async-copy *from the shadow*. The working buffer is
+        # then immediately free to be re-staged by the next step, while the H2D
+        # keeps overlapping with subsequent CPU work. A per-shadow CUDA event
+        # guards reuse: before overwriting a shadow we wait on the event for its
+        # previous in-flight H2D (a no-op in steady state, since one engine step
+        # >> the few-us copy; the wait only bites inside the tight warmup loop).
+        idx = self._h2d_shadow_idx
+        shadow = self._h2d_shadow_bufs[idx]
+        if self._h2d_shadow_primed[idx]:
+            self._h2d_shadow_events[idx].synchronize()
+        # Host-only memcpy (pinned -> pinned); does not stall on the GPU.
+        shadow.copy_(self._cpu_bookkeeping_buf)
+        self.gpu_view._buf.copy_(shadow, non_blocking=True)
+        self._h2d_shadow_events[idx].record()
+        self._h2d_shadow_primed[idx] = True
+        self._h2d_shadow_idx = 1 - idx
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
