@@ -425,3 +425,11 @@ the CUDA graph private pool provides stable replay addresses and lifetime reuse.
 All behavior is gated by `enable_full_iteration_cuda_graph=False` by default.
 The MCore FSDP adapter enables it when
 `TransformerConfig.cuda_graph_impl == "full_iteration"`.
+
+## 13. Forward-only validation and test
+
+When Megatron FSDP v2 is active, `FullCudaGraphWrapper` runs forward-only
+validation and test passes eagerly. The bypass happens before static input
+staging and does not create or update validation CUDA graph state. Training
+iterations continue to use full-iteration capture and replay, while non-v2
+models retain their existing validation graph behavior.

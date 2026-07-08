@@ -18,6 +18,16 @@ _shared_graph_pool = None
 _shared_capture_stream = None
 
 
+def _has_megatron_fsdp_v2(model):
+    """Return whether the model contains a Megatron FSDP v2 wrapper."""
+    roots = model if isinstance(model, (list, tuple)) else (model,)
+    return any(
+        getattr(getattr(module, "ddp_config", None), "use_megatron_fsdp_v2", False)
+        for root in roots
+        for module in root.modules()
+    )
+
+
 def get_shared_capture_stream():
     """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
 
@@ -206,6 +216,9 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        if not training and _has_megatron_fsdp_v2(model):
+            return self.forward_backward_func(*args, **kwargs)
+
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
