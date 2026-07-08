@@ -801,8 +801,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_hybridep_pad_variable_tokens: bool = False
     """Pad uneven local token counts to the HybridEP group maximum before dispatch.
-    This is needed when the frontend supplies locally packed THD inputs whose token counts
-    can differ across ranks, without using Megatron Core's sequence_packing_scheduler.
+    Enable only when HybridEP inputs can have different token counts across ranks.
+    Leave disabled when inputs are already statically padded to equal token counts.
     """
 
     moe_per_layer_logging: bool = False
