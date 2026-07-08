@@ -58,7 +58,10 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
+        # one slot per cached block boundary, reused across requests. Sized to
+        # `max_slots`; the budget accounting in DynamicInferenceContext refers to
+        # these as the "durable" buffers.
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -100,7 +103,12 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
+        # Pre-allocated "scratch" output buffers for CUDA graph compatible
+        # extraction (GPU): per-step staging that the kernel writes intermediate
+        # states into before commit copies them to the durable cache above. Sized
+        # to the per-step worst case (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
+        # max_requests); the budget accounting in DynamicInferenceContext refers to
+        # these as the "scratch" buffers.
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,

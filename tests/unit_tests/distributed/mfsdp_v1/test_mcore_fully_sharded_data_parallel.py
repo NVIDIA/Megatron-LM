@@ -27,7 +27,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
-from tests.unit_tests.distributed.megatron_fsdp.utils import (
+from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
     pretrain_forward_backward,
@@ -92,11 +92,7 @@ class TestFullyShardedDataParallel:
         Utils.destroy_model_parallel()
 
     def _build_fsdp_model(
-        self,
-        grad_reduce_in_fp32=False,
-        main_params_dtype=torch.float32,
-        main_grads_dtype=None,
-        grad_comm_dtype=None,
+        self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
     ):
         """Helper to construct a FullyShardedDataParallel with the given dtype args."""
         fsdp_config = DistributedDataParallelConfig(
@@ -105,7 +101,6 @@ class TestFullyShardedDataParallel:
             overlap_param_gather=True,
             bucket_size=10000,
             use_megatron_fsdp=True,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
             megatron_fsdp_main_params_dtype=main_params_dtype,
             megatron_fsdp_main_grads_dtype=main_grads_dtype,
             megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
@@ -156,36 +151,6 @@ class TestFullyShardedDataParallel:
         assert fsdp_model.mp_policy.main_params_dtype == main_params_dtype
         assert fsdp_model.mp_policy.main_grads_dtype == main_grads_dtype
         assert fsdp_model.mp_policy.grad_comm_dtype == grad_comm_dtype
-
-    def test_fsdp_mp_policy_grad_reduce_in_fp32_overrides_dtypes(self):
-        """Test that grad_reduce_in_fp32=True forces main_grads and grad_comm to fp32."""
-        if not is_torch_min_version("2.4.0"):
-            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
-
-        fsdp_model = self._build_fsdp_model(
-            grad_reduce_in_fp32=True,
-            main_params_dtype=torch.bfloat16,
-            main_grads_dtype=torch.bfloat16,
-            grad_comm_dtype=torch.float16,
-        )
-        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.main_grads_dtype == torch.float32
-        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float32
-
-    def test_fsdp_mp_policy_grad_reduce_in_fp32_disabled_preserves_dtypes(self):
-        """Test that grad_reduce_in_fp32=False preserves the user-specified grads/comm dtypes."""
-        if not is_torch_min_version("2.4.0"):
-            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
-
-        fsdp_model = self._build_fsdp_model(
-            grad_reduce_in_fp32=False,
-            main_params_dtype=torch.bfloat16,
-            main_grads_dtype=torch.bfloat16,
-            grad_comm_dtype=torch.float16,
-        )
-        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.main_grads_dtype == torch.bfloat16
-        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float16
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -483,11 +448,22 @@ class TestFullyShardedDataParallel:
 
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
-        ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
-        [(8, False, True, False), (8, True, True, False), (8, True, True, True)],
+        (
+            "dp_size",
+            "nccl_ub",
+            "fsdp_double_buffer",
+            "fsdp_manual_registration",
+            "megatron_fsdp_max_pool_double_buffer",
+        ),
+        [(8, False, True, False, True), (8, True, True, False, False), (8, True, True, True, True)],
     )
     def test_fsdp_user_buffer_registration(
-        self, dp_size, nccl_ub, fsdp_double_buffer, fsdp_manual_registration
+        self,
+        dp_size,
+        nccl_ub,
+        fsdp_double_buffer,
+        fsdp_manual_registration,
+        megatron_fsdp_max_pool_double_buffer,
     ):
         """Test that FSDP works correctly with user buffer registration.
         This test compares the training results of the baseline fsdp with the target fsdp config.
@@ -531,6 +507,7 @@ class TestFullyShardedDataParallel:
             nccl_ub=False,
             fsdp_double_buffer=False,
             fsdp_manual_registration=False,
+            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Setup FSDP config - target fsdp config
@@ -543,6 +520,7 @@ class TestFullyShardedDataParallel:
             nccl_ub=nccl_ub,
             fsdp_double_buffer=fsdp_double_buffer,
             fsdp_manual_registration=fsdp_manual_registration,
+            megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
         )
 
         # Create two identical models
@@ -776,7 +754,7 @@ class TestMegatronFSDPE2E:
     @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
-        Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
+        Run a small deterministic training loop using a mocked hybrid Mamba+MoE model and optimizer.
         This helper initializes model-parallel state, creates a model and optimizer via
         make_moe_args_model_and_optimizer, constructs a mock GPT data iterator, and runs
         NUM_TRAINING_STEPS iterations of forward/backward/optimization. Losses from each
@@ -928,6 +906,7 @@ class TestMegatronFSDPE2E:
                 dict(
                     data_parallel_sharding_strategy="optim_grads_params",
                     fsdp_double_buffer=True,
+                    megatron_fsdp_max_pool_double_buffer=True,
                     fp8_recipe="mxfp8",
                     fp8="e4m3",
                     fp8_param_gather=True,
@@ -1095,7 +1074,10 @@ class TestMegatronFSDPE2E:
         from megatron.core.rerun_state_machine import destroy_rerun_state_machine
         from megatron.core.transformer.enums import CudaGraphScope
         from megatron.training import pretrain
-        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+        from megatron.training.argument_utils import (
+            gpt_config_from_args,
+            pretrain_cfg_container_from_args,
+        )
         from megatron.training.arguments import add_megatron_arguments, validate_args
         from megatron.training.global_vars import set_global_variables, unset_global_variables
 
@@ -1199,7 +1181,8 @@ class TestMegatronFSDPE2E:
             args.world_size = int(os.getenv("WORLD_SIZE", "1"))
             validate_args(args)
             set_global_variables(args)
-            cfg = pretrain_cfg_container_from_args(args)
+            model_cfg = gpt_config_from_args(args)
+            cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider
@@ -1207,7 +1190,6 @@ class TestMegatronFSDPE2E:
             pretrain(
                 cfg,
                 _pretrain_gpt.train_valid_test_datasets_provider,
-                partial(model_provider, gpt_builder),
                 ModelType.encoder_or_decoder,
                 wrapped_forward_step,
                 get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
@@ -1523,4 +1505,108 @@ class TestFsdpMambaConvParamGather:
         fsdp_model(x)
 
         # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()
+
+
+class TestFsdpHybridModelDoubleBuffer:
+    """Smoke test for fsdp_double_buffer with attention and Mamba FSDP units."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_train_steps_with_double_buffer(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip("Requires exactly 2 GPUs (DP=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: d_inner = 2 * HIDDEN, nheads = d_inner / 64,
+        # and nheads must be divisible by the default mamba_num_groups=8.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+                fsdp_double_buffer=True,
+                megatron_fsdp_max_pool_double_buffer=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer, MambaLayer],
+        )
+
+        optimizer = DistributedOptimizer(
+            optimizer=None,
+            config=OptimizerConfig(optimizer="adam", lr=1e-3),
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[fsdp_model],
+            per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        NUM_MICROBATCHES = 4
+        for _ in range(5):
+            optimizer.zero_grad()
+            for microbatch_idx in range(NUM_MICROBATCHES):
+                fsdp_model.is_last_microbatch = microbatch_idx == NUM_MICROBATCHES - 1
+                x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+                out = fsdp_model(x)
+                loss = out.sum()
+                loss.backward()
+            finalize_model_grads([fsdp_model])
+            optimizer.step()
+
         torch.cuda.synchronize()
