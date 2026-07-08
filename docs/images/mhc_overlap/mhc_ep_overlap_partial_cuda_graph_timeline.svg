@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="945" viewBox="0 0 1800 945">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1005" viewBox="0 0 1800 1005">
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
 <path d="M 0 0 L 10 5 L 0 10 z" fill="#475467"/>
@@ -9,9 +9,9 @@
 <line x1="0" y1="0" x2="0" y2="12" stroke="#6EC5D7" stroke-width="4" opacity="0.55"/>
 </pattern>
 </defs>
-<rect x="0" y="0" width="1800" height="945" fill="#FFFFFF" stroke="none" stroke-width="2" rx="0"/>
+<rect x="0" y="0" width="1800" height="1005" fill="#FFFFFF" stroke="none" stroke-width="2" rx="0"/>
 <text x="70" y="52" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">mHC scheduling with EP overlap and TE partial CUDA graphs</text>
-<text x="70" y="82" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="17">No dedicated mHC stream: all work remains on Megatron's existing compute and communication streams</text>
+<text x="70" y="82" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="17">No dedicated mHC stream: post-processing stays in combine by default or uses Megatron's normal compute stream</text>
 <rect x="70" y="105" width="22" height="17" fill="#4C78A8" stroke="none" stroke-width="2" rx="3"/>
 <text x="101" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">Normal compute</text>
 <rect x="515" y="105" width="22" height="17" fill="#E45756" stroke="none" stroke-width="2" rx="3"/>
@@ -20,7 +20,7 @@
 <text x="1151" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">TE partial CUDA graph</text>
 <rect x="55" y="150" width="1690" height="335" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
 <text x="80" y="190" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">A. Partial CUDA graph + EP overlap</text>
-<text x="80" y="218" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Selective mHC recompute is off; MLP-side mHC post is part of the combine node</text>
+<text x="80" y="218" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Default mode: selective mHC recompute is off; MLP-side mHC post is part of the combine node</text>
 <path d="M 250 274 Q 250 264 260 264 L 611.25 264 Q 621.25 264 621.25 254 Q 621.25 264 631.25 264 L 982.5 264 Q 992.5 264 992.5 274" fill="none" stroke="#0E7490" stroke-width="2.5"/>
 <text x="621.25" y="246" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">layer j backward / layer i forward</text>
 <path d="M 992.5 274 Q 992.5 264 1002.5 264 L 1353.75 264 Q 1363.75 264 1363.75 254 Q 1363.75 264 1373.75 264 L 1725 264 Q 1735 264 1735 274" fill="none" stroke="#0E7490" stroke-width="2.5"/>
@@ -85,7 +85,7 @@
 <text x="1150" y="467" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Experts.F → (Combine + Post).F</text>
 <rect x="55" y="510" width="1690" height="360" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
 <text x="80" y="550" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">B. Explicit mHC group recompute + EP overlap (eager)</text>
-<text x="80" y="578" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Recompute runs on normal compute immediately before the combine node; post remains merged into combine</text>
+<text x="80" y="578" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Default mode: recompute runs on normal compute immediately before combine; post remains merged into combine</text>
 <path d="M 250 634 Q 250 624 260 624 L 611.25 624 Q 621.25 624 621.25 614 Q 621.25 624 631.25 624 L 982.5 624 Q 992.5 624 992.5 634" fill="none" stroke="#0E7490" stroke-width="2.5"/>
 <text x="621.25" y="606" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">recompute group N backward / other microbatch forward</text>
 <path d="M 992.5 634 Q 992.5 624 1002.5 624 L 1353.75 624 Q 1363.75 624 1363.75 614 Q 1363.75 624 1373.75 624 L 1725 624 Q 1735 624 1735 634" fill="none" stroke="#0E7490" stroke-width="2.5"/>
@@ -150,4 +150,7 @@
 <rect x="55" y="880" width="1690" height="48" fill="#FFF7D6" stroke="#E5A000" stroke-width="1.5" rx="8"/>
 <rect x="72" y="894" width="18" height="18" fill="#F2C14E" stroke="none" stroke-width="2" rx="3"/>
 <text x="104" y="912" fill="#7A4E00" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700">Current constraint: EP overlap + selective mHC recompute + any CUDA graph is rejected; explicit group replay is eager-only.</text>
+<rect x="55" y="940" width="1690" height="48" fill="#EFF8FF" stroke="#2E90FA" stroke-width="1.5" rx="8"/>
+<rect x="72" y="954" width="18" height="18" fill="#4C78A8" stroke="none" stroke-width="2" rx="3"/>
+<text x="104" y="972" fill="#175CD3" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700">Optional --mhc-post-on-compute-stream: mHC Post uses normal compute (Combine.F → Post.F; Recompute.B → Post.B → Combine.B); combine stays on communication.</text>
 </svg>

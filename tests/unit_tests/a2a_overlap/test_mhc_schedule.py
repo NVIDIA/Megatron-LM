@@ -10,7 +10,7 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
-from megatron.core.pipeline_parallel.utils import get_comp_stream, set_streams
+from megatron.core.pipeline_parallel.utils import NoopScheduleNode, get_comp_stream, set_streams
 from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
@@ -57,6 +57,37 @@ def _make_valid_mhc_overlap_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
+def test_mhc_post_on_compute_stream_defaults_to_false():
+    config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+
+    assert config.mhc_post_on_compute_stream is False
+
+
+def test_mhc_post_on_compute_stream_does_not_require_recompute():
+    config = _make_valid_mhc_overlap_config(
+        mhc_post_on_compute_stream=True, recompute_granularity=None, recompute_modules=[]
+    )
+
+    assert config.mhc_post_on_compute_stream is True
+
+
+def test_mhc_post_on_compute_stream_requires_hyper_connections():
+    with pytest.raises(ValueError, match="enable_hyper_connections"):
+        _make_valid_mhc_overlap_config(
+            mhc_post_on_compute_stream=True,
+            enable_hyper_connections=False,
+            recompute_granularity=None,
+            recompute_modules=[],
+        )
+
+
+def test_mhc_post_on_compute_stream_requires_ep_overlap():
+    with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm"):
+        _make_valid_mhc_overlap_config(
+            mhc_post_on_compute_stream=True, overlap_moe_expert_parallel_comm=False
+        )
+
+
 @pytest.mark.parametrize(
     "cuda_graph_kwargs",
     ({"cuda_graph_impl": "local"}, {"enable_cuda_graph": True}, {"external_cuda_graph": True}),
@@ -84,13 +115,16 @@ class _RecordingNode:
 
 
 class _RecordingLayer:
-    def __init__(self, calls, prefix):
+    def __init__(self, calls, prefix, separate_mhc_post=False):
         self.calls = calls
         self.config = SimpleNamespace(ep_overlap_early_attn_memory_release=False)
         self.attn = _RecordingNode(calls, f"{prefix}.attn")
         self.moe_dispatch = _RecordingNode(calls, f"{prefix}.moe_dispatch")
         self.mlp = _RecordingNode(calls, f"{prefix}.mlp")
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
+        self.mhc_post = (
+            _RecordingNode(calls, f"{prefix}.mhc_post") if separate_mhc_post else NoopScheduleNode()
+        )
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
 
@@ -131,11 +165,12 @@ def _assert_called_before(calls, first, second):
     assert calls.index(first) < calls.index(second), f"Expected {first} before {second}: {calls}"
 
 
-@pytest.mark.parametrize("explicit_recompute", (False, True))
-def test_layer_schedule_runs_explicit_recompute_before_combine_backward(explicit_recompute):
+@pytest.mark.parametrize("separate_mhc_post", (False, True), ids=("merged", "compute-stream"))
+@pytest.mark.parametrize("explicit_recompute", (False, True), ids=("eager", "recompute"))
+def test_layer_schedule_orders_mhc_post_and_recompute(separate_mhc_post, explicit_recompute):
     calls = []
-    forward_layer = _RecordingLayer(calls, "forward")
-    backward_layer = _RecordingLayer(calls, "backward")
+    forward_layer = _RecordingLayer(calls, "forward", separate_mhc_post)
+    backward_layer = _RecordingLayer(calls, "backward", separate_mhc_post)
     if explicit_recompute:
         backward_layer.mhc_recompute = _RecordingNode(calls, "backward.mhc_recompute")
 
@@ -143,15 +178,23 @@ def test_layer_schedule_runs_explicit_recompute_before_combine_backward(explicit
         forward_layer, backward_layer, f_input=object(), b_grad=object(), is_last_layer_in_bwd=True
     )
 
+    if separate_mhc_post:
+        _assert_called_before(calls, "forward.moe_combine.forward", "forward.mhc_post.forward")
+        _assert_called_before(calls, "backward.mhc_post.backward", "backward.moe_combine.backward")
+    else:
+        assert not any(".mhc_post." in call for call in calls)
+
     if explicit_recompute:
-        _assert_called_before(
-            calls, "backward.mhc_recompute.forward", "backward.moe_combine.backward"
+        next_backward = (
+            "backward.mhc_post.backward" if separate_mhc_post else "backward.moe_combine.backward"
         )
+        _assert_called_before(calls, "backward.mhc_recompute.forward", next_backward)
     else:
         assert "backward.mhc_recompute.forward" not in calls
 
 
-def test_mhc_post_is_merged_into_combine(monkeypatch):
+@pytest.mark.parametrize("mhc_post_on_compute_stream", (False, True), ids=("merged", "separate"))
+def test_mhc_post_node_uses_configured_stream(monkeypatch, mhc_post_on_compute_stream):
     import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
     import megatron.core.transformer.moe.moe_layer as moe_layer
     import megatron.core.transformer.transformer_layer as transformer_layer
@@ -185,6 +228,7 @@ def test_mhc_post_is_merged_into_combine(monkeypatch):
         def __init__(self):
             self.config = SimpleNamespace(
                 delay_wgrad_compute=False,
+                mhc_post_on_compute_stream=mhc_post_on_compute_stream,
                 moe_flex_dispatcher_backend=None,
                 moe_token_dispatcher_type="alltoall",
             )
@@ -227,6 +271,12 @@ def test_mhc_post_is_merged_into_combine(monkeypatch):
                 "is_last_layer_in_mhc_recompute_group", False
             )
 
+        def set_post_forward_hook(self, hook):
+            self.post_forward_hook = hook
+
+        def set_post_backward_hook(self, hook):
+            self.post_backward_hook = hook
+
     monkeypatch.setattr(fine_grained_callables, "MoELayer", _FakeMoE)
     monkeypatch.setattr(
         fine_grained_callables, "HyperConnectionTransformerLayer", _FakeHyperConnectionLayer
@@ -241,6 +291,7 @@ def test_mhc_post_is_merged_into_combine(monkeypatch):
     monkeypatch.setattr(
         transformer_layer, "HyperConnectionTransformerLayer", _FakeHyperConnectionLayer
     )
+    monkeypatch.setattr(transformer_layer, "TransformerLayer", _FakeHyperConnectionLayer)
 
     layer = _FakeHyperConnectionLayer()
     plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
@@ -274,9 +325,53 @@ def test_mhc_post_is_merged_into_combine(monkeypatch):
     assert plan.moe_combine.stream is comm_stream
     assert plan.mhc_recompute.stream is comp_stream
     combine_output = plan.moe_combine.submodule(plan.moe_combine, _Value("experts"))
-    assert not hasattr(plan, "mhc_post")
-    assert combine_output is post_value
-    assert calls == ["combine", "postprocess", "mhc_post"]
+    if mhc_post_on_compute_stream:
+        assert isinstance(plan.mhc_post, _CapturedNode)
+        assert plan.mhc_post.stream is comp_stream
+        assert combine_output is combined_value
+        assert calls == ["combine", "postprocess"]
+        assert plan.mhc_post.submodule(plan.mhc_post, combine_output) is post_value
+        assert calls == ["combine", "postprocess", "mhc_post"]
+    else:
+        assert isinstance(plan.mhc_post, NoopScheduleNode)
+        assert combine_output is post_value
+        assert calls == ["combine", "postprocess", "mhc_post"]
+
+    plan.set_fsdp_reshard_hooks(lambda _: None, lambda _: None)
+    expected_last_node = plan.mhc_post if mhc_post_on_compute_stream else plan.moe_combine
+    previous_node = plan.moe_combine if mhc_post_on_compute_stream else plan.mhc_post
+    assert hasattr(expected_last_node, "post_forward_hook")
+    assert not hasattr(previous_node, "post_forward_hook")
+
+
+def test_mtp_preserves_optional_mhc_post_callable(monkeypatch):
+    import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
+
+    class _FakeMoE:
+        pass
+
+    marker = object()
+
+    def mhc_post_forward(node, hidden_states):
+        return marker
+
+    transformer_callables = [object(), object(), object(), object(), mhc_post_forward, None]
+    backward_dw = {"attn": object(), "mlp": object()}
+    monkeypatch.setattr(fine_grained_callables, "MoELayer", _FakeMoE)
+    monkeypatch.setattr(
+        fine_grained_callables,
+        "build_transformer_layer_callables",
+        lambda _: (transformer_callables, backward_dw),
+    )
+    layer = SimpleNamespace(
+        mtp_model_layer=SimpleNamespace(mlp=_FakeMoE()),
+        config=SimpleNamespace(sequence_parallel=False),
+        eh_proj=object(),
+    )
+
+    forward_callables, _ = fine_grained_callables.build_mtp_layer_callables(layer)
+
+    assert forward_callables[4](object(), object()) is marker
 
 
 def test_model_chunk_recompute_groups_trigger_in_reverse_order():
@@ -444,7 +539,7 @@ def _run_eager_batches_and_capture(model, batches):
     return output_values, gradients
 
 
-def _make_mhc_numerical_config(overlap=True, recompute=True):
+def _make_mhc_numerical_config(overlap=True, recompute=True, mhc_post_on_compute_stream=False):
     recompute_kwargs = (
         {
             "recompute_granularity": "selective",
@@ -461,6 +556,7 @@ def _make_mhc_numerical_config(overlap=True, recompute=True):
             "overlap_moe_expert_parallel_comm": overlap,
             "enable_hyper_connections": True,
             "mhc_sinkhorn_iterations": 5,
+            "mhc_post_on_compute_stream": mhc_post_on_compute_stream,
             **recompute_kwargs,
         },
     )
@@ -479,10 +575,17 @@ class TestMhcA2AOverlapNumerics:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "mhc_post_on_compute_stream", (False, True), ids=("merged", "compute-stream")
+    )
     @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
-    def test_two_layer_alltoall_schedule_matches_eager_hook_path(self, recompute):
+    def test_two_layer_alltoall_schedule_matches_eager_hook_path(
+        self, recompute, mhc_post_on_compute_stream
+    ):
         reference_config = _make_mhc_numerical_config(overlap=False, recompute=recompute)
-        overlap_config = _make_mhc_numerical_config(recompute=recompute)
+        overlap_config = _make_mhc_numerical_config(
+            recompute=recompute, mhc_post_on_compute_stream=mhc_post_on_compute_stream
+        )
         with deterministic_mode():
             data = build_input_data(seq_len=16)
             reference_model = build_gpt_model(reference_config)
@@ -506,9 +609,14 @@ class TestMhcA2AOverlapNumerics:
             )
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_two_inflight_plans_keep_recompute_groups_independent(self):
+    @pytest.mark.parametrize(
+        "mhc_post_on_compute_stream", (False, True), ids=("merged", "compute-stream")
+    )
+    def test_two_inflight_plans_keep_recompute_groups_independent(self, mhc_post_on_compute_stream):
         reference_config = _make_mhc_numerical_config(overlap=False)
-        overlap_config = _make_mhc_numerical_config()
+        overlap_config = _make_mhc_numerical_config(
+            mhc_post_on_compute_stream=mhc_post_on_compute_stream
+        )
         with deterministic_mode():
             batches = [build_input_data(seq_len=16) for _ in range(2)]
             reference_model = build_gpt_model(reference_config)
