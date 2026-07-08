@@ -24,7 +24,6 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import get_worker_info
 
 try:
     import zstandard

@@ -37,7 +37,7 @@ Assumptions
 * The current ``micro_batch_size``, ``data_parallel_size`` and
   ``global_batch_size`` may each differ from the teacher run, restricted to
   integer multiples (in either direction) of the saved value.  The loader
-  builds a :class:`~megatron.training.distillation.utils_logits.LogprobsReshardPlan`
+  builds a :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
   that maps each load microbatch to one or a few contiguous slices of saved
   monoliths.
 * Teacher log-probs were saved by ``LogitsSaverHooks`` with payload
@@ -78,7 +78,7 @@ from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.training import get_args
-from megatron.training.distillation.utils_logits import (
+from megatron.training.distillation.utils import (
     BATCHED_TAR_RE,
     CACHED_LOGITS_LOGPROB_SENTINEL,
     LogprobsReshardPlan,
@@ -174,7 +174,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     The loader maintains one decode stream per saved DP rank it reads from
     and assembles each load microbatch as a (typically single) contiguous
     slice of those monoliths, using a
-    :class:`~megatron.training.distillation.utils_logits.LogprobsReshardPlan`
+    :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
     to map (load iteration, microbatch step, current DP rank) → saved
     (iteration, DP rank, row range) tuples.
 
