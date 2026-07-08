@@ -1276,29 +1276,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     token_list, num_tiles=num_tiles, imgs_sizes=imgs_sizes
                 )
             )
-            tokens = torch.tensor(
-                expanded_tokens_list[0], dtype=torch.int64, device=device
-            )
+            tokens = torch.tensor(expanded_tokens_list[0], dtype=torch.int64, device=device)
             mask_tensor = torch.tensor(
                 [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
             )
 
-        if (
-            has_images
-            and imgs is not None
-            and is_pipeline_first_stage(self.controller.pp_group)
-        ):
+        if has_images and imgs is not None and is_pipeline_first_stage(self.controller.pp_group):
             with torch.inference_mode():
-                image_embeddings = (
-                    self.controller.inference_wrapped_model._forward_vision_encoder(
-                        imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
-                    )
+                image_embeddings = self.controller.inference_wrapped_model._forward_vision_encoder(
+                    imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
                 )
 
         self.context.add_vlm_request_data(
-            request_id,
-            image_embeddings=image_embeddings,
-            image_token_mask=mask_tensor,
+            request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
         )
 
         return DynamicVLMInferenceRequest(

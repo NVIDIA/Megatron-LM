@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -147,11 +147,14 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             mask (List[List[int or None]]): Mask indicating image embedding indices for each
                 position, None for non-image positions.
         """
-        module = self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        module = (
+            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        )
         image_token_index = module.image_token_index
 
         pad_value = -1
         batch_size = len(tokens)
+        img_embeddings_per_tile = 0  # set below in the static-resolution branch
 
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
@@ -226,9 +229,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
                 image_idx = 0
                 image_embedding_offset = (
-                    sum(
-                        num_tiles_per_sample[i].sum().item() for i in range(batch_idx)
-                    )
+                    sum(num_tiles_per_sample[i].sum().item() for i in range(batch_idx))
                     * img_embeddings_per_tile
                 )
 
@@ -258,7 +259,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         return expanded_tokens_list, mask_list
 
-    def _forward_vision_encoder(self, images, num_image_tiles=None, imgs_sizes=None) -> torch.Tensor:
+    def _forward_vision_encoder(
+        self, images, num_image_tiles=None, imgs_sizes=None
+    ) -> torch.Tensor:
         """Run the vision encoder only, returning image embeddings.
 
         Temporarily disables the decoder so that the LLaVA forward only runs
@@ -274,17 +277,21 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
-        module = self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        module = (
+            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        )
 
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
             patch_dim = module._patch_dim
             seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
-            cu_seqlens = torch.cat([
-                torch.zeros(1, dtype=torch.int32, device=imgs_sizes.device),
-                torch.cumsum(seq_lens, dim=0).to(torch.int32),
-            ])
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=imgs_sizes.device),
+                    torch.cumsum(seq_lens, dim=0).to(torch.int32),
+                ]
+            )
             max_seqlen = int(seq_lens.max().item())
             vision_packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
@@ -336,7 +343,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input.get("attention_mask", None)
         image_embeddings = inference_input.get("image_embeddings", None)
 
-        module = self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        module = (
+            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
+        )
 
         if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
             # Replace -1 padding with 0 for embedding lookup
@@ -361,13 +370,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                     image_indices = image_token_mask[image_positions]
 
                     # Reshape image embeddings to [total_image_tokens, embed_dim]
-                    image_embeddings_flat = image_embeddings.permute(1, 0, 2).reshape(
-                        -1, embed_dim
-                    )
+                    image_embeddings_flat = image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
 
-                    image_embeddings_flat = image_embeddings_flat.to(
-                        dtype=final_embedding.dtype
-                    )
+                    image_embeddings_flat = image_embeddings_flat.to(dtype=final_embedding.dtype)
 
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
