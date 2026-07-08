@@ -357,9 +357,7 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
     gemm_events = [
         event
         for event in cuda_events
-        if any(
-            token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet")
-        )
+        if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet"))
     ]
     assert all_gather_events, [event.name for event in cuda_events]
     assert gemm_events, [event.name for event in cuda_events]
