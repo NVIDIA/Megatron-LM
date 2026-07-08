@@ -264,10 +264,9 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     )
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
-    rolled_tensor = tensor.clone()
-
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
+        rolled_tensor = tensor.clone()
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
             start_idx = cu_seqlens[i]
@@ -388,7 +387,7 @@ def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fi
         nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
         nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
         cu = cu[nonduplicate_boundaries]
-    if cu.numel() <= 1 or cu[-1].item() == 0:
+    if cu.numel() <= 1:
         rolled_tensor.fill_(fill_value)
         return rolled_tensor
 
@@ -399,8 +398,7 @@ def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fi
     valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
 
     invalid_next = ~valid_next
-    if invalid_next.any():
-        rolled_tensor[..., invalid_next] = fill_value
+    rolled_tensor[..., invalid_next] = fill_value
 
     recv_next_first = torch.empty_like(tensor.select(dims, 0))
     ops = []
@@ -414,8 +412,9 @@ def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fi
     for op in ops:
         op.wait()
 
-    if local_rank < cp_size - 1 and valid_next[-1].item():
-        rolled_tensor.select(dims, -1).copy_(recv_next_first)
+    if local_rank < cp_size - 1:
+        last = rolled_tensor.select(dims, -1)
+        last.copy_(torch.where(valid_next[-1], recv_next_first, last))
 
     return rolled_tensor
 
