@@ -52,6 +52,7 @@ Run with::
 
 import os
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -59,8 +60,9 @@ import torch.distributed as dist
 from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
+from examples.mimo.training.grad_sync import configure_grad_sync
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
@@ -164,88 +166,24 @@ def _set_deterministic_env():
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
-def _wire_training_hooks(mimo_model, language_pg, vision_pg):
-    """Attach no_sync / finalize_grads / grad_scale hooks to a MimoModel.
+def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg):
+    """Attach no_sync plus the production grad-sync hooks to a MimoModel.
 
-    The finalize hook implements the heterogeneous-DP grad-scaling story
-    without touching ``DistributedDataParallel``. Both sub-model configs
-    set ``calculate_per_token_loss=True``, so both DDPs pure-SUM across
-    their own DP group (``gradient_scaling_factor=1.0``). After backward
-    and DDP reduce, every rank's ``main_grad`` holds the un-normalized
-    full-batch sum of per-token gradients.
-
-    This hook then:
-      1. all-reduces the schedule's ``total_num_tokens`` across the LLM
-         DP group to obtain ``N_global`` (total valid tokens in the global
-         batch). Since ranks are colocated, every rank now knows
-         ``N_global``.
-      2. Calls ``finalize_model_grads(num_tokens=None)`` per side — runs
-         the usual DDP grad finish + layernorm/embedding AR work without
-         letting the built-in divisor path fire.
-      3. Calls ``scale_gradients(1/N_global)`` on each side — lands the
-         true global per-token mean uniformly on encoder and LLM grads.
-
-    Note: encoder has no loss_func (so nothing emits a per-encoder-DP
-    ``num_tokens`` to feed ``finalize_model_grads``' internal all-reduce).
-    Doing the all-reduce once ourselves and calling ``scale_gradients``
-    directly avoids engineering a fictitious per-encoder-rank count whose
-    sum happens to equal ``N_global``.
+    Delegates the finalize/grad-scale wiring to ``configure_grad_sync`` (the real
+    examples/mimo path), so this test's dp1-reference assertions validate that
+    production hook directly. ``configure_grad_sync`` implements the same per-token
+    mean: all-reduce ``total_num_tokens`` over the LLM DP group to get ``N_global``,
+    finalize each submodule over its own group, then ``scale_gradients(1/N_global)``.
     """
-
-    no_sync_func = build_no_sync_func(mimo_model)
-
-    def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
-        # Schedule passes the per-rank sum-across-microbatches of what the
-        # loss_func returned. Because loss_func runs only on the LLM side,
-        # this is the LLM-local token count.
-        assert num_tokens is not None, (
-            "finalize_grads_func expects calculate_per_token_loss=True on the "
-            "TransformerConfig so the schedule forwards total_num_tokens; got None."
-        )
-
-        # Phase 1: lift the all-reduce. After this, every rank (including
-        # encoder-only replicas) has N_global = total non-padded tokens in
-        # the global batch.
-        llm_dp_pg = language_pg.dp_cp if language_pg.dp_cp is not None else language_pg.dp
-        dist.all_reduce(num_tokens, group=llm_dp_pg, op=dist.ReduceOp.SUM)
-        n_global = num_tokens.item()
-
-        # Phase 2: per-side DDP finish without built-in num_tokens scaling.
-        # Forward ``force_all_reduce`` so PP grad-sync semantics (if ever
-        # exercised here) aren't silently dropped.
-        if mimo_model.language_model is not None:
-            finalize_model_grads(
-                [mimo_model.language_model],
-                num_tokens=None,
-                pg_collection=language_pg,
-                force_all_reduce=force_all_reduce,
-            )
-        for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                finalize_model_grads(
-                    [submodule],
-                    num_tokens=None,
-                    pg_collection=vision_pg,
-                    force_all_reduce=force_all_reduce,
-                )
-
-        # Phase 3: uniform divide by N_global. Guard div-by-zero for the
-        # degenerate fully-masked batch.
-        if n_global > 0:
-            inv = 1.0 / n_global
-            if mimo_model.language_model is not None:
-                mimo_model.language_model.scale_gradients(inv)
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    submodule.scale_gradients(inv)
-
-    mimo_model.config.no_sync_func = no_sync_func
-    mimo_model.config.finalize_model_grads_func = finalize_grads_func
-    mimo_model.config.grad_scale_func = lambda loss: (
-        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
-        if isinstance(loss, (int, float))
-        else loss
+    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
+    topology = SimpleNamespace(
+        grids=module_to_grid_map,
+        module_pgs={
+            MIMO_LANGUAGE_MODULE_KEY: language_pg,
+            **{name: vision_pg for name in mimo_model.modality_submodules},
+        },
     )
+    configure_grad_sync(SimpleNamespace(), mimo_model, topology)
 
 
 def _generate_and_broadcast_global_batches(
@@ -990,7 +928,7 @@ class TestColocatedGradientScalingCorrectness:
 
         # Build dist first (heterogeneous TP/DP).
         torch.manual_seed(12345)
-        dist_mimo, _, _, dist_language_pg, dist_vision_pg = get_mimo_model(
+        dist_mimo, dist_module_to_grid_map, _, dist_language_pg, dist_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=dist_enc_grid,
             llm_grid=dist_llm_grid,
@@ -1009,7 +947,7 @@ class TestColocatedGradientScalingCorrectness:
 
         # Reference with equal-DP uniform (enc_tp == llm_tp, enc_dp == llm_dp).
         torch.manual_seed(12345)
-        ref_mimo, _, _, ref_language_pg, ref_vision_pg = get_mimo_model(
+        ref_mimo, ref_module_to_grid_map, _, ref_language_pg, ref_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=ref_enc_grid,
             llm_grid=ref_llm_grid,
@@ -1044,8 +982,8 @@ class TestColocatedGradientScalingCorrectness:
             dist_llm_grid.get_pg("tp"),
         )
 
-        _wire_training_hooks(dist_mimo, dist_language_pg, dist_vision_pg)
-        _wire_training_hooks(ref_mimo, ref_language_pg, ref_vision_pg)
+        _wire_training_hooks(dist_mimo, dist_module_to_grid_map, dist_language_pg, dist_vision_pg)
+        _wire_training_hooks(ref_mimo, ref_module_to_grid_map, ref_language_pg, ref_vision_pg)
 
         # Distributed optimizers snapshot current param.data into fp32 master
         # weights at __init__, so both must be built AFTER the ref-to-dist

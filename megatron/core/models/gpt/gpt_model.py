@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -339,6 +339,12 @@ class GPTModel(LanguageModule):
                     f"input_ids shape {input_ids.shape}"
                 )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
@@ -690,11 +696,19 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
+            if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
                 self._decoder_hidden_states_cache = hidden_states
-            else:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 hidden_states = process_mtp_loss(

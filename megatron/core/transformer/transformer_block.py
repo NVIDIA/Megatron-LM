@@ -23,6 +23,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
@@ -380,6 +382,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline

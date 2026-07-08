@@ -42,6 +42,7 @@ from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
+    get_pg_rank,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -292,8 +293,12 @@ def logical_and_across_model_parallel_group(
     return bool(input.item())
 
 
-def report_memory(name):
-    """Simple GPU memory report."""
+def report_memory(name, process_group=None):
+    """Simple GPU memory report.
+
+    process_group: optional data-parallel group to gate the rank-0 print on; None falls back
+        to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
+    """
     args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
@@ -303,7 +308,12 @@ def report_memory(name):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    if mpu.get_data_parallel_rank() == 0:
+    is_dp_rank_0 = (
+        get_pg_rank(process_group) == 0
+        if process_group is not None
+        else mpu.get_data_parallel_rank() == 0
+    )
+    if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 

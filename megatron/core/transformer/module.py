@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
 from functools import partial
@@ -353,6 +353,9 @@ class GraphableMegatronModule(MegatronModule):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
             cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
             cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs

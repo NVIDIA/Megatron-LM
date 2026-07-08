@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from typing import Literal, Optional
@@ -464,6 +464,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
+
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -567,7 +574,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
-            else:
+                if inference_context is not None:
+                    if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                        # Block-scope CUDA graph mode: copy_() into the
+                        # pre-allocated buffer so every graph replay writes to
+                        # the same fixed GPU address regardless of batch size.
+                        assert inference_context.mtp_decoder_hidden_states is not None
+                        inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                            hidden_states
+                        )
+                    else:
+                        # Non-block scope: direct assignment; the controller will set
+                        # this back to None after reading to allow GC.
+                        inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(

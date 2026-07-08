@@ -31,6 +31,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -652,6 +653,9 @@ class HybridStack(MegatronModule):
             if self.config.enable_hyper_connections:
                 layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
             self.layers.append(layer)
+
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)

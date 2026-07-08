@@ -87,6 +87,7 @@ from megatron.rl.sequence_packing_utils import (
     pack_inference_logprobs,
     update_microbatch_calculator,
 )
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -583,9 +584,13 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
+        parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
+        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
+        num_groups = n_prompts
+        if streaming and args.rl_submission_granularity != "B":
+            num_groups = 1
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            num_groups=num_groups,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -596,7 +601,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            submission_granularity=args.rl_submission_granularity,
+            consumption_granularity=args.rl_consumption_granularity,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR

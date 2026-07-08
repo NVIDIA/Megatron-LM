@@ -34,6 +34,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -311,6 +312,9 @@ class TransformerConfig(ModelParallelConfig):
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks."""
 
+    experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
+    """Optional hook for experimental attention variants to receive the main loss scale."""
+
     ####################
     # DSA
     ####################
@@ -323,12 +327,39 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """Frequency of DSA indexer top-k computation across layers.
+    A value greater than 1 enables cross-layer top-k sharing."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset for DSA cross-layer top-k sharing."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    """Optional fused DSA kernel backend.
+    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
+    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether DSA indexer RoPE should use MLA-style interleaving."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
+
+    dsa_indexer_scoring_relu: bool = True
+    """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Optional epsilon override for the DSA indexer key LayerNorm."""
+
+    dsa_indexer_k_norm_fp32: bool = False
+    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -722,6 +753,18 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared experts execute before the router. 
     Only effective when moe-shared-expert-intermediate-size is set.
+    """
+
+    use_grouped_gemm_for_shared_expert: bool = False
+    """Use GroupedLinear(num_groups=1) for the shared expert MLP to trigger the
+    Transformer Engine grouped SwiGLU fusion path. Only effective when
+    moe-shared-expert-intermediate-size is set.
+    """
+
+    moe_shared_expert_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the shared expert MLP will use a block
+    interleaved format. This is only effective when
+    use_grouped_gemm_for_shared_expert is set.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -1351,7 +1394,10 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     activation_offload_fraction: float = 1.0
-    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+    """Fraction of eligible activation offload groups to offload across configured modules.
+    For details, see:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#activation-offload-fraction.
+    """
 
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
@@ -1569,7 +1615,21 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.add_bias_linear:
+                raise ValueError(
+                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
+                    "Disable linear bias for DSA configs."
+                )
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -2170,7 +2230,9 @@ class TransformerConfig(ModelParallelConfig):
                     "which is needed in core_attn.backward()."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1"} & set(self.offload_modules)
+                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
+                    self.offload_modules
+                )
                 assert not offload_inside_moe, (
                     f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
                     f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
@@ -2921,6 +2983,19 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
+                if self.cuda_graph_impl == "local":
+                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    unsupported_offload_modules = offload_modules - local_supported_offload_modules
+                    assert not unsupported_offload_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
+                        "'fused_group_mlp'. "
+                        f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
+                    )
+                    assert self.cuda_graph_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "is not supported with whole-layer CUDA graph capture."
+                    )
                 local_partial_moe_offload = (
                     self.cuda_graph_impl == "local"
                     and bool(offload_modules)
@@ -2933,7 +3008,7 @@ class TransformerConfig(ModelParallelConfig):
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
-                    "implementation with full_iteration scope. Local partial CUDA graphs "
+                    "implementation with partial MoE offload. Local partial CUDA graphs "
                     "are supported only for expert_fc1, moe_act, or fused_group_mlp "
                     "offload when the full MoE module is not captured."
                 )
@@ -3147,6 +3222,23 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+
+        if self.experimental_attention_variant == "dsa":
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(
+                    cp_comm_type is not None
+                    and cp_comm_type.replace("_", "").lower() == "allgather"
+                    for cp_comm_type in cp_comm_types
+                ), (
+                    "DSAttention context parallelism currently supports "
+                    "cp_comm_type=allgather only."
+                )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
