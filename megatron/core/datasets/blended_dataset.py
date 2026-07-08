@@ -14,6 +14,7 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import normalize
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -96,10 +97,10 @@ class BlendedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         if self.dataset_index is None:
-            self.dataset_index = numpy.load(
+            self.dataset_index = safe_numpy_load(
                 self.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
             )
-            self.dataset_sample_index = numpy.load(
+            self.dataset_sample_index = safe_numpy_load(
                 self.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
             )
 
@@ -223,7 +224,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
+        dataset_index = safe_numpy_load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -233,7 +234,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             f"\tLoad the dataset sample index from {path_to_dataset_sample_index}",
         )
         t_beg = time.time()
-        dataset_sample_index = numpy.load(
+        dataset_sample_index = safe_numpy_load(
             path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
         )
         t_end = time.time()
