@@ -60,32 +60,32 @@ products:
   - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp8_dp1_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_dp2_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1, L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_round_robin_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L2]
         platforms: [dgx_h100]
   # Throughput coverage for this 583M dynamic-batching DP=8 config now lives at
   # tests/performance_tests/test_cases/gpt/gpt_583m_perf/ — see

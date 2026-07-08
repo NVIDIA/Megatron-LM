@@ -148,6 +148,16 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    # Sliding-window attention config. When `window_size` is None, SWA is
+    # disabled and all layers do full causal attention. When set to a
+    # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
+    # local window of `left` past tokens and `right` future tokens.
+    window_size: Optional[Tuple[int, int]] = None
+    window_attn_skip_freq: Optional[int] = None
+    # Sink (off-by-one / learnable) softmax — exercises the post-hoc LSE
+    # rescale path inside Attention.flash_decode_and_prefill. Default keeps
+    # behavior unchanged for existing tests.
+    softmax_type: str = "vanilla"
 
     def __post_init__(self):
 
@@ -370,7 +380,10 @@ class DynamicInferenceEngineTestBase:
                     if test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
+                softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
+                window_size=test_config.window_size,
+                window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -881,6 +894,40 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """Test adding multiple requests simultaneously."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         self._run_test(num_gap_steps=0, model_provider=model_provider)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        # Cover three regimes:
+        #   - SWA active on every layer (window_attn_skip_freq=None)
+        #   - SWA active on a subset of layers (gpt-oss style: every other layer)
+        #   - window smaller than the longest sequence we generate, so the
+        #     kernel actually applies the local-attention mask.
+        "window_size,window_attn_skip_freq",
+        [((4, 0), None), ((4, 0), 2), ((127, 0), 2)],
+    )
+    def test_sliding_window_attention(
+        self, window_size: Tuple[int, int], window_attn_skip_freq: Optional[int]
+    ) -> None:
+        """Exercise SWA on the dynamic batching (FA2/FA3/FA4) attention path.
+
+        This mirrors the gpt-oss configuration (window 127 to the left, no
+        future tokens, applied every other layer) at a much smaller scale.
+        The test only checks that decoding runs end-to-end and produces the
+        expected number of tokens; numerical correctness of the SWA kernels
+        themselves is owned by the upstream flash-attention test suites.
+        """
+        self._run_test(
+            model_provider="gpt",
+            num_gap_steps=0,
+            window_size=window_size,
+            window_attn_skip_freq=window_attn_skip_freq,
+            # Disable CUDA graphs: this test only validates the SWA plumbing
+            # through the attention kernel, not the CG capture path.
+            num_cuda_graphs=None,
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1957,6 +2004,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             f"Expected effective chunk length to be backed off to 17, "
             f"but got {ctx.request_query_lengths[req_b_idx].item()}."
         )
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_mamba_match_is_chunk_local_when_chunked_prefill_limits_kv_match(self):
+        """Mamba restore depth is bounded to KV blocks assigned for the current chunk."""
+        block_size = 256
+        block_hashes = [111, 222]
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.arange(512, dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+            precomputed_block_hashes=block_hashes,
+        )
+
+        # This simulates the old scheduler-side full-prompt Mamba match. The
+        # context must ignore it and record the chunk-local executable count.
+        req._mamba_num_matched_blocks = 2
+
+        ctx = DynamicInferenceContext.__new__(DynamicInferenceContext)
+        ctx.block_size_tokens = block_size
+        ctx.enable_prefix_caching = True
+        ctx.is_hybrid_model = True
+        ctx.kv_block_allocator = types.SimpleNamespace(
+            kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+        ctx.mamba_slot_allocator = types.SimpleNamespace(
+            hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+
+        (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_prefill_chunk_length,
+        ) = DynamicInferenceContext._compute_prefix_match(
+            ctx, req, prefill_chunk_length=211, record_mamba_match=True
+        )
+
+        assert matched_block_ids == [7]
+        assert num_blocks_from_pool == 0
+        assert already_allocated_blocks == 0
+        assert overall_required_blocks == 1
+        assert req._mamba_num_matched_blocks == 1
+        assert prefix_skip_tokens == 0
+        assert effective_prefill_chunk_length == 211
 
     @pytest.mark.internal
     @pytest.mark.skipif(
