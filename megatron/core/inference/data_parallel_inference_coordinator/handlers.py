@@ -87,6 +87,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Serialize prompt.
     if isinstance(prompt, (str, list)):
@@ -117,6 +118,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         logging.error("Coordinator: no reachable engines for request %d", request_id)
         del coordinator.request_id_to_client_id[request_id]
         del coordinator.request_id_to_client_request_id[request_id]
+        coordinator.client_request_to_request_id.pop((sender_identity, client_request_id), None)
         return True
 
     coordinator.request_id_to_rank[request_id] = next_identity
@@ -192,7 +194,10 @@ def handle_engine_reply(coordinator, sender_identity, payload):
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_identity = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
-        del coordinator.request_id_to_client_request_id[fid]
+        original_request_id = coordinator.request_id_to_client_request_id.pop(fid)
+        coordinator.client_request_to_request_id.pop(
+            (client_identity, original_request_id), None
+        )
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -208,6 +213,47 @@ def handle_engine_reply(coordinator, sender_identity, payload):
                     use_bin_type=True,
                 ),
             ]
+        )
+
+
+@message_handler(Headers.ENGINE_REPLY_PARTIAL)
+def handle_engine_reply_partial(coordinator, sender_identity, payload):
+    """Route incremental engine replies without releasing request routing state."""
+    assert sender_identity in coordinator.identities_of_data_parallel_ranks
+    for partial in payload[1]:
+        request_id = partial["request_id"]
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        if client_identity is None:
+            continue
+        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        coordinator.router_socket.send_multipart(
+            [
+                client_identity,
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+
+
+@message_handler(Headers.ABORT_REQUEST)
+def handle_abort_request(coordinator, sender_identity, payload):
+    """Forward a client cancellation to the engine serving that request."""
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring abort from unknown client.")
+        return
+    client_request_id = int(payload[1])
+    request_id = coordinator.client_request_to_request_id.get(
+        (sender_identity, client_request_id)
+    )
+    if request_id is None:
+        return
+    assigned_rank = coordinator.request_id_to_rank.get(request_id)
+    if assigned_rank is not None:
+        coordinator._send_to_engine(
+            assigned_rank,
+            msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
         )
 
 

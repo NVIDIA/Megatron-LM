@@ -316,6 +316,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Generated token count already streamed for each request.
+        self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
@@ -2112,6 +2114,34 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
 
+            # Stream newly generated tokens for active requests. Finished
+            # requests were already popped from self.requests above, so their
+            # emit lengths are dropped here rather than in the loop.
+            for record in finished_request_records:
+                self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
+            partials: list = []
+            for rid, entry in self.requests.items():
+                request = entry.record[-1]
+                if not getattr(request.sampling_params, "streaming", False):
+                    continue
+                already = self._partial_emit_lengths.get(rid, 0)
+                total = len(request.generated_tokens)
+                if total > already:
+                    new_tokens = list(request.generated_tokens[already:])
+                    partial = {"request_id": rid, "new_tokens": new_tokens}
+                    if request.sampling_params.return_log_probs:
+                        partial["new_log_probs"] = list(
+                            (request.generated_log_probs or [])[already:]
+                        )
+                    partials.append(partial)
+                    self._partial_emit_lengths[rid] = total
+            if partials:
+                nvtx_range_push("coordinator_streaming")
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
+                )
+                nvtx_range_pop("coordinator_streaming")
+
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
@@ -2434,6 +2464,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.ABORT_REQUEST:
+                request_id = int(data[1])
+                entry = self.requests.get(request_id)
+                if entry is not None:
+                    request = entry.record[-1]
+                    # Force active requests to finish on the next step.
+                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    active_ids = self.context.request_ids[: self.context.total_request_count]
+                    matches = torch.where(active_ids == request_id)[0]
+                    if matches.numel() > 0:
+                        idx = int(matches[0].item())
+                        self.context.request_output_lengths[idx] = (
+                            self.context.request_kv_length_offsets[idx]
+                            + self.context.request_query_lengths[idx]
+                        )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             elif header == Headers.START_CUDA_PROFILER:

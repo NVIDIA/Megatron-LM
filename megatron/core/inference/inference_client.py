@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import functools
 import logging
 import time
 from typing import List, Optional, Union
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
@@ -83,6 +85,8 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        self.streams: dict[int, AsyncStream[dict]] = {}
+        self.aborted_request_ids: set[int] = set()
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -115,6 +119,57 @@ class InferenceClient:
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    def abort_request(self, request_id: int) -> None:
+        """Cancel an in-flight request and close its local response stream."""
+        request_id = int(request_id)
+        self.aborted_request_ids.add(request_id)
+        stream = self.streams.pop(request_id, None)
+        if stream is not None:
+            stream.finish()
+        future = self.completion_futures.pop(request_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self.request_submission_times.pop(request_id, None)
+        payload = [Headers.ABORT_REQUEST.value, request_id]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
+    def add_request_streaming(
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+    ) -> AsyncStream[dict]:
+        """Submit a streaming inference request.
+
+        Used by Dynamo directly and by the OpenAI-compatible HTTP frontend.
+
+        Returns an async iterator that yields one dict per engine step:
+
+        - ``{"partial": {"request_id": int, "new_tokens": list[int]}}`` for each
+          step that produced new tokens, in order.
+        - ``{"final": <full reply dict or DynamicInferenceRequest>}`` exactly once
+          at the end. The iterator then stops.
+
+        ``sampling_params.streaming`` is forced to True before submission so the
+        engine knows to emit ENGINE_REPLY_PARTIAL frames for this request.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters. ``streaming`` is set to True
+                in-place.
+
+        Returns:
+            AsyncStream[dict]: Per-step partial and final reply frames.
+        """
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        stream = AsyncStream(
+            request_id, functools.partial(self.abort_request, request_id), loop=self._loop
+        )
+        self.streams[request_id] = stream
+        self.request_submission_times[request_id] = time.perf_counter()
+        return stream
+
     @trace_async_exceptions
     async def _recv_task(self):
         """
@@ -134,9 +189,23 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
-                    reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
-                        request_id
-                    )
+                    if request_id in self.aborted_request_ids:
+                        self.aborted_request_ids.discard(request_id)
+                        continue
+                    submitted = self.request_submission_times.pop(request_id, None)
+                    if submitted is not None:
+                        reply['latency'] = time.perf_counter() - submitted
+                    # Streaming path: deliver final reply + sentinel and stop.
+                    if request_id in self.streams:
+                        stream = self.streams.pop(request_id)
+                        completed_request = (
+                            DynamicInferenceRequest.deserialize(reply)
+                            if self.deserialize
+                            else reply
+                        )
+                        stream.put({"final": completed_request})
+                        stream.finish()
+                        continue
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
@@ -145,13 +214,18 @@ class InferenceClient:
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
+                elif header == Headers.ENGINE_REPLY_PARTIAL:
+                    request_id, partial = data[1:]
+                    stream = self.streams.get(request_id)
+                    if stream is not None:
+                        stream.put({"partial": partial})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
             except KeyboardInterrupt:
                 break
 
-    def _connect_with_inference_coordinator(self):
+    def _connect_with_inference_coordinator(self, timeout_seconds: Optional[float] = None):
         """
         Performs the initial handshake with the inference coordinator.
 
@@ -160,10 +234,18 @@ class InferenceClient:
         """
         payload = [Headers.CONNECT.value]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        assert Headers(reply) == Headers.CONNECT_ACK
+        if timeout_seconds is not None and not self.socket.poll(
+            timeout=max(0, int(timeout_seconds * 1000))
+        ):
+            raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
+        reply = msgpack.unpackb(self.socket.recv(), raw=False)
+        assert Headers(reply[0]) == Headers.CONNECT_ACK
 
-    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def start(
+        self,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        connect_timeout_seconds: Optional[float] = None,
+    ):
         """
         Connects to the coordinator and starts the background listener task.
 
@@ -173,7 +255,7 @@ class InferenceClient:
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
-        self._connect_with_inference_coordinator()
+        self._connect_with_inference_coordinator(connect_timeout_seconds)
         self.listener_task = self._loop.create_task(self._recv_task())
 
     def _send_signal_to_engines(self, signal, *args):
@@ -266,5 +348,10 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
+        # Terminate any open streaming iterators.
+        for stream in self.streams.values():
+            stream.finish()
+        self.streams.clear()
+        self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()
