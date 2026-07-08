@@ -1009,9 +1009,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
-            hidden_states,
-            extract_layer_indices=extract_layer_indices,
-            return_mhc_multistream=True,
+            hidden_states, extract_layer_indices=extract_layer_indices, return_mhc_multistream=True
         )
 
         if len(extract_layer_indices) > 0:
