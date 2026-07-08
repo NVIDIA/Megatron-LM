@@ -303,6 +303,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+    def add_kv_event_listener(self, listener) -> None:
+        """Register a prefix-cache lifecycle listener on the context.
+
+        Currently used only by the Dynamo frontend.
+        """
+        self.context.add_kv_event_listener(listener)
+
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
@@ -811,6 +818,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
+        self.context.notify_kv_cache_cleared()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -1933,6 +1941,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # Discard registrations left by an interrupted prior step before this
+        # step's scheduling queues new registrations.
+        self.context.discard_pending_kv_stored_events()
+
         # schedule requests
         self.schedule_waiting_requests()
 
@@ -1972,6 +1984,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if will_log_this_step:
             self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        self.context.publish_pending_kv_stored_events()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
