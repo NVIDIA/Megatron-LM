@@ -1891,9 +1891,14 @@ class GTPWeightCache:
             reduce_scatter=reduce_scatter,
             fwd=fwd,
             chain_id=getattr(param, "chain_id", GTPChain.UNGRAPHED.value),
-            # Pin only the output-layer forward buffer so it's never pooled — its
-            # gathered weight is retained for backward dgrad (output-layer reuse).
-            pin=bool(fwd and getattr(param, "_reuse_fwd_weight_in_bwd", False)),
+            # Pin the output-layer fwd buffer (retained for bwd dgrad reuse) so it's never
+            # pooled. Mirror the retain guard: exclude native-FP8 (never retained), else the
+            # pin would strand an unused buffer.
+            pin=bool(
+                fwd
+                and getattr(param, "_reuse_fwd_weight_in_bwd", False)
+                and not getattr(param, "_gtp_native_fp8", False)
+            ),
         )
         return ticket
 
