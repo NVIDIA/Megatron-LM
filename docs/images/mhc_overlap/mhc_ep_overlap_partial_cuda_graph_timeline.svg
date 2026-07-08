@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1145" viewBox="0 0 1800 1145">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="945" viewBox="0 0 1800 945">
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
 <path d="M 0 0 L 10 5 L 0 10 z" fill="#475467"/>
@@ -8,167 +8,146 @@
 <rect width="12" height="12" fill="#277DA1"/>
 <line x1="0" y1="0" x2="0" y2="12" stroke="#6EC5D7" stroke-width="4" opacity="0.55"/>
 </pattern>
-<filter id="shadow" x="-10%" y="-20%" width="120%" height="150%">
-<feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#101828" flood-opacity="0.13"/>
-</filter>
 </defs>
-<rect x="0" y="0" width="1800" height="1145" fill="#FFFFFF" stroke="none" stroke-width="2" rx="0"/>
+<rect x="0" y="0" width="1800" height="945" fill="#FFFFFF" stroke="none" stroke-width="2" rx="0"/>
 <text x="70" y="52" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">mHC scheduling with EP overlap and TE partial CUDA graphs</text>
-<text x="70" y="82" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="17">Illustrative steady-state 1F1B window; widths show ordering, not measured silicon time</text>
+<text x="70" y="82" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="17">No dedicated mHC stream: all work remains on Megatron's existing compute and communication streams</text>
 <rect x="70" y="105" width="22" height="17" fill="#4C78A8" stroke="none" stroke-width="2" rx="3"/>
 <text x="101" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">Normal compute</text>
-<rect x="455" y="105" width="22" height="17" fill="#E45756" stroke="none" stroke-width="2" rx="3"/>
-<text x="486" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">EP / pipeline communication</text>
-<rect x="875" y="105" width="22" height="17" fill="#59A14F" stroke="none" stroke-width="2" rx="3"/>
-<text x="906" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">mHC high-priority compute</text>
-<rect x="1320" y="105" width="22" height="17" fill="url(#graphHatch)" stroke="none" stroke-width="2" rx="3"/>
-<text x="1351" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">TE partial CUDA graph</text>
-<rect x="55" y="150" width="1690" height="430" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
-<text x="80" y="195" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">A. Supported now: partial CUDA graph + EP overlap + standalone mHC post</text>
-<text x="80" y="225" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">mhc_high_priority_stream_mode=post; selective mHC recompute is off</text>
-<line x1="235" y1="285" x2="1735" y2="285" stroke="#344054" stroke-width="2" marker-end="url(#arrow)"/>
-<text x="223" y="290" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">time</text>
-<line x1="235" y1="293" x2="235" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="310" y1="293" x2="310" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="385" y1="293" x2="385" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="460" y1="293" x2="460" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="535" y1="293" x2="535" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="610" y1="293" x2="610" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="685" y1="293" x2="685" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="760" y1="293" x2="760" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="835" y1="293" x2="835" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="910" y1="293" x2="910" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="985" y1="293" x2="985" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1060" y1="293" x2="1060" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1135" y1="293" x2="1135" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1210" y1="293" x2="1210" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1285" y1="293" x2="1285" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1360" y1="293" x2="1360" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1435" y1="293" x2="1435" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1510" y1="293" x2="1510" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1585" y1="293" x2="1585" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1660" y1="293" x2="1660" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1735" y1="293" x2="1735" y2="547" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<path d="M 235 282 Q 235 270 247 270 L 575.5 270 Q 587.5 270 587.5 258 Q 587.5 270 599.5 270 L 928 270 Q 940 270 940 282" fill="none" stroke="#0E7490" stroke-width="2.5"/>
-<text x="587.5" y="249" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="17" text-anchor="middle" font-weight="700">layer j backward / layer i forward</text>
-<path d="M 940 282 Q 940 270 952 270 L 1325.5 270 Q 1337.5 270 1337.5 258 Q 1337.5 270 1349.5 270 L 1723 270 Q 1735 270 1735 282" fill="none" stroke="#0E7490" stroke-width="2.5"/>
-<text x="1337.5" y="249" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="17" text-anchor="middle" font-weight="700">layer i forward / layer j backward</text>
-<text x="205" y="356" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">Normal compute</text>
-<line x1="235" y1="351" x2="1735" y2="351" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="338" width="12" height="12" fill="#4C78A8" stroke="none" stroke-width="2" rx="2"/>
-<text x="205" y="436" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">EP / PP comm</text>
-<line x1="235" y1="431" x2="1735" y2="431" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="418" width="12" height="12" fill="#E45756" stroke="none" stroke-width="2" rx="2"/>
-<text x="205" y="516" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">mHC high priority</text>
-<line x1="235" y1="511" x2="1735" y2="511" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="498" width="12" height="12" fill="#59A14F" stroke="none" stroke-width="2" rx="2"/>
-<rect x="250" y="325" width="180" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="340" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="340" y="347.75">TE partial CG</tspan><tspan x="340" y="363.5">Attn.B</tspan></text>
-<rect x="430" y="325" width="60" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="460" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="460" y="356">W/attn</tspan></text>
-<rect x="610" y="325" width="240" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="730" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="730" y="347.75">TE partial CG</tspan><tspan x="730" y="363.5">Attn.F + Router.F</tspan></text>
-<rect x="880" y="325" width="135" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="947.5" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="947.5" y="356">Experts.B</tspan></text>
-<rect x="1015" y="325" width="105" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1067.5" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1067.5" y="356">W/experts</tspan></text>
-<rect x="1150" y="325" width="165" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1232.5" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1232.5" y="356">Experts.F</tspan></text>
-<rect x="1510" y="325" width="165" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1592.5" y="356" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1592.5" y="347.75">TE partial CG</tspan><tspan x="1592.5" y="363.5">Attn.B</tspan></text>
-<rect x="490" y="405" width="120" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="550" y="436" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="550" y="436">Combine.B</tspan></text>
-<rect x="850" y="405" width="120" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="910" y="436" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="910" y="436">Dispatch.F</tspan></text>
-<rect x="970" y="405" width="150" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1045" y="436" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1045" y="436">Dispatch.B</tspan></text>
-<rect x="1315" y="405" width="120" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1375" y="436" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1375" y="436">Combine.F</tspan></text>
-<rect x="1675" y="405" width="60" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1705" y="436" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="1705" y="436">P2P</tspan></text>
-<rect x="415" y="485" width="75" height="52" fill="#59A14F" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="452.5" y="516" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="452.5" y="508.85">mHC</tspan><tspan x="452.5" y="522.5">Post.B</tspan></text>
-<rect x="1435" y="485" width="75" height="52" fill="#59A14F" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1472.5" y="516" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="1472.5" y="508.85">mHC</tspan><tspan x="1472.5" y="522.5">Post.F</tspan></text>
-<polyline points="490,511 490,511 490,431 490,431" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="610,431 745,431 745,351 880,351" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="1315,351 1315,351 1315,431 1315,431" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="1435,431 1435,431 1435,511 1435,511" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="1510,511 1510,511 1510,351 1510,351" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<text x="245" y="562" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Post.B → Combine.B → Experts.B</text>
-<text x="1160" y="562" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Experts.F → Combine.F → Post.F</text>
-<rect x="55" y="600" width="1690" height="455" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
-<text x="80" y="640" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">B. Supported alternative: explicit mHC group recompute + EP overlap (eager)</text>
-<text x="80" y="670" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">mhc_high_priority_stream_mode=all; recompute node and standalone post share one high-priority stream</text>
-<line x1="235" y1="735" x2="1735" y2="735" stroke="#344054" stroke-width="2" marker-end="url(#arrow)"/>
-<text x="223" y="740" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">time</text>
-<line x1="235" y1="743" x2="235" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="310" y1="743" x2="310" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="385" y1="743" x2="385" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="460" y1="743" x2="460" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="535" y1="743" x2="535" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="610" y1="743" x2="610" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="685" y1="743" x2="685" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="760" y1="743" x2="760" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="835" y1="743" x2="835" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="910" y1="743" x2="910" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="985" y1="743" x2="985" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1060" y1="743" x2="1060" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1135" y1="743" x2="1135" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1210" y1="743" x2="1210" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1285" y1="743" x2="1285" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1360" y1="743" x2="1360" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1435" y1="743" x2="1435" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1510" y1="743" x2="1510" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1585" y1="743" x2="1585" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1660" y1="743" x2="1660" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<line x1="1735" y1="743" x2="1735" y2="997" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
-<path d="M 235 732 Q 235 720 247 720 L 583 720 Q 595 720 595 708 Q 595 720 607 720 L 943 720 Q 955 720 955 732" fill="none" stroke="#0E7490" stroke-width="2.5"/>
-<text x="595" y="699" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="17" text-anchor="middle" font-weight="700">recompute group N backward / other microbatch forward</text>
-<path d="M 955 732 Q 955 720 967 720 L 1333 720 Q 1345 720 1345 708 Q 1345 720 1357 720 L 1723 720 Q 1735 720 1735 732" fill="none" stroke="#0E7490" stroke-width="2.5"/>
-<text x="1345" y="699" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="17" text-anchor="middle" font-weight="700">forward continuation / next backward layer</text>
-<text x="205" y="806" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">Normal compute</text>
-<line x1="235" y1="801" x2="1735" y2="801" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="788" width="12" height="12" fill="#4C78A8" stroke="none" stroke-width="2" rx="2"/>
-<text x="205" y="886" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">EP / PP comm</text>
-<line x1="235" y1="881" x2="1735" y2="881" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="868" width="12" height="12" fill="#E45756" stroke="none" stroke-width="2" rx="2"/>
-<text x="205" y="966" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end" font-weight="700">mHC high priority</text>
-<line x1="235" y1="961" x2="1735" y2="961" stroke="#D0D5DD" stroke-width="2"/>
-<rect x="47" y="948" width="12" height="12" fill="#59A14F" stroke="none" stroke-width="2" rx="2"/>
-<rect x="505" y="775" width="195" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="602.5" y="806" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="602.5" y="797.75">Attn.F</tspan><tspan x="602.5" y="813.5">(eager)</tspan></text>
-<rect x="730" y="775" width="150" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="805" y="806" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="805" y="806">Experts.B</tspan></text>
-<rect x="880" y="775" width="105" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="932.5" y="806" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="932.5" y="806">W/experts</tspan></text>
-<rect x="1015" y="775" width="180" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1105" y="806" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1105" y="806">Experts.F</tspan></text>
-<rect x="1255" y="775" width="195" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1352.5" y="806" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1352.5" y="797.75">Attn.B</tspan><tspan x="1352.5" y="813.5">(eager)</tspan></text>
-<rect x="475" y="855" width="210" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="580" y="886" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="580" y="886">Combine.B</tspan></text>
-<rect x="700" y="855" width="150" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="775" y="886" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="775" y="886">Dispatch.F</tspan></text>
-<rect x="850" y="855" width="150" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="925" y="886" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="925" y="886">Dispatch.B</tspan></text>
-<rect x="1195" y="855" width="255" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1322.5" y="886" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1322.5" y="886">Combine.F</tspan></text>
-<rect x="1540" y="855" width="195" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1637.5" y="886" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="1637.5" y="886">P2P send / recv</tspan></text>
-<rect x="250" y="935" width="150" height="52" fill="#59A14F" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="325" y="966" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="middle" font-weight="700"><tspan x="325" y="957.75">mHC Recompute.B</tspan><tspan x="325" y="973.5">(group N)</tspan></text>
-<rect x="400" y="935" width="75" height="52" fill="#59A14F" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="437.5" y="966" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="437.5" y="958.85">mHC</tspan><tspan x="437.5" y="972.5">Post.B</tspan></text>
-<rect x="1450" y="935" width="90" height="52" fill="#59A14F" stroke="#FFFFFF" stroke-width="2" rx="7"/>
-<text x="1495" y="966" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" text-anchor="middle" font-weight="700"><tspan x="1495" y="958.85">mHC</tspan><tspan x="1495" y="972.5">Post.F</tspan></text>
-<polyline points="475,961 475,961 475,881 475,881" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="685,881 707.5,881 707.5,801 730,801" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="1195,801 1195,801 1195,881 1195,881" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<polyline points="1450,881 1450,881 1450,961 1450,961" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
-<text x="245" y="1032" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Recompute.B → Post.B → Combine.B → Experts.B</text>
-<text x="1175" y="1032" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Experts.F → Combine.F → Post.F</text>
-<rect x="55" y="1080" width="1690" height="48" fill="#FFF7D6" stroke="#E5A000" stroke-width="1.5" rx="8"/>
-<rect x="72" y="1094" width="18" height="18" fill="#F2C14E" stroke="none" stroke-width="2" rx="3"/>
-<text x="104" y="1112" fill="#7A4E00" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700">Current constraint: EP overlap + selective mHC recompute + any CUDA graph is rejected; explicit group replay is eager-only.</text>
+<rect x="515" y="105" width="22" height="17" fill="#E45756" stroke="none" stroke-width="2" rx="3"/>
+<text x="546" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">EP / pipeline communication</text>
+<rect x="1120" y="105" width="22" height="17" fill="url(#graphHatch)" stroke="none" stroke-width="2" rx="3"/>
+<text x="1151" y="119" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="13">TE partial CUDA graph</text>
+<rect x="55" y="150" width="1690" height="335" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
+<text x="80" y="190" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">A. Partial CUDA graph + EP overlap</text>
+<text x="80" y="218" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Selective mHC recompute is off; MLP-side mHC post is part of the combine node</text>
+<path d="M 250 274 Q 250 264 260 264 L 611.25 264 Q 621.25 264 621.25 254 Q 621.25 264 631.25 264 L 982.5 264 Q 992.5 264 992.5 274" fill="none" stroke="#0E7490" stroke-width="2.5"/>
+<text x="621.25" y="246" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">layer j backward / layer i forward</text>
+<path d="M 992.5 274 Q 992.5 264 1002.5 264 L 1353.75 264 Q 1363.75 264 1363.75 254 Q 1363.75 264 1373.75 264 L 1725 264 Q 1735 264 1735 274" fill="none" stroke="#0E7490" stroke-width="2.5"/>
+<text x="1363.75" y="246" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">layer i forward / layer j backward</text>
+<line x1="250" y1="278" x2="1735" y2="278" stroke="#344054" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="234" y="283" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">time</text>
+<line x1="250" y1="288" x2="250" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="324.25" y1="288" x2="324.25" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="398.5" y1="288" x2="398.5" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="472.75" y1="288" x2="472.75" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="547" y1="288" x2="547" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="621.25" y1="288" x2="621.25" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="695.5" y1="288" x2="695.5" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="769.75" y1="288" x2="769.75" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="844" y1="288" x2="844" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="918.25" y1="288" x2="918.25" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="992.5" y1="288" x2="992.5" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1066.75" y1="288" x2="1066.75" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1141" y1="288" x2="1141" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1215.25" y1="288" x2="1215.25" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1289.5" y1="288" x2="1289.5" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1363.75" y1="288" x2="1363.75" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1438" y1="288" x2="1438" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1512.25" y1="288" x2="1512.25" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1586.5" y1="288" x2="1586.5" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1660.75" y1="288" x2="1660.75" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1735" y1="288" x2="1735" y2="452" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<rect x="73" y="326" width="13" height="13" fill="#4C78A8" stroke="none" stroke-width="2" rx="2"/>
+<text x="220" y="341" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="end" font-weight="700">Normal compute</text>
+<line x1="250" y1="333" x2="1735" y2="333" stroke="#D0D5DD" stroke-width="2"/>
+<rect x="73" y="406" width="13" height="13" fill="#E45756" stroke="none" stroke-width="2" rx="2"/>
+<text x="220" y="421" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="end" font-weight="700">EP / PP comm</text>
+<line x1="250" y1="413" x2="1735" y2="413" stroke="#D0D5DD" stroke-width="2"/>
+<rect x="264.85" y="307" width="178.2" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="353.95" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="353.95" y="329.75">TE partial CG</tspan><tspan x="353.95" y="345.5">Attn.B</tspan></text>
+<rect x="443.05" y="307" width="74.25" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="480.175" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" text-anchor="middle"><tspan x="480.175" y="338">W/attn</tspan></text>
+<rect x="665.8" y="307" width="222.75" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="777.175" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="777.175" y="329.75">TE partial CG</tspan><tspan x="777.175" y="345.5">Attn.F + Router.F</tspan></text>
+<rect x="933.1" y="307" width="148.5" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1007.35" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1007.35" y="338">Experts.B</tspan></text>
+<rect x="1081.6" y="307" width="103.95" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1133.57" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1133.57" y="338">W/experts</tspan></text>
+<rect x="1215.25" y="307" width="163.35" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1296.92" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1296.92" y="338">Experts.F</tspan></text>
+<rect x="1556.8" y="307" width="148.5" height="52" fill="url(#graphHatch)" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1631.05" y="338" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1631.05" y="329.75">TE partial CG</tspan><tspan x="1631.05" y="345.5">Attn.B</tspan></text>
+<rect x="517.3" y="387" width="148.5" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="591.55" y="418" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="591.55" y="409.75">mHC Post.B +</tspan><tspan x="591.55" y="425.5">Combine.B</tspan></text>
+<rect x="888.55" y="387" width="133.65" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="955.375" y="418" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="955.375" y="418">Dispatch.F</tspan></text>
+<rect x="1022.2" y="387" width="163.35" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1103.88" y="418" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1103.88" y="418">Dispatch.B</tspan></text>
+<rect x="1378.6" y="387" width="178.2" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1467.7" y="418" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1467.7" y="409.75">Combine.F +</tspan><tspan x="1467.7" y="425.5">mHC Post.F</tspan></text>
+<rect x="1705.3" y="387" width="29.7" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1720.15" y="418" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" text-anchor="middle"><tspan x="1720.15" y="418">P2P</tspan></text>
+<polyline points="665.8,413 799.45,413 799.45,333 933.1,333" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<polyline points="1378.6,333 1378.6,333 1378.6,413 1378.6,413" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<polyline points="1556.8,413 1556.8,413 1556.8,333 1556.8,333" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<text x="315" y="467" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">(Post + Combine).B → Experts.B</text>
+<text x="1150" y="467" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Experts.F → (Combine + Post).F</text>
+<rect x="55" y="510" width="1690" height="360" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5" rx="12"/>
+<text x="80" y="550" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">B. Explicit mHC group recompute + EP overlap (eager)</text>
+<text x="80" y="578" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="15">Recompute runs on normal compute immediately before the combine node; post remains merged into combine</text>
+<path d="M 250 634 Q 250 624 260 624 L 611.25 624 Q 621.25 624 621.25 614 Q 621.25 624 631.25 624 L 982.5 624 Q 992.5 624 992.5 634" fill="none" stroke="#0E7490" stroke-width="2.5"/>
+<text x="621.25" y="606" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">recompute group N backward / other microbatch forward</text>
+<path d="M 992.5 634 Q 992.5 624 1002.5 624 L 1353.75 624 Q 1363.75 624 1363.75 614 Q 1363.75 624 1373.75 624 L 1725 624 Q 1735 624 1735 634" fill="none" stroke="#0E7490" stroke-width="2.5"/>
+<text x="1363.75" y="606" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="middle" font-weight="700">forward continuation / next backward layer</text>
+<line x1="250" y1="638" x2="1735" y2="638" stroke="#344054" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="234" y="643" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">time</text>
+<line x1="250" y1="648" x2="250" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="324.25" y1="648" x2="324.25" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="398.5" y1="648" x2="398.5" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="472.75" y1="648" x2="472.75" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="547" y1="648" x2="547" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="621.25" y1="648" x2="621.25" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="695.5" y1="648" x2="695.5" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="769.75" y1="648" x2="769.75" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="844" y1="648" x2="844" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="918.25" y1="648" x2="918.25" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="992.5" y1="648" x2="992.5" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1066.75" y1="648" x2="1066.75" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1141" y1="648" x2="1141" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1215.25" y1="648" x2="1215.25" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1289.5" y1="648" x2="1289.5" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1363.75" y1="648" x2="1363.75" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1438" y1="648" x2="1438" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1512.25" y1="648" x2="1512.25" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1586.5" y1="648" x2="1586.5" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1660.75" y1="648" x2="1660.75" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<line x1="1735" y1="648" x2="1735" y2="812" stroke="#D0D5DD" stroke-width="1" opacity="0.45"/>
+<rect x="73" y="686" width="13" height="13" fill="#4C78A8" stroke="none" stroke-width="2" rx="2"/>
+<text x="220" y="701" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="end" font-weight="700">Normal compute</text>
+<line x1="250" y1="693" x2="1735" y2="693" stroke="#D0D5DD" stroke-width="2"/>
+<rect x="73" y="766" width="13" height="13" fill="#E45756" stroke="none" stroke-width="2" rx="2"/>
+<text x="220" y="781" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="16" text-anchor="end" font-weight="700">EP / PP comm</text>
+<line x1="250" y1="773" x2="1735" y2="773" stroke="#D0D5DD" stroke-width="2"/>
+<rect x="264.85" y="667" width="163.35" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="346.525" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="346.525" y="689.75">mHC Recompute.B</tspan><tspan x="346.525" y="705.5">(group N)</tspan></text>
+<rect x="517.3" y="667" width="193.05" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="613.825" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="613.825" y="689.75">Attn.F</tspan><tspan x="613.825" y="705.5">(eager)</tspan></text>
+<rect x="754.9" y="667" width="148.5" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="829.15" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="829.15" y="698">Experts.B</tspan></text>
+<rect x="903.4" y="667" width="103.95" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="955.375" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" text-anchor="middle"><tspan x="955.375" y="698">W/experts</tspan></text>
+<rect x="1037.05" y="667" width="178.2" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1126.15" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1126.15" y="698">Experts.F</tspan></text>
+<rect x="1438" y="667" width="163.35" height="52" fill="#4C78A8" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1519.67" y="698" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1519.67" y="689.75">Attn.B</tspan><tspan x="1519.67" y="705.5">(eager)</tspan></text>
+<rect x="428.2" y="747" width="252.45" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="554.425" y="778" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="554.425" y="778">mHC Post.B + Combine.B</tspan></text>
+<rect x="710.35" y="747" width="163.35" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="792.025" y="778" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="792.025" y="778">Dispatch.F</tspan></text>
+<rect x="873.7" y="747" width="148.5" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="947.95" y="778" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="947.95" y="778">Dispatch.B</tspan></text>
+<rect x="1215.25" y="747" width="222.75" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1326.62" y="778" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1326.62" y="778">Combine.F + mHC Post.F</tspan></text>
+<rect x="1601.35" y="747" width="133.65" height="52" fill="#E45756" stroke="#FFFFFF" stroke-width="2" rx="7"/>
+<text x="1668.17" y="778" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="middle"><tspan x="1668.17" y="778">P2P send / recv</tspan></text>
+<polyline points="428.2,693 428.2,693 428.2,773 428.2,773" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<polyline points="680.65,773 717.775,773 717.775,693 754.9,693" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<polyline points="1215.25,693 1215.25,693 1215.25,773 1215.25,773" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<polyline points="1438,773 1438,773 1438,693 1438,693" fill="none" stroke="#475467" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<text x="315" y="847" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Recompute.B → (Post + Combine).B → Experts.B</text>
+<text x="1150" y="847" fill="#667085" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700">Experts.F → (Combine + Post).F</text>
+<rect x="55" y="880" width="1690" height="48" fill="#FFF7D6" stroke="#E5A000" stroke-width="1.5" rx="8"/>
+<rect x="72" y="894" width="18" height="18" fill="#F2C14E" stroke="none" stroke-width="2" rx="3"/>
+<text x="104" y="912" fill="#7A4E00" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700">Current constraint: EP overlap + selective mHC recompute + any CUDA graph is rejected; explicit group replay is eager-only.</text>
 </svg>

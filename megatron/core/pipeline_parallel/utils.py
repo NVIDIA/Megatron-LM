@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Literal, Optional
+from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
@@ -339,7 +339,6 @@ class AbstractSchedulePlan(ABC):
 _USE_DYNAMIC_COMP_STREAM = None
 _COMP_STREAM = None
 _COMM_STREAM = None
-_MHC_HIGH_PRIORITY_STREAM = None
 
 
 def set_streams(comm_stream=None, high_priority=False):
@@ -366,37 +365,3 @@ def get_comm_stream():
     """Get the stream for communication"""
     global _COMM_STREAM
     return _COMM_STREAM
-
-
-def get_mhc_high_priority_stream() -> torch.cuda.Stream:
-    """Get the lazily-created high-priority compute stream used by mHC work."""
-    global _MHC_HIGH_PRIORITY_STREAM
-    if _MHC_HIGH_PRIORITY_STREAM is None:
-        _, high = torch.cuda.Stream.priority_range()
-        _MHC_HIGH_PRIORITY_STREAM = torch.cuda.Stream(device="cuda", priority=high)
-    return _MHC_HIGH_PRIORITY_STREAM
-
-
-def get_mhc_execution_stream(
-    config, work_kind: Literal["post", "recompute"]
-) -> Callable[[], torch.cuda.Stream]:
-    """Resolve the actual execution stream getter for one kind of mHC work.
-
-    Args:
-        config: Transformer configuration containing ``mhc_high_priority_stream_mode``.
-        work_kind: Either ``post`` for MLP-side mHC post-processing or ``recompute``
-            for explicit group recomputation.
-
-    Returns:
-        A callable returning the communication stream for merged post work, the
-        normal compute stream for non-priority recompute, or the dedicated
-        high-priority mHC stream when selected.
-    """
-    if work_kind not in ("post", "recompute"):
-        raise ValueError(f"Unsupported mHC work kind: {work_kind}")
-
-    mode = config.mhc_high_priority_stream_mode
-    use_high_priority = mode == "all" or mode == work_kind
-    if use_high_priority:
-        return get_mhc_high_priority_stream
-    return get_comm_stream if work_kind == "post" else get_comp_stream

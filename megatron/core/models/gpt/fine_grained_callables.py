@@ -255,8 +255,6 @@ class TransformerLayerNode(ScheduleNode):
         name="default",
         bwd_dw_callables=None,
         extra_args={},
-        forward_nvtx_name=None,
-        backward_nvtx_name=None,
     ):
         """Initialize a transformer layer node.
 
@@ -270,8 +268,6 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
             extra_args (dict): Extra arguments for the node: is_moe, config.
-            forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
-            backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
         """
         # Determine whether to free input memory
         config = extra_args.get("config", None)
@@ -291,8 +287,6 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
-            forward_nvtx_name=forward_nvtx_name,
-            backward_nvtx_name=backward_nvtx_name,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
@@ -482,13 +476,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The six callable slots are:
-    1. Attention (computation)
-    2. Post-Attention (computation)
-    3. MoE Dispatch (communication)
-    4. MLP / MoE Experts (computation)
-    5. MoE Combine (communication)
-    6. MLP-side mHC post-processing (a separate high-priority node when selected)
+    The five callable slots are:
+    1. Attention and routing preprocess (computation)
+    2. MoE Dispatch (communication)
+    3. MLP / MoE Experts (computation)
+    4. MoE Combine and MLP-side mHC post-processing (communication)
+    5. MTP post-processing (computation, MTP layers only)
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing
@@ -515,10 +508,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     )
     is_hyper_connection_layer = isinstance(layer, HyperConnectionTransformerLayer)
     is_mhc_layer = is_moe and is_hyper_connection_layer
-    use_separate_mhc_post = is_mhc_layer and layer.config.mhc_high_priority_stream_mode in (
-        "post",
-        "all",
-    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -713,8 +702,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Trigger token combine and the remaining layer computation.
 
-        MHC post-processing stays in this communication-stream node unless the stream mode
-        explicitly selects a separate high-priority post node.
+        MHC post-processing stays in this communication-stream node so it preserves the
+        existing EP overlap stream topology.
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
@@ -729,8 +718,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.shared_expert_output = None
 
         if is_mhc_layer:
-            if use_separate_mhc_post:
-                return output
             return submodule_mhc_post_forward(node, output)
 
         mlp_output_with_bias = (output, None)
@@ -841,11 +828,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
-    mhc_post_func = submodule_mhc_post_forward if use_separate_mhc_post else None
 
     layer.init_backward_dw_wrapper()
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mhc_post_func, None]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
     backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
@@ -858,9 +844,7 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
-    attn_forward, dispatch_forward, mlp_forward, combine_forward, mhc_post_forward, _ = (
-        forward_funcs
-    )
+    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
     is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
@@ -938,19 +922,9 @@ def build_mtp_layer_callables(layer):
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
-    mhc_post_func = (
-        partial(rng_context_wrapper, mhc_post_forward) if mhc_post_forward is not None else None
-    )
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
-    forward_funcs = [
-        attn_func,
-        dispatch_func,
-        mlp_func,
-        combine_func,
-        mhc_post_func,
-        mtp_post_process_func,
-    ]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
     if isinstance(backward_dw["attn"], list):
         backward_dw["attn"].append(layer.eh_proj)
     else:
