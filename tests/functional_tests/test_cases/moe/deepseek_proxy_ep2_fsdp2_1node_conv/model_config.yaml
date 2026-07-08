@@ -1,10 +1,20 @@
-# DeepSeek-style proxy: 2 layers — first dense, second MoE with expert parallelism 2.
-# Used for functional testing of dense+MoE hybrid and EP.
 ENV_VARS:
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
+  NVTE_FUSED_ATTN: 1
+  NVTE_CPU_OFFLOAD_V1: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+
+  # FSDP Perf settings
+  CUDA_DEVICE_MAX_CONNECTIONS : 32
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+
+  PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NCCL_GRAPH_REGISTER: 0
   NCCL_ALGO: Ring
 
 MODEL_ARGS:
@@ -18,7 +28,6 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  --attention-backend: unfused
 
   --num-distributed-optimizer-instances: 1
 
@@ -27,28 +36,43 @@ MODEL_ARGS:
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
 
-  --deterministic-mode: true
+  --init-model-with-meta-device: true
+
   --ckpt-format: "fsdp_dtensor"
-  --no-gradient-accumulation-fusion: true
+  #--no-gradient-accumulation-fusion: true
 
   # Precision
   --fp8-format: "hybrid"
   --fp8-recipe: "tensorwise"
-  #--fp8-param-gather: true
+  --fp8-param-gather: true
 
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 4
-  --global-batch-size: 32
-  --train-iters: 50
+  --micro-batch-size: 128
+  --global-batch-size: 1024
+  --train-iters: 1000
   --exit-duration-in-mins: 60
-  --no-check-for-nan-in-loss-and-grad: true
-  --no-rope-fusion: true
+  # --cross-entropy-loss-fusion: true  # Not deterministic yet.
+  --cross-entropy-fusion-impl: te
   --manual-gc: true
-  --manual-gc-interval: 100
+  --manual-gc-interval: 10
+  --deterministic-mode: true
+  --seed: 42 
+  --no-check-for-nan-in-loss-and-grad: true # To see if gets better over time.
+
+  # Transformer Engine args
   --transformer-impl: transformer_engine
+
+  # Recompute args
+  --recompute-granularity: selective
+  --recompute-modules: "[layernorm mla_up_proj moe_act]"
+
+  # CPU Offloading
+  --fine-grained-activation-offloading: true
+  --offload-modules: "[core_attn attn_proj]"
+
 
   # Data args
   --seq-length: 1024
@@ -58,7 +82,8 @@ MODEL_ARGS:
   --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
 
-  # Network: 2 layers — first dense, second MoE
+
+  # Network
   --num-layers: 2
   --hidden-size: 512
   --ffn-hidden-size: 2048
@@ -73,39 +98,49 @@ MODEL_ARGS:
   --swiglu: true
   --untie-embeddings-and-output-weights: true
   --multi-latent-attention: true
-  # No MTP for this 2-layer proxy
-  # Add regularization args
+
+
+
+  # Regularization args
   --attention-dropout: 0.0
   --hidden-dropout: 0.0
   --clip-grad: 1.0
   --weight-decay: 0.1
   --qk-layernorm: true
-  # Learning rate args
+
+  # Learning Rate args
   --lr-warmup-fraction: .01
   --lr: 0.00015
   --min-lr: 1.0e-5
   --lr-decay-style: cosine
   --adam-beta1: 0.9
   --adam-beta2: 0.95
-  # MoE args (DeepSeek-style): 1 dense layer, 1 MoE layer, ep=4
+  
+  # MoE args (DeepSeek-style)
   --num-experts: 8
   --moe-layer-freq: ([0]*1+[1]*1)
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 1024
   --moe-router-load-balancing-type: seq_aux_loss
-  --moe-router-topk: 4
-  --moe-token-dispatcher-type: alltoall
-  --moe-router-pre-softmax: true
+  --moe-router-topk: 2
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
-  --moe-router-group-topk: 2
+  --moe-router-group-topk: 4
   --moe-router-num-groups: 4
-  --moe-router-topk-scaling-factor: 2.0
+  --moe-router-topk-scaling-factor: 2.5
   --moe-router-score-function: sigmoid
   --moe-router-enable-expert-bias: true
   --moe-router-bias-update-rate: 1e-3
   --moe-router-dtype: fp32
   --moe-permute-fusion: true
+  # Running into issues with router fusion, skipping for now
+  #--moe-router-fusion: true 
+  --moe-router-pre-softmax: true
+  
+  # MoE Dispatcher
+  --moe-token-dispatcher-type: alltoall
+  #--moe-flex-dispatcher-backend: hybridep
+  
   # MLA args (DeepSeek-style)
   --q-lora-rank: 256
   --kv-lora-rank: 128
@@ -115,13 +150,19 @@ MODEL_ARGS:
   --rotary-scaling-factor: 1.0
   --mscale: 1.0
   --mscale-all-dim: 1.0
-  # Validation, checkpointing, logging
+
+
+  # Validation
   --eval-iters: 10
-  --eval-interval: 200
-  #--save: ${CHECKPOINT_SAVE_PATH}
-  #--load: ${CHECKPOINT_LOAD_PATH}
-  #--ckpt-format: fsdp_dtensor
-  --save-interval: 25
+  --eval-interval: 100
+
+  # Checkpointing
+  # --save: ${CHECKPOINT_SAVE_PATH}
+  # --load: ${CHECKPOINT_LOAD_PATH}
+  --ckpt-format: fsdp_dtensor
+
+  # Logging
+  #--save-interval: 25
   --init-method-std: 0.02
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
@@ -130,12 +171,12 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
   --log-interval: 1
-  --logging-level: 10
+  #--logging-level: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
 
-  --exit-interval: 50
 TEST_TYPE: regular
 METRICS:
+  - "iteration-time"
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"

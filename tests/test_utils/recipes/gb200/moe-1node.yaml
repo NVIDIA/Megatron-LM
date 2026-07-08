@@ -133,3 +133,13 @@ products:
       - environment: [dev]
         scope: [L1-temp-disabled]
         platforms: [dgx_gb200]
+  - test_case: [deepseek_proxy_ep2_fsdp2_1node_conv]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [deepseek_proxy_ep2_pp2_1node_conv]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
