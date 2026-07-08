@@ -147,8 +147,13 @@ class FsdpModule:
         if self._context is not None:
             return
 
-        context = FsdpContext(device=self._parameter_groups[0].main_weight.device, root_module=self)
-        for submodule_name, submodule in cast(nn.Module, self).named_modules():
+        module = cast(nn.Module, self)
+        first_parameter = next(module.parameters(), None)
+        if first_parameter is None:
+            raise RuntimeError("FSDP root module requires at least one parameter in its subtree.")
+
+        context = FsdpContext(device=first_parameter.device, root_module=self)
+        for submodule_name, submodule in module.named_modules():
             if not isinstance(submodule, FsdpModule):
                 continue
             if submodule._context is not None:
@@ -306,8 +311,6 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
             visit(child_module, child_fqn)
 
     visit(root_module, "")
-    if not parameters:
-        raise ValueError("fully_shard requires at least one unowned parameter.")
     return parameters
 
 
