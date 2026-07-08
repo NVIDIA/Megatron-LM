@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 MAX_DET_NONDET_RATIO = 1.25
-MEASUREMENT_ITER = 7  # clean iter inside --profile-step-start=5/end=7 window
+MEASUREMENT_ITER = 5  # steady-state; iter 7 is noisy under nsys profile teardown
 LEADERBOARD_TOP_N = 20
 # Strip per-call-site ``, op_id = N`` and autograd-engine ``, seq = N`` so
 # identical op kinds aggregate across det/nondet.
