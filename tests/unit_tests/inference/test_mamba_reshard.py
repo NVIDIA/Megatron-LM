@@ -165,9 +165,9 @@ def test_mamba_dedupes_replica_sources():
 
 
 def test_layout_wire_roundtrip():
-    """Layouts cross the coordinator as plain dicts (asdict) and are rebuilt via
-    MambaShardLayout(**dict); the nested dims dict must coerce back to
-    MambaStateDims so proxies (.headdim/.d_conv/...) keep working."""
+    """Layouts cross the coordinator as plain dicts (asdict) and are rebuilt
+    via MambaShardLayout(**dict); the nested dims dict must coerce back to
+    MambaStateDims."""
     import dataclasses
 
     lay = MambaShardLayout(
@@ -182,4 +182,4 @@ def test_layout_wire_roundtrip():
     )
     rebuilt = MambaShardLayout(**dataclasses.asdict(lay))
     assert rebuilt == lay
-    assert rebuilt.headdim == HEADDIM and rebuilt.d_conv == DCONV
+    assert rebuilt.conv_dim_local == lay.conv_dim_local
