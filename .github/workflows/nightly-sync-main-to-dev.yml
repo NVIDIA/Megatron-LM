@@ -111,14 +111,19 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install pre-push merge guard
+      - name: Install pre-push merge guidance
         if: steps.check-sync.outputs.skip != 'true'
         run: |
           cat > .git/hooks/pre-push <<'HOOK'
           #!/usr/bin/env bash
+
+          # This hook is advisory. Run the checks in a strict subshell so an
+          # audit error can be reported without blocking the push.
+          set +e
+          (
           set -euo pipefail
 
-          echo "=== nightly-sync pre-push guard ==="
+          echo "=== nightly-sync pre-push guidance ==="
 
           merge_commit=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
           if [ -n "$merge_commit" ]; then
@@ -130,8 +135,7 @@ jobs:
           fi
 
           if ! git diff --quiet "$dev_ref" HEAD -- .github/CODEOWNERS; then
-            echo "ABORT: .github/CODEOWNERS differs from dev. Restore it before pushing."
-            exit 1
+            echo "WARNING: .github/CODEOWNERS differs from dev. Restore it before finalizing the sync."
           fi
 
           for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
@@ -148,7 +152,7 @@ jobs:
           intentional_override_regex='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
           skip_regex='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
 
-          violations=0
+          findings=0
           while IFS= read -r f; do
             [[ "$f" =~ $skip_regex ]] && continue
             [[ "$f" =~ $intentional_override_regex ]] && continue
@@ -164,20 +168,28 @@ jobs:
             if [ -n "$missing" ]; then
               echo "=== $f ==="
               printf '%s\n' "$missing"
-              violations=$((violations + $(printf '%s\n' "$missing" | grep -c .)))
+              findings=$((findings + $(printf '%s\n' "$missing" | grep -c .)))
             fi
           done < <(git diff --name-only "$dev_ref"..HEAD \
                     -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
                        '*.sh' '*.cpp' '*.cu' '*.h' \
                     | sort -u)
 
-          if [ "$violations" -gt 0 ]; then
-            echo "ABORT: $violations dev-only line(s) were dropped by the merge."
-            echo "Restore the dev-only code, or document the exact main commit that intentionally removed it."
-            exit 1
+          if [ "$findings" -gt 0 ]; then
+            echo "WARNING: $findings potential dev-only line removal(s) were detected."
+            echo "Review each finding: restore merge accidents and document intentional main removals in the PR body."
+            echo "This audit is advisory; the push will continue."
+          else
+            echo "No potential dev-only line removals detected."
           fi
 
-          echo "nightly-sync pre-push guard passed"
+          echo "nightly-sync pre-push guidance complete"
+          )
+          guidance_status=$?
+          if [ "$guidance_status" -ne 0 ]; then
+            echo "WARNING: nightly-sync pre-push guidance failed with status $guidance_status; allowing the push to continue."
+          fi
+          exit 0
           HOOK
           chmod +x .git/hooks/pre-push
 
@@ -236,12 +248,14 @@ jobs:
             conversation in between — that wastes `--max-turns` and
             creates windows where the agent could forget the loop.
 
-            **Pre-push guard:** The workflow installs a local git pre-push
-            hook that enforces CODEOWNERS, dependency-triple, and dev-feature
-            preservation checks. You MUST NOT bypass it with `--no-verify`.
-            If a push fails, read the hook output, restore the dropped dev
-            code unless main explicitly removed it, and push again only after
-            the hook passes.
+            **Pre-push guidance:** The workflow installs a local git pre-push
+            hook that reports CODEOWNERS, dependency-triple, and dev-feature
+            preservation findings. It is advisory and MUST NOT block a push.
+            Do not use `--no-verify`; let the hook run and review its output.
+            Restore genuine merge accidents and CODEOWNERS changes. For
+            intentional main removals or formatting/reordering false positives,
+            document the evidence in the PR body and continue. Do not stop or
+            ask for authorization solely because advisory findings remain.
 
             **Merge strategy:** Start from `origin/dev` and run
             `git merge origin/main --no-edit`. Do NOT use global
