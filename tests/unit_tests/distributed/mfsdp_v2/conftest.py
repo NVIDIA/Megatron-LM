@@ -18,22 +18,6 @@ class DistributedSetup:
     device: torch.device
 
 
-@pytest.fixture(scope="session", autouse=True)
-def cleanup():
-    """Destroy the default process group after the mFSDP v2 bucket."""
-    yield
-    if dist.is_initialized():
-        try:
-            if torch.cuda.is_available():
-                # Pass the device explicitly to suppress PyTorch's NCCL barrier warning.
-                dist.barrier(device_ids=[torch.cuda.current_device()])
-            else:
-                dist.barrier()
-        except Exception:
-            return
-        dist.destroy_process_group()
-
-
 @pytest.fixture(scope="function")
 def distributed_setup() -> Iterator[DistributedSetup]:
     """Read torchrun rank state and set up this rank's local device."""
