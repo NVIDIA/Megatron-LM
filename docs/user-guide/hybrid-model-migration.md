@@ -185,9 +185,7 @@ A minimal migration of the model and checkpoint arguments looks like this:
 -     --save /path/to/gpt-checkpoints
 + torchrun --nproc_per_node=8 pretrain_hybrid.py \
 +     --hybrid-layer-pattern '*-*-*-*-' \
-+     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
-+     --ckpt-format torch_dist \
-+     --pretrained-checkpoint /path/to/hybrid-checkpoints \
++     --pretrained-checkpoint /path/to/hybrid-checkpoints \  # first-time only
 +     --load /path/to/new-training-checkpoints \
 +     --save /path/to/new-training-checkpoints
 ```
@@ -205,43 +203,7 @@ path or equivalent Hybrid entry-point support before migration.
 With an empty `--load` directory, `--pretrained-checkpoint` loads the converted
 weights with finetuning semantics: iteration starts at zero, and optimizer and
 RNG state are not restored. After the job writes a checkpoint to `--load`, later
-launches resume the new HybridModel training state normally. Alternatively, use
-`--load /path/to/hybrid-checkpoints --finetune` for the first launch, then remove
-`--finetune` and resume from the new output directory.
-
-Do not use `--use-checkpoint-args` for the first converted-checkpoint load. The
-converter updates the cached layer count and pattern, but it does not rewrite
-every GPT-specific model argument, including the old layer specification and
-cached `mamba_state_dim`, `mamba_head_dim`, `mamba_num_groups`, and
-`mamba_num_heads`. Provide the HybridModel target arguments explicitly.
-
-For an architecture-preserving migration, keep hidden size, attention heads,
-query groups, FFN size, normalization, positional embeddings, vocabulary,
-weight tying, and MoE settings identical to the source GPT run. If the pattern
-contains `M`, use the following matching option names.
-
-| Conversion option | Training option |
-|-------------------|-----------------|
-| `--d-model` | `--hidden-size` |
-| `--mamba-d-state` | `--mamba-state-dim` |
-| `--mamba2-n-groups` | `--mamba-num-groups` |
-| `--mamba2-head-dim` | `--mamba-head-dim` |
-
-The converter derives the Mamba head count as
-`2 * hidden_size / mamba_head_dim`. An explicit training
-`--mamba-num-heads` must equal that value. The default Hybrid stack uses a
-convolution width of 4 and has no separate training CLI option for it; keep
-converter `--d-conv 4` unless a custom stack spec uses a matching width.
-
-Set `--position-embedding-type` explicitly to preserve the source architecture.
-The direct `GPTModelConfig` and `HybridModelConfig` defaults differ, and the
-Hybrid training config does not currently carry GPT's `--use-rope-scaling`
-setting or `mrope` path. Models that depend on either need corresponding custom
-Hybrid support before their checkpoints can be equivalent.
-
-New Mamba layers begin with random weights. Expect an initial loss discontinuity
-and choose learning-rate warmup and validation criteria as you would for a newly
-initialized part of a model.
+launches resume the new HybridModel training state normally.
 
 ### Train from scratch
 
@@ -305,6 +267,3 @@ Before starting a long run:
   parameter counts by layer.
 - Save and reload one new checkpoint to confirm that the new optimizer and RNG
   state resume correctly.
-
-Logit equivalence is not expected when the pattern adds freshly initialized
-`M` layers; validate that case as an architecture change instead.
