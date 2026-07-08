@@ -1177,16 +1177,6 @@ class TransformerConfig(ModelParallelConfig):
 
     Must be a positive integer when set."""
 
-    mhc_high_priority_stream_mode: Literal["none", "post", "recompute", "all"] = "none"
-    """Select which mHC work runs on the dedicated high-priority compute stream.
-
-    ``post`` moves the schedulable MoE post-combine mHC work in forward and backward,
-    ``recompute`` moves explicit mHC group recomputation, and ``all`` moves both.
-    When post work is not selected (``none`` or ``recompute``), it remains fused into
-    the MoE combine node on the communication stream. Dense-layer and attention-side
-    mHC work remain in their existing compute nodes.
-    """
-
     ####################
     # miscellaneous
     ####################
@@ -2141,13 +2131,6 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
-        valid_mhc_stream_modes = {"none", "post", "recompute", "all"}
-        if self.mhc_high_priority_stream_mode not in valid_mhc_stream_modes:
-            raise ValueError(
-                "mhc_high_priority_stream_mode must be one of "
-                f"{sorted(valid_mhc_stream_modes)}, got {self.mhc_high_priority_stream_mode!r}."
-            )
-
         if (
             self.overlap_moe_expert_parallel_comm
             and self.recompute_granularity == "selective"
@@ -2160,24 +2143,6 @@ class TransformerConfig(ModelParallelConfig):
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
                 "to be disabled because explicit group replay is eager-only."
             )
-
-        if self.mhc_high_priority_stream_mode != "none":
-            if not self.enable_hyper_connections:
-                raise ValueError(
-                    "mhc_high_priority_stream_mode requires enable_hyper_connections=True."
-                )
-            if not self.overlap_moe_expert_parallel_comm:
-                raise ValueError(
-                    "mhc_high_priority_stream_mode requires "
-                    "overlap_moe_expert_parallel_comm=True."
-                )
-            if self.mhc_high_priority_stream_mode in ("recompute", "all") and not (
-                self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
-            ):
-                raise ValueError(
-                    "mhc_high_priority_stream_mode='recompute' or 'all' requires selective "
-                    "recompute with 'mhc' in recompute_modules."
-                )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules

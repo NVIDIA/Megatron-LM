@@ -10,14 +10,7 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
-from megatron.core.pipeline_parallel.utils import (
-    NoopScheduleNode,
-    get_comm_stream,
-    get_comp_stream,
-    get_mhc_execution_stream,
-    get_mhc_high_priority_stream,
-    set_streams,
-)
+from megatron.core.pipeline_parallel.utils import get_comp_stream, set_streams
 from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
@@ -35,8 +28,6 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-_MODES = ("none", "post", "recompute", "all")
-
 
 @pytest.fixture
 def _initialized_model_parallel():
@@ -45,8 +36,8 @@ def _initialized_model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _make_valid_mhc_overlap_config(mode, **overrides):
-    """Build the smallest config satisfying all mHC high-priority prerequisites."""
+def _make_valid_mhc_overlap_config(**overrides):
+    """Build the smallest config satisfying the mHC overlap prerequisites."""
     kwargs = dict(
         num_layers=2,
         hidden_size=64,
@@ -61,54 +52,9 @@ def _make_valid_mhc_overlap_config(mode, **overrides):
         num_moe_experts=4,
         moe_token_dispatcher_type="alltoall",
         bf16=True,
-        mhc_high_priority_stream_mode=mode,
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
-
-
-def test_mhc_high_priority_stream_mode_defaults_to_none():
-    config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
-
-    assert config.mhc_high_priority_stream_mode == "none"
-
-
-@pytest.mark.parametrize("mode", _MODES)
-def test_mhc_high_priority_stream_mode_accepts_all_modes(mode):
-    config = _make_valid_mhc_overlap_config(mode)
-
-    assert config.mhc_high_priority_stream_mode == mode
-
-
-def test_mhc_high_priority_stream_mode_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="mhc_high_priority_stream_mode"):
-        _make_valid_mhc_overlap_config("invalid")
-
-
-def test_mhc_post_high_priority_does_not_require_recompute():
-    config = _make_valid_mhc_overlap_config(
-        "post", recompute_granularity=None, recompute_modules=[]
-    )
-
-    assert config.mhc_high_priority_stream_mode == "post"
-
-
-def test_mhc_high_priority_requires_hyper_connections():
-    with pytest.raises(ValueError, match="enable_hyper_connections"):
-        _make_valid_mhc_overlap_config(
-            "post", enable_hyper_connections=False, recompute_granularity=None, recompute_modules=[]
-        )
-
-
-def test_mhc_high_priority_requires_a2a_overlap():
-    with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm"):
-        _make_valid_mhc_overlap_config("post", overlap_moe_expert_parallel_comm=False)
-
-
-@pytest.mark.parametrize("mode", ("recompute", "all"))
-def test_recompute_high_priority_requires_mhc_recompute(mode):
-    with pytest.raises(ValueError, match="selective recompute"):
-        _make_valid_mhc_overlap_config(mode, recompute_granularity=None, recompute_modules=[])
 
 
 @pytest.mark.parametrize(
@@ -117,47 +63,7 @@ def test_recompute_high_priority_requires_mhc_recompute(mode):
 )
 def test_mhc_overlap_recompute_rejects_cuda_graphs(cuda_graph_kwargs):
     with pytest.raises(ValueError, match="eager-only"):
-        _make_valid_mhc_overlap_config("recompute", **cuda_graph_kwargs)
-
-
-@pytest.mark.parametrize(
-    ("mode", "work_kind", "expected_stream_getter"),
-    (
-        ("none", "post", get_comm_stream),
-        ("none", "recompute", get_comp_stream),
-        ("post", "post", get_mhc_high_priority_stream),
-        ("post", "recompute", get_comp_stream),
-        ("recompute", "post", get_comm_stream),
-        ("recompute", "recompute", get_mhc_high_priority_stream),
-        ("all", "post", get_mhc_high_priority_stream),
-        ("all", "recompute", get_mhc_high_priority_stream),
-    ),
-)
-def test_mhc_execution_stream_mapping(mode, work_kind, expected_stream_getter):
-    config = SimpleNamespace(mhc_high_priority_stream_mode=mode)
-
-    stream_getter = get_mhc_execution_stream(config, work_kind)
-
-    assert stream_getter is expected_stream_getter
-
-
-def test_all_mode_reuses_one_high_priority_stream(_initialized_model_parallel):
-    config = SimpleNamespace(mhc_high_priority_stream_mode="all")
-
-    post_stream = get_mhc_execution_stream(config, "post")()
-    recompute_stream = get_mhc_execution_stream(config, "recompute")()
-    _, expected_high_priority = torch.cuda.Stream.priority_range()
-
-    assert post_stream == recompute_stream
-    assert post_stream == get_mhc_high_priority_stream()
-    assert post_stream.priority == expected_high_priority
-
-
-def test_mhc_execution_stream_rejects_unknown_work_kind():
-    config = SimpleNamespace(mhc_high_priority_stream_mode="all")
-
-    with pytest.raises(ValueError, match="work.?kind"):
-        get_mhc_execution_stream(config, "attention")
+        _make_valid_mhc_overlap_config(**cuda_graph_kwargs)
 
 
 class _RecordingNode:
@@ -178,18 +84,13 @@ class _RecordingNode:
 
 
 class _RecordingLayer:
-    def __init__(self, calls, prefix, standalone_mhc_post=True):
+    def __init__(self, calls, prefix):
         self.calls = calls
         self.config = SimpleNamespace(ep_overlap_early_attn_memory_release=False)
         self.attn = _RecordingNode(calls, f"{prefix}.attn")
         self.moe_dispatch = _RecordingNode(calls, f"{prefix}.moe_dispatch")
         self.mlp = _RecordingNode(calls, f"{prefix}.mlp")
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
-        self.mhc_post = (
-            _RecordingNode(calls, f"{prefix}.mhc_post")
-            if standalone_mhc_post
-            else NoopScheduleNode()
-        )
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
 
@@ -230,21 +131,11 @@ def _assert_called_before(calls, first, second):
     assert calls.index(first) < calls.index(second), f"Expected {first} before {second}: {calls}"
 
 
-@pytest.mark.parametrize(
-    ("mode", "standalone_mhc_post", "explicit_recompute"),
-    (
-        ("none", False, False),
-        ("post", True, False),
-        ("recompute", False, True),
-        ("all", True, True),
-    ),
-)
-def test_layer_schedule_orders_merged_and_standalone_mhc_post(
-    mode, standalone_mhc_post, explicit_recompute
-):
+@pytest.mark.parametrize("explicit_recompute", (False, True))
+def test_layer_schedule_runs_explicit_recompute_before_combine_backward(explicit_recompute):
     calls = []
-    forward_layer = _RecordingLayer(calls, "forward", standalone_mhc_post)
-    backward_layer = _RecordingLayer(calls, "backward", standalone_mhc_post)
+    forward_layer = _RecordingLayer(calls, "forward")
+    backward_layer = _RecordingLayer(calls, "backward")
     if explicit_recompute:
         backward_layer.mhc_recompute = _RecordingNode(calls, "backward.mhc_recompute")
 
@@ -252,28 +143,15 @@ def test_layer_schedule_orders_merged_and_standalone_mhc_post(
         forward_layer, backward_layer, f_input=object(), b_grad=object(), is_last_layer_in_bwd=True
     )
 
-    if standalone_mhc_post:
-        _assert_called_before(calls, "forward.moe_combine.forward", "forward.mhc_post.forward")
-        _assert_called_before(calls, "backward.mhc_post.backward", "backward.moe_combine.backward")
-    else:
-        assert not any(".mhc_post." in call for call in calls), f"Unexpected mHC post node: {calls}"
-
     if explicit_recompute:
-        next_backward = (
-            "backward.mhc_post.backward" if standalone_mhc_post else "backward.moe_combine.backward"
+        _assert_called_before(
+            calls, "backward.mhc_recompute.forward", "backward.moe_combine.backward"
         )
-        _assert_called_before(calls, "backward.mhc_recompute.forward", next_backward)
     else:
         assert "backward.mhc_recompute.forward" not in calls
 
 
-@pytest.mark.parametrize(
-    ("mode", "standalone_mhc_post"),
-    (("none", False), ("post", True), ("recompute", False), ("all", True)),
-)
-def test_mhc_post_is_merged_into_combine_unless_post_uses_high_priority(
-    monkeypatch, mode, standalone_mhc_post
-):
+def test_mhc_post_is_merged_into_combine(monkeypatch):
     import megatron.core.models.gpt.fine_grained_callables as fine_grained_callables
     import megatron.core.transformer.moe.moe_layer as moe_layer
     import megatron.core.transformer.transformer_layer as transformer_layer
@@ -307,7 +185,6 @@ def test_mhc_post_is_merged_into_combine_unless_post_uses_high_priority(
         def __init__(self):
             self.config = SimpleNamespace(
                 delay_wgrad_compute=False,
-                mhc_high_priority_stream_mode=mode,
                 moe_flex_dispatcher_backend=None,
                 moe_token_dispatcher_type="alltoall",
             )
@@ -336,8 +213,6 @@ def test_mhc_post_is_merged_into_combine_unless_post_uses_high_priority(
             name="default",
             bwd_dw_callables=None,
             extra_args=None,
-            forward_nvtx_name=None,
-            backward_nvtx_name=None,
         ):
             extra_args = extra_args or {}
             self.stream = stream
@@ -384,30 +259,29 @@ def test_mhc_post_is_merged_into_combine_unless_post_uses_high_priority(
     def comm_stream():
         return "communication"
 
+    recompute_manager = CheckpointManager()
     plan._build_callable_nodes(
-        event=object(), comp_stream=comp_stream, comm_stream=comm_stream, extra_args={}
+        event=object(),
+        comp_stream=comp_stream,
+        comm_stream=comm_stream,
+        extra_args={
+            "mhc_recompute_manager": recompute_manager,
+            "is_last_layer_in_mhc_recompute_group": True,
+            "mhc_recompute_group_index": 0,
+        },
     )
 
     assert plan.moe_combine.stream is comm_stream
+    assert plan.mhc_recompute.stream is comp_stream
     combine_output = plan.moe_combine.submodule(plan.moe_combine, _Value("experts"))
-    if standalone_mhc_post:
-        assert isinstance(plan.mhc_post, _CapturedNode)
-        assert plan.mhc_post.stream is get_mhc_high_priority_stream
-        assert calls == ["combine", "postprocess"]
-        assert combine_output is combined_value
-        assert plan.mhc_post.submodule(plan.mhc_post, combine_output) is post_value
-        assert calls == ["combine", "postprocess", "mhc_post"]
-    else:
-        assert isinstance(plan.mhc_post, NoopScheduleNode)
-        assert combine_output is post_value
-        assert calls == ["combine", "postprocess", "mhc_post"]
+    assert not hasattr(plan, "mhc_post")
+    assert combine_output is post_value
+    assert calls == ["combine", "postprocess", "mhc_post"]
 
 
 def test_model_chunk_recompute_groups_trigger_in_reverse_order():
     calls = []
-    layers = [
-        _RecordingLayer(calls, f"layer_{index}", standalone_mhc_post=False) for index in range(5)
-    ]
+    layers = [_RecordingLayer(calls, f"layer_{index}") for index in range(5)]
     # Forward groups are [0, 1], [2, 3], [4], so their explicit replay nodes
     # live on the final forward layer of each group.
     for group_end in (1, 3, 4):
@@ -570,7 +444,7 @@ def _run_eager_batches_and_capture(model, batches):
     return output_values, gradients
 
 
-def _make_mhc_numerical_config(mode, overlap=True, recompute=True):
+def _make_mhc_numerical_config(overlap=True, recompute=True):
     recompute_kwargs = (
         {
             "recompute_granularity": "selective",
@@ -587,7 +461,6 @@ def _make_mhc_numerical_config(mode, overlap=True, recompute=True):
             "overlap_moe_expert_parallel_comm": overlap,
             "enable_hyper_connections": True,
             "mhc_sinkhorn_iterations": 5,
-            "mhc_high_priority_stream_mode": mode,
             **recompute_kwargs,
         },
     )
@@ -606,14 +479,10 @@ class TestMhcA2AOverlapNumerics:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize(
-        ("mode", "recompute"),
-        [(mode, True) for mode in _MODES] + [("none", False), ("post", False)],
-        ids=(*_MODES, "none-without-recompute", "post-without-recompute"),
-    )
-    def test_two_layer_alltoall_schedule_matches_eager_hook_path(self, mode, recompute):
-        reference_config = _make_mhc_numerical_config("none", overlap=False, recompute=recompute)
-        mode_config = _make_mhc_numerical_config(mode, recompute=recompute)
+    @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
+    def test_two_layer_alltoall_schedule_matches_eager_hook_path(self, recompute):
+        reference_config = _make_mhc_numerical_config(overlap=False, recompute=recompute)
+        overlap_config = _make_mhc_numerical_config(recompute=recompute)
         with deterministic_mode():
             data = build_input_data(seq_len=16)
             reference_model = build_gpt_model(reference_config)
@@ -621,15 +490,15 @@ class TestMhcA2AOverlapNumerics:
             reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
             del reference_model
 
-            mode_model = build_gpt_model(mode_config)
-            reset_model(mode_model, initial_parameters)
-            mode_output, mode_gradients = _run_schedule_and_capture(mode_model, data)
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
 
-        torch.testing.assert_close(mode_output, reference_output, rtol=5e-3, atol=5e-3)
-        assert mode_gradients.keys() == reference_gradients.keys()
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        assert overlap_gradients.keys() == reference_gradients.keys()
         for name in reference_gradients:
             torch.testing.assert_close(
-                mode_gradients[name],
+                overlap_gradients[name],
                 reference_gradients[name],
                 rtol=5e-3,
                 atol=5e-3,
@@ -637,10 +506,9 @@ class TestMhcA2AOverlapNumerics:
             )
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("mode", ("recompute", "all"))
-    def test_two_inflight_plans_keep_recompute_groups_independent(self, mode):
-        reference_config = _make_mhc_numerical_config("none", overlap=False)
-        overlap_config = _make_mhc_numerical_config(mode)
+    def test_two_inflight_plans_keep_recompute_groups_independent(self):
+        reference_config = _make_mhc_numerical_config(overlap=False)
+        overlap_config = _make_mhc_numerical_config()
         with deterministic_mode():
             batches = [build_input_data(seq_len=16) for _ in range(2)]
             reference_model = build_gpt_model(reference_config)

@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     ScheduleNode,
     get_comm_stream,
     get_comp_stream,
-    get_mhc_execution_stream,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -41,7 +40,6 @@ class TransformerLayerSchedulePlan:
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
-    ├── mhc_post (TransformerLayerNode): optional high-priority MLP-side mHC post
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
@@ -55,7 +53,6 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
-    mhc_post = None
     mhc_recompute = None
     mtp_post_process = None
 
@@ -102,9 +99,6 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
-        if hasattr(self, 'mhc_post') and self.mhc_post is not None:
-            del self.mhc_post
-            self.mhc_post = None
         if hasattr(self, 'mhc_recompute') and self.mhc_recompute is not None:
             del self.mhc_recompute
             self.mhc_recompute = None
@@ -145,7 +139,7 @@ class TransformerLayerSchedulePlan:
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
-        def create_node(stream, module, name, forward_nvtx_name=None, backward_nvtx_name=None):
+        def create_node(stream, module, name):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
             return TransformerLayerNode(
                 stream,
@@ -156,8 +150,6 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
-                forward_nvtx_name=forward_nvtx_name,
-                backward_nvtx_name=backward_nvtx_name,
             )
 
         (
@@ -165,7 +157,6 @@ class TransformerLayerSchedulePlan:
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
-            mhc_post_module,
             mtp_post_process_module,
         ) = fwd_callables
 
@@ -180,18 +171,6 @@ class TransformerLayerSchedulePlan:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
-        if mhc_post_module is not None:
-            layer_number = transformer_layer.layer_number
-            self.mhc_post = create_node(
-                get_mhc_execution_stream(self.config, "post"),
-                mhc_post_module,
-                "mhc_post",
-                forward_nvtx_name=f"mhc/post/layer_{layer_number}/F",
-                backward_nvtx_name=f"mhc/post/layer_{layer_number}/B",
-            )
-        else:
-            self.mhc_post = NoopScheduleNode()
-
         mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
         if mhc_recompute_manager is not None and extra_args.get(
             "is_last_layer_in_mhc_recompute_group", False
@@ -199,7 +178,7 @@ class TransformerLayerSchedulePlan:
             group_index = extra_args["mhc_recompute_group_index"]
             self.mhc_recompute = ScheduleNode(
                 mhc_recompute_manager.recompute_now,
-                get_mhc_execution_stream(self.config, "recompute"),
+                comp_stream,
                 event,
                 name="mhc_recompute",
                 forward_nvtx_name=f"mhc/recompute/group_{group_index}/B",
@@ -246,9 +225,7 @@ class TransformerLayerSchedulePlan:
         self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
         # Determine the last node in forward order.
-        if not isinstance(self.mhc_post, NoopScheduleNode):
-            last_fwd_node = self.mhc_post
-        elif isinstance(self.moe_combine, NoopScheduleNode):
+        if isinstance(self.moe_combine, NoopScheduleNode):
             last_fwd_node = self.mlp
         else:
             last_fwd_node = self.moe_combine
@@ -280,10 +257,8 @@ class TransformerLayerSchedulePlan:
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
-        In ``post`` and ``all`` modes, mhc_post runs as a separate high-priority node after
-        combine_fwd and before combine_bwd. Otherwise, mhc_post is part of the combine node on
-        the communication stream. Group recompute runs immediately before the node containing
-        mhc_post_bwd.
+        MLP-side mHC post-processing runs inside the combine node on the communication stream.
+        Group recompute runs on the normal compute stream immediately before combine_bwd.
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -303,7 +278,6 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             if b_layer.mhc_recompute is not None:
                 b_layer.mhc_recompute.forward()
-            b_grad = b_layer.mhc_post.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -334,10 +308,6 @@ class TransformerLayerSchedulePlan:
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
-
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.mhc_post.forward(f_input)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
