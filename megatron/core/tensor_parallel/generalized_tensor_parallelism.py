@@ -1447,7 +1447,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 q.dtype if q is not None else w.dtype for q, w in zip(quantizers, self._weights)
             ]
             for w, dt in zip(self._weights, dtypes):
-                w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
+                # Reuse the fwd ticket the on-demand consume already reserved; a fresh reserve
+                # would orphan it — harmless when pooled, but a pinned (output-layer) buffer
+                # never returns to the pool, stranding a [vocab, hidden] buffer for the run.
+                if w._ag_ticket_fwd is None:
+                    w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
                 cache.get(w._ag_ticket_fwd)
                 cache.release(w._ag_ticket_fwd)
 
