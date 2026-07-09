@@ -766,7 +766,7 @@ class NativeDSv4HybridAttention(nn.Module):
         self.core_attention = NativeCompressedSparseAttention(config, compress_ratio)
         group_in = (config.num_attention_heads * config.v_head_dim) // config.o_groups
         self.linear_o_group_proj = nn.Parameter(
-            torch.empty(config.o_groups * config.o_lora_rank, group_in)
+            torch.empty(config.o_groups, config.o_lora_rank, group_in)
         )
         self.linear_proj = nn.Linear(
             config.o_groups * config.o_lora_rank, config.hidden_size, bias=False

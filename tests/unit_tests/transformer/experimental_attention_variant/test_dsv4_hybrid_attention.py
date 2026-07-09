@@ -7,12 +7,21 @@ import torch
 import torch.nn.functional as F
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+if HAVE_TE:
+    import transformer_engine.common.recipe as te_recipe
+    import transformer_engine.pytorch as te_pytorch
+else:
+    te_recipe = None
+    te_pytorch = None
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -413,10 +422,138 @@ class TestDSv4HybridGroupedOutput:
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
-        expected_out = o_groups * o_lora_rank
         expected_in = (config.v_head_dim * config.num_attention_heads) // o_groups
-        assert attn.linear_o_group_proj.shape == (expected_out, expected_in)
+        assert attn.linear_o_group_proj.shape == (o_groups, o_lora_rank, expected_in)
         assert attn.linear_o_group_proj.requires_grad
+
+    def test_o_group_proj_legacy_checkpoint_compatibility(self):
+        """Checkpoint I/O should retain the legacy 2D weight layout."""
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config(o_groups=8, o_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        runtime_weight = attn.linear_o_group_proj.detach().clone()
+        checkpoint_shape = (config.o_groups * config.o_lora_rank, attn.linear_o_group_proj.size(-1))
+
+        state_dict = attn.state_dict()
+        assert state_dict["linear_o_group_proj"].shape == checkpoint_shape
+
+        reloaded_attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        incompatible_keys = reloaded_attn.load_state_dict(state_dict)
+        assert not incompatible_keys.missing_keys
+        assert not incompatible_keys.unexpected_keys
+        assert reloaded_attn.linear_o_group_proj.shape == runtime_weight.shape
+        torch.testing.assert_close(reloaded_attn.linear_o_group_proj, runtime_weight)
+
+        sharded_state_dict = attn.sharded_state_dict()
+        factory = sharded_state_dict["linear_o_group_proj"]
+        assert isinstance(factory, ShardedTensorFactory)
+        assert factory.data is attn.linear_o_group_proj
+        optim_param_map = get_param_id_to_sharded_param_map(
+            sharded_state_dict, [attn.linear_o_group_proj]
+        )
+        assert optim_param_map[0] is factory
+        checkpoint_shard = factory.build()
+        assert checkpoint_shard.data.shape == checkpoint_shape
+        restored_weight = factory.merge_fn(checkpoint_shard.data)
+        assert restored_weight.shape == runtime_weight.shape
+        torch.testing.assert_close(restored_weight, runtime_weight)
+
+    @pytest.mark.parametrize("use_mxfp8", [False, True], ids=["bf16", "mxfp8"])
+    def test_o_group_proj_numerics_and_gradients(self, use_mxfp8):
+        """TE BatchedGEMM should match einsum in BF16 and MXFP8 forward/backward."""
+        if not hasattr(te_pytorch.ops, "BatchedGEMM"):
+            pytest.skip("Transformer Engine BatchedGEMM is not available")
+        if use_mxfp8:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config(o_groups=8, o_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        op = attn._get_linear_o_group_proj_op()
+        assert "_linear_o_group_proj_op" not in attn._modules
+        group_proj_param_names = [
+            name
+            for name, param in attn.named_parameters(remove_duplicate=False)
+            if param is attn.linear_o_group_proj
+        ]
+        assert group_proj_param_names == ["linear_o_group_proj"]
+
+        seq_len, batch_size = 4, 8
+        in_features = attn.linear_o_group_proj.size(-1)
+        input_ref = torch.empty(
+            seq_len, batch_size, config.o_groups, in_features, device="cuda", dtype=torch.bfloat16
+        ).uniform_(-0.25, 0.25)
+        input_ref.requires_grad_(True)
+        input_test = input_ref.detach().clone().requires_grad_(True)
+
+        weight_ref = torch.empty_like(attn.linear_o_group_proj).uniform_(-0.25, 0.25)
+        with torch.no_grad():
+            attn.linear_o_group_proj.copy_(weight_ref)
+        weight_ref.requires_grad_(True)
+
+        output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
+        grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
+        output_ref.backward(grad_output)
+
+        if use_mxfp8:
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+            with te_pytorch.autocast(enabled=True, recipe=recipe):
+                output_test = op(input_test)
+        else:
+            output_test = op(input_test)
+        output_test.backward(grad_output)
+
+        assert op is attn._get_linear_o_group_proj_op()
+        assert op.weight is attn.linear_o_group_proj
+        assert output_test.shape == output_ref.shape
+        if use_mxfp8:
+            assert op.get_quantizer("forward", 0).__class__.__name__ == "MXFP8Quantizer"
+            tolerances = {"rtol": 0.125, "atol": 0.0675}
+        else:
+            tolerances = {"rtol": 0.016, "atol": 1e-5}
+        torch.testing.assert_close(output_test, output_ref, **tolerances)
+        torch.testing.assert_close(input_test.grad, input_ref.grad, **tolerances)
+        torch.testing.assert_close(attn.linear_o_group_proj.grad, weight_ref.grad, **tolerances)
+
+    def test_o_group_proj_falls_back_to_einsum(self, monkeypatch):
+        """Missing TE BatchedGEMM should retain the legacy forward/backward path."""
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config(o_groups=8, o_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        monkeypatch.delattr(te_pytorch.ops, "BatchedGEMM", raising=False)
+        assert attn._get_linear_o_group_proj_op() is None
+
+        seq_len, batch_size = 4, 8
+        in_features = attn.linear_o_group_proj.size(-1)
+        input_ref = torch.empty(
+            seq_len, batch_size, config.o_groups, in_features, device="cuda", dtype=torch.bfloat16
+        ).uniform_(-0.25, 0.25)
+        input_ref.requires_grad_(True)
+        input_test = input_ref.detach().clone().requires_grad_(True)
+        weight_ref = attn.linear_o_group_proj.detach().clone().requires_grad_(True)
+
+        output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
+        output_test = attn._apply_linear_o_group_proj(input_test)
+        grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
+        output_ref.backward(grad_output)
+        output_test.backward(grad_output)
+
+        torch.testing.assert_close(output_test, output_ref)
+        torch.testing.assert_close(input_test.grad, input_ref.grad)
+        torch.testing.assert_close(attn.linear_o_group_proj.grad, weight_ref.grad)
 
 
 # ===========================================================================
