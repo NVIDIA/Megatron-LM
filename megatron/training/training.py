@@ -322,9 +322,11 @@ _otel_slurm_job_span = None
 _otel_slurm_job_ctx_token = None
 _otel_pretrain_span = None
 _otel_startup_span = None
+_otel_train_span = None
 _otel_ctx_module = None
 _otel_pretrain_ctx_token = None
 _otel_startup_ctx_token = None
+_otel_train_ctx_token = None
 _otel_shutdown_done = False
 
 
@@ -423,8 +425,9 @@ def _end_otel_startup_span():
     """End the startup span (sibling to the training-loop span) and detach its token.
 
     Safe to call more than once -- the None check makes it idempotent, since it
-    may run once explicitly right before train() and again later via
-    _end_otel_job_spans() if that first call never happened (early crash).
+    may run once explicitly inside train() (after the preamble, before the loop)
+    and again later via _end_otel_job_spans() if that first call never happened
+    (early crash).
     """
     global _otel_startup_span
     if _otel_startup_span is not None:
@@ -432,6 +435,44 @@ def _end_otel_startup_span():
             _otel_ctx_module.detach(_otel_startup_ctx_token)
         _otel_startup_span.end()
         _otel_startup_span = None
+
+
+def _start_otel_train_span():
+    """Start megatron.train (the steady-state training loop), a child of
+    megatron.pretrain and sibling of megatron.startup.
+
+    Explicit module-managed span, not the @_otel_trace_fn decorator train() used
+    to carry, for two reasons: (1) the decorator made megatron.train the current
+    span for the *whole* function, so the preamble (weight-hash check, sniff
+    test, cuda-graph setup) parented to it -- but that work is init, not the
+    loop, and now correctly parents to megatron.startup, which stays open through
+    the preamble and is ended right before this call. (2) On the exit-interval/
+    duration/signal path, train() calls sys.exit() and _end_otel_job_spans()
+    shuts telemetry down first; the decorator's span-end then unwound *after*
+    shutdown and was dropped ("Shutdown called, ignoring Span"). As a module span
+    it's ended by _end_otel_job_spans() *before* the shutdown, so it survives.
+
+    Called after _end_otel_startup_span() (so startup's context is detached and
+    the current span reverts to megatron.pretrain -> correct parent).
+    """
+    global _otel_train_span, _otel_train_ctx_token
+    if not _otel_sg_enabled('job'):
+        return
+    from opentelemetry import context as _otel_ctx, trace as _otel_trace
+
+    _otel_train_span = get_telemetry().tracer.start_span('megatron.train')
+    _otel_train_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_train_span))
+
+
+def _end_otel_train_span():
+    """End megatron.train and detach its token. Idempotent -- ended on train()'s
+    normal return, or via _end_otel_job_spans() on the sys.exit() path."""
+    global _otel_train_span
+    if _otel_train_span is not None:
+        if _otel_ctx_module is not None and _otel_train_ctx_token is not None:
+            _otel_ctx_module.detach(_otel_train_ctx_token)
+        _otel_train_span.end()
+        _otel_train_span = None
 
 
 def _end_otel_job_spans():
@@ -453,6 +494,7 @@ def _end_otel_job_spans():
     global _otel_pretrain_span, _otel_pretrain_ctx_token
     global _otel_slurm_job_span, _otel_slurm_job_ctx_token, _otel_shutdown_done
 
+    _end_otel_train_span()  # end innermost first (train() sys.exit() path)
     _end_otel_startup_span()
     if _otel_pretrain_span is not None:
         if _otel_ctx_module is not None and _otel_pretrain_ctx_token is not None:
@@ -1650,11 +1692,12 @@ def pretrain(
         )
         print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
-    # OTel: startup phase ends here -- everything above this point (imports,
-    # arg parsing, initialize_megatron, model/optimizer setup, checkpoint
-    # load, dataset/dataloader build) is megatron.startup; train() below is
-    # its sibling, megatron.train (decorated separately).
-    _end_otel_startup_span()
+    # OTel: megatron.startup deliberately stays open into train() -- its
+    # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
+    # the loop, so it should parent to startup. train() ends startup and starts
+    # megatron.train itself, right before its loop. If train() isn't called
+    # (do_train False), _end_otel_job_spans() ends startup as an idempotent
+    # fallback.
 
     if not cfg_container.validation.skip_train or args.perform_rl_step:
         if cfg_container.validation.skip_train:
@@ -3679,7 +3722,6 @@ def checkpoint_and_decide_exit(
     return False
 
 
-@_otel_trace_fn('job', 'megatron.train')
 def train(
     forward_step_func,
     model,
@@ -4085,6 +4127,16 @@ def train(
     if _train_setup_span is not None:
         _train_setup_span.end()
         _train_setup_span = None
+
+    # OTel: everything above in train() (the preamble: weight-hash check, sniff
+    # test, cuda-graph setup) was init and parented to megatron.startup, which
+    # stayed open through it. Close startup and open megatron.train now -- the
+    # steady-state loop is its own span, a sibling of megatron.startup under
+    # megatron.pretrain. (Previously train() carried an @_otel_trace_fn
+    # decorator, which both mis-parented the preamble and dropped its own span
+    # on the sys.exit() exit path -- see _start_otel_train_span's docstring.)
+    _end_otel_startup_span()
+    _start_otel_train_span()
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -4562,6 +4614,11 @@ def train(
         # down, so it must be this call, not a standalone get_telemetry().shutdown().
         _end_otel_job_spans()
         sys.exit(exit_code)
+
+    # OTel: normal loop completion -- end megatron.train here so it doesn't bleed
+    # into pretrain()'s post-train eval/test (which parent to megatron.pretrain).
+    # The sys.exit() path above ends it via _end_otel_job_spans() instead.
+    _end_otel_train_span()
 
     return iteration, num_floating_point_operations_so_far
 
