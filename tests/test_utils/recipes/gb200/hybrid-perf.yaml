@@ -44,5 +44,6 @@ products:
   - test_case: [hybrid_2b_perf]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_gb200]
+        allow_failure: [true] # TODO: remove after https://github.com/NVIDIA/Megatron-LM/issues/5693

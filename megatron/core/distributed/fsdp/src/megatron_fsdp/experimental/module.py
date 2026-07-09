@@ -15,7 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 from collections.abc import Callable
-from typing import cast
+from typing import Literal, cast
 
 import torch
 from torch import nn
@@ -48,6 +48,9 @@ class FsdpContext:
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
+    # Name relative to the root FSDP module from named_modules().
+    # Root uses "" and None means uninitialized.
+    _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
@@ -62,6 +65,7 @@ class FsdpModule:
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = None
+        self._name = None
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -111,7 +115,7 @@ class FsdpModule:
             return
 
         context = FsdpContext(root_module=self)
-        for submodule in cast(nn.Module, self).modules():
+        for submodule_name, submodule in cast(nn.Module, self).named_modules():
             if not isinstance(submodule, FsdpModule):
                 continue
             if submodule._context is not None:
@@ -120,12 +124,21 @@ class FsdpModule:
                     "Run forward through the root FSDP module first."
                 )
             submodule._context = context
+            submodule._name = submodule_name
 
     @property
     def context(self) -> FsdpContext:
         """Return the initialized runtime context."""
         assert self._context is not None
         return self._context
+
+    @property
+    def name(self) -> str:
+        """Return this FSDP unit's name."""
+        name = self._name
+        if name is None:
+            raise RuntimeError("FSDP module name has not been initialized.")
+        return name
 
     def is_root(self) -> bool:
         """Return whether this module is the outermost FSDP unit in its context."""
@@ -157,6 +170,7 @@ class FsdpModule:
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
         self._lazy_init_context()
+        torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
         for group in self._parameter_groups:
             group.sync_model_weight_from_main_weight()
@@ -166,9 +180,11 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         for group in self._parameter_groups:
             group.reshard_parameters()
+        torch.cuda.nvtx.range_pop()
 
     def pre_backward(self) -> None:
         """Prepare full parameters for backward compute."""
+        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         for group in self._parameter_groups:
             group.unshard_parameters()
 
@@ -179,10 +195,15 @@ class FsdpModule:
                 group.reduce_gradients()
             group.reshard_parameters()
         self._ready_grad_parameters.clear()
+        torch.cuda.nvtx.range_pop()
 
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Return parameter groups owned by this FSDP unit."""
         return self._parameter_groups
+
+    def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
+        name = self.name if self.name else "<root>"
+        return f"MFSDP {name} {phase}"
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:

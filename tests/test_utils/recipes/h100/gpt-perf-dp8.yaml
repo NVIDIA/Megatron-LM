@@ -41,5 +41,5 @@ products:
   - test_case: [gpt_583m_perf]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [mr]
         platforms: [dgx_h100]
