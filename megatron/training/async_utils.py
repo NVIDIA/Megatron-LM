@@ -95,20 +95,31 @@ def build_otel_worker_bootstrap(args):
     if not service_name and not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         service_name = 'megatron-lm'
 
-    # The worker (NVRx-side setup_telemetry) resolves span groups with the BASE
-    # SpanGroup class, not MegatronSpanGroup, so any Megatron-only group name
-    # (e.g. 'trace_region', 'data_loading') would raise "Unknown span group".
-    # Resolve here with MegatronSpanGroup, then intersect with the base group
-    # set so the worker only ever sees base-resolvable names -- it keeps its
-    # 'checkpoint' spans; it just won't get Megatron-only ones (save-side
-    # trace_region detail) until NVRx forwards span_group_cls (needs a rebuild).
+    # Span groups cross to the worker two ways, for backward compatibility with
+    # a baked (not-yet-rebuilt) NVRx worker:
+    #
+    #   span_groups (str)         -- BASE-resolvable spec only. The worker's
+    #       setup_telemetry() resolves this with the base SpanGroup class (not
+    #       MegatronSpanGroup), so Megatron-only names ('trace_region', etc.)
+    #       would raise "Unknown span group". We resolve here with
+    #       MegatronSpanGroup and intersect with the base group set, so an OLD
+    #       worker only ever sees names it can resolve (keeps its 'checkpoint'
+    #       spans; misses Megatron-only save-side detail). Never crashes.
+    #
+    #   resolved_span_groups (list[str]) -- the FULL set (incl. Megatron-only
+    #       groups), already resolved here. A NEW worker calls
+    #       set_enabled_span_groups() with this AFTER setup_telemetry, overriding
+    #       the base-safe set -- giving it trace_region etc. (save-side
+    #       checkpoint internals). An OLD worker ignores this key.
     worker_span_groups = getattr(args, 'otel_span_groups', None)
+    resolved_span_groups = None
     if worker_span_groups:
         try:
             from nemo.lens.groups import SpanGroup as _BaseSpanGroup
             from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
             resolved = MegatronSpanGroup.resolve(worker_span_groups)
+            resolved_span_groups = sorted(resolved)
             base_safe = resolved & _BaseSpanGroup.ALL_GROUPS
             worker_span_groups = ','.join(sorted(base_safe)) if base_safe else 'default'
         except Exception:
@@ -120,6 +131,7 @@ def build_otel_worker_bootstrap(args):
         'enabled': bool(getattr(args, 'otel_enabled', False)),
         'service_name': service_name,
         'span_groups': worker_span_groups,
+        'resolved_span_groups': resolved_span_groups,
         'json_dir': getattr(args, 'otel_json_dir', None),
         'rank': args.rank,
         'world_size': args.world_size,
