@@ -1270,7 +1270,7 @@ class SequentialMLP(MegatronModule):
                     output, output_bias = expert(tokens, probs)
                 if output_local is None:
                     output_local = output.new_empty(
-                        (permuted_local_hidden_states.shape[0], output.shape[-1])
+                        (permuted_local_hidden_states.shape[0], *output.shape[1:])
                     )
                 output_local[output_offset : output_offset + output.shape[0]].copy_(output)
                 output_offset += output.shape[0]

@@ -156,6 +156,8 @@ class TestTEParallelSequentialMLP:
 
         output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert, probs)
         output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert, probs)
+        assert output_local.shape == hidden_states.shape
+        assert output_te.shape == hidden_states.shape
         assert torch.equal(output_local, output_te)
 
     @pytest.mark.internal
@@ -211,6 +213,8 @@ class TestTEParallelSequentialMLP:
 
         output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert, probs)
         output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert, probs)
+        assert output_local.shape == hidden_states.shape
+        assert output_te.shape == hidden_states.shape
         assert torch.equal(output_local, output_te)
 
     def teardown_method(self, method):
