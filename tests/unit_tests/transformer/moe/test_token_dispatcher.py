@@ -8,10 +8,10 @@ import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -76,6 +76,36 @@ def test_set_cudagraph_attr_supports_nested_paths():
     dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
 
     assert dispatcher._comm_manager.routing_map is routing_map
+
+
+def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(moe_hybridep_pad_variable_tokens=True)
+    manager.group = object()
+    manager.num_experts = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    local_num_tokens = 65
+    group_max_num_tokens = 129
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts))
+
+    def fake_all_reduce(tensor, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(group_max_num_tokens)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    manager.setup_metadata(routing_map, probs)
+
+    expected_num_tokens = group_max_num_tokens
+    expected_num_tokens += -expected_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
+    assert manager._padded_num_tokens == expected_num_tokens
+    assert manager.routing_map.shape == (expected_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
 
 
 class MoEModelTestContainer:
