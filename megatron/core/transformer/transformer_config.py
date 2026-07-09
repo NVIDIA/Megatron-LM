@@ -1112,13 +1112,13 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
-    thd_max_packed_sequences: int = field(
-        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    thd_max_packed_sequences: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
     )
-    """Maximum number of THD packed sequences per microbatch, including any dummy
-    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
-    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
-    tensors are padded to this size + 1.
+    """Optional maximum number of THD packed sequences per microbatch, including any
+    dummy sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When set, cu_seqlens tensors are padded
+    to this size + 1 in both eager and CUDA Graph modes. THD CUDA Graph requires this value.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
@@ -3171,6 +3171,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
+            if self.thd_max_packed_sequences is None:
+                raise ValueError(
+                    "THD CUDA Graph requires --thd-max-packed-sequences to be set."
+                )
             assert (
                 self.pad_packed_seq_alignment is not None
             ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."

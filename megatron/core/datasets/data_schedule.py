@@ -826,8 +826,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         pad_between_seqs=False,
     )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    # Pad the already-packed THD tensors at the end when requested. A configured
+    # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
     if pad_alignment is not None and packed_seq_params is not None:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
