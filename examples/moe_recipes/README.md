@@ -78,7 +78,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>2/8/32/1/1</td>
       <td>1/2048/4096</td>
       <td>router/preprocess CG; HybridEP; EP overlap</td>
-      <td>214.3</td>
+      <td>302.0</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/b200/mxfp8_128GPU_TP2PP4EP16.yaml">B200 MXFP8</a></td>
@@ -102,7 +102,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
       <td>paged stash; full CG; HybridEP; EP overlap</td>
-      <td>1159.5</td>
+      <td>1208.3</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/gb200/mxfp8_128GPU_TP1PP1EP64_partial_cg_overlap.yaml">GB200 MXFP8 partial CG</a></td>
@@ -110,7 +110,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
       <td>partial CG; HybridEP; EP overlap</td>
-      <td>1018</td>
+      <td>876.2</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/gb300/mxfp8_128GPU_TP1PP1EP64_paged_stash_full_cg.yaml">GB300 MXFP8 full CG</a></td>
@@ -118,7 +118,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
       <td>paged stash; full CG; HybridEP; EP overlap</td>
-      <td>1323.1</td>
+      <td>1396.1</td>
     </tr>
     <tr>
       <td rowspan="5">Qwen3-30B-A3B</td>
@@ -127,7 +127,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/8/1/1</td>
       <td>1/256/4096</td>
       <td>FP8 blockwise; router/preprocess CG</td>
-      <td>232.4</td>
+      <td>242.9</td>
     </tr>
     <tr>
       <td><a href="qwen3_30b/h100/bf16_32GPU_TP1PP1EP8.yaml">H100 BF16</a></td>
@@ -135,7 +135,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/8/1/1</td>
       <td>1/256/4096</td>
       <td>BF16 baseline</td>
-      <td>234.1</td>
+      <td>240.5</td>
     </tr>
     <tr>
       <td><a href="qwen3_30b/gb200/bf16_16GPU_TP1PP1EP16.yaml">GB200 BF16</a></td>
@@ -143,7 +143,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/16/1/1</td>
       <td>4/512/4096</td>
       <td>BF16 baseline</td>
-      <td>528</td>
+      <td>504.2</td>
     </tr>
     <tr>
       <td><a href="qwen3_30b/gb200/mxfp8_16GPU_TP1PP1EP16_partial_cg.yaml">GB200 MXFP8 partial CG</a></td>
@@ -151,7 +151,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/16/1/1</td>
       <td>4/512/4096</td>
       <td>MXFP8; partial CG</td>
-      <td>514</td>
+      <td>480.3</td>
     </tr>
     <tr>
       <td><a href="qwen3_30b/gb200/mxfp8_16GPU_TP1PP1EP16_paged_stash.yaml">GB200 MXFP8 paged stash</a></td>
@@ -159,7 +159,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/1/16/1/1</td>
       <td>4/512/4096</td>
       <td>MXFP8; paged stash; full CG</td>
-      <td>646.8</td>
+      <td>598.1</td>
     </tr>
   </tbody>
 </table>
