@@ -22,10 +22,12 @@ import torch
 # not require torch.distributed.
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.datasets.varlen_dataset import (
+    ChatTemplateSample,
     MockVarlenDataset,
     VarlenDataset,
     VarlenLowLevelDataset,
     _alpaca_to_messages,
+    _ensure_list_field,
     _looks_like_hf_id,
     _messages_passthrough,
     _raw_text_loader,
@@ -148,14 +150,16 @@ def test_sharegpt_role_map(speaker, expected_role):
 
 
 def test_messages_passthrough_prepends_system_when_missing():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert sample.chat_template_kwargs == {}
 
 
 def test_messages_passthrough_keeps_existing_system():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {
             "messages": [
                 {"role": "system", "content": "be terse"},
@@ -164,23 +168,76 @@ def test_messages_passthrough_keeps_existing_system():
             ]
         }
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
     assert out[0]["content"] == "be terse"
 
 
-def test_messages_passthrough_strips_extra_keys():
-    """OpenAI-style messages may carry ``name`` / ``tool_calls`` etc.;
-    chat-template input only wants ``role`` and ``content``."""
-    out = _messages_passthrough(
+def test_messages_passthrough_preserves_math_v3_template_fields():
+    tools = [
         {
+            "type": "function",
+            "function": {"name": "stateful_python_code_exec", "parameters": {"type": "object"}},
+        }
+    ]
+    sample = _messages_passthrough(
+        {
+            "tools": tools,
             "messages": [
-                {"role": "user", "content": "hi", "name": "alice"},
-                {"role": "assistant", "content": "hi alice", "tool_calls": [{"function": "foo"}]},
-            ]
+                {"role": "user", "content": "solve"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "I should calculate this.",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "stateful_python_code_exec",
+                                "arguments": '{"code":"1 + 1"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "stateful_python_code_exec",
+                    "tool_call_id": "call-1",
+                    "content": "2",
+                },
+            ],
         }
     )
-    for m in out:
-        assert set(m.keys()) == {"role", "content"}
+    assert sample.chat_template_kwargs == {"tools": tools}
+    assert sample.messages[1]["content"] == ""
+    assert sample.messages[1]["reasoning_content"] == "I should calculate this."
+    assert sample.messages[1]["tool_calls"][0]["function"]["name"] == "stateful_python_code_exec"
+    assert sample.messages[2]["name"] == "stateful_python_code_exec"
+    assert sample.messages[2]["tool_call_id"] == "call-1"
+
+
+def test_messages_passthrough_rejects_non_list_tools():
+    with pytest.raises(ValueError, match="field 'tools' must be a list"):
+        _messages_passthrough(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": {"name": "bad"}}
+        )
+
+
+def test_messages_passthrough_decodes_json_encoded_parquet_columns():
+    messages = [
+        {"role": "user", "content": "solve"},
+        {"role": "assistant", "content": "2", "reasoning_content": "1 + 1"},
+    ]
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    sample = _messages_passthrough({"messages": json.dumps(messages), "tools": json.dumps(tools)})
+    assert sample.messages == [{"role": "system", "content": ""}, *messages]
+    assert sample.chat_template_kwargs == {"tools": tools}
+
+
+def test_ensure_list_field_rejects_invalid_json():
+    with pytest.raises(ValueError, match="contains invalid JSON"):
+        _ensure_list_field("[broken", "messages")
 
 
 # ----------------------------------------------------------------------------
@@ -370,7 +427,8 @@ def test_low_level_loads_jsonl_messages(tmp_path):
     ll = VarlenLowLevelDataset(path)
     assert ll.schema_name == "openai-messages"
     sample = ll[0]
-    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+    assert isinstance(sample, ChatTemplateSample)
+    assert [m["role"] for m in sample.messages] == ["system", "user", "assistant"]
 
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
@@ -439,6 +497,7 @@ class _FakeTokenizer:
     def __init__(self, eod: int = 0, pad=None):
         self._eod = eod
         self._pad = pad
+        self.last_chat_template_kwargs = None
 
     @property
     def eod(self):
@@ -451,7 +510,10 @@ class _FakeTokenizer:
     def tokenize(self, text):
         return [ord(c) % 100 + 1 for c in text]  # always >= 1, never eod (0)
 
-    def tokenize_conversation(self, messages, return_target=True, add_generation_prompt=False):
+    def tokenize_conversation(
+        self, messages, return_target=True, add_generation_prompt=False, chat_template_kwargs=None
+    ):
+        self.last_chat_template_kwargs = chat_template_kwargs
         tokens, targets = [], []
         for m in messages:
             ids = self.tokenize(m["content"])
@@ -526,6 +588,22 @@ def test_getitem_thd_sft_prompt_is_masked():
     loss_mask = out["loss_mask"]
     assert torch.all(loss_mask[labels == IGNORE_INDEX] == 0.0)
     assert loss_mask.sum() > 0  # assistant span still contributes
+
+
+def test_getitem_forwards_openai_chat_template_kwargs():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    item = ChatTemplateSample(
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+        ],
+        chat_template_kwargs={"tools": tools},
+    )
+    ds = _make_varlen([item], _make_config(tok, seq_length=64))
+    out = ds[0]
+    assert tok.last_chat_template_kwargs == {"tools": tools}
+    assert out["tokens"].numel() > 0
 
 
 def test_getitem_thd_pad_masked_by_position_keeps_real_eod():

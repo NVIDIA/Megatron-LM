@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -128,7 +128,11 @@ class SFTTokenizer:
         return arr[0] if arr.ndim == 2 and arr.shape[0] == 1 else arr
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Convert a conversation to tokens.
 
@@ -142,11 +146,14 @@ class SFTTokenizer:
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            chat_template_kwargs (Optional[Dict[str, Any]]): Additional keyword arguments passed
+                to the Hugging Face chat template, such as top-level tool definitions.
         """
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
+        template_kwargs = dict(chat_template_kwargs or {})
         tokens = self._extract_token_ids(
             self._tokenizer.apply_chat_template(
                 conversation,
@@ -155,6 +162,7 @@ class SFTTokenizer:
                 return_assistant_token_mask=False,
                 return_tensors="np",
                 chat_template=self._prompt_config.custom_chat_template,
+                **template_kwargs,
             )
         )
 
