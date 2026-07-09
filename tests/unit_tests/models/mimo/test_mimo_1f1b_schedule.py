@@ -328,7 +328,6 @@ def get_vision_submodules_spec(
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
-    cp_size = pg_collection.cp.size() if pg_collection.cp is not None else 1
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
     pp_rank = dist.get_rank(pg_collection.pp)
 
@@ -352,7 +351,6 @@ def get_vision_submodules_spec(
         pipeline_dtype=pipeline_dtype,
         bf16=bf16,
         calculate_per_token_loss=per_token_loss,
-        context_parallel_size=cp_size,
         **extra_kwargs,
     )
     vision_encoder_spec = ModuleSpec(
@@ -566,248 +564,6 @@ class DataIterator:
         }
 
 
-class _BatchIterator:
-    """Finite iterator over deterministic, pre-generated microbatches."""
-
-    def __init__(self, batches):
-        self.batches = batches
-        self.index = 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.index >= len(self.batches):
-            raise StopIteration
-        batch = self.batches[self.index]
-        self.index += 1
-        return batch
-
-
-def _clone_batch_value(value):
-    """Clone a nested batch so sequential reference/target runs cannot share mutations."""
-    if isinstance(value, torch.Tensor):
-        return value.clone()
-    if isinstance(value, dict):
-        return {key: _clone_batch_value(item) for key, item in value.items()}
-    return value
-
-
-def _generate_and_broadcast_global_batches(
-    global_micro_batch_size,
-    seq_length,
-    hidden_size,
-    vocab_size,
-    encoder_name,
-    num_microbatches,
-    modality_dtype=torch.bfloat16,
-    image_token_id=50257,
-):
-    """Generate deterministic global microbatches once and broadcast them to every rank."""
-    image_seq_length = seq_length // 2
-    batches = []
-
-    for _ in range(num_microbatches):
-        if dist.get_rank() == 0:
-            encoder_hidden_states = torch.randn(
-                image_seq_length,
-                global_micro_batch_size,
-                hidden_size,
-                device='cuda',
-                dtype=modality_dtype,
-            )
-            image_tokens = torch.full(
-                (global_micro_batch_size, image_seq_length),
-                image_token_id,
-                dtype=torch.long,
-                device='cuda',
-            )
-            text_tokens = torch.randint(
-                1,
-                vocab_size,
-                (global_micro_batch_size, seq_length - image_seq_length),
-                device='cuda',
-            )
-            input_ids = torch.cat([image_tokens, text_tokens], dim=1)
-        else:
-            encoder_hidden_states = torch.empty(
-                image_seq_length,
-                global_micro_batch_size,
-                hidden_size,
-                device='cuda',
-                dtype=modality_dtype,
-            )
-            input_ids = torch.empty(
-                global_micro_batch_size, seq_length, dtype=torch.long, device='cuda'
-            )
-
-        dist.broadcast(encoder_hidden_states, src=0)
-        dist.broadcast(input_ids, src=0)
-
-        labels = input_ids.clone()
-        labels[input_ids == image_token_id] = -100
-        loss_mask = torch.ones(
-            global_micro_batch_size, seq_length, device='cuda', dtype=torch.float32
-        )
-        loss_mask[input_ids == image_token_id] = 0.0
-        position_ids = (
-            torch.arange(seq_length, device='cuda')
-            .unsqueeze(0)
-            .expand(global_micro_batch_size, -1)
-            .clone()
-        )
-        batches.append(
-            {
-                "input_ids": input_ids,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-                "modality_inputs": {
-                    encoder_name: {
-                        "clip_encoder": {
-                            'hidden_states': encoder_hidden_states,
-                            'attention_mask': None,
-                        }
-                    }
-                },
-            }
-        )
-
-    return batches
-
-
-def _slice_batch(global_batch, num_slices, slice_rank):
-    """Slice a global batch for one encoder DP rank."""
-    batch_size = global_batch['input_ids'].shape[0]
-    assert batch_size % num_slices == 0
-    slice_size = batch_size // num_slices
-    start = slice_rank * slice_size
-    end = start + slice_size
-
-    batch = {
-        key: global_batch[key][start:end].contiguous()
-        for key in ['input_ids', 'labels', 'loss_mask', 'position_ids']
-    }
-    batch['modality_inputs'] = {}
-    for modality_name, modality_data in global_batch['modality_inputs'].items():
-        batch['modality_inputs'][modality_name] = {}
-        for encoder_name, encoder_data in modality_data.items():
-            batch['modality_inputs'][modality_name][encoder_name] = {}
-            for key, tensor in encoder_data.items():
-                if isinstance(tensor, torch.Tensor):
-                    batch['modality_inputs'][modality_name][encoder_name][key] = tensor[
-                        :, start:end, :
-                    ].contiguous()
-                else:
-                    batch['modality_inputs'][modality_name][encoder_name][key] = tensor
-    return batch
-
-
-def _build_noncolocated_role_batches(global_batches, encoder_grid, llm_grid):
-    """Build encoder-DP slices or full LLM batches for this disjoint-grid rank."""
-    if is_rank_in_grid(encoder_grid):
-        encoder_dp = encoder_grid.get_pg("dp")
-        return [
-            _slice_batch(batch, encoder_dp.size(), encoder_dp.rank()) for batch in global_batches
-        ]
-    if is_rank_in_grid(llm_grid):
-        return [_clone_batch_value(batch) for batch in global_batches]
-    raise AssertionError(f"Rank {dist.get_rank()} belongs to neither MIMO grid")
-
-
-def _copy_ref_params_to_dist(ref_module, dist_module, ref_tp_group, dist_tp_group):
-    """Copy parameters across differing TP layouts by gathering then re-slicing shards.
-
-    This helper is shared with the colocated MIMO correctness tests. It must be called before
-    constructing the distributed optimizer, which snapshots parameter data into master weights.
-    """
-    ref_tp_size = ref_tp_group.size()
-    dist_tp_size = dist_tp_group.size()
-    dist_tp_rank = dist_tp_group.rank()
-    ref_params = dict(ref_module.named_parameters())
-
-    with torch.no_grad():
-        for name, dist_param in dist_module.named_parameters():
-            assert name in ref_params, f"Distributed parameter {name!r} is missing from reference"
-            ref_param = ref_params[name]
-            if ref_param.shape == dist_param.shape:
-                dist_param.data.copy_(ref_param.data.to(dist_param.dtype))
-                continue
-
-            partition_dim = getattr(dist_param, 'partition_dim', -1)
-            assert partition_dim >= 0, (
-                f"Parameter {name!r} differs in shape but has no TP partition dimension: "
-                f"reference={tuple(ref_param.shape)}, distributed={tuple(dist_param.shape)}"
-            )
-            ref_shards = [torch.empty_like(ref_param.data) for _ in range(ref_tp_size)]
-            dist.all_gather(ref_shards, ref_param.data.contiguous(), group=ref_tp_group)
-            full_param = torch.cat(ref_shards, dim=partition_dim)
-            dist_shard = torch.tensor_split(full_param, dist_tp_size, dim=partition_dim)[
-                dist_tp_rank
-            ]
-            assert dist_shard.shape == dist_param.shape, (
-                f"Parameter {name!r} reshard shape {tuple(dist_shard.shape)} does not match "
-                f"distributed shape {tuple(dist_param.shape)}"
-            )
-            dist_param.data.copy_(dist_shard.to(dist_param.dtype))
-
-
-def _snapshot_first_layer_encoder_grads(mimo_model, encoder_name):
-    """Snapshot first-layer encoder main gradients before the optimizer consumes them."""
-    encoder = mimo_model.modality_submodules[encoder_name].module
-    gradients = {}
-    for name, parameter in encoder.named_parameters():
-        if '.layers.0.' not in name:
-            continue
-        main_grad = getattr(parameter, 'main_grad', None)
-        if main_grad is not None:
-            gradients[name] = main_grad.detach().clone()
-    assert gradients, "Expected non-empty first-layer encoder main_grad snapshot"
-    return gradients
-
-
-def _forward_step_with_per_token_loss(data_iterator, model):
-    """Forward step using the per-token loss contract expected by configure_grad_sync."""
-
-    def loss_func(loss_mask, output_tensor):
-        def _ret(loss, num_tokens, reduced):
-            return loss, num_tokens, {'loss_reduced': reduced}
-
-        zero = torch.tensor(0.0, device='cuda', requires_grad=True)
-        one = torch.tensor(1, device='cuda', dtype=torch.int)
-        if output_tensor is None:
-            return _ret(zero, one, 0.0)
-
-        if isinstance(output_tensor, dict):
-            output = output_tensor.get(
-                MIMO_LANGUAGE_MODULE_KEY, next(iter(output_tensor.values()), None)
-            )
-        else:
-            output = output_tensor
-
-        if output is None:
-            return _ret(zero, one, 0.0)
-
-        loss = output.float().sum()
-        num_tokens = loss_mask.sum().to(torch.int).clamp(min=1) if loss_mask is not None else one
-        return _ret(loss, num_tokens, loss)
-
-    batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
-    output_tensor, loss_mask = model(**batch)
-    return output_tensor, partial(loss_func, loss_mask)
-
-
-def _assert_finite_losses(losses, llm_grid):
-    """Require finite reported losses on the terminal language stage."""
-    if not (is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp"))):
-        return
-    assert losses, "Expected losses on last LLM stage"
-    for loss_dict in losses:
-        assert 'loss_reduced' in loss_dict
-        loss = torch.as_tensor(loss_dict['loss_reduced'])
-        assert torch.isfinite(loss).all(), f"Expected finite loss, got {loss}"
-
-
 # ============================================================================
 # Test Runner
 # ============================================================================
@@ -822,7 +578,6 @@ def run_mimo_1f1b_test(
     llm_pp,
     llm_dp,
     llm_offset,
-    encoder_cp=1,
     llm_cp=1,
     hidden_size=256,
     num_layers=2,
@@ -848,7 +603,7 @@ def run_mimo_1f1b_test(
     encoder_name = "images"
 
     encoder_grid = create_hypercomm_grid(
-        offset=encoder_offset, tp=encoder_tp, cp=encoder_cp, pp=encoder_pp, dp=encoder_dp
+        offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
     )
     llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=llm_cp, pp=llm_pp, dp=llm_dp)
 
@@ -1013,87 +768,6 @@ def run_mimo_1f1b_test(
         mimo_model.destroy()
 
 
-def _run_deterministic_1f1b_configuration(
-    mimo_model,
-    module_to_grid_map,
-    topology,
-    language_pg,
-    vision_pg,
-    encoder_grid,
-    llm_grid,
-    encoder_name,
-    batches,
-    optimizer,
-    micro_batch_size,
-    seq_length,
-    num_microbatches,
-):
-    """Run one deterministic non-colocated 1F1B step and snapshot encoder gradients."""
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
-    grad_sync_topology = SimpleNamespace(
-        grids=module_to_grid_map,
-        module_pgs={
-            MIMO_LANGUAGE_MODULE_KEY: language_pg,
-            **{name: vision_pg for name in mimo_model.modality_submodules},
-        },
-    )
-    configure_grad_sync(SimpleNamespace(), mimo_model, grad_sync_topology)
-
-    communicator = MultiModulePipelineCommunicator(
-        module_to_grid_map,
-        topology,
-        mimo_model.config,
-        dim_mapping={'s': 0, 'h': 2, 'b': 1},
-        module_output_ndim={encoder_name: 2},
-    )
-
-    module_pgs = {}
-    language_model_module_name = None
-    if is_rank_in_grid(encoder_grid):
-        module_pgs[encoder_name] = vision_pg
-    if is_rank_in_grid(llm_grid):
-        module_pgs[MIMO_LANGUAGE_MODULE_KEY] = language_pg
-        language_model_module_name = MIMO_LANGUAGE_MODULE_KEY
-    pg_collection = MultiModuleProcessGroupCollection(
-        module_pgs=module_pgs, language_model_module_name=language_model_module_name
-    )
-
-    needs_data = (
-        is_rank_in_grid(encoder_grid) and is_pp_first_stage(encoder_grid.get_pg("pp"))
-    ) or (
-        is_rank_in_grid(llm_grid)
-        and (is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp")))
-    )
-    data_iterator = _BatchIterator(batches) if needs_data else None
-
-    optimizer.zero_grad()
-    losses = schedule.forward_backward_pipelining_without_interleaving(
-        forward_step_func=_forward_step_with_per_token_loss,
-        data_iterator=data_iterator,
-        model=[mimo_model],
-        num_microbatches=num_microbatches,
-        seq_length=seq_length,
-        micro_batch_size=micro_batch_size,
-        forward_only=False,
-        p2p_communicator=communicator,
-        pg_collection=pg_collection,
-    )
-
-    encoder_grads = (
-        _snapshot_first_layer_encoder_grads(mimo_model, encoder_name)
-        if is_rank_in_grid(encoder_grid)
-        else {}
-    )
-    success, grad_norm, _ = optimizer.step()
-    assert success, "Optimizer step failed"
-    assert grad_norm is not None and grad_norm > 0, f"Expected positive grad norm, got {grad_norm}"
-    assert torch.isfinite(
-        torch.as_tensor(grad_norm)
-    ).all(), f"Expected finite grad norm, got {grad_norm}"
-    _assert_finite_losses(losses, llm_grid)
-    return encoder_grads
-
-
 # ============================================================================
 # Tests
 # ============================================================================
@@ -1206,11 +880,17 @@ class TestMimo1F1BSchedule:
             num_microbatches=4,
         )
 
-    def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):
-        """Fan-in 4→1: Encoder DP=4 → LLM TP=2 PP=2 DP=1, on 8 GPUs.
+    @pytest.mark.parametrize(
+        "llm_tp,llm_cp,hidden_size",
+        [(2, 1, 256), (1, 2, 128)],
+        ids=["tp2-cp1", "tp1-cp2"],
+    )
+    def test_fan_in_dp4_to_dp1_llm_pp2_8gpu(self, llm_tp, llm_cp, hidden_size):
+        """Fan-in 4→1: Encoder DP=4 → LLM PP=2 DP=1 with TP or CP.
 
         High fan-in ratio. Each encoder rank processes MBS=1, bridge concatenates
-        4 × [img_seq, H] → [4*img_seq, H]. LLM has both TP and PP.
+        4 × [img_seq, H] → [4*img_seq, H]. The CP2 case exercises destination
+        CP gradient reconstruction in steady-state and cooldown backward paths.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -1220,235 +900,18 @@ class TestMimo1F1BSchedule:
             encoder_pp=1,
             encoder_dp=4,
             encoder_offset=0,
-            llm_tp=2,
+            llm_tp=llm_tp,
+            llm_cp=llm_cp,
             llm_pp=2,
             llm_dp=1,
             llm_offset=4,
-            hidden_size=256,
+            hidden_size=hidden_size,
             num_layers=2,
             vocab_size=1000,
             seq_length=64,
             micro_batch_size=4,
             num_microbatches=4,
         )
-
-    def test_fan_in_dp4_to_cp2_llm_pp2_8gpu(self):
-        """Destination CP=2 exercises steady-state and cooldown bridge backward paths."""
-        if self.world_size != 8:
-            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
-
-        run_mimo_1f1b_test(
-            encoder_tp=1,
-            encoder_cp=1,
-            encoder_pp=1,
-            encoder_dp=4,
-            encoder_offset=0,
-            llm_tp=1,
-            llm_cp=2,
-            llm_pp=2,
-            llm_dp=1,
-            llm_offset=4,
-            hidden_size=128,
-            num_layers=2,
-            vocab_size=1000,
-            seq_length=64,
-            micro_batch_size=4,
-            num_microbatches=4,
-        )
-
-    def test_noncolocated_cp2_matches_cp1_baseline(self):
-        """CP2 reconstructs the same encoder gradient as a deterministic CP1 baseline."""
-        if self.world_size != 8:
-            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
-
-        import os
-
-        for key, value in {
-            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-            "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        }.items():
-            os.environ[key] = value
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-        previous_deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
-        previous_cudnn_deterministic = torch.backends.cudnn.deterministic
-        previous_cudnn_benchmark = torch.backends.cudnn.benchmark
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-        encoder_name = "images"
-        hidden_size = 128
-        seq_length = 64
-        vocab_size = 1000
-        micro_batch_size = 4
-        num_microbatches = 4
-        ref_mimo = None
-        target_mimo = None
-
-        try:
-            ref_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
-            ref_llm_grid = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=2, dp=1)
-            target_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
-            target_llm_grid = create_hypercomm_grid(offset=4, tp=1, cp=2, pp=2, dp=1)
-            create_all_embedding_groups(
-                [ref_encoder_grid, ref_llm_grid, target_encoder_grid, target_llm_grid]
-            )
-
-            ddp_config = DistributedDataParallelConfig(
-                overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=False
-            )
-
-            torch.manual_seed(12345)
-            (ref_mimo, ref_module_to_grid_map, ref_topology, ref_language_pg, ref_vision_pg) = (
-                get_mimo_model(
-                    encoder_name=encoder_name,
-                    encoder_grid=ref_encoder_grid,
-                    llm_grid=ref_llm_grid,
-                    hidden_size=hidden_size,
-                    num_layers=2,
-                    vocab_size=vocab_size,
-                    seq_len=seq_length,
-                    ddp_config=ddp_config,
-                    bf16=True,
-                    bias=False,
-                    dropout=False,
-                    per_token_loss=True,
-                )
-            )
-
-            torch.manual_seed(12345)
-            (
-                target_mimo,
-                target_module_to_grid_map,
-                target_topology,
-                target_language_pg,
-                target_vision_pg,
-            ) = get_mimo_model(
-                encoder_name=encoder_name,
-                encoder_grid=target_encoder_grid,
-                llm_grid=target_llm_grid,
-                hidden_size=hidden_size,
-                num_layers=2,
-                vocab_size=vocab_size,
-                seq_len=seq_length,
-                ddp_config=ddp_config,
-                bf16=True,
-                bias=False,
-                dropout=False,
-                per_token_loss=True,
-            )
-
-            if is_rank_in_grid(ref_encoder_grid):
-                _copy_ref_params_to_dist(
-                    ref_mimo.modality_submodules[encoder_name].module,
-                    target_mimo.modality_submodules[encoder_name].module,
-                    ref_encoder_grid.get_pg("tp"),
-                    target_encoder_grid.get_pg("tp"),
-                )
-            else:
-                assert is_rank_in_grid(ref_llm_grid)
-                _copy_ref_params_to_dist(
-                    ref_mimo.language_model.module,
-                    target_mimo.language_model.module,
-                    ref_llm_grid.get_pg("tp"),
-                    target_llm_grid.get_pg("tp"),
-                )
-            dist.barrier()
-
-            opt_config = OptimizerConfig(
-                optimizer='adam',
-                lr=1e-4,
-                weight_decay=0.01,
-                clip_grad=1.0,
-                bf16=True,
-                use_distributed_optimizer=False,
-            )
-            ref_optimizer = get_mimo_optimizer(ref_mimo, opt_config)
-
-            torch.manual_seed(99999)
-            global_batches = _generate_and_broadcast_global_batches(
-                global_micro_batch_size=micro_batch_size,
-                seq_length=seq_length,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                encoder_name=encoder_name,
-                num_microbatches=num_microbatches,
-            )
-            ref_batches = _build_noncolocated_role_batches(
-                global_batches, ref_encoder_grid, ref_llm_grid
-            )
-            target_batches = _build_noncolocated_role_batches(
-                global_batches, target_encoder_grid, target_llm_grid
-            )
-
-            ref_grads = _run_deterministic_1f1b_configuration(
-                ref_mimo,
-                ref_module_to_grid_map,
-                ref_topology,
-                ref_language_pg,
-                ref_vision_pg,
-                ref_encoder_grid,
-                ref_llm_grid,
-                encoder_name,
-                ref_batches,
-                ref_optimizer,
-                micro_batch_size,
-                seq_length,
-                num_microbatches,
-            )
-            dist.barrier()
-            target_optimizer = get_mimo_optimizer(target_mimo, opt_config)
-            target_grads = _run_deterministic_1f1b_configuration(
-                target_mimo,
-                target_module_to_grid_map,
-                target_topology,
-                target_language_pg,
-                target_vision_pg,
-                target_encoder_grid,
-                target_llm_grid,
-                encoder_name,
-                target_batches,
-                target_optimizer,
-                micro_batch_size,
-                seq_length,
-                num_microbatches,
-            )
-
-            local_error = None
-            if is_rank_in_grid(ref_encoder_grid):
-                if set(ref_grads) != set(target_grads):
-                    local_error = (
-                        f"First-layer gradient names differ: reference={set(ref_grads)}, "
-                        f"target={set(target_grads)}"
-                    )
-                else:
-                    for name in sorted(ref_grads):
-                        try:
-                            torch.testing.assert_close(
-                                target_grads[name], ref_grads[name], rtol=1e-3, atol=1e-3
-                            )
-                        except AssertionError as error:
-                            local_error = f"First-layer gradient {name!r} differs: {error}"
-                            break
-
-            gradients_match = torch.tensor(
-                0 if local_error else 1, device='cuda', dtype=torch.int32
-            )
-            dist.all_reduce(gradients_match, op=dist.ReduceOp.MIN)
-            assert gradients_match.item() == 1, (
-                local_error or "A remote encoder rank reported a CP1-vs-CP2 gradient mismatch"
-            )
-        finally:
-            if target_mimo is not None:
-                target_mimo.destroy()
-            if ref_mimo is not None:
-                ref_mimo.destroy()
-            torch.use_deterministic_algorithms(previous_deterministic_algorithms)
-            torch.backends.cudnn.deterministic = previous_cudnn_deterministic
-            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
 
     def test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu(self):
         """Fan-out 1→4: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.

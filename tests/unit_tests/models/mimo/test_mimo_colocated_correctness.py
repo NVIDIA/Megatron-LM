@@ -68,7 +68,6 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
-    _copy_ref_params_to_dist,
     build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
@@ -196,6 +195,7 @@ def _generate_and_broadcast_global_batches(
     num_batches,
     image_token_id=50257,
     mask_pattern="uniform",
+    modality_dtype=torch.float32,
 ):
     """Generate global batches on rank 0 and broadcast so every rank sees
     identical data. Dist pre-slices per rank; ref consumes the full batch.
@@ -221,7 +221,11 @@ def _generate_and_broadcast_global_batches(
     for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length,
+                global_mbs,
+                hidden_size,
+                device='cuda',
+                dtype=modality_dtype,
             )
             image_tokens = torch.full(
                 (global_mbs, image_seq_length), image_token_id, dtype=torch.long, device='cuda'
@@ -232,7 +236,11 @@ def _generate_and_broadcast_global_batches(
             input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         else:
             encoder_hidden_states = torch.empty(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length,
+                global_mbs,
+                hidden_size,
+                device='cuda',
+                dtype=modality_dtype,
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 
@@ -335,6 +343,57 @@ def _slice_global_batch_by_dp(global_batch, dp_pg):
     if dp_size <= 1:
         return global_batch
     return _slice_batch(global_batch, dp_size, dist.get_rank(dp_pg))
+
+
+def _copy_ref_params_to_dist(ref_module, dist_module, ref_tp_group, dist_tp_group):
+    """Copy ref params into dist, handling differing TP shardings.
+
+    When ref and dist params have the same shape (same TP size and layout
+    at offset=0), shards align 1:1 and we copy directly. When shapes differ
+    (different TP sizes), we all-gather ref's shards across ``ref_tp_group``
+    to reconstruct the full weight, then slice by the dist ``partition_dim``
+    for this rank's dist TP shard.
+
+    Must be called **before** constructing the distributed optimizer, which
+    clones current param data into fp32 master weights at __init__.
+    """
+    ref_tp_size = dist.get_world_size(ref_tp_group)
+    dist_tp_rank = dist.get_rank(dist_tp_group)
+    dist_tp_size = dist.get_world_size(dist_tp_group)
+    ref_params = dict(ref_module.named_parameters())
+
+    with torch.no_grad():
+        for name, dist_param in dist_module.named_parameters():
+            assert name in ref_params, f"Param '{name}' in dist but not in ref"
+            ref_param = ref_params[name]
+            partition_dim = getattr(dist_param, 'partition_dim', -1)
+
+            if ref_param.shape == dist_param.shape:
+                # Same shard size (same TP layout or both replicated).
+                dist_param.data.copy_(ref_param.data.to(dist_param.dtype))
+                continue
+
+            assert partition_dim >= 0, (
+                f"Param '{name}': shapes differ "
+                f"(ref={tuple(ref_param.shape)}, dist={tuple(dist_param.shape)}) "
+                f"but partition_dim<0 — cannot reshard a replicated param."
+            )
+
+            # Different TP sizes: gather ref shards, then slice for dist.
+            shards = [torch.empty_like(ref_param.data) for _ in range(ref_tp_size)]
+            dist.all_gather(shards, ref_param.data.contiguous(), group=ref_tp_group)
+            full_weight = torch.cat(shards, dim=partition_dim)
+            dist_slice = torch.tensor_split(full_weight, dist_tp_size, dim=partition_dim)[
+                dist_tp_rank
+            ]
+
+            assert dist_slice.shape == dist_param.shape, (
+                f"Param '{name}': sliced.shape={tuple(dist_slice.shape)} != "
+                f"dist.shape={tuple(dist_param.shape)} "
+                f"(ref_tp={ref_tp_size}, dist_tp={dist_tp_size}, "
+                f"partition_dim={partition_dim})"
+            )
+            dist_param.data.copy_(dist_slice.to(dist_param.dtype))
 
 
 def _global_abs_diff_stats(a, b, pg=None):
