@@ -399,24 +399,15 @@ def _detect_gpu_identity(local_rank):
         return {}
 
 
-def _set_telemetry(args):
-    """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
-    global _GLOBAL_TELEMETRY_HANDLE
-    from nemo.lens import NemoLensConfig, setup_telemetry
-    from megatron.core.telemetry.span_groups import MegatronSpanGroup
+def build_telemetry_resource_attrs(args):
+    """Build the OTel resource-attribute dict from training config.
 
-    config = NemoLensConfig.from_env(
-        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
-        span_group_cls=MegatronSpanGroup,
-    )
-    if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
-        config.service_name = 'megatron-lm'
-    if getattr(args, 'otel_enabled', False):
-        config.enabled = True
-    if getattr(args, 'otel_service_name', None):
-        config.service_name = args.otel_service_name
-    if getattr(args, 'otel_span_groups', None):
-        config.span_groups = args.otel_span_groups
+    Shared by _set_telemetry() (the main process) and
+    megatron.training.async_utils.build_otel_worker_bootstrap() (the persistent
+    checkpoint worker process) so both end up with identical resource attributes
+    by construction, rather than two independently-written implementations that
+    could silently drift apart as args evolve.
+    """
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
     resource_attrs = {}
@@ -447,18 +438,55 @@ def _set_telemetry(args):
         resource_attrs['megatron.precision'] = 'fp32'
 
     resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+    return resource_attrs
+
+
+def _set_telemetry(args):
+    """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
+    global _GLOBAL_TELEMETRY_HANDLE
+    from nemo.lens import NemoLensConfig, setup_telemetry
+    from megatron.core.telemetry.span_groups import MegatronSpanGroup
+
+    config = NemoLensConfig.from_env(
+        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
+        span_group_cls=MegatronSpanGroup,
+    )
+    if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
+        config.service_name = 'megatron-lm'
+    if getattr(args, 'otel_enabled', False):
+        config.enabled = True
+    if getattr(args, 'otel_service_name', None):
+        config.service_name = args.otel_service_name
+    if getattr(args, 'otel_span_groups', None):
+        config.span_groups = args.otel_span_groups
+    resource_attrs = build_telemetry_resource_attrs(args)
 
     # The "console" exporter defaults to stdout, which interleaves spans/metrics
     # with regular training logs. If --otel-json-dir is set, redirect it to a
-    # dedicated per-rank JSONL file instead.
+    # dedicated per-rank file instead. gzip-compressed: the per-span resource
+    # block (~25 attributes) is identical on every span and compresses to almost
+    # nothing, so this shrinks the dominant redundancy for free, on the exporter's
+    # own daemon thread -- never the training thread.
     span_exporter = None
     metric_reader = None
     json_dir = getattr(args, 'otel_json_dir', None)
     if config.enabled and config.exporter == 'console' and json_dir:
         os.makedirs(json_dir, exist_ok=True)
-        json_file = open(  # noqa: SIM115 -- kept open for process lifetime, closed on exit.
-            os.path.join(json_dir, f'lens_rank{args.rank}.jsonl'), 'a', buffering=1
+        import gzip
+        json_file = gzip.open(  # noqa: SIM115 -- kept open for process lifetime.
+            os.path.join(json_dir, f'lens_rank{args.rank}.jsonl.gz'), 'at'
         )
+        # gzip needs an explicit close() to write its trailer (CRC + length);
+        # ConsoleSpanExporter.shutdown() only flushes the out= we pass it, never
+        # closes it. Register the close via atexit -- atexit is LIFO and this
+        # runs before pretrain() registers _end_otel_job_spans (which flushes on
+        # shutdown), so flush-then-close ordering is correct on any clean exit.
+        # A hard SIGKILL runs neither: the file is then recoverable-with-warning
+        # (gunzip yields the flushed data but exits nonzero on the missing
+        # trailer), the same graceful-degradation category as a truncated plain
+        # text file, just noisier.
+        import atexit
+        atexit.register(json_file.close)
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 
         if config.traces_enabled:
