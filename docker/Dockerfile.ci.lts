@@ -22,6 +22,10 @@ ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
 ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
+ENV NCCL_VERSION=2.30.4
+ENV NCCL_WHEEL_ROOT=/opt/nvidia/nccl-cu13
+ENV NCCL_HOME=${NCCL_WHEEL_ROOT}/nvidia/nccl
+ENV LD_LIBRARY_PATH=${NCCL_HOME}/lib:/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 
 RUN bash -ex <<"EOF"
     apt-get update
@@ -40,13 +44,23 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
+# Install the standalone NCCL wheel and expose it to the dynamic linker: create a
+# versionless libnccl.so symlink and register its directory via ldconfig so builds
+# and runtime can link against NCCL without the version-suffixed filename.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    bash -ex <<"EOF"
+    uv pip install --target "${NCCL_WHEEL_ROOT}" --only-binary=:all: "nvidia-nccl-cu13==${NCCL_VERSION}"
+    NCCL_LIB=$(find "${NCCL_HOME}/lib" -maxdepth 1 -name "libnccl.so*" | sort | head -n 1)
+    test -n "${NCCL_LIB}"
+    ln -sfn "$(basename "${NCCL_LIB}")" "${NCCL_HOME}/lib/libnccl.so"
+    echo "${NCCL_HOME}/lib" > /etc/ld.so.conf.d/nvidia-nccl-cu13.conf
+    ldconfig
+EOF
+
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
-# The 25.09 LTS base image does not ship nccl_device.h, which TE 2.17's
-# optional NCCL EP component needs when building for Hopper/Blackwell.
-ENV NVTE_WITH_NCCL_EP=0
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
