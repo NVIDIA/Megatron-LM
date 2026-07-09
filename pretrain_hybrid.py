@@ -446,8 +446,37 @@ if __name__ == "__main__":
     print_rank_0(f'> Megatron-Core version .......... {mcore_version}')
     print_rank_0(f'> Transformer Engine version ... {get_te_version()}')
 
+    # Optional: the sbatch launch script's own timestamps, if it passed them
+    # through env vars (see megatron.startup.launch_script_setup/.container_load
+    # in training.py). Not every entry point is launched this way, so both are
+    # None by default rather than required.
+    def _env_float(name):
+        val = os.environ.get(name, '').strip()
+        try:
+            return float(val) if val else None
+        except ValueError:
+            return None
+
+    _LAUNCH_SCRIPT_START_TIME = _env_float('LENS_LAUNCH_SCRIPT_START_TIME')
+    _LAUNCH_SCRIPT_PRESRUN_TIME = _env_float('LENS_LAUNCH_SCRIPT_PRESRUN_TIME')
+
+    # SLURM_JOB_START_TIME is set by Slurm itself for the whole job (every
+    # process in it, not just the launch script) -- Slurm's own record of when
+    # the job was actually granted its allocation and started, which can be
+    # earlier than LENS_LAUNCH_SCRIPT_START_TIME if there's prolog/scheduling
+    # overhead before the launch script's first line even runs. Unlike the
+    # LENS_LAUNCH_SCRIPT_* vars, this needs no cooperation from the launch
+    # script -- it's just already there.
+    _SLURM_JOB_START_TIME = _env_float('SLURM_JOB_START_TIME')
+
     # Register startup timestamps for timing report in pretrain()
-    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
+    set_startup_timestamps(
+        program_start=_PROGRAM_START_TIME,
+        main_entry=_MAIN_ENTRY_TIME,
+        launch_script_start=_LAUNCH_SCRIPT_START_TIME,
+        launch_script_presrun=_LAUNCH_SCRIPT_PRESRUN_TIME,
+        slurm_job_start_time=_SLURM_JOB_START_TIME,
+    )
 
     # Temporary for transition to core datasets
     setattr(train_valid_test_datasets_provider, "is_distributed", True)
