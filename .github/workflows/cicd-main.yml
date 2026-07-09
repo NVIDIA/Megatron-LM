@@ -1315,6 +1315,26 @@ jobs:
               body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
             });
 
+  slack-notification:
+    needs:
+      - pre-flight
+      - Nemo_CICD_Test
+    if: |
+      failure()
+      && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
+      && needs.pre-flight.outputs.is_ci_workload == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack on failure
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@v1.8.1
+        with:
+          message: >
+            CICD Megatron-LM failed on `${{ github.ref_name }}`
+            (commit `${{ github.sha }}`):
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+
   cleanup-taint-node:
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     needs:
