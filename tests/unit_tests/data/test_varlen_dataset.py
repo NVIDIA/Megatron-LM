@@ -210,11 +210,11 @@ def test_messages_passthrough_preserves_math_v3_template_fields():
         }
     )
     assert sample.chat_template_kwargs == {"tools": tools}
-    assert sample.messages[1]["content"] == ""
-    assert sample.messages[1]["reasoning_content"] == "I should calculate this."
-    assert sample.messages[1]["tool_calls"][0]["function"]["name"] == "stateful_python_code_exec"
-    assert sample.messages[2]["name"] == "stateful_python_code_exec"
-    assert sample.messages[2]["tool_call_id"] == "call-1"
+    assert sample.messages[2]["content"] == ""
+    assert sample.messages[2]["reasoning_content"] == "I should calculate this."
+    assert sample.messages[2]["tool_calls"][0]["function"]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
 
 
 def test_messages_passthrough_rejects_non_list_tools():
