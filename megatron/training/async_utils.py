@@ -55,6 +55,58 @@ def _get_async_calls_queue():
     return _async_calls_queue
 
 
+def build_otel_worker_bootstrap(args):
+    """Build the plain-dict otel config + resource attributes to hand to the
+    persistent checkpoint worker process.
+
+    The worker is spawned via multiprocessing 'spawn' and inherits nothing from
+    this process -- no TracerProvider, no open file -- so it has to bootstrap
+    its own independent telemetry from data passed explicitly through the
+    ctx.Process args (same channel cpu_priority/io_priority already use). Must
+    stay a plain dict of primitives: it crosses a pickling boundary, and a
+    class instance there would tie correctness to an import path staying
+    resolvable in a separate process.
+    """
+    import os
+
+    from megatron.training.global_vars import build_telemetry_resource_attrs
+
+    service_name = getattr(args, 'otel_service_name', None)
+    if not service_name and not os.environ.get('OTEL_SERVICE_NAME', '').strip():
+        service_name = 'megatron-lm'
+
+    # The worker (NVRx-side setup_telemetry) resolves span groups with the BASE
+    # SpanGroup class, not MegatronSpanGroup, so any Megatron-only group name
+    # (e.g. 'trace_region', 'data_loading') would raise "Unknown span group".
+    # Resolve here with MegatronSpanGroup, then intersect with the base group
+    # set so the worker only ever sees base-resolvable names -- it keeps its
+    # 'checkpoint' spans; it just won't get Megatron-only ones (save-side
+    # trace_region detail) until NVRx forwards span_group_cls (needs a rebuild).
+    worker_span_groups = getattr(args, 'otel_span_groups', None)
+    if worker_span_groups:
+        try:
+            from nemo.lens.groups import SpanGroup as _BaseSpanGroup
+            from megatron.core.telemetry.span_groups import MegatronSpanGroup
+
+            resolved = MegatronSpanGroup.resolve(worker_span_groups)
+            base_safe = resolved & _BaseSpanGroup.ALL_GROUPS
+            worker_span_groups = ','.join(sorted(base_safe)) if base_safe else 'default'
+        except Exception:
+            # nemo-lens absent or resolve failed -- fall back to a base preset
+            # rather than risk handing the worker something it can't resolve.
+            worker_span_groups = 'per_step'
+
+    return {
+        'enabled': bool(getattr(args, 'otel_enabled', False)),
+        'service_name': service_name,
+        'span_groups': worker_span_groups,
+        'json_dir': getattr(args, 'otel_json_dir', None),
+        'rank': args.rank,
+        'world_size': args.world_size,
+        'resource_attrs': build_telemetry_resource_attrs(args),
+    }
+
+
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     global _async_calls_queue
     args = get_args()
@@ -88,6 +140,10 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
                 "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
                 "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
             )
+        # Older nvidia-resiliency-ext installs won't have this parameter yet --
+        # degrade to no worker-side telemetry rather than hard-failing checkpointing.
+        if "otel_bootstrap" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
+            warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=args.async_ckpt_cpu_priority,
