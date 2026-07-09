@@ -294,6 +294,185 @@ except ImportError:
     from megatron.core.telemetry._fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
     from megatron.core.telemetry._fallbacks import span_cm
     from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
+
+
+# OTel: module-level state for the job-level spans -- module level rather than
+# closures local to pretrain(), because train()'s own early-exit path (a few
+# thousand lines away, a different function) needs to reach the same
+# end-spans-then-shutdown sequence. Closures defined inside pretrain() aren't
+# callable from there; these are.
+#
+# Hierarchy (when the launch script passes its timestamps through):
+#   slurm.job (outermost -- SLURM_JOB_START_TIME if available (Slurm's own
+#   |          record), else launch_script_start -> job end)
+#   |- slurm.job_prolog (only if SLURM_JOB_START_TIME predates launch_script_start
+#   |     -- prolog/scheduling overhead before the launch script's first line runs)
+#   |- slurm.startup (launch_script_start -> program_start; immediately closed,
+#   |     fully backdated, nothing live happens "inside" it by the time it's built)
+#   |  |- slurm.launch_script_setup
+#   |  `- slurm.container_load
+#   `- megatron.pretrain (program_start -> job end)
+#      |- megatron.startup (program_start -> train() begins)
+#      `- megatron.train (decorated separately, started later)
+#
+# If the launch script didn't pass launch_script_start through (other entry
+# points), slurm.job/slurm.startup are skipped entirely and megatron.pretrain
+# is the outermost span, matching prior behavior.
+_otel_slurm_job_span = None
+_otel_slurm_job_ctx_token = None
+_otel_pretrain_span = None
+_otel_startup_span = None
+_otel_ctx_module = None
+_otel_pretrain_ctx_token = None
+_otel_startup_ctx_token = None
+_otel_shutdown_done = False
+
+
+def _start_otel_job_spans(model_type, program_start):
+    """Start the job-level span tree. See the module comment above for the full
+    hierarchy. In short: slurm.job (outermost, if the launch script passed its
+    timestamps through) contains slurm.startup and megatron.pretrain as siblings;
+    megatron.pretrain contains megatron.startup and megatron.train (the latter
+    decorated separately, started later -- see _end_otel_startup_span(), called
+    right before train() runs) as its own siblings. If launch_script_start isn't
+    available, slurm.job/slurm.startup are skipped and megatron.pretrain is the
+    outermost span instead.
+
+    megatron.pretrain and megatron.startup use the explicit span API (start_span +
+    context.attach), not managed_span, because megatron.pretrain needs to stay
+    open for the rest of pretrain() without restructuring it into one `with`
+    block. slurm.job needs the same treatment for the same reason -- it stays
+    open until the whole job ends, which is later than anything in this function
+    can see. slurm.startup, by contrast, is fully backdated and already
+    completely known by the time this function runs (no tracer existed yet during
+    imports/arg parsing -- telemetry isn't initialized until
+    parse_and_validate_args() finishes, in __main__, before pretrain() is even
+    called), so it's created and closed immediately rather than staying open --
+    see _backdated_otel_span.
+    """
+    global _otel_slurm_job_span, _otel_slurm_job_ctx_token
+    global _otel_pretrain_span, _otel_startup_span, _otel_ctx_module
+    global _otel_pretrain_ctx_token, _otel_startup_ctx_token
+
+    if not _otel_sg_enabled('job'):
+        return
+
+    from opentelemetry import context as _otel_ctx, trace as _otel_trace
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+
+    _otel_ctx_module = _otel_ctx
+    _otel_tracer = get_telemetry().tracer
+
+    launch_script_start = _STARTUP_TIMESTAMPS.get('launch_script_start')
+    launch_script_presrun = _STARTUP_TIMESTAMPS.get('launch_script_presrun')
+    slurm_job_start_time = _STARTUP_TIMESTAMPS.get('slurm_job_start_time')
+    _program_start_ns = int(program_start * 1e9) if program_start is not None else None
+
+    if launch_script_start is not None:
+        # slurm.job's true start: Slurm's own record if available, since it can
+        # predate launch_script_start (prolog/scheduling overhead the launch
+        # script's first line can't see). min() guards against SLURM_JOB_START_TIME
+        # somehow landing after our own first timestamp, which would otherwise
+        # produce a negative-duration slurm.job_prolog span below.
+        job_start = launch_script_start
+        if slurm_job_start_time is not None:
+            job_start = min(slurm_job_start_time, launch_script_start)
+
+        _otel_slurm_job_span = _otel_tracer.start_span('slurm.job', start_time=int(job_start * 1e9))
+        _otel_slurm_job_ctx_token = _otel_ctx.attach(
+            _otel_trace.set_span_in_context(_otel_slurm_job_span)
+        )
+
+        # Gap between Slurm marking the job started and our own launch script's
+        # first line actually running -- prolog scripts, node setup, etc. Only
+        # meaningful (and only created) if that gap is real and positive.
+        if slurm_job_start_time is not None and slurm_job_start_time < launch_script_start:
+            _backdated_otel_span('slurm.job_prolog', slurm_job_start_time, launch_script_start)
+
+        # slurm.startup: sibling of megatron.pretrain under slurm.job, covering
+        # everything before Python itself started running.
+        _slurm_startup_span = _otel_tracer.start_span(
+            'slurm.startup', start_time=int(launch_script_start * 1e9)
+        )
+        _slurm_startup_ctx_token = _otel_ctx.attach(
+            _otel_trace.set_span_in_context(_slurm_startup_span)
+        )
+        _backdated_otel_span('slurm.launch_script_setup', launch_script_start, launch_script_presrun)
+        _backdated_otel_span('slurm.container_load', launch_script_presrun, program_start)
+        _otel_ctx.detach(_slurm_startup_ctx_token)
+        _slurm_startup_span.end(end_time=_program_start_ns)
+
+    _otel_pretrain_span = _otel_tracer.start_span("megatron.pretrain", start_time=_program_start_ns)
+    _otel_set_attrs(_otel_pretrain_span, {'megatron.model_type': str(model_type)})
+    _otel_pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_pretrain_span))
+
+    _otel_startup_span = _otel_tracer.start_span("megatron.startup", start_time=_program_start_ns)
+    _otel_startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_startup_span))
+
+
+def _backdated_otel_span(name, start, end):
+    """Record an already-elapsed phase as a closed span with explicit timestamps."""
+    if not _otel_sg_enabled('job') or start is None or end is None:
+        return
+    _otel_tracer = get_telemetry().tracer
+    _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
+    _s.end(end_time=int(end * 1e9))
+
+
+def _end_otel_startup_span():
+    """End the startup span (sibling to the training-loop span) and detach its token.
+
+    Safe to call more than once -- the None check makes it idempotent, since it
+    may run once explicitly right before train() and again later via
+    _end_otel_job_spans() if that first call never happened (early crash).
+    """
+    global _otel_startup_span
+    if _otel_startup_span is not None:
+        if _otel_ctx_module is not None and _otel_startup_ctx_token is not None:
+            _otel_ctx_module.detach(_otel_startup_ctx_token)
+        _otel_startup_span.end()
+        _otel_startup_span = None
+
+
+def _end_otel_job_spans():
+    """End pretrain (+ startup, if a crash/early-exit skipped the normal end point)
+    and slurm.job (if present), then flush+shutdown telemetry, in that order.
+
+    This is the single place that does all of this, and every exit path --
+    pretrain()'s own normal completion, train()'s early-exit
+    (--exit-interval/duration/signal, which calls sys.exit() directly from inside
+    train(), never returning control to the rest of pretrain()), and the atexit
+    fallback for unhandled exceptions -- must call this same function rather than
+    reimplementing the sequence. Ending the spans before shutdown() matters:
+    shutdown() flushes and tears down the provider, so anything ended afterward
+    has nowhere left to export into. Safe to call more than once (e.g. once from
+    train()'s early exit, again via atexit) -- span-ending is idempotent via the
+    None checks below, and the shutdown() call is separately guarded so it only
+    actually fires once.
+    """
+    global _otel_pretrain_span, _otel_pretrain_ctx_token
+    global _otel_slurm_job_span, _otel_slurm_job_ctx_token, _otel_shutdown_done
+
+    _end_otel_startup_span()
+    if _otel_pretrain_span is not None:
+        if _otel_ctx_module is not None and _otel_pretrain_ctx_token is not None:
+            _otel_ctx_module.detach(_otel_pretrain_ctx_token)
+        _otel_pretrain_span.end()
+        _otel_pretrain_span = None
+
+    if _otel_slurm_job_span is not None:
+        if _otel_ctx_module is not None and _otel_slurm_job_ctx_token is not None:
+            _otel_ctx_module.detach(_otel_slurm_job_ctx_token)
+        _otel_slurm_job_span.end()
+        _otel_slurm_job_span = None
+
+    if not _otel_shutdown_done:
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
+        _otel_shutdown_done = True
+
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -1121,13 +1300,10 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
-    # OTel span setup is deferred until after set_jit_fusion_options() below,
-    # where program_start/main_entry/pretrain_entry and the other startup
-    # timestamps are all available -- see the block right after those are
-    # extracted from _STARTUP_TIMESTAMPS.
-    _pretrain_span = _pretrain_ctx_token = None
-    _startup_span = _startup_ctx_token = None
-    _otel_ctx = None
+    # OTel span setup (_start_otel_job_spans) is deferred until after
+    # set_jit_fusion_options() below, where program_start/main_entry/pretrain_entry
+    # and the other startup timestamps are all available -- see the block right
+    # after those are extracted from _STARTUP_TIMESTAMPS.
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1148,84 +1324,40 @@ def pretrain(
     main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
     pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
 
-    # OTel: start megatron.pretrain (outermost) and megatron.startup (its
-    # first child; megatron.train, decorated separately, is its sibling --
-    # see the explicit _end_startup_span() call right before train() below).
-    # Both use the explicit span API (start_span + context.attach), not
-    # managed_span, because (a) megatron.pretrain needs to stay open for the
-    # rest of this large function without restructuring it into one `with`
-    # block, and (b) both are backdated to this rank's actual program_start --
-    # no tracer exists yet during imports/arg-parsing (telemetry isn't
-    # initialized until parse_and_validate_args() finishes, in __main__,
-    # before pretrain() is even called), so that window can only be
-    # represented by retroactively creating already-closed spans for it once
-    # the tracer exists, from timestamps the entry script and pretrain() have
-    # already been capturing. An atexit handler ensures both are ended even if
-    # pretrain() exits via unhandled exception.
-    if _otel_sg_enabled('job'):
-        from opentelemetry import context as _otel_ctx, trace as _otel_trace
-        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
-        _otel_tracer = get_telemetry().tracer
+    # OTel: start the job-level span tree (slurm.job / slurm.startup / .../
+    # megatron.pretrain / megatron.startup -- see _start_otel_job_spans()'s
+    # docstring and the module comment above it for the full hierarchy and why
+    # these use the explicit span API and backdating instead of managed_span).
+    # megatron.train, decorated separately, is megatron.startup's sibling -- see
+    # _end_otel_startup_span(), called right before train() below.
+    _start_otel_job_spans(model_type, program_start)
 
-        _program_start_ns = int(program_start * 1e9) if program_start is not None else None
-        _pretrain_span = _otel_tracer.start_span("megatron.pretrain", start_time=_program_start_ns)
-        _otel_set_attrs(_pretrain_span, {
-            'megatron.model_type': str(model_type),
-        })
-        _pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_pretrain_span))
+    _backdated_otel_span('megatron.startup.imports', program_start, main_entry)
+    _backdated_otel_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
+    _backdated_otel_span(
+        'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
+    )
+    _backdated_otel_span(
+        'megatron.startup.in_job_setup',
+        timestamp_after_inprocess_setup,
+        timestamp_after_in_job_setup,
+    )
+    _backdated_otel_span(
+        'megatron.startup.initialize_megatron',
+        timestamp_after_in_job_setup,
+        timestamp_after_initialize_megatron,
+    )
+    _backdated_otel_span(
+        'megatron.startup.jit_fusion_options',
+        timestamp_after_initialize_megatron,
+        timestamp_after_set_jit_fusion_options,
+    )
 
-        _startup_span = _otel_tracer.start_span("megatron.startup", start_time=_program_start_ns)
-        _startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_startup_span))
-
-        def _backdated_span(name, start, end):
-            """Record an already-elapsed phase as a closed span with explicit timestamps."""
-            if start is None or end is None:
-                return
-            _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
-            _s.end(end_time=int(end * 1e9))
-
-        _backdated_span('megatron.startup.imports', program_start, main_entry)
-        _backdated_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
-        _backdated_span(
-            'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
-        )
-        _backdated_span(
-            'megatron.startup.in_job_setup',
-            timestamp_after_inprocess_setup,
-            timestamp_after_in_job_setup,
-        )
-        _backdated_span(
-            'megatron.startup.initialize_megatron',
-            timestamp_after_in_job_setup,
-            timestamp_after_initialize_megatron,
-        )
-        _backdated_span(
-            'megatron.startup.jit_fusion_options',
-            timestamp_after_initialize_megatron,
-            timestamp_after_set_jit_fusion_options,
-        )
-
-    def _end_startup_span():
-        """End the startup span (sibling to the training-loop span) and detach its token."""
-        nonlocal _startup_span
-        if _startup_span is not None:
-            if _otel_ctx is not None and _startup_ctx_token is not None:
-                _otel_ctx.detach(_startup_ctx_token)
-            _startup_span.end()
-            _startup_span = None  # Prevent double-end from atexit/_end_pretrain_span.
-
-    def _end_pretrain_span():
-        """End the pretrain span (and startup, if a crash skipped the normal end point above)."""
-        nonlocal _pretrain_span
-        _end_startup_span()
-        if _pretrain_span is not None:
-            if _otel_ctx is not None and _pretrain_ctx_token is not None:
-                _otel_ctx.detach(_pretrain_ctx_token)
-            _pretrain_span.end()
-            _pretrain_span = None  # Prevent double-end from atexit
-
+    # An atexit fallback in case pretrain() exits via unhandled exception --
+    # ensures both spans still get ended and telemetry flushed. Idempotent, so
+    # this doesn't double-flush if _end_otel_job_spans() already ran normally.
     import atexit
-    atexit.register(_end_pretrain_span)
+    atexit.register(_end_otel_job_spans)
 
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
@@ -1517,7 +1649,7 @@ def pretrain(
     # arg parsing, initialize_megatron, model/optimizer setup, checkpoint
     # load, dataset/dataloader build) is megatron.startup; train() below is
     # its sibling, megatron.train (decorated separately).
-    _end_startup_span()
+    _end_otel_startup_span()
 
     if not cfg_container.validation.skip_train or args.perform_rl_step:
         if cfg_container.validation.skip_train:
@@ -1633,10 +1765,7 @@ def pretrain(
     one_logger_utils.finish()
 
     # OTel: end megatron.pretrain span and flush all pending telemetry data.
-    _end_pretrain_span()
-    _otel_handle = get_telemetry()
-    if _otel_handle is not None:
-        _otel_handle.shutdown()
+    _end_otel_job_spans()
 
 
 def update_train_iters(args):
@@ -4368,9 +4497,13 @@ def train(
         one_logger_utils.finish()
         if args.perform_rl_step:
             rl_utils.rl_inference_interface_shutdown()
-        _otel_handle = get_telemetry()
-        if _otel_handle is not None:
-            _otel_handle.shutdown()
+        # This sys.exit() bypasses the rest of pretrain() -- including its normal
+        # _end_otel_job_spans() call -- so megatron.pretrain/megatron.startup would
+        # otherwise only get ended later via the atexit fallback, which runs AFTER
+        # a bare shutdown() here already tore down the provider (nothing left to
+        # export into). _end_otel_job_spans() ends the spans first, then shuts
+        # down, so it must be this call, not a standalone get_telemetry().shutdown().
+        _end_otel_job_spans()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
