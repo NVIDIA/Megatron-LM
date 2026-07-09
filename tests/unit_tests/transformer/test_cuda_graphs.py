@@ -32,10 +32,14 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
+    ArgMetadata,
+    CudagraphBufferMetadata,
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
     create_cudagraphs,
+    _copy_cudagraph_buffer_metadata,
+    mark_cuda_graph_prebound_input,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -63,6 +67,26 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def test_cudagraph_buffer_metadata_copy_preserves_nonleaf_buffer_reference():
+    """Metadata copies must not deepcopy live graph-buffer tensors."""
+    source = torch.ones(1, requires_grad=True)
+    nonleaf_buffer = source * 2
+    metadata = CudagraphBufferMetadata(
+        is_cudagraph_input=True,
+        capture_reuse_count=2,
+        fwd_cudagraph_buffer=nonleaf_buffer,
+        bwd_cudagraph_buffer=nonleaf_buffer,
+    )
+
+    copied = _copy_cudagraph_buffer_metadata(metadata)
+
+    assert copied is not metadata
+    assert copied.fwd_cudagraph_buffer is nonleaf_buffer
+    assert copied.bwd_cudagraph_buffer is nonleaf_buffer
+    copied.capture_reuse_count -= 1
+    assert metadata.capture_reuse_count == 2
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -1795,6 +1819,40 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+    @torch.inference_mode()
+    def test_prebound_input_uses_exact_capture_allocation(self):
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        static_input = mark_cuda_graph_prebound_input(
+            torch.randn(4, config.hidden_size, device="cuda")
+        )
+        module.my_op(static_input, cache_key="prebound")
+
+        runner = manager.cudagraph_runners[0]
+        assert runner.fwd_graph_input_surface[0].data_ptr() == static_input.data_ptr()
+
+        wrong_allocation = mark_cuda_graph_prebound_input(torch.empty_like(static_input))
+        with pytest.raises(AssertionError, match="prebound input requires"):
+            module.my_op(wrong_allocation, cache_key="prebound")
+
+    def test_prebound_input_preserves_requires_grad(self):
+        static_input = mark_cuda_graph_prebound_input(
+            torch.randn(4, 32, device="cuda", requires_grad=True)
+        )
+        metadata = ArgMetadata(static_input)
+
+        assert metadata.prebound_cudagraph_input.requires_grad
+        assert metadata.prebound_cudagraph_input.data_ptr() == static_input.data_ptr()
 
 
 class TestSkipFp8WeightUpdateTensor:

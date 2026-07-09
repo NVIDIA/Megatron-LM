@@ -54,6 +54,10 @@ def checkpointed_forward(
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+    shortcut_enabled = self.config.moe_shortcut_connection and getattr(
+        self, '_supports_moe_shortcut', False
+    )
+    prev_hidden_states = None  # For HybridStack ScMoE across recompute chunks.
 
     def custom(start: int, end: int):
         def custom_forward(
@@ -64,6 +68,7 @@ def checkpointed_forward(
             rotary_pos_emb_local,
             rotary_pos_emb_global,
             padding_mask=None,
+            prev_hidden_states=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -92,6 +97,12 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
+                extra_kwargs = {}
+                if shortcut_enabled and getattr(layer, 'is_moe_layer', False):
+                    extra_kwargs['shortcut_hidden'] = prev_hidden_states
+
+                layer_input = hidden_states if shortcut_enabled else None
+
                 # Build the full TransformerLayer kwarg set; for non-TL
                 # layers (currently MambaLayer in HybridStack) pop the kwargs
                 # they don't accept and treat the return as a single tensor.
@@ -105,6 +116,7 @@ def checkpointed_forward(
                     inference_context=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    **extra_kwargs,
                 )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
@@ -118,20 +130,27 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+                if shortcut_enabled:
+                    prev_hidden_states = layer_input
+            if shortcut_enabled:
+                return hidden_states, context, prev_hidden_states
             return hidden_states, context
 
         return custom_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
-        nonlocal hidden_states, context
+        nonlocal hidden_states, context, prev_hidden_states
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        if shortcut_enabled:
+            args += (prev_hidden_states,)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
             if self.config.fp8 or self.config.fp4:
-                hidden_states, context = te_checkpoint(
+                outputs = te_checkpoint(
                     cf,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
@@ -139,13 +158,18 @@ def checkpointed_forward(
                     *args,
                 )
             else:
-                hidden_states, context = tensor_parallel.checkpoint(
+                outputs = tensor_parallel.checkpoint(
                     cf, self.config.distribute_saved_activations, *args
                 )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
             # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+            outputs = cf(*args)
+
+        if shortcut_enabled:
+            hidden_states, context, prev_hidden_states = outputs
+        else:
+            hidden_states, context = outputs
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:

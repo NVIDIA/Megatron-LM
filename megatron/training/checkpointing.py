@@ -2107,6 +2107,16 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
 
+    # ScMoE shortcut-connection args.
+    _set_arg('moe_shortcut_connection', force=True)
+    _set_arg('moe_shortcut_parallel', force=True)
+    _set_arg('moe_shortcut_scalar_gate', force=True)
+    _set_arg('moe_shortcut_vector_gate', force=True)
+    _set_arg('moe_shortcut_output_norm', force=True)
+    _set_arg('moe_shortcut_tied_norm', force=True)
+    _set_arg('moe_shortcut_untied_norm', force=True)
+    _set_arg('moe_shortcut_post_norm', force=True)
+
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)

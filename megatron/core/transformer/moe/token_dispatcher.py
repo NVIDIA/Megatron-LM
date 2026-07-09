@@ -97,7 +97,11 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def dispatch_preprocess(
-        self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        self,
+        tokens: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Prepares tokens for dispatch without inter-device communication.
 
@@ -208,7 +212,9 @@ class MoETokenDispatcher:
             hidden_states (torch.Tensor): Combined hidden states from token combination
 
         Returns:
-            The final output tensor.
+            A tuple (output, deferred_shared_expert_output). The second element is non-None
+            only when the dispatcher computed a shared-expert output (via overlap) but the
+            MoE layer wants to combine it itself (e.g., moe_shortcut_vector_gate).
         """
         raise NotImplementedError("combine_postprocess function not implemented.")
 
@@ -268,7 +274,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Reshapes hidden states and caches the routing map."""
         self.hidden_shape = hidden_states.shape
@@ -368,7 +378,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     def combine_postprocess(self, hidden_states):
         """Restores the original tensor shape."""
-        return hidden_states.view(self.hidden_shape)
+        return hidden_states.view(self.hidden_shape), None
 
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
@@ -621,7 +631,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return num_tokens_per_local_expert
 
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Prepares hidden states and probabilities for dispatch.
 
@@ -632,6 +646,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input token embeddings.
             routing_map (torch.Tensor): The mapping of tokens to experts.
             probs (torch.Tensor): Routing probabilities.
+            shared_expert_input (torch.Tensor, optional): When ScMoE is active, provides
+                the current layer's hidden states for the shared expert overlap path
+                (since hidden_states may be the shortcut input for routing).
 
         Returns:
             A tuple of permuted hidden states and probabilities.
@@ -654,7 +671,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
-            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+            se_input = shared_expert_input if shared_expert_input is not None else hidden_states
+            self.shared_experts.pre_forward_comm(se_input.view(self.hidden_shape))
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -900,11 +918,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output
+        # Add shared experts output. Defer the add to MoELayer.postprocess when it needs the
+        # shared-expert output separately: moe_shortcut_vector_gate (learned interpolation), or
+        # moe_shortcut_tied_norm / moe_shortcut_untied_norm (normalize the shared path before the
+        # sum). Otherwise add it here.
+        deferred_shared_expert_output = None
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
-            output += shared_expert_output
-        return output
+            if (
+                self.config.moe_shortcut_vector_gate
+                or self.config.moe_shortcut_tied_norm
+                or self.config.moe_shortcut_untied_norm
+            ):
+                deferred_shared_expert_output = shared_expert_output
+            else:
+                output += shared_expert_output
+        return output, deferred_shared_expert_output
 
     def _maybe_update_cuda_sync_point(self, point: str):
         """
@@ -1171,11 +1200,15 @@ class _HybridEPManager(_DispatchManager):
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
 
         if self.num_permuted_tokens is None:
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-            # num_permuted_tokens is necessary to allocate the output tensor for combine.
-            self.num_permuted_tokens = self.tokens_per_expert.sum()
+            # capacity_factor=None: tokens_per_expert is the CPU-pinned padded tensor from
+            # dispatch_with_permute (the non_blocking=False sync already occurred).
+            self.num_permuted_tokens = int(tokens_per_expert.sum())
+            # DeepEP exposes its padded int64 GPU counts in the dense-layout handle. The
+            # CPU-pinned result above is used only to resolve the dynamic output size.
+            self.tokens_per_expert = self.handle[10]
         if self.moe_expert_rank_capacity_factor is not None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+
         return dispatched_hidden
 
     def combine(
@@ -1218,7 +1251,6 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
-
 
 class _DeepepManager(_DispatchManager):
     """
@@ -1913,7 +1945,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     @jit_fuser
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
@@ -1955,7 +1991,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched
-            probs (torch.Tensor): Routing probabilities (unused in current implementation)
+            probs (torch.Tensor): Routing probabilities to dispatch.
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
 
@@ -1964,6 +2000,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        # The dispatcher normally retains this tensor from dispatch_preprocess. An asynchronous
+        # dispatch bridge may provide an autograd-private alias instead; make the explicit argument
+        # authoritative so its backward remains inside that private graph.
+        if probs is not None:
+            self._comm_manager.token_probs = probs
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )
@@ -1986,6 +2027,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of permuted tokens, token counts per expert, and permuted probabilities.
         """
+        # Rebind state to the explicit dispatch output. This is normally the same tensor, but an
+        # asynchronous autograd bridge wraps it; using stale manager state would leak the bridge's
+        # private tensor into expert compute and bypass its backward.
+        if probs is not None:
+            self._comm_manager.dispatched_probs = probs
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
@@ -2042,7 +2088,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
             hidden_states += self.shared_experts.get_output()
-        return hidden_states.view(self.hidden_shape)
+        return hidden_states.view(self.hidden_shape), None
 
     def check_over_budget(self):
         """Check if the dispatcher has exceeded its budget."""

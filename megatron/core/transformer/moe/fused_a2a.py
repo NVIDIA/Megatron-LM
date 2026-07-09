@@ -411,9 +411,6 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
-        # If we provide the num_permuted_tokens, we do not need to use sync to
-        # wait for the data in pinned memory ready
-        non_blocking = num_permuted_tokens is not None
         # Process the dispatch
         (
             dispatched_hidden,
@@ -429,7 +426,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
-            non_blocking=non_blocking,
+            non_blocking=(num_permuted_tokens is not None),
             **({"fuse_permute_dispatch": fused} if fused else {}),
         )
 
@@ -458,19 +455,19 @@ class HybridEPDispatch(torch.autograd.Function):
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
         return (
-            combined_hidden,
-            None,
-            combined_probs,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            combined_hidden,  # x
+            None,             # routing_map
+            combined_probs,   # probs
+            None,             # group
+            None,             # num_local_experts
+            None,             # num_sms_dispatch_api
+            None,             # num_sms_combine_api
+            None,             # num_blocks_permute
+            None,             # num_blocks_unpermute
+            None,             # fused
+            None,             # num_permuted_tokens
+            None,             # pad_multiple
+            None,             # num_sms_preprocessing_api
         )
 
 

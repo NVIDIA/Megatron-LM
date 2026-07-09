@@ -37,7 +37,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
-from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -311,6 +311,9 @@ class Attention(MegatronModule, ABC):
         """
         super().__init__(config=config)
 
+        # Subclasses with a specialized forward (for example MLA) retain that atomic path.
+        # Standard SelfAttention inherits Attention.forward and can use the split phase API.
+        self._supports_split_input_output = type(self).forward is Attention.forward
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
@@ -1276,7 +1279,7 @@ class Attention(MegatronModule, ABC):
 
         return output_total
 
-    def forward(
+    def input_proj_attn(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
@@ -1291,9 +1294,9 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor | None]:
+    ) -> Tensor:
         """
-        Perform a forward pass through the attention module.
+        Run the QKV input projection and core attention, stopping before linear_proj.
 
         Args:
             hidden_states (Tensor): Hidden states.
@@ -1313,7 +1316,7 @@ class Attention(MegatronModule, ABC):
                 inference CUDA graphs.
 
         Return:
-            (Tuple[Tensor, Tensor]) Attention output and bias.
+            Tensor consumed by the attention output projection.
 
         """
         # Check if we need to skip RoPE
@@ -1441,8 +1444,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = apply_module(self.linear_proj)(context_layer)
-            return output, bias
+            return context_layer
 
         if (
             in_decode_mode
@@ -1609,9 +1611,10 @@ class Attention(MegatronModule, ABC):
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
-        # =================
-        # Output. [sq, b, h]
-        # =================
+        return core_attn_out
+
+    def output_proj(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Apply the attention output projection to a core-attention result."""
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
@@ -1620,6 +1623,11 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
+
+    @copy_signature(input_proj_attn)
+    def forward(self, *args, **kwargs):
+        """Run core attention followed by the output projection."""
+        return self.output_proj(self.input_proj_attn(*args, **kwargs))
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):

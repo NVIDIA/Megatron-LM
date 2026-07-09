@@ -104,31 +104,36 @@ class MambaLayer(GraphableMegatronModule):
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        if (
+        should_graph = (
             not self.config.cuda_graph_modules
             and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
-        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules:
-            self.cudagraph_manager = CudaGraphManager(config)
+        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules
+        if should_graph:
+            if self.config.moe_shortcut_connection:
+                # Serialized shortcut execution is intentionally eager. HybridStack creates the
+                # composite graph only for the supported overlapped schedule.
+                if self.config.moe_shortcut_parallel:
+                    self._shortcut_graph_output_proj = True
+            else:
+                self.cudagraph_manager = CudaGraphManager(config)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
 
-    def forward(
+    def input_proj_ssm(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        sequence_len_offset: Optional[int] = None,  # Not used in MambaLayer
+        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        """
-        Perform a forward pass through the Mamba layer.
-
-        This method implements the core computation of a Mamba layer, including
-        the convolution and the selective SSM/SSD.
+        """Run normalization, input projection, and the selective SSM/SSD.
 
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
@@ -139,7 +144,7 @@ class MambaLayer(GraphableMegatronModule):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, h].
+            Tuple containing the pre-output-projection SSM result and residual.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -151,9 +156,14 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
+        ssm_output = self.mixer.input_proj_ssm(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
+        return ssm_output, residual
+
+    def output_proj(self, ssm_output: Tensor, residual: Tensor):
+        """Apply Mamba's output projection and the original residual/BDA operation."""
+        mixer_out_with_bias = self.mixer.output_proj(ssm_output)
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(
@@ -161,6 +171,31 @@ class MambaLayer(GraphableMegatronModule):
             )(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        sequence_len_offset: Optional[int] = None,
+        padding_mask: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Run the two Mamba phases with behavior identical to the original forward."""
+        ssm_output, residual = self.input_proj_ssm(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+        )
+        return self.output_proj(ssm_output, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

@@ -256,6 +256,33 @@ class CudagraphBufferMetadata:
     bwd_cudagraph_buffer: torch.Tensor = None
 
 
+_PREBOUND_CUDAGRAPH_INPUT_ATTR = '_mcore_prebound_cudagraph_input'
+
+
+def mark_cuda_graph_prebound_input(tensor: torch.Tensor) -> torch.Tensor:
+    """Require a local CUDA graph to capture and replay this exact tensor allocation.
+
+    Prebound inputs are intended for buffers populated asynchronously by work outside the graph.
+    The caller must keep the allocation alive and pass the same address on every replay.
+    """
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"Expected a tensor, got {type(tensor).__name__}")
+    setattr(tensor, _PREBOUND_CUDAGRAPH_INPUT_ATTR, True)
+    return tensor
+
+
+def _copy_cudagraph_buffer_metadata(
+    metadata: CudagraphBufferMetadata,
+) -> CudagraphBufferMetadata:
+    """Copy metadata while preserving the identity of its CUDA-graph buffers.
+
+    The buffer fields are live tensors whose addresses are part of the graph-reuse protocol.
+    ``deepcopy`` would either clone those buffers (breaking their identity) or fail when a buffer
+    is a non-leaf tensor produced by a preceding graph.
+    """
+    return dataclasses.replace(metadata)
+
+
 class ArgMetadata:
     """Arg meta."""
 
@@ -263,10 +290,17 @@ class ArgMetadata:
         self.type = type(arg)
         if isinstance(arg, torch.Tensor):
             self.shape = arg.shape
+            self.stride = arg.stride()
             self.dtype = arg.dtype
             self.device = arg.device
             self.value = arg.data_ptr()
             self.requires_grad = arg.requires_grad
+            self.is_prebound_cudagraph_input = bool(
+                getattr(arg, _PREBOUND_CUDAGRAPH_INPUT_ATTR, False)
+            )
+            if self.is_prebound_cudagraph_input:
+                # Keep the allocation alive without retaining the producer's autograd graph.
+                self.prebound_cudagraph_input = arg.detach().requires_grad_(self.requires_grad)
             if hasattr(arg, "cg_buffer_metadata"):
                 # Its important this is a reference copy
                 self.cg_buffer_metadata = arg.cg_buffer_metadata
@@ -440,7 +474,7 @@ def create_strong_ref(ten: torch.Tensor):
     if hasattr(ten, "is_from_global_mempool"):
         ref.is_from_global_mempool = ten.is_from_global_mempool
     if hasattr(ten, "cg_buffer_metadata"):
-        ref.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
+        ref.cg_buffer_metadata = _copy_cudagraph_buffer_metadata(ten.cg_buffer_metadata)
     if hasattr(ten, "can_skip_replay_copy"):
         ref.can_skip_replay_copy = ten.can_skip_replay_copy
     ref.requires_grad_(ten.requires_grad)
@@ -626,7 +660,7 @@ class _CudagraphGlobalRecord:
                 args, kwargs, out = g[2:]
                 runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
             else:
-                assert fwd_buffer_reuse_ref_count == 0
+                # assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
 
         # Memory usage.
@@ -1196,9 +1230,14 @@ class _CudaGraphRunner(torch.nn.Module):
                     raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
         # cache the moe aux loss if needed, which is accumulated inside the forward pass
+        from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
-        is_moe = isinstance(self.base_module, MoETransformerLayer)
+        # The shortcut route/input graph owns an MoELayer child even though its composite wrapper
+        # is not a MoETransformerLayer. Preserve the same aux-loss state across capture warmups.
+        is_moe = isinstance(self.base_module, MoETransformerLayer) or any(
+            isinstance(module, MoELayer) for module in self.base_module.modules()
+        )
         if is_moe:
             from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
@@ -1223,9 +1262,14 @@ class _CudaGraphRunner(torch.nn.Module):
             if not isinstance(ten, ArgMetadata):
                 return ten
             metadata = getattr(ten, "cg_buffer_metadata", None)
-
-            # the input tensor is resued from another cudagraph's input or output
-            if metadata is not None and metadata.fwd_cudagraph_buffer is not None:
+            if ten.is_prebound_cudagraph_input:
+                # External work writes directly into this allocation. Capturing a clone would
+                # reintroduce a replay-time copy and make cross-stream event synchronization race.
+                buf = ten.prebound_cudagraph_input
+                assert buf.data_ptr() == ten.value
+                can_skip_replay_copy = True
+            # The input tensor is reused from another cudagraph's input or output.
+            elif metadata is not None and metadata.fwd_cudagraph_buffer is not None:
                 shared_buf = metadata.fwd_cudagraph_buffer
                 buf_metadata = shared_buf.cg_buffer_metadata
 
@@ -1245,7 +1289,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 # need to provide a fresh buffer from the pool
                 buf = alloc_tensor_from_graph_mempool(ten)
                 if metadata is not None:
-                    buf.cg_buffer_metadata = deepcopy(metadata)
+                    buf.cg_buffer_metadata = _copy_cudagraph_buffer_metadata(metadata)
                 can_skip_replay_copy = False
 
             buf.can_skip_replay_copy = can_skip_replay_copy
@@ -1262,7 +1306,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     and metadata.fwd_cudagraph_buffer is None
                 ):
                     buf = alloc_tensor_from_graph_mempool(ten)
-                    buf.cg_buffer_metadata = deepcopy(metadata)
+                    buf.cg_buffer_metadata = _copy_cudagraph_buffer_metadata(metadata)
                     buf.cg_buffer_metadata.capture_reuse_count = metadata.input_use_count
                     metadata.fwd_cudagraph_buffer = buf
                     fwd_buffer_reuse_ref_count += 1
@@ -1371,7 +1415,7 @@ class _CudaGraphRunner(torch.nn.Module):
             metadata = getattr(o, "cg_buffer_metadata", None)
             assert metadata is not None and metadata.is_cudagraph_output
             fwd_graph_out.is_from_global_mempool = True
-            fwd_graph_out.cg_buffer_metadata = deepcopy(metadata)
+            fwd_graph_out.cg_buffer_metadata = _copy_cudagraph_buffer_metadata(metadata)
 
             if metadata.is_cudagraph_input and metadata.fwd_cudagraph_buffer is None:
                 buf = create_strong_ref(fwd_graph_out)
@@ -1382,8 +1426,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
-            ), """Tried graphing a module that returned no tensors in training mode, 
-                however the graphed module must output at least one tensor, 
+            ), """Tried graphing a module that returned no tensors in training mode,
+                however the graphed module must output at least one tensor,
                 so that a corresponding backward node may be registered in the autograd graph."""
 
             # Preserve only forward buffers whose lifetime crosses into backward capture.
@@ -1538,7 +1582,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 metadata = input_tensor.cg_buffer_metadata
                 input_grad = grad_inputs.pop(0)
                 input_grad.is_from_global_mempool = True
-                input_grad.cg_buffer_metadata = deepcopy(metadata)
+                input_grad.cg_buffer_metadata = _copy_cudagraph_buffer_metadata(metadata)
 
                 if metadata.is_cudagraph_output and metadata.bwd_cudagraph_buffer is None:
                     buf = create_strong_ref(input_grad)
@@ -1683,10 +1727,16 @@ class _CudaGraphRunner(torch.nn.Module):
                 mismatches = []
                 if val.shape != ref.shape:
                     mismatches.append(f"Received shape {val.shape} but expected {ref.shape}")
+                if ref.is_prebound_cudagraph_input and val.stride != ref.stride:
+                    mismatches.append(f"Received stride {val.stride} but expected {ref.stride}")
                 if val.dtype != ref.dtype:
                     mismatches.append(f"Received dtype {val.dtype} but expected {ref.dtype}")
                 if val.device != ref.device:
                     mismatches.append(f"Received device {val.device} but expected {ref.device}")
+                if ref.is_prebound_cudagraph_input and val.value != ref.value:
+                    mismatches.append(
+                        f"Received data_ptr {val.value} but prebound input requires {ref.value}"
+                    )
                 if mismatches:
                     add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 

@@ -702,7 +702,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router. 
+    Without this, the shared experts execute before the router.
     Only effective when moe-shared-expert-intermediate-size is set.
     """
 
@@ -717,6 +717,57 @@ class TransformerConfig(ModelParallelConfig):
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
     """
+    moe_shortcut_connection: bool = False
+    """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
+    process the preceding layer's output (via a shortcut connection) instead of the current layer's
+    post-attention representation. The shared expert still processes the current layer's representation.
+    This decouples routing from current-layer computation. Supported only by HybridStack and requires
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap.
+    Without moe_shortcut_parallel, dispatch and combine communication are serialized with the
+    paired compute and the shortcut pair executes eagerly. CUDA graphs are supported only for the
+    overlapped shortcut schedule. For the first MoE layer (no preceding layer), falls back to
+    standard routing."""
+
+    moe_shortcut_parallel: bool = False
+    """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
+    Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
+    compute remain on the main stream. Requires moe_shortcut_connection = True and
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
+    full activation recomputation."""
+
+    moe_shortcut_scalar_gate: bool = False
+    """Enable a learned scalar gate for combining routed and shared expert outputs in ScMoE.
+    Applies sigmoid(alpha) * routed_output before adding shared expert output, where alpha
+    is a single learnable parameter initialized to 0 (sigmoid=0.5). Requires
+    moe_shortcut_connection = True. Mutually exclusive with moe_shortcut_vector_gate."""
+
+    moe_shortcut_vector_gate: bool = False
+    """Enable a learned vector gate for interpolating routed and shared expert outputs in ScMoE.
+    Computes sigmoid(v) * routed_output + (1 - sigmoid(v)) * shared_output, where v is a
+    learnable vector of shape [hidden_size] initialized to 0. Requires
+    moe_shortcut_connection = True. Mutually exclusive with moe_shortcut_scalar_gate."""
+
+    moe_shortcut_output_norm: bool = False
+    """Apply RMSNorm to the routed expert output before combining with the shared expert output.
+    Normalizes the routed output to stabilize the representation space mismatch between the
+    shortcut-routed and current-layer shared expert paths. Requires
+    moe_shortcut_connection = True."""
+
+    moe_shortcut_tied_norm: bool = False
+    """Normalize both parallel paths then sum, using a single weight-tied RMSNorm:
+    LN(routed) + LN(shared), where the SAME RMSNorm module (one set of weights) is applied to both
+    paths. Mutually exclusive with moe_shortcut_untied_norm and moe_shortcut_output_norm.
+    Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_untied_norm: bool = False
+    """Normalize both parallel paths then sum, using two independent (untied) RMSNorms:
+    LN_routed(routed) + LN_shared(shared), where each path has its OWN RMSNorm weights. Mutually
+    exclusive with moe_shortcut_tied_norm and moe_shortcut_output_norm.
+    Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_post_norm: bool = False
+    """Apply RMSNorm after combining routed, shared, and zero expert outputs. Normalizes the
+    final MoE layer output. Requires moe_shortcut_connection = True."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -1691,6 +1742,62 @@ class TransformerConfig(ModelParallelConfig):
                         "single moe_flex_dispatcher_num_sms instead."
                     )
                 self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
+        if self.moe_shortcut_connection:
+            assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
+                "moe_shortcut_connection requires MoE to be enabled (num_moe_experts > 0)"
+            )
+            if self.moe_shared_expert_overlap:
+                raise ValueError(
+                    "moe_shortcut_connection is mutually exclusive with "
+                    "moe_shared_expert_overlap. ScMoE computes shared experts inline."
+                )
+
+        if self.moe_shortcut_parallel:
+            assert self.moe_shortcut_connection, (
+                "moe_shortcut_parallel requires moe_shortcut_connection = True"
+            )
+            assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
+                "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
+            )
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_shortcut_parallel is not supported with full activation recomputation; "
+                    "full recomputation executes layers sequentially and cannot preserve the "
+                    "shortcut communication-overlap schedule"
+                )
+
+        for flag_name in [
+            'moe_shortcut_scalar_gate',
+            'moe_shortcut_vector_gate',
+            'moe_shortcut_output_norm',
+            'moe_shortcut_tied_norm',
+            'moe_shortcut_untied_norm',
+            'moe_shortcut_post_norm',
+        ]:
+            if getattr(self, flag_name):
+                assert self.moe_shortcut_connection, (
+                    f"{flag_name} requires moe_shortcut_connection = True"
+                )
+
+        if self.moe_shortcut_scalar_gate and self.moe_shortcut_vector_gate:
+            raise ValueError(
+                "moe_shortcut_scalar_gate and moe_shortcut_vector_gate are mutually exclusive. "
+                "Use only one gating strategy."
+            )
+
+        if self.moe_shortcut_tied_norm and self.moe_shortcut_untied_norm:
+            raise ValueError(
+                "moe_shortcut_tied_norm (one weight-tied norm for both paths) and "
+                "moe_shortcut_untied_norm (separate norm per path) are mutually exclusive."
+            )
+
+        if (self.moe_shortcut_tied_norm or self.moe_shortcut_untied_norm) and (
+            self.moe_shortcut_output_norm
+        ):
+            raise ValueError(
+                "moe_shortcut_tied_norm / moe_shortcut_untied_norm already normalize the routed "
+                "path and are mutually exclusive with moe_shortcut_output_norm."
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

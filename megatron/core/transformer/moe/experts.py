@@ -655,22 +655,22 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        if skip_routed_expert_padding(self.config):
-            pass
-        elif self.config.fp8 or self.config.fp4:
-            tokens_per_expert = tokens_per_expert.tolist()
-            unpadded_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
-            )
-            permuted_probs = permuted_probs.squeeze(-1)
-            tokens_per_expert = torch.tensor(
-                tokens_per_expert, dtype=torch.int, device=permuted_probs.device
-            )
-        # if the number of tokens is 0, pad the hidden states to 256
+        if tokens_per_expert.is_cuda:
+            assert skip_routed_expert_padding(self.config)
+        elif not skip_routed_expert_padding(self.config):
+            if self.config.fp8 or self.config.fp4:
+                # CPU path: standard list-based padding.
+                tokens_per_expert = tokens_per_expert.tolist()
+                unpadded_tokens_per_expert = tokens_per_expert
+                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
+                )
+                permuted_probs = permuted_probs.squeeze(-1)
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert, dtype=torch.int, device=permuted_probs.device)
 
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)

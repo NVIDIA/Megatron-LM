@@ -672,4 +672,4 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._shared_expert_output
             self._shared_expert_output = None
-        return output
+        return output, None
