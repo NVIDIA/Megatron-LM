@@ -18,6 +18,26 @@ from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
+
+def _tag_current_span_call_idx(call_idx):
+    """Stamp the async request's call_idx onto whatever OTel span is currently
+    active -- the shared join key that ties an async checkpoint's three
+    separate-in-time spans together (dispatch's megatron.save_checkpoint subtree,
+    the worker's nvrx.checkpoint.* with nvrx.call_idx, and finalize's
+    megatron.finalize_async_save), since they can't share a parent span. No-op
+    when telemetry is off (get_current_span returns a non-recording span) or
+    nemo-lens is absent. call_idx may be an int (dispatch) or a list (finalize
+    may complete more than one call)."""
+    if call_idx is None or call_idx == []:
+        return
+    try:
+        from opentelemetry import trace as _ot
+        from nemo.lens.helpers import safe_set_span_attributes as _set
+
+        _set(_ot.get_current_span(), {'nvrx.call_idx': call_idx})
+    except Exception:  # noqa: BLE001 -- telemetry must never break checkpointing
+        pass
+
 if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
 else:
@@ -168,7 +188,8 @@ def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
     Args:
         async_request (AsyncRequest | NVRxAsyncRequest): the async save request.
     """
-    _get_async_calls_queue().schedule_async_request(async_request)
+    call_idx = _get_async_calls_queue().schedule_async_request(async_request)
+    _tag_current_span_call_idx(call_idx)
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate=False):
@@ -190,7 +211,11 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
 
     async_calls_queue = _async_calls_queue
     if async_calls_queue is not None:
-        async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
+        finalized = async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
+        # Tag the active finalize span (megatron.finalize_async_save) with the
+        # call_idx(es) that actually completed this call, so it groups with the
+        # matching dispatch + worker spans.
+        _tag_current_span_call_idx(finalized)
 
     # Clean up finished deletion processes to prevent zombies
     # Import here to avoid circular dependency
