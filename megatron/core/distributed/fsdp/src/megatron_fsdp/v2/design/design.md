@@ -307,28 +307,48 @@ def reduce_grad(self, async_op: bool = False):
                     #   → DataParallelBuffer.reshard() (frees unsharded grad bucket)
             if module is self: break
 
-    # --- Step 2: Copy .grad → main_grad_buffer (on main stream, fast memcpy) ---
+    # --- Step 2: Stage .grad → main_grad_buffer ---
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
+        zero_targets = []
+        copy_srcs = []
+        copy_dsts = []
         for name, param in zip(param_names, param_group.params):
             main_grad = param.get_main_grad()
             if param.grad is None:
                 if not getattr(param, 'grad_added_to_main_grad', False):
-                    main_grad.zero_()       # no TE fusion: zero the slot
+                    zero_targets.append(main_grad.view(-1))
             else:
-                main_grad.copy_(param.grad.detach())   # normal backward: copy .grad
+                copy_srcs.append(param.grad.detach().view(-1))
+                copy_dsts.append(main_grad.view(-1))
                 del param.grad
+
+        stage_on_rs_stream = async_op and getattr(
+            self._fsdp_state, "enable_full_iteration_cuda_graph", False
+        )
+        if stage_on_rs_stream:
+            stream.wait_stream(torch.cuda.current_stream())
+            for source in copy_srcs:
+                source.record_stream(stream)
+            with torch.cuda.stream(stream):
+                if zero_targets:
+                    torch._foreach_zero_(zero_targets)
+                if copy_dsts:
+                    torch._foreach_copy_(copy_dsts, copy_srcs)
+        else:
+            if zero_targets:
+                torch._foreach_zero_(zero_targets)
+            if copy_dsts:
+                torch._foreach_copy_(copy_dsts, copy_srcs)
 
         # --- Step 3: Reduce-scatter on rs_stream ---
         if async_op:
-            stream.wait_stream(torch.cuda.current_stream())    # ensure .grad copy is visible to rs_stream
-            with torch.cuda.stream(stream):
-                param_group.reduce_grad()
-                #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
-                #       fetch_unsharded_buffer() allocates full grad buffer
-                #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
-                #       self.data[local_idx:...] += grad_shard
+            param_group.reduce_grad(stream=stream)
+            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
+            #       fetch_unsharded_buffer() allocates full grad buffer
+            #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
+            #       self.data[local_idx:...] += grad_shard
             event = stream.record_event()
             ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
@@ -347,9 +367,17 @@ def reduce_grad(self, async_op: bool = False):
 ```
 
 **Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
-The operation is inherently synchronous *within whatever stream is current* when called. The
-"async" behavior is achieved entirely by the caller dispatching into `rs_stream` via
-`with torch.cuda.stream(stream)`. This avoids any API changes to `DataParallelBuffer`.
+The operation is inherently synchronous *within its selected stream*. The caller passes
+`rs_stream` through `ParameterGroup.reduce_grad(stream=...)`, and the buffer implementation
+uses that stream for the collective. This avoids exposing asynchronous work handles through
+the buffer API.
+
+For full-iteration CUDA graphs, the batched zero/copy staging is also dispatched to
+`rs_stream` immediately before reduce-scatter. `rs_stream.wait_stream(current_stream())`
+orders the staging after backward, while `record_stream(rs_stream)` keeps detached `.grad`
+sources alive after their Python references are deleted. This removes staging kernels from
+the captured caller stream and lets them overlap with the next module's backward compute.
+Eager, per-module CUDA graph, and synchronous-reduction paths retain caller-stream staging.
 
 **`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
@@ -637,13 +665,13 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
 
 BACKWARD PASS (enable_async_reduce_grad=True)
 ---------------------------------------------------------
-main stream:  |bwd L[2]|copy grad[2]|bwd L[1]|copy grad[1]|bwd L[0]|copy grad[0]|
+main stream:  |bwd L[2]-----------|bwd L[1]-----------|bwd L[0]-----------|
 ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
-rs_stream:    |                RS(L[2]) ------|     RS(L[1]) ------|   RS(L[0])---|
+rs_stream:    |stage+RS(L[2]) ------|stage+RS(L[1]) ------|stage+RS(L[0])---------|
 
-post-bwd L[2]: reshard, copy grad[2]→main_grad, rs_stream.wait(main), RS(L[2]), event[2]
-post-bwd L[1]: drain event[2-2]? (i=1, no drain), copy grad[1], RS(L[1]), event[1]
-post-bwd L[0]: drain event[L[2]] (i=2, drain backward_order[0]=L[2]), RS(L[0]), event[0]
+post-bwd L[2]: reshard, rs_stream.wait(main), stage grad[2], RS(L[2]), event[2]
+post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], RS(L[1]), event[1]
+post-bwd L[0]: drain event[L[2]] (i=2, drain backward_order[0]=L[2]), stage grad[0], RS(L[0]), event[0]
 
 final_callback:
   drain event[L[1]], event[L[0]]
