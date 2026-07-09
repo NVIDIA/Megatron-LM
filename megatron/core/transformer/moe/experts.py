@@ -63,10 +63,7 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     try:
-        from transformer_engine.pytorch.ops._common import (
-            GRAD_INPUT_BUFFER_KEY,
-            OUTPUT_BUFFER_KEY,
-        )
+        from transformer_engine.pytorch.ops._common import GRAD_INPUT_BUFFER_KEY, OUTPUT_BUFFER_KEY
     except ImportError:
         GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 else:
@@ -628,7 +625,7 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy: the fused-MLP input aliases the persistent symm buffer (reused as the
+            # NCCL-EP zero-copy: the fused-MLP input aliases the persistent symm buffer (also the
             # fc2 output combine reads), whose storage is non-resizable — don't force-release it.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
@@ -638,7 +635,7 @@ class TEGroupedMLP(MegatronModule):
             with stash_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
-                # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0 = fc1, -1 = fc2.
+                # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.
                 op_kwargs = {}
                 if output_buffer is not None:
                     op_kwargs[-1] = {OUTPUT_BUFFER_KEY: output_buffer}

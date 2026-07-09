@@ -20,10 +20,10 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
-    alloc_ep_symm_buffer,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     nccl_ep_combine,
@@ -1429,9 +1429,9 @@ class _NCCLEPManager(_DispatchManager):
     # (class-level so every per-layer manager shares one set). _zc_fwd_token_buf is the forward symm
     # buffer combine reads (the fc2 output); _zc_bwd_token_buf holds the backward grad.
     #  - fp8/fp4 (mxfp8 CuTe DSL grouped GEMM, Blackwell+): recv_tokens dies after FC1 quantizes it,
-    #    so _zc_fwd_token_buf double-duties as the dispatch recv_tokens; mcore also holds the dispatch
+    #    so _zc_fwd_token_buf doubles as the dispatch recv_tokens; mcore also holds the dispatch
     #    probs (_zc_recv_topk_weights_buf) -- TE allocates nothing.
-    #  - bf16 (op-fuser GroupedLinear grouped GEMM, Hopper+): recv_tokens is the saved activation and
+    #  - bf16 (op-fuser GroupedLinear GEMM, Hopper+): recv_tokens is the saved activation and
     #    can't double-duty, so TE pools the per-call recv_tokens/topk; _zc_fwd_token_buf holds only
     #    the fc2 output.
     # TODO: move all to TE pool based allocation when symm memory pool supports cuda graph
@@ -1490,8 +1490,8 @@ class _NCCLEPManager(_DispatchManager):
             if config.fp8 or config.fp4:
                 if torch.cuda.get_device_capability()[0] < 10:
                     raise ValueError(
-                        "moe_ncclep_static_shape=True with fp8/fp4 requires an sm100+ (Blackwell or "
-                        "later) GPU for the CuTe DSL grouped GEMM; leave it False on older GPUs."
+                        "moe_ncclep_static_shape=True with fp8/fp4 requires an sm100+ (Blackwell+) "
+                        "GPU for the CuTe DSL grouped GEMM; leave it False on older GPUs."
                     )
                 if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
                     raise ValueError(
@@ -1571,9 +1571,9 @@ class _NCCLEPManager(_DispatchManager):
             if self.config.overlap_moe_expert_parallel_comm:
                 # The 1F1B overlap schedule detaches the dispatch input, so autograd hands the
                 # dispatch-backward a non-symm clone of the grad_input buffer; TE stages it into a
-                # symm buffer with one extra copy per dispatch-backward (forward legs stay zero-copy).
+                # symm buffer with one extra copy per dispatch-backward; forward legs zero-copy.
                 warnings.warn(
-                    "moe_ncclep_zero_copy + overlap_moe_expert_parallel_comm (1F1B EP overlap): the "
+                    "moe_ncclep_zero_copy + overlap_moe_expert_parallel_comm (1F1B EP overlap): "
                     "dispatch-backward gradient is not symm-mem-backed under the overlap schedule, "
                     "so it is staged into a symm buffer with one extra copy per dispatch-backward.",
                     stacklevel=2,
@@ -1582,10 +1582,14 @@ class _NCCLEPManager(_DispatchManager):
                 not torch.cuda.is_current_stream_capturing()
             ), "zero-copy symm buffers must be allocated before CUDA-graph capture"
             rc, h = self._recv_capacity, self.hidden_dim
-            _NCCLEPManager._zc_bwd_token_buf = alloc_ep_symm_buffer((rc, h), torch.bfloat16, self.group)
+            _NCCLEPManager._zc_bwd_token_buf = alloc_ep_symm_buffer(
+                (rc, h), torch.bfloat16, self.group
+            )
             # The forward buffer combine reads (fc2 output). fp8 also feeds it to dispatch as
             # recv_tokens (dead after FC1 quantize, so it double-duties); bf16 uses it only for fc2.
-            _NCCLEPManager._zc_fwd_token_buf = alloc_ep_symm_buffer((rc, h), torch.bfloat16, self.group)
+            _NCCLEPManager._zc_fwd_token_buf = alloc_ep_symm_buffer(
+                (rc, h), torch.bfloat16, self.group
+            )
             if self._zc_quant:
                 # fp8 also owns the dispatch probs buffer (bf16 pools it per-call in TE).
                 _NCCLEPManager._zc_recv_topk_weights_buf = alloc_ep_symm_buffer(
@@ -1627,7 +1631,7 @@ class _NCCLEPManager(_DispatchManager):
             recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-        # fp8 zero-copy: dispatched_probs aliases the shared recv_topk_weights symm buffer, which the
+        # fp8 zero-copy: dispatched_probs aliases the recv_topk_weights symm buffer, which the
         # next layer's dispatch reuses; copy it out so it stays valid through this layer's backward.
         # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
@@ -1747,7 +1751,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         experts write the fc2 output / fc1 dgrad into, so combine (fwd) and dispatch (bwd) read and
         scatter them one-sided. ``(None, None)`` for every other backend/mode.
 
-        Returned detached: the op-fuser calls requires_grad_() on its output and returns that object,
+        Returned detached: the op-fuser calls requires_grad_() on its output and returns it,
         so handing it the persistent buffer would permanently mark the shared classvar as requiring
         grad and break the next layer's reuse. The detached view shares storage (zero-copy intact).
         """
