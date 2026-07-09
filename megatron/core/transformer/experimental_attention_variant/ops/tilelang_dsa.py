@@ -162,68 +162,31 @@ def _build_packed_cp_indexer_inputs(
         )
 
     cu_q, cu_k = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-    if cu_q.shape != cu_k.shape or cu_q.numel() < 2:
-        raise RuntimeError("packed CP TileLang indexer requires matching non-empty q/k cu_seqlens")
-
     device = index_k.device
-    cu_q = cu_q.to(device=device, dtype=torch.int64).contiguous()
-    cu_k = cu_k.to(device=device, dtype=torch.int64).contiguous()
-    q_lengths = cu_q[1:] - cu_q[:-1]
-    k_lengths = cu_k[1:] - cu_k[:-1]
-    segment_divisor = 2 * cp_size
-    q_half = q_lengths // segment_divisor
-    segment_q_lengths = torch.stack((q_half, q_half), dim=1).reshape(-1)
-
     sk = index_k.size(0)
-    if single_packed_thd_sequence and sk == local_query_len:
-        if cu_q.numel() != 2 or local_query_len % 2 != 0:
-            raise RuntimeError(
-                "local-key packed CP TileLang indexer requires one sequence and even query rows"
-            )
-        half = local_query_len // 2
-        segment_q_lengths = torch.full((2,), half, dtype=torch.int64, device=device)
-        segment_k_lengths = torch.tensor((half, local_query_len), dtype=torch.int64, device=device)
-        segment_key_starts = torch.zeros(2, dtype=torch.int64, device=device)
-        total_segment_k = local_query_len + half
-    else:
-        if sk % segment_divisor != 0:
-            raise RuntimeError(
-                f"packed CP TileLang key length must be divisible by {segment_divisor}, got {sk}"
-            )
-        k_half = k_lengths // segment_divisor
-        segment_k_lengths = torch.stack(
-            ((cp_rank + 1) * k_half, k_lengths - cp_rank * k_half), dim=1
-        ).reshape(-1)
-        segment_key_starts = cu_k[:-1].repeat_interleave(2)
-        total_segment_k = sk + sk // segment_divisor
-
-    zero = torch.zeros(1, dtype=torch.int64, device=device)
-    segment_cu_q = torch.cat((zero, segment_q_lengths.cumsum(dim=0))).contiguous()
-    segment_cu_k = torch.cat((zero, segment_k_lengths.cumsum(dim=0))).contiguous()
-
-    segment_ids_k = torch.repeat_interleave(
-        torch.arange(segment_k_lengths.numel(), device=device),
-        segment_k_lengths,
-        output_size=total_segment_k,
+    layout = dsa_layout.build_packed_cp_indexer_layout(
+        cu_q.to(device=device),
+        cu_k.to(device=device),
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        key_size=sk,
+        local_key_layout=single_packed_thd_sequence and sk == local_query_len,
     )
-    segment_offsets_k = torch.arange(total_segment_k, device=device, dtype=torch.int64)
-    segment_offsets_k -= torch.repeat_interleave(
-        segment_cu_k[:-1], segment_k_lengths, output_size=total_segment_k
-    )
-    source_indices = segment_key_starts.index_select(0, segment_ids_k) + segment_offsets_k
-    segmented_k = index_k.index_select(0, source_indices).contiguous()
+    segmented_k = index_k.index_select(0, layout.source_indices).contiguous()
 
     segment_ids_q = torch.repeat_interleave(
-        torch.arange(segment_q_lengths.numel(), device=device),
-        segment_q_lengths,
+        torch.arange(layout.segment_q_lengths.numel(), device=device),
+        layout.segment_q_lengths,
         output_size=local_query_len,
     )
     row_start = local_query_start
     row_end = row_start + starts.numel()
     row_segment_ids = segment_ids_q[row_start:row_end]
-    row_segment_starts = segment_cu_k[:-1].index_select(0, row_segment_ids)
-    row_segment_ends = row_segment_starts + segment_k_lengths.index_select(0, row_segment_ids)
-    row_global_starts = segment_key_starts.index_select(0, row_segment_ids)
+    row_segment_starts = layout.segment_cu_k[:-1].index_select(0, row_segment_ids)
+    row_segment_ends = row_segment_starts + layout.segment_k_lengths.index_select(
+        0, row_segment_ids
+    )
+    row_global_starts = layout.segment_key_starts.index_select(0, row_segment_ids)
 
     local_starts = row_segment_starts + starts.to(torch.int64) - row_global_starts
     local_ends = row_segment_starts + ends.to(torch.int64) - row_global_starts
@@ -235,7 +198,7 @@ def _build_packed_cp_indexer_inputs(
         segmented_k,
         local_starts.to(torch.int32).contiguous(),
         local_ends.to(torch.int32).contiguous(),
-        source_indices,
+        layout.source_indices,
     )
 
 
@@ -475,14 +438,11 @@ def _canonicalize_topk_scores_for_tp_reduce(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sort selected top-k slots by key index before slot-wise TP reductions."""
     valid = topk_indices >= 0
-    sort_key = torch.where(valid, topk_indices, torch.full_like(topk_indices, sk))
-    order = sort_key.argsort(dim=-1)
-    topk_indices = torch.gather(topk_indices, dim=-1, index=order)
-    topk_scores = torch.gather(topk_scores, dim=-1, index=order)
-    valid = torch.gather(valid, dim=-1, index=order)
-    topk_indices = topk_indices.masked_fill(~valid, -1)
-    topk_scores = topk_scores.masked_fill(~valid, float("-inf"))
-    return topk_indices.contiguous(), topk_scores.contiguous()
+    topk_indices, topk_scores = dsa_masking.sort_topk_by_index(
+        topk_indices, valid, sk=sk, topk_scores=topk_scores
+    )
+    assert topk_scores is not None
+    return topk_indices, topk_scores
 
 
 def _accumulate_topk_kl_chunk(

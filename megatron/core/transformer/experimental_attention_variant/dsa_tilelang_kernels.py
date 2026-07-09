@@ -33,7 +33,7 @@ def run_fused_qk_topk(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
 ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-    """Run fused TileLang indexer and return top-k indices."""
+    """Adapt TileLang's indices-only result to the shared backend hook contract."""
     topk_indices = tilelang_dsa.run_fused_qk_topk(
         q,
         k,

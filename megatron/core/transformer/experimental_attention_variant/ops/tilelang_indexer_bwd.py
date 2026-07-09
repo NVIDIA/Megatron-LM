@@ -44,11 +44,12 @@ def is_supported_indexer_bwd_head_count(heads: int) -> bool:
 
 
 def _get_indexer_bwd_kernel(heads: int, dim: int, topk: int, use_relu: bool = True):
+    num_threads = 32 if heads < 16 else 128
     return _get_cached_kernel(
         _tilelang_indexer_bwd_kernel_cache,
         _tilelang_indexer_bwd_cache_lock,
         (heads, dim, topk, use_relu),
-        lambda: tl_indexer_bwd_impl(heads, dim, topk, use_relu=use_relu),
+        lambda: tl_indexer_bwd_impl(heads, dim, topk, num_threads=num_threads, use_relu=use_relu),
     )
 
 

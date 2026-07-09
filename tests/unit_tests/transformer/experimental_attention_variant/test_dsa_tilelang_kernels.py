@@ -568,6 +568,103 @@ def test_lighting_indexer_indices_preserves_single_head_weight_axis(monkeypatch)
     torch.testing.assert_close(topk_indices, torch.tensor([[2, 1], [2, 1]], dtype=torch.int32))
 
 
+def _skip_if_real_tilelang_indexer_unavailable():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TileLang indexer parity tests")
+    if not indexer.HAVE_TILELANG_INDEXER:
+        pytest.skip("TileLang indexer forward/backward kernels are unavailable")
+
+
+def _pytorch_indexer_scores(index_q, index_k, weights, *, use_relu):
+    per_head_scores = torch.einsum("qhd,kd->qkh", index_q.float(), index_k.float())
+    if use_relu:
+        per_head_scores = per_head_scores.relu()
+    return (per_head_scores * weights.float().unsqueeze(1)).sum(dim=-1)
+
+
+@pytest.mark.parametrize("use_relu", [False, True])
+def test_tilelang_indexer_forward_matches_pytorch(use_relu):
+    _skip_if_real_tilelang_indexer_unavailable()
+    torch.manual_seed(1234)
+
+    device = torch.device("cuda")
+    q_len, k_len, heads, dim = 5, 19, 8, 16
+    index_q = (torch.randn(q_len, heads, dim, device=device) * 0.25).to(torch.bfloat16)
+    index_k = (torch.randn(k_len, dim, device=device) * 0.25).to(torch.bfloat16)
+    weights = torch.randn(q_len, heads, dtype=torch.float32, device=device) * 0.25
+    starts = torch.tensor([0, 1, 3, 5, 8], dtype=torch.int32, device=device)
+    ends = torch.tensor([7, 10, 13, 17, 19], dtype=torch.int32, device=device)
+
+    actual = indexer.indexer_fwd_interface(
+        index_q, index_k, weights, starts, ends, clean_logits=True, use_relu=use_relu
+    )
+    expected = _pytorch_indexer_scores(index_q, index_k, weights, use_relu=use_relu)
+    key_positions = torch.arange(k_len, device=device)
+    valid = (key_positions.unsqueeze(0) >= starts.unsqueeze(1)) & (
+        key_positions.unsqueeze(0) < ends.unsqueeze(1)
+    )
+
+    torch.testing.assert_close(actual[valid], expected[valid], rtol=2e-2, atol=2e-2)
+    assert torch.isneginf(actual[~valid]).all()
+
+
+@pytest.mark.parametrize("use_relu", [False, True])
+def test_tilelang_indexer_backward_matches_pytorch(use_relu):
+    _skip_if_real_tilelang_indexer_unavailable()
+    torch.manual_seed(5678)
+
+    device = torch.device("cuda")
+    q_len, k_len, heads, dim = 4, 32, 8, 16
+    index_q = (torch.randn(q_len, heads, dim, device=device) * 0.25).to(torch.bfloat16)
+    index_k = (torch.randn(k_len, dim, device=device) * 0.25).to(torch.bfloat16)
+    weights = torch.randn(q_len, heads, dtype=torch.float32, device=device) * 0.25
+    topk_indices = torch.tensor(
+        [
+            [0, 2, 4, 6, 8, 10, -1],
+            [1, 3, 5, 7, 9, 11, -1],
+            [12, 14, 16, 18, 20, 22, -1],
+            [13, 15, 17, 19, 21, 23, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    grad_scores = torch.randn(topk_indices.shape, dtype=torch.float32, device=device)
+    grad_scores.masked_fill_(topk_indices < 0, 0.0)
+
+    actual_grad_q, actual_grad_w, actual_grad_k = indexer.indexer_bwd_interface(
+        index_q, weights, index_k, topk_indices, grad_scores, use_relu=use_relu
+    )
+
+    reference_q = index_q.detach().clone().requires_grad_(True)
+    reference_k = index_k.detach().clone().requires_grad_(True)
+    reference_w = weights.detach().clone().requires_grad_(True)
+    reference_scores = _pytorch_indexer_scores(
+        reference_q, reference_k, reference_w, use_relu=use_relu
+    )
+    valid = topk_indices >= 0
+    selected_scores = reference_scores.gather(1, topk_indices.clamp_min(0).long())
+    selected_scores = selected_scores.masked_fill(~valid, 0.0)
+    (selected_scores * grad_scores).sum().backward()
+
+    torch.testing.assert_close(actual_grad_q, reference_q.grad, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(actual_grad_w, reference_w.grad, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(actual_grad_k, reference_k.grad, rtol=5e-2, atol=5e-2)
+
+
+def test_shared_topk_sort_uses_explicit_validity_mask():
+    indices = torch.tensor([[5, 1, 7, 3]], dtype=torch.int32)
+    scores = torch.tensor([[0.5, 0.1, 0.7, 0.3]])
+    valid = torch.tensor([[True, False, True, False]])
+
+    sorted_indices, sorted_scores = dsa_masking.sort_topk_by_index(
+        indices, valid, sk=8, topk_scores=scores
+    )
+
+    torch.testing.assert_close(sorted_indices, torch.tensor([[5, 7, -1, -1]], dtype=torch.int32))
+    torch.testing.assert_close(sorted_scores[:, :2], torch.tensor([[0.5, 0.7]]))
+    assert torch.isneginf(sorted_scores[:, 2:]).all()
+
+
 def test_tilelang_kernel_getters_reuse_cached_builders(monkeypatch):
     def make_fake_kernel():
         return lambda *_args, **_kwargs: None
@@ -617,6 +714,8 @@ def test_tilelang_kernel_getters_reuse_cached_builders(monkeypatch):
         assert bwd_first is bwd_second
         assert bwd_third is not bwd_first
         assert len(bwd_builds) == 2
+        assert bwd_builds[0][1]["num_threads"] == 32
+        assert bwd_builds[1][1]["num_threads"] == 128
 
         tilelang_sparse_mla_bwd._tilelang_sparse_mla_preprocess_kernel_cache.clear()
         tilelang_sparse_mla_bwd._tilelang_sparse_mla_bwd_kernel_cache.clear()
