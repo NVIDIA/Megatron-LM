@@ -367,8 +367,8 @@ class TestMoESingleGroupedWeightNumerics:
             assert torch.isfinite(loss)
             loss.backward()
 
-            if args.overlap_grad_reduce:
-                model[0].finish_grad_sync()
+            # Wait for an overlapped reduction, or launch it synchronously when overlap is off.
+            model[0].finish_grad_sync()
 
             update_successful, _, _ = optimizer.step()
             assert update_successful
@@ -396,8 +396,8 @@ class TestMoESingleGroupedWeightNumerics:
         assert torch.isfinite(loss)
         loss.backward()
 
-        if args.overlap_grad_reduce:
-            model[0].finish_grad_sync()
+        # Wait for an overlapped reduction, or launch it synchronously when overlap is off.
+        model[0].finish_grad_sync()
 
         update_successful, _, _ = optimizer.step()
         assert update_successful
@@ -710,17 +710,17 @@ class TestMoESingleGroupedWeightNumerics:
             use_transformer_engine_op_fuser=True,
         )
 
-    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
-    @pytest.mark.parametrize("primary_param_gather", [False, True])
-    @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
-    def test_single_grouped_weight_parity_module_grouped_linear(
-        self, precision, primary_param_gather, gradient_accumulation_fusion
-    ):
-        """Compare single vs discrete MoE weights through TE module.GroupedLinear."""
-        _skip_if_unsupported(precision)
-        self.run_parity_case(
-            precision=precision,
-            primary_param_gather=primary_param_gather,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
+    def test_single_grouped_weight_parity_module_grouped_linear(self):
+        """Single grouped weights require the TE op-fuser execution path."""
+        args = self.create_test_args(
+            precision="bf16",
+            primary_param_gather=False,
+            single_weight=True,
+            gradient_accumulation_fusion=False,
             use_transformer_engine_op_fuser=False,
         )
+        with pytest.raises(
+            ValueError,
+            match="moe_single_grouped_weight requires use_transformer_engine_op_fuser=True",
+        ):
+            core_transformer_config_from_args(args)
