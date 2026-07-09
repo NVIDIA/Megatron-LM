@@ -158,3 +158,7 @@ If you use Megatron in your research or project, use the following citation:
   year={2019}
 }
 ```
+
+---
+
+*[Mukller](https://github.com/Mukller)*
