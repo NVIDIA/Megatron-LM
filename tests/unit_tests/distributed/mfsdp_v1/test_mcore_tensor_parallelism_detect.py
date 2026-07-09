@@ -7,6 +7,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
+    safe_get_rank,
     using_tensor_parallel,
 )
 
@@ -77,6 +78,13 @@ def test_using_tensor_parallel_false_when_mesh_size_one():
     # Mesh with 1 element -> no tensor parallel
     dist_index = DummyDistIndex(numel=1)
     assert using_tensor_parallel(dist_index) is False
+
+
+def test_safe_get_rank_should_fall_back_to_rank_env_if_distributed_is_not_initialized(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setenv("RANK", "7")
+
+    assert safe_get_rank() == 7
 
 
 class DummyConfig:
