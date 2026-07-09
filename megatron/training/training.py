@@ -1570,31 +1570,36 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
-    # Data stuff.
+    # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
+    # index building or loading from the cache) can be a multi-second chunk of
+    # startup on its own -- the 'data_loading' span group exists exactly for this.
+    # This shares scope with the existing perfetto-native trace_region; the two
+    # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-            assert "vp_stage" in dataset_provider_parameters, \
-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = \
-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+    with _otel_managed_span('data_loading', 'megatron.setup_data_iterators'):
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for vp_stage in range(len(model)):
+                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                assert "vp_stage" in dataset_provider_parameters, \
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                vp_stage_train_valid_test_dataset_provider = \
+                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                iterators = build_train_valid_test_data_iterators(
+                    vp_stage_train_valid_test_dataset_provider
+                )
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator = (
+                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
-        )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -3469,14 +3474,18 @@ def _run_gpu_sniff_test(tag):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['ep', 'dp', 'tp'],
-    )
-    print_datetime(f'running GPU sniff test ({tag})')
-    timers = get_timers()
-    timers('gpu-sniff-test', log_level=0).start(barrier=True)
-    run_gpu_sniff_test(tag, pg_collection=pg_collection)
-    timers('gpu-sniff-test').stop(barrier=True)
+    # One span here covers both call sites (the once-at-start 'before training'
+    # run in train()'s preamble and the periodic --gpu-sniff-test-interval runs
+    # in the step loop); the tag attribute distinguishes them.
+    with _otel_managed_span('job', 'megatron.gpu_sniff_test', **{'megatron.sniff_test.tag': tag}):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['ep', 'dp', 'tp'],
+        )
+        print_datetime(f'running GPU sniff test ({tag})')
+        timers = get_timers()
+        timers('gpu-sniff-test', log_level=0).start(barrier=True)
+        run_gpu_sniff_test(tag, pg_collection=pg_collection)
+        timers('gpu-sniff-test').stop(barrier=True)
     timers.log(['gpu-sniff-test'])
     print_datetime(f'finished GPU sniff test ({tag})')
 
@@ -3695,6 +3704,19 @@ def train(
     """
     args = get_args()
     timers = get_timers()
+
+    # OTel: the train() preamble below (up to the training loop) is one-off setup
+    # -- forward-backward wrapping, the pedantic weight-hash-across-DP check, the
+    # first collective, CUDA-graph helper init, forward pre-hook management -- and
+    # can be a multi-second chunk with no finer span inside megatron.train until
+    # the first train_step. start_span (not managed_span) so it auto-parents to
+    # megatron.train (the current span from this function's @_otel_trace_fn
+    # decorator) without indenting the whole preamble into a `with` block; ended
+    # explicitly right before the `while` loop below.
+    _train_setup_span = None
+    if _otel_sg_enabled('job'):
+        _train_setup_span = get_telemetry().tracer.start_span('megatron.train_setup')
+
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -4036,12 +4058,16 @@ def train(
         param_sync_func = config.param_sync_func
         config.param_sync_func = None
         pre_hook_enabled = False
-    # Also, check weight hash across DP replicas to be very pedantic.
+    # Also, check weight hash across DP replicas to be very pedantic. This hashes
+    # every parameter and all-reduces across DP replicas + a barrier -- it's
+    # typically the dominant cost of the train() preamble, so it gets its own
+    # span rather than being lumped into megatron.train_setup.
     if args.check_weight_hash_across_dp_replicas_interval is not None:
-        assert check_param_hashes_across_dp_replicas(
-            model, cross_check=True
-        ), "Parameter hashes not matching across DP replicas"
-        torch.distributed.barrier()
+        with _otel_managed_span('job', 'megatron.check_weight_hashes'):
+            assert check_param_hashes_across_dp_replicas(
+                model, cross_check=True
+            ), "Parameter hashes not matching across DP replicas"
+            torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
@@ -4053,6 +4079,12 @@ def train(
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
         )
+
+    # OTel: end the train-setup span -- the training loop (each iteration its own
+    # megatron.train_step span) begins here.
+    if _train_setup_span is not None:
+        _train_setup_span.end()
+        _train_setup_span = None
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -4071,7 +4103,13 @@ def train(
                 nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
-        maybe_finalize_async_save(blocking=False)
+        # Non-blocking finalize of the *previous* async checkpoint, on the
+        # training critical path -- this is the "exposed" cost the async save
+        # imposes back on the loop (the flip side of the background write span
+        # on the worker), and shows up as a per-iteration gap near checkpoint
+        # boundaries. Cheap most iterations, blocks when finalizing.
+        with _otel_managed_span('checkpoint', 'megatron.finalize_async_save'):
+            maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
         # Update the timeout for all process groups after initialization
         # We update the timeout after the first successful iteration,
@@ -4115,18 +4153,23 @@ def train(
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # Capture CUDA Graphs.
+        # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
+        # graph capture (create_cudagraphs) is a notable one-time cost worth its
+        # own span, distinct from the megatron.train_step spans around it.
         if (
             args.cuda_graph_impl == "transformer_engine"
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model, param_sync=False)
-            cuda_graph_helper.create_cudagraphs()
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                enable_forward_pre_hook(model)
-                cuda_graph_helper.cuda_graph_set_manual_hooks()
+            with _otel_managed_span(
+                'job', 'megatron.cuda_graph_capture', **{'megatron.iteration': iteration}
+            ):
+                if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
+                    disable_forward_pre_hook(model, param_sync=False)
+                cuda_graph_helper.create_cudagraphs()
+                if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
+                    enable_forward_pre_hook(model)
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
@@ -4178,10 +4221,21 @@ def train(
             max_attention_logit = None
             _step_span = None
         else:
-            # OTel: per-step span wrapping train_step.
-            with _otel_managed_span(
-                'step', 'megatron.train_step', **{'megatron.iteration': iteration}
-            ) as _step_span:
+            # OTel: dedicated span for the first iteration actually executed in this
+            # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
+            # just the first one that runs. Kept separate from the per-step span below
+            # since it captures one-off warmup costs (compilation, CUDA graph capture,
+            # prefetch) that steady-state iterations don't pay.
+            _first_iter_span_cm = (
+                _otel_managed_span(
+                    'first_iteration', 'megatron.first_iteration',
+                    **{'megatron.iteration': iteration},
+                )
+                if is_first_iteration
+                else nullcontext()
+            )
+            # OTel: optional per-step span wrapping the real train_step.
+            with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train_step', **{'megatron.iteration': iteration}) as _step_span:
                 ft_integration.on_training_step_start()
                 (
                     loss_dict,
@@ -4327,23 +4381,26 @@ def train(
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
             learning_rate = None
-        report_memory_flag = training_log(
-            loss_dict,
-            total_loss_dict,
-            learning_rate,
-            iteration,
-            loss_scale,
-            report_memory_flag,
-            skipped_iter,
-            grad_norm,
-            params_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-            pg_collection=model_pg_collection,
-            is_first_iteration=is_first_iteration,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-        )
+        # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
+        # uninstrumented per-iteration overhead outside the train_step span.
+        with _otel_managed_span('step', 'megatron.train_log'):
+            report_memory_flag = training_log(
+                loss_dict,
+                total_loss_dict,
+                learning_rate,
+                iteration,
+                loss_scale,
+                report_memory_flag,
+                skipped_iter,
+                grad_norm,
+                params_norm,
+                num_zeros_in_grad,
+                max_attention_logit,
+                pg_collection=model_pg_collection,
+                is_first_iteration=is_first_iteration,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+            )
         is_first_iteration = False
 
         # Evaluation.
