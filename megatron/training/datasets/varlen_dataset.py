@@ -47,7 +47,9 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
   * For HF Hub repos, only ``split="train"`` is loaded.
 """
 
+import json
 import os
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -87,6 +89,14 @@ _SHAREGPT_ROLE_MAP: Dict[str, str] = {
     "function": "tool",
     "observation": "tool",
 }
+
+
+@dataclass
+class ChatTemplateSample:
+    """Conversation plus keyword arguments consumed by the chat template."""
+
+    messages: List[Dict[str, Any]]
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 def _looks_like_hf_id(path: str) -> bool:
@@ -131,6 +141,23 @@ def _ensure_str_content(content: Any, where: str) -> str:
     return content
 
 
+def _ensure_list_field(value: Any, field_name: str) -> List[Any]:
+    """Return a list field, decoding JSON-encoded parquet columns when needed."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"VarlenDataset: field '{field_name}' contains invalid JSON.") from exc
+    if not isinstance(value, list):
+        raise ValueError(
+            f"VarlenDataset: field '{field_name}' must be a list or a JSON-encoded list, "
+            f"got {type(value).__name__}."
+        )
+    return value
+
+
 def _alpaca_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     """Convert an Alpaca/Dolly-style sample to a 3-turn messages list."""
     instruction = _first_present(sample, _INSTRUCTION_FIELDS) or ""
@@ -151,7 +178,7 @@ def _sharegpt_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     with one, so ``SFTDataset._split_conversations`` treats the sample as a
     single conversation.
     """
-    conv = sample.get("conversations") or []
+    conv = _ensure_list_field(sample.get("conversations"), "conversations")
     out: List[Dict[str, str]] = []
     first_speaker = (conv[0].get("from") or "").lower() if conv else ""
     if first_speaker != "system":
@@ -164,22 +191,33 @@ def _sharegpt_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
-def _messages_passthrough(sample: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Pass through an OpenAI ``messages`` sample, ensuring a leading system turn.
+def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
+    """Normalize an OpenAI ``messages`` sample without dropping template metadata.
 
-    Strips any keys other than ``role``/``content`` (e.g. ``name``,
-    ``tool_calls``) since they are not part of the chat-template input
-    expected by SFTTokenizer.
+    Fields such as ``reasoning_content``, ``tool_calls``, ``name``, and
+    ``tool_call_id`` are interpreted by model-specific Hugging Face chat
+    templates. Top-level ``tools`` are forwarded as a template keyword
+    argument. This is required for tool-integrated datasets such as
+    ``nvidia/Nemotron-SFT-Math-v3``.
     """
-    raw = list(sample.get("messages") or [])
+    raw = _ensure_list_field(sample.get("messages"), "messages")
     if raw and raw[0].get("role") != "system":
         raw = [{"role": "system", "content": ""}] + raw
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     for m in raw:
         role = m.get("role") or "user"
         content = _ensure_str_content(m.get("content"), f"messages turn role={role}")
-        out.append({"role": role, "content": content})
-    return out
+        normalized = dict(m)
+        normalized["role"] = role
+        normalized["content"] = content
+        out.append(normalized)
+
+    tools = _ensure_list_field(sample.get("tools"), "tools")
+    if not tools:
+        chat_template_kwargs: Dict[str, Any] = {}
+    else:
+        chat_template_kwargs = {"tools": tools}
+    return ChatTemplateSample(out, chat_template_kwargs)
 
 
 def _raw_text_loader(sample: Dict[str, Any]) -> str:
@@ -247,9 +285,10 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         between rows (e.g. LongAlpaca-12k).
 
     A per-sample converter is selected once at construction time based on
-    column names and applied at access time. The instruction-tuning schemas
-    convert to a messages list; the ``pretrain-text`` fallback returns the raw
-    string instead.
+    column names and applied at access time. OpenAI-style samples retain both
+    messages and chat-template metadata, other instruction-tuning schemas
+    convert to a messages list, and the ``pretrain-text`` fallback returns the
+    raw string instead.
     """
 
     def __init__(self, dataset_path: str) -> None:
@@ -286,7 +325,7 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> List[Dict[str, str]]:
+    def __getitem__(self, idx: int) -> Any:
         return self._converter(self.dataset[idx])
 
 
@@ -342,9 +381,10 @@ class VarlenDataset(SFTDataset):
             eod is not None
         ), "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
 
-        # 1. Pull a single item from the low-level dataset. For SFT schemas
-        #    (alpaca / sharegpt / openai-messages) this is a messages list;
-        #    for the pretrain-text schema it is a raw string.
+        # 1. Pull a single item from the low-level dataset. OpenAI-style data
+        #    carries messages plus optional chat-template kwargs (for example,
+        #    top-level tool definitions); other SFT schemas return a messages
+        #    list, and pretrain-text returns a raw string.
         item = self.dataset[int(self.indices[idx % len(self.indices)])]
 
         assert not self.config.reset_position_ids
@@ -358,6 +398,15 @@ class VarlenDataset(SFTDataset):
             ids = list(tokenizer.tokenize(item))
             tokens_list = ids
             targets_list = list(ids)
+        elif isinstance(item, ChatTemplateSample):
+            tokens, targets = tokenizer.tokenize_conversation(
+                item.messages,
+                return_target=True,
+                add_generation_prompt=False,
+                chat_template_kwargs=item.chat_template_kwargs,
+            )
+            tokens_list = tokens.tolist()
+            targets_list = targets.tolist()
         else:
             tokens, targets = tokenizer.tokenize_conversation(
                 item, return_target=True, add_generation_prompt=False

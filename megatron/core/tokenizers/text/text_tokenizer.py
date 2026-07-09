@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 from megatron.core.tokenizers.text.libraries.abstract_tokenizer import MegatronTokenizerTextAbstract
@@ -121,7 +121,11 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         )
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Convert a conversation to tokens. Needed for SFTTokenizer.
 
@@ -135,6 +139,8 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            chat_template_kwargs (Optional[Dict[str, Any]]): Additional keyword arguments passed
+                to the tokenizer's chat template.
         """
 
         if self.library == 'sft':
@@ -142,6 +148,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 conversation=conversation,
                 return_target=return_target,
                 add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
