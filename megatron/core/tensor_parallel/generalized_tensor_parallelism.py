@@ -353,9 +353,7 @@ def configure_gtp_remat_from_recipe(
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
-    update_gtp_config(
-        calculate_per_token_loss=calculate_per_token_loss, check_param_states=False
-    )
+    update_gtp_config(calculate_per_token_loss=calculate_per_token_loss, check_param_states=False)
     if fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":

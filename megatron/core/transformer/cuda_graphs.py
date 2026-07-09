@@ -20,7 +20,6 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
-from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -850,17 +849,15 @@ class _CudaGraphRunner(torch.nn.Module):
                 # Register (chain, group) side streams before the first forward.
                 # Dense for mamba/attn/shared_experts; expert (below) for routed
                 # experts captured when "moe" is in cuda_graph_modules.
-                from megatron.core.parallel_state import (
-                    get_expert_gtp_weight_remat_group,
-                    get_expert_gtp_weight_remat_world_size,
-                    get_gtp_weight_remat_group,
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=["gtp_remat", "expt_gtp_remat"]
                 )
-
-                self._register_gtp_side_streams(get_gtp_weight_remat_group())
+                self._register_gtp_side_streams(pg_collection.gtp_remat)
                 # EGTP_remat streams: required so _wait/_sync_side_streams drain EGTP_remat
                 # NCCL into runner_stream before bwd_completion_event fires.
-                if get_expert_gtp_weight_remat_world_size() > 1:
-                    self._register_gtp_side_streams(get_expert_gtp_weight_remat_group())
+                egtp_remat_group = pg_collection.expt_gtp_remat
+                if egtp_remat_group is not None and egtp_remat_group.size() > 1:
+                    self._register_gtp_side_streams(egtp_remat_group)
                 # Registered for finalize_model_grads to wait on (Phase 2 fence).
                 _GTP_RUNNER_STREAMS.append(self.stream)
 
@@ -1302,17 +1299,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 # Phase 1: drain AG; fence runner_stream past dense + EGTP AG
                 # so bwd_completion_event records AFTER NCCL_AG completion.
                 wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
-                from megatron.core.parallel_state import (
-                    get_expert_gtp_weight_remat_group,
-                    get_expert_gtp_weight_remat_world_size,
-                    get_gtp_weight_remat_group,
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=["gtp_remat", "expt_gtp_remat"]
                 )
-
-                gtp_remat_group = get_gtp_weight_remat_group()
+                gtp_remat_group = pg_collection.gtp_remat
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_remat_group)
                 torch.cuda.current_stream().wait_stream(graphed_ag)
-                if get_expert_gtp_weight_remat_world_size() > 1:
-                    egtp_remat_group = get_expert_gtp_weight_remat_group()
+                egtp_remat_group = pg_collection.expt_gtp_remat
+                if egtp_remat_group is not None and egtp_remat_group.size() > 1:
                     egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_remat_group)
                     torch.cuda.current_stream().wait_stream(egtp_graphed_ag)
 
@@ -1344,8 +1338,11 @@ class _CudaGraphRunner(torch.nn.Module):
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
         self._gtp_finalize_hook_plan = []
         if self.gtp_remat and self.finalized_during_bwd_capture:
-            dense_group = parallel_state.get_gtp_weight_remat_group()
-            expert_group = parallel_state.get_expert_gtp_weight_remat_group()
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["gtp_remat", "expt_gtp_remat"]
+            )
+            dense_group = pg_collection.gtp_remat
+            expert_group = pg_collection.expt_gtp_remat
             params_by_group = defaultdict(list)
             for param in self.finalized_during_bwd_capture:
                 is_expert = not getattr(param, 'allreduce', True)

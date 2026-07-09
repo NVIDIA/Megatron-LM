@@ -22,9 +22,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     divide,
-    get_gtp_weight_remat_group,
     get_pg_rank,
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
@@ -308,7 +308,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
 
         self.gtp_remat_size = 1
-        gtp_remat_group = get_gtp_weight_remat_group()
+        gtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat"]
+        ).gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 
@@ -1007,7 +1009,10 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = None
 
         self.gtp_remat_size = 1
-        gtp_remat_group = get_gtp_weight_remat_group(is_expert=self.is_expert)
+        _pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 
@@ -1364,7 +1369,10 @@ class RowParallelLinear(torch.nn.Module):
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 
         self.gtp_remat_size = 1
-        gtp_remat_group = get_gtp_weight_remat_group(is_expert=self.is_expert)
+        _pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
 

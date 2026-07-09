@@ -599,17 +599,6 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     return tp_group
 
 
-def get_gtp_weight_remat_group(is_expert=False):
-    """Return the active GTP weight-remat group from parallel_state, or None if inactive."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return None
-    if not parallel_state.is_initialized():
-        return None
-    if is_expert:
-        return parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
-    return parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-
-
 def get_pg_size(group=None):
     """Get world size for a distributed group.
 

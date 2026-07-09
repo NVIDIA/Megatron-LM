@@ -465,8 +465,11 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
 
     No-op when GTP_remat is inactive (group size <= 1).
     """
-    gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-    egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=["gtp_remat", "expt_gtp_remat"]
+    )
+    gtp_remat_group = pg_collection.gtp_remat
+    egtp_remat_group = pg_collection.expt_gtp_remat
 
     dense_params, dense_grads = [], []
     expert_params, expert_grads = [], []

@@ -111,16 +111,16 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     if not HAVE_GTP:
         return gtp_fold
 
-    from megatron.core import parallel_state
-
-    # Source the (e)gtp_remat groups from pg_collection if populated, else from parallel_state
-    # (the default pg_collection leaves gtp_remat/expt_gtp_remat unset). Compatibility point.
     gtp_remat_group = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
     if gtp_remat_group is None:
-        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+        gtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat"]
+        ).gtp_remat
     egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
     if egtp_remat_group is None:
-        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+        egtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["expt_gtp_remat"]
+        ).expt_gtp_remat
 
     for model_chunk in model_chunks:
         for name, p in model_chunk.named_parameters():
