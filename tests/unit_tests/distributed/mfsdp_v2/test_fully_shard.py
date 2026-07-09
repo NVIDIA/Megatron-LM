@@ -374,7 +374,7 @@ def test_overlaps_communication_and_compute(distributed_setup):
     gemm_streams = {event.device_resource_id for event in gemm_events}
     assert len(all_gather_streams) == 1
     assert len(reduce_scatter_streams) == 1
-    assert all_gather_streams == reduce_scatter_streams
+    assert all_gather_streams.isdisjoint(reduce_scatter_streams)
     assert all_gather_streams.isdisjoint(gemm_streams)
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
