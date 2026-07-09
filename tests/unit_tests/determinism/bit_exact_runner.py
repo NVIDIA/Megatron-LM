@@ -14,7 +14,8 @@ are bit-identical. It handles:
 
 * TP, PP, VPP, CP, EP via ``Utils.initialize_model_parallel``.
 * FSDP via ``fully_shard_model`` wrap.
-* MoE auto-enable when ``EP > 1`` (merges ``configs.moe_overrides(tp, ep)``).
+* MoE auto-enable when ``EP > 1`` (via ``configs.merge_moe_overrides``, which
+  keeps a model preset's own expert topology).
 * num_layers auto-bump when ``PP * VPP`` exceeds the preset's layer count.
 * sequence_parallel + tensor_model_parallel_size propagation when MoE+TP.
 * Pipeline schedule (``get_forward_backward_func``) when ``PP > 1``;
@@ -33,7 +34,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.determinism.configs import (
     apply_parallelism,
-    moe_overrides,
+    merge_moe_overrides,
     required_world_size,
 )
 from tests.unit_tests.determinism.utils import (
@@ -123,7 +124,11 @@ class BitExactRunner:
         if needs_moe:
             tp = init_kwargs.get("tensor_model_parallel_size", 1)
             ep = init_kwargs.get("expert_model_parallel_size", 1)
-            cfg_overrides = {**cfg_overrides, **moe_overrides(tp, ep)}
+            # merge_moe_overrides (not the raw moe_overrides) so a model preset
+            # that already defines its expert topology — like the DeepSeek base
+            # this test builds on — keeps its own num_moe_experts/routing instead
+            # of being overwritten by the generic four-expert defaults.
+            cfg_overrides = merge_moe_overrides(self.base_config(), cfg_overrides, tp, ep)
 
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(**init_kwargs)
