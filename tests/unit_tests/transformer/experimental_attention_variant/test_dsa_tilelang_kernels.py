@@ -288,7 +288,7 @@ def test_run_fused_qk_topk_with_loss_adds_empty_topk_length(monkeypatch):
 def test_run_fused_absorbed_sparse_attention_forwards_to_tilelang_backend(monkeypatch):
     query = torch.empty(2, 1, 3, 4)
     key = torch.empty(5, 1, 1, 4)
-    topk_indices = torch.tensor([[[0, 1], [1, -1]]], dtype=torch.int32)
+    topk_indices = torch.tensor([[[0, 1], [1, 99]]], dtype=torch.int32)
     topk_length = torch.tensor([[2, 1]], dtype=torch.int32)
     expected_output = torch.empty(2, 1, 3, 4)
     call = {}
@@ -318,7 +318,9 @@ def test_run_fused_absorbed_sparse_attention_forwards_to_tilelang_backend(monkey
     assert result is expected_output
     assert call["query"] is query
     assert call["key"] is key
-    assert call["topk_indices"] is topk_indices
+    torch.testing.assert_close(
+        call["topk_indices"], torch.tensor([[[0, 1], [1, -1]]], dtype=torch.int32)
+    )
     assert call["softmax_scale"] == 0.5
     assert call["v_channels"] == 4
 

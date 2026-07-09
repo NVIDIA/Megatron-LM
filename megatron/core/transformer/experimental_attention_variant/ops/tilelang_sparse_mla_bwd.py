@@ -68,7 +68,12 @@ def _get_postprocess_kernel(D: int, D_tail: int, kv_group: int):
 
 @tilelang_jit(out_idx=[-1])
 def preprocess(  # pragma: no cover
-    H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dtype=T.float32
+    H,
+    D,
+    block_ND=32,
+    num_stages=5,
+    dtype=T.bfloat16 if HAVE_TILELANG else None,
+    accum_dtype=T.float32 if HAVE_TILELANG else None,
 ):
     """Build preprocessing kernel that computes Delta = sum(O * dO) per row/head."""
     require_tilelang()
@@ -119,7 +124,13 @@ def preprocess(  # pragma: no cover
 
 @tilelang_jit(out_idx=[-1])
 def postprocess(  # pragma: no cover
-    D, D_tail, kv_group=1, block_N=64, threads=128, dtype=T.bfloat16, accum_dtype=T.float32
+    D,
+    D_tail,
+    kv_group=1,
+    block_N=64,
+    threads=128,
+    dtype=T.bfloat16 if HAVE_TILELANG else None,
+    accum_dtype=T.float32 if HAVE_TILELANG else None,
 ):
     """Build postprocess kernel that casts/exports accumulated dKV."""
     require_tilelang()
@@ -169,9 +180,9 @@ def bwd(  # pragma: no cover
     max_block_h=32,
     num_stages=2,
     threads=128,
-    indices_dtype=T.int32,
-    dtype=T.bfloat16,
-    accum_dtype=T.float32,
+    indices_dtype=T.int32 if HAVE_TILELANG else None,
+    dtype=T.bfloat16 if HAVE_TILELANG else None,
+    accum_dtype=T.float32 if HAVE_TILELANG else None,
 ):
     """Build sparse-MLA backward kernel."""
     require_tilelang()

@@ -367,10 +367,12 @@ def _compute_topk_target_chunk_sum(
 
         # Two-pass online softmax over top-k chunks:
         # 1) compute row-wise max and denominator; 2) recompute and accumulate probabilities.
-        # These accumulators are rebound to fresh tensors each top-k chunk (m = m_new,
-        # l = l * alpha + ...), so they cannot reuse a scratch buffer in place.
-        m = torch.full((h_chunk, s_len), float("-inf"), dtype=torch.float32, device=device)
-        l = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=device)
+        # These accumulators are rebound to fresh tensors each top-k chunk, so they
+        # cannot reuse a scratch buffer in place.
+        running_max = torch.full(
+            (h_chunk, s_len), float("-inf"), dtype=torch.float32, device=device
+        )
+        running_denom = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=device)
 
         def _chunk_logits(idx_topk, valid_topk_chunk, k_len):
             if key_shared is not None:
@@ -389,19 +391,23 @@ def _compute_topk_target_chunk_sum(
             t1 = min(t0 + topk_chunk_size, topk)
             logits = _chunk_logits(idx_seq[:, t0:t1], valid_seq[:, t0:t1], t1 - t0)
             chunk_max = logits.max(dim=-1).values
-            m_new = torch.maximum(m, chunk_max)
-            m_new_for_exp = torch.where(torch.isfinite(m_new), m_new, torch.zeros_like(m_new))
-            alpha = torch.exp(m - m_new_for_exp)
-            p_chunk = torch.exp(logits - m_new_for_exp.unsqueeze(-1))
-            l = l * alpha + p_chunk.sum(dim=-1)
-            m = m_new
+            new_running_max = torch.maximum(running_max, chunk_max)
+            max_for_exp = torch.where(
+                torch.isfinite(new_running_max), new_running_max, torch.zeros_like(new_running_max)
+            )
+            alpha = torch.exp(running_max - max_for_exp)
+            p_chunk = torch.exp(logits - max_for_exp.unsqueeze(-1))
+            running_denom = running_denom * alpha + p_chunk.sum(dim=-1)
+            running_max = new_running_max
 
-        stable_m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-        inv_l = l.clamp_min(1e-10).reciprocal()
+        stable_max = torch.where(
+            torch.isfinite(running_max), running_max, torch.zeros_like(running_max)
+        )
+        inverse_denom = running_denom.clamp_min(1e-10).reciprocal()
         for t0 in range(0, topk, topk_chunk_size):
             t1 = min(t0 + topk_chunk_size, topk)
             logits = _chunk_logits(idx_seq[:, t0:t1], valid_seq[:, t0:t1], t1 - t0)
-            probs = torch.exp(logits - stable_m.unsqueeze(-1)) * inv_l.unsqueeze(-1)
+            probs = torch.exp(logits - stable_max.unsqueeze(-1)) * inverse_denom.unsqueeze(-1)
             attn_chunk_sum[:, t0:t1] += probs.sum(dim=0)
 
     return attn_chunk_sum

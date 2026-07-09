@@ -122,7 +122,14 @@ def run_fused_absorbed_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Run fused TileLang SparseMLA for absorbed DSA sparse attention."""
-    del topk_length
+    if topk_length is not None:
+        if topk_indices.ndim != 3 or topk_length.shape != topk_indices.shape[:-1]:
+            return None
+        positions = torch.arange(topk_indices.size(-1), device=topk_indices.device)
+        valid = positions < topk_length.to(dtype=torch.int64, device=topk_indices.device).unsqueeze(
+            -1
+        )
+        topk_indices = topk_indices.masked_fill(~valid, -1)
     return tilelang_dsa.run_fused_absorbed_sparse_attention(
         query, key, topk_indices, softmax_scale, v_channels
     )
