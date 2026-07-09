@@ -18,6 +18,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_indexer_loss,
     dsa_kernels,
     dsa_layout,
     dsa_masking,
@@ -25,6 +26,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_size
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -228,7 +230,7 @@ def _validate_nonpacked_cp_uniform_length(
         cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
-        and cp_group.size() == cp_size
+        and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
@@ -432,6 +434,15 @@ def compute_dsa_indexer_loss(
         query_valid_rows, b=b, sq=sq, device=index_scores.device
     )
 
+    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        sk=sk,
+        device=index_scores.device,
+    )
+
     # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
     query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
     # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
@@ -440,15 +451,6 @@ def compute_dsa_indexer_loss(
     attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
     # Reshape to [b, np, sq, sk]
     attention_scores = attention_scores.reshape(b, np, sq, sk)
-    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
-        mask=mask,
-        varlen_starts=varlen_starts,
-        varlen_ends=varlen_ends,
-        key_positions=key_positions,
-        sk=sk,
-        device=attention_scores.device,
-    )
-
     if varlen_starts is not None:
         attention_scores = dsa_masking.apply_starts_ends_mask_to_scores(
             attention_scores, varlen_starts, varlen_ends, key_positions
@@ -491,7 +493,9 @@ def compute_dsa_indexer_loss(
         attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
     )
     # [b, sq, sk] -> [b, sq, sk]
-    index_scores = dsa_masking.masked_softmax(index_scores.float(), index_valid_mask, dim=-1)
+    index_log_scores = dsa_masking.masked_log_softmax(
+        index_scores.float(), index_valid_mask, dim=-1
+    )
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
@@ -499,37 +503,15 @@ def compute_dsa_indexer_loss(
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
-    # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
-    # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True).clamp_min(
-        1e-10
+    # The target is already non-negative because it is a sum of softmax probabilities.
+    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    return dsa_indexer_loss.indexer_loss_from_target(
+        attention_scores,
+        index_log_scores,
+        loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
-
-    # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
-    # kl_per_element [b, sq, sk]
-    kl_per_element = attention_scores * (
-        torch.log(attention_scores + 1e-10) - torch.log(index_scores + 1e-10)
-    )
-
-    # [b, sq, sk] -> [b, sq] -> [1]
-    # Each real token has the same weight in the loss.
-    kl_per_row = kl_per_element.sum(dim=-1)
-    if calculate_per_token_loss:
-        if query_valid_rows is None:
-            kl_div = kl_per_row.sum()
-        else:
-            kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum()
-    elif query_valid_rows is None:
-        kl_div = kl_per_row.mean()
-    else:
-        valid_row_count = query_valid_rows.sum().to(dtype=torch.float32, device=kl_per_row.device)
-        valid_row_count = valid_row_count.clamp_min(1.0)
-        kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum() / valid_row_count
-
-    # Scale by coefficient.
-    indexer_loss = kl_div * loss_coeff
-
-    return indexer_loss
 
 
 def _compute_index_scores(
@@ -794,9 +776,7 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
-        dim=-1, keepdim=True
-    ).clamp_min(1e-10)
+    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -826,19 +806,13 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # Backward through kl_per_element = target * (log(target) - log(index))
-    # ∂kl/∂index_softmax = -target / index_softmax
-    grad_index_scores_softmax = (
-        -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
-    )
-    # Free attention_scores_normalized - no longer needed
-    del attention_scores_normalized
-
-    # Backward through softmax: ∂L/∂x = softmax * (∂L/∂softmax - sum(∂L/∂softmax * softmax))
-    sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
-    grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
-    # Free intermediate tensors
-    del index_scores_softmax, grad_index_scores_softmax, sum_grad
+    # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
+    # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
+    # valid predicted probabilities are smaller than eps.
+    grad_index_scores_logits = (
+        index_scores_softmax - attention_scores_normalized
+    ) * grad_kl_per_element
+    del index_scores_softmax, attention_scores_normalized
 
     # Zero out gradients for masked positions.
     if sparse_loss:
@@ -1228,6 +1202,10 @@ class DSAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
+        # should be averaged during final gradient synchronization.
+        for param in self.parameters():
+            setattr(param, "average_gradients_across_tp_domain", True)
 
     def _apply_rope(
         self,
@@ -1714,48 +1692,158 @@ class DSAttention(MegatronModule):
             )
 
         sq, b, _, _ = query.size()
+        local_sequence_rows = x.size(0)
 
         cp_group = getattr(self.pg_collection, "cp", None)
-        cp_size = cp_group.size() if cp_group is not None else 1
+        cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
+        tp_group = getattr(self.pg_collection, "tp", None)
+        tp_size = get_pg_size(tp_group)
+        sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
+        sequence_parallel_tp_row_start = 0
+        sequence_parallel_tp_full_rows = sq
+        sequence_parallel_query_is_local = False
+        if sequence_parallel_tp:
+            sequence_parallel_tp_full_rows = local_sequence_rows * tp_size
+            if sq == local_sequence_rows:
+                sequence_parallel_query_is_local = True
+                sequence_parallel_tp_row_start = tp_group.rank() * local_sequence_rows
+            elif sq != sequence_parallel_tp_full_rows:
+                raise RuntimeError(
+                    "DSA sequence-parallel query row count mismatch: "
+                    f"query_rows={sq}, local_rows={local_sequence_rows}, tp_size={tp_size}"
+                )
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
+        nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
-        if packed_thd and cp_size > 1:
+        if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            packed_query_positions, kv_reorder_idx = (
-                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_kv,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                    device=query.device,
-                    local_output_size=sq,
-                    global_output_size=sq * cp_size,
-                )
+            single_packed_thd_sequence = (
+                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             )
+            packed_query_output_size = (
+                sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
+            )
+            packed_global_output_size = packed_query_output_size * cp_size
+            if sequence_parallel_query_is_local and cp_size == 1:
+                row_start = sequence_parallel_tp_row_start
+                packed_query_positions = torch.arange(
+                    row_start, row_start + sq, dtype=torch.int64, device=query.device
+                )
+            elif sequence_parallel_tp and cp_size > 1:
+                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
+                    cu_seqlens_q,
+                    cp_size,
+                    cp_rank,
+                    query.device,
+                    output_size=packed_query_output_size,
+                )
+                if sequence_parallel_query_is_local:
+                    row_start = sequence_parallel_tp_row_start
+                    packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
+                else:
+                    packed_query_positions = packed_query_positions_full
+            elif cp_size > 1:
+                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
+                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
+                query_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_q, int)
+                    and packed_seq_params.max_seqlen_q == packed_global_output_size
+                )
+                key_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_kv, int)
+                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
+                )
+                packed_query_positions, kv_reorder_idx = (
+                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=packed_query_output_size,
+                        key_local_output_size=packed_query_output_size,
+                        global_output_size=packed_global_output_size,
+                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    )
+                )
+            if packed_query_positions is not None:
+                packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
-            kv_reorder_idx = dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                sq=sq, cp_size=cp_size, device=query.device
-            )
 
+        if sequence_parallel_tp:
+            if key.size(0) == local_sequence_rows:
+                key = gather_from_sequence_parallel_region(key, group=tp_group)
+            elif key.size(0) != sequence_parallel_tp_full_rows:
+                raise RuntimeError(
+                    "DSA sequence-parallel key row count mismatch before CP gather: "
+                    f"key_rows={key.size(0)}, local_rows={local_sequence_rows}, "
+                    f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
+                )
+            if value is not None:
+                if value.size(0) == local_sequence_rows:
+                    value = gather_from_sequence_parallel_region(value, group=tp_group)
+                elif value.size(0) != sequence_parallel_tp_full_rows:
+                    raise RuntimeError(
+                        "DSA sequence-parallel value row count mismatch before CP gather: "
+                        f"value_rows={value.size(0)}, local_rows={local_sequence_rows}, "
+                        f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
+                    )
+
+        local_cp_kv_lens = {sq}
+        if sequence_parallel_tp:
+            local_cp_kv_lens.add(sequence_parallel_tp_full_rows)
+        local_cp_kv_len = None
         if cp_size > 1:
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
+
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
+            def _build_kv_reorder_idx(local_len):
+                if packed_thd:
+                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=local_len,
+                        key_local_output_size=local_len,
+                        global_output_size=local_len * cp_size,
+                    )
+                    return idx
+                return dsa_layout.build_zigzag_allgather_cp_key_reorder(
+                    sq=local_len, cp_size=cp_size, device=query.device
+                )
+
             gathered_cp_key = False
             gathered_cp_value = False
-            if key.size(0) == sq:
+            if key.size(0) in local_cp_kv_lens:
+                local_cp_kv_len = key.size(0)
+                if kv_reorder_idx is None:
+                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
                 gathered_cp_key = True
-            if value is not None and value.size(0) == sq:
+            if value is not None and value.size(0) in local_cp_kv_lens:
+                if local_cp_kv_len is None:
+                    local_cp_kv_len = value.size(0)
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                elif value.size(0) != local_cp_kv_len:
+                    raise RuntimeError(
+                        "DSA local key/value sequence length mismatch before CP gather: "
+                        f"key_len={local_cp_kv_len}, value_len={value.size(0)}"
+                    )
                 value = gather_from_sequence_parallel_region(value, group=cp_group)
                 gathered_cp_value = True
             if kv_reorder_idx is not None:
@@ -1776,6 +1864,25 @@ class DSAttention(MegatronModule):
 
         skv = key.size(0)
 
+        if not packed_thd and sequence_parallel_query_is_local:
+            nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
+                position_ids, sq, query.device
+            )
+            if nonpacked_query_positions is None:
+                full_query_positions, _ = dsa_layout.get_cp_positions_from_layout(
+                    sq=sequence_parallel_tp_full_rows,
+                    skv=skv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    cp_comm_type=self.cp_comm_type,
+                    device=query.device,
+                    cp_group=cp_group,
+                )
+                row_start = sequence_parallel_tp_row_start
+                nonpacked_query_positions = full_query_positions[
+                    row_start : row_start + sq
+                ].contiguous()
+
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
         qr = qr.detach()
@@ -1785,20 +1892,28 @@ class DSAttention(MegatronModule):
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
-        float_mask, varlen_params = dsa_masking.build_dsattention_forward_mask(
-            sq=sq,
-            skv=skv,
-            b=b,
-            device=x.device,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            cp_comm_type=self.cp_comm_type,
-            cp_group=cp_group,
-            attn_mask_type=attn_mask_type,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            packed_query_positions=packed_query_positions,
+        if use_indexer_loss and sequence_parallel_query_is_local:
+            raise RuntimeError(
+                "DSA indexer loss requires TP ranks to own the same query rows; "
+                "sequence-local TP query shards cannot form a global-head target."
+            )
+        float_mask, varlen_params, varlen_is_plain_causal = (
+            dsa_masking.build_dsattention_forward_mask(
+                sq=sq,
+                skv=skv,
+                b=b,
+                device=x.device,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                cp_comm_type=self.cp_comm_type,
+                cp_group=cp_group,
+                attn_mask_type=attn_mask_type,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                packed_query_positions=packed_query_positions,
+                nonpacked_query_positions=nonpacked_query_positions,
+            )
         )
         if varlen_params is not None:
             varlen_starts, varlen_ends, key_positions = varlen_params
@@ -1815,6 +1930,7 @@ class DSAttention(MegatronModule):
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
+            and key_positions is None
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -1836,6 +1952,11 @@ class DSAttention(MegatronModule):
         topk_indices = None
         topk_length = None
         q = k = weights = None
+        local_packed_cp_query_start = 0
+        local_packed_cp_query_len = sq
+        if sequence_parallel_query_is_local:
+            local_packed_cp_query_start = sequence_parallel_tp_row_start
+            local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
         if self.skip_topk:
             assert topk_holder is not None
@@ -1855,16 +1976,38 @@ class DSAttention(MegatronModule):
                 topk_length = topk_length_holder.get(self.source_layer)
         else:
             assert self.indexer is not None
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            if cp_size > 1 and k.size(0) == sq:
-                k = gather_from_sequence_parallel_region(k, group=cp_group)
-                if kv_reorder_idx is not None:
+            with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                if cp_size > 1 and k.size(0) in local_cp_kv_lens:
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
+                    k = gather_from_sequence_parallel_region(k, group=cp_group)
                     if k.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
                             "DSA gathered indexer-key length mismatch: "
                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
                     k = k.index_select(0, kv_reorder_idx)
+                if sequence_parallel_tp and q.size(0) != sq:
+                    if (
+                        q.size(0) != sequence_parallel_tp_full_rows
+                        or weights.size(0) != sequence_parallel_tp_full_rows
+                    ):
+                        raise RuntimeError(
+                            "DSA sequence-parallel indexer row count mismatch: "
+                            f"q_rows={q.size(0)}, weights_rows={weights.size(0)}, "
+                            f"query_rows={sq}, full_rows={sequence_parallel_tp_full_rows}, "
+                            f"tp_size={tp_size}"
+                        )
+                    if not sequence_parallel_query_is_local:
+                        raise RuntimeError(
+                            "DSA indexer produced TP-gathered rows while attention query rows "
+                            "were not sequence-local."
+                        )
+                    row_start = sequence_parallel_tp_row_start
+                    row_end = row_start + sq
+                    q = q[row_start:row_end].contiguous()
+                    weights = weights[row_start:row_end].contiguous()
 
         def compute_indexer_loss_with_reference_path():
             key_for_loss = key.detach()
@@ -1904,7 +2047,7 @@ class DSAttention(MegatronModule):
                 indexer_weights=weights,
                 indexer_topk=self.index_topk,
                 softmax_scale=self.softmax_scale,
-                loss_coeff=indexer_loss_coeff,
+                loss_coeff=indexer_loss_coeff if use_indexer_loss else 0.0,
                 sparse_loss=sparse_indexer_loss,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
                 absorbed_mla=absorbed_mla,
@@ -1915,8 +2058,13 @@ class DSAttention(MegatronModule):
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
                 query_valid_rows=query_valid_rows,
+                varlen_is_plain_causal=varlen_is_plain_causal,
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 use_local_indexer_varlen=use_local_indexer_varlen,
+                single_packed_thd_sequence=single_packed_thd_sequence,
+                local_packed_cp_rank=cp_rank,
+                local_packed_cp_query_start=local_packed_cp_query_start,
+                local_packed_cp_query_len=local_packed_cp_query_len,
                 pg_collection=self.pg_collection,
             )
         if fused_output is not None:
@@ -1949,6 +2097,25 @@ class DSAttention(MegatronModule):
 
         indexer_loss = None
 
+        def slice_topk_to_local_sequence_parallel_rows():
+            nonlocal topk_indices, topk_length
+            if topk_indices is None or not sequence_parallel_query_is_local:
+                return
+            topk_sq = topk_indices.size(1)
+            if topk_sq == sq:
+                return
+            expected_topk_sq = sequence_parallel_tp_full_rows
+            if topk_sq != expected_topk_sq:
+                raise RuntimeError(
+                    "DSA sequence-parallel top-k row count mismatch: "
+                    f"topk_rows={topk_sq}, query_rows={sq}, tp_size={tp_size}"
+                )
+            row_start = sequence_parallel_tp_row_start
+            row_end = row_start + sq
+            topk_indices = topk_indices[:, row_start:row_end].contiguous()
+            if topk_length is not None:
+                topk_length = topk_length[:, row_start:row_end].contiguous()
+
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
             # ===================================
@@ -1975,12 +2142,20 @@ class DSAttention(MegatronModule):
                     calculate_per_token_loss=self.config.calculate_per_token_loss,
                     use_relu=self.config.dsa_indexer_scoring_relu,
                     use_local_indexer_varlen=use_local_indexer_varlen,
+                    single_packed_thd_sequence=single_packed_thd_sequence,
+                    local_packed_cp_rank=cp_rank,
+                    local_packed_cp_query_start=local_packed_cp_query_start,
+                    local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
+            # No TP-local top-k slicing here: the guard above forbids the indexer loss
+            # under sequence-local TP query shards, so the top-k rows are already global.
 
             # Save indexer loss for logging.
             if indexer_loss_coeff > 0:
@@ -2010,22 +2185,31 @@ class DSAttention(MegatronModule):
                     block_size=max(1, block_size),
                     use_relu=self.config.dsa_indexer_scoring_relu,
                     use_local_indexer_varlen=use_local_indexer_varlen,
+                    single_packed_thd_sequence=single_packed_thd_sequence,
+                    local_packed_cp_rank=cp_rank,
+                    local_packed_cp_query_start=local_packed_cp_query_start,
+                    local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
-                _, topk_indices = fused_qk_topk_naive(
-                    q,
-                    k,
-                    weights,
-                    self.index_topk,
-                    mask=float_mask,
-                    varlen_starts=varlen_starts,
-                    varlen_ends=varlen_ends,
-                    key_positions=key_positions,
-                    use_relu=self.config.dsa_indexer_scoring_relu,
-                )
+                with torch.no_grad():
+                    index_scores, topk_indices = fused_qk_topk_naive(
+                        q,
+                        k,
+                        weights,
+                        self.index_topk,
+                        mask=float_mask,
+                        varlen_starts=varlen_starts,
+                        varlen_ends=varlen_ends,
+                        key_positions=key_positions,
+                        use_relu=self.config.dsa_indexer_scoring_relu,
+                    )
+                    del index_scores
+            slice_topk_to_local_sequence_parallel_rows()
 
         if self.index_share and computes_topk:
             assert topk_holder is not None and topk_indices is not None
