@@ -435,13 +435,14 @@ def apply_swiglu_sharded_factory(
     )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
-    # Detect TP-DP strided sharding (FSDP), in which case we need to map [W; V] to
-    # [ {W_tp0; V_tp0}_dp{1...DP}, {W_tp1; V_tp1}_dp{1...DP}, ... ]
-    # TP sharding produces TP-sharded pairs of W/V, followed by DP sharding!
-    assert tp_group is not None and dp_group is not None
-    tp_size = get_pg_size(tp_group)
-    dp_size = get_pg_size(dp_group)
-    is_dp_sharded = getattr(original_sh_ten, "is_torch_fsdp2_param", False) and dp_size > 1
+    # Only FSDP2 supports torch_dist ShardedTensor. (Add other DP sharding algos here if needed.)
+    is_torch_fsdp2_param = getattr(original_sh_ten, "is_torch_fsdp2_param", False)
+    if is_torch_fsdp2_param:
+        assert dp_group is not None
+        dp_size = get_pg_size(dp_group)
+        is_dp_sharded = dp_size > 1
+    else:
+        is_dp_sharded = False
 
     @torch.no_grad()
     def sh_ten_build_fn(
@@ -486,10 +487,17 @@ def apply_swiglu_sharded_factory(
         ]
 
     @torch.no_grad()
-    def fsdp2_sh_ten_build_fn(
+    def dp_sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        # FSDP2 shards the TP-local [W; V] SwiGLU FC1 tensor over DP along dim 0.
+        assert not singleton_local_shards, (
+            "FSDP does not support singleton ShardedTensor for SwiGLU fused FC1. "
+            "Set singleton_local_shards=False, which is the default in MCore."
+        )
+        # FSDP shards the TP-local [W; V] SwiGLU FC1 tensor over DP along dim 0.
+        # TP sharding produces TP-sharded pairs of W/V, followed by DP sharding!
+        assert tp_group is not None and dp_group is not None
+        tp_size = get_pg_size(tp_group)
         global_axis = swiglu_shard_axis + prepend_axis_num
         tp_rank = get_pg_rank(tp_group)
         dp_rank = get_pg_rank(dp_group)
@@ -500,8 +508,8 @@ def apply_swiglu_sharded_factory(
         half_axis_size = tp_local_axis_size // 2
         # Check that the TP-local W or V is cleanly divisible by DP.
         assert half_axis_size % local_axis_size == 0, (
-            "SwiGLU FSDP2 torch_dist checkpoint loading requires each DP shard of "
-            "linear_fc1 to fall wholly inside either the W or V half."
+            "SwiGLU FC1 FSDP ShardedTensor requires each DP shard of "
+            "linear_fc1 to be completely inside either the W or V half."
         )
         # Number of DP shards per W or V TP-shard, and make sure
         # that DP sharding spans both W and V.
@@ -512,13 +520,13 @@ def apply_swiglu_sharded_factory(
         swiglu_half_idx, half_dp_shard_idx = divmod(dp_rank, shards_per_half)
         # If W, then 0. If V, then 1.
         assert swiglu_half_idx in (0, 1)
-        # Map [W; V] to this rank's shard [W_tpx_dpy; V_tpx_dpy].
+        # Map [ W; V ] to this rank's shard [ {W_tpx; V_tpx}_dpy ].
         shard_rank_offset = (
-            # W or V
+            # W or V half of the [W; V] global data.
             swiglu_half_idx * tp_size * shards_per_half
-            # TP Shard
+            # TP Shard Index
             + tp_rank * shards_per_half
-            # TP-DP Shard
+            # TP-DP Shard Index
             + half_dp_shard_idx
         )
 
@@ -534,7 +542,7 @@ def apply_swiglu_sharded_factory(
         ]
 
     # Construct a ShardedTensorFactory.
-    sh_ten_factory_build_function = fsdp2_sh_ten_build_fn if is_dp_sharded else sh_ten_build_fn
+    sh_ten_factory_build_function = dp_sh_ten_build_fn if is_dp_sharded else sh_ten_build_fn
     return ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
