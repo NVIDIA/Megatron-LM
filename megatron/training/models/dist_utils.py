@@ -27,7 +27,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_pg_rank
 
 
 try:
@@ -213,7 +213,7 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
         print(
             " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
-                pg_collection.gtp_remat.rank(),
+                get_pg_rank(pg_collection.gtp_remat),
                 pg_collection.pp.rank(),
                 sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model]),
             ),
