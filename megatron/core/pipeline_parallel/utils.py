@@ -17,6 +17,11 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+try:
+    from transformer_engine.pytorch.ep import is_symm_backed
+except ImportError:
+    is_symm_backed = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,7 +233,9 @@ class ScheduleNode:
             for input in inputs:
                 if input is not None:
                     input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+                    # Skip symmetric-memory (zero-copy EP) buffers
+                    if is_symm_backed is None or not is_symm_backed(input):
+                        input.untyped_storage().resize_(0)
 
         return self.output
 

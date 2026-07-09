@@ -933,11 +933,11 @@ class TransformerConfig(ModelParallelConfig):
     later); the dispatcher asserts this. On older GPUs leave it False (dynamic shape). Defaults to
     False (narrow to the received tokens)."""
 
-    moe_ncclep_use_symm_mem: bool = False
+    moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
-    staged-copy path. NOT SUPPORTED YET -- the dispatcher rejects this if set; the cross-stream
-    reuse ordering for the persistent symm-mem buffer is not implemented. Leave False."""
+    staged-copy path, saving one copy on the wire. Requires moe_ncclep_static_shape and the fused op
+    (use_transformer_engine_op_fuser). Defaults to False."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a

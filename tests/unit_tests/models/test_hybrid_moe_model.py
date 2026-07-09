@@ -190,7 +190,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_ncclep_static_shape": False,
-    "moe_ncclep_use_symm_mem": False,
+    "moe_ncclep_zero_copy": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_paged_stash": False,
