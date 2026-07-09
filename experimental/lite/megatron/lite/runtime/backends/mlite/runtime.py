@@ -31,6 +31,12 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
         and impl_cfg_kwargs.get("attention_backend_override") is None
     ):
         impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
+    if (
+        "router_aux_loss_coef" in init_fields
+        and impl_cfg_kwargs.get("router_aux_loss_coef") is None
+        and rt_cfg.router_aux_loss_coef is not None
+    ):
+        impl_cfg_kwargs["router_aux_loss_coef"] = rt_cfg.router_aux_loss_coef
     if "hf_path" in init_fields and impl_cfg_kwargs.get("hf_path") in (None, "") and rt_cfg.hf_path:
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
     # Thread the user-level OptimizerConfig so the protocol can pass it to
