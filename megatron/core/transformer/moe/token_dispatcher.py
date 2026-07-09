@@ -74,9 +74,9 @@ def _get_ep_combine_max_rows(tokens_per_expert: torch.Tensor, ep_size: int) -> t
         )
 
     split_matrix = tokens_per_expert.reshape(ep_size, ep_size, -1).sum(dim=-1)
-    max_input_rows = split_matrix.sum(dim=0).max()
-    max_output_rows = split_matrix.sum(dim=1).max()
-    return torch.maximum(max_input_rows, max_output_rows)
+    max_received_rows = split_matrix.sum(dim=0).max()
+    max_sent_rows = split_matrix.sum(dim=1).max()
+    return torch.maximum(max_received_rows, max_sent_rows)
 
 
 class _ChunkedAllToAllAndUnpermute(torch.autograd.Function):
