@@ -859,7 +859,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
+    ``use_transformer_engine_op_fuser=True``.
     """
 
     moe_single_grouped_bias: bool = False
@@ -1858,12 +1859,11 @@ class TransformerConfig(ModelParallelConfig):
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
             if not self.use_transformer_engine_op_fuser:
-                warnings.warn(
-                    "moe_single_grouped_weight=True without "
-                    "use_transformer_engine_op_fuser=True is functionally supported but not "
-                    "performance-optimized. The non-op-fuser TE GroupedLinear path may split "
-                    "the grouped weight into per-expert tensors for GEMM; enable "
-                    "--use-transformer-engine-op-fuser for the fast grouped-weight path."
+                raise ValueError(
+                    "moe_single_grouped_weight requires "
+                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
+                    "path splits the grouped parameter into per-expert tensors and does not "
+                    "support single-grouped-weight training."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
