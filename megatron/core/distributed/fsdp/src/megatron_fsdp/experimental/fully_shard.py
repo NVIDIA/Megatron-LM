@@ -14,11 +14,14 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpModule
+from .module import FsdpContext, FsdpModule
 from .placement import Placements
 
 
@@ -27,6 +30,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    use_symm_mem: bool = False,
 ) -> None:
     """Shard one module as a per-module FSDP unit.
 
@@ -39,6 +43,8 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
+        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
+            PyTorch's NCCL symmetric-memory pool.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -49,11 +55,36 @@ def fully_shard(
     try:
         assert isinstance(module, FsdpModule)
         FsdpModule.__init__(
-            module, mesh=mesh, placements=placements, mixed_precision_policy=mixed_precision_policy
+            module,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=mixed_precision_policy,
+            use_symm_mem=use_symm_mem,
         )
     except Exception:
         module.__class__ = original_cls
         raise
+
+
+@contextmanager
+def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
+    """Scope experimental FSDP state to one microbatch.
+
+    Args:
+        module: Module tree whose experimental FSDP roots should use this microbatch state.
+        is_last: Whether forwards in this scope are for the last microbatch.
+    """
+    contexts: list[FsdpContext] = []
+    _collect_fsdp_contexts(module, contexts)
+    previous_states = [(context, context.is_last_microbatch) for context in contexts]
+    for context in contexts:
+        context.is_last_microbatch = is_last
+
+    try:
+        yield
+    finally:
+        for context, is_last_microbatch in previous_states:
+            context.is_last_microbatch = is_last_microbatch
 
 
 def _attach_mixin(module: nn.Module) -> None:
@@ -62,3 +93,13 @@ def _attach_mixin(module: nn.Module) -> None:
     module_cls = module.__class__
     fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
     module.__class__ = fsdp_cls
+
+
+def _collect_fsdp_contexts(module: nn.Module, contexts: list[FsdpContext]) -> None:
+    if isinstance(module, FsdpModule):
+        module._lazy_init_context()
+        contexts.append(module.context)
+        return
+
+    for child in module.children():
+        _collect_fsdp_contexts(child, contexts)
