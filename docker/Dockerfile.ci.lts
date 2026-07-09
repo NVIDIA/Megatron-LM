@@ -44,6 +44,9 @@ COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
+# The 25.09 LTS base image does not ship nccl_device.h, which TE 2.17's
+# optional NCCL EP component needs when building for Hopper/Blackwell.
+ENV NVTE_WITH_NCCL_EP=0
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
