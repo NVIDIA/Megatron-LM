@@ -83,7 +83,7 @@ def test_two_child_subtrees_then_parent_collapse_to_one_context(distributed_setu
 
 
 def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
-    """Independent FSDP roots should not share runtime state."""
+    """Independent FSDP roots should not share runtime scheduling state."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
