@@ -3680,7 +3680,13 @@ def checkpoint_and_decide_exit(
         done_cuda = torch.tensor(
             [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
         )
-        torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
+        # Per-iteration collective in checkpoint_and_decide_exit (which has no
+        # span of its own), right after the checkpoint dispatch. Being a
+        # collective it absorbs cross-rank skew, so it dominates the otherwise-
+        # dark post-checkpoint gap: fast ranks wait here for the heaviest
+        # fully-parallel-save writer. Spanning it makes that wait readable.
+        with _otel_managed_span('checkpoint', 'megatron.exit_duration_barrier'):
+            torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
         if done:
             if args.save and not saved_checkpoint:
@@ -4154,7 +4160,11 @@ def train(
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
                 nsys_nvtx_context.__enter__()
 
-        ft_integration.on_checkpointing_start()
+        # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
+        # main-thread work that sits in the post-checkpoint gap alongside the
+        # exit-duration barrier.
+        with _otel_managed_span('checkpoint', 'megatron.ft_checkpointing_start'):
+            ft_integration.on_checkpointing_start()
         # Non-blocking finalize of the *previous* async checkpoint, on the
         # training critical path -- this is the "exposed" cost the async save
         # imposes back on the loop (the flip side of the background write span
@@ -4342,9 +4352,13 @@ def train(
             else:
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
-                # `forward_backward_func`.
+                # `forward_backward_func`. One-time (iteration == start_iteration)
+                # param-gather pre-hook re-enable -- runs between the train_step
+                # and train_log spans on the first iteration only, which is
+                # exactly the ~1.8s post-first-iteration gap.
                 if should_disable_forward_pre_hook(args):
-                    enable_forward_pre_hook(model)
+                    with _otel_managed_span('first_iteration', 'megatron.enable_forward_pre_hook'):
+                        enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
