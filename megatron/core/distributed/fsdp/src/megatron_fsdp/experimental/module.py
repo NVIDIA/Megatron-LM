@@ -30,6 +30,7 @@ class FsdpContext:
     """Runtime stream and forward-prefetch state shared by one FSDP subtree."""
 
     allgather_stream: torch.cuda.Stream
+    reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
@@ -52,6 +53,7 @@ class FsdpContext:
         self.forward_order = []
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
+            self.reduce_scatter_stream = torch.cuda.Stream()
 
     def next_of(self, module: "FsdpModule") -> "FsdpModule | None":
         """Return the FSDP unit that runs right after ``module`` in forward, if any."""
@@ -61,6 +63,31 @@ class FsdpContext:
                     return self.forward_order[index + 1]
                 return None
         return None
+
+    def next_backward_of(self, module: "FsdpModule") -> "FsdpModule | None":
+        """Return the next FSDP unit in the reverse forward traversal."""
+        if module is self.root_module:
+            return self.forward_order[-1] if len(self.forward_order) > 1 else None
+
+        for index in range(1, len(self.forward_order)):
+            if self.forward_order[index] is module:
+                return self.forward_order[index - 1] if index > 1 else None
+        return None
+
+    def register_post_backward_final_callback(self) -> None:
+        """Register this root context's final callback for the current backward.
+
+        Root ``post_backward()`` means only that root-owned parameters have
+        accumulated gradients; it may run before descendant reductions, or not
+        run at all when the root owns no trainable parameters. Waiting at
+        autograd completion orders consumers after every descendant reduction.
+        """
+
+        def post_backward_final_callback() -> None:
+            current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
+            current_stream.wait_stream(self.reduce_scatter_stream)
+
+        torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
 
 class FsdpModule:
@@ -237,20 +264,6 @@ class FsdpModule:
                 group.unshard_parameters()
         self._is_unsharded = True
 
-    def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
-        """Materialize full parameters for this FSDP unit (backward path)."""
-        allgather_stream = self.context.allgather_stream
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
-
-        with torch.cuda.stream(allgather_stream):
-            for group in self._parameter_groups:
-                if sync_model_weight:
-                    # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
-                    # optimizer post-step hook instead of running it every microbatch.
-                    group.sync_model_weight_from_main_weight()
-                group.unshard_parameters()
-        current_stream.wait_stream(allgather_stream)
-
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         self._reshard_parameter_groups()
@@ -279,19 +292,49 @@ class FsdpModule:
             group.reshard_parameters()
 
     def pre_backward(self) -> None:
-        """Prepare full parameters for backward compute."""
+        """Prepare full parameters and prefetch the next unit in backward order."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
-        self._unshard_parameter_groups(sync_model_weight=False)
+        context = self.context
+        if self.is_root():
+            context.register_post_backward_final_callback()
+        allgather_stream = context.allgather_stream
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+
+        if not self._is_unsharded:
+            self._issue_unshard(sync_model_weight=False)
+        current_stream.wait_stream(allgather_stream)
+
+        next_module = context.next_backward_of(self)
+        if next_module is not None and not next_module._is_unsharded:
+            next_module._issue_unshard(sync_model_weight=False)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        for group in self._parameter_groups:
-            if group.requires_grad:
-                group.reduce_gradients()
+        self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self._release_after_compute()
         self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
+
+    def _reduce_gradient_groups(self) -> None:
+        """Pack gradients and immediately launch their reduce-scatters."""
+        context = self.context
+        reduce_scatter_stream = context.reduce_scatter_stream
+        current_stream = torch.cuda.current_stream(reduce_scatter_stream.device)
+
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+
+            with torch.cuda.stream(reduce_scatter_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+
+            current_stream.wait_stream(reduce_scatter_stream)
+            group.copy_gradients_to_partial_buffer(partial_grad)
+
+            reduce_scatter_stream.wait_stream(current_stream)
+            with torch.cuda.stream(reduce_scatter_stream):
+                group.reduce_partial_gradients(partial_grad)
 
     def release_unsharded_storage(self) -> None:
         """Release unsharded storage owned by this FsdpModule."""
