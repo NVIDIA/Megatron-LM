@@ -471,6 +471,11 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
     gtp_remat_group = pg_collection.gtp_remat
     egtp_remat_group = pg_collection.expt_gtp_remat
 
+    dense_active = gtp_remat_group is not None and gtp_remat_group.size() > 1
+    expert_active = egtp_remat_group is not None and egtp_remat_group.size() > 1
+    if not dense_active and not expert_active:
+        return
+
     dense_params, dense_grads = [], []
     expert_params, expert_grads = [], []
     for model_chunk in model:
