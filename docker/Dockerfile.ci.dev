@@ -13,10 +13,6 @@ ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
 ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
-ENV NCCL_VERSION=2.30.4
-ENV NCCL_WHEEL_ROOT=/opt/nvidia/nccl-cu13
-ENV NCCL_HOME=${NCCL_WHEEL_ROOT}/nvidia/nccl
-ENV LD_LIBRARY_PATH=${NCCL_HOME}/lib:/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 
 RUN bash -ex <<"EOF"
     apt-get update
@@ -33,19 +29,6 @@ RUN bash -ex <<"EOF"
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
-EOF
-
-# Install the standalone NCCL wheel and expose it to the dynamic linker: create a
-# versionless libnccl.so symlink and register its directory via ldconfig so builds
-# and runtime can link against NCCL without the version-suffixed filename.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    bash -ex <<"EOF"
-    uv pip install --target "${NCCL_WHEEL_ROOT}" --only-binary=:all: "nvidia-nccl-cu13==${NCCL_VERSION}"
-    NCCL_LIB=$(find "${NCCL_HOME}/lib" -maxdepth 1 -name "libnccl.so*" | sort | head -n 1)
-    test -n "${NCCL_LIB}"
-    ln -sfn "$(basename "${NCCL_LIB}")" "${NCCL_HOME}/lib/libnccl.so"
-    echo "${NCCL_HOME}/lib" > /etc/ld.so.conf.d/nvidia-nccl-cu13.conf
-    ldconfig
 EOF
 
 COPY README.md pyproject.toml uv.lock /workspace/
@@ -92,6 +75,7 @@ ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
     if [ "$IMAGE_TYPE" = "lts" ]; then
