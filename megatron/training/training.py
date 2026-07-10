@@ -305,12 +305,12 @@ except ImportError:
 # Hierarchy (when the launch script passes its timestamps through):
 #   slurm.job (outermost -- SLURM_JOB_START_TIME if available (Slurm's own
 #   |          record), else launch_script_start -> job end)
-#   |- slurm.job_prolog (only if SLURM_JOB_START_TIME predates launch_script_start
+#   |- slurm.job.prolog (only if SLURM_JOB_START_TIME predates launch_script_start
 #   |     -- prolog/scheduling overhead before the launch script's first line runs)
 #   |- slurm.startup (launch_script_start -> program_start; immediately closed,
 #   |     fully backdated, nothing live happens "inside" it by the time it's built)
-#   |  |- slurm.launch_script_setup
-#   |  `- slurm.container_load
+#   |  |- slurm.startup.launch_script
+#   |  `- slurm.startup.container_load
 #   `- megatron.pretrain (program_start -> job end)
 #      |- megatron.startup (program_start -> train() begins)
 #      `- megatron.train (decorated separately, started later)
@@ -375,12 +375,13 @@ def _start_otel_job_spans(model_type, program_start):
         # predate launch_script_start (prolog/scheduling overhead the launch
         # script's first line can't see). min() guards against SLURM_JOB_START_TIME
         # somehow landing after our own first timestamp, which would otherwise
-        # produce a negative-duration slurm.job_prolog span below.
+        # produce a negative-duration slurm.job.prolog span below.
         job_start = launch_script_start
         if slurm_job_start_time is not None:
             job_start = min(slurm_job_start_time, launch_script_start)
 
         _otel_slurm_job_span = _otel_tracer.start_span('slurm.job', start_time=int(job_start * 1e9))
+        _otel_tag_span(_otel_slurm_job_span, 'job')
         _otel_slurm_job_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_otel_slurm_job_span)
         )
@@ -389,27 +390,49 @@ def _start_otel_job_spans(model_type, program_start):
         # first line actually running -- prolog scripts, node setup, etc. Only
         # meaningful (and only created) if that gap is real and positive.
         if slurm_job_start_time is not None and slurm_job_start_time < launch_script_start:
-            _backdated_otel_span('slurm.job_prolog', slurm_job_start_time, launch_script_start)
+            _backdated_otel_span('slurm.job.prolog', slurm_job_start_time, launch_script_start)
 
         # slurm.startup: sibling of megatron.pretrain under slurm.job, covering
         # everything before Python itself started running.
         _slurm_startup_span = _otel_tracer.start_span(
             'slurm.startup', start_time=int(launch_script_start * 1e9)
         )
+        _otel_tag_span(_slurm_startup_span, 'job')
         _slurm_startup_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_slurm_startup_span)
         )
-        _backdated_otel_span('slurm.launch_script_setup', launch_script_start, launch_script_presrun)
-        _backdated_otel_span('slurm.container_load', launch_script_presrun, program_start)
+        _backdated_otel_span('slurm.startup.launch_script', launch_script_start, launch_script_presrun)
+        _backdated_otel_span('slurm.startup.container_load', launch_script_presrun, program_start)
         _otel_ctx.detach(_slurm_startup_ctx_token)
         _slurm_startup_span.end(end_time=_program_start_ns)
 
     _otel_pretrain_span = _otel_tracer.start_span("megatron.pretrain", start_time=_program_start_ns)
+    _otel_tag_span(_otel_pretrain_span, 'job')
     _otel_set_attrs(_otel_pretrain_span, {'megatron.model_type': str(model_type)})
     _otel_pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_pretrain_span))
 
     _otel_startup_span = _otel_tracer.start_span("megatron.startup", start_time=_program_start_ns)
+    _otel_tag_span(_otel_startup_span, 'job')
     _otel_startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_startup_span))
+
+
+def _otel_tag_span(span, group):
+    """Stamp lens.group + lens.span_category on a manually created span.
+
+    managed_span/trace_fn do this automatically; the job/startup structural spans
+    are created via the explicit start_span API (they must outlive the function
+    that opens them), so they need the same two attributes stamped by hand to
+    stay sliceable by category (goodput/profiling) offline.
+    """
+    try:
+        from nemo.lens.state import category_of
+
+        span.set_attribute('lens.group', group)
+        _c = category_of(group)
+        if _c is not None:
+            span.set_attribute('lens.span_category', _c)
+    except Exception:  # noqa: BLE001 -- telemetry must never break training
+        pass
 
 
 def _backdated_otel_span(name, start, end):
@@ -418,6 +441,7 @@ def _backdated_otel_span(name, start, end):
         return
     _otel_tracer = get_telemetry().tracer
     _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
+    _otel_tag_span(_s, 'job')
     _s.end(end_time=int(end * 1e9))
 
 
@@ -461,6 +485,7 @@ def _start_otel_train_span():
     from opentelemetry import context as _otel_ctx, trace as _otel_trace
 
     _otel_train_span = get_telemetry().tracer.start_span('megatron.train')
+    _otel_tag_span(_otel_train_span, 'job')
     _otel_train_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_train_span))
 
 
@@ -1501,7 +1526,7 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    with _otel_managed_span('model_init', 'megatron.model_init'):
+    with _otel_managed_span('model_init', 'megatron.startup.model_init'):
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             model_type,
             model_provider_func=model_provider,
@@ -1619,7 +1644,7 @@ def pretrain(
     # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    with _otel_managed_span('data_loading', 'megatron.setup_data_iterators'):
+    with _otel_managed_span('data_loading', 'megatron.startup.dataloader'):
         if args.virtual_pipeline_model_parallel_size is not None:
             train_data_iterator = []
             valid_data_iterator = []
@@ -2520,7 +2545,7 @@ def setup_model_and_optimizer(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        with _otel_managed_span('load_checkpoint', 'megatron.load_checkpoint'):
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load'):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
             args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
@@ -2739,7 +2764,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
-            span_cm("megatron.forward_backward", tracer=_otel_step_tracer,
+            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, group='forward_backward',
                     num_microbatches=get_num_microbatches())
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None
             else nullcontext()
@@ -2813,7 +2838,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     _opt_cm = (
-        span_cm("megatron.optimizer_step", tracer=_otel_step_tracer)
+        span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer, group='optimizer')
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
     )
     with _opt_cm as _opt_span:
@@ -3462,7 +3487,7 @@ def save_checkpoint_and_time(
         report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
 
     # Save checkpoint.
-    with _otel_managed_span('checkpoint', 'megatron.save_checkpoint', **{'megatron.iteration': iteration}):
+    with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', **{'megatron.iteration': iteration}):
         save_checkpoint(
             iteration,
             model,
@@ -3513,14 +3538,15 @@ def save_checkpoint_and_time(
     timers('interval-time', log_level=0).start(barrier=True)
 
 
-def _run_gpu_sniff_test(tag):
+def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
-    # One span here covers both call sites (the once-at-start 'before training'
-    # run in train()'s preamble and the periodic --gpu-sniff-test-interval runs
-    # in the step loop); the tag attribute distinguishes them.
-    with _otel_managed_span('job', 'megatron.gpu_sniff_test', **{'megatron.sniff_test.tag': tag}):
+    # Two call sites with distinct span names (span_name): the once-at-start
+    # 'megatron.startup.sniff_test' run in train()'s preamble, and the periodic
+    # --gpu-sniff-test-interval 'megatron.train.sniff_test' runs in the step
+    # loop. The tag attribute additionally records which invocation this is.
+    with _otel_managed_span('job', span_name, **{'megatron.sniff_test.tag': tag}):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=['ep', 'dp', 'tp'],
         )
@@ -3685,7 +3711,7 @@ def checkpoint_and_decide_exit(
         # collective it absorbs cross-rank skew, so it dominates the otherwise-
         # dark post-checkpoint gap: fast ranks wait here for the heaviest
         # fully-parallel-save writer. Spanning it makes that wait readable.
-        with _otel_managed_span('checkpoint', 'megatron.exit_duration_barrier'):
+        with _otel_managed_span('checkpoint', 'megatron.train.exit_barrier'):
             torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
         if done:
@@ -3752,18 +3778,6 @@ def train(
     """
     args = get_args()
     timers = get_timers()
-
-    # OTel: the train() preamble below (up to the training loop) is one-off setup
-    # -- forward-backward wrapping, the pedantic weight-hash-across-DP check, the
-    # first collective, CUDA-graph helper init, forward pre-hook management -- and
-    # can be a multi-second chunk with no finer span inside megatron.train until
-    # the first train_step. start_span (not managed_span) so it auto-parents to
-    # megatron.train (the current span from this function's @_otel_trace_fn
-    # decorator) without indenting the whole preamble into a `with` block; ended
-    # explicitly right before the `while` loop below.
-    _train_setup_span = None
-    if _otel_sg_enabled('job'):
-        _train_setup_span = get_telemetry().tracer.start_span('megatron.train_setup')
 
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -3962,7 +3976,7 @@ def train(
 
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
-        _run_gpu_sniff_test('before training')
+        _run_gpu_sniff_test('before training', span_name='megatron.startup.sniff_test')
 
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
@@ -4109,9 +4123,9 @@ def train(
     # Also, check weight hash across DP replicas to be very pedantic. This hashes
     # every parameter and all-reduces across DP replicas + a barrier -- it's
     # typically the dominant cost of the train() preamble, so it gets its own
-    # span rather than being lumped into megatron.train_setup.
+    # span (parented to megatron.startup, still open here).
     if args.check_weight_hash_across_dp_replicas_interval is not None:
-        with _otel_managed_span('job', 'megatron.check_weight_hashes'):
+        with _otel_managed_span('job', 'megatron.startup.weight_hash_check'):
             assert check_param_hashes_across_dp_replicas(
                 model, cross_check=True
             ), "Parameter hashes not matching across DP replicas"
@@ -4128,14 +4142,8 @@ def train(
             optimizers=[optimizer],
         )
 
-    # OTel: end the train-setup span -- the training loop (each iteration its own
-    # megatron.train_step span) begins here.
-    if _train_setup_span is not None:
-        _train_setup_span.end()
-        _train_setup_span = None
-
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
-    # test, cuda-graph setup) was init and parented to megatron.startup, which
+    # test, cuda-graph helper init) was init and parented to megatron.startup, which
     # stayed open through it. Close startup and open megatron.train now -- the
     # steady-state loop is its own span, a sibling of megatron.startup under
     # megatron.pretrain. (Previously train() carried an @_otel_trace_fn
@@ -4163,14 +4171,14 @@ def train(
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
         # main-thread work that sits in the post-checkpoint gap alongside the
         # exit-duration barrier.
-        with _otel_managed_span('checkpoint', 'megatron.ft_checkpointing_start'):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.ft_heartbeat'):
             ft_integration.on_checkpointing_start()
         # Non-blocking finalize of the *previous* async checkpoint, on the
         # training critical path -- this is the "exposed" cost the async save
         # imposes back on the loop (the flip side of the background write span
         # on the worker), and shows up as a per-iteration gap near checkpoint
         # boundaries. Cheap most iterations, blocks when finalizing.
-        with _otel_managed_span('checkpoint', 'megatron.finalize_async_save'):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.finalize'):
             maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
         # Update the timeout for all process groups after initialization
@@ -4217,14 +4225,14 @@ def train(
 
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
-        # own span, distinct from the megatron.train_step spans around it.
+        # own span, distinct from the megatron.train.iteration spans around it.
         if (
             args.cuda_graph_impl == "transformer_engine"
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
             with _otel_managed_span(
-                'job', 'megatron.cuda_graph_capture', **{'megatron.iteration': iteration}
+                'job', 'megatron.train.cuda_graph_capture', **{'megatron.iteration': iteration}
             ):
                 if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(model, param_sync=False)
@@ -4290,14 +4298,14 @@ def train(
             # prefetch) that steady-state iterations don't pay.
             _first_iter_span_cm = (
                 _otel_managed_span(
-                    'first_iteration', 'megatron.first_iteration',
+                    'first_iteration', 'megatron.train.first_iteration',
                     **{'megatron.iteration': iteration},
                 )
                 if is_first_iteration
                 else nullcontext()
             )
             # OTel: optional per-step span wrapping the real train_step.
-            with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train_step', **{'megatron.iteration': iteration}) as _step_span:
+            with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train.iteration', **{'megatron.iteration': iteration}) as _step_span:
                 ft_integration.on_training_step_start()
                 (
                     loss_dict,
@@ -4357,7 +4365,7 @@ def train(
                 # and train_log spans on the first iteration only, which is
                 # exactly the ~1.8s post-first-iteration gap.
                 if should_disable_forward_pre_hook(args):
-                    with _otel_managed_span('first_iteration', 'megatron.enable_forward_pre_hook'):
+                    with _otel_managed_span('first_iteration', 'megatron.train.forward_pre_hook'):
                         enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
@@ -4449,7 +4457,7 @@ def train(
             learning_rate = None
         # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
         # uninstrumented per-iteration overhead outside the train_step span.
-        with _otel_managed_span('step', 'megatron.train_log'):
+        with _otel_managed_span('step', 'megatron.train.log'):
             report_memory_flag = training_log(
                 loss_dict,
                 total_loss_dict,

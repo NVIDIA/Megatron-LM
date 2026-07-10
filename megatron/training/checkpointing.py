@@ -776,7 +776,7 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        with _otel_managed_span('checkpoint', 'megatron.save_checkpoint.state_dict'):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict'):
             state_dict = generate_state_dict(
                 args,
                 model,
@@ -852,7 +852,7 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            with _otel_managed_span('checkpoint', 'megatron.save_checkpoint.io_write'):
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write'):
                 async_save_request = dist_checkpointing.save(
                     state_dict,
                     checkpoint_name,
@@ -2187,7 +2187,7 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        with _otel_managed_span('load_checkpoint', 'megatron.load_checkpoint.io_read'):
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read'):
             state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
                 load_dir, args, rank0=True, checkpointing_context=checkpointing_context
             )
