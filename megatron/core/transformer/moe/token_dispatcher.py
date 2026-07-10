@@ -1225,19 +1225,10 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        # Expand mode (`do_expand=True` + `do_cpu_sync=False`) is the CUDA-graph-
-        # capturable path on the DeepEP V2 epv2-release branch: the dispatch
-        # writes one slot per (token, expert) pair into a worst-case-sized recv
-        # buffer, with `psum_num_recv_tokens_per_expert[-1]` marking the valid
-        # prefix on device. The matching consumer is a grouped GEMM over the
-        # padded buffer with on-device cumulative offsets, implemented as
-        # `InferenceGroupedMLP._deepep_v2_expand_forward`. combine() discards
-        # padding slots, so wasted compute on padding rows is harmless.
-        # MCORE_DEEPEP_V2_DISABLE_EXPAND=1 forces the standard (non-expand) path
-        # for A/B-testing whether bugs live in the expanded-layout consumer. The
-        # non-expand path uses CPU sync so it cannot be CUDA-graphed, but for
-        # debugging correctness it routes through the same tested permute →
-        # grouped_gemm → combine flow used by training.
+        # Expanded layout (do_expand=True, do_cpu_sync=False): graph-capturable path where dispatch
+        # writes one slot per (token, expert) into a padded recv buffer; the expert GEMM uses
+        # on-device offsets and combine() discards the padding.
+        # Set MCORE_DEEPEP_V2_DISABLE_EXPAND=1 to force the non-expand path for correctness A/B.
         _disable_expand = os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
         self.enable_expanded_layout_for_inference = (
             self.use_deepep_v2
@@ -1268,25 +1259,6 @@ class _DeepepManager(_DispatchManager):
             and self.token_indices.dtype != DEEPEP_TOPK_IDX_DTYPE
         ):
             self.token_indices = self.token_indices.to(DEEPEP_TOPK_IDX_DTYPE)
-        # DEBUG (unconditional, capture-gated): surface within-row duplicates
-        # that would trip the `dispatch_copy_epilogue.cuh:106` assertion in
-        # DeepEP V2. Skipped during graph capture because the check uses host
-        # syncs.
-        if not torch.cuda.is_current_stream_capturing():
-            _idx = self.token_indices
-            _valid = _idx >= 0
-            _idx_for_uniq = _idx.masked_fill(~_valid, -1)
-            _sorted, _ = _idx_for_uniq.sort(dim=-1)
-            _has_dup = ((_sorted[:, 1:] == _sorted[:, :-1]) & (_sorted[:, 1:] >= 0)).any(dim=-1)
-            if _has_dup.any():
-                _dup_rows = _has_dup.nonzero(as_tuple=False).flatten()[:5].tolist()
-                raise RuntimeError(
-                    f"[deepep_v2 debug] token_indices has within-row duplicates: "
-                    f"router_topk={self.router_topk}, num_experts={self.num_experts}, "
-                    f"num_tokens={num_tokens}, dup_row_count={int(_has_dup.sum())}, "
-                    f"first_dup_rows={_dup_rows}, "
-                    f"sample_rows={_idx[_dup_rows].tolist()}"
-                )
 
     def dispatch(
         self,

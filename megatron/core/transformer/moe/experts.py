@@ -922,11 +922,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-        # When the inference dispatcher is DeepEP V2, the post-dispatch tensors are
-        # already in the per-expert grouped layout the parent TEGroupedMLP expects;
-        # the FlashInfer / mcore_fused_moe paths (which assume a gathered global
-        # tensor + valid_tokens mask) do not apply, so skip their activation
-        # resolution (which has narrower op support than the parent forward).
+        # DeepEP V2 delivers tensors already in per-expert layout; FlashInfer/mcore_fused_moe
+        # (which expect a gathered global tensor + valid_tokens) don't apply.
         self._deepep_v2_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep_v2'
 
         if not self._deepep_v2_dispatcher:
@@ -1094,16 +1091,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, None]:
-        """Graph-capturable expert forward for the DeepEP V2 expand-layout dispatch.
+        """Expert forward for the DeepEP V2 expand-layout dispatch (graph-capturable).
 
-        DeepEP V2's expand mode (`do_expand=True`) writes one slot per
-        (token, expert) pair into a worst-case-sized recv buffer; the valid
-        prefix `[0, tokens_per_expert.sum())` is followed by padding rows that
-        combine() discards. We bypass TE GroupedLinear (whose `.tolist()` host
-        sync breaks CUDA graph capture) and call torch.nn.functional.grouped_mm
-        directly with on-device cumulative offsets. Padding rows past `offs[-1]`
-        are not visited by grouped_mm and end up as uninitialised output —
-        harmless because combine() ignores them.
+        do_expand=True writes one slot per (token, expert) into a worst-case-sized recv buffer.
+        We bypass TE GroupedLinear (its .tolist() host sync breaks graph capture) and call
+        grouped_mm directly with on-device cumsum offsets. Padding rows are harmless — combine()
+        ignores them.
         """
         try:
             from torch.nn.functional import grouped_mm
@@ -1122,36 +1115,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
             not self.config.add_bias_linear
         ), "deepep_v2 expand-layout forward does not yet support add_bias_linear=True."
 
-        # PyTorch's CUTLASS grouped_mm (sm90/sm100 BF16) asserts
-        # offs[-1] == mat1.shape[0]. The recv buffer is sized to the worst-case
-        # `num_max_tokens_per_rank * num_ranks * num_topk` padded total, but
-        # the routed prefix `psum[-1]` is smaller. Extend the last expert's
-        # row range to cover the padding rows: the last expert computes garbage
-        # over the pad slots, which combine() discards.
-        #
-        # Naively this is `offs[-1] = N_padded`, but tensor-setitem with a
-        # Python int does a host->device cudaMemcpyAsync, which is forbidden
-        # during CUDA graph capture. Instead we adjust the last token count
-        # via device-side arithmetic so the cumsum's last element naturally
-        # equals N_padded:
-        #   tokens'[i] = tokens[i]                              for i < N-1
-        #   tokens'[N-1] = N_padded - sum(tokens[:N-1])         (rsub.Scalar)
-        # which is `Python_int - tensor` — kernel-with-constant, capture-safe.
+        # grouped_mm requires offs[-1] == mat1.shape[0], but the recv buffer is padded
+        # beyond the routed prefix. We extend the last expert's range device-side to cover
+        # the padding (tensor-setitem would do a host->device copy, breaking graph capture):
+        #   tokens'[N-1] = N_padded - sum(tokens[:N-1])  (rsub.Scalar — capture-safe)
         N_padded = permuted_local_hidden_states.shape[0]
         sum_first = tokens_per_expert[:-1].sum()
         adjusted_last = (N_padded - sum_first).unsqueeze(0)
         tokens_per_expert_padded = torch.cat([tokens_per_expert[:-1], adjusted_last])
         offs = tokens_per_expert_padded.cumsum(0).to(torch.int32)
 
-        # FC1: input [N, hidden] @ weight^T → [N, ffn_hidden * (2 if gated else 1)]
-        # _fc1_weight is [num_local_experts, ffn_hidden_out, hidden]; grouped_mm
-        # wants [G, K, N], so transpose(1, 2).
+        # _fc1_weight is [E, ffn_hidden_out, hidden]; grouped_mm wants [G, K, N] so transpose.
         fc1_output = grouped_mm(
             permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
         )
 
-        # Activation (+ per-row probs multiply, matching the standard TEGroupedMLP
-        # post-activation prob application).
+        # Activation + per-row prob weighting (mirrors TEGroupedMLP).
         probs_col = permuted_probs.unsqueeze(-1).to(fc1_output.dtype)
         if self.config.gated_linear_unit:
             # SwiGLU when activation_func is silu; otherwise generic gated form.
@@ -1227,11 +1206,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             self._concatenated_weights_built = True
 
         if self._deepep_v2_dispatcher:
-            # DeepEP V2's expand-mode dispatch (used under CUDA graph capture)
-            # writes into a worst-case-padded recv buffer, so sum(tokens_per_expert)
-            # < input.shape[0]. TEGroupedMLP's internal torch.split requires exact
-            # size match and cannot consume the padding. _deepep_v2_expand_forward
-            # calls grouped_mm directly with offs extended to cover pad rows.
             return self._deepep_v2_expand_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )

@@ -334,9 +334,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
-        # The flex/DeepEP token dispatcher uses the combined expert-TP x EP group (tp_ep) for its
-        # A2A, so the DeepEP V2 ElasticBuffer must be allocated against the same group, otherwise
-        # _get_deepep_v2_buffer sees a different group object and discards the prepared buffer.
+        # DeepEP V2 dispatches over tp_ep (expert-TP × EP); the ElasticBuffer must match that group.
         if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
             self.expert_tp_ep_group = pg_collection.tp_ep
         else:
@@ -701,32 +699,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
                 "ElasticBuffer (install from the epv2-release branch)."
             )
-            # moe_latent_size if set, else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-            # ElasticBuffer uses symmetric memory.
-            # To avoid _get_deepep_v2_buffer lazily reallocating based on each rank's x.shape[0]
-            # (i.e. chunked prefill with uneven DP request sizes), we pre-allocate to the worst
-            # case across both captured-graph decode steps and eager prefill steps:
-            #   - decode/spec graph cap: max_requests * (num_speculative_tokens + 1)
-            #   - prefill cap:           round_up_tokens(max_tokens)
-            # then divide by tp_size for the per-rank count.
-            # Pre-allocate two ElasticBuffers — one sized for fixed-shape decode steps, one for
-            # chunked-prefill steps. The engine must call set_deepep_v2_active_dispatch_size
-            # before each forward with the matching cap
-            # (decode_per_rank_cap or prefill_per_rank_cap).
+            # Pre-allocate two ElasticBuffers (symmetric NVLink memory) — one for fixed-shape
+            # decode steps, one for chunked-prefill steps. All ranks must use the same capacity,
+            # so we size to worst-case upfront rather than lazily reallocating per local x.shape[0].
             deepep_decode_per_rank_cap = (
                 self.round_up_tokens(self.max_requests * (self.num_speculative_tokens + 1))
                 // tp_size
             )
             deepep_prefill_per_rank_cap = self.round_up_tokens(self.max_tokens) // tp_size
-            # The decode cap may be larger than max_tokens in extreme configs; ensure
-            # prefill cap is at least decode cap so the fallback "largest pinned buffer"
-            # still covers worst-case.
             deepep_prefill_per_rank_cap = max(
                 deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
             )
-            # Stash the caps so the engine can read them when setting the active dispatch
-            # size per step.
             self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
             self.deepep_v2_prefill_per_rank_cap = deepep_prefill_per_rank_cap
             prepare_deepep_v2_buffer(
@@ -2281,13 +2265,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        # If we're using the DeepEP V2 inference dispatcher, tell it which
-        # pinned ElasticBuffer to use for the upcoming forward step. Decode-only
-        # steps use the smaller decode-cap buffer; any step with prefill
-        # requests uses the larger prefill-cap buffer. This decision must be
-        # identical across all ranks in the dispatch group, which it is —
-        # `is_decode_only()` derives from `padded_batch_dimensions`, an
-        # engine-level value that's already EP-synced by this point.
+        # Select the pre-allocated ElasticBuffer for this step. is_decode_only() is already
+        # EP-synced via padded_batch_dimensions, so all ranks pick the same buffer.
         if self._deepep_v2_ep_dispatcher:
             from megatron.core.transformer.moe.fused_a2a import set_deepep_v2_active_dispatch_size
 

@@ -286,18 +286,13 @@ else:
     set_deepep_num_sms = None
 
 
-# Pool of pre-allocated ElasticBuffers, keyed by (group, num_max_tokens_per_rank).
-# Multiple distinct sizes are pinned at init (e.g. one for decode steps, one for
-# prefill chunks) so the runtime can pick a small buffer for decode without
-# violating DeepEP V2's symmetric-memory invariant — every rank picks the same
-# pool entry by passing the same `num_max_tokens_per_rank`.
+# Pool of pre-allocated ElasticBuffers keyed by (group, num_max_tokens_per_rank).
+# Multiple sizes may be pinned (e.g. one for decode, one for prefill) so the
+# engine can pick the right capacity per step without reallocation.
 _deepep_v2_buffer_pool = {}
 
-# The currently-active per-rank dispatch size, set by the engine before each
-# step via `set_deepep_v2_active_dispatch_size`. The dispatcher uses this to
-# pick which pre-allocated buffer to use, regardless of the local token count
-# (which differs across ranks under chunked prefill). Must be identical across
-# all ranks in the dispatch group at the moment of dispatch.
+# Set by the engine via set_deepep_v2_active_dispatch_size before each forward step.
+# Must be identical across all ranks in the dispatch group.
 _deepep_v2_active_dispatch_size = None
 
 _deepep_v2_num_sms = 0
@@ -307,28 +302,19 @@ _deepep_v2_num_sms_num_topk = None
 
 
 def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
-    """Tell the DeepEP V2 dispatcher which pinned buffer to use for the next dispatch(es).
+    """Set the per-rank dispatch cap for the next forward step.
 
-    The engine MUST call this before each forward step, with a value identical
-    across all ranks in the dispatch group (decode vs chunked-prefill). The
-    DeepEP V2 ElasticBuffer is symmetric NVLink memory: cross-rank reads land
-    on undefined offsets if ranks pick different buffers.
-
-    Pass `None` to revert to "use the largest pinned buffer" (failsafe).
+    Must be called with the same value on all ranks before dispatch; pass None
+    to fall back to the largest pinned buffer.
     """
     global _deepep_v2_active_dispatch_size
     _deepep_v2_active_dispatch_size = num_max_tokens_per_rank
 
 
 def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_size: int):
-    """Select the smallest pinned buffer in the pool that holds `requested_size`.
+    """Return the smallest pinned buffer for `group` with capacity >= `requested_size`.
 
-    Asserts that at least one buffer in the pool is large enough and tied to
-    the same `group`. Lazy reallocation has been removed: any size that the
-    runtime needs must be pre-allocated at init via `prepare_deepep_v2_buffer`,
-    otherwise we raise — silent realloc with a different size on different
-    ranks is exactly the bug pattern that triggers
-    `dispatch_copy_epilogue.cuh:106`.
+    Raises if no such buffer exists — all needed sizes must be pre-allocated at init.
     """
     matching = [
         ((g, sz), buf)
@@ -350,26 +336,14 @@ def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_si
 def _get_deepep_v2_buffer(
     group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ):
-    """Return the pinned ElasticBuffer matching the requested per-rank size.
-
-    Looks up the pool populated by `prepare_deepep_v2_buffer`. The
-    `hidden`/`num_topk` arguments are kept for API compatibility but the
-    pinned buffers were sized at init using these same values; runtime
-    callers don't trigger reallocation.
-    """
+    """Look up the pinned ElasticBuffer for this group and per-rank size."""
     return _select_deepep_v2_buffer(group, num_max_tokens_per_rank)
 
 
 def prepare_deepep_v2_buffer(
     group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ) -> None:
-    """Pin an ElasticBuffer of the given per-rank size in the global pool.
-
-    Call once per distinct size the engine needs (typically two: a decode-cap
-    sized buffer for fixed-shape decode steps, and a prefill-cap sized buffer
-    for chunked-prefill steps). All calls must be made outside any CUDA graph
-    capture region.
-    """
+    """Allocate and pin an ElasticBuffer in the pool. Call at model init, outside graph capture."""
     if not HAVE_DEEP_EP_V2:
         raise RuntimeError(
             "prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). "
@@ -390,10 +364,8 @@ def prepare_deepep_v2_buffer(
 def _tokens_per_expert_from_psum(psum: torch.Tensor) -> torch.Tensor:
     """Recover per-expert token counts from the device-resident inclusive prefix sum.
 
-    Avoids ``torch.tensor(handle.num_recv_tokens_per_expert_list)``, which is a
-    host->device copy that breaks CUDA graph capture. Valid when
-    ``expert_alignment == 1`` (alignment-padded == raw counts), which is the
-    setting used for both the training and inference paths here.
+    Avoids torch.tensor(handle.num_recv_tokens_per_expert_list), which is a host sync
+    that breaks CUDA graph capture.
     """
     return torch.diff(psum, prepend=psum.new_zeros(1))
 
@@ -401,16 +373,10 @@ def _tokens_per_expert_from_psum(psum: torch.Tensor) -> torch.Tensor:
 def _get_deepep_v2_num_sms(
     buffer, group: torch.distributed.ProcessGroup, num_experts: int, num_topk: int
 ) -> int:
-    """Get or calculate the SM count for the current DeepEP V2 layout.
+    """Return the SM count for dispatch, caching across calls with identical (group, experts, topk).
 
-    Defaults to ``buffer.get_theoretical_num_sms(num_experts, num_topk)`` which
-    optimises the dispatch kernel's *standalone* throughput. On a chip with
-    competing concurrent kernels (attention, Mamba, expert FFN) this can
-    over-allocate SMs to dispatch and starve compute. Override with the
-    ``MCORE_DEEPEP_V2_NUM_SMS`` env var to fix the count for tuning sweeps;
-    typical good values on B200 are 8-24 (vs the auto-default of ~30 at
-    EP=64, num_topk=22). Each new value triggers a JIT recompile, so pin
-    ``EP_JIT_CACHE_DIR`` if sweeping.
+    Override with MCORE_DEEPEP_V2_NUM_SMS for tuning sweeps (good values on B200: 8-24).
+    Each new value triggers a JIT recompile; pin EP_JIT_CACHE_DIR when sweeping.
     """
     _override = os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
     if _override is not None:
@@ -451,29 +417,16 @@ class DeepEPV2Dispatch(torch.autograd.Function):
     ):
         local_num_tokens, hidden = x.shape
         num_topk = token_indices.shape[1]
-        # Pick the buffer based on the engine-set active dispatch size, not on
-        # the local token count (which differs across ranks under chunked
-        # prefill). The engine sets this via `set_deepep_v2_active_dispatch_size`
-        # before each forward step. Falls back to "largest pinned buffer" so
-        # paths that haven't been wired to set the active size still work
-        # (just at the worst-case capacity).
-        if _deepep_v2_active_dispatch_size is not None:
-            requested_size = _deepep_v2_active_dispatch_size
-        else:
-            # Fallback: largest pinned buffer for this group. Same behaviour
-            # as the previous single-buffer design.
-            requested_size = max(
+        # Use the engine-set active size rather than local_num_tokens: ElasticBuffer is symmetric
+        # NVLink memory and all ranks must pass the same num_max_tokens_per_rank to dispatch.
+        requested_size = (
+            _deepep_v2_active_dispatch_size
+            if _deepep_v2_active_dispatch_size is not None
+            else max(
                 (sz for (g, sz) in _deepep_v2_buffer_pool if g is group), default=local_num_tokens
             )
+        )
         buffer = _get_deepep_v2_buffer(group, requested_size, hidden, num_topk)
-        # Use the buffer's allocated per-rank capacity rather than the local
-        # token count: ElasticBuffer is symmetric NVLink memory, so every rank
-        # MUST pass the same `num_max_tokens_per_rank` to `buffer.dispatch`,
-        # otherwise the kernel templates with mismatched strides per rank and
-        # cross-rank reads land on undefined offsets (manifests as duplicate
-        # `dst_expert_idx` values tripping `dispatch_copy_epilogue.cuh:106`).
-        # `prepare_deepep_v2_buffer` is sized at init time for the worst case
-        # across decode + prefill, so all ranks see the same capacity.
         num_max_tokens_per_rank = buffer.num_max_tokens_per_rank
         assert local_num_tokens <= num_max_tokens_per_rank, (
             f"deepep_v2 dispatch local_num_tokens={local_num_tokens} exceeds "
@@ -481,9 +434,8 @@ class DeepEPV2Dispatch(torch.autograd.Function):
             f"increase the cap in dynamic_context._deepep_v2_ep_dispatcher init."
         )
         num_sms = _get_deepep_v2_num_sms(buffer, group, num_experts, num_topk)
-        # Inference (use_expanded_layout=True) is the graph-capturable path: we
-        # must avoid the dispatch-side host sync, and we recover tokens_per_expert
-        # from the device-resident prefix-sum on the handle below.
+        # expanded layout skips the CPU sync so tokens_per_expert is recovered from the
+        # device-resident psum below — required for CUDA graph capture.
         do_cpu_sync = False if use_expanded_layout else None
         recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
             x.contiguous(),
