@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import os
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -411,9 +412,7 @@ def _get_deepep_v2_num_sms(
     EP=64, num_topk=22). Each new value triggers a JIT recompile, so pin
     ``EP_JIT_CACHE_DIR`` if sweeping.
     """
-    import os as _os
-
-    _override = _os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
+    _override = os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
     if _override is not None:
         return int(_override)
 

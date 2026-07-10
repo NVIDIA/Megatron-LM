@@ -336,16 +336,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # The flex/DeepEP token dispatcher uses the combined expert-TP x EP group (tp_ep) for its
         # A2A, so the DeepEP V2 ElasticBuffer must be allocated against the same group, otherwise
-        # `_get_deepep_v2_buffer` sees a different group object and discards the prepared buffer.
+        # _get_deepep_v2_buffer sees a different group object and discards the prepared buffer.
         if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
             self.expert_tp_ep_group = pg_collection.tp_ep
         else:
-            try:
-                self.expert_tp_ep_group = (
-                    parallel_state.get_expert_tensor_and_model_parallel_group()
-                )
-            except (AssertionError, AttributeError):
-                self.expert_tp_ep_group = self.expert_model_parallel_group
+            _get_tp_ep = getattr(parallel_state, 'get_expert_tensor_and_model_parallel_group', None)
+            tp_ep_group = _get_tp_ep(check_initialized=False) if _get_tp_ep is not None else None
+            self.expert_tp_ep_group = (
+                tp_ep_group if tp_ep_group is not None else self.expert_model_parallel_group
+            )
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
@@ -707,27 +706,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
                     "ElasticBuffer (install from the epv2-release branch)."
                 )
-                # The ElasticBuffer uses symmetric NVLink memory: every rank in the group must
-                # allocate the same per-rank size, otherwise cross-rank reads land on undefined
-                # offsets and the dispatch copy epilogue trips its dst_expert_idx dedup assertion.
-                # `_get_deepep_v2_buffer` will lazily realloc on size growth, but it does so
-                # per-rank from local `x.shape[0]`, so chunked prefill with uneven DP request sizes
-                # (e.g. rank A sees 224 tokens while rank B sees 64) breaks the invariant.
-                # To avoid lazy realloc, pre-allocate to the worst case across both
-                # captured-graph decode steps and eager prefill steps:
+                # ElasticBuffer uses symmetric memory.
+                # To avoid _get_deepep_v2_buffer lazily reallocating based on each rank's x.shape[0]
+                # (i.e. chunked prefill with uneven DP request sizes), we pre-allocate to the worst
+                # case across both captured-graph decode steps and eager prefill steps:
                 #   - decode/spec graph cap: max_requests * (num_speculative_tokens + 1)
                 #   - prefill cap:           round_up_tokens(max_tokens)
-                # then divide by tp_size for the per-rank count. This matches the NVLS
-                # allgather_worst_case sizing below.
-                # Pre-allocate two ElasticBuffers — one sized for fixed-shape
-                # decode steps, one for chunked-prefill steps. Decode dispatches
-                # use the small buffer to avoid running dispatch/combine kernels
-                # and _deepep_v2_expand_forward's last-expert grouped_mm over
-                # the prefill-cap padding (~30x compute overhead at decode for
-                # max_tokens=2048, max_requests=64). The engine must call
-                # set_deepep_v2_active_dispatch_size before each forward step
-                # with the matching cap (decode_per_rank_cap for decode steps,
-                # prefill_per_rank_cap for prefill chunks).
+                # then divide by tp_size for the per-rank count.
+                # This matches the NVLS allgather_worst_case sizing below.
+                # Pre-allocate two ElasticBuffers — one sized for fixed-shape decode steps, one for
+                # chunked-prefill steps. The engine must call set_deepep_v2_active_dispatch_size
+                # before each forward with the matching cap
+                # (decode_per_rank_cap or prefill_per_rank_cap).
                 deepep_decode_per_rank_cap = (
                     self.round_up_tokens(self.max_requests * (self.num_speculative_tokens + 1))
                     // tp_size

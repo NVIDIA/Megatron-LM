@@ -706,6 +706,16 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
+    def _apply_routing_overrides(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply benchmark/debug routing-override flags to logits."""
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+        if self.config.moe_router_force_biased is not None:
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
+        return logits
+
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
@@ -722,16 +732,7 @@ class TopKRouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
-        if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
-
-        if self.config.moe_router_force_biased is not None:
-            # Apply biased logits with shared random bias across all ranks
-            logits = apply_biased_logits(
-                logits, self.config.moe_router_force_biased, self.layer_number
-            )
-
+        logits = self._apply_routing_overrides(logits)
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map
@@ -824,17 +825,9 @@ class InferenceTopKRouter(TopKRouter):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
         # Honour debug/benchmark routing-override flags at inference. The parent
-        # `TopKRouter.forward` applies these before calling `routing()`; this
-        # inference path bypasses `forward()`, so we must replicate the logic
-        # explicitly. Without this, the flags silently no-op for
-        # `transformer_impl=inference_optimized`, which makes routing-imbalance
-        # diagnostics misleading.
-        if self.config.moe_router_force_load_balancing:
-            logits = apply_random_logits(logits)
-        if self.config.moe_router_force_biased is not None:
-            logits = apply_biased_logits(
-                logits, self.config.moe_router_force_biased, self.layer_number
-            )
+        # `TopKRouter.forward` applies these via `_apply_routing_overrides`; this
+        # inference path bypasses `forward()`, so we call it explicitly.
+        logits = self._apply_routing_overrides(logits)
 
         probs, routing = self._compiled_topk_routing(
             logits,

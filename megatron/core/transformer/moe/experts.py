@@ -1108,8 +1108,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         try:
             from torch.nn.functional import grouped_mm
         except ImportError:
-            # Fallback to the private symbol for torch versions < 2.10.
             grouped_mm = getattr(torch, "_grouped_mm", None)
+            if grouped_mm is None:
+                raise ImportError(
+                    "deepep_v2 expand-layout forward requires torch.nn.functional.grouped_mm "
+                    "(PyTorch >= 2.10) or the torch._grouped_mm private symbol."
+                )
 
         assert (
             permuted_local_hidden_states.dtype == torch.bfloat16

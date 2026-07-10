@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1237,9 +1238,7 @@ class _DeepepManager(_DispatchManager):
         # non-expand path uses CPU sync so it cannot be CUDA-graphed, but for
         # debugging correctness it routes through the same tested permute →
         # grouped_gemm → combine flow used by training.
-        import os as _os
-
-        _disable_expand = _os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
+        _disable_expand = os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
         self.enable_expanded_layout_for_inference = (
             self.use_deepep_v2
             and config.bf16
