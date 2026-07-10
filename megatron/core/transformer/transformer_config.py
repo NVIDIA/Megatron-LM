@@ -1164,18 +1164,20 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
-    
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointManager is created for subsequent layers
-    
-    If None, all layers in the transformer block share a single recompute block.
+    """Number of layers in each mHC recompute group.
 
-    Must be a positive integer when set."""
+    Layers are grouped in their local transformer-block order. The last layer in each group leaves
+    its final MLP BDA output uncheckpointed and closes the current ``CheckpointManager``; a new
+    manager is created for the next group.
+
+    In the standard forward path, the group-ending layer registers a unified recompute hook on its
+    MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are
+    discarded explicitly and a compute-stream schedule node replays the group before its backward
+    computation.
+
+    If ``None``, all local layers in the transformer block share one recompute group. The value must
+    be a positive integer when set.
+    """
 
     mhc_post_on_compute_stream: bool = False
     """Run MLP-side mHC post-processing as a separate node on the compute stream.

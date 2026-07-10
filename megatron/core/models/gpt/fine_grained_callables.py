@@ -472,6 +472,7 @@ class _BackwardDWWrapper:
 
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
+
     Divides the transformer layer's operations into a sequence of smaller, independent
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
@@ -497,7 +498,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         - forward_funcs: List of callable functions for the layer
         - backward_dw: Dict of weight gradient functions for the layer
     """
-
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
@@ -842,12 +842,27 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
 
 def build_mtp_layer_callables(layer):
-    """Callables for multi-token prediction layer nodes.
+    """Create callables for multi-token prediction layer schedule nodes.
 
-    This class contains the callable functions for different types of
-    multi-token prediction layer nodes (attention, MLP, etc.)
+    The returned forward callables use the same six-slot layout as transformer layers:
+
+    1. Attention with MTP preprocessing.
+    2. MoE dispatch.
+    3. MoE experts.
+    4. MoE combine and, by default, MLP-side mHC post-processing.
+    5. Optional standalone MLP-side mHC post-processing.
+    6. MTP post-processing.
+
+    Args:
+        layer: Multi-token prediction layer whose underlying transformer layer is decomposed.
+
+    Returns:
+        A tuple containing the ordered forward callables and a mapping of node names to backward
+        weight-gradient callables.
+
+    Raises:
+        AssertionError: If the underlying transformer layer is not an MoE layer.
     """
-
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
     attn_forward, dispatch_forward, mlp_forward, combine_forward, mhc_post_forward, _ = (
         forward_funcs

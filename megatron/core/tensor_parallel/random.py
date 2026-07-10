@@ -759,19 +759,20 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
 
 class CheckpointManager:
-    """
-    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock
-    cross layer recomputations, enabling unified recomputation during backward pass.
-    This is particularly useful for scenarios where multiple checkpoint operations have
-    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+    """Manage checkpoints that are recomputed together across transformer layers.
 
-    Usage:
-        ckptManager = CheckpointManager()
-        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckptManager)
+    This manager enables unified recomputation for checkpoint operations with sequential
+    dependencies, such as when one checkpoint's output is the next checkpoint's input.
+
+    Examples:
+        ckpt_manager = CheckpointManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckpt_manager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
+
         # Hook-driven path:
         ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+
         # Or scheduler-driven path:
         ckpt_manager.discard_all_outputs()
         ckpt_manager.recompute_now()
@@ -802,7 +803,10 @@ class CheckpointManager:
             hook_tensor.register_hook(self._unified_recompute_hook)
 
     def discard_all_outputs(self) -> None:
-        """Discard all managed checkpoint outputs without registering a backward hook."""
+        """Discard all managed checkpoint outputs without registering a backward hook.
+
+        This operation is idempotent; calls after the first successful discard are no-ops.
+        """
         if self._outputs_discarded:
             return
         for ckpt in self.checkpoints:
@@ -813,8 +817,10 @@ class CheckpointManager:
     def recompute_now(self) -> None:
         """Eagerly replay all managed checkpoints in their original forward order.
 
-        Replaying is idempotent because each ``CheckpointWithoutOutput`` clears its
-        context after the first successful recomputation.
+        This operation is idempotent; calls after the first successful replay are no-ops.
+
+        Raises:
+            RuntimeError: If the managed outputs have not been discarded before replay.
         """
         if self._recomputed:
             return

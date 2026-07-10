@@ -440,7 +440,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
 
     def preprocess_for_layer_schedule(self, hidden_states: Union[Tensor, WrappedTensor]) -> Tensor:
-        """Apply TransformerBlock entry processing shared by normal and scheduled forward paths."""
+        """Apply TransformerBlock entry processing for normal and scheduled forward paths.
+
+        On the first pipeline stage, this method uses the provided hidden states. On subsequent
+        stages, it uses the tensor supplied through :meth:`set_input_tensor`. The result is made
+        viewless and, on the first pipeline stage, expanded into mHC residual streams when mHC is
+        enabled.
+
+        Args:
+            hidden_states: Hidden states for the first pipeline stage, optionally wrapped for
+                deferred unwrapping.
+
+        Returns:
+            Viewless hidden states ready for layer execution. When mHC is enabled on the first
+            pipeline stage, the hidden dimension contains all residual streams.
+        """
         # Delete the obsolete reference to the initial input tensor if necessary.
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
@@ -484,8 +498,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
 
-        Returns a Tensor by default. When return_mhc_multistream is True, always returns
-        (hidden_states, mhc_multistream), where mhc_multistream may be None.
+        This method contracts mHC residual streams on the stage that owns the final layer norm,
+        applies the final layer norm, and preserves a distinct output node for empty pipeline
+        stages. With MTP, it can also return the pre-contraction mHC streams for the MTP input.
+
+        Args:
+            hidden_states: Hidden states produced by the transformer layers.
+            extract_layer_indices: Requested feature-extraction layer indices. Nonempty feature
+                extraction is not supported when mHC and MTP are both enabled.
+            return_mhc_multistream: Whether to return the pre-contraction mHC streams together with
+                the processed hidden states.
+
+        Returns:
+            The processed hidden states. If ``return_mhc_multistream`` is true, returns a tuple of
+            the processed hidden states and the pre-contraction mHC streams. The second element is
+            ``None`` when no MTP mHC streams need to be preserved.
+
+        Raises:
+            AssertionError: If nonempty feature extraction is requested while mHC and MTP are both
+                enabled.
         """
         mhc_multistream = None
         # Only contract if the final layer norm is in this stage.
