@@ -391,28 +391,20 @@ class MoELayer(BaseMoELayer):
         The active dispatcher is selected at the start of `forward` based on
         `InferenceMode.is_active()`.
           - 'nccl' / 'nvls': swap to a dedicated AllGather-style inference dispatcher
-            in eval mode.
-          - 'deepep_v2': keep the training MoEFlexTokenDispatcher in eval mode; its
-            _DeepepManager already routes through DeepEP V2 ElasticBuffer and
-            switches to the gather-free expanded layout when grad is disabled.
-        The active dispatcher is swapped automatically via the train() override:
-        eval mode → inference dispatcher, train mode → standard dispatcher.
+            in eval mode; train() swaps back to the standard dispatcher.
+          - 'deepep_v2': the existing MoEFlexTokenDispatcher already handles inference
+            via DeepEP V2 ElasticBuffer; no dispatcher swap is needed.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
-
-        self._training_token_dispatcher = self.token_dispatcher
 
         if dispatcher_type == 'deepep_v2':
             assert self.config.moe_token_dispatcher_type == 'flex', (
                 "inference_moe_token_dispatcher_type='deepep_v2' requires "
                 "moe_token_dispatcher_type='flex' (the DeepEP-backed dispatcher)."
             )
-            # Reuse the training dispatcher directly. train() will be a no-op for
-            # the dispatcher; expanded-layout activation is gated on grad state
-            # inside _DeepepManager.dispatch.
-            self._inference_token_dispatcher = self.token_dispatcher
             return
 
+        self._training_token_dispatcher = self.token_dispatcher
         dispatcher_cls = (
             NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
         )
@@ -559,16 +551,9 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        # NCCL/NVLS dispatchers expose routing_map; deepep_v2 uses by-expert layout and does not.
-        is_inference_eval = hasattr(self, "_inference_token_dispatcher") and not self.training
-        is_deepep_v2_inference = (
-            is_inference_eval and self.config.inference_moe_token_dispatcher_type == 'deepep_v2'
-        )
-        if (
-            hasattr(self, "_inference_token_dispatcher")
-            and InferenceMode.is_active()
-            and not is_deepep_v2_inference
-        ):
+        # NCCL/NVLS inference dispatchers expose routing_map for FlashInfer/mcore_fused_moe.
+        # deepep_v2 uses by-expert layout and doesn't set _inference_token_dispatcher.
+        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map

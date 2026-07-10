@@ -345,9 +345,7 @@ def prepare_deepep_v2_buffer(
 ) -> None:
     """Allocate and pin an ElasticBuffer in the pool. Call at model init, outside graph capture."""
     if not HAVE_DEEP_EP_V2:
-        raise RuntimeError(
-            "prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). "
-        )
+        raise RuntimeError("prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). ")
     key = (group, num_max_tokens_per_rank)
     if key in _deepep_v2_buffer_pool:
         return  # already pinned
@@ -455,13 +453,7 @@ if HAVE_DEEP_EP_V2:
         tokens_per_expert = _tokens_per_expert_from_psum(handle.psum_num_recv_tokens_per_expert)
         return recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle
 
-    def deepep_v2_combine(
-        x,
-        group,
-        handle,
-        async_finish=False,
-        allocate_on_comm_stream=False,
-    ):
+    def deepep_v2_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
         """Inference-only combine using DeepEP V2 ElasticBuffer."""
         num_topk = handle.topk_idx.shape[1]
         hidden = x.shape[1]

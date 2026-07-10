@@ -825,8 +825,8 @@ class InferenceTopKRouter(TopKRouter):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
         # Honour debug/benchmark routing-override flags at inference. The parent
-        # `TopKRouter.forward` applies these via `_apply_routing_overrides`; this
-        # inference path bypasses `forward()`, so we call it explicitly.
+        # TopKRouter.forward applies these via _apply_routing_overrides. This
+        # inference path bypasses forward(), so we call it explicitly.
         logits = self._apply_routing_overrides(logits)
 
         probs, routing = self._compiled_topk_routing(

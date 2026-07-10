@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1228,15 +1227,12 @@ class _DeepepManager(_DispatchManager):
         # Expanded layout (do_expand=True, do_cpu_sync=False): graph-capturable path where dispatch
         # writes one slot per (token, expert) into a padded recv buffer; the expert GEMM uses
         # on-device offsets and combine() discards the padding.
-        # Set MCORE_DEEPEP_V2_DISABLE_EXPAND=1 to force the non-expand path for correctness A/B.
-        _disable_expand = os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
         self.enable_expanded_layout_for_inference = (
             self.use_deepep_v2
             and config.bf16
             and not config.fp8
             and not config.fp4
             and not config.moe_router_padding_for_quantization
-            and not _disable_expand
         )
         self.use_expanded_layout = False
         if not self.use_deepep_v2:
@@ -1274,8 +1270,7 @@ class _DeepepManager(_DispatchManager):
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.use_deepep_v2:
-            # Reentrant activation checkpointing may run training forwards with grad mode
-            # disabled, so also require the tensors to be outside the autograd graph.
+            # Guard against accidental use during a training forward (e.g. grad still enabled).
             self.use_expanded_layout = (
                 self.enable_expanded_layout_for_inference
                 and not torch.is_grad_enabled()

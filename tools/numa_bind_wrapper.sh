@@ -1,6 +1,6 @@
 #!/bin/bash
 # Maps each LOCAL_RANK to its GPU's NUMA node based on `nvidia-smi topo -m`.
-# For your GB200 NVL72 topology: GPU0,1 → NUMA 0; GPU2,3 → NUMA 1.
+# For GB200 NVL72 topology: GPU0,1 -> NUMA 0; GPU2,3 -> NUMA 1.
 case $LOCAL_RANK in
     0|1) NODE=0 ;;
     2|3) NODE=1 ;;
