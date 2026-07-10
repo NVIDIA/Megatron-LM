@@ -5,6 +5,7 @@ import fnmatch
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -34,6 +35,28 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
+_force_all_reduce_reduction_logged = False
+
+
+def _log_buffer_bucket_sizes_enabled() -> bool:
+    """Return whether to log detailed buffer and bucket size diagnostics."""
+    return os.getenv("MEGATRON_LOG_BUFFER_BUCKET_SIZES", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_force_all_reduce_reduction_once(force_all_reduce: bool) -> None:
+    """Log the forced all-reduce reduction path once per process."""
+    global _force_all_reduce_reduction_logged
+    if _force_all_reduce_reduction_logged or not force_all_reduce:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        logger.info(f"Performing reduction using all_reduce because {force_all_reduce=}")
+    _force_all_reduce_reduction_logged = True
+
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -86,6 +109,8 @@ class _ParamAndGradBucket:
             Used to derive bucket-local offsets for param_to_index.
         params_with_extra_main_grads: List of parameters in this bucket that require a
             separate higher-precision main_grad tensor for local gradient accumulation.
+        param_to_name: Optional mapping from parameter to name for diagnostics.
+        layerwise_fallback: Whether this bucket belongs to a LayerWise fallback buffer.
     """
 
     def __init__(
@@ -99,6 +124,8 @@ class _ParamAndGradBucket:
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
         params_with_extra_main_grads: List[torch.nn.Parameter],
+        param_to_name: Optional[Dict[torch.nn.Parameter, str]] = None,
+        layerwise_fallback: bool = False,
     ):
         self.params_list = params
         self.params = set(params)
@@ -118,6 +145,8 @@ class _ParamAndGradBucket:
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
+        self.param_to_name = param_to_name if param_to_name is not None else {}
+        self.layerwise_fallback = layerwise_fallback
 
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
@@ -198,6 +227,8 @@ class _ParamAndGradBucketGroup:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
 
+        self.layerwise_fallback = any(bucket.layerwise_fallback for bucket in self.buckets)
+
         self.next_param_gather_bucket_group = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
         # points to the bucket group whose grad-reduce was dispatched immediately before mine in
@@ -214,13 +245,18 @@ class _ParamAndGradBucketGroup:
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
         reduction_collective = (
-            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+            "all-reduce"
+            if self.layerwise_fallback
+            else "reduce-scatter"
+            if self.ddp_config.use_distributed_optimizer
+            else "all-reduce"
         )
         log_single_rank(
             logger,
             logging.INFO,
             f"Using {reduction_collective} for gradient reductions because "
-            f"{self.ddp_config.use_distributed_optimizer=}",
+            f"{self.ddp_config.use_distributed_optimizer=} "
+            f"{self.layerwise_fallback=}",
         )
 
         global dist_reduce_scatter_func
@@ -375,6 +411,10 @@ class _ParamAndGradBucketGroup:
         else:
             assert self.param_gather_handle is None
 
+        if self.layerwise_fallback:
+            self.param_gather_dispatched = True
+            return
+
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
         if not self.ddp_config.use_distributed_optimizer:
@@ -511,6 +551,13 @@ class _ParamAndGradBucketGroup:
         """
         assert self.ddp_config.overlap_param_gather
 
+        if self.layerwise_fallback:
+            self.param_gather_dispatched = True
+            if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
+                if not self.next_param_gather_bucket_group.param_gather_dispatched:
+                    self.next_param_gather_bucket_group.start_param_sync()
+            return
+
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
         # AG bucket in first model chunk if ddp_config.align_param_gather is False).
         if not self.param_gather_dispatched:
@@ -643,6 +690,14 @@ class _ParamAndGradBucketGroup:
         else:
             stream_context = nullcontext()
 
+        force_all_reduce = force_all_reduce or self.layerwise_fallback
+        if force_all_reduce and self.ddp_config.num_distributed_optimizer_instances > 1:
+            raise AssertionError(
+                "LayerWise fallback / force_all_reduce is not supported with "
+                "num_distributed_optimizer_instances > 1 because the fallback path "
+                "all-reduces full gradients instead of reduce-scattering local shards."
+            )
+
         if self.ddp_config.use_distributed_optimizer:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
@@ -668,10 +723,7 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                     )
                 else:
-                    if torch.distributed.get_rank() == 0 and force_all_reduce:
-                        logger.info(
-                            f"Performing reduction using all_reduce because {force_all_reduce=}"
-                        )
+                    _log_force_all_reduce_reduction_once(force_all_reduce)
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -822,7 +874,9 @@ class _ParamAndGradBucketGroup:
             if not self.is_first_batch:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
-                    self.start_grad_sync(force_all_reduce=force_all_reduce)
+                    self.start_grad_sync(
+                        force_all_reduce=force_all_reduce or self.layerwise_fallback
+                    )
 
 
 def group_params_for_buffers(
@@ -830,11 +884,13 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with four dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
       which requires a separate buffer with a different data-parallel group.
+    - is_managed_by_layer_wise_optimizer: whether the parameter is routed to the LayerWise
+      optimizer buffer instead of the sibling DistributedOptimizer buffer.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -1028,6 +1084,7 @@ class _ParamAndGradBuffer:
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
+        self.layerwise_fallback = param_layout.layerwise_fallback
 
         # Check if this buffer contains NVFP4 params.
         #
@@ -1315,6 +1372,8 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params_list:
                 log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
+        if _log_buffer_bucket_sizes_enabled():
+            log_strs.extend(self._build_buffer_bucket_size_log())
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
@@ -1322,6 +1381,130 @@ class _ParamAndGradBuffer:
             tp_group=self.tp_group,
             dp_cp_group=self.dp_cp_group,
         )
+
+    @staticmethod
+    def _dtype_element_size(dtype: torch.dtype) -> int:
+        """Return element size for a dtype without allocating CUDA memory."""
+        return torch.empty((), dtype=dtype, device='cpu').element_size()
+
+    @staticmethod
+    def _format_numel_and_bytes(numel: int, element_size: int) -> str:
+        """Format element and byte counts in a compact diagnostic-friendly form."""
+        mib = numel * element_size / (1024 * 1024)
+        return f"{numel} elements ({mib:.2f} MiB)"
+
+    def _build_buffer_bucket_size_log(self) -> List[str]:
+        """Build a detailed size breakdown for this buffer and each bucket.
+
+        The report separates actual parameter elements from all buffer padding
+        observed in the final layout.  It is intended for diagnosing OOMs caused
+        by distributed-optimizer reduce-scatter layouts, especially when bucket
+        shard balancing introduces padding that is much larger than the raw
+        parameter payload.
+        """
+        grad_element_size = self._dtype_element_size(self.grad_dtype)
+        param_element_size = self._dtype_element_size(self.param_dtype)
+        param_numel = self.param_data.numel() if self.param_data is not None else 0
+        param_bytes = (
+            self.param_data.numel() * self.param_data.element_size()
+            if self.param_data is not None
+            else 0
+        )
+        grad_bytes = self.numel * grad_element_size
+        actual_param_numel = sum(param.data.nelement() for param in self.params)
+        total_padding_numel = self.numel - actual_param_numel
+        local_shard_numel = (
+            self.numel // self.data_parallel_world_size
+            if self.ddp_config.use_distributed_optimizer
+            else self.numel
+        )
+
+        lines = [
+            "[BUFFER_BUCKET_SIZE] "
+            f"buffer_id={id(self)} "
+            f"param_dtype={self.param_dtype} grad_dtype={self.grad_dtype} "
+            f"dp_size={self.data_parallel_world_size} "
+            f"use_distributed_optimizer={self.ddp_config.use_distributed_optimizer} "
+            f"layerwise_fallback={self.layerwise_fallback} "
+            f"buckets={len(self.buckets)}",
+            "[BUFFER_BUCKET_SIZE] "
+            f"buffer_total actual_param={self._format_numel_and_bytes(actual_param_numel, grad_element_size)} "
+            f"layout_unpadded={self._format_numel_and_bytes(self.numel_unpadded, grad_element_size)} "
+            f"padded_grad={self._format_numel_and_bytes(self.numel, grad_element_size)} "
+            f"total_padding={self._format_numel_and_bytes(total_padding_numel, grad_element_size)} "
+            f"local_grad_shard={self._format_numel_and_bytes(local_shard_numel, grad_element_size)} "
+            f"grad_buffer_bytes={grad_bytes} param_buffer_bytes={param_bytes}",
+        ]
+        if self.has_nvfp4_params:
+            lines.append(
+                "[BUFFER_BUCKET_SIZE] "
+                f"nvfp4_packed_param_buffer "
+                f"layout_unpadded={self._format_numel_and_bytes(self.nvfp4_packed_numel_unpadded, param_element_size)} "
+                f"padded={self._format_numel_and_bytes(self.nvfp4_packed_numel, param_element_size)}"
+            )
+
+        for bucket_index, bucket in enumerate(self.buckets):
+            bucket_start, bucket_end = self.bucket_indices[bucket.bucket_id]
+            bucket_padded_numel = bucket_end - bucket_start
+            bucket_actual_param_numel = sum(param.data.nelement() for param in bucket.params_list)
+            local_bucket_shard_numel = (
+                bucket_padded_numel // self.data_parallel_world_size
+                if self.ddp_config.use_distributed_optimizer
+                else bucket_padded_numel
+            )
+
+            param_ranges = []
+            for param in bucket.params_list:
+                start, end, _ = self.param_index_map[param]
+                param_ranges.append((start, end, param))
+            param_ranges.sort(key=lambda item: item[0])
+
+            gap_padding_numel = 0
+            cursor = bucket_start
+            per_param_lines = []
+            for start, end, param in param_ranges:
+                padding_before = max(0, start - cursor)
+                gap_padding_numel += padding_before
+                per_param_lines.append(
+                    "[BUFFER_BUCKET_SIZE_PARAM] "
+                    f"bucket={bucket_index} "
+                    f"name={self.param_to_name.get(param, '<unnamed>')} "
+                    f"shape={tuple(param.shape)} dtype={param.dtype} "
+                    f"numel={param.data.nelement()} "
+                    f"range=[{start - bucket_start},{end - bucket_start}) "
+                    f"padding_before={padding_before}"
+                )
+                cursor = max(cursor, end)
+
+            tail_padding_numel = max(0, bucket_end - cursor)
+            total_bucket_padding_numel = bucket_padded_numel - bucket_actual_param_numel
+            layout_unpadded_padding_numel = bucket.numel_unpadded - bucket_actual_param_numel
+
+            lines.append(
+                "[BUFFER_BUCKET_SIZE] "
+                f"bucket={bucket_index} global_bucket_id={bucket.bucket_id} "
+                f"params={len(bucket.params_list)} "
+                f"actual_param={self._format_numel_and_bytes(bucket_actual_param_numel, grad_element_size)} "
+                f"layout_unpadded={self._format_numel_and_bytes(bucket.numel_unpadded, grad_element_size)} "
+                f"padded_grad={self._format_numel_and_bytes(bucket_padded_numel, grad_element_size)} "
+                f"local_grad_shard={self._format_numel_and_bytes(local_bucket_shard_numel, grad_element_size)} "
+                f"total_padding={self._format_numel_and_bytes(total_bucket_padding_numel, grad_element_size)} "
+                f"gap_padding={self._format_numel_and_bytes(gap_padding_numel, grad_element_size)} "
+                f"tail_padding={self._format_numel_and_bytes(tail_padding_numel, grad_element_size)} "
+                f"layout_unpadded_padding={self._format_numel_and_bytes(layout_unpadded_padding_numel, grad_element_size)} "
+                f"range=[{bucket_start},{bucket_end})"
+            )
+            if self.has_nvfp4_params:
+                packed_start, packed_end = self.nvfp4_packed_bucket_indices[bucket.bucket_id]
+                lines.append(
+                    "[BUFFER_BUCKET_SIZE] "
+                    f"bucket={bucket_index} nvfp4_packed_param_padded="
+                    f"{self._format_numel_and_bytes(packed_end - packed_start, param_element_size)} "
+                    f"packed_range=[{packed_start},{packed_end})"
+                )
+            lines.extend(per_param_lines)
+
+        return lines
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
         """Derive packed NVFP4 index map and bucket indices from the primary layout.
@@ -1496,6 +1679,8 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            param_to_name=self.param_to_name,
+            layerwise_fallback=self.layerwise_fallback,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
@@ -1642,6 +1827,7 @@ def partition_buckets(
         data_parallel_world_size = buffers[0].data_parallel_world_size
         ordered_distopt_values = []
         buckets_by_distopt = {}
+        fallback_buckets = []
         # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
         ddp_config_by_distopt = {}
         for buffer in buffers:
@@ -1650,12 +1836,15 @@ def partition_buckets(
             distopt = buffer.ddp_config.use_distributed_optimizer
             ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
             for bucket in buffer.buckets:
+                if bucket.layerwise_fallback:
+                    fallback_buckets.append((bucket, buffer.ddp_config))
+                    continue
                 if distopt not in buckets_by_distopt:
                     buckets_by_distopt[distopt] = []
                     ordered_distopt_values.append(distopt)
                 buckets_by_distopt[distopt].append(bucket)
 
-        return [
+        bucket_groups = [
             _ParamAndGradBucketGroup(
                 buckets_by_distopt[distopt],
                 ddp_config_by_distopt[distopt],
@@ -1664,6 +1853,16 @@ def partition_buckets(
             )
             for distopt in ordered_distopt_values
         ]
+        bucket_groups.extend(
+            _ParamAndGradBucketGroup(
+                [fallback_bucket],
+                fallback_ddp_config,
+                data_parallel_group,
+                data_parallel_world_size,
+            )
+            for fallback_bucket, fallback_ddp_config in fallback_buckets
+        )
+        return bucket_groups
 
     if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
@@ -1682,12 +1881,15 @@ def partition_buckets(
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        # Track each non-fp8 bucket with its buffer's (authoritative) ddp_config.
-        non_fp8_buckets = []  # list of (bucket, ddp_config)
+        non_fp8_buckets = []
+        fallback_buckets = []
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append((bucket, buffer.ddp_config))
+                    if bucket.layerwise_fallback:
+                        fallback_buckets.append((bucket, buffer))
+                    else:
+                        non_fp8_buckets.append((bucket, buffer))
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1702,24 +1904,24 @@ def partition_buckets(
                         _ParamAndGradBucketGroup(
                             [bucket],
                             fp8_buffer.ddp_config,
-                            buffer.data_parallel_group,
-                            buffer.data_parallel_world_size,
+                            fp8_buffer.data_parallel_group,
+                            fp8_buffer.data_parallel_world_size,
                         )
                     )
                     if non_fp8_buckets:
-                        for non_fp8_bucket, non_fp8_ddp_config in non_fp8_buckets:
+                        for non_fp8_bucket, non_fp8_buffer in non_fp8_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    non_fp8_ddp_config,
-                                    buffer.data_parallel_group,
-                                    buffer.data_parallel_world_size,
+                                    non_fp8_buffer.ddp_config,
+                                    non_fp8_buffer.data_parallel_group,
+                                    non_fp8_buffer.data_parallel_world_size,
                                 )
                             )
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + [b for b, _ in non_fp8_buckets]
+                    group_buckets = [bucket] + [bucket for bucket, _ in non_fp8_buckets]
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
@@ -1732,8 +1934,18 @@ def partition_buckets(
                 _ParamAndGradBucketGroup(
                     group_buckets,
                     fp8_buffer.ddp_config,
-                    buffer.data_parallel_group,
-                    buffer.data_parallel_world_size,
+                    fp8_buffer.data_parallel_group,
+                    fp8_buffer.data_parallel_world_size,
+                )
+            )
+
+        for fallback_bucket, fallback_buffer in fallback_buckets:
+            bucket_groups.append(
+                _ParamAndGradBucketGroup(
+                    [fallback_bucket],
+                    fallback_buffer.ddp_config,
+                    fallback_buffer.data_parallel_group,
+                    fallback_buffer.data_parallel_world_size,
                 )
             )
         return bucket_groups
