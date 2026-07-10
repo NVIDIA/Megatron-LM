@@ -4162,6 +4162,13 @@ def _add_distributed_args(parser):
         'FSDP units can use NCCL user-buffer registration or CUDA graph replay.',
     )
     group.add_argument(
+        '--megatron-fsdp-max-pool-buffer-count',
+        type=int,
+        default=2,
+        help='Number of persistent buffer groups in the Megatron-FSDP MaxPoolAllocator. '
+        'Values above 2 support schedules with more than two simultaneously live FSDP units.',
+    )
+    group.add_argument(
         '--fsdp-db-use-persist-buf-on-alloc-fail',
         action='store_true',
         dest='fsdp_db_use_persist_buf_on_alloc_fail',

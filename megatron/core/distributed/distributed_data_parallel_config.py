@@ -269,6 +269,14 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    megatron_fsdp_max_pool_buffer_count: int = 2
+    """Number of persistent buffer groups used by the Megatron-FSDP MaxPoolAllocator.
+
+    Two preserves standard double-buffer behavior. Schedules that intentionally keep
+    more FSDP units live may increase this value when
+    ``megatron_fsdp_max_pool_double_buffer`` is enabled.
+    """
+
     def __post_init__(self):
         import os
 
@@ -323,3 +331,13 @@ class DistributedDataParallelConfig:
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
             self.fsdp_double_buffer = True
+        if self.megatron_fsdp_max_pool_buffer_count < 2:
+            raise ValueError("Megatron-FSDP MaxPool buffer count must be at least 2.")
+        if (
+            self.megatron_fsdp_max_pool_buffer_count != 2
+            and not self.megatron_fsdp_max_pool_double_buffer
+        ):
+            raise ValueError(
+                "A non-default Megatron-FSDP MaxPool buffer count requires "
+                "megatron_fsdp_max_pool_double_buffer=True."
+            )

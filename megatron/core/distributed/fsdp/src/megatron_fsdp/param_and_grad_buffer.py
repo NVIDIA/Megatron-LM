@@ -2648,7 +2648,11 @@ class ParamAndGradBuffer:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
-            UB_BUFFER_NUM = 2
+            UB_BUFFER_NUM = (
+                self.ddp_config.megatron_fsdp_max_pool_buffer_count
+                if self.ddp_config.megatron_fsdp_max_pool_double_buffer
+                else 2
+            )
             # Double Buffer Allocator Choice
             FIXED_POOL_ALLOC_TYPE = (
                 MaxPoolAllocator
@@ -4548,6 +4552,7 @@ class AllGatherPipeline:
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
+            max_buffered_units = self.buffer.weight_alloc.size
             double_buf_units = set()
             # A 1F1B schedule may issue this gather while the opposite pass still owns
             # a pool slot. Include those live allocations when deciding whether another
@@ -4566,10 +4571,11 @@ class AllGatherPipeline:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
                     double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > max_buffered_units:
                 raise ValueError(
                     f"{double_buf_units} FSDP units were requested, "
-                    "but double buffers can support no more than 2 FSDP units."
+                    f"but the parameter buffer pool can support no more than "
+                    f"{max_buffered_units} FSDP units."
                 )
 
         # Do not release the buckets that are being all-gathered.
@@ -4621,9 +4627,9 @@ class AllGatherPipeline:
                 if self.buffer.ddp_config.fsdp_double_buffer:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                     double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
+                    if len(double_buf_units) > max_buffered_units:
                         # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
+                        # the parameter buffer pool, so we need to stop prefetching.
                         return True
                 return False
 
