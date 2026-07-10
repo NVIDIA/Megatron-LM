@@ -638,7 +638,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list.
         ep_size = get_pg_size(self.expert_model_parallel_group)
         self._deepep_v2_ep_dispatcher = (
             ep_size > 1 and model_config.inference_moe_token_dispatcher_type == 'deepep_v2'
@@ -693,73 +692,58 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if ep_size > 1:
-            # Use moe_latent_size if set, else hidden_size.
-            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-            # AllGather-style dispatchers must hold the full per-step worst case
-            # (any non-graphed prefill step can be up to max_tokens).
-            allgather_worst_case = self.round_up_tokens(self.max_tokens) // tp_size
-            if self._nccl_ep_dispatcher:
-                NCCLAllGatherDispatcher.allocate_buffers()
-            elif self._deepep_v2_ep_dispatcher:
-                assert HAVE_DEEP_EP_V2, (
-                    "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
-                    "ElasticBuffer (install from the epv2-release branch)."
-                )
-                # ElasticBuffer uses symmetric memory.
-                # To avoid _get_deepep_v2_buffer lazily reallocating based on each rank's x.shape[0]
-                # (i.e. chunked prefill with uneven DP request sizes), we pre-allocate to the worst
-                # case across both captured-graph decode steps and eager prefill steps:
-                #   - decode/spec graph cap: max_requests * (num_speculative_tokens + 1)
-                #   - prefill cap:           round_up_tokens(max_tokens)
-                # then divide by tp_size for the per-rank count.
-                # This matches the NVLS allgather_worst_case sizing below.
-                # Pre-allocate two ElasticBuffers — one sized for fixed-shape decode steps, one for
-                # chunked-prefill steps. The engine must call set_deepep_v2_active_dispatch_size
-                # before each forward with the matching cap
-                # (decode_per_rank_cap or prefill_per_rank_cap).
-                deepep_decode_per_rank_cap = (
-                    self.round_up_tokens(self.max_requests * (self.num_speculative_tokens + 1))
-                    // tp_size
-                )
-                deepep_prefill_per_rank_cap = self.round_up_tokens(self.max_tokens) // tp_size
-                # The decode cap may be larger than max_tokens in extreme
-                # configs; ensure prefill cap is at least decode cap so the
-                # fallback "largest pinned buffer" still covers worst-case.
-                deepep_prefill_per_rank_cap = max(
-                    deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
-                )
-                # Stash the caps so the engine can read them when setting the
-                # active dispatch size per step.
-                self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
-                self.deepep_v2_prefill_per_rank_cap = deepep_prefill_per_rank_cap
-                prepare_deepep_v2_buffer(
-                    group=self.expert_tp_ep_group,
-                    num_max_tokens_per_rank=deepep_decode_per_rank_cap,
-                    hidden=moe_hidden_size,
-                    num_topk=model_config.moe_router_topk,
-                )
-                if deepep_prefill_per_rank_cap != deepep_decode_per_rank_cap:
-                    prepare_deepep_v2_buffer(
-                        group=self.expert_tp_ep_group,
-                        num_max_tokens_per_rank=deepep_prefill_per_rank_cap,
-                        hidden=moe_hidden_size,
-                        num_topk=model_config.moe_router_topk,
-                    )
-            else:
-                NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=allgather_worst_case,
-                    topk=model_config.moe_router_topk,
-                    hidden_size=moe_hidden_size,
-                    ep_group=self.expert_model_parallel_group,
-                )
-
         # Both dispatchers need _valid_tokens_tensor initialized even at EP=1:
         # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
         if model_config.inference_moe_token_dispatcher_type == 'nccl':
             NCCLAllGatherDispatcher.allocate_buffers()
+        elif self._deepep_v2_ep_dispatcher:
+            assert HAVE_DEEP_EP_V2, (
+                "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
+                "ElasticBuffer (install from the epv2-release branch)."
+            )
+            # moe_latent_size if set, else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # ElasticBuffer uses symmetric memory.
+            # To avoid _get_deepep_v2_buffer lazily reallocating based on each rank's x.shape[0]
+            # (i.e. chunked prefill with uneven DP request sizes), we pre-allocate to the worst
+            # case across both captured-graph decode steps and eager prefill steps:
+            #   - decode/spec graph cap: max_requests * (num_speculative_tokens + 1)
+            #   - prefill cap:           round_up_tokens(max_tokens)
+            # then divide by tp_size for the per-rank count.
+            # Pre-allocate two ElasticBuffers — one sized for fixed-shape decode steps, one for
+            # chunked-prefill steps. The engine must call set_deepep_v2_active_dispatch_size
+            # before each forward with the matching cap
+            # (decode_per_rank_cap or prefill_per_rank_cap).
+            deepep_decode_per_rank_cap = (
+                self.round_up_tokens(self.max_requests * (self.num_speculative_tokens + 1))
+                // tp_size
+            )
+            deepep_prefill_per_rank_cap = self.round_up_tokens(self.max_tokens) // tp_size
+            # The decode cap may be larger than max_tokens in extreme configs; ensure
+            # prefill cap is at least decode cap so the fallback "largest pinned buffer"
+            # still covers worst-case.
+            deepep_prefill_per_rank_cap = max(
+                deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
+            )
+            # Stash the caps so the engine can read them when setting the active dispatch
+            # size per step.
+            self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
+            self.deepep_v2_prefill_per_rank_cap = deepep_prefill_per_rank_cap
+            prepare_deepep_v2_buffer(
+                group=self.expert_tp_ep_group,
+                num_max_tokens_per_rank=deepep_decode_per_rank_cap,
+                hidden=moe_hidden_size,
+                num_topk=model_config.moe_router_topk,
+            )
+            if deepep_prefill_per_rank_cap != deepep_decode_per_rank_cap:
+                prepare_deepep_v2_buffer(
+                    group=self.expert_tp_ep_group,
+                    num_max_tokens_per_rank=deepep_prefill_per_rank_cap,
+                    hidden=moe_hidden_size,
+                    num_topk=model_config.moe_router_topk,
+                )
         elif get_pg_size(self.expert_model_parallel_group) > 1:
-            # Use moe_latent_size if set, else hidden_size.
+            # moe_latent_size if set, else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
