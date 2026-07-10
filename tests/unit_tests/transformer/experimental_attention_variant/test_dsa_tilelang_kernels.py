@@ -765,8 +765,10 @@ def test_compute_topk_target_chunk_sum_shared_and_per_head_paths(monkeypatch):
     tilelang_dsa._DSA_SCRATCH_CACHE.clear()
     monkeypatch.setattr(tilelang_dsa, "_DSA_SCRATCH_CACHE_TOTAL_BYTES", 0)
 
-    query_h = torch.tensor([[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]])
-    key_shared = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    query_h = torch.tensor(
+        [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]], requires_grad=True
+    )
+    key_shared = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], requires_grad=True)
     idx_seq = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
     valid_seq = torch.tensor([[True, True], [True, False]])
 
@@ -786,10 +788,11 @@ def test_compute_topk_target_chunk_sum_shared_and_per_head_paths(monkeypatch):
     )
 
     assert shared.shape == (2, 2)
+    assert not shared.requires_grad
     assert torch.allclose(shared.sum(dim=-1), torch.tensor([2.0, 2.0]), atol=1e-6)
     assert shared[1, 1] == 0
 
-    key_per_head = torch.stack((key_shared, key_shared + 1.0))
+    key_per_head = torch.stack((key_shared, key_shared + 1.0)).detach().requires_grad_(True)
     per_head = tilelang_dsa._compute_topk_target_chunk_sum(
         query_h=query_h,
         key_shared=None,
@@ -806,6 +809,7 @@ def test_compute_topk_target_chunk_sum_shared_and_per_head_paths(monkeypatch):
     )
 
     assert per_head.shape == (2, 2)
+    assert not per_head.requires_grad
     assert torch.allclose(per_head.sum(dim=-1), torch.tensor([2.0, 2.0]), atol=1e-6)
     assert per_head[1, 1] == 0
 

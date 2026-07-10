@@ -288,6 +288,7 @@ def fused_qk_topk_lighting(
     return topk_out
 
 
+@torch.no_grad()
 def _compute_topk_target_chunk_sum(
     *,
     query_h: torch.Tensor,

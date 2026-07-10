@@ -57,7 +57,6 @@ class IndexerFunction(torch.autograd.Function):  # pragma: no cover
         use_relu: bool = True,
     ):
         """Run fused indexer forward and optionally select top-k indices."""
-        _, head_num, _ = index_q.shape
         logits = indexer_fwd_interface(
             index_q,
             index_k,
@@ -73,8 +72,6 @@ class IndexerFunction(torch.autograd.Function):  # pragma: no cover
             index_score = pytorch_extract_topk_scores(logits, topk_indices)
 
         ctx.save_for_backward(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices)
-        ctx.topk = topk
-        ctx.head_num = head_num
         ctx.use_relu = use_relu
         return index_score, topk_indices
 
