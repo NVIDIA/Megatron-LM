@@ -40,14 +40,22 @@ logger = logging.getLogger(__name__)
 
 MSC_PREFIX = "msc://"
 
-# Matches batched tar filenames.  New shards omit the CP prefix
-# (``dp{D}__{I}.tar``); legacy compatible shards may use
-# ``cp0_dp{D}__{I}.tar``.  Named groups:
-#   cp   – optional CP rank
+# Matches v1 (legacy) batched tar filenames: ``cp{C}_dp{D}__{I}.tar``.
+# Named groups:
+#   cp   – saved CP rank
 #   dp   – DP rank
 #   iter – trailing iteration number *I*
 BATCHED_TAR_RE = re.compile(
-    r"^(?:cp(?P<cp>\d+)_)?dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
+    r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
+)
+
+# v2 batched tar filenames: ``dp{D}__{start}-{end}.tar``, where ``start``
+# (inclusive) / ``end`` (exclusive) are the global sample-count range this
+# DP rank's shard covers -- the same "sample index" space
+# ``LogprobsReshardPlan`` computes internally.  No CP prefix; v2 shards are
+# always CP-agnostic.
+V2_BATCHED_TAR_RE = re.compile(
+    r"^dp(?P<dp>\d+)__(?P<start>\d+)-(?P<end>\d+)\.tar$"
 )
 
 # Name of the metadata member written as the first entry of every batched
@@ -56,10 +64,23 @@ META_TAR_MEMBER = "_meta.json"
 
 LOGPROBS_TAR_MEMBER_SUFFIX = ".pt.zst"
 
-# Matches compressed iteration payload members inside a batched tar archive.
+# Matches compressed iteration payload members inside a v1 batched tar
+# archive (legacy; kept for :class:`LegacyTeacherTarDataset`).
 LOGPROBS_TAR_MEMBER_RE = re.compile(
     rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
 )
+
+# Matches compressed sample-range payload members inside a v2 batched tar
+# archive: ``{start}-{end}.pt.zst``, mirroring ``V2_BATCHED_TAR_RE``.
+V2_LOGPROBS_TAR_MEMBER_RE = re.compile(
+    rf"^(?P<start>\d+)-(?P<end>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
+)
+
+# Suffix appended to a tar file to quarantine it as superseded/stale
+# without deleting it outright.  Deliberately falls outside the ``*.tar``
+# glob pattern used everywhere else, so no reader-side filtering changes
+# are needed to ignore quarantined shards.
+STALE_TAR_SUFFIX = ".stale"
 
 CACHED_LOGITS_LOGPROB_SENTINEL = -1e3
 CACHED_LOGITS_INDEX_SENTINEL = -1
@@ -109,9 +130,37 @@ def storage_makedirs(path: str, exist_ok: bool = True) -> None:
 
 
 def storage_move(src: str, dst: str) -> None:
-    """Atomically publish a local temporary file."""
+    """Atomically publish a local temporary file, or copy+delete for MSC objects.
+
+    Local paths use ``os.replace``, atomic on POSIX filesystems.
+
+    MSC paths use copy-then-delete instead: ``MultiStorageClient``'s
+    ``MultiStoragePath.rename()`` is documented as unsupported for remote
+    storage paths (object stores have no native rename).  This is still
+    cheap, not a full data transfer: MSC's ``copy_object`` maps to each
+    backend's native *server-side* copy API (S3 ``CopyObject`` / multipart
+    ``UploadPartCopy``, GCS ``Blob.rewrite``, Azure
+    ``start_copy_from_url``) -- verified against the provider source --
+    none of which stream the object's bytes through the calling process,
+    so the cost is independent of object size.
+
+    Not atomic like a true rename: a crash between the copy and the
+    delete could leave both *src* and *dst* present.  Callers relying on
+    this purely for cleanup (like the v2 writer-side supersede cleanup,
+    which moves a stale tar aside with :data:`STALE_TAR_SUFFIX`) are
+    unaffected either way; callers needing true atomicity on MSC should
+    not rely on this helper.
+
+    *src* and *dst* must resolve to the same MSC profile (this is a
+    same-profile move, not a cross-backend copy utility).
+    """
     if is_msc_path(src) or is_msc_path(dst):
-        raise ValueError("storage_move is local-only; write MSC objects directly")
+        msc = _require_msc()
+        client, parsed_src = msc.resolve_storage_client(src)
+        _, parsed_dst = msc.resolve_storage_client(dst)
+        client.copy(parsed_src, parsed_dst)
+        msc.delete(src)
+        return
 
     os.replace(src, dst)
 
@@ -165,6 +214,18 @@ def get_current_iteration() -> int:
     return iteration
 
 
+def get_consumed_train_samples() -> int:
+    """Return the cumulative global sample count consumed so far.
+
+    ``training.py`` only updates ``args.consumed_train_samples`` **after**
+    ``train_step()`` returns, so at forward-hook time (inside
+    ``train_step``) this value is exactly the global sample count *before*
+    the in-flight iteration's batch -- i.e. the v2 tar naming scheme's
+    ``start_sample``, for free.
+    """
+    return get_args().consumed_train_samples
+
+
 def _blend_identifiers(args: Any) -> Dict[str, Any]:
     """Build a path-agnostic representation of the training data blend."""
     blend, blend_per_split = get_blend_and_blend_per_split(args)
@@ -216,21 +277,44 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
 
 
 def batched_tar_filename(dp_rank: int, last_iter: int) -> str:
-    """Return the canonical filename for a CP-agnostic DP batched tar shard."""
+    """Return the canonical filename for a CP-agnostic DP batched tar shard (v1)."""
     return f"dp{dp_rank}__{last_iter}.tar"
 
 
+def v2_batched_tar_filename(dp_rank: int, start_sample: int, end_sample: int) -> str:
+    """Return the canonical v2 filename keyed by global sample range.
+
+    *start_sample* is inclusive, *end_sample* is exclusive -- the shard
+    covers global samples ``[start_sample, end_sample)``.
+    """
+    return f"dp{dp_rank}__{start_sample}-{end_sample}.tar"
+
+
 def batched_tar_prefix(dp_rank: int) -> str:
-    """Return the canonical glob prefix for CP-agnostic DP batched tar shards."""
+    """Return the canonical glob prefix for CP-agnostic DP batched tar shards.
+
+    Shared by v1 and v2 naming schemes -- only the suffix after ``dp{d}__``
+    differs between them.
+    """
     return f"dp{dp_rank}__"
 
 
 def sorted_batched_tars(paths: List[str]) -> List[str]:
-    """Sort batched tar paths by their iteration number (numeric, ascending)."""
+    """Sort v1 batched tar paths by their iteration number (numeric, ascending)."""
     keyed = []
     for path in paths:
         if match := BATCHED_TAR_RE.match(storage_basename(path)):
             keyed.append((int(match.group("iter")), path))
+    keyed.sort()
+    return [path for _, path in keyed]
+
+
+def v2_sorted_batched_tars(paths: List[str]) -> List[str]:
+    """Sort v2 batched tar paths by their sample range (numeric, ascending)."""
+    keyed = []
+    for path in paths:
+        if match := V2_BATCHED_TAR_RE.match(storage_basename(path)):
+            keyed.append(((int(match.group("start")), int(match.group("end"))), path))
     keyed.sort()
     return [path for _, path in keyed]
 
@@ -298,9 +382,17 @@ def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor
 
 
 class LogprobsTarEntry(NamedTuple):
-    """Raw cached-logits payload read from one batched tar member."""
+    """Raw cached-logits payload read from one v1 batched tar member."""
 
     iteration: int
+    data: bytes
+
+
+class V2LogprobsTarEntry(NamedTuple):
+    """Raw cached-logits payload read from one v2 batched tar member."""
+
+    start_sample: int
+    end_sample: int
     data: bytes
 
 
@@ -357,10 +449,14 @@ def iter_logprobs_tar_entries(
     expected_hash: Optional[str] = None,
     metadata_out: Optional[List[Dict[str, Any]]] = None,
 ) -> Iterator[LogprobsTarEntry]:
-    """Stream cached-logits payload members from a batched tar archive.
+    """Stream cached-logits payload members from a v1 (legacy) batched tar archive.
 
-    The tar format is written by :class:`LogitsSaverHooks`: a leading
-    ``_meta.json`` member followed by ``{iteration}.pt.zst`` payloads.
+    The v1 tar format has a leading ``_meta.json`` member followed by
+    ``{iteration}.pt.zst`` payloads keyed by iteration number.
+    :class:`LogitsSaverHooks` no longer writes this format (it always
+    writes v2); this reader exists for :class:`LegacyTeacherTarDataset`
+    to read pre-existing v1 teacher caches.  See
+    :func:`v2_iter_logprobs_tar_entries` for the current v2 format.
     Members before *start_iteration* are skipped before their payload bytes
     are materialized in Python.
 
@@ -422,6 +518,78 @@ def iter_logprobs_tar_entries(
         )
 
 
+def v2_iter_logprobs_tar_entries(
+    tar_path: str,
+    *,
+    start_sample: int = 0,
+    expected_hash: Optional[str] = None,
+    metadata_out: Optional[List[Dict[str, Any]]] = None,
+) -> Iterator[V2LogprobsTarEntry]:
+    """Stream cached-logits payload members from a v2 batched tar archive.
+
+    Structurally mirrors :func:`iter_logprobs_tar_entries` (leading
+    ``_meta.json`` handling and hash verification are identical) but
+    matches :data:`V2_LOGPROBS_TAR_MEMBER_RE` and filters by sample range
+    instead of by iteration number: members whose ``end_sample <=
+    start_sample`` are skipped entirely, since they hold nothing the
+    caller needs.
+    """
+    metadata_seen = False
+
+    with open_logit_file(tar_path, "rb", prefetch_file=True) as stream:
+        with tarfile.open(fileobj=stream, mode="r|*") as tar:
+            for member in tar:
+                if not member.isreg():
+                    continue
+
+                name = member.name
+                if name == META_TAR_MEMBER:
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
+                    meta = _verify_logprobs_metadata(
+                        extracted.read(),
+                        tar_path=tar_path,
+                        expected_hash=expected_hash,
+                    )
+                    if metadata_out is not None:
+                        metadata_out.append(meta)
+                    metadata_seen = True
+                    continue
+
+                match = V2_LOGPROBS_TAR_MEMBER_RE.match(name)
+                if match is None:
+                    continue
+
+                if expected_hash is not None and not metadata_seen:
+                    raise RuntimeError(
+                        f"Teacher tar {tar_path} does not contain leading "
+                        f"{META_TAR_MEMBER}; cannot verify data alignment."
+                    )
+
+                member_start = int(match.group("start"))
+                member_end = int(match.group("end"))
+                if member_end <= start_sample:
+                    continue
+
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    raise RuntimeError(
+                        f"Could not read log-probs member '{name}' in '{tar_path}'"
+                    )
+                yield V2LogprobsTarEntry(
+                    start_sample=member_start,
+                    end_sample=member_end,
+                    data=extracted.read(),
+                )
+
+    if expected_hash is not None and not metadata_seen:
+        raise RuntimeError(
+            f"Teacher tar {tar_path} does not contain {META_TAR_MEMBER}; "
+            "cannot verify data alignment."
+        )
+
+
 def peek_logprobs_metadata(tar_path: str) -> Optional[Dict[str, Any]]:
     """Read the ``_meta.json`` member of *tar_path* without decoding payloads.
 
@@ -462,10 +630,10 @@ def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     distributed = (
         dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     )
+    tars = storage_glob_with_caching(logprobs_dir, "*.tar")
     if distributed and dist.get_rank() != 0:
         meta: Optional[Dict[str, Any]] = None
     else:
-        tars = storage_glob(os.path.join(logprobs_dir, "*.tar"))
         meta = peek_logprobs_metadata(tars[0]) if tars else None
     if distributed:
         payload: List[Optional[Dict[str, Any]]] = [meta]
@@ -525,7 +693,7 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
         fname = storage_basename(path)
         if match := BATCHED_TAR_RE.match(fname):
             cp_group = match.group("cp")
-            if cp_group is not None and int(cp_group) > 0:
+            if int(cp_group) > 0:
                 raise ValueError(
                     f"Found cached-logits tar shards with saved CP rank {cp_group}. "
                     "Only legacy shards with cp0_ prefix are compatible."
@@ -538,12 +706,41 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
 
 # NOTE: This function is for interactive debugging purposes
 def load_log_probs_from_tar(tar_path: str, iteration: int):
-    """Load one iteration from a specific batched tar shard.
+    """Load one saved iteration from a specific batched tar shard.
 
+    *iteration* is the zero-indexed count of saved iterations (the Nth
+    iteration this DP rank flushed), matching the pre-v2 numbering scheme.
     Returns ``(values, indices)`` as tensors for v2 tars or as lists of
-    per-microbatch tensors for v1 tars (``decode_logprobs_payload``
-    dispatches internally on ``format_version``).
+    per-microbatch tensors for v1 tars.
+
+    Peeks the tar's ``_meta.json`` to detect ``format_version`` and picks
+    the matching entry iterator.  v2 tars are keyed on disk by global
+    sample range rather than iteration number, so *iteration* is
+    translated via the saved ``gbs_save``
+    (``start_sample = iteration * gbs_save``).
     """
+    meta = peek_logprobs_metadata(tar_path)
+    fmt = (meta or {}).get("saver", {}).get("format_version", 1)
+
+    if fmt >= 2:
+        gbs_save = (meta or {}).get("saver", {}).get("gbs_save")
+        if gbs_save is None:
+            raise RuntimeError(
+                f"Tar '{tar_path}' is format_version={fmt} but its "
+                "_meta.json is missing gbs_save; cannot translate the "
+                "requested iteration into a sample range."
+            )
+        start_sample = iteration * int(gbs_save)
+        for entry in v2_iter_logprobs_tar_entries(tar_path, start_sample=start_sample):
+            if entry.start_sample == start_sample:
+                return decode_logprobs_payload(entry.data)
+            if entry.start_sample > start_sample:
+                break
+        raise FileNotFoundError(
+            f"No log-probs member found for iteration {iteration} "
+            f"(global sample {start_sample}) in '{tar_path}'"
+        )
+
     for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
         if entry.iteration == iteration:
             return decode_logprobs_payload(entry.data)
