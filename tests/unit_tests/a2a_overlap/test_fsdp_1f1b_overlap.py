@@ -51,6 +51,8 @@ class TestFSDP1F1BOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    # Quarantined in dev CI: NCCL EP params in this sweep abort with a pybind11 GIL dec_ref failure.
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
