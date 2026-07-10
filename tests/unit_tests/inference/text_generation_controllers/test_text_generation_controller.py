@@ -45,7 +45,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -1785,6 +1785,66 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    def test_serial_mtp_slices_block_cuda_graph_buffer_before_sp_gather(self):
+        """Only gather the valid local shard of a persistent block-graph buffer."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            num_speculative_tokens=2,
+            max_requests=2,
+            mtp_num_layers=2,
+        )
+
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.total_request_count = 2
+        context.paused_request_count = 0
+        context.request_kv_length_offsets[:2] = 0
+        context.request_query_lengths[:2] = 1
+        context.padded_active_token_count = 2
+        context.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+
+        controller._init_mtp_sampling_tensors()
+        controller._sampled_tokens_cuda[:2] = torch.tensor([1, 2], device='cuda')
+        controller._last_accepted_seq_indices = torch.tensor([0, 1], device='cuda')
+
+        # Each TP rank writes one row, but block graphs retain a max-token-sized
+        # allocation. Poisoning the tail mirrors stale data from an earlier replay.
+        context.mtp_decoder_hidden_states = torch.full((8, 1, 32), -1.0, device='cuda')
+        context.mtp_decoder_hidden_states[0] = parallel_state.get_tensor_model_parallel_rank()
+
+        gathered_inputs = []
+
+        def mock_gather(local_hidden, group=None):
+            gathered_inputs.append(local_hidden.clone())
+            return torch.cat((local_hidden, local_hidden), dim=0)
+
+        model = controller._unwrapped_model
+        model.compute_mtp_single_step = mock.MagicMock(
+            side_effect=lambda hidden_states, **kwargs: (
+                hidden_states,
+                torch.zeros(2, 1, self.vocab_size, device='cuda'),
+            )
+        )
+        controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([3, 4], device='cuda')
+        )
+
+        controller_module = (
+            "megatron.core.inference.text_generation_controllers.text_generation_controller"
+        )
+        with mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather), mock.patch(
+            f"{controller_module}.scatter_to_sequence_parallel_region",
+            side_effect=lambda hidden, group=None: hidden[:1],
+        ):
+            controller._compute_serial_mtp_and_sample()
+
+        assert len(gathered_inputs) == 1
+        assert gathered_inputs[0].shape == (1, 1, 32)
+        assert not torch.any(gathered_inputs[0] == -1)
 
     @pytest.mark.parametrize("active_request_count", [2, 3, 4, 5])
     def test_mtp_sp_padding_real_ranks(self, active_request_count):
