@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -376,9 +376,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
         )
         inter_dist_opt_ag = (
-            getattr(pg_collection, 'inter_dist_opt_ag', None)
-            if pg_collection is not None
-            else None
+            getattr(pg_collection, 'inter_dist_opt_ag', None) if pg_collection is not None else None
         )
 
         if enable_hsdp:

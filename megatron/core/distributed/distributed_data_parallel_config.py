@@ -307,17 +307,11 @@ class DistributedDataParallelConfig:
 
         if self.fsdp_zero_sm_allgather:
             if not self.use_megatron_fsdp:
-                raise ValueError(
-                    "fsdp_zero_sm_allgather is only supported with Megatron-FSDP."
-                )
+                raise ValueError("fsdp_zero_sm_allgather is only supported with Megatron-FSDP.")
             if not self.nccl_ub:
-                raise ValueError(
-                    "fsdp_zero_sm_allgather requires NCCL user-buffer registration."
-                )
+                raise ValueError("fsdp_zero_sm_allgather requires NCCL user-buffer registration.")
             if self.disable_symmetric_registration:
-                raise ValueError(
-                    "fsdp_zero_sm_allgather requires symmetric NCCL registration."
-                )
+                raise ValueError("fsdp_zero_sm_allgather requires symmetric NCCL registration.")
         if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
             assert not self.grad_reduce_in_fp32, (
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "

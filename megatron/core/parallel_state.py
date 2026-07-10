@@ -201,9 +201,7 @@ def _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_grou
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
 
-def _apply_fsdp_zero_sm_allgather_group_options(
-    nccl_comm_cfgs, for_expert_parallelism, use_hsdp
-):
+def _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism, use_hsdp):
     """Configure FSDP all-gather groups to use NCCL's zero-CTA policy."""
     overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "dp_cp_ag", ("cta_policy", "zero"))
     if for_expert_parallelism:
@@ -1552,17 +1550,13 @@ def create_all_gather_groups(
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
             if use_hsdp:
-                inner_expert_dp_size = (
-                    expert_dp_size // num_distributed_optimizer_instances
-                )
+                inner_expert_dp_size = expert_dp_size // num_distributed_optimizer_instances
                 hierarchical_ag_groups, _ = create_hierarchical_groups(
                     rank,
                     expert_dp_ranks,
                     [inner_expert_dp_size, num_distributed_optimizer_instances],
                     pg_options=[
-                        _get_nccl_options_with_fallback(
-                            "ep_dp_ag", "intra_ep_dp", nccl_comm_cfgs
-                        ),
+                        _get_nccl_options_with_fallback("ep_dp_ag", "intra_ep_dp", nccl_comm_cfgs),
                         _get_nccl_options_with_fallback(
                             "inter_dist_opt_ag", "inter_ep_dp", nccl_comm_cfgs
                         ),
@@ -1578,9 +1572,7 @@ def create_all_gather_groups(
                 expert_dp_ag = create_group(
                     expert_dp_ranks,
                     timeout=timeout,
-                    pg_options=_get_nccl_options_with_fallback(
-                        "ep_dp_ag", "ep_dp", nccl_comm_cfgs
-                    ),
+                    pg_options=_get_nccl_options_with_fallback("ep_dp_ag", "ep_dp", nccl_comm_cfgs),
                     group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
                 )
                 if rank in expert_dp_ranks:

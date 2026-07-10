@@ -49,9 +49,7 @@ def test_standalone_fsdp_zero_sm_allgather_config_valid(monkeypatch):
         (StandaloneFSDPDistributedDataParallelConfig, {}),
     ],
 )
-def test_fsdp_zero_sm_allgather_preserves_allocator_fallback(
-    config_cls, kwargs, monkeypatch
-):
+def test_fsdp_zero_sm_allgather_preserves_allocator_fallback(config_cls, kwargs, monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     ddp_config = config_cls(
         nccl_ub=True,
@@ -95,10 +93,7 @@ def test_fsdp_zero_sm_allgather_config_requires_symmetric_registration(
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     with pytest.raises(ValueError, match="requires symmetric NCCL registration"):
         config_cls(
-            nccl_ub=True,
-            disable_symmetric_registration=True,
-            fsdp_zero_sm_allgather=True,
-            **kwargs,
+            nccl_ub=True, disable_symmetric_registration=True, fsdp_zero_sm_allgather=True, **kwargs
         )
 
 
@@ -112,9 +107,7 @@ def test_fsdp_zero_sm_allgather_config_requires_symmetric_registration(
 def test_fsdp_max_pool_buffer_count_accepts_three(config_cls, kwargs, monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     config = config_cls(
-        megatron_fsdp_max_pool_double_buffer=True,
-        megatron_fsdp_max_pool_buffer_count=3,
-        **kwargs,
+        megatron_fsdp_max_pool_double_buffer=True, megatron_fsdp_max_pool_buffer_count=3, **kwargs
     )
 
     assert config.fsdp_double_buffer
@@ -163,10 +156,7 @@ def _make_live_unit_pipeline(pool_size):
         param_to_param_group={param: index for index, param in enumerate(params)},
         double_buf_units=[0, 1, 2],
         weight_alloc=SimpleNamespace(size=pool_size),
-        ddp_config=SimpleNamespace(
-            fsdp_double_buffer=True,
-            outer_dp_sharding_strategy="no_shard",
-        ),
+        ddp_config=SimpleNamespace(fsdp_double_buffer=True, outer_dp_sharding_strategy="no_shard"),
         bucket_to_bucket_group={index: [index] for index in range(3)},
         dist_index=SimpleNamespace(use_hybrid_fsdp=False),
     )

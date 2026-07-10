@@ -601,9 +601,7 @@ def test_separate_all_gather_group():
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag, _outer_ag = ps.create_all_gather_groups(
-        for_expert_parallelism=False
-    )
+    dp_cp_ag_group, _expt_ag, _outer_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
@@ -620,18 +618,14 @@ def test_separate_all_gather_group():
 def test_hsdp_all_gather_groups_match_hsdp_topology():
     """HSDP AG-only communicators must match the groups that gather parameter shards."""
     Utils.initialize_model_parallel(
-        expert_model_parallel_size=2,
-        num_distributed_optimizer_instances=2,
+        expert_model_parallel_size=2, num_distributed_optimizer_instances=2
     )
 
     dp_cp_ag, expt_dp_ag, inter_dist_opt_ag = ps.create_all_gather_groups(
-        for_expert_parallelism=True,
-        num_distributed_optimizer_instances=2,
+        for_expert_parallelism=True, num_distributed_optimizer_instances=2
     )
 
-    intra_dp_cp = ps.get_data_parallel_group(
-        with_context_parallel=True, partial_data_parallel=True
-    )
+    intra_dp_cp = ps.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
     intra_expt_dp = ps.get_expert_data_parallel_group(partial_expert_data_parallel=True)
     inter_dist_opt = ps.get_inter_distributed_optimizer_instance_group()
 

@@ -2219,9 +2219,7 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP.
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
-            outer_fsdp_group_ag = self.dist_index.get_outer_fsdp_group(
-                independent_all_gather=True
-            )
+            outer_fsdp_group_ag = self.dist_index.get_outer_fsdp_group(independent_all_gather=True)
             if (
                 outer_fsdp_group_ag is not None
                 and outer_fsdp_group_ag is not self.dist_index.get_outer_fsdp_group()
@@ -4718,8 +4716,7 @@ class AllGatherPipeline:
                 with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
                     is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
                     outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
-                        is_expert_parallel=is_expert_parallel,
-                        independent_all_gather=True,
+                        is_expert_parallel=is_expert_parallel, independent_all_gather=True
                     )
                     with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:

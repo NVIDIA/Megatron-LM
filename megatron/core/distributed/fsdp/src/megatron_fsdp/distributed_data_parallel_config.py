@@ -230,13 +230,9 @@ class DistributedDataParallelConfig:
 
         if self.fsdp_zero_sm_allgather:
             if not self.nccl_ub:
-                raise ValueError(
-                    "fsdp_zero_sm_allgather requires NCCL user-buffer registration."
-                )
+                raise ValueError("fsdp_zero_sm_allgather requires NCCL user-buffer registration.")
             if self.disable_symmetric_registration:
-                raise ValueError(
-                    "fsdp_zero_sm_allgather requires symmetric NCCL registration."
-                )
+                raise ValueError("fsdp_zero_sm_allgather requires symmetric NCCL registration.")
 
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
