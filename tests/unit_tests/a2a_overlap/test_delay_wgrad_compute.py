@@ -12,15 +12,15 @@ from megatron.core.transformer import TransformerLayer
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
+    apply_flex_backend_kwargs,
     assert_models_equal,
     build_gpt_model,
     build_input_data,
     deterministic_mode,
     fsdp_train_step,
     get_test_config,
-    get_valid_flex_dispatcher_backend,
+    get_valid_dispatcher_configs,
     get_valid_fp8_flags,
-    get_valid_token_dispatcher_types,
     overlap_train_step,
     reset_model,
 )
@@ -60,10 +60,10 @@ class TestDelayWgradCompute:
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_overlap_dispatch_backward_with_experts_wgrad(
-        self, shared_expert_intermediate_size, dispatcher_type, fp8_flag
+        self, shared_expert_intermediate_size, dispatcher_type, flex_backend, fp8_flag
     ):
         """Verify that overlap_dispatch_backward_with_experts_wgrad produces identical
         per-step loss and final weights as the non-delayed baseline across multiple
@@ -73,9 +73,8 @@ class TestDelayWgradCompute:
         and FP8 modes.
         """
         num_layers = 4
-        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
-        if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -113,9 +112,9 @@ class TestDelayWgradCompute:
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     def test_overlap_dispatch_backward_with_experts_wgrad_with_fsdp(
-        self, shared_expert_intermediate_size, dispatcher_type
+        self, shared_expert_intermediate_size, dispatcher_type, flex_backend
     ):
         """Verify delayed wgrad with MegatronFSDP wrapping.
 
@@ -135,9 +134,8 @@ class TestDelayWgradCompute:
             )
 
         num_layers = 4
-        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
-        if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if shared_expert_intermediate_size is not None:
             extra_kwargs["moe_shared_expert_intermediate_size"] = shared_expert_intermediate_size
 
@@ -186,9 +184,9 @@ class TestDelayWgradCompute:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
-    def test_fsdp_1f1b_delay_wgrad(self, dispatcher_type, sharding_strategy):
+    def test_fsdp_1f1b_delay_wgrad(self, dispatcher_type, flex_backend, sharding_strategy):
         """Verify FSDP + 1F1B overlap + delay_wgrad_compute.
 
         Compares per-step loss and final weights between:
@@ -211,12 +209,8 @@ class TestDelayWgradCompute:
             )
 
         num_layers = 2
-        base_kwargs = {
-            "moe_token_dispatcher_type": dispatcher_type,
-            "moe_shared_expert_intermediate_size": 512,
-        }
-        if dispatcher_type == "flex":
-            base_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
+        base_kwargs = {"moe_shared_expert_intermediate_size": 512}
+        apply_flex_backend_kwargs(base_kwargs, dispatcher_type, flex_backend)
 
         with deterministic_mode():
             data = build_input_data(seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE)
