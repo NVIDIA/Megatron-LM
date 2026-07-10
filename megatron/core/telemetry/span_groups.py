@@ -145,12 +145,35 @@ class MegatronSpanGroup(SpanGroup):
     # microbatch, layer, communication, activation offload, trace_region,
     # inference) is profiling detail. Drives both the "goodput" preset and the
     # per-span lens.span_category attribute.
-    GOODPUT_GROUPS: Final[frozenset] = SpanGroup.GOODPUT_GROUPS | frozenset(
+    #
+    # Listed self-contained (NOT `SpanGroup.GOODPUT_GROUPS | ...`) so an older
+    # installed nemo-lens without GOODPUT_GROUPS can't AttributeError at class
+    # definition and take the whole training run down with it -- telemetry must
+    # never break training.
+    GOODPUT_GROUPS: Final[frozenset] = frozenset(
         [
+            SpanGroup.JOB,
+            SpanGroup.CHECKPOINT,
+            SpanGroup.EVALUATE,
+            SpanGroup.MODEL_INIT,
+            SpanGroup.LOAD_CHECKPOINT,
+            SpanGroup.STEP,
             DATA_LOADING,
             FIRST_ITERATION,
         ]
     )
+
+    @classmethod
+    def categories(cls) -> dict:
+        """{group: 'goodput'|'profiling'} for every group in ALL_GROUPS.
+
+        Defined here (not only on the base) so it works even against an older
+        nemo-lens whose SpanGroup predates categories().
+        """
+        return {
+            g: ("goodput" if g in cls.GOODPUT_GROUPS else "profiling")
+            for g in cls.ALL_GROUPS
+        }
 
     _PRESETS: ClassVar[dict] = {
         "default": frozenset(
