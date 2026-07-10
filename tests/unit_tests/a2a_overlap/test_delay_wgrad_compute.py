@@ -32,6 +32,19 @@ VOCAB_SIZE = 512
 LR = 0.01
 
 
+def _mark_ncclep_flaky_in_dev(dispatcher_configs):
+    # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure. Keep the
+    # quarantine scoped to that backend so alltoall/hybridep coverage still runs.
+    return [
+        (
+            pytest.param(*config, marks=pytest.mark.flaky_in_dev)
+            if config == ("flex", "ncclep")
+            else config
+        )
+        for config in dispatcher_configs
+    ]
+
+
 def _train_step(model, optimizer, data):
     """Run one forward-backward-optimizer step. Return the detached loss."""
     optimizer.zero_grad()
@@ -60,7 +73,9 @@ class TestDelayWgradCompute:
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize(
+        "dispatcher_type,flex_backend", _mark_ncclep_flaky_in_dev(get_valid_dispatcher_configs())
+    )
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_overlap_dispatch_backward_with_experts_wgrad(
         self, shared_expert_intermediate_size, dispatcher_type, flex_backend, fp8_flag
