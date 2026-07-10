@@ -54,15 +54,22 @@ from megatron.training.distillation.utils import (
     LOGPROBS_FORMAT_VERSION,
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
-    batched_tar_filename,
+    STALE_TAR_SUFFIX,
+    V2_BATCHED_TAR_RE,
+    batched_tar_prefix,
     compute_dataset_hash,
+    get_consumed_train_samples,
     get_current_iteration,
     is_remote_storage_path,
     open_logit_file,
     pack_indices,
+    peek_logprobs_metadata,
     reassemble_cp_sequence,
+    storage_basename,
+    storage_glob,
     storage_makedirs,
     storage_move,
+    v2_batched_tar_filename,
 )
 from megatron.training.utils import print_rank_0
 
@@ -112,8 +119,17 @@ class LogitsSaverHooks:
     CP rank 0 stores one CP-group payload per DP rank; tar filenames are DP-only.
 
     Iteration data is accumulated in memory and flushed as a tar archive at
-    checkpoint time via the async checkpoint queue.  Call :meth:`flush` at
-    shutdown to write any remaining buffered data synchronously.
+    checkpoint time via the async checkpoint queue.
+
+    Tars and their inner payload members are named by the **global sample
+    range** they cover (``dp{d}__{start}-{end}.tar``,
+    ``{start}-{end}.pt.zst``) rather than by training-iteration number --
+    the same "sample index" space :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
+    already computes internally.  This makes discovery/filtering agnostic
+    to whether the loader's MBS/DP/GBS differ from this run's.  Dedup of
+    stale shards from a crash-and-resume is handled entirely here, at
+    construction time (see :meth:`_quarantine_superseded_tars`); there is
+    no reader-side overlap check.
 
     Args:
         save_dir: Directory to save log-prob files
@@ -213,7 +229,7 @@ class LogitsSaverHooks:
         self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
         # Batched tar state — accumulates until checkpoint time.
-        self._pending_writes: OrderedDict[int, bytes] = OrderedDict()
+        self._pending_writes: "OrderedDict[Tuple[int, int], bytes]" = OrderedDict()
 
         # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
         self._topp_kept_counts: List[float] = []
@@ -221,9 +237,72 @@ class LogitsSaverHooks:
         # Create save directory if needed
         storage_makedirs(self.save_dir, exist_ok=True)
 
+        # Quarantine any of this rank's own tars that the resumed run is
+        # about to make stale.  Sole dedup mechanism — see docstring.
+        self._quarantine_superseded_tars()
+
         # Register as the active saver so checkpoint code can flush
         global _ACTIVE_LOGITS_SAVER
         _ACTIVE_LOGITS_SAVER = self
+
+    def _quarantine_superseded_tars(self) -> None:
+        """Quarantine this DP rank's own prior tars that a resume makes stale.
+
+        Runs once at construction time, scoped to this rank's own
+        ``dp{d}__*.tar`` prefix only — no cross-rank coordination or
+        collective is needed, since prefixes are disjoint across DP ranks.
+
+        This is the **sole** dedup mechanism for stale/superseded shards
+        from a crash-and-resume; there is no reader-side overlap check.
+        It is safe because ``take_pending_data`` (the only thing that ever
+        flushes a v2 tar bundle) is invoked exactly once per checkpoint
+        save, so every tar's ``[start, end)`` range is an inter-checkpoint
+        interval, and ``resume_sample`` (this run's starting
+        ``consumed_train_samples``) is itself always a checkpoint-boundary
+        value.  Two checkpoint-aligned intervals can never partially
+        overlap: a prior tar is either entirely before ``resume_sample``
+        (still valid, never rewritten, left alone) or entirely at-or-after
+        it (unambiguously superseded by what this run is about to write,
+        safe to discard in full).
+        """
+        resume_sample = get_args().consumed_train_samples
+        prefix = batched_tar_prefix(self.dp_rank)
+        candidates = storage_glob(os.path.join(self.save_dir, f"*{prefix}*.tar"))
+
+        for path in candidates:
+            match = V2_BATCHED_TAR_RE.match(storage_basename(path))
+            if match is None:
+                # Not a v2 sample-range shard (e.g. a legacy v1 tar sitting
+                # in the same directory) — not ours to clean up.
+                continue
+
+            start_sample = int(match.group("start"))
+
+            meta = peek_logprobs_metadata(path)
+            saved_hash = (meta or {}).get("hash")
+            if saved_hash != self.dataset_hash:
+                # Same naming pattern, different dataset identity: not
+                # safe to assume ownership even though the prefix matches.
+                logger.warning(
+                    "Found cached-logits shard %s with hash %s that does not "
+                    "match this run's hash %s; leaving it alone.",
+                    path, saved_hash, self.dataset_hash,
+                )
+                continue
+
+            if start_sample >= resume_sample:
+                # Move aside rather than delete: nothing is unrecoverably
+                # destroyed if the resume-point detection is ever wrong.
+                # The .stale suffix naturally falls outside the *.tar glob
+                # pattern used everywhere else, so no reader-side filtering
+                # changes are needed.
+                quarantined = f"{path}{STALE_TAR_SUFFIX}"
+                storage_move(path, quarantined)
+                print_rank_0(
+                    f"Quarantined superseded cached-logits shard "
+                    f"{path} -> {quarantined}"
+                )
+            # else: entirely before resume_sample -- still valid, untouched.
 
     def _forward_hook(
         self,
@@ -598,6 +677,15 @@ class LogitsSaverHooks:
         tensors) lets the loader serve any load microbatch as a contiguous
         view along the sample dim, which is what the
         :class:`LogprobsReshardPlan`-driven loader relies on.
+
+        Keyed by the global sample range ``(start_sample, end_sample)``
+        this iteration covers, rather than the training-iteration number.
+        ``training.py`` only updates ``args.consumed_train_samples`` after
+        ``train_step()`` returns, so at this point (inside the forward
+        hook, within ``train_step``) it still holds exactly the sample
+        count *before* this iteration's batch -- ``start_sample``, for
+        free.  ``end_sample`` matches how ``training.py`` itself computes
+        the current global batch size.
         """
         buffer = io.BytesIO()
         torch.save({
@@ -607,14 +695,15 @@ class LogitsSaverHooks:
             'format_version': LOGPROBS_FORMAT_VERSION,
         }, buffer)
         data = buffer.getvalue()
-        iteration = get_current_iteration()
-        self._pending_writes[iteration] = data
+        start_sample = get_consumed_train_samples()
+        end_sample = start_sample + get_num_microbatches() * self.dp_size * get_args().micro_batch_size
+        self._pending_writes[(start_sample, end_sample)] = data
 
     # ------------------------------------------------------------------
     #  Flush helpers
     # ------------------------------------------------------------------
 
-    def take_pending_data(self) -> Tuple[str, "OrderedDict[int, bytes]", bytes, bool]:
+    def take_pending_data(self) -> Tuple[str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool]:
         """Take ownership of buffered data for async flush at checkpoint time.
 
         Returns:
@@ -631,8 +720,9 @@ class LogitsSaverHooks:
         writes = self._pending_writes
         self._pending_writes = OrderedDict()
 
-        last_iter = max(writes.keys())
-        tar_filename = batched_tar_filename(self.dp_rank, last_iter)
+        bundle_start = min(s for s, _ in writes)
+        bundle_end = max(e for _, e in writes)
+        tar_filename = v2_batched_tar_filename(self.dp_rank, bundle_start, bundle_end)
         tar_path = os.path.join(self.save_dir, tar_filename)
         print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
         return (tar_path, writes, self._meta_bytes, msc_enabled)
@@ -640,7 +730,7 @@ class LogitsSaverHooks:
     @staticmethod
     def _write_batched_tar(
         tar_path: str,
-        writes: "OrderedDict[int, bytes]",
+        writes: "OrderedDict[Tuple[int, int], bytes]",
         meta_bytes: bytes,
         msc_enabled: bool = False,
     ) -> None:
@@ -654,8 +744,10 @@ class LogitsSaverHooks:
         sees it before any payload members and can
         verify alignment before any iteration data is decoded.
 
-        Each subsequent member is named ``{iteration}.pt.zst`` so that
-        the student-side tar reader can stream iterations by member name.
+        Each subsequent member is named ``{start_sample}-{end_sample}.pt.zst``
+        (the global sample range that iteration covers) so that the
+        student-side tar reader can stream iterations by member name,
+        without needing to know the training iteration count at all.
         """
         if not writes:
             return
@@ -679,9 +771,9 @@ class LogitsSaverHooks:
                 info.size = len(meta_bytes)
                 tar.addfile(info, io.BytesIO(meta_bytes))
 
-                for iteration, data in writes.items():
+                for (start_sample, end_sample), data in writes.items():
                     data = compressor.compress(data)
-                    member_name = f"{iteration}{LOGPROBS_TAR_MEMBER_SUFFIX}"
+                    member_name = f"{start_sample}-{end_sample}{LOGPROBS_TAR_MEMBER_SUFFIX}"
                     info = tarfile.TarInfo(name=member_name)
                     info.size = len(data)
                     tar.addfile(info, io.BytesIO(data))
