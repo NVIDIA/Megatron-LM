@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -28,12 +29,12 @@ from megatron.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.core.typed_torch import apply_module
+from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -323,6 +324,69 @@ class TestParallelMLAAttention:
             assert query.is_contiguous()
             assert key.is_contiguous()
             assert value.is_contiguous()
+
+    def test_gpu_forward_thd_qv_head_dim_mismatch(self):
+        """Test THD MLA path when q and v head dimensions differ."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            mismatch_attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            mismatch_attention.cuda().bfloat16()
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            attention_mask = None
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+                query, key, value, q_compressed, kv_compressed = (
+                    mismatch_attention.get_query_key_value_tensors(
+                        hidden_states, None, None, packed_seq_params, None
+                    )
+                )
+
+                assert query is not None
+                assert key is not None
+                assert value is not None
+                assert q_compressed is not None
+                assert kv_compressed is not None
+                assert query.shape[-1] != value.shape[-1]
+
+                output, bias = mismatch_attention(
+                    hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                )
+
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == transformer_config.hidden_size
+                assert bias.shape[0] == transformer_config.hidden_size
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
@@ -722,24 +786,18 @@ class TestParallelMLAAttentionPrecision:
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -747,8 +805,12 @@ class TestParallelMLAAttentionPrecision:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
@@ -887,24 +949,18 @@ class TestContextParallelMLAAttentionPrecision:
             torch.testing.assert_close(_q_compressed_sbhd, q_compressed_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_kv_compressed_sbhd, kv_compressed_thd, atol=1e-6, rtol=1e-6)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -912,8 +968,12 @@ class TestContextParallelMLAAttentionPrecision:
             )
             torch.testing.assert_close(_core_attn_out_sbhd, core_attn_out_thd, atol=atol, rtol=rtol)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             torch.testing.assert_close(_output_sbhd, output_thd, atol=atol, rtol=rtol)
 
@@ -1038,24 +1098,18 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -1063,8 +1117,12 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
@@ -1617,6 +1675,45 @@ class TestFusedMLASelfAttention:
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         )
 
+    def test_qkv_down_projection_split_tensor_parallel_shard(self, monkeypatch):
+        config = self.transformer_config
+        tp_size = 2
+        seq_len, batch = 2, 1
+        q_split = config.q_lora_rank // tp_size
+        kv_split = (config.kv_lora_rank + config.qk_pos_emb_head_dim) // tp_size
+
+        q_shard = torch.arange(seq_len * batch * q_split, dtype=torch.float32).view(
+            seq_len, batch, q_split
+        )
+        kv_shard = torch.full((seq_len, batch, kv_split), 7.0)
+        qkv_shard = torch.cat([q_shard, kv_shard], dim=-1)
+
+        class FakeQKVDownProjection(torch.nn.Module):
+            def forward(self, hidden_states):
+                return qkv_shard, None
+
+        gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
+        captured = {}
+
+        def fake_gather_from_tensor_model_parallel_region(tensor):
+            captured["q_shard"] = tensor
+            return gathered_q
+
+        monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
+        monkeypatch.setattr(
+            mla_module,
+            "gather_from_tensor_model_parallel_region",
+            fake_gather_from_tensor_model_parallel_region,
+        )
+        self.fused_attention.linear_qkv_down_proj = FakeQKVDownProjection()
+
+        hidden = torch.zeros(seq_len, batch, config.hidden_size)
+        q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
+
+        torch.testing.assert_close(captured["q_shard"], q_shard)
+        torch.testing.assert_close(q_compressed, gathered_q)
+        torch.testing.assert_close(kv_combined, kv_shard)
+
     def test_gpu_forward(self):
         if not is_te_min_version("1.10.0"):
             pytest.skip("Requires TE >= 1.10.0")
@@ -1791,6 +1888,78 @@ class TestFusedMLALoadFromStateDict:
         assert not any(
             'linear_qkv_down_proj.weight' in k for k in sharded_sd
         ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
+
+    def test_set_for_recompute_input_layernorm_uses_fused_down_proj(self, monkeypatch):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        seen = []
+
+        def mock_set_save_original_input(module):
+            seen.append(module)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_latent_attention.set_save_original_input",
+            mock_set_save_original_input,
+        )
+
+        fused.set_for_recompute_input_layernorm()
+
+        assert seen == [fused.linear_qkv_down_proj]
+
+    def test_sharded_state_dict_preserves_fused_layernorm_keys(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        sharded_sd = fused.sharded_state_dict(prefix="")
+        layernorm_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.layer_norm_")]
+        if not layernorm_keys:
+            pytest.skip("Fused test backend did not expose linear_qkv_down_proj layernorm keys")
+
+        fused_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.")]
+        assert all(k.startswith("linear_qkv_down_proj.layer_norm_") for k in fused_keys)
+
+    def test_synthetic_state_dict_hooks_fuse_legacy_down_proj_weights(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        config = self.transformer_config
+        q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
+        kv_weight = torch.randn(
+            config.kv_lora_rank + config.qk_pos_emb_head_dim, config.hidden_size
+        )
+        state_dict = {
+            "linear_q_down_proj.weight": q_weight,
+            "linear_kv_down_proj.weight": kv_weight,
+        }
+
+        assert fused._synthetic_state_dict_key_suffixes() == ("linear_q_down_proj.weight",)
+        fused._synthesize_fused_qkv_down_weight(state_dict, "")
+
+        assert "linear_q_down_proj.weight" not in state_dict
+        assert "linear_kv_down_proj.weight" not in state_dict
+        torch.testing.assert_close(
+            state_dict["linear_qkv_down_proj.weight"], torch.cat([q_weight, kv_weight], dim=0)
+        )
 
 
 class TestFusedMLARequiresQLora:

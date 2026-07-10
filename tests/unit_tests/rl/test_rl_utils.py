@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
-from unittest.mock import MagicMock
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -28,9 +30,12 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
     delete_cuda_graphs,
 )
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.inference import ReturnsRaw
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -82,6 +87,27 @@ class MockTokenizer:
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
+
+
+class DummyLangModule:
+    def __init__(self, config):
+        self.config = config
+        self.rotary_pos_emb = None
+        self.eval = MagicMock()
+        self.train = MagicMock()
+
+    def modules(self):
+        return iter(())
+
+
+class DummyMoELayer:
+    def __init__(self, use_partial_cudagraphs):
+        self.use_partial_cudagraphs = use_partial_cudagraphs
+        self.transition_calls = []
+
+    def transition_cudagraph_scope(self, mode):
+        self.transition_calls.append(mode)
+        self.use_partial_cudagraphs = mode == "partial"
 
 
 @pytest.fixture
@@ -140,6 +166,202 @@ class TestRLUtils:
         args = validate_args(args)
         set_global_variables(args, False)
         return args
+
+    def test_rl_granularity_defaults(self):
+        args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
+
+        assert args.rl_submission_granularity == "B"
+        assert args.rl_consumption_granularity == "B"
+        assert args.rl_generation_lag == 0
+        assert not hasattr(args, "rl_parallel_generation_tasks")
+        assert get_rl_parallel_generation_tasks(args) == 1
+
+    @pytest.mark.parametrize(
+        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
+        [
+            pytest.param("B", 0, 1, id="batch"),
+            pytest.param("B", 2, 3, id="batch_with_lag"),
+            pytest.param("G", 0, 8, id="group"),
+            pytest.param("G", 2, 24, id="group_with_lag"),
+            pytest.param("R", 0, 32, id="rollout"),
+            pytest.param("R", 2, 96, id="rollout_with_lag"),
+        ],
+    )
+    def test_get_rl_parallel_generation_tasks(
+        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
+    ):
+        args = SimpleNamespace(
+            rl_submission_granularity=submission_granularity,
+            rl_generation_lag=generation_lag,
+            grpo_prompts_per_step=8,
+            grpo_group_size=4,
+        )
+
+        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
+
+    @pytest.mark.parametrize(
+        "rl_partial_rollouts, submission_granularity",
+        [
+            pytest.param(False, "B", id="non_streaming_batch"),
+            pytest.param(True, "B", id="streaming_batch"),
+            pytest.param(True, "G", id="streaming_group"),
+            pytest.param(True, "R", id="streaming_rollout"),
+        ],
+    )
+    def test_get_rollout_generator_keeps_num_groups_at_trainer_batch_size(
+        self, monkeypatch, rl_partial_rollouts, submission_granularity
+    ):
+        """Regression for the removed ``num_groups=1`` streaming override.
+
+        Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
+        streamed with a non-batch submission granularity. For a multi-environment
+        agent that collapses the per-env group distribution so some environments
+        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
+        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
+        (``n_prompts``) regardless of streaming or submission granularity.
+        """
+        n_prompts = 8
+        captured = {}
+        rollout_generator = object()
+
+        class Agent:
+            def get_grouped_rollouts(self, request):
+                captured["request"] = request
+                return rollout_generator
+
+        def get_agent(_args, parallel_generation_tasks=None):
+            captured["parallel_generation_tasks"] = parallel_generation_tasks
+            return Agent()
+
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+
+        args = SimpleNamespace(
+            rl_partial_rollouts=rl_partial_rollouts,
+            rl_submission_granularity=submission_granularity,
+            rl_consumption_granularity="B",
+            rl_generation_lag=0,
+            grpo_prompts_per_step=n_prompts,
+            grpo_group_size=4,
+            rl_default_temperature=1.0,
+            inference_max_seq_length=128,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            grpo_filter_groups_with_same_reward=False,
+        )
+
+        result = rl_utils.get_rollout_generator(
+            args, inference_interface=ReturnsRaw(), n_prompts=n_prompts, samples_per_group=4
+        )
+
+        assert result is rollout_generator
+        assert captured["request"].num_groups == n_prompts
+        assert captured["request"].streaming == rl_partial_rollouts
+        assert captured["request"].submission_granularity == submission_granularity
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            pytest.param(
+                {"rl_generation_lag": 1},
+                "--rl-generation-lag requires --rl-partial-rollouts",
+                id="lag_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "R"},
+                "Rollout submission granularity requires streaming grouped rollouts",
+                id="rollout_submission_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_consumption_granularity": "R"},
+                "--rl-consumption-granularity R is not currently supported",
+                id="rollout_consumption_unsupported",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
+                "--rl-submission-granularity B with --rl-consumption-granularity G",
+                id="batch_submit_group_consume_unsupported",
+            ),
+        ],
+    )
+    def test_rl_granularity_validation_rejects_unsupported_modes(self, overrides, match):
+        with pytest.raises(AssertionError, match=match):
+            self.create_test_args(perform_rl_step=True, **overrides)
+
+    @pytest.mark.parametrize(
+        "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
+    )
+    def test_rl_granularity_choices_reject_unknown_value(self, monkeypatch, flag):
+        monkeypatch.setattr("sys.argv", ["test", flag, "X"])
+        with pytest.raises(SystemExit):
+            parse_args(ignore_unknown_args=False)
+
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args):
+        interface = MagicMock()
+        interface.resume.return_value = object()
+        interface.suspend.return_value = object()
+        loop = SimpleNamespace(run_until_complete=MagicMock())
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        monkeypatch.setattr(
+            rl_utils,
+            "unwrap_model",
+            lambda model: model.module if hasattr(model, "module") else model,
+        )
+        monkeypatch.setattr(
+            rl_utils, "_maybe_prefetch_separate_inference_model_weights", MagicMock()
+        )
+        monkeypatch.setattr(rl_utils, "set_decode_expert_padding", MagicMock())
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        return interface, loop
+
+    def _make_toggle_cuda_graphs_mock(self):
+        def _toggle(lang_module, set_to):
+            assert set_to in {"none", "local"}, f"Invalid CUDA graph implementation: {set_to}"
+            lang_module.config.cuda_graph_impl = set_to
+
+        return MagicMock(side_effect=_toggle)
+
+    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(self, monkeypatch):
+        config = SimpleNamespace(
+            cuda_graph_impl="none",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+        )
+        lang_module = DummyLangModule(config)
+        model = [SimpleNamespace(config=config, module=lang_module)]
+        args = SimpleNamespace(
+            rl_training_cuda_graphs=False,
+            num_experts=None,
+            curr_iteration=11,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+        )
+        interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
+        monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
+
+        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+            assert result is interface
+            assert config.cuda_graph_impl == "local"
+            assert config.cuda_graph_modules == []
+            assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+        assert toggle_cuda_graphs.call_args_list == [
+            call(lang_module, "local"),
+            call(lang_module, "none"),
+        ]
+        assert config.cuda_graph_impl == "local"
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        lang_module.eval.assert_called_once()
+        lang_module.train.assert_called_once()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -316,9 +538,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0]],
-            completed_at_step=[1],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -328,9 +549,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
-            completed_at_step=[1],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
 
@@ -350,9 +570,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
-            completed_at_step=[1],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         r2 = TokenRollout(
@@ -362,9 +581,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
-            completed_at_step=[1],
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
             num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -399,9 +617,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
-            policy_staleness=[[0, 0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0, 0]] * num_turns,
-            completed_at_step=[0] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
@@ -411,9 +628,8 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0, 0, 0]] * num_turns,
-            completed_at_step=[0] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
@@ -423,9 +639,8 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
-            policy_staleness=[[0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0]] * num_turns,
-            completed_at_step=[0] * num_turns,
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
             num_evictions=[0] * num_turns,
         )
 
@@ -813,6 +1028,9 @@ class TestRLUtils:
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
         wrapped_model = Float16Module(transformer_config, model)
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in wrapped_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         # Create test inputs (batch_size=1 required for thd format with sequence packing)
         batch_size = 1
@@ -896,30 +1114,6 @@ class TestRLUtils:
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
 
-    def test_compute_true_staleness(self):
-        # Single group, 2 turns: turn 1 has 1 token, turn 2 has 2 tokens
-        result = rl_utils.compute_true_staleness(
-            per_token_staleness=[[1, 2, 3]],
-            completed_at_steps=[[8, 7]],
-            turn_lens=[[1, 2]],
-            current_iteration=10,
-        )
-        # token 0: 1 + (10-8) = 3
-        # token 1: 2 + (10-7) = 5
-        # token 2: 3 + (10-7) = 6
-        assert result == [3, 5, 6]
-
-        # Multiple groups
-        result = rl_utils.compute_true_staleness(
-            per_token_staleness=[[0, 0], [1]],
-            completed_at_steps=[[5], [5]],
-            turn_lens=[[2], [1]],
-            current_iteration=6,
-        )
-        # group 1: [0+1, 0+1] = [1, 1]
-        # group 2: [1+1] = [2]
-        assert result == [1, 1, 2]
-
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [pytest.param((1, 1), id="tp1-pp1")],
@@ -933,12 +1127,12 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        # Per-token staleness (6 tokens in group 1, 3 in group 2; matching turn_lens)
-        policy_staleness = [[1, 2, 2, 0, 0, 3], [0, 3, 3]]
-        kv_cache_staleness = [[1, 1, 1, 0, 0, 2], [0, 2, 2]]
+        # Per-token epoch stamps, grouped by group then rollout
+        policy_epoch = [[[4, 5], [2, 3]], [[5], [0, 1]]]
+        kv_cache_epoch = [[[4, 5], [3, 4]], [[5], [1, 2]]]
+        # Per-turn max epoch stamps (when each turn completed)
+        completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
-        # Per-turn completed_at_steps (5 turns in group 1, 2 in group 2; matching turn_lens)
-        completed_at_steps = [[5, 4, 5, 5, 3], [5, 3]]
         current_iteration = 6
         metrics = rl_utils.prep_wandb_metrics(
             MagicMock(),
@@ -947,10 +1141,10 @@ class TestRLUtils:
             rewards,
             num_turns,
             advantages,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
+            completed_epochs=completed_epochs,
             num_evictions=num_evictions,
-            completed_at_steps=completed_at_steps,
             current_iteration=current_iteration,
         )
         assert metrics["mean_reward"] == 0.75
@@ -967,15 +1161,23 @@ class TestRLUtils:
         assert metrics["mean_num_turns"] == 15.5
         assert metrics["max_num_turns"] == 42
         assert metrics["min_num_turns"] == 2
-        # true_policy_staleness = [2, 4, 4, 1, 1, 6, 1, 6, 6]
-        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 4, 1, 1, 6, 1, 6, 6])
+        # true_policy_staleness = [6-4, 6-2, 6-5, 6-0] = [2, 4, 1, 6] -> mean=3.25, max=6, min=1
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 1, 6])
         assert metrics["max_policy_staleness"] == 6
         assert metrics["min_policy_staleness"] == 1
-        # true_kv_staleness = [2, 3, 3, 1, 1, 5, 1, 5, 5]
-        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 3, 1, 1, 5, 1, 5, 5])
+        # true_kv_staleness = [6-4, 6-3, 6-5, 6-1] = [2, 3, 1, 5] -> mean=2.75, max=5, min=1
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 1, 5])
         assert metrics["max_kv_cache_staleness"] == 5
         assert metrics["min_kv_cache_staleness"] == 1
+        # last_token (max epoch per rollout): policy=[5, 3, 5, 1] -> staleness=[1, 3, 1, 5]
+        assert metrics["mean_policy_last_token_staleness"] == np.mean([1, 3, 1, 5])
+        assert metrics["max_policy_last_token_staleness"] == 5
+        assert metrics["min_policy_last_token_staleness"] == 1
+        # last_token (max epoch per rollout): kv=[5, 4, 5, 2] -> staleness=[1, 2, 1, 4]
+        assert metrics["mean_kv_cache_last_token_staleness"] == np.mean([1, 2, 1, 4])
+        assert metrics["max_kv_cache_last_token_staleness"] == 4
+        assert metrics["min_kv_cache_last_token_staleness"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
-        # completion_gaps per-turn = [1, 2, 1, 1, 3, 1, 3]
-        assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 1, 3, 1, 3])
+        # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
+        assert metrics["mean_completion_gap"] == 2.5

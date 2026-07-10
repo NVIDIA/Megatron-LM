@@ -138,7 +138,6 @@ class TestTransformerLayerSubmoduleCallables:
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():

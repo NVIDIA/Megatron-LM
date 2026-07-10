@@ -4,6 +4,7 @@ build
 .coverage_*
 *.egg-info
 *~
+*.swp
 slurm*
 logs
 .vscode
@@ -20,3 +21,7 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+
+# Git worktrees
+.worktrees/
+.claude/worktrees/

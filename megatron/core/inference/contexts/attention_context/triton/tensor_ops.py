@@ -3,8 +3,21 @@
 from typing import Optional
 
 import torch
-import triton  # type: ignore
-import triton.language as tl  # type: ignore
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 @triton.jit
@@ -12,8 +25,8 @@ def _tensor_get_slice_after_kernel(
     INPUT_TENSOR,
     OUTPUT_TENSOR,
     POS_ON_DEVICE,
-    INPUT_BATCH_SIZE: tl.constexpr,
-    OUTPUT_BATCH_SIZE: tl.constexpr,
+    INPUT_BATCH_SIZE,
+    OUTPUT_BATCH_SIZE,
     ROW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -43,10 +56,10 @@ def _tensor_merge_kernel(
     TENSOR_B,
     OUTPUT_TENSOR,
     POS_ON_DEVICE,
-    TENSOR_B_BATCH_SIZE: tl.constexpr,
+    TENSOR_B_BATCH_SIZE,
     ROW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    OUTPUT_BATCH_SIZE: tl.constexpr,
+    OUTPUT_BATCH_SIZE,
     IS_INPLACE: tl.constexpr,
 ):
     """

@@ -22,6 +22,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -117,7 +118,7 @@ def test_builder():
         def build_low_level_dataset(
             dataset_path: str, config: BlendedMegatronDatasetConfig
         ) -> LowLevelDataset:
-            return numpy.load(dataset_path)
+            return safe_numpy_load(dataset_path)
 
         def __len__(self) -> int:
             return len(self.sample_index)
@@ -368,6 +369,7 @@ def test_fast_builder(
             rank=0,
             make_vocab_size_divisible_by=128,
             tensor_model_parallel_size=1,
+            pad_vocab_size=True,
         )
     )
 
@@ -435,9 +437,7 @@ def test_fast_builder(
             args.test_data_path = test_file_prefixes
 
         if sequences_per_dataset:
-            args.path_to_sequences_per_dataset_json = os.path.join(
-                temp_dir, "sequences_per_dataset.json"
-            )
+            args.per_dataset_sequences_path = os.path.join(temp_dir, "sequences_per_dataset.json")
             sequences_per_dataset = build_sequences_per_dataset(args)
 
         blend, blend_per_split = get_blend_and_blend_per_split(args)

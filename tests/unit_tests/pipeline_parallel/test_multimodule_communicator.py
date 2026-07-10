@@ -18,6 +18,7 @@ from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     _create_transformer_block,
     _get_pg_collection_from_grid,
     create_hypercomm_grid,
+    destroy_all_grids,
     get_transformer_block_and_grid,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -42,6 +43,9 @@ class TestMultiModulePipelineCommunicator:
 
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        destroy_all_grids()
 
     def test_multimodule_communicator_init(self):
         """Test MultiModulePipelineCommunicator initialization."""

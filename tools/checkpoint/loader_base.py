@@ -80,7 +80,6 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
-        margs.use_legacy_models = False
         margs.transformer_impl = self.args.loader_transformer_impl
         if self.args.loader_transformer_impl == "local" and margs.normalization == "RMSNorm":
             margs.no_persist_layer_norm = True
@@ -135,7 +134,6 @@ class MegatronCheckpointLoaderBase:
         try:
             from megatron.training.global_vars import set_global_variables
             from megatron.core import mpu
-            from megatron.legacy import fused_kernels
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             self.queue.put("exit")
@@ -152,7 +150,6 @@ class MegatronCheckpointLoaderBase:
         fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-        fused_kernels.load(self.margs)
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
@@ -456,7 +453,6 @@ class MegatronCheckpointLoaderBase:
         md.true_vocab_size = true_vocab_size
         md.make_vocab_size_divisible_by = self.margs.make_vocab_size_divisible_by
         md.checkpoint_args = self.checkpoint_args
-        md.use_legacy_models = self.margs.use_legacy_models
         return md
 
     def build_sys_argv(self):
@@ -470,7 +466,6 @@ class MegatronCheckpointLoaderBase:
             '--no-masked-softmax-fusion',
             '--no-bias-gelu-fusion',
             '--no-bias-dropout-fusion',
-            '--no-async-tensor-model-parallel-allreduce',
             '--use-cpu-initialization',
             '--micro-batch-size', '1',
             '--no-load-optim',

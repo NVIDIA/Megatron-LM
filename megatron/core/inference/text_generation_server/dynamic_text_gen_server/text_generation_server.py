@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 import logging
@@ -48,6 +48,7 @@ async def _run_text_gen_server(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     fd: Optional[int] = None,
+    hostname: Optional[str] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -57,16 +58,17 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr)
+    inference_client = InferenceClient(coordinator_addr, deserialize=False)
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
     try:
-        try:
-            hostname = socket.gethostname()
-        except Exception as e:
-            logger.warning(f"Could not get hostname: {e}")
-            hostname = "0.0.0.0"
+        if hostname is None:
+            try:
+                hostname = socket.gethostname()
+            except Exception as e:
+                logger.warning(f"Could not get hostname: {e}")
+                hostname = "0.0.0.0"
 
         app = Quart(__name__)
 
@@ -93,7 +95,7 @@ async def _run_text_gen_server(
         if fd is not None:
             config.bind = [f"fd://{fd}"]
         else:
-            config.bind = [f"0.0.0.0:{server_port}"]
+            config.bind = [f"{hostname}:{server_port}"]
 
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
@@ -117,6 +119,7 @@ def _server_process_worker(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     fd: Optional[int] = None,
+    hostname: Optional[str] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -124,7 +127,7 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd
+                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname
             )
         )
     except KeyboardInterrupt:
@@ -146,6 +149,8 @@ def start_text_gen_server(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     num_replicas: int = 4,
+    hostname: Optional[str] = None,
+    sock: Optional[socket.socket] = None,
 ):
     """Start the text generation server."""
     global _SERVER_PROCESSES
@@ -155,17 +160,29 @@ def start_text_gen_server(
         logger.warning("Text gen server processes are already running.")
         return
 
-    _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # The caller may pass in a socket it has already bound ahead of time.
+    if sock is not None:
+        bound_port = sock.getsockname()[1]
+        if bound_port == 0:
+            raise ValueError(
+                "socket must be bound to a real port before being passed to start_text_gen_server"
+            )
+        _SHARED_SOCKET = sock
+        server_port = bound_port
+        _SHARED_SOCKET.setblocking(False)
+    else:
+        _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    if hasattr(socket, 'SO_REUSEPORT'):
-        try:
-            _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
 
-    _SHARED_SOCKET.bind(("0.0.0.0", server_port))
-    _SHARED_SOCKET.setblocking(False)
+        bind_address = hostname if hostname is not None else "0.0.0.0"
+        _SHARED_SOCKET.bind((bind_address, server_port))
+        _SHARED_SOCKET.setblocking(False)
 
     _SHARED_SOCKET.set_inheritable(True)
     fd = _SHARED_SOCKET.fileno()
@@ -173,7 +190,7 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd),
+            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname),
             daemon=True,
         )
         p.start()

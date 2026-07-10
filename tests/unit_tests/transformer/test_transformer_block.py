@@ -318,6 +318,46 @@ class TestParallelTransformerBlock:
             config.hidden_size,
         )
 
+    def test_gpu_forward_uniform_checkpoint_non_divisible_layers(self):
+        """Test that uniform recompute works when num_layers is not evenly
+        divisible by recompute_num_layers.
+
+        With num_layers=5 and recompute_num_layers=3 the chunks should be
+        [0, 1, 2] and [3, 4].  Before the fix the last chunk would attempt
+        to access layers 3, 4, **5** which is out of bounds.
+
+        Regression test for https://github.com/NVIDIA/Megatron-LM/issues/2294
+        """
+        transformer_config = TransformerConfig(
+            num_layers=5,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=3,
+        )
+        uniform_block = TransformerBlock(
+            transformer_config, get_gpt_layer_with_transformer_engine_spec()
+        )
+        uniform_block.cuda()
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, transformer_config.hidden_size), device='cuda'
+        )
+        hidden_states.requires_grad = True
+
+        attention_mask = torch.ones(
+            (1, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        # This should not raise an IndexError
+        output = uniform_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
+
 
 class TestPipelineParallelTransformerBlock:
     @pytest.mark.parametrize(

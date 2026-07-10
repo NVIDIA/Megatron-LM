@@ -93,8 +93,9 @@ def _apply_rotary_pos_emb_bshd(
     t: Tensor,
     freqs: Tensor,
     rotary_interleaved: bool = False,
-    multi_latent_attention: bool = False,
+    mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
+    multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
@@ -103,16 +104,26 @@ def _apply_rotary_pos_emb_bshd(
     Args:
         t (Tensor): Input tensor T is of shape [seq_length, ... , dim]
         freqs (Tensor): Rotary Positional embedding tensor freq is of shape [seq_length, ..., dim]
+        rotary_interleaved (bool): Whether to apply interleaving in the rotate half function.
+        mla_rotary_interleaved (bool): Whether to apply MLA-style interleaving for RoPE.
+        mscale (float): The scaling factor for the RoPE.
 
     Returns:
         Tensor: The input tensor after applying RoPE
     """
+    if multi_latent_attention is not None:
+        warnings.warn(
+            "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
+            DeprecationWarning,
+        )
+        mla_rotary_interleaved = multi_latent_attention
+
     rot_dim = freqs.shape[-1]
 
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 
-    if multi_latent_attention:
+    if mla_rotary_interleaved:
         x1 = t[..., 0::2]
         x2 = t[..., 1::2]
         t = torch.cat((x1, x2), dim=-1)
@@ -180,9 +191,10 @@ def _apply_rotary_pos_emb_thd(
     cu_seqlens: Tensor,
     freqs: Tensor,
     rotary_interleaved: bool = False,
-    multi_latent_attention: bool = False,
+    mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -196,55 +208,64 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
+    if multi_latent_attention is not None:
+        warnings.warn(
+            "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
+            DeprecationWarning,
+        )
+        mla_rotary_interleaved = multi_latent_attention
 
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    sequence_splits = torch.split(t, seqlens)
+    total_seqlen = int(cu_seqlens[-1].item())
+    has_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == total_seqlen
 
     # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
-    #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
-    #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
+    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains positions for the whole packed
+    #    batch. Each sequence must therefore use its cu_seqlens offset when selecting the local CP
+    #    front/back slices. For example, with cu_seqlens=[0, 4, 8], cp_size=2, rank 0 should use
+    #    positions [0, 3, 4, 7], not [0, 3, 0, 3].
+    # 2. Otherwise: freqs contains only max sequence length positions. Each packed sequence should
+    #    reuse positions starting from 0, preserving the legacy THD behavior.
+    if has_packed_freqs:
         # CASE 1: Exact mapping with offsets
-        # Build packed freqs in one pass, then apply once to the whole packed tensor
-        sequence_splits = torch.split(t, seqlens)
-        freq_slices = []
+        local_freqs = []
         for i, x in enumerate(sequence_splits):
             # cu_seqlens[i] is the starting offset of this sequence in the original batch
             seq_start_offset = cu_seqlens[i].item()
-            freq_slices.append(
+            local_freqs.append(
                 _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
             )
-
-        freqs_packed = torch.cat(freq_slices, dim=0)
-
+        freqs = torch.cat(local_freqs, dim=0)
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
-            freqs_packed,
+            freqs,
             rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
         ).squeeze(1)
-    else:
-        # CASE 2: Traditional mapping without offsets
-        # Build packed freqs for all sequences using the standard mapping, then apply once
-        sequence_splits = torch.split(t, seqlens)
-        freqs_packed = torch.cat(
-            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
-            dim=0,
-        )
 
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
+    # CASE 2: Traditional mapping without offsets. Apply RoPE one sequence at a time so the second
+    # and later packed sequences do not look like continuations of the first sequence.
+    output = torch.empty_like(t)
+    output_offset = 0
+    for x in sequence_splits:
+        freq_slice = _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs)
+        output_slice = _apply_rotary_pos_emb_bshd(
+            x.unsqueeze(1),
+            freq_slice,
             rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
         ).squeeze(1)
+        output.narrow(0, output_offset, x.size(0)).copy_(output_slice)
+        output_offset += x.size(0)
+
+    return output
 
 
 def apply_rotary_pos_emb(
@@ -254,6 +275,7 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    mla_rotary_interleaved: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -264,6 +286,8 @@ def apply_rotary_pos_emb(
     # Keep for backward compatibility. Will deprecate in the future.
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = config.multi_latent_attention
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
@@ -279,6 +303,12 @@ def apply_rotary_pos_emb(
             if mscale != 1.0:
                 warnings.warn(
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
+                )
+                use_unfused = True
+            if mla_rotary_interleaved:
+                warnings.warn(
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
                     "Using unfused implementation."
                 )
                 use_unfused = True
@@ -301,7 +331,7 @@ def apply_rotary_pos_emb(
             t,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
         )
     else:
@@ -310,7 +340,7 @@ def apply_rotary_pos_emb(
             cu_seqlens,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
         )
@@ -339,7 +369,7 @@ def apply_rotary_pos_emb_with_cos_sin(
             t,
             freqs,
             rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=False,
+            mla_rotary_interleaved=False,
             mscale=1.0,
         )
     else:

@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import sys
 from unittest import mock
 
 import pytest
@@ -9,7 +10,11 @@ from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistSaveShardedStrategy,
+    get_async_strategy,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,7 +61,9 @@ class TestAsyncSave:
         ):
             # async
             async_calls = AsyncCallsQueue(persistent)
-            async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
+            async_request = save(
+                sharded_state_dict, async_ckpt_dir, async_sharded_save=True, async_strategy="mcore"
+            )
             async_calls.schedule_async_request(async_request)
 
             # sync
@@ -74,36 +81,85 @@ class TestAsyncSave:
 
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('async_save', [False, True])
-    @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
-    def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
-        Utils.initialize_model_parallel(2, 4)
-        orig_fn = FileSystemWriterAsync.write_preloaded_data
-        FileSystemWriterAsync.write_preloaded_data = worker_fn
+    @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
+    def test_get_async_strategy(self, async_strategy):
+        strategy, modules = get_async_strategy(async_strategy)
 
-        sharded_state_dict = {
-            f'key{i}': ShardedTensor.from_rank_offsets(f'key{i}_rank{Utils.rank}', torch.ones(2, 4))
-            for i in range(4)  # make sure there is enough non-empty saving workers
-        }
-        save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8)
+        assert len(modules) > 1
+        assert strategy == async_strategy
 
-        with (
-            TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported') as ckpt_dir,
-            pytest.raises(CheckpointException) as exc_info,
+        _, module = get_async_strategy(async_strategy, module="FileSystemWriterAsync")
+        assert type(module) is not dict
+
+    @pytest.mark.parametrize('async_strategy', ["nvrx", "mcore"])
+    def test_get_async_strategy_no_nvrx_installed(self, async_strategy):
+        with mock.patch.dict(
+            'sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}
         ):
-            if async_save:
-                async_calls = AsyncCallsQueue()
-                async_request = save(
-                    sharded_state_dict, ckpt_dir, save_strategy, async_sharded_save=True
-                )
-                async_calls.schedule_async_request(async_request)
-                async_calls.maybe_finalize_async_calls(blocking=True)
-            else:
-                save(sharded_state_dict, ckpt_dir, save_strategy)
-        if Utils.rank == 0:
-            assert 'Worker failure' in str(exc_info.value)
-        else:
-            assert 'Worker failure' not in str(exc_info.value)
+            from megatron.core.dist_checkpointing.strategies.async_utils import (
+                AsyncRequest as MCoreAsyncRequest,
+            )
 
-        FileSystemWriterAsync.write_preloaded_data = orig_fn
-        Utils.destroy_model_parallel()
+            if async_strategy == "nvrx":
+                with pytest.raises(ModuleNotFoundError):
+                    strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
+            else:
+                strategy, module = get_async_strategy(async_strategy, module="AsyncRequest")
+
+                assert strategy == "mcore"
+                assert module == MCoreAsyncRequest
+
+    def test_get_async_strategy_missing_nvrx_cached_metadata_reader(self):
+        with mock.patch.dict(
+            'sys.modules',
+            {
+                'nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader': None
+            },
+        ):
+            with pytest.raises(ModuleNotFoundError):
+                get_async_strategy("nvrx", module="CachedMetadataFileSystemReader")
+
+
+_NVRX_SUBMODULES = [
+    'nvidia_resiliency_ext.checkpointing.async_ckpt.core',
+    'nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader',
+    'nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async',
+    'nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver',
+]
+
+
+class TestHasNvrxAsyncSupport:
+    """Tests for has_nvrx_async_support, focusing on the minimum-version assertion."""
+
+    def _fake_modules(self):
+        """MagicMock modules that satisfy every symbol and hasattr check in has_nvrx_async_support."""
+        return {name: mock.MagicMock() for name in _NVRX_SUBMODULES}
+
+    def test_version_check_passes(self):
+        """Returns True when all NVRx symbols are present and version meets the minimum."""
+        with (
+            mock.patch(
+                'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
+                side_effect=lambda name: self._fake_modules()[name],
+            ),
+            mock.patch(
+                'megatron.core.dist_checkpointing.strategies.nvrx.is_nvrx_min_version',
+                return_value=True,
+            ),
+        ):
+            assert has_nvrx_async_support() is True
+
+    def test_version_check_fails(self):
+        """Raises AssertionError when all NVRx symbols are present but version is too old."""
+        with (
+            mock.patch(
+                'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
+                side_effect=lambda name: self._fake_modules()[name],
+            ),
+            mock.patch(
+                'megatron.core.dist_checkpointing.strategies.nvrx.is_nvrx_min_version',
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
+                has_nvrx_async_support()

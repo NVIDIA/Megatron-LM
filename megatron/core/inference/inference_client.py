@@ -176,14 +176,15 @@ class InferenceClient:
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
+    def _send_signal_to_engines(self, signal, *args):
         """
         Sends a generic control signal to the inference coordinator.
 
         Args:
             signal: The signal to send, typically a value from the `Headers` enum.
+            *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value]
+        payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
@@ -200,9 +201,13 @@ class InferenceClient:
         """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def increment_staleness(self):
-        """Sends a signal to increment staleness on all in-flight requests."""
-        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+    def set_generation_epoch(self, generation_epoch: int):
+        """Sends a signal to stamp all in-flight requests with the given generation epoch.
+
+        Args:
+            generation_epoch: The current generation epoch number.
+        """
+        self._send_signal_to_engines(Headers.SET_GENERATION_EPOCH, generation_epoch)
 
     def suspend_engines(self):
         """Sends SUSPEND to all engines via coordinator. Requires PAUSED.

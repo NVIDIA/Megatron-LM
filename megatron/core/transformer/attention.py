@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -11,7 +11,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -33,8 +35,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
+from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -51,7 +53,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -81,6 +83,13 @@ if not HAVE_FA3:
         pass
 
 try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     HAVE_FMLA = True
@@ -97,18 +106,15 @@ except:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
+        TENorm,
         set_save_original_input,
     )
-except ImportError:
-    HAVE_TE = False
-    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+else:
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -118,8 +124,8 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
-class LinearQkv(Protocol):
-    """Protocol for linear_qkv modules."""
+class LinearQkvInterface(Protocol):
+    """Interface for linear_qkv modules."""
 
     def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_qkv."""
@@ -147,13 +153,13 @@ class LinearQkvBuilder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str,
         tp_group: torch.distributed.ProcessGroup | None = None,
-    ) -> LinearQkv: ...
+    ) -> LinearQkvInterface: ...
 
 
-class LinearLayer(Protocol):
-    """Protocol for linear_q and linear_kv modules."""
+class LinearInterface(Protocol):
+    """Interface for linear_q and linear_kv modules."""
 
-    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_q/linear_kv."""
         ...
 
@@ -173,23 +179,23 @@ class LinearLayerBuilder(Protocol):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
-    ) -> LinearLayer: ...
+    ) -> LinearInterface: ...
 
 
-class CoreAttention(Protocol):
-    """Protocol for core_attention modules."""
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention modules."""
 
     def forward(
         self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor],
+        attention_mask: Tensor | None,
         /,
         *,
         attn_mask_type: AttnMaskType,
-        attention_bias: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
+        attention_bias: Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
     ) -> Tensor:
         """Applies dot product attention."""
         ...
@@ -205,10 +211,42 @@ class CoreAttentionBuilder(Protocol):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: Optional[str],
-        softmax_scale: Optional[float],
-        pg_collection: Optional[ProcessGroupCollection],
-    ) -> CoreAttention: ...
+        cp_comm_type: str | None,
+        softmax_scale: float | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...
+
+
+class LinearProjInterface(Protocol):
+    """Interface for linear_proj modules."""
+
+    def forward(self, hidden_states: Tensor, /) -> tuple[Tensor, Tensor | None]:
+        """Applies the linear projection to the output of the core attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Computes weight gradients of output projection layer."""
+        ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        query_projection_size: int,
+        hidden_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearProjInterface: ...
 
 
 @dataclass
@@ -219,7 +257,7 @@ class SelfAttentionSubmodules:
 
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
 
@@ -233,7 +271,7 @@ class CrossAttentionSubmodules:
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -253,7 +291,12 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config = config
@@ -263,6 +306,11 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+
+        # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
+        # which is a pure function of the config and is reused on every forward
+        # pass for both static and dynamic batching code paths.
+        self._yarn_concentration_factor = _yarn_get_concentration_factor_from_config(config)
 
         assert self.config.kv_channels is not None
         assert self.config.num_query_groups is not None
@@ -349,18 +397,18 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_proj") if name is not None else None,
         )
 
         if (
@@ -391,17 +439,28 @@ class Attention(MegatronModule, ABC):
         attn_mask_type=None,
         attention_bias=None,
         packed_seq_params=None,
+        core_attention_extra_kwargs=None,
     ):
         """Forward method with selective activation checkpointing."""
+        if core_attention_extra_kwargs is None:
+            core_attention_extra_kwargs = {}
+        tensor_kwarg_names = []
+        checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
+        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
+        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
+        # closing over the original forward tensors.
+        for name, kwarg_value in core_attention_extra_kwargs.items():
+            if torch.is_tensor(kwarg_value):
+                tensor_kwarg_names.append(name)
+                checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
+            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = apply_module(self.core_attention)(
+            extra_kwargs = dict(core_attention_extra_kwargs)
+            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
+                extra_kwargs[name] = kwarg_value
+            output_ = self._run_core_attention(
                 query,
                 key,
                 value,
@@ -409,17 +468,42 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                **extra_kwargs,
             )
             return output_
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
+        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
+        # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
-        )
+        checkpoint_inputs[5] = attn_mask_type
+        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
 
         return hidden_states
+
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        **extra_kwargs,
+    ):
+        """Run the configured core attention module."""
+        return apply_module(self.core_attention)(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            **extra_kwargs,
+        )
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -609,7 +693,11 @@ class Attention(MegatronModule, ABC):
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, self.pg_collection.cp
+                    key,
+                    k_pos_emb,
+                    self.config,
+                    self.pg_collection.cp,
+                    mscale=self._yarn_concentration_factor,
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -619,8 +707,10 @@ class Attention(MegatronModule, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+            if (
+                getattr(self.config, "cache_mla_latents", None)
+                and not inference_context.is_decode_only()
+            ):
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
@@ -684,7 +774,10 @@ class Attention(MegatronModule, ABC):
         if rotary_sin is not None:
             rotary_sin = rotary_sin.to(query_layer.dtype)
 
-        out = flash_attn_with_kvcache(
+        softmax_offset = self._get_inference_softmax_offset()
+        need_lse = softmax_offset is not None
+
+        kv_kwargs = dict(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -695,7 +788,102 @@ class Attention(MegatronModule, ABC):
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
         )
+        if need_lse:
+            kv_kwargs["return_softmax_lse"] = True
+            out, softmax_lse = flash_attn_with_kvcache(**kv_kwargs)
+            # out: (B, S, H, D); softmax_lse: (B, H, S)
+            out = self._apply_sink_softmax_correction_bshd(out, softmax_lse, softmax_offset)
+        else:
+            out = flash_attn_with_kvcache(**kv_kwargs)
         return out
+
+    def _get_inference_softmax_offset(self) -> Optional[Tensor]:
+        """Return the per-head sink (off-by-one / learnable) softmax logit, or None.
+
+        This mirrors how the static-inference path applies the off-by-one /
+        learnable softmax in :class:`DotProductAttention` and (for TE) in
+        :class:`TEDotProductAttention`. The dynamic-inference path bypasses
+        ``self.core_attention`` and calls flash-attention kernels directly,
+        so we plumb the offset back out here and apply the correction as a
+        post-hoc rescale of the flash-attention output.
+
+        Returns:
+            * ``None`` when ``config.softmax_type == "vanilla"`` (no correction).
+            * A tensor of shape ``[num_attention_heads_per_partition]`` of
+              per-head sink logits otherwise.
+        """
+        if self.config.softmax_type == "vanilla":
+            return None
+        # Both local DotProductAttention (zeros for off-by-one, Parameter for
+        # learnable) and the TE backend (learnable) expose `softmax_offset`
+        # directly on the core_attention module.
+        offset = getattr(self.core_attention, "softmax_offset", None)
+        if offset is None:
+            # Fallback: TE off-by-one path may not surface `softmax_offset`
+            # as a named attribute (TE applies a fixed +1 in the denominator
+            # internally). Logit space zero == +1 in the denominator, which
+            # matches off-by-one semantics.
+            assert self.config.softmax_type == "off-by-one", (
+                f"softmax_type={self.config.softmax_type!r} requires a "
+                f"softmax_offset tensor on core_attention but none was found."
+            )
+            if not hasattr(self, "_inference_zero_softmax_offset"):
+                self._inference_zero_softmax_offset = torch.zeros(
+                    self.num_attention_heads_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=self.config.params_dtype,
+                )
+            offset = self._inference_zero_softmax_offset
+        return offset
+
+    @staticmethod
+    def _apply_sink_softmax_correction_varlen(
+        output: Tensor, lse: Tensor, softmax_offset: Tensor
+    ) -> Tensor:
+        """Apply sink-softmax post-correction to a varlen flash-attn output.
+
+        For vanilla softmax flash-attention returns
+        ``out_i = sum_j (exp(qk_j) / sum_k exp(qk_k)) * v_j`` with
+        ``lse = log(sum_k exp(qk_k))``. Sink (off-by-one / learnable) softmax
+        replaces the denominator with ``exp(sink_h) + sum_k exp(qk_k)``,
+        which is equivalent to multiplying ``out`` by
+        ``sigmoid(lse - sink_h)``. NaN/inf LSE values can appear for rows
+        with no attended keys (e.g. padding); those rows are kept unmodified
+        — the dynamic-batching path zeros padded tokens downstream.
+
+        Args:
+            output (Tensor): ``(total_q, num_heads, head_dim)``.
+            lse (Tensor): ``(num_heads, total_q)`` log-sum-exp from flash-attn.
+            softmax_offset (Tensor): ``(num_heads,)`` per-head sink logit.
+        """
+        # (H, T) -> (T, H, 1)
+        lse_aligned = lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+        sink = softmax_offset.reshape(1, -1, 1).to(device=output.device, dtype=torch.float32)
+        scale = torch.sigmoid(lse_aligned - sink)
+        # Preserve rows where LSE is non-finite (no attended keys).
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        return (output.to(torch.float32) * scale).to(output.dtype)
+
+    @staticmethod
+    def _apply_sink_softmax_correction_bshd(
+        output: Tensor, lse: Tensor, softmax_offset: Tensor
+    ) -> Tensor:
+        """Apply sink-softmax post-correction to a (B, S, H, D) flash-attn output.
+
+        See :meth:`_apply_sink_softmax_correction_varlen` for the math; this
+        variant only differs in tensor layout.
+
+        Args:
+            output (Tensor): ``(B, S, num_heads, head_dim)``.
+            lse (Tensor): ``(B, num_heads, S)`` log-sum-exp from flash-attn.
+            softmax_offset (Tensor): ``(num_heads,)`` per-head sink logit.
+        """
+        # (B, H, S) -> (B, S, H, 1)
+        lse_aligned = lse.permute(0, 2, 1).unsqueeze(-1).to(torch.float32)
+        sink = softmax_offset.reshape(1, 1, -1, 1).to(device=output.device, dtype=torch.float32)
+        scale = torch.sigmoid(lse_aligned - sink)
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        return (output.to(torch.float32) * scale).to(output.dtype)
 
     def _flash_attention_3_forward_wrapper(
         self,
@@ -708,10 +896,17 @@ class Attention(MegatronModule, ABC):
         seqlens_k,
         block_table,
         softmax_scale,
+        window_size: Tuple[int, int] = (-1, -1),
+        return_lse: bool = False,
     ):
         """
         Wrapper for calling the FA3 _flash_attn_forward function.
         Handles argument conversion for different versions of the _flash_attn_forward API.
+
+        Args:
+            return_lse (bool): If True, the wrapper also returns the per-token
+                log-sum-exp tensor produced by flash-attention (used by the
+                sink / off-by-one softmax correction path).
         """
         candidate_kwargs = {
             "q": q,
@@ -742,9 +937,9 @@ class Attention(MegatronModule, ABC):
             "causal": True,
             "attention_chunk": 0,
             "softcap": 0.0,
-            "window_size": (-1, -1),
-            "window_size_left": -1,
-            "window_size_right": -1,
+            "window_size": window_size,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
             "rotary_interleaved": True,
             "scheduler_metadata": None,
             "num_splits": 0 if not self.batch_invariant_mode else 1,
@@ -761,9 +956,32 @@ class Attention(MegatronModule, ABC):
         valid_kwargs = set(sig.parameters.keys())
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
-        output_total, *unused = _flash_attn_forward(**final_kwargs)
+        ret = _flash_attn_forward(**final_kwargs)
+        if isinstance(ret, torch.Tensor):
+            output_total = ret
+            unused = ()
+        else:
+            output_total, *unused = ret
 
-        return output_total
+        if not return_lse:
+            return output_total
+
+        # FA3 versions return softmax_lse at different positions depending on
+        # the build (some return (out, lse), others
+        # (out, q, k, v, out_padded, lse, p)). We probe by tensor rank because
+        # softmax_lse is always 2D (num_heads, total_q).
+        num_heads = q.shape[-2]
+        softmax_lse = None
+        for item in unused:
+            if isinstance(item, torch.Tensor) and item.dim() == 2 and item.shape[0] == num_heads:
+                softmax_lse = item
+                break
+        assert softmax_lse is not None, (
+            "Could not locate softmax_lse in flash-attn 3 _flash_attn_forward "
+            "return value; sink (off-by-one / learnable) softmax requires "
+            "log-sum-exp output from the kernel."
+        )
+        return output_total, softmax_lse
 
     def flash_decode_and_prefill(
         self,
@@ -777,6 +995,7 @@ class Attention(MegatronModule, ABC):
         seqlens_k,
         block_table,
         is_decode_only,
+        softmax_offset: Optional[Tensor] = None,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -791,6 +1010,14 @@ class Attention(MegatronModule, ABC):
             seqlens_k (Tensor): key sequence lengths.
             block_table (Tensor): KV cache block ids for all samples.
             is_decode_only (bool): True if batch is decode only.
+            softmax_offset (Optional[Tensor]): Per-head sink (off-by-one or
+                learnable) logit. Shape ``[num_attention_heads_per_partition]``.
+                When provided, the flash-attention output is post-corrected
+                by ``out *= sigmoid(log_sum_exp - softmax_offset)`` so that
+                the attention probabilities match
+                ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
+                the same denominator-with-sink formulation used by the
+                static-inference path (TE / DotProductAttention).
         Return:
             (Tensor) Attention output.
         """
@@ -798,17 +1025,48 @@ class Attention(MegatronModule, ABC):
         assert not self.training
         assert block_table is not None
 
+        # Resolve sliding-window-attention size for this layer.
+        # `config.window_size` is a (left, right) tuple, where -1 means infinite
+        # window in that direction (i.e. full attention). When SWA is not active
+        # for this layer (either globally disabled, or the layer is a "full
+        # attention" layer per `window_attn_skip_freq`), fall back to (-1, -1).
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = (-1, -1)
+
+        # Whether we need to retrieve LSE from the flash-attn kernels to apply
+        # the sink (off-by-one / learnable) softmax correction post-hoc.
+        need_lse = softmax_offset is not None
+
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA3:
+            if HAVE_FA4:
+                output_total, softmax_lse = flash_attn4_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    num_splits=1,
+                )
+            elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                output_total = self._flash_attention_3_forward_wrapper(
+                fa3_ret = self._flash_attention_3_forward_wrapper(
                     q,
                     k,
                     v,
@@ -818,12 +1076,19 @@ class Attention(MegatronModule, ABC):
                     seqlens_k,
                     block_table,
                     softmax_scale,
+                    window_size=window_size,
+                    return_lse=need_lse,
                 )
+                if need_lse:
+                    output_total, softmax_lse = fa3_ret
+                else:
+                    output_total = fa3_ret
+                    softmax_lse = None
             else:
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
-                output_total = flash_attn_varlen_func(
+                fa2_ret = flash_attn_varlen_func(
                     q,
                     k,
                     v,
@@ -833,16 +1098,44 @@ class Attention(MegatronModule, ABC):
                     max_seqlen_k,
                     softmax_scale=softmax_scale,
                     causal=True,
+                    window_size=window_size,
                     block_table=block_table,
+                    return_attn_probs=need_lse,
+                )
+                if need_lse:
+                    # FA2 varlen with return_attn_probs=True returns
+                    # (out, softmax_lse, S_dmask)
+                    output_total, softmax_lse, _ = fa2_ret
+                else:
+                    output_total = fa2_ret
+                    softmax_lse = None
+            if need_lse:
+                # output_total: (total_q, H, D); softmax_lse: (H, total_q)
+                output_total = self._apply_sink_softmax_correction_varlen(
+                    output_total, softmax_lse, softmax_offset
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
+            # For speculative decoding, q arrives as (B*S, 1, H, D) where S is
+            # the number of tokens per request. Reshape to (B, S, H, D) so the
+            # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
+            num_requests = seqlens_k.shape[0]
+            tokens_per_request = q.shape[0] // num_requests
+            q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
+
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
+            # standard Attention.
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
+                # FlashMLA does not currently support sliding window attention.
+                assert window_size == (-1, -1), (
+                    "FlashMLA decode kernel does not support sliding window attention. "
+                    "Set config.window_size = None or use a non-MLA attention layer."
+                )
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = 1  # Sequence length is 1 for decode
+                seq_len_q = tokens_per_request
                 num_heads_q = self.num_attention_heads_per_partition
                 num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
 
@@ -865,23 +1158,83 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                 )
+                if need_lse:
+                    # output_total: (B, S, H, D_v); softmax_lse: (B, H, S)
+                    output_total = self._apply_sink_softmax_correction_bshd(
+                        output_total, softmax_lse, softmax_offset
+                    )
             else:
-                flash_attn_args = {
-                    "q": q,
-                    "k_cache": k,
-                    "v_cache": v,
-                    "cache_seqlens": seqlens_k,
-                    "causal": True,
-                    "page_table" if HAVE_FA3 else "block_table": block_table,
-                    "num_splits": 0 if not self.batch_invariant_mode else 1,
-                }
-                if HAVE_FA3:
-                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                if HAVE_FA4:
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
+                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
+                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    output_total, softmax_lse = flash_attn4_varlen_func(
+                        q_varlen,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=tokens_per_request,
+                        max_seqlen_k=max_seqlen_k,
+                        seqused_k=seqlens_k,
+                        page_table=block_table,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        num_splits=1,
+                    )
+                    if need_lse:
+                        # output_total: (B*S, H, D); softmax_lse: (H, B*S)
+                        output_total = self._apply_sink_softmax_correction_varlen(
+                            output_total, softmax_lse, softmax_offset
+                        )
+                    # Reshape back to (B, S, H, D)
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
-                    output_total = flash_attn_with_kvcache(**flash_attn_args)
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
+                    flash_attn_args = {
+                        "q": q,
+                        "k_cache": k,
+                        "v_cache": v,
+                        "cache_seqlens": seqlens_k,
+                        "softmax_scale": softmax_scale,
+                        "causal": True,
+                        "window_size": window_size,
+                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    }
+                    if need_lse:
+                        flash_attn_args["return_softmax_lse"] = True
+                    if HAVE_FA3:
+                        kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
+                    else:
+                        assert (
+                            not self.batch_invariant_mode
+                        ), "Batch invariant mode is not supported for flash attention 2"
+                        kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
+                    if need_lse:
+                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
+                        # return_softmax_lse=True.
+                        output_total, softmax_lse = kvcache_ret
+                        # output_total: (B, S, H, D); softmax_lse: (B, H, S)
+                        output_total = self._apply_sink_softmax_correction_bshd(
+                            output_total, softmax_lse, softmax_offset
+                        )
+                    else:
+                        output_total = kvcache_ret
+
+            # Reshape back to (B*S, 1, H, D) for consistent output shape.
+            output_total = output_total.reshape(
+                num_requests * tokens_per_request, 1, *output_total.shape[2:]
+            )
+
         return output_total
 
     def forward(
@@ -899,7 +1252,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None]:
         """
         Perform a forward pass through the attention module.
 
@@ -935,18 +1288,20 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA3 or is_fa_min_version(
-                "2.7.3"
+            assert (
+                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        is_inference_mode = inference_context is not None and not self.training
+        is_inference_mode = InferenceMode.is_active()
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
         # with flashinfer fused rope
-        is_using_flashinfer_rope = is_inference_mode and (
-            not inference_context.is_static_batching()
+        is_using_flashinfer_rope = (
+            is_inference_mode
+            and inference_context is not None
+            and not inference_context.is_static_batching()
             and inference_context.use_flashinfer_fused_rope
         )
         if is_using_flash_decode or is_using_flashinfer_rope:
@@ -989,18 +1344,16 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
             )
-        if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = off_interface.group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[]
-            )
+        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1024,7 +1377,7 @@ class Attention(MegatronModule, ABC):
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
-            and not self.training
+            and InferenceMode.is_active()
         )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
@@ -1049,13 +1402,12 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
+            output, bias = apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1111,12 +1463,17 @@ class Attention(MegatronModule, ABC):
                             q_pos_emb,
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
-                            mscale=_yarn_get_concentration_factor_from_config(self.config),
+                            mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            query,
+                            q_pos_emb,
+                            self.config,
+                            cu_seqlens_q,
+                            self.pg_collection.cp,
+                            mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
@@ -1124,7 +1481,7 @@ class Attention(MegatronModule, ABC):
                         k_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
+                        mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
                     )
             else:
@@ -1143,6 +1500,9 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -1156,9 +1516,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
@@ -1186,6 +1544,7 @@ class Attention(MegatronModule, ABC):
                     kv_lengths,
                     block_table,
                     inference_context.is_decode_only(),
+                    softmax_offset=self._get_inference_softmax_offset(),
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
@@ -1194,10 +1553,9 @@ class Attention(MegatronModule, ABC):
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1216,12 +1574,10 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
@@ -1263,7 +1619,12 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1273,6 +1634,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1289,25 +1651,54 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_qkv") if name is not None else None,
         )
 
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        if self.config.qk_l2_norm:
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
         else:
-            self.q_layernorm = None
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
 
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = submodules.k_layernorm(
+        self.q_layernorm = (
+            q_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-        else:
-            self.k_layernorm = None
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -1420,8 +1811,10 @@ class SelfAttention(Attention):
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
                 self.world_size // self.config.num_query_groups
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
@@ -1478,7 +1871,7 @@ class SelfAttention(Attention):
             # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
             # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
             # This is step 4 in the list of steps above.
-            idx = get_tensor_model_parallel_rank() % (
+            idx = get_pg_rank(self.pg_collection.tp) % (
                 self.world_size // self.config.num_query_groups
             )
             size = self.num_attention_heads_per_partition // (
@@ -1642,7 +2035,12 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1651,6 +2049,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            name=name,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -1666,6 +2065,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_q") if name is not None else None,
         )
 
         self.linear_kv = submodules.linear_kv(
@@ -1677,6 +2077,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_kv") if name is not None else None,
         )
 
     def get_query_key_value_tensors(
