@@ -126,6 +126,7 @@ def _make_boundary_block(
 ):
     """Create a lightweight TransformerBlock instance for boundary helper tests."""
     block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
     block.config = config
     block.pre_process = pre_process
     block.input_tensor = input_tensor
