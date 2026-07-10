@@ -94,6 +94,42 @@ class TestBertModel:
         assert logits[0].shape[2] == self.bert_model.vocab_size
 
     @pytest.mark.internal
+    def test_qk_layernorm_submodules_are_none(self):
+        # The TE BERT spec leaves q_layernorm/k_layernorm unset (None) instead of hardcoding
+        # IdentityOp, so that TransformerConfig.qk_layernorm can select the default TENorm
+        # through the shared SelfAttention fallback (`submodules.q_layernorm or TENorm`).
+        spec = get_bert_layer_with_transformer_engine_spec()
+        assert spec.submodules.self_attention.submodules.q_layernorm is None
+        assert spec.submodules.self_attention.submodules.k_layernorm is None
+
+    @pytest.mark.internal
+    def test_qk_layernorm_from_config_fallback(self):
+        # With config.qk_layernorm=True and the spec's q_layernorm/k_layernorm left unset,
+        # SelfAttention should fall back to instantiating a real TE LayerNorm for Q and K.
+        te_pytorch = pytest.importorskip("transformer_engine.pytorch")
+
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            qk_layernorm=True,
+            pipeline_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.unfused,
+        )
+        bert_model = BertModel(
+            config=transformer_config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+        )
+        attention = bert_model.encoder.layers[0].self_attention
+        assert isinstance(attention.q_layernorm, te_pytorch.LayerNorm)
+        assert isinstance(attention.k_layernorm, te_pytorch.LayerNorm)
+
+    @pytest.mark.internal
     def test_packed_forward_uses_cu_seqlens_positions_and_no_attention_mask(self, mocker):
         config = TransformerConfig(
             num_layers=2,

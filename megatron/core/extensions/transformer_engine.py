@@ -1749,8 +1749,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("tokens_per_sample")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later

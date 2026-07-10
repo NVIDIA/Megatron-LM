@@ -321,6 +321,7 @@ def forward_step(data_iterator, model: HybridModel):
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
+            tokens_per_sample=args.seq_length,
         )
 
     timers('batch-generator').stop()
@@ -454,7 +455,6 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, hybrid_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         store=store,
