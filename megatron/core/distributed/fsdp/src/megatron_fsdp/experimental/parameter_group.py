@@ -25,7 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placement, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -151,13 +151,22 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            if self.main_grad.placements != self.main_weight.placements:
+            if not _grad_placements_reduce_to_weight(
+                self.main_grad.placements, self.main_weight.placements
+            ):
                 raise ValueError(
-                    "FSDP temporarily requires main_grad and main_weight to have the same "
-                    "placements until HSDP/HFSDP support is implemented. "
+                    "FSDP requires main_grad placements to equal main_weight placements, or "
+                    "to defer a reduction by being Partial on an axis where main_weight is "
+                    "Replicate (HSDP DP-outer accumulation). "
                     f"Got main_grad placements {self.main_grad.placements} and "
                     f"main_weight placements {self.main_weight.placements}."
                 )
+            # When main_grad placements differ from main_weight, main_grad rests at a
+            # DP-outer Partial accumulation state: each backward reduce-scatters DP-inner
+            # into it, and the deferred DP-outer reduction runs on the last microbatch.
+            self._defers_grad_reduction = self.main_grad.placements != self.main_weight.placements
+            self._grad_accumulating = False
+            self._reduced_grad: DBuffer | None = None
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
@@ -245,8 +254,82 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def reduce_gradients(self) -> None:
-        """Reduce full local gradients into sharded parameter gradients."""
+    def _reduce_partial_grad(
+        self, partial_grad: DBuffer, partial_op: dist.ReduceOp.RedOpType, *, out: "DBuffer | None"
+    ) -> DBuffer:
+        """Reduce an all-Partial gradient buffer to ``main_grad``'s placements.
+
+        ``DBuffer.redistribute`` changes one mesh axis per call, so a 2-D DP mesh
+        (HSDP/HFSDP) composes the reduction axis by axis. Innermost axes are
+        reduced first: each reduce-scatter shrinks the buffer before the next
+        collective, and every intermediate placement keeps ``Flat`` a suffix
+        (``[Partial, Flat]`` is valid, ``[Flat, Partial]`` is not). The outermost
+        changed axis is reduced last so it can write directly into ``out``.
+        """
+        target = self.main_grad.placements
+        changed_axes = [
+            axis
+            for axis in range(self.mesh.ndim)
+            if partial_grad.placements[axis] != target[axis]
+        ]
+        if not changed_axes:
+            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
+        if self._symm_mem_pool is not None and len(changed_axes) > 1:
+            raise NotImplementedError(
+                "Symmetric-memory gradient reduction supports a single mesh axis; "
+                f"got changed axes {changed_axes}."
+            )
+
+        current = partial_grad
+        for axis in reversed(changed_axes):
+            placements = list(current.placements)
+            placements[axis] = target[axis]
+            if self._symm_mem_pool is not None:
+                current.rendezvous(axis)
+            is_outermost_change = axis == changed_axes[0]
+            current = current.redistribute(placements, out=out if is_outermost_change else None)
+            if partial_op == dist.ReduceOp.SUM:
+                current.local_buffer.div_(self.mesh.size(axis))
+        return current
+
+    def _accumulate_deferred_grad(
+        self, partial_grad: DBuffer, partial_op: dist.ReduceOp.RedOpType, is_last_microbatch: bool
+    ) -> None:
+        """Accumulate DP-inner-reduced grads, deferring the DP-outer reduction.
+
+        main_grad rests at its DP-outer-Partial placement. Each backward
+        reduce-scatters DP-inner into main_grad (resetting it on the first
+        microbatch, accumulating afterwards). Only the last microbatch reduces
+        DP-outer into ``main_weight``'s placement and installs the resulting
+        sharded parameter gradients.
+        """
+        assert self.main_grad is not None
+        inner_reduced = self._reduce_partial_grad(partial_grad, partial_op, out=None)
+        if self._grad_accumulating:
+            self.main_grad.local_buffer.add_(inner_reduced.local_buffer)
+        else:
+            self.main_grad.local_buffer.copy_(inner_reduced.local_buffer)
+            self._grad_accumulating = True
+
+        if not is_last_microbatch:
+            return
+
+        # Reduce DP-outer into the optimizer's placement; keep the buffer alive for
+        # optimizer.step() through both this reference and the sharded grad DTensors.
+        self._reduced_grad = self.main_grad.redistribute(self.main_weight.placements)
+        for index, sharded_parameter in enumerate(self.sharded_parameters):
+            sharded_parameter.grad = self._reduced_grad.get_dtensor(index)
+        self._grad_accumulating = False
+
+    def reduce_gradients(self, is_last_microbatch: bool = True) -> None:
+        """Reduce full local gradients into sharded parameter gradients.
+
+        For a plain DP mesh (or matching gradient/optimizer placements) the
+        reduction runs fully every backward. When main_grad defers a DP-outer
+        reduction (HSDP: main_grad Partial where main_weight is Replicate), each
+        backward reduce-scatters DP-inner and accumulates into main_grad, and only
+        the last microbatch reduces DP-outer and installs the sharded gradients.
+        """
         assert self.main_grad is not None
 
         def has_grad(parameters: Iterable[nn.Parameter]) -> bool:
@@ -275,6 +358,12 @@ class FsdpParameterGroup:
                 grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
             )
 
+        if self._defers_grad_reduction:
+            self._accumulate_deferred_grad(partial_grad, partial_op, is_last_microbatch)
+            for parameter in self.unsharded_parameters:
+                parameter.grad = None
+            return
+
         # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
@@ -282,20 +371,10 @@ class FsdpParameterGroup:
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )
-        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
-        if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        grad_divisor = self.mesh.size(reduce_axis) if partial_op == dist.ReduceOp.SUM else 1
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
-            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if grad_divisor != 1:
-                self.main_grad.local_buffer.div_(grad_divisor)
+            self._reduce_partial_grad(partial_grad, partial_op, out=self.main_grad)
         else:
-            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if grad_divisor != 1:
-                reduced_grad.local_buffer.div_(grad_divisor)
+            reduced_grad = self._reduce_partial_grad(partial_grad, partial_op, out=None)
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
@@ -314,3 +393,24 @@ def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
     module_name, separator, parameter_name = name.rpartition(".")
     owner = module.get_submodule(module_name) if separator else module
     return owner, parameter_name
+
+
+def _grad_placements_reduce_to_weight(
+    grad_placements: tuple[Placement, ...], weight_placements: tuple[Placement, ...]
+) -> bool:
+    """Return whether main_grad placements reduce to main_weight placements.
+
+    They may be equal, or main_grad may be ``Partial`` on an axis where
+    main_weight is ``Replicate`` (an HSDP DP-outer reduction deferred to the last
+    microbatch). All other axes must match so the buffers share a layout and
+    local size.
+    """
+    if len(grad_placements) != len(weight_placements):
+        return False
+    for grad_placement, weight_placement in zip(grad_placements, weight_placements):
+        if grad_placement == weight_placement:
+            continue
+        if isinstance(grad_placement, Partial) and isinstance(weight_placement, Replicate):
+            continue
+        return False
+    return True

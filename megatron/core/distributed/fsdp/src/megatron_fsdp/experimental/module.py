@@ -247,7 +247,7 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         for group in self._parameter_groups:
             if group.requires_grad:
-                group.reduce_gradients()
+                group.reduce_gradients(self.context.is_last_microbatch)
         self._reshard_parameter_groups()
         self.context.enqueue_release(self)
         if self.is_root():
