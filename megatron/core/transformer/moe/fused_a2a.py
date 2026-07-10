@@ -347,7 +347,7 @@ def prepare_deepep_v2_buffer(
     if not HAVE_DEEP_EP_V2:
         raise RuntimeError(
             "prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). "
-            "Install deep_ep from the epv2-release branch."
+            "Install deep_ep >= epv2-release (ElasticBuffer is on main as of 2025)."
         )
     key = (group, num_max_tokens_per_rank)
     if key in _deepep_v2_buffer_pool:

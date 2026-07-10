@@ -697,7 +697,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif self._deepep_v2_ep_dispatcher:
             assert HAVE_DEEP_EP_V2, (
                 "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
-                "ElasticBuffer (install from the epv2-release branch)."
+                "ElasticBuffer (available on deep_ep main as of 2025)."
             )
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             # Pre-allocate two ElasticBuffers (symmetric NVLink memory) — one for fixed-shape

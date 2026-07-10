@@ -1103,7 +1103,7 @@ class TransformerConfig(ModelParallelConfig):
     - 'deepep_v2': Reuse the training-side DeepEP V2 (ElasticBuffer) all-to-all
       dispatcher in eval mode, with the expanded-layout (one-slot-per-expert)
       gather-free path. Requires moe_token_dispatcher_type='flex' and a deep_ep
-      install that exposes ElasticBuffer (epv2-release branch).
+      install that exposes ElasticBuffer (deep_ep main or later).
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     mrope_section: Optional[List[int]] = None
