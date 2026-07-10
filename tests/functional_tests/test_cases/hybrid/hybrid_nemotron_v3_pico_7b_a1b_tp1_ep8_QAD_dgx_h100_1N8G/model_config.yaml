@@ -1,8 +1,10 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+  TRITON_CACHE_AUTOTUNING: 0
+  MAMBA_DETERMINISTIC: 1
   # Paths
   MODEL_BF16_CKPT: "${DATA_PATH}/model/nemotron_v3_pico_7b-a1b/3T-token_deeparch"
   PTQ_QUANTIZED_CKPT: "${DATA_CACHE_PATH}/ptq_quantized_ckpt"
@@ -19,6 +21,7 @@ BEFORE_SCRIPT: |
   export NCCL_IB_TIMEOUT=22
   uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 \
     examples/post_training/modelopt/quantize.py \
+    --deterministic-mode \
     --micro-batch-size 1 \
     --save-interval 100000 \
     --bf16 \
@@ -126,9 +129,10 @@ MODEL_ARGS:
   --bf16: true
   # Parallelism
   --tensor-model-parallel-size: 1     # TODO(aanoosheh): can change to 2 once TE fix is released
-  --expert-model-parallel-size: 4     # TODO(aanoosheh): can change to 8 once TE fix is released
+  --expert-model-parallel-size: 4
   --expert-tensor-parallel-size: 1
-  --pipeline-model-parallel-size: 2   # TODO(aanoosheh): can change to 1 once TE fix is released
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 2
   --sequence-parallel: true
   # Infrastructure
   --attention-backend: fused
@@ -144,8 +148,8 @@ MODEL_ARGS:
   # Training
   --micro-batch-size: 1
   --global-batch-size: 8
-  --seq-length: 4096
-  --max-position-embeddings: 4096
+  --seq-length: 2048               # TODO(aanoosheh): change to 4096 once TE fix is released
+  --max-position-embeddings: 2048  # TODO(aanoosheh): change to 4096 once TE fix is released
   --train-iters: 10
   --lr: 0.00015
   --lr-decay-style: cosine
@@ -179,6 +183,8 @@ MODEL_ARGS:
   --timing-log-level: 0
   --no-gradient-accumulation-fusion: true
   --distributed-timeout-minutes: 30
+  # Etc
+  --deterministic-mode: true
   --exit-interval: 10
 TEST_TYPE: regular
 METRICS:
