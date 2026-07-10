@@ -1362,7 +1362,6 @@ class _DeepepManager(_DispatchManager):
                 self.handle,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
-                use_expanded_layout=self.use_expanded_layout,
             )
         else:
             hidden_states, _ = fused_combine(

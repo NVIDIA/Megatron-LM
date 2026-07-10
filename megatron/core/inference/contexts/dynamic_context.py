@@ -334,7 +334,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
-        # DeepEP V2 dispatches over tp_ep (expert-TP × EP); the ElasticBuffer must match that group.
+        # DeepEP V2 dispatches over tp_ep (expert-TP x EP); the ElasticBuffer must match that group.
         if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
             self.expert_tp_ep_group = pg_collection.tp_ep
         else:
@@ -727,7 +727,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     num_topk=model_config.moe_router_topk,
                 )
         elif get_pg_size(self.expert_model_parallel_group) > 1:
-            # moe_latent_size if set, else hidden_size.
+            # Use moe_latent_size if set, else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
                 per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,

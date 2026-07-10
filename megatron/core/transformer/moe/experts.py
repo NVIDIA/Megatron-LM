@@ -896,7 +896,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets
     """
 
     def __init__(
@@ -1017,7 +1017,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         This allows:
         - TE's forward to work correctly (same Parameter objects, same internal state)
         - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        - torch._grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -1091,22 +1091,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, None]:
-        """Expert forward for the DeepEP V2 expand-layout dispatch (graph-capturable).
+        """Expert forward for the DeepEP V2 expand-layout dispatch.
 
         do_expand=True writes one slot per (token, expert) into a worst-case-sized recv buffer.
-        We bypass TE GroupedLinear (its .tolist() host sync breaks graph capture) and call
-        grouped_mm directly with on-device cumsum offsets. Padding rows are harmless — combine()
-        ignores them.
+        We bypass TE GroupedLinear (requires a .tolist() host sync) and call grouped_mm directly
+        with on-device cumsum offsets. Padding rows are harmless — combine() ignores them.
+        This is necessary to make this graph captureable.
         """
-        try:
-            from torch.nn.functional import grouped_mm
-        except ImportError:
-            grouped_mm = getattr(torch, "_grouped_mm", None)
-            if grouped_mm is None:
-                raise ImportError(
-                    "deepep_v2 expand-layout forward requires torch.nn.functional.grouped_mm "
-                    "(PyTorch >= 2.10) or the torch._grouped_mm private symbol."
-                )
+        grouped_mm = getattr(torch, "_grouped_mm", None)
+        if grouped_mm is None:
+            raise ImportError(
+                "deepep_v2 expand-layout forward requires torch._grouped_mm "
+                "(available in NGC/nightly builds with Blackwell support)."
+            )
 
         assert (
             permuted_local_hidden_states.dtype == torch.bfloat16
@@ -1175,7 +1172,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
           is not used in this path; the FlashInfer kernel operates directly on
           routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -1192,9 +1189,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        # Lazily build concatenated weights on first forward (after checkpoint
-        # load). Must happen before the deepep_v2 branch — _deepep_v2_expand_forward
-        # reads self._fc1_weight / self._fc2_weight directly.
+        # Lazily build concatenated weights on first forward (after checkpoint load)
+        # Must happen before _deepep_v2_expand_forward since self._fc1_weight / self._fc2_weight
+        # is read directly.
         if not self._concatenated_weights_built:
             w = self.linear_fc1.weight0
             if isinstance(w, MXFP8Tensor) or (

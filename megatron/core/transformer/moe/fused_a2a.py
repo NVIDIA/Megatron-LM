@@ -312,9 +312,9 @@ def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
 
 
 def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_size: int):
-    """Return the smallest pinned buffer for `group` with capacity >= `requested_size`.
+    """Return the smallest pinned buffer for `group` with capacity >= requested_size.
 
-    Raises if no such buffer exists — all needed sizes must be pre-allocated at init.
+    Raises if no such buffer exists since all needed sizes must be pre-allocated at init.
     """
     matching = [
         ((g, sz), buf)
@@ -347,7 +347,6 @@ def prepare_deepep_v2_buffer(
     if not HAVE_DEEP_EP_V2:
         raise RuntimeError(
             "prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). "
-            "Install deep_ep >= epv2-release (ElasticBuffer is on main as of 2025)."
         )
     key = (group, num_max_tokens_per_rank)
     if key in _deepep_v2_buffer_pool:
@@ -375,7 +374,7 @@ def _get_deepep_v2_num_sms(
 ) -> int:
     """Return the SM count for dispatch, caching across calls with identical (group, experts, topk).
 
-    Override with MCORE_DEEPEP_V2_NUM_SMS for tuning sweeps (good values on B200: 8-24).
+    Override with MCORE_DEEPEP_V2_NUM_SMS for tuning sweeps (suggested 8-24 on B200 to start).
     Each new value triggers a JIT recompile; pin EP_JIT_CACHE_DIR when sweeping.
     """
     _override = os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
@@ -400,12 +399,9 @@ def _get_deepep_v2_num_sms(
     return _deepep_v2_num_sms
 
 
-class DeepEPV2Dispatch(torch.autograd.Function):
-    """Fused dispatch operation using DeepEP V2 ElasticBuffer."""
+if HAVE_DEEP_EP_V2:
 
-    @staticmethod
-    def forward(
-        ctx,
+    def deepep_v2_dispatch(
         x,
         token_indices,
         token_probs,
@@ -415,6 +411,7 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         allocate_on_comm_stream=False,
         use_expanded_layout=False,
     ):
+        """Inference-only dispatch using DeepEP V2 ElasticBuffer."""
         local_num_tokens, hidden = x.shape
         num_topk = token_indices.shape[1]
         # Use the engine-set active size rather than local_num_tokens: ElasticBuffer is symmetric
@@ -453,122 +450,10 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         if use_expanded_layout:
             assert recv_token_indices is None
             assert recv_token_probs is not None and recv_token_probs.dim() == 1
-
         if async_finish:
             event.current_stream_wait()
-
-        ctx.group = group
-        ctx.handle = handle
-        ctx.async_finish = async_finish
-        ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        ctx.num_max_tokens_per_rank = num_max_tokens_per_rank
-        ctx.hidden = hidden
-        ctx.num_topk = num_topk
-        ctx.num_sms = num_sms
         tokens_per_expert = _tokens_per_expert_from_psum(handle.psum_num_recv_tokens_per_expert)
-
         return recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle
-
-    @staticmethod
-    def backward(
-        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
-    ):
-        buffer = _get_deepep_v2_buffer(
-            ctx.group, ctx.num_max_tokens_per_rank, ctx.hidden, ctx.num_topk
-        )
-        grad_token_probs_for_combine = (
-            grad_token_probs.float() if grad_token_probs is not None else None
-        )
-        grad_x, grad_token_probs, event = buffer.combine(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            topk_weights=grad_token_probs_for_combine,
-            num_sms=ctx.num_sms,
-            async_with_compute_stream=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
-        if ctx.async_finish:
-            event.current_stream_wait()
-        return grad_x, None, grad_token_probs, None, None, None, None, None
-
-
-class DeepEPV2Combine(torch.autograd.Function):
-    """Fused combine operation using DeepEP V2 ElasticBuffer."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        x,
-        group,
-        handle,
-        async_finish=False,
-        allocate_on_comm_stream=False,
-        use_expanded_layout=False,
-    ):
-        num_topk = handle.topk_idx.shape[1]
-        hidden = x.shape[1]
-        buffer = _get_deepep_v2_buffer(group, handle.num_max_tokens_per_rank, hidden, num_topk)
-        num_sms = handle.num_sms
-        combined_x, _, event = buffer.combine(
-            x,
-            handle=handle,
-            num_sms=num_sms,
-            async_with_compute_stream=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
-
-        if async_finish:
-            event.current_stream_wait()
-
-        ctx.group = group
-        ctx.handle = handle
-        ctx.async_finish = async_finish
-        ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        ctx.hidden = hidden
-        ctx.num_topk = num_topk
-        ctx.num_sms = num_sms
-        return combined_x, None
-
-    @staticmethod
-    def backward(ctx, grad_output, previous_event=None):
-        buffer = _get_deepep_v2_buffer(
-            ctx.group, ctx.handle.num_max_tokens_per_rank, ctx.hidden, ctx.num_topk
-        )
-        grad_x, _, _, _, event = buffer.dispatch(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            num_sms=ctx.num_sms,
-            async_with_compute_stream=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
-        if ctx.async_finish:
-            event.current_stream_wait()
-        return grad_x, None, None, None, None, None
-
-
-if HAVE_DEEP_EP_V2:
-
-    def deepep_v2_dispatch(
-        x,
-        token_indices,
-        token_probs,
-        num_experts,
-        group,
-        async_finish=False,
-        allocate_on_comm_stream=False,
-        use_expanded_layout=False,
-    ):
-        """Perform fused dispatch operation using DeepEP V2 ElasticBuffer."""
-        return DeepEPV2Dispatch.apply(
-            x,
-            token_indices,
-            token_probs,
-            num_experts,
-            group,
-            async_finish,
-            allocate_on_comm_stream,
-            use_expanded_layout,
-        )
 
     def deepep_v2_combine(
         x,
@@ -576,12 +461,21 @@ if HAVE_DEEP_EP_V2:
         handle,
         async_finish=False,
         allocate_on_comm_stream=False,
-        use_expanded_layout=False,
     ):
-        """Perform fused combine operation using DeepEP V2 ElasticBuffer."""
-        return DeepEPV2Combine.apply(
-            x, group, handle, async_finish, allocate_on_comm_stream, use_expanded_layout
+        """Inference-only combine using DeepEP V2 ElasticBuffer."""
+        num_topk = handle.topk_idx.shape[1]
+        hidden = x.shape[1]
+        buffer = _get_deepep_v2_buffer(group, handle.num_max_tokens_per_rank, hidden, num_topk)
+        combined_x, _, event = buffer.combine(
+            x,
+            handle=handle,
+            num_sms=handle.num_sms,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        if async_finish:
+            event.current_stream_wait()
+        return combined_x, None
 
 else:
     deepep_v2_dispatch = None
