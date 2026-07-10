@@ -152,6 +152,7 @@ from megatron.training.utils import is_hybrid_model
 from megatron.core.transformer.per_layer_profiling import (
     per_layer_profiling_start_step,
     per_layer_profiling_end_step,
+    per_layer_profiling_final_report,
     log_per_layer_resource_usage,
 )
 
@@ -3891,6 +3892,7 @@ def train(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
 
+        # Per-layer profiling.
         if args.log_per_layer_profiling and args.log_memory_interval is not None \
                 and iteration % args.log_memory_interval == 0 and len(model) == 1:
             from megatron.core.transformer.transformer_layer import (
@@ -3998,6 +4000,10 @@ def train(
         )
         if should_exit:
             break
+
+    # End-of-run per-layer report: gather cross-rank's running global and print
+    if args.log_per_layer_profiling:
+        per_layer_profiling_final_report(model)
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():

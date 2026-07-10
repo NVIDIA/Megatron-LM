@@ -311,9 +311,9 @@ class LoggerConfig:
     """Report memory interval."""
 
     log_per_layer_profiling: bool = False
-    """If set, enable measured per-layer forward/backward timing and memory
-    profiling. Requires log_memory_interval; Hooks are installed only on 
-    logged steps."""
+    """If set, enable measured per-layer forward/backward timing and (from the
+    CUDA allocator trace) per-layer memory profiling. Requires
+    log_memory_interval; hooks are installed only on logged steps."""
 
     log_device_memory_used: bool = False
     """Log device memory used (as reported by nvidia-smi)."""

@@ -1031,7 +1031,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     log_per_layer_profiling: bool = False
     """If set, a PerLayerProfiler is created on the TransformerBlock and hooks
-    are installed lazily on logged steps."""
+    are installed lazily on logged steps. On those steps it records per-layer
+    forward/backward time (CUDA events) and per-layer memory (peak, retained
+    activation, transient workspace, largest allocation, comm buffer, reserved
+    fragmentation) from the CUDA allocator trace
+    (torch.cuda.memory._record_memory_history), degrading to timing-only if that
+    private API is unavailable."""
 
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
