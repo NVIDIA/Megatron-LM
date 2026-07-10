@@ -321,6 +321,7 @@ def forward_step(data_iterator, model: HybridModel):
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
+            tokens_per_sample=args.seq_length,
         )
 
     timers('batch-generator').stop()
