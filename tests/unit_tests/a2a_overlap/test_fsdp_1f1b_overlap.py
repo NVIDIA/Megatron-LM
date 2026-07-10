@@ -26,6 +26,9 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
+pytestmark = pytest.mark.flaky_in_dev
+
 SEQ_LEN = 32
 VOCAB_SIZE = 128
 NUM_STEPS = 3
@@ -51,8 +54,6 @@ class TestFSDP1F1BOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    # Quarantined in dev CI: NCCL EP params in this sweep abort with a pybind11 GIL dec_ref failure.
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())

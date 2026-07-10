@@ -26,23 +26,13 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
+pytestmark = pytest.mark.flaky_in_dev
+
 NUM_STEPS = 3
 SEQ_LEN = 128
 VOCAB_SIZE = 512
 LR = 0.01
-
-
-def _mark_ncclep_flaky_in_dev(dispatcher_configs):
-    # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure. Keep the
-    # quarantine scoped to that backend so alltoall/hybridep coverage still runs.
-    return [
-        (
-            pytest.param(*config, marks=pytest.mark.flaky_in_dev)
-            if config == ("flex", "ncclep")
-            else config
-        )
-        for config in dispatcher_configs
-    ]
 
 
 def _train_step(model, optimizer, data):
@@ -73,9 +63,7 @@ class TestDelayWgradCompute:
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize(
-        "dispatcher_type,flex_backend", _mark_ncclep_flaky_in_dev(get_valid_dispatcher_configs())
-    )
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_overlap_dispatch_backward_with_experts_wgrad(
         self, shared_expert_intermediate_size, dispatcher_type, flex_backend, fp8_flag
@@ -127,9 +115,7 @@ class TestDelayWgradCompute:
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize(
-        "dispatcher_type,flex_backend", _mark_ncclep_flaky_in_dev(get_valid_dispatcher_configs())
-    )
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     def test_overlap_dispatch_backward_with_experts_wgrad_with_fsdp(
         self, shared_expert_intermediate_size, dispatcher_type, flex_backend
     ):
@@ -201,9 +187,7 @@ class TestDelayWgradCompute:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize(
-        "dispatcher_type,flex_backend", _mark_ncclep_flaky_in_dev(get_valid_dispatcher_configs())
-    )
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
     def test_fsdp_1f1b_delay_wgrad(self, dispatcher_type, flex_backend, sharding_strategy):
         """Verify FSDP + 1F1B overlap + delay_wgrad_compute.
