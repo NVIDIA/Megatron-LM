@@ -54,19 +54,14 @@ from megatron.training.distillation.utils import (
     LOGPROBS_FORMAT_VERSION,
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
-    STALE_TAR_SUFFIX,
-    V2_BATCHED_TAR_RE,
-    batched_tar_prefix,
     compute_dataset_hash,
     get_consumed_train_samples,
     get_current_iteration,
     is_remote_storage_path,
     open_logit_file,
     pack_indices,
-    peek_logprobs_metadata,
+    quarantine_contained_tars,
     reassemble_cp_sequence,
-    storage_basename,
-    storage_glob,
     storage_makedirs,
     storage_move,
     v2_batched_tar_filename,
@@ -126,10 +121,24 @@ class LogitsSaverHooks:
     ``{start}-{end}.pt.zst``) rather than by training-iteration number --
     the same "sample index" space :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
     already computes internally.  This makes discovery/filtering agnostic
-    to whether the loader's MBS/DP/GBS differ from this run's.  Dedup of
-    stale shards from a crash-and-resume is handled entirely here, at
-    construction time (see :meth:`_quarantine_superseded_tars`); there is
-    no reader-side overlap check.
+    to whether the loader's MBS/DP/GBS differ from this run's.
+
+    Dedup of stale/superseded shards from a crash-and-resume happens
+    lazily, per flush, right before the new tar is written (see
+    :func:`~megatron.training.distillation.utils.quarantine_contained_tars`)
+    -- **not** eagerly at construction time.  Only existing shards whose
+    range is fully contained in the range about to be written are
+    touched, so retroactively regenerating a few specific (e.g.
+    corrupted) shards doesn't quarantine unrelated future-dated shards
+    this run never rewrites.  An exact-range rewrite doesn't need
+    quarantining at all: writing to the same deterministic filename
+    naturally overwrites the old contents in place (``os.replace``
+    locally, an overwrite-by-put on MSC).  This is not an exhaustive
+    dedup guarantee (see that function's docstring for the corner case it
+    doesn't cover); the loader's
+    :class:`~megatron.training.distillation.cached_logits_loss.TeacherTarDataset`
+    enforces a sequential/no-overlap check across discovered shards as a
+    safety net.
 
     Args:
         save_dir: Directory to save log-prob files
@@ -237,72 +246,9 @@ class LogitsSaverHooks:
         # Create save directory if needed
         storage_makedirs(self.save_dir, exist_ok=True)
 
-        # Quarantine any of this rank's own tars that the resumed run is
-        # about to make stale.  Sole dedup mechanism — see docstring.
-        self._quarantine_superseded_tars()
-
         # Register as the active saver so checkpoint code can flush
         global _ACTIVE_LOGITS_SAVER
         _ACTIVE_LOGITS_SAVER = self
-
-    def _quarantine_superseded_tars(self) -> None:
-        """Quarantine this DP rank's own prior tars that a resume makes stale.
-
-        Runs once at construction time, scoped to this rank's own
-        ``dp{d}__*.tar`` prefix only — no cross-rank coordination or
-        collective is needed, since prefixes are disjoint across DP ranks.
-
-        This is the **sole** dedup mechanism for stale/superseded shards
-        from a crash-and-resume; there is no reader-side overlap check.
-        It is safe because ``take_pending_data`` (the only thing that ever
-        flushes a v2 tar bundle) is invoked exactly once per checkpoint
-        save, so every tar's ``[start, end)`` range is an inter-checkpoint
-        interval, and ``resume_sample`` (this run's starting
-        ``consumed_train_samples``) is itself always a checkpoint-boundary
-        value.  Two checkpoint-aligned intervals can never partially
-        overlap: a prior tar is either entirely before ``resume_sample``
-        (still valid, never rewritten, left alone) or entirely at-or-after
-        it (unambiguously superseded by what this run is about to write,
-        safe to discard in full).
-        """
-        resume_sample = get_args().consumed_train_samples
-        prefix = batched_tar_prefix(self.dp_rank)
-        candidates = storage_glob(os.path.join(self.save_dir, f"*{prefix}*.tar"))
-
-        for path in candidates:
-            match = V2_BATCHED_TAR_RE.match(storage_basename(path))
-            if match is None:
-                # Not a v2 sample-range shard (e.g. a legacy v1 tar sitting
-                # in the same directory) — not ours to clean up.
-                continue
-
-            start_sample = int(match.group("start"))
-
-            meta = peek_logprobs_metadata(path)
-            saved_hash = (meta or {}).get("hash")
-            if saved_hash != self.dataset_hash:
-                # Same naming pattern, different dataset identity: not
-                # safe to assume ownership even though the prefix matches.
-                logger.warning(
-                    "Found cached-logits shard %s with hash %s that does not "
-                    "match this run's hash %s; leaving it alone.",
-                    path, saved_hash, self.dataset_hash,
-                )
-                continue
-
-            if start_sample >= resume_sample:
-                # Move aside rather than delete: nothing is unrecoverably
-                # destroyed if the resume-point detection is ever wrong.
-                # The .stale suffix naturally falls outside the *.tar glob
-                # pattern used everywhere else, so no reader-side filtering
-                # changes are needed.
-                quarantined = f"{path}{STALE_TAR_SUFFIX}"
-                storage_move(path, quarantined)
-                print_rank_0(
-                    f"Quarantined superseded cached-logits shard "
-                    f"{path} -> {quarantined}"
-                )
-            # else: entirely before resume_sample -- still valid, untouched.
 
     def _forward_hook(
         self,
@@ -748,6 +694,17 @@ class LogitsSaverHooks:
         (the global sample range that iteration covers) so that the
         student-side tar reader can stream iterations by member name,
         without needing to know the training iteration count at all.
+
+        Quarantines any existing shards this write will supersede (see
+        :func:`~megatron.training.distillation.utils.quarantine_contained_tars`)
+        **before** writing the new tar, not after: if a crash happens
+        between the quarantine and the write completing, the result is
+        at worst a temporary hole (no live shard covering that range)
+        rather than two overlapping live shards.  A hole self-heals on
+        resume -- the corresponding checkpoint didn't complete either,
+        so the resumed run naturally regenerates that range and
+        reflushes it -- whereas an overlap would require the loader's
+        sequential/no-overlap check to catch it as a hard error.
         """
         if not writes:
             return
@@ -762,6 +719,9 @@ class LogitsSaverHooks:
             )
 
         storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
+        for old_path, quarantined in quarantine_contained_tars(tar_path):
+            print_rank_0(f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}")
+
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
         compressor = zstandard.ZstdCompressor(level=3)
 

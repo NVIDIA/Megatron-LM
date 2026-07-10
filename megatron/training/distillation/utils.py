@@ -704,6 +704,74 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
     return max(dp_ranks_found) + 1
 
 
+def quarantine_contained_tars(tar_path: str) -> List[Tuple[str, str]]:
+    """Quarantine existing v2 shards fully contained in *tar_path*'s range.
+
+    Call this **before** writing *tar_path*.  An existing shard
+    ``[old_start, old_end)`` is quarantined (renamed aside with
+    :data:`STALE_TAR_SUFFIX`, not deleted) only if it's fully contained
+    in *tar_path*'s range, i.e. ``old_start >= new_start and old_end <=
+    new_end`` -- the narrowest condition under which the new write
+    unambiguously supersedes it, so regenerating a few specific (e.g.
+    corrupted) shards never touches unrelated ones.  Quarantining before
+    the write means a crash in between leaves at worst a temporary hole
+    (self-heals on resume) rather than two overlapping live shards.  No
+    dataset-identity hash check is performed, since a wrong match is
+    cheaply recoverable (renamed, not deleted), not destructive.
+
+    An exact-range duplicate lives at *this exact path* (filenames are a
+    deterministic function of ``(dp_rank, start, end)``) and gets
+    overwritten in place by the imminent write anyway, so it's skipped
+    too.  Scoped to *tar_path*'s own DP rank prefix -- no cross-rank
+    coordination needed, since prefixes are disjoint across DP ranks.
+
+    **Known gap**: doesn't handle reverse containment (an old shard's
+    range properly containing the new one, e.g. from a shrinking
+    checkpoint interval) -- left to the loader's sequential/no-overlap
+    check as a safety net.
+
+    Returns ``(old_path, quarantined_path)`` pairs for the caller to log;
+    empty if nothing was quarantined.
+    """
+    save_dir = os.path.dirname(tar_path)
+    match = V2_BATCHED_TAR_RE.match(storage_basename(tar_path))
+    if match is None:
+        return []
+    dp_rank = int(match.group("dp"))
+    new_start, new_end = int(match.group("start")), int(match.group("end"))
+
+    prefix = batched_tar_prefix(dp_rank)
+    candidates = storage_glob(os.path.join(save_dir, f"*{prefix}*.tar"))
+
+    quarantined_pairs: List[Tuple[str, str]] = []
+    for path in candidates:
+        if path == tar_path:
+            # An exact-range duplicate lives at this exact path; the
+            # imminent write overwrites it in place, so quarantining it
+            # first would just leave never-cleaned-up .stale junk.
+            continue
+
+        other = V2_BATCHED_TAR_RE.match(storage_basename(path))
+        if other is None:
+            # Not a v2 sample-range shard (e.g. a legacy v1 tar sitting
+            # in the same directory) — not ours to clean up.
+            continue
+
+        old_start, old_end = int(other.group("start")), int(other.group("end"))
+        if not (old_start >= new_start and old_end <= new_end):
+            continue  # not contained in the range about to be written
+
+        # Move aside rather than delete: nothing is unrecoverably
+        # destroyed if this containment check is ever wrong.  The .stale
+        # suffix naturally falls outside the *.tar glob pattern used
+        # everywhere else, so no reader-side filtering changes are needed.
+        quarantined = f"{path}{STALE_TAR_SUFFIX}"
+        storage_move(path, quarantined)
+        quarantined_pairs.append((path, quarantined))
+
+    return quarantined_pairs
+
+
 # NOTE: This function is for interactive debugging purposes
 def load_log_probs_from_tar(tar_path: str, iteration: int):
     """Load one saved iteration from a specific batched tar shard.
