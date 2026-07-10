@@ -852,6 +852,7 @@ def forward_backward_no_pipelining(
 
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
+
     return forward_data_store
 
 
