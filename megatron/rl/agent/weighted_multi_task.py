@@ -5,7 +5,7 @@ from typing import Any, AsyncGenerator, Optional, Type
 
 import numpy as np
 
-from .. import import_class
+from .registry import get_agent_class
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -73,7 +73,7 @@ class WeightedMultiTask(
 
         Args:
             config: List of dicts with keys:
-                - agent_type: String path to agent class
+                - agent_type: Registered agent name (see megatron.rl.agent.registry)
                 - agent_args: Dict of arguments to pass to agent constructor
                 - weight: Float weight for this agent
 
@@ -87,8 +87,7 @@ class WeightedMultiTask(
             agent_args = entry.get('agent_args', {})
             agent_args['parallel_generation_tasks'] = parallel_generation_tasks
 
-            # Import and instantiate the agent class
-            agent_type = import_class(entry['agent_type'])
+            agent_type = get_agent_class(entry['agent_type'])
             agent_configs.append(
                 AgentConfig(
                     agent_type=agent_type,

@@ -14,7 +14,8 @@ from uvicorn.config import LOGGING_CONFIG
 
 LOGGING_CONFIG['root'] = {"handlers": ["default"], "level": "INFO"}
 
-from ... import import_class, inference
+from ... import inference
+from ...agent.registry import get_agent_class
 from ...agent.api import (
     Agent,
     ContrastiveRollout,
@@ -192,6 +193,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with open(args.env_config, 'r') as f:
         config = yaml.safe_load(f)[0]
-    agent_cls = import_class(config['agent_type'])
+    agent_cls = get_agent_class(config['agent_type'])
     cls_args = config['agent_args']
     run(agent_cls, cls_args, port=args.port)
