@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -63,11 +62,6 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
     TELinear, te_checkpoint = None, None
-
-
-# State for the MCORE_MOE_TIMING=1 debug probe (see MoELayer.forward).
-_MCORE_MOE_TIMING_PROBE_INTROD = False
-_MOE_TIMING_ACC: Optional[dict] = None
 
 
 class ExpertsInterface(Protocol):
@@ -609,80 +603,12 @@ class MoELayer(BaseMoELayer):
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
-        # DEBUG: confirm postprocess is reached at all (independent of layer-0 latch).
-        import os as _os
-
-        global _MCORE_DEEPEP_V2_POSTPROCESS_HIT
-        try:
-            _MCORE_DEEPEP_V2_POSTPROCESS_HIT
-        except NameError:
-            _MCORE_DEEPEP_V2_POSTPROCESS_HIT = False
-        if (
-            _os.environ.get("MCORE_DEEPEP_V2_DEBUG_LAYER0", "0") == "1"
-            and not _MCORE_DEEPEP_V2_POSTPROCESS_HIT
-        ):
-            _MCORE_DEEPEP_V2_POSTPROCESS_HIT = True
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else -1
-            print(
-                f"[moe postprocess hit] rank={_rank} layer_number={getattr(self, 'layer_number', None)} "
-                f"input_shape={tuple(output.shape)} dispatcher={self.config.inference_moe_token_dispatcher_type}",
-                flush=True,
-            )
-
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
-        # Snapshot the routed-only output BEFORE adding shared expert, so we
-        # can A/B routed and shared contributions independently.
-        _routed_only_for_debug = output
-
         if shared_expert_output is not None:
             output = output + shared_expert_output
-        # DEBUG: split the post-combine checksum into routed-only, shared-only,
-        # and final. Fires once per process on the first MoE postprocess call.
-        # Enable with MCORE_DEEPEP_V2_DEBUG_LAYER0=1.
-        import os as _os
-
-        global _MCORE_DEEPEP_V2_LAYER0_DUMPED
-        try:
-            _MCORE_DEEPEP_V2_LAYER0_DUMPED
-        except NameError:
-            _MCORE_DEEPEP_V2_LAYER0_DUMPED = False
-        if (
-            _os.environ.get("MCORE_DEEPEP_V2_DEBUG_LAYER0", "0") == "1"
-            and not _MCORE_DEEPEP_V2_LAYER0_DUMPED
-        ):
-            _MCORE_DEEPEP_V2_LAYER0_DUMPED = True
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else -1
-            _dispatcher = self.config.inference_moe_token_dispatcher_type
-            _layer = getattr(self, 'layer_number', None)
-
-            def _stats(name, t):
-                if t is None:
-                    return f"{name}=None"
-                _f = t.detach().float().flatten()
-                _f8 = [round(float(v), 6) for v in _f[:4].tolist()]
-                return (
-                    f"{name}_norm={float(_f.norm()):.6e} "
-                    f"{name}_mean={float(_f.mean()):.6e} "
-                    f"{name}_std={float(_f.std()):.6e} "
-                    f"{name}_first4={_f8}"
-                )
-
-            print(
-                f"[moe firstcall debug] dispatcher={_dispatcher} rank={_rank} "
-                f"layer_number={_layer} shape={tuple(output.shape)} "
-                f"shared_present={shared_expert_output is not None} | "
-                f"{_stats('routed', _routed_only_for_debug)} | "
-                f"{_stats('shared', shared_expert_output)} | "
-                f"{_stats('final', output)}",
-                flush=True,
-            )
         elif (
             isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
             and self._latent_shared_expert_output is not None
@@ -767,127 +693,12 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                # DEBUG: per-stage MoE timing for dispatcher A/B comparison.
-                # Enable with MCORE_MOE_TIMING=1. Uses `torch.cuda.synchronize`
-                # around each stage so wall-clock reflects actual GPU work
-                # (slow — benchmarking only). Skips entirely during CUDA graph
-                # capture (synchronize is forbidden inside capture); to get
-                # numbers, run with --cuda-graph-impl none.
-                _moe_timing_env_on = os.environ.get("MCORE_MOE_TIMING", "0") == "1"
-                _is_capturing = torch.cuda.is_current_stream_capturing()
-                global _MCORE_MOE_TIMING_PROBE_INTROD
-                if _moe_timing_env_on and not _MCORE_MOE_TIMING_PROBE_INTROD:
-                    _MCORE_MOE_TIMING_PROBE_INTROD = True
-                    _rank = (
-                        torch.distributed.get_rank()
-                        if torch.distributed.is_initialized() else -1
-                    )
-                    _status = "WILL TIME" if not _is_capturing else (
-                        "SKIPPED (run with --cuda-graph-impl none)"
-                    )
-                    print(
-                        f"[moe timing probe] rank={_rank} "
-                        f"layer_number={getattr(self, 'layer_number', None)} "
-                        f"is_current_stream_capturing={_is_capturing} -> {_status}",
-                        flush=True,
-                    )
-                # Only time layer 2 (the first MoE layer in this hybrid model)
-                # so the accumulator reflects per-call cost of one MoE layer
-                # rather than averaging across the ~44 MoE layers per step.
-                _moe_timing_on = (
-                    _moe_timing_env_on
-                    and not _is_capturing
-                    and getattr(self, 'layer_number', None) == 2
-                )
-                if _moe_timing_on:
-                    import time as _time
-
-                    global _MOE_TIMING_ACC
-                    if _MOE_TIMING_ACC is None:
-                        _MOE_TIMING_ACC = {
-                            "dispatch_ms": 0.0,
-                            "experts_ms": 0.0,
-                            "combine_ms": 0.0,
-                            "step_count": 0,
-                        }
-                        # Register an atexit summary so we get output even if
-                        # the periodic threshold is never crossed (short runs,
-                        # or runs where the inference engine wraps later
-                        # decode steps in captured graphs).
-                        import atexit
-
-                        _dispatcher_name = self.config.inference_moe_token_dispatcher_type
-
-                        def _final_moe_timing_summary():
-                            if (
-                                torch.distributed.is_initialized()
-                                and torch.distributed.get_rank() == 0
-                                and _MOE_TIMING_ACC["step_count"] > 0
-                            ):
-                                n = _MOE_TIMING_ACC["step_count"]
-                                d = _MOE_TIMING_ACC["dispatch_ms"] / n
-                                e = _MOE_TIMING_ACC["experts_ms"] / n
-                                c = _MOE_TIMING_ACC["combine_ms"] / n
-                                total = d + e + c
-                                print(
-                                    f"[moe timing final] dispatcher={_dispatcher_name} "
-                                    f"steps={n} avg_dispatch={d:.3f}ms "
-                                    f"avg_experts={e:.3f}ms avg_combine={c:.3f}ms "
-                                    f"avg_total={total:.3f}ms "
-                                    f"(experts_pct={e / max(total, 1e-9) * 100:.1f}%)",
-                                    flush=True,
-                                )
-
-                        atexit.register(_final_moe_timing_summary)
-                    torch.cuda.synchronize()
-                    _t0 = _time.perf_counter()
-
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
-
-                if _moe_timing_on:
-                    torch.cuda.synchronize()
-                    _t1 = _time.perf_counter()
-                    _MOE_TIMING_ACC["dispatch_ms"] += (_t1 - _t0) * 1e3
-
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-
-                if _moe_timing_on:
-                    torch.cuda.synchronize()
-                    _t2 = _time.perf_counter()
-                    _MOE_TIMING_ACC["experts_ms"] += (_t2 - _t1) * 1e3
-
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
-
-                if _moe_timing_on:
-                    torch.cuda.synchronize()
-                    _t3 = _time.perf_counter()
-                    _MOE_TIMING_ACC["combine_ms"] += (_t3 - _t2) * 1e3
-                    _MOE_TIMING_ACC["step_count"] += 1
-                    # Log every 10 layer-2 visits on rank 0. Short runs may
-                    # never cross higher thresholds; the atexit handler also
-                    # prints a final summary regardless.
-                    if (
-                        torch.distributed.is_initialized()
-                        and torch.distributed.get_rank() == 0
-                        and _MOE_TIMING_ACC["step_count"] % 10 == 0
-                    ):
-                        _n = _MOE_TIMING_ACC["step_count"]
-                        _disp = _MOE_TIMING_ACC["dispatch_ms"] / _n
-                        _exp = _MOE_TIMING_ACC["experts_ms"] / _n
-                        _comb = _MOE_TIMING_ACC["combine_ms"] / _n
-                        _total = _disp + _exp + _comb
-                        print(
-                            f"[moe timing layer2] dispatcher="
-                            f"{self.config.inference_moe_token_dispatcher_type} "
-                            f"steps={_n} avg_dispatch={_disp:.3f}ms "
-                            f"avg_experts={_exp:.3f}ms avg_combine={_comb:.3f}ms "
-                            f"avg_total={_total:.3f}ms "
-                            f"(experts_pct={_exp / max(_total, 1e-9) * 100:.1f}%)",
-                            flush=True,
-                        )
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

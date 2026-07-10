@@ -334,10 +334,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
-        # The flex/DeepEP token dispatcher uses the combined expert-TP × EP
-        # group (tp_ep) for its all-to-all, so the DeepEP V2 ElasticBuffer must
-        # be allocated against the same group — otherwise `_get_deepep_v2_buffer`
-        # sees a different group object and discards the prepared buffer.
+        # The flex/DeepEP token dispatcher uses the combined expert-TP x EP group (tp_ep) for its
+        # A2A, so the DeepEP V2 ElasticBuffer must be allocated against the same group, otherwise
+        # `_get_deepep_v2_buffer` sees a different group object and discards the prepared buffer.
         if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
             self.expert_tp_ep_group = pg_collection.tp_ep
         else:
@@ -740,21 +739,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 deepep_prefill_per_rank_cap = max(
                     deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
                 )
-                # DEBUG: confirm this branch runs and the cap math is what we expect.
-                import torch.distributed as _dist
-
-                if _dist.is_initialized() and _dist.get_rank() == 0:
-                    print(
-                        f"[deepep_v2 prepare] max_requests={self.max_requests} "
-                        f"num_speculative_tokens={self.num_speculative_tokens} "
-                        f"max_tokens={self.max_tokens} tp_size={tp_size} "
-                        f"decode_per_rank_cap={deepep_decode_per_rank_cap} "
-                        f"prefill_per_rank_cap={deepep_prefill_per_rank_cap} "
-                        f"moe_hidden_size={moe_hidden_size} "
-                        f"moe_router_topk={model_config.moe_router_topk} "
-                        f"prepare_group_size={get_pg_size(self.expert_tp_ep_group)}",
-                        flush=True,
-                    )
                 # Stash the caps so the engine can read them when setting the
                 # active dispatch size per step.
                 self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
