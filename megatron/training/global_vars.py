@@ -490,7 +490,14 @@ def _set_telemetry(args):
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 
         if config.traces_enabled:
-            span_exporter = ConsoleSpanExporter(out=json_file)
+            # Compact single-line JSON per span (indent=None) instead of the
+            # stock exporter's pretty-printed multi-line default: ~1 line/span
+            # vs ~25, so the gzip is far smaller AND a crash-truncated tail loses
+            # only the final partial line rather than risking a half-written
+            # multi-line object. json_to_perfetto parses either form.
+            span_exporter = ConsoleSpanExporter(
+                out=json_file, formatter=lambda span: span.to_json(indent=None) + "\n"
+            )
         if config.metrics_enabled:
             from opentelemetry.sdk.metrics.export import (
                 ConsoleMetricExporter,
