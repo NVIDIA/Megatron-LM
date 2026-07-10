@@ -54,6 +54,61 @@ from megatron.training.utils import (
 )
 
 
+_ARGPARSE_HELP_FORMAT_RE = re.compile(
+    r"%\((?P<name>[^)]+)\)([#0 +\-]?\d*(?:\.\d+)?[hlL]?[diouxXeEfFgGcrs])"
+)
+
+
+def _escape_literal_help_percent_characters(help_string, params):
+    """Escape literal percent characters while preserving argparse substitutions."""
+
+    pieces = []
+    index = 0
+    while index < len(help_string):
+        if help_string[index] != "%":
+            pieces.append(help_string[index])
+            index += 1
+            continue
+
+        if index + 1 < len(help_string) and help_string[index + 1] == "%":
+            pieces.append("%%")
+            index += 2
+            continue
+
+        match = _ARGPARSE_HELP_FORMAT_RE.match(help_string, index)
+        if match is not None and match.group("name") in params:
+            pieces.append(match.group(0))
+            index = match.end()
+            continue
+
+        pieces.append("%%")
+        index += 1
+
+    return "".join(pieces)
+
+
+class _MegatronHelpFormatter(argparse.HelpFormatter):
+    """Help formatter that treats bare percent characters as literals."""
+
+    def _expand_help(self, action):
+        help_string = self._get_help_string(action)
+        if "%" not in help_string:
+            return help_string
+
+        params = dict(vars(action), prog=self._prog)
+        for name in list(params):
+            value = params[name]
+            if value is argparse.SUPPRESS:
+                del params[name]
+            elif hasattr(value, "__name__"):
+                params[name] = value.__name__
+        if params.get("choices") is not None:
+            params["choices"] = ", ".join(map(str, params["choices"]))
+
+        help_string = _escape_literal_help_percent_characters(help_string, params)
+        return help_string % params
+
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """ "Add Megatron-LM arguments to the given parser."""
 
@@ -131,7 +186,11 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments', allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        description='Megatron-LM Arguments',
+        allow_abbrev=False,
+        formatter_class=_MegatronHelpFormatter,
+    )
 
     parser = add_megatron_arguments(parser)
 
