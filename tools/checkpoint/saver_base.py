@@ -313,8 +313,12 @@ class MegatronCheckpointSaverBase:
         Get the local model for a certain (pp,ep,tp).
         """
         if self.models[pp_rank][ep_rank][tp_rank] is None:
+            from megatron.core import mpu
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
+            mpu.set_pipeline_model_parallel_rank(pp_rank)
+            if hasattr(mpu, '_PIPELINE_MODEL_PARALLEL_GROUP') and mpu._PIPELINE_MODEL_PARALLEL_GROUP is not None:
+                mpu._PIPELINE_MODEL_PARALLEL_GROUP.set_rank(pp_rank)
             self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype)
         return self.models[pp_rank][ep_rank][tp_rank]
 
