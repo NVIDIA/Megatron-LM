@@ -7,6 +7,8 @@
 #      requirements.in containing the loose specs).
 #   2. Rebuild `docker/Dockerfile.ci.lts` and run the LTS CI lane.
 
+# TE 2.17 builds NCCL EP, which needs nccl_device.h that is not in the 25.09 LTS image.
+transformer-engine[pytorch,core_cu13]==2.16.0
 tqdm==4.67.3
 einops==0.8.2                          # was: einops~=0.8
 tensorstore==0.1.84                    # was: tensorstore~=0.1,!=0.1.46,!=0.1.72

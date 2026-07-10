@@ -46,10 +46,9 @@ COPY megatron/core/package_info.py /workspace/megatron/core/
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
-    export NVTE_CUDA_ARCHS="80;90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra mlm --extra ssm --extra te --link-mode copy --locked \
+    uv sync --extra mlm --extra ssm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -77,7 +76,8 @@ EOF
 COPY docker/lts/requirements.txt /workspace/docker/lts/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
-    uv pip install -r /workspace/docker/lts/requirements.txt
+    export NVTE_CUDA_ARCHS="80;90;100"
+    uv pip install --no-build-isolation -r /workspace/docker/lts/requirements.txt
 EOF
 
 # Install DeepEP
