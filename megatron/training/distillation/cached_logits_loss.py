@@ -46,6 +46,11 @@ Assumptions
   :func:`make_teacher_tar_dataset`) and remain restricted to DP-only
   resharding.  That class is slated for removal once existing teacher caches
   are regenerated.
+* v2 tars and their inner payload members are named by the global sample
+  range they cover (``dp{d}__{start}-{end}.tar``, ``{start}-{end}.pt.zst``)
+  rather than by training-iteration number.  Dedup of stale/superseded
+  shards from a crash-and-resume is handled entirely on the writer side at
+  construction time; the loader performs no reader-side overlap check.
 
 Usage example
 -------------
@@ -81,9 +86,11 @@ from megatron.training import get_args
 from megatron.training.distillation.utils import (
     BATCHED_TAR_RE,
     CACHED_LOGITS_LOGPROB_SENTINEL,
+    V2_BATCHED_TAR_RE,
     LogprobsReshardPlan,
     LogprobsTarEntry,
     TarShardPrefetcher,
+    V2LogprobsTarEntry,
     batched_tar_prefix,
     compute_dataset_hash,
     decode_logprobs_payload,
@@ -96,6 +103,8 @@ from megatron.training.distillation.utils import (
     sorted_batched_tars,
     storage_basename,
     storage_glob_with_caching,
+    v2_iter_logprobs_tar_entries,
+    v2_sorted_batched_tars,
 )
 from megatron.training.utils import print_rank_0
 
@@ -179,8 +188,15 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     (iteration, DP rank, row range) tuples.
 
     Supports flexible MBS / DP / GBS at load time, restricted to integer
-    multiples in either direction.  See ``compute_logprobs_reshard_plan``
+    multiples in either direction.  See :class:`LogprobsReshardPlan`
     for the exact restriction.
+
+    Tars and their inner members are named by the **global sample range**
+    they cover (``dp{d}__{start}-{end}.tar``, ``{start}-{end}.pt.zst``)
+    rather than by training-iteration number.  Discovery filters purely on
+    sample ranges (``end_sample > save_sample_start``), with no
+    reader-side overlap/dedup check -- that's handled entirely by the
+    writer at construction time (``LogitsSaverHooks._quarantine_superseded_tars``).
 
     Shard discovery refreshes the directory listing after known shards are
     exhausted so a concurrent writer can publish more data; remote refreshes
@@ -259,12 +275,11 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
 
         self._needed_d_saves = self._plan.needed_d_saves(self.dp_rank)
-        # First saved iteration whose data covers the first requested load
-        # iteration's samples.  Used to skip earlier tar members at the
-        # tar-streaming level.
-        self._save_iter_start = (
-            self.start_iteration * self._plan.gbs_load
-        ) // self._plan.gbs_save
+        # Global sample index the first requested load iteration starts at.
+        # Used to skip earlier tar members at the tar-streaming level.  No
+        # division by gbs_save is needed here since v2 tar/member names are
+        # already keyed by sample range, not by an iteration number.
+        self._save_sample_start = self.start_iteration * self._plan.gbs_load
 
     # ------------------------------------------------------------------
     #  Plan construction
@@ -304,17 +319,23 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     def _discover_shards(self, already_processed: set, dp_save: int) -> List[str]:
-        """Glob for new batched tar shards for a given saved DP rank."""
+        """Glob for new v2 batched tar shards for a given saved DP rank.
+
+        No overlap resolution is needed here: the writer-side supersede
+        cleanup (``LogitsSaverHooks._quarantine_superseded_tars``) is the
+        sole dedup mechanism, so by the time a reader gets here the
+        directory never contains overlapping tars for a given ``dp_save``.
+        """
         prefix = batched_tar_prefix(dp_save)
-        all_urls = sorted_batched_tars(
+        all_urls = v2_sorted_batched_tars(
             storage_glob_with_caching(self.logprobs_dir, f"*{prefix}*.tar", cached=False)
         )
         new_urls = []
         for url in all_urls:
             if url in already_processed:
                 continue
-            m = BATCHED_TAR_RE.match(storage_basename(url))
-            if m and int(m.group("iter")) >= self._save_iter_start:
+            m = V2_BATCHED_TAR_RE.match(storage_basename(url))
+            if m and int(m.group("end")) > self._save_sample_start:
                 new_urls.append(url)
         return new_urls
 
@@ -322,21 +343,32 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     #  Decode hooks (overridable by LegacyTeacherTarDataset)
     # ------------------------------------------------------------------
 
-    def _decode_entry(self, entry: LogprobsTarEntry) -> _StreamCacheEntry:
+    def _decode_entry(self, entry: V2LogprobsTarEntry) -> _StreamCacheEntry:
         """Decode one tar payload into a monolithic ``(values, indices)`` pair."""
         values, indices = decode_logprobs_payload(entry.data)
-        return entry.iteration, values, indices
+        span = entry.end_sample - entry.start_sample
+        if span != self._plan.gbs_save:
+            raise RuntimeError(
+                f"Cached-logits member {entry.start_sample}-{entry.end_sample} "
+                f"spans {span} samples, expected gbs_save={self._plan.gbs_save}. "
+                "This indicates a corrupt shard or one written by a "
+                "different run/config."
+            )
+        i_save = entry.start_sample // self._plan.gbs_save
+        return i_save, values, indices
 
     def _iter_entries_parallel(
         self,
         pool: concurrent.futures.ThreadPoolExecutor,
-        entries: Iterator[LogprobsTarEntry],
+        entries: Iterator[Any],
     ) -> Iterator[Any]:
         """Yield decoded entries using a decode thread pool.
 
         The main thread streams raw tar members one at a time and submits the
         CPU-heavy zstd + ``torch.load`` + index unpacking work to *pool*.
-        Results are yielded in tar order via a FIFO of futures.
+        Results are yielded in tar order via a FIFO of futures.  Shared by
+        both the v2 (:class:`V2LogprobsTarEntry`) and legacy v1
+        (:class:`LogprobsTarEntry`) decode paths.
         """
         pending: "deque[concurrent.futures.Future]" = deque()
         exhausted = False
@@ -369,9 +401,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         url: str,
     ) -> Iterator[Any]:
         """Yield decoded iteration payloads from one tar URL."""
-        entries = iter_logprobs_tar_entries(
+        entries = v2_iter_logprobs_tar_entries(
             url,
-            start_iteration=self._save_iter_start,
+            start_sample=self._save_sample_start,
             expected_hash=self._expected_hash,
         )
         if pool is None:
@@ -409,7 +441,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 if not processed:
                     raise FileNotFoundError(
                         f"No batched tar shards for saved dp_rank={d_save} found "
-                        f"at or after save iteration {self._save_iter_start} "
+                        f"covering global sample {self._save_sample_start} or later "
                         f"in '{self.logprobs_dir}'"
                     )
                 return
@@ -997,9 +1029,10 @@ class CachedLogitsKDLoss:
     ``tensor.to(device, non_blocking=True)`` call can overlap the DMA transfer
     with ongoing GPU kernels.
 
-    A custom tar reader sequentially streams ``dp{D}__{B}.tar`` shards
-    (or compatible legacy ``cp0_dp{D}__{B}.tar`` shards) through the same
-    storage layer used by the writer.
+    A custom tar reader sequentially streams ``dp{D}__{start}-{end}.tar``
+    v2 shards (keyed by global sample range) -- or, for legacy caches,
+    iteration-numbered ``dp{D}__{B}.tar`` / ``cp0_dp{D}__{B}.tar`` v1
+    shards -- through the same storage layer used by the writer.
 
     The DataLoader is initialised lazily on the first ``__call__`` because the
     starting iteration is not known at construction time.
