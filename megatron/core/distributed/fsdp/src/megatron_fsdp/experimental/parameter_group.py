@@ -308,6 +308,10 @@ class FsdpParameterGroup:
         if self._grad_accumulating:
             self.main_grad.local_buffer.add_(inner_reduced.local_buffer)
         else:
+            # First microbatch of a step: reset the accumulator and release the
+            # previous step's reduced-grad buffer, whose sharded grads have been
+            # cleared by optimizer.zero_grad().
+            self._reduced_grad = None
             self.main_grad.local_buffer.copy_(inner_reduced.local_buffer)
             self._grad_accumulating = True
 
@@ -400,17 +404,21 @@ def _grad_placements_reduce_to_weight(
 ) -> bool:
     """Return whether main_grad placements reduce to main_weight placements.
 
-    They may be equal, or main_grad may be ``Partial`` on an axis where
+    They may be equal, or main_grad may be ``Partial`` on a single axis where
     main_weight is ``Replicate`` (an HSDP DP-outer reduction deferred to the last
     microbatch). All other axes must match so the buffers share a layout and
-    local size.
+    local size. At most one deferred axis is allowed because the deferred
+    reduction finalizes with a single-axis ``DBuffer.redistribute``; multi-axis
+    deferral is not yet supported.
     """
     if len(grad_placements) != len(weight_placements):
         return False
+    deferred_axes = 0
     for grad_placement, weight_placement in zip(grad_placements, weight_placements):
         if grad_placement == weight_placement:
             continue
         if isinstance(grad_placement, Partial) and isinstance(weight_placement, Replicate):
+            deferred_axes += 1
             continue
         return False
-    return True
+    return deferred_axes <= 1
