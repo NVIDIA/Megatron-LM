@@ -3172,9 +3172,7 @@ class TransformerConfig(ModelParallelConfig):
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
             if self.thd_max_packed_sequences is None:
-                raise ValueError(
-                    "THD CUDA Graph requires --thd-max-packed-sequences to be set."
-                )
+                raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
                 self.pad_packed_seq_alignment is not None
             ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
