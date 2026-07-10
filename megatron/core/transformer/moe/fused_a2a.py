@@ -328,7 +328,6 @@ def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_si
             f"{requested_size} (pool has sizes {sizes} for this group). "
             f"Call prepare_deepep_v2_buffer at init with a size >= {requested_size}."
         )
-    # Smallest fit — same correctness, less padding work.
     matching.sort(key=lambda kv: kv[0][1])
     return matching[0][1]
 
@@ -372,8 +371,8 @@ def _get_deepep_v2_num_sms(
 ) -> int:
     """Return the SM count for dispatch, caching across calls with identical (group, experts, topk).
 
-    Override with MCORE_DEEPEP_V2_NUM_SMS for tuning sweeps (suggested 8-24 on B200 to start).
-    Each new value triggers a JIT recompile; pin EP_JIT_CACHE_DIR when sweeping.
+    Override with MCORE_DEEPEP_V2_NUM_SMS to pin a fixed SM count (each new value triggers a JIT
+    recompile in deep_ep).
     """
     _override = os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
     if _override is not None:

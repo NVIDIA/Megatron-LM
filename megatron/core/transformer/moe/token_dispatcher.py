@@ -1270,7 +1270,7 @@ class _DeepepManager(_DispatchManager):
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.use_deepep_v2:
-            # Guard against accidental use during a training forward (e.g. grad still enabled).
+            # Expanded layout requires no autograd.
             self.use_expanded_layout = (
                 self.enable_expanded_layout_for_inference
                 and not torch.is_grad_enabled()

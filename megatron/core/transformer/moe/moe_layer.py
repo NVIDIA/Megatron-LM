@@ -551,8 +551,6 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        # NCCL/NVLS inference dispatchers expose routing_map for FlashInfer/mcore_fused_moe.
-        # deepep_v2 uses by-expert layout and doesn't set _inference_token_dispatcher.
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(

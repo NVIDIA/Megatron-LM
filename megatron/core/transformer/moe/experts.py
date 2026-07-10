@@ -1100,10 +1100,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
         grouped_mm = getattr(torch, "_grouped_mm", None)
         if grouped_mm is None:
-            raise ImportError(
-                "deepep_v2 expand-layout forward requires torch._grouped_mm "
-                "(available in NGC/nightly builds with Blackwell support)."
-            )
+            raise ImportError("deepep_v2 expand-layout forward requires torch._grouped_mm.")
 
         assert (
             permuted_local_hidden_states.dtype == torch.bfloat16
@@ -1113,9 +1110,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ), "deepep_v2 expand-layout forward does not yet support add_bias_linear=True."
 
         # grouped_mm requires offs[-1] == mat1.shape[0], but the recv buffer is padded
-        # beyond the routed prefix. We extend the last expert's range device-side to cover
-        # the padding (tensor-setitem would do a host->device copy, breaking graph capture):
-        #   tokens'[N-1] = N_padded - sum(tokens[:N-1])  (rsub.Scalar — capture-safe)
+        # beyond the routed prefix. Extend the last expert's range to cover the padding
+        # using device-side arithmetic (avoids host->device copies that break graph capture).
         N_padded = permuted_local_hidden_states.shape[0]
         sum_first = tokens_per_expert[:-1].sum()
         adjusted_last = (N_padded - sum_first).unsqueeze(0)
@@ -1130,7 +1126,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Activation + per-row prob weighting (mirrors TEGroupedMLP).
         probs_col = permuted_probs.unsqueeze(-1).to(fc1_output.dtype)
         if self.config.gated_linear_unit:
-            # SwiGLU when activation_func is silu; otherwise generic gated form.
             gate, up = fc1_output.chunk(2, dim=-1)
             activation_out = self.config.activation_func(gate) * up
         else:
