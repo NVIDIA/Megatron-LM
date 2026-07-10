@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 from typing import Any, Optional, Type
 
 import numpy as np
@@ -15,10 +16,13 @@ from .api import (
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     Rollout,
     RolloutGenerator,
     RolloutRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AgentConfig(AgentBaseModel):
@@ -153,14 +157,17 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+    async def prepare_group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+    ) -> GroupRolloutParams:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )
 
-    async def rollout(self, request: RolloutRequest) -> Rollout:
+    async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
+            "WeightedMultiTask delegates to sub-agents; get_rollout_response is not used."
         )
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
@@ -186,13 +193,50 @@ class WeightedMultiTask(
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
-        agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
+        if request.submission_granularity == "B":
+            # In BATCH mode, pgt counts local batches in flight. agent_groups already
+            # splits each batch by weight, so copy pgt to every active agent.
+            agent_pgts = [
+                self.parallel_generation_tasks if num_groups > 0 else 0
+                for num_groups in agent_groups
+            ]
+        else:
+            # In GROUP/ROLLOUT mode, pgt counts fine-grained work units, so split it by weight.
+            agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
         agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
+        # Snapshot the distribution for observability. Read back by rl_utils
+        # during per-iteration metric logging.
+        env_ids = [getattr(a, "env_id", f"agent_{i}") or f"agent_{i}"
+                   for i, a in enumerate(self.agents)]
+        self.latest_distribution = {
+            "env_ids": env_ids,
+            "agent_groups": list(agent_groups),
+            "agent_pgts": list(agent_pgts),
+            "agent_slots": agent_slots.tolist(),
+            "total_pgt": int(sum(agent_pgts)),
+            "num_groups": request.num_groups,
+        }
+        logger.info(
+            "WeightedMultiTask distribution: sub=%s cons=%s num_groups=%d "
+            "rollouts_per_group=%d total_pgt=%d per_agent="
+            + ", ".join(
+                f"{eid}(groups={g}, pgt={p}, slots={s:g})"
+                for eid, g, p, s in zip(env_ids, agent_groups, agent_pgts, agent_slots)
+            ),
+            request.submission_granularity,
+            request.consumption_granularity,
+            request.num_groups,
+            request.rollouts_per_group,
+            int(sum(agent_pgts)),
+        )
+
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
+        for agent, num_groups, pgt in zip(
+            self.agents, agent_groups, agent_pgts, strict=True
+        ):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
@@ -202,12 +246,13 @@ class WeightedMultiTask(
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
-                    enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
+                    submission_granularity=request.submission_granularity,
+                    consumption_granularity=request.consumption_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:
