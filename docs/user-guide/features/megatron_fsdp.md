@@ -136,7 +136,7 @@ fsdp_model.load_state_dict(ckpt["model"], strict=False)
 optimizer.load_state_dict(ckpt["optimizer"])
 ```
 
-> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py)
+> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py)
 
 ### 🤖 Megatron-LM
 
