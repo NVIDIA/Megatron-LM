@@ -507,6 +507,7 @@ class FSDPDistributedIndex:
         expt_device_mesh: Optional[DeviceMesh] = None,
         fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
         expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+        outer_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -535,6 +536,8 @@ class FSDPDistributedIndex:
             expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
                 process group for expert parameters in MoE models. When provided, enables AG/RS
                 overlap optimization for expert parameters.
+            outer_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for HSDP outer-DP parameter gathers.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -557,6 +560,7 @@ class FSDPDistributedIndex:
         # AG groups: supplied via ProcessGroupCollection (Megatron-FSDP entrypoint).
         self.fsdp_group_ag = fsdp_group_ag
         self.expt_fsdp_group_ag = expt_fsdp_group_ag
+        self.outer_fsdp_group_ag = outer_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
             self.device_mesh[self.dp_outer_dim].get_group()
@@ -708,10 +712,14 @@ class FSDPDistributedIndex:
             return self.fsdp_group_ag
         return self.fsdp_group
 
-    def get_outer_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
+    def get_outer_fsdp_group(
+        self, is_expert_parallel: bool = False, independent_all_gather: bool = False
+    ) -> ProcessGroup:
         """Get the outer-FSDP process group."""
         if not self.use_hybrid_fsdp:
             return None
+        if independent_all_gather and self.outer_fsdp_group_ag is not None:
+            return self.outer_fsdp_group_ag
         if is_expert_parallel:
             return self.expt_outer_fsdp_group
         return self.outer_fsdp_group

@@ -2145,6 +2145,17 @@ class ParamAndGradBuffer:
                     "Megatron-FSDP zero-SM all-gather with expert parallelism requires "
                     "a dedicated expert parameter all-gather process group."
                 )
+            if (
+                self.dist_index.use_hybrid_fsdp
+                and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            ):
+                assert (
+                    self.dist_index.get_outer_fsdp_group(independent_all_gather=True)
+                    is not self.dist_index.get_outer_fsdp_group()
+                ), (
+                    "Megatron-FSDP zero-SM all-gather with outer-DP sharding requires "
+                    "a dedicated outer-DP parameter all-gather process group."
+                )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -2206,8 +2217,16 @@ class ParamAndGradBuffer:
                     )
                 )
             if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
+                # Outer/Inter-FSDP group when using hybrid FSDP.
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+            outer_fsdp_group_ag = self.dist_index.get_outer_fsdp_group(
+                independent_all_gather=True
+            )
+            if (
+                outer_fsdp_group_ag is not None
+                and outer_fsdp_group_ag is not self.dist_index.get_outer_fsdp_group()
+            ):
+                self.ubr_groups.append(outer_fsdp_group_ag)
 
             log_single_rank(
                 logger,
@@ -2742,11 +2761,11 @@ class ParamAndGradBuffer:
             # to enable overlap with gradient reduction operations (main_grad_buffer).
             # This avoids head-of-line blocking between forward all-gather and backward
             # reduce-scatter on the same communicator.
+            ag_group = self.dist_index.get_fsdp_group(
+                is_expert_parallel=group.is_expert_param, independent_all_gather=True
+            )
             model_wbuf_dp_group = main_buf_dp_group
             if not should_create_hfsdp_helper_buffers:
-                ag_group = self.dist_index.get_fsdp_group(
-                    is_expert_parallel=group.is_expert_param, independent_all_gather=True
-                )
                 if ag_group is not None:
                     model_wbuf_dp_group = ag_group
 
@@ -2869,7 +2888,7 @@ class ParamAndGradBuffer:
                 wbuf = group.model_weight_buffer
                 group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
                     group.model_weight_buffer,
-                    inner_dp_group=inner_dp_group,
+                    inner_dp_group=ag_group if ag_group is not None else inner_dp_group,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and inner_dp_group.size() > 1,
                 )
@@ -2877,7 +2896,7 @@ class ParamAndGradBuffer:
                 if group.transpose_weight_buffer is not None:
                     group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(
                         group.transpose_weight_buffer,
-                        inner_dp_group=inner_dp_group,
+                        inner_dp_group=ag_group if ag_group is not None else inner_dp_group,
                         is_data_distributed=is_main_weight_buffer_distributed
                         and inner_dp_group.size() > 1,
                     )
@@ -4699,7 +4718,8 @@ class AllGatherPipeline:
                 with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
                     is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
                     outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
-                        is_expert_parallel=is_expert_parallel
+                        is_expert_parallel=is_expert_parallel,
+                        independent_all_gather=True,
                     )
                     with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:

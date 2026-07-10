@@ -201,11 +201,15 @@ def _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_grou
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
 
-def _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism):
+def _apply_fsdp_zero_sm_allgather_group_options(
+    nccl_comm_cfgs, for_expert_parallelism, use_hsdp
+):
     """Configure FSDP all-gather groups to use NCCL's zero-CTA policy."""
     overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "dp_cp_ag", ("cta_policy", "zero"))
     if for_expert_parallelism:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "ep_dp_ag", ("cta_policy", "zero"))
+    if use_hsdp:
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "inter_dist_opt_ag", ("cta_policy", "zero"))
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -1419,6 +1423,7 @@ def initialize_model_parallel(
 
 def create_all_gather_groups(
     for_expert_parallelism=False,
+    num_distributed_optimizer_instances=1,
     timeout=None,
     nccl_comm_cfgs=None,
     nccl_communicator_config_path=None,
@@ -1433,6 +1438,9 @@ def create_all_gather_groups(
 
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
+        num_distributed_optimizer_instances (int): Number of HSDP outer-DP groups. When
+            greater than one, the dense and expert AG groups match the corresponding inner
+            FSDP shard groups, and an AG-only outer-DP group is also created.
         timeout (timedelta): Timeout for distributed collectives.
         nccl_comm_cfgs (dict): NCCL communicator configurations.
         nccl_communicator_config_path (str): Path to NCCL communicator YAML.
@@ -1442,12 +1450,12 @@ def create_all_gather_groups(
             dedicated all-gather groups. NCCL falls back for ineligible buffers.
 
     Returns:
-        tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
-               if for_expert_parallelism=False.
+        tuple: (dp_cp_ag_group, expt_dp_ag_group, inter_dist_opt_ag_group), where expert
+            and inter groups are None when they are not needed.
 
     Example:
         # After initialize_model_parallel():
-        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+        dp_cp_ag, expt_dp_ag, inter_dist_opt_ag = parallel_state.create_all_gather_groups(
             for_expert_parallelism=True
         )
 
@@ -1455,6 +1463,7 @@ def create_all_gather_groups(
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
+        pg_collection.inter_dist_opt_ag = inter_dist_opt_ag
     """
     if not is_initialized():
         raise RuntimeError(
@@ -1465,8 +1474,11 @@ def create_all_gather_groups(
     if nccl_comm_cfgs is None:
         nccl_comm_cfgs = _load_nccl_comm_cfgs(nccl_communicator_config_path)
     _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_groups)
+    use_hsdp = num_distributed_optimizer_instances > 1
     if fsdp_zero_sm_allgather:
-        _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism)
+        _apply_fsdp_zero_sm_allgather_group_options(
+            nccl_comm_cfgs, for_expert_parallelism, use_hsdp
+        )
 
     rank = torch.distributed.get_rank()
     pp_size = get_pipeline_model_parallel_world_size()
@@ -1475,25 +1487,50 @@ def create_all_gather_groups(
     ep_size = get_expert_model_parallel_world_size()
     dp_size = get_data_parallel_world_size()
 
+    if num_distributed_optimizer_instances < 1:
+        raise ValueError("num_distributed_optimizer_instances must be at least one")
+    if (dp_size * cp_size) % num_distributed_optimizer_instances != 0:
+        raise ValueError(
+            "The data-parallel and context-parallel domain must be divisible by "
+            "num_distributed_optimizer_instances"
+        )
+
     # Create regular DP all-gather group
     dp_cp_ag_group = None
     decoder_rank_gen = RankGenerator(
         tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
     )
 
+    inner_dp_cp_size = (dp_size * cp_size) // num_distributed_optimizer_instances
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=_get_nccl_options_with_fallback('dp_cp_ag', 'dp_cp', nccl_comm_cfgs),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
-        if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+        if use_hsdp:
+            ag_rank_groups = [
+                ranks_with_cp[offset : offset + inner_dp_cp_size]
+                for offset in range(0, len(ranks_with_cp), inner_dp_cp_size)
+            ]
+            fallback_group_name = 'intra_dp_cp'
+            group_desc = 'INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_AG'
+        else:
+            ag_rank_groups = [ranks_with_cp]
+            fallback_group_name = 'dp_cp'
+            group_desc = 'DATA_PARALLEL_GROUP_WITH_CP_AG'
+
+        for ag_ranks in ag_rank_groups:
+            group_with_cp_ag = create_group(
+                ag_ranks,
+                timeout=timeout,
+                pg_options=_get_nccl_options_with_fallback(
+                    'dp_cp_ag', fallback_group_name, nccl_comm_cfgs
+                ),
+                group_desc=group_desc,
+            )
+            if rank in ag_ranks:
+                dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
-    if for_expert_parallelism and ep_size > 1:
+    inter_dist_opt_ag_group = None
+    if (for_expert_parallelism and ep_size > 1) or use_hsdp:
         expert_tp_size = get_expert_tensor_parallel_world_size()
         expert_dp_size = get_expert_data_parallel_world_size()
 
@@ -1507,17 +1544,49 @@ def create_all_gather_groups(
             rank_offset=0,
         )
 
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=_get_nccl_options_with_fallback("ep_dp_ag", "ep_dp", nccl_comm_cfgs),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+        if expert_dp_size % num_distributed_optimizer_instances != 0:
+            raise ValueError(
+                "The expert data-parallel domain must be divisible by "
+                "num_distributed_optimizer_instances"
             )
-            if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
 
-    return dp_cp_ag_group, expt_dp_ag_group
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+            if use_hsdp:
+                inner_expert_dp_size = (
+                    expert_dp_size // num_distributed_optimizer_instances
+                )
+                hierarchical_ag_groups, _ = create_hierarchical_groups(
+                    rank,
+                    expert_dp_ranks,
+                    [inner_expert_dp_size, num_distributed_optimizer_instances],
+                    pg_options=[
+                        _get_nccl_options_with_fallback(
+                            "ep_dp_ag", "intra_ep_dp", nccl_comm_cfgs
+                        ),
+                        _get_nccl_options_with_fallback(
+                            "inter_dist_opt_ag", "inter_ep_dp", nccl_comm_cfgs
+                        ),
+                    ],
+                    timeout=timeout,
+                    group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
+                )
+                if rank in expert_dp_ranks:
+                    if for_expert_parallelism and ep_size > 1:
+                        expt_dp_ag_group = hierarchical_ag_groups[0]
+                    inter_dist_opt_ag_group = hierarchical_ag_groups[1]
+            else:
+                expert_dp_ag = create_group(
+                    expert_dp_ranks,
+                    timeout=timeout,
+                    pg_options=_get_nccl_options_with_fallback(
+                        "ep_dp_ag", "ep_dp", nccl_comm_cfgs
+                    ),
+                    group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                )
+                if rank in expert_dp_ranks:
+                    expt_dp_ag_group = expert_dp_ag
+
+    return dp_cp_ag_group, expt_dp_ag_group, inter_dist_opt_ag_group
 
 
 def is_initialized():

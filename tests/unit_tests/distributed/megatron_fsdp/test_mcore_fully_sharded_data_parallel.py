@@ -111,6 +111,19 @@ def _make_fsdp_zero_sm_allgather_args(**extra_overrides):
     return args
 
 
+def test_fsdp_zero_sm_allgather_cli_name():
+    import argparse
+
+    from megatron.training.arguments import add_megatron_arguments
+
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    add_megatron_arguments(parser)
+
+    args = parser.parse_args(["--fsdp-zero-sm-allgather"])
+
+    assert args.fsdp_zero_sm_allgather
+
+
 def test_fsdp_zero_sm_allgather_validation_enables_ag_group(monkeypatch):
     from megatron.training.arguments import validate_args
 

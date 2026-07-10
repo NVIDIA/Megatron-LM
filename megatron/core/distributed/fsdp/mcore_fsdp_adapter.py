@@ -375,6 +375,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         expt_dp_ag = (
             getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
         )
+        inter_dist_opt_ag = (
+            getattr(pg_collection, 'inter_dist_opt_ag', None)
+            if pg_collection is not None
+            else None
+        )
 
         if enable_hsdp:
             if self.num_moe_experts is not None:
@@ -406,6 +411,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
                 fsdp_group_ag=dp_cp_ag,
                 expt_fsdp_group_ag=expt_dp_ag,
+                outer_fsdp_group_ag=inter_dist_opt_ag,
             )
         else:
             if self.num_moe_experts is not None:

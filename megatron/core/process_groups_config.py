@@ -52,6 +52,8 @@ class ProcessGroupCollection:
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
+        inter_dist_opt_ag: Independent inter distributed optimizer instance group for parameter
+            all-gather
 
     Example:
         # Create instance and set needed process groups
@@ -135,6 +137,9 @@ class ProcessGroupCollection:
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+    # Separate inter distributed optimizer communicator for parameter all-gather
+    inter_dist_opt_ag: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
@@ -233,6 +238,7 @@ class ProcessGroupCollection:
                 parallel_state.get_inter_distributed_optimizer_instance_group,
                 check_initialized=False,
             ),
+            'inter_dist_opt_ag': lambda: None,
             'intra_dist_opt': partial(
                 parallel_state.get_intra_distributed_optimizer_instance_group,
                 check_initialized=False,
