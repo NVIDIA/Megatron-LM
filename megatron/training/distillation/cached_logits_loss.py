@@ -49,8 +49,13 @@ Assumptions
 * v2 tars and their inner payload members are named by the global sample
   range they cover (``dp{d}__{start}-{end}.tar``, ``{start}-{end}.pt.zst``)
   rather than by training-iteration number.  Dedup of stale/superseded
-  shards from a crash-and-resume is handled entirely on the writer side at
-  construction time; the loader performs no reader-side overlap check.
+  shards from a crash-and-resume happens lazily on the writer side, per
+  flush (``megatron.training.distillation.utils.quarantine_contained_tars``),
+  and only covers the narrow "new write fully contains an old shard" case
+  -- not an exhaustive guarantee.  The loader complements this with a
+  sequential/no-overlap check across discovered shards for a given saved
+  DP rank, raising a clear error rather than silently reading
+  overlapping/duplicate data if one slips through.
 
 Usage example
 -------------
@@ -194,9 +199,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     Tars and their inner members are named by the **global sample range**
     they cover (``dp{d}__{start}-{end}.tar``, ``{start}-{end}.pt.zst``)
     rather than by training-iteration number.  Discovery filters purely on
-    sample ranges (``end_sample > save_sample_start``), with no
-    reader-side overlap/dedup check -- that's handled entirely by the
-    writer at construction time (``LogitsSaverHooks._quarantine_superseded_tars``).
+    sample ranges (``end_sample > save_sample_start``).  Dedup of
+    stale/superseded shards from a crash-and-resume mostly happens on the
+    writer side, per flush
+    (``megatron.training.distillation.utils.quarantine_contained_tars``),
+    but that only covers the narrow "new write fully contains an old
+    shard" case; :meth:`_stream_decoded` enforces a sequential/no-overlap
+    check across discovered shards as a safety net for the rest.
 
     Shard discovery refreshes the directory listing after known shards are
     exhausted so a concurrent writer can publish more data; remote refreshes
@@ -321,10 +330,11 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     def _discover_shards(self, already_processed: set, dp_save: int) -> List[str]:
         """Glob for new v2 batched tar shards for a given saved DP rank.
 
-        No overlap resolution is needed here: the writer-side supersede
-        cleanup (``LogitsSaverHooks._quarantine_superseded_tars``) is the
-        sole dedup mechanism, so by the time a reader gets here the
-        directory never contains overlapping tars for a given ``dp_save``.
+        Returns shards in ascending ``start`` order (via
+        ``v2_sorted_batched_tars``); :meth:`_stream_decoded` relies on
+        that ordering to check for overlaps as a safety net, since the
+        writer-side supersede cleanup only resolves the narrow case where
+        a new write fully contains an old shard.
         """
         prefix = batched_tar_prefix(dp_save)
         all_urls = v2_sorted_batched_tars(
@@ -433,8 +443,22 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         concurrent writer can publish more shards.  Raises
         :class:`FileNotFoundError` if no shards ever appear; returns normally
         once a writer has stopped publishing new shards.
+
+        Also enforces that shards for this ``d_save`` are sequential (no
+        two overlap): ``LogitsSaverHooks``'s writer-side supersede cleanup
+        only handles the narrow "new write fully contains an old shard"
+        case, so a reverse-containment or partial-overlap case could in
+        principle leave two overlapping shards on disk.  Since
+        :meth:`_discover_shards` always returns shards in ascending
+        ``start`` order, checking each newly-discovered shard's ``start``
+        against the running ``end`` of the last one streamed is sufficient
+        to catch *any* pairwise overlap among all shards seen so far, not
+        just adjacent ones (if shard A overlapped some later shard Y, A's
+        end would necessarily also exceed A's immediate successor's
+        start, so the very next comparison would already have raised).
         """
         processed: set = set()
+        last_end: Optional[int] = None
         while True:
             urls = self._discover_shards(processed, d_save)
             if not urls:
@@ -452,6 +476,20 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             # (different ``dp{d}__*.tar`` prefixes) so no scheduling
             # collision occurs.
             for (url,) in prefetcher.iter_prefetched([(u,) for u in urls]):
+                m = V2_BATCHED_TAR_RE.match(storage_basename(url))
+                start, end = int(m.group("start")), int(m.group("end"))
+                if last_end is not None and start < last_end:
+                    raise RuntimeError(
+                        f"Cached-logits shards for saved dp_rank={d_save} in "
+                        f"'{self.logprobs_dir}' are not sequential: shard "
+                        f"'{storage_basename(url)}' (start={start}) overlaps "
+                        f"the previous shard's end ({last_end}).  The "
+                        "writer-side supersede cleanup only resolves the "
+                        "case where a new write fully contains an old "
+                        "shard; this indicates a leftover overlapping tar "
+                        "that needs manual cleanup."
+                    )
+                last_end = end
                 processed.add(url)
                 yield from self._iter_decoded_entries(pool, url)
 
