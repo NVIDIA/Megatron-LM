@@ -29,11 +29,11 @@ class ModelChunkState:
 
 
 class TransformerLayerSchedulePlan:
-    """Schedule the executing plan of the nodes in a transformer/mtp layer.
+    """Schedule the execution plan for nodes in a transformer or MTP layer.
 
-    This class organizes the sub-modules of a transformer/mtp layer,
-    including attention, post attention, MLP, dispatch, combine and
-    mtp post process nodes.
+    This class organizes the submodules of a transformer or MTP layer, including attention,
+    MLP, MoE dispatch and combine, optional mHC post-processing and recomputation, and MTP
+    post-processing nodes.
 
     layer (TransformerLayerSchedulePlan)
     ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
@@ -41,6 +41,7 @@ class TransformerLayerSchedulePlan:
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     ├── mhc_post (TransformerLayerNode): optional MLP-side mHC post-processing
+    ├── mhc_recompute (ScheduleNode): optional explicit replay before mHC backward
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
