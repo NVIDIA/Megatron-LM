@@ -32,9 +32,7 @@ def _make_param(shape, dtype=torch.bfloat16, **attrs):
 
 
 def _make_ddp_config(
-    pad_for_high_busbw=False,
-    grad_reduce_in_fp32=True,
-    use_layer_wise_param_layout=True,
+    pad_for_high_busbw=False, grad_reduce_in_fp32=True, use_layer_wise_param_layout=True
 ):
     cfg = mock.Mock()
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw

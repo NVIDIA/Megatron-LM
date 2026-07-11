@@ -40,12 +40,7 @@ _force_all_reduce_reduction_logged = False
 
 def _log_buffer_bucket_sizes_enabled() -> bool:
     """Return whether to log detailed buffer and bucket size diagnostics."""
-    return os.getenv("MEGATRON_LOG_BUFFER_BUCKET_SIZES", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return os.getenv("MEGATRON_LOG_BUFFER_BUCKET_SIZES", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _log_force_all_reduce_reduction_once(force_all_reduce: bool) -> None:
@@ -247,9 +242,7 @@ class _ParamAndGradBucketGroup:
         reduction_collective = (
             "all-reduce"
             if self.layerwise_fallback
-            else "reduce-scatter"
-            if self.ddp_config.use_distributed_optimizer
-            else "all-reduce"
+            else "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
         )
         log_single_rank(
             logger,
@@ -1428,19 +1421,25 @@ class _ParamAndGradBuffer:
             f"layerwise_fallback={self.layerwise_fallback} "
             f"buckets={len(self.buckets)}",
             "[BUFFER_BUCKET_SIZE] "
-            f"buffer_total actual_param={self._format_numel_and_bytes(actual_param_numel, grad_element_size)} "
-            f"layout_unpadded={self._format_numel_and_bytes(self.numel_unpadded, grad_element_size)} "
+            f"buffer_total actual_param={self._format_numel_and_bytes(actual_param_numel, \
+                                                                      grad_element_size)} "
+            f"layout_unpadded={self._format_numel_and_bytes(self.numel_unpadded, \
+                                                            grad_element_size)} "
             f"padded_grad={self._format_numel_and_bytes(self.numel, grad_element_size)} "
-            f"total_padding={self._format_numel_and_bytes(total_padding_numel, grad_element_size)} "
-            f"local_grad_shard={self._format_numel_and_bytes(local_shard_numel, grad_element_size)} "
+            f"total_padding={self._format_numel_and_bytes(total_padding_numel, \
+                                                          grad_element_size)} "
+            f"local_grad_shard={self._format_numel_and_bytes(local_shard_numel, \
+                                                             grad_element_size)} "
             f"grad_buffer_bytes={grad_bytes} param_buffer_bytes={param_bytes}",
         ]
         if self.has_nvfp4_params:
             lines.append(
                 "[BUFFER_BUCKET_SIZE] "
                 f"nvfp4_packed_param_buffer "
-                f"layout_unpadded={self._format_numel_and_bytes(self.nvfp4_packed_numel_unpadded, param_element_size)} "
-                f"padded={self._format_numel_and_bytes(self.nvfp4_packed_numel, param_element_size)}"
+                f"layout_unpadded={self._format_numel_and_bytes(\
+                    self.nvfp4_packed_numel_unpadded, param_element_size)} "
+                f"padded={self._format_numel_and_bytes(self.nvfp4_packed_numel, \
+                                                       param_element_size)}"
             )
 
         for bucket_index, bucket in enumerate(self.buckets):
@@ -1484,14 +1483,22 @@ class _ParamAndGradBuffer:
                 "[BUFFER_BUCKET_SIZE] "
                 f"bucket={bucket_index} global_bucket_id={bucket.bucket_id} "
                 f"params={len(bucket.params_list)} "
-                f"actual_param={self._format_numel_and_bytes(bucket_actual_param_numel, grad_element_size)} "
-                f"layout_unpadded={self._format_numel_and_bytes(bucket.numel_unpadded, grad_element_size)} "
-                f"padded_grad={self._format_numel_and_bytes(bucket_padded_numel, grad_element_size)} "
-                f"local_grad_shard={self._format_numel_and_bytes(local_bucket_shard_numel, grad_element_size)} "
-                f"total_padding={self._format_numel_and_bytes(total_bucket_padding_numel, grad_element_size)} "
-                f"gap_padding={self._format_numel_and_bytes(gap_padding_numel, grad_element_size)} "
-                f"tail_padding={self._format_numel_and_bytes(tail_padding_numel, grad_element_size)} "
-                f"layout_unpadded_padding={self._format_numel_and_bytes(layout_unpadded_padding_numel, grad_element_size)} "
+                f"actual_param={self._format_numel_and_bytes(bucket_actual_param_numel, \
+                                                             grad_element_size)} "
+                f"layout_unpadded={self._format_numel_and_bytes(bucket.numel_unpadded, \
+                                                                grad_element_size)} "
+                f"padded_grad={self._format_numel_and_bytes(bucket_padded_numel, \
+                                                            grad_element_size)} "
+                f"local_grad_shard={self._format_numel_and_bytes(local_bucket_shard_numel, \
+                                                                 grad_element_size)} "
+                f"total_padding={self._format_numel_and_bytes(total_bucket_padding_numel, \
+                                                              grad_element_size)} "
+                f"gap_padding={self._format_numel_and_bytes(gap_padding_numel, \
+                                                            grad_element_size)} "
+                f"tail_padding={self._format_numel_and_bytes(tail_padding_numel, \
+                                                            grad_element_size)} "
+                f"layout_unpadded_padding={self._format_numel_and_bytes(
+                    layout_unpadded_padding_numel, grad_element_size)} "
                 f"range=[{bucket_start},{bucket_end})"
             )
             if self.has_nvfp4_params:
@@ -1499,7 +1506,8 @@ class _ParamAndGradBuffer:
                 lines.append(
                     "[BUFFER_BUCKET_SIZE] "
                     f"bucket={bucket_index} nvfp4_packed_param_padded="
-                    f"{self._format_numel_and_bytes(packed_end - packed_start, param_element_size)} "
+                    f"{self._format_numel_and_bytes(packed_end - packed_start, \
+                                                    param_element_size)} "
                     f"packed_range=[{packed_start},{packed_end})"
                 )
             lines.extend(per_param_lines)

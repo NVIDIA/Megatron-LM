@@ -791,9 +791,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.pg_collection is None:
             return
         if self.dp_cp_fallback_params_list:
-            self._allgather_params_list(
-                self.dp_cp_fallback_params_list, self.pg_collection.dp_cp
-            )
+            self._allgather_params_list(self.dp_cp_fallback_params_list, self.pg_collection.dp_cp)
         if self.expt_dp_fallback_params_list:
             self._allgather_params_list(
                 self.expt_dp_fallback_params_list, self.pg_collection.expt_dp
