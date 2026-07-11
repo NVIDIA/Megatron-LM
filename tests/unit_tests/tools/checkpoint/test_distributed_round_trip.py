@@ -45,7 +45,13 @@ import torch.distributed as dist
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.join(_THIS_DIR, '..', '..', '..', '..')
 sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools', 'checkpoint'))
-sys.path.insert(0, _THIS_DIR)
+
+from dist_checkpoint_io import (
+    load_dist_checkpoint_full,
+    save_dist_checkpoint_full,
+    write_latest_iteration_marker,
+)
+from gpt_hybrid_conversion import main as conversion_main
 
 
 def _log(msg, rank, label=""):
@@ -219,14 +225,6 @@ def main():
         if rank == 0:
             print(f"FAIL [{args.label}]: world={world} but tp*pp*fsdp*ep={expected_world}")
         sys.exit(2)
-
-    # Lazy imports after sys.path is set.
-    from dist_checkpoint_io import (
-        load_dist_checkpoint_full,
-        save_dist_checkpoint_full,
-        write_latest_iteration_marker,
-    )
-    from gpt_hybrid_conversion import main as conversion_main
 
     if rank == 0:
         _log(

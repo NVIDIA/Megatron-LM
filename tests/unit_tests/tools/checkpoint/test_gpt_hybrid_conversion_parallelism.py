@@ -32,8 +32,13 @@ import torch.distributed as dist
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.join(_THIS_DIR, '..', '..', '..', '..')
 sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools', 'checkpoint'))
-sys.path.insert(0, _THIS_DIR)
 
+from dist_checkpoint_io import (
+    ensure_single_rank_process_group,
+    load_dist_checkpoint_full,
+    save_dist_checkpoint_full,
+    write_latest_iteration_marker,
+)
 from gpt_hybrid_conversion import main as conversion_main
 
 
@@ -181,12 +186,6 @@ def _save_dist_checkpoint(
     and the read planner reassembles the full tensor regardless of how many
     processes wrote it.
     """
-    from dist_checkpoint_io import (
-        ensure_single_rank_process_group,
-        save_dist_checkpoint_full,
-        write_latest_iteration_marker,
-    )
-
     ensure_single_rank_process_group()
 
     iter_dir = os.path.join(root_dir, f'iter_{iteration:07d}')
@@ -201,9 +200,7 @@ def _save_dist_checkpoint(
 
 def _load_converted_dist(ckpt_dir):
     """Read a dist-format converted checkpoint back into a full state dict."""
-    from dist_checkpoint_io import load_dist_checkpoint_full
-
-    sd, common, prefix, backend, iteration = load_dist_checkpoint_full(ckpt_dir)
+    sd, common, *_ = load_dist_checkpoint_full(ckpt_dir)
     return sd, common.get('args', None)
 
 

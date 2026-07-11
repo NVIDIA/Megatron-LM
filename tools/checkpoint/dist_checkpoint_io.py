@@ -156,7 +156,7 @@ def _is_non_model_key(bare_key):
     return False
 
 
-def load_dist_checkpoint_full(load_dir):
+def load_dist_checkpoint_full(load_dir, process_group=None):
     """Load a dist checkpoint and return fully-gathered model weights.
 
     Returns:
@@ -202,7 +202,12 @@ def load_dist_checkpoint_full(load_dir):
             f"'{model_prefix}', backend '{backend}')."
         )
 
-    dcp.load(raw_state_dict, storage_reader=reader, planner=DefaultLoadPlanner())
+    dcp.load(
+        raw_state_dict,
+        storage_reader=reader,
+        planner=DefaultLoadPlanner(),
+        process_group=process_group,
+    )
 
     model_state_dict = OrderedDict()
     for key, tensor in raw_state_dict.items():
@@ -224,6 +229,7 @@ def save_dist_checkpoint_full(
     save_dir,
     model_prefix='model.',
     backend=FORMAT_TORCH_DIST,
+    process_group=None,
 ):
     """Save a fully-gathered state dict as a distributed checkpoint.
 
@@ -247,14 +253,15 @@ def save_dist_checkpoint_full(
         state_dict=raw_state_dict,
         storage_writer=writer,
         planner=DefaultSavePlanner(),
+        process_group=process_group,
     )
 
     if common_state:
         save_common(common_state, save_dir)
 
-    if dist.get_rank() == 0:
+    if dist.get_rank(process_group) == 0:
         save_config(CheckpointingConfig(sharded_backend=backend), save_dir)
-    dist.barrier()
+    dist.barrier(group=process_group)
 
 
 def write_latest_iteration_marker(save_dir, iteration):
@@ -265,7 +272,8 @@ def write_latest_iteration_marker(save_dir, iteration):
     the latest iteration on load.
     """
     parent = os.path.dirname(save_dir.rstrip('/')) or save_dir
-    if os.path.basename(save_dir.rstrip('/')).startswith('iter_'):
-        tracker = os.path.join(parent, 'latest_checkpointed_iteration.txt')
-        with open(tracker, 'w') as f:
-            f.write(str(iteration))
+    if not os.path.basename(save_dir.rstrip('/')).startswith('iter_'):
+        raise ValueError(f"expected save_dir to end in iter_XXXXXXX/, got {save_dir!r}")
+    tracker = os.path.join(parent, 'latest_checkpointed_iteration.txt')
+    with open(tracker, 'w') as f:
+        f.write(str(iteration))

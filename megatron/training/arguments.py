@@ -3331,6 +3331,14 @@ def _add_experimental_args(parser):
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')
+    group.add_argument('--use-legacy-model', action='store_true', default=False,
+                       help='Use GPTModel instead of HybridModel when running the Hybrid training '
+                       'entrypoint. This allows an existing GPTModel checkpoint to continue '
+                       'training without automatic conversion to the HybridModel checkpoint '
+                       'layout. This flag has no effect when using the GPT training entrypoint.')
+    group.add_argument('--auto-convert-checkpoint-dir', type=str, default=None,
+                       help='Shared parent directory for temporary GPT-to-Hybrid checkpoints. '
+                       'Defaults to the parent of --load; must be visible from every node.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 

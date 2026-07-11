@@ -46,7 +46,7 @@ from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0
+from .utils import append_to_progress_log, is_last_rank, is_rank0, print_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -78,6 +78,216 @@ _LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+_AUTO_CONVERT_TMP_PREFIX = 'mcore_gpt_to_hybrid_autoconvert_'
+_AUTO_CONVERT_RANK0_GROUP = None
+
+# Fields cleared on the rewritten common_state so the auto-converted checkpoint
+# doesn't inherit stale training-step bookkeeping from the source GPT run.
+_AUTO_CONVERT_ITERATION_FIELDS = (
+    'iteration',
+    'consumed_valid_samples',
+    'consumed_train_samples',
+    'train_iters',
+    'train_samples',
+)
+
+
+def _is_hybrid_runtime(ddp_model) -> bool:
+    """Return whether the instantiated runtime contains a HybridModel."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    models = unwrap_model(ddp_model)
+    if not isinstance(models, list):
+        models = [models]
+    return any(isinstance(m, HybridModel) for m in models)
+
+
+def _get_auto_convert_rank0_group():
+    """Return (creating on first call) a cached ``ranks=[0]`` gloo group.
+
+    ``new_group`` is collective, so this must fire on every rank. Nonzero ranks
+    get PyTorch's ``NON_GROUP_MEMBER`` sentinel and never invoke the group.
+    """
+    global _AUTO_CONVERT_RANK0_GROUP
+    if _AUTO_CONVERT_RANK0_GROUP is None and torch.distributed.is_initialized():
+        _AUTO_CONVERT_RANK0_GROUP = torch.distributed.new_group(ranks=[0], backend='gloo')
+    return _AUTO_CONVERT_RANK0_GROUP
+
+
+def _build_auto_convert_args(runtime_args, ckpt_args):
+    """Assemble a plain ``SimpleNamespace`` with the Mamba shapes the pure
+    ``convert_gpt_to_hybrid`` helper needs.
+
+    Values are drawn from the runtime args first, then the source checkpoint's
+    args, then a small set of Mamba defaults. Kept as a standalone function so
+    the rank-zero body below reads top-to-bottom without shape bookkeeping.
+    """
+    conv_args = types.SimpleNamespace()
+    for name in (
+        'd_model',
+        'mamba_d_inner',
+        'mamba_d_state',
+        'mamba2_n_groups',
+        'mamba2_n_heads',
+        'mamba2_head_dim',
+        'd_conv',
+        'init_method_std',
+    ):
+        value = getattr(runtime_args, name, None)
+        if value is None:
+            value = getattr(ckpt_args, name, None)
+        if value is not None:
+            setattr(conv_args, name, value)
+
+    # Runtime-side canonical names for the same Mamba dimensions.
+    canonical_mamba_args = {
+        'mamba_d_state': 'mamba_state_dim',
+        'mamba2_n_groups': 'mamba_num_groups',
+        'mamba2_n_heads': 'mamba_num_heads',
+        'mamba2_head_dim': 'mamba_head_dim',
+    }
+    for converter_name, runtime_name in canonical_mamba_args.items():
+        if not hasattr(conv_args, converter_name):
+            value = getattr(runtime_args, runtime_name, None)
+            if value is not None:
+                setattr(conv_args, converter_name, value)
+
+    if not hasattr(conv_args, 'd_model'):
+        hidden_size = getattr(runtime_args, 'hidden_size', None) or getattr(
+            ckpt_args, 'hidden_size', None
+        )
+        if hidden_size is None:
+            raise RuntimeError(
+                'Auto-convert cannot infer d_model: pass --hidden-size / '
+                '--d-model or provide a Mamba-shaped source checkpoint.'
+            )
+        conv_args.d_model = hidden_size
+    if not hasattr(conv_args, 'mamba_d_inner'):
+        conv_args.mamba_d_inner = conv_args.d_model * 2
+    if not hasattr(conv_args, 'mamba2_head_dim'):
+        conv_args.mamba2_head_dim = 64
+    if not hasattr(conv_args, 'mamba2_n_heads'):
+        conv_args.mamba2_n_heads = conv_args.mamba_d_inner // conv_args.mamba2_head_dim
+    if not hasattr(conv_args, 'mamba_d_state'):
+        conv_args.mamba_d_state = 128
+    if not hasattr(conv_args, 'mamba2_n_groups'):
+        conv_args.mamba2_n_groups = 8
+    return conv_args
+
+
+def _autoconvert_gpt_to_hybrid_ckpt_rank0(
+    load_dir: str, ckpt_args, args, iteration: Optional[int]
+) -> Optional[str]:
+    """Rewrite a GPT distributed checkpoint into a Hybrid layout on rank 0.
+
+    Called collectively (so the rank-zero-only gloo group creation lines up on
+    every rank), but every non-collective step and all DCP I/O runs on rank 0
+    only. Nonzero ranks return ``None``; the outer coordinator broadcasts the
+    rank-zero result back to them.
+    """
+    import copy
+    import tempfile
+
+    # new_group is collective: every rank must reach this call, so it runs
+    # before the rank-zero early return below.
+    conversion_group = _get_auto_convert_rank0_group()
+    if not is_rank0():
+        return None
+
+    src_iter = iteration or 0
+    shared_root = getattr(args, 'auto_convert_checkpoint_dir', None)
+    if shared_root is None:
+        shared_root = os.path.dirname(os.path.abspath(load_dir))
+    os.makedirs(shared_root, exist_ok=True)
+    tmp_root = tempfile.mkdtemp(prefix=_AUTO_CONVERT_TMP_PREFIX, dir=shared_root)
+    iter_dir = os.path.join(tmp_root, f'iter_{src_iter:07d}')
+    os.makedirs(iter_dir, exist_ok=True)
+
+    # ``dist_checkpoint_io`` lives under ``tools/checkpoint`` and is not on the
+    # normal package path; splice it in for this rank-zero rewrite only.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tools_checkpoint = os.path.join(repo_root, 'tools', 'checkpoint')
+    if tools_checkpoint not in sys.path:
+        sys.path.insert(0, tools_checkpoint)
+    from dist_checkpoint_io import (  # type: ignore[import-not-found]
+        load_dist_checkpoint_full,
+        save_dist_checkpoint_full,
+        write_latest_iteration_marker,
+    )
+
+    from megatron.core.models.hybrid.conversion import (
+        convert_gpt_to_hybrid,
+        parse_hybrid_layer_pattern,
+        validate_pattern_gpt_compatible,
+        validate_source_args_gpt_compatible,
+    )
+
+    pattern_str = args.hybrid_layer_pattern
+    layer_types = parse_hybrid_layer_pattern(pattern_str)
+    validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
+    validate_source_args_gpt_compatible(ckpt_args, 'gpt-to-hybrid')
+
+    print_rank_0(
+        f'[auto-convert] rank 0: reading GPT dist-checkpoint from '
+        f'{load_dir} for in-memory rewrite to hybrid layout.'
+    )
+    full_model, common_state, model_prefix, backend, _ = load_dist_checkpoint_full(
+        load_dir, process_group=conversion_group
+    )
+
+    conv_args = _build_auto_convert_args(args, ckpt_args)
+
+    target_state_dict = convert_gpt_to_hybrid(full_model, layer_types, conv_args)
+    common_state = copy.deepcopy(common_state) if common_state else {}
+    if common_state.get('args') is not None:
+        new_ckpt_args = common_state['args']
+        new_ckpt_args.hybrid_layer_pattern = pattern_str
+        if hasattr(new_ckpt_args, 'num_layers'):
+            new_ckpt_args.num_layers = len(layer_types)
+        # Auto-convert always requires --finetune; reset the source GPT's
+        # iteration bookkeeping so the rewritten metadata reflects a fresh
+        # run rather than a stale continuation of the GPT training.
+        for attr in _AUTO_CONVERT_ITERATION_FIELDS:
+            if hasattr(new_ckpt_args, attr):
+                setattr(new_ckpt_args, attr, 0)
+    if 'iteration' in common_state:
+        common_state['iteration'] = 0
+
+    print_rank_0(
+        f'[auto-convert] writing hybrid-layout dist checkpoint to '
+        f'{iter_dir} (backend={backend}, prefix={model_prefix!r}).'
+    )
+    save_dist_checkpoint_full(
+        target_state_dict,
+        common_state,
+        iter_dir,
+        model_prefix=model_prefix or 'model.',
+        backend=backend,
+        process_group=conversion_group,
+    )
+    write_latest_iteration_marker(iter_dir, src_iter)
+    return tmp_root
+
+
+def _autoconvert_gpt_to_hybrid_ckpt(
+    load_dir: str, ckpt_args, args, iteration: Optional[int]
+) -> str:
+    """Coordinate rank-zero conversion and propagate its result to every rank."""
+    path, error = None, None
+    try:
+        path = _autoconvert_gpt_to_hybrid_ckpt_rank0(load_dir, ckpt_args, args, iteration)
+    except Exception as exc:  # noqa: BLE001 — rebroadcast to all ranks
+        if is_rank0():
+            error = f'{type(exc).__name__}: {exc}'
+
+    if torch.distributed.is_initialized():
+        payload = [(path, error)]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        path, error = payload[0]
+
+    if error is not None:
+        raise RuntimeError(f'Automatic GPT-to-Hybrid conversion failed:\n{error}')
+    return path
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
@@ -1747,7 +1957,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     model = unwrap_model(ddp_model)
 
     ckpt_format = args.ckpt_format
-    if args.auto_detect_ckpt_format or ckpt_format == "torch_dist":
+    # Only the auto-detect / torch_dist branch preloads a state dict here;
+    # other formats populate it in the format-specific branches further down.
+    preloaded = args.auto_detect_ckpt_format or ckpt_format == "torch_dist"
+    if preloaded:
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir,
             args,
@@ -1768,6 +1981,60 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             pass    # Not loaded.
         else:
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
+
+    if preloaded and ckpt_format in ('torch_dist', 'torch_dcp', 'fsdp_dtensor'):
+        preload_ckpt_args = state_dict.get('args') if isinstance(state_dict, dict) else None
+        # Old GPT checkpoints predate hybrid_layer_pattern and can lack the
+        # attribute entirely; treat that as "not hybrid".
+        source_is_hybrid = bool(getattr(preload_ckpt_args, 'hybrid_layer_pattern', None))
+        runtime_is_hybrid = _is_hybrid_runtime(ddp_model)
+
+        if source_is_hybrid and not runtime_is_hybrid:
+            raise RuntimeError(
+                'Loaded a HybridModel checkpoint but the runtime is GPTModel. '
+                'Use HybridModel training or explicitly convert the checkpoint to GPT format.'
+            )
+
+        if not source_is_hybrid and runtime_is_hybrid:
+            if ckpt_format != 'torch_dist':
+                raise RuntimeError(
+                    f'Auto GPT->Hybrid conversion only supports torch_dist source checkpoints '
+                    f'in v1 (got {ckpt_format!r}).'
+                )
+            if not args.finetune:
+                raise RuntimeError(
+                    'Auto-converting a GPT checkpoint requires --finetune because SSM '
+                    'layers are initialized from scratch.'
+                )
+            if not args.no_load_optim:
+                raise RuntimeError(
+                    'Auto-converting a GPT checkpoint requires --no-load-optim.'
+                )
+            if args.hybrid_layer_pattern is None:
+                source_num_layers = getattr(preload_ckpt_args, 'num_layers', None)
+                if not source_num_layers:
+                    raise RuntimeError(
+                        'Auto GPT->Hybrid conversion needs --hybrid-layer-pattern or '
+                        'num_layers in the source checkpoint arguments.'
+                    )
+                args.hybrid_layer_pattern = '*-' * source_num_layers
+                print_rank_0(
+                    f'[auto-convert] synthesizing attention-only pattern '
+                    f'{args.hybrid_layer_pattern!r} from num_layers={source_num_layers}.'
+                )
+
+            source_iteration = (
+                state_dict.get('iteration') if isinstance(state_dict, dict) else None
+            )
+            load_dir = _autoconvert_gpt_to_hybrid_ckpt(
+                load_dir, preload_ckpt_args, args, source_iteration
+            )
+            state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+                load_dir,
+                args,
+                rank0=True,
+                checkpointing_context=checkpointing_context,
+            )
 
     load_kwargs = {}
     ignore_rng_state = False

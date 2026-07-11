@@ -15,20 +15,15 @@ These tests validate:
 
 import argparse
 import math
-import os
-import sys
-import tempfile
 from collections import OrderedDict
 
 import pytest
 import torch
 
-# Add the tools/checkpoint directory to the path so we can import the module
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'tools', 'checkpoint')
-)
-
-from gpt_hybrid_conversion import (
+# The pure conversion logic lives in megatron.core; the tools/checkpoint CLI
+# only re-exports it. Import from the package directly so the tests don't
+# depend on tools/checkpoint being on sys.path.
+from megatron.core.models.hybrid.conversion import (
     build_layer_index_mapping,
     convert_gpt_to_hybrid,
     convert_hybrid_to_gpt,

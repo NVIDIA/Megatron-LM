@@ -54,6 +54,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import (
+    gpt_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
@@ -433,6 +434,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     return train_ds, valid_ds, test_ds
 
 
+def select_hybrid_model_cfg(args):
+    """Return the model config; ``--use-legacy-model`` picks GPT over Hybrid."""
+    if getattr(args, 'use_legacy_model', False):
+        print_rank_0('[pretrain_hybrid] --use-legacy-model set: building GPTModel.')
+        return gpt_config_from_args(args)
+    return hybrid_config_from_args(args)
+
+
 if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
@@ -450,7 +459,7 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    model_cfg = hybrid_config_from_args(args)
+    model_cfg = select_hybrid_model_cfg(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,

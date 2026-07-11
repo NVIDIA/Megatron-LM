@@ -118,7 +118,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     print_rank_0('building Mamba model ...')
     config = core_transformer_config_from_args(args, TransformerConfig)
 
-    assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
+    assert args.use_legacy_model == False, "Mamba only supported in Mcore!"
 
     if args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
