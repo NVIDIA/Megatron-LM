@@ -25,7 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placement, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -151,19 +151,10 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            if not _grad_placements_reduce_to_weight(
-                self.main_grad.placements, self.main_weight.placements
-            ):
-                raise ValueError(
-                    "FSDP requires main_grad placements to equal main_weight placements, or "
-                    "to defer a reduction by being Partial on an axis where main_weight is "
-                    "Replicate (HSDP DP-outer accumulation). "
-                    f"Got main_grad placements {self.main_grad.placements} and "
-                    f"main_weight placements {self.main_weight.placements}."
-                )
             # When main_grad placements differ from main_weight, main_grad rests at a
             # DP-outer Partial accumulation state: each backward reduce-scatters DP-inner
             # into it, and the deferred DP-outer reduction runs on the last microbatch.
+            # Unsupported placement combinations surface from DBuffer.redistribute.
             self._defers_grad_reduction = self.main_grad.placements != self.main_weight.placements
             self._grad_accumulating = False
             self._reduced_grad: DBuffer | None = None
@@ -397,28 +388,3 @@ def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
     module_name, separator, parameter_name = name.rpartition(".")
     owner = module.get_submodule(module_name) if separator else module
     return owner, parameter_name
-
-
-def _grad_placements_reduce_to_weight(
-    grad_placements: tuple[Placement, ...], weight_placements: tuple[Placement, ...]
-) -> bool:
-    """Return whether main_grad placements reduce to main_weight placements.
-
-    They may be equal, or main_grad may be ``Partial`` on a single axis where
-    main_weight is ``Replicate`` (an HSDP DP-outer reduction deferred to the last
-    microbatch). All other axes must match so the buffers share a layout and
-    local size. At most one deferred axis is allowed because the deferred
-    reduction finalizes with a single-axis ``DBuffer.redistribute``; multi-axis
-    deferral is not yet supported.
-    """
-    if len(grad_placements) != len(weight_placements):
-        return False
-    deferred_axes = 0
-    for grad_placement, weight_placement in zip(grad_placements, weight_placements):
-        if grad_placement == weight_placement:
-            continue
-        if isinstance(grad_placement, Partial) and isinstance(weight_placement, Replicate):
-            deferred_axes += 1
-            continue
-        return False
-    return deferred_axes <= 1
