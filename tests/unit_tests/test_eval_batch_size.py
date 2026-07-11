@@ -199,6 +199,22 @@ class TestGetTrainValidTestNumSamples:
         # train_samples = 100 * 32 = 3200
         assert train_samples == 3200
 
+    def test_num_samples_iteration_based_phase_uses_train_iters_total(self):
+        """Iteration-based phase boundaries should use train_iters-derived total samples."""
+        args = create_test_args(
+            iteration=100,
+            train_samples=None,
+            train_iters=10000,
+            global_batch_size=512,
+            eval_global_batch_size=512,
+            phase_transition_iterations=[100],
+        )
+        set_args(args)
+
+        train_samples, _, _ = get_train_valid_test_num_samples()
+
+        assert train_samples == (10000 - 100) * 512
+
     def test_num_samples_with_skip_train(self):
         """With skip_train, eval_iters used directly (no multiplier from train_iters/eval_interval)."""
         args = create_test_args(
