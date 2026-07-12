@@ -44,7 +44,10 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import (
+    ArgumentGroupFactory,
+    _normalize_dsv4_hybrid_csa_compress_ratios,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -2251,76 +2254,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
-        # When the dsv4_hybrid variant is active (set above or explicitly), accept
-        # csa_compress_ratios in the compact HybridModel form: one entry per DSv4 attention
-        # symbol (W/C/H), with no padding for MoE/MLP/etc. layers. Older padded lists with
-        # one entry per actual Hybrid layer are still accepted and normalized to compact form
-        # on args. TransformerConfig still receives the padded form because existing attention
-        # code can index csa_compress_ratios by full layer_number.
-        _variant = kw_args.get('experimental_attention_variant',
-                               getattr(args, 'experimental_attention_variant', None))
-        if _variant == 'dsv4_hybrid':
-            _fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
-            _ratio_symbols = set(_fixed_ratio_map)
-            _sections = _pat.split(Symbols.MTP_SEPARATOR)
-            _layers = ''.join(_sec.replace(Symbols.PIPE, '') for _sec in _sections)
-            _attn_symbols = [_c for _c in _layers if _c in _ratio_symbols]
-            _compact_len = len(_attn_symbols)
-            _full_len = len(_layers)
-
-            def _padded_to_compact_and_full(_provided):
-                _compact = []
-                _full = []
-                _compact_iter = iter(_provided)
-                for _symbol in _layers:
-                    if _symbol in _ratio_symbols:
-                        _ratio = next(_compact_iter)
-                        _expected = _fixed_ratio_map.get(_symbol)
-                        assert _expected is None or _ratio == _expected, (
-                            f"csa_compress_ratios has ratio {_ratio} for hybrid symbol "
-                            f"'{_symbol}', expected {_expected}."
-                        )
-                        _compact.append(_ratio)
-                        _full.append(_ratio)
-                    else:
-                        _full.append(0)
-                return _compact, _full
-
-            if getattr(args, 'csa_compress_ratios', None) is None:
-                _compact_ratios = [_fixed_ratio_map.get(_symbol, 0) for _symbol in _attn_symbols]
-                args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                    _padded_to_compact_and_full(_compact_ratios)
-                )
-            else:
-                _provided = list(args.csa_compress_ratios)
-                if len(_provided) == _compact_len:
-                    args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                        _padded_to_compact_and_full(_provided)
-                    )
-                elif len(_provided) == _full_len:
-                    _compact = []
-                    for _ratio, _symbol in zip(_provided, _layers):
-                        if _symbol in _ratio_symbols:
-                            _expected = _fixed_ratio_map.get(_symbol)
-                            assert _expected is None or _ratio == _expected, (
-                                f"csa_compress_ratios has ratio {_ratio} for hybrid symbol "
-                                f"'{_symbol}', expected {_expected}."
-                            )
-                            _compact.append(_ratio)
-                        else:
-                            assert _ratio == 0, (
-                                f"csa_compress_ratios should not pad non-attention hybrid symbol "
-                                f"'{_symbol}' with non-zero ratio {_ratio}."
-                            )
-                    args.csa_compress_ratios = _compact
-                    kw_args['csa_compress_ratios'] = _provided
-                else:
-                    raise AssertionError(
-                        f"csa_compress_ratios length ({len(_provided)}) must equal either the "
-                        f"number of W/C/H attention symbols ({_compact_len}) or the legacy "
-                        f"number of all layers in the hybrid pattern ({_full_len}) for pattern "
-                        f"'{_pat}'."
-                    )
+        # Normalize compact and legacy-padded ratios through the shared migration helper.
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
     kw_args['inference_sampling_seed'] = args.seed
 

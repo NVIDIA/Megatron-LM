@@ -437,7 +437,6 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         attention backend when the mask is ``None``).
         """
 
-        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         if mhc_recompute_manager is None:
             mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 

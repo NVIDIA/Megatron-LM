@@ -291,6 +291,79 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
+    """Normalize DSv4 hybrid compression ratios for args and TransformerConfig."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    variant = kw_args.get(
+        'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
+    )
+    if variant != 'dsv4_hybrid':
+        return
+
+    fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
+    ratio_symbols = set(fixed_ratio_map)
+    sections = pattern.split(Symbols.MTP_SEPARATOR)
+    layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)
+    attn_symbols = [symbol for symbol in layers if symbol in ratio_symbols]
+    compact_len = len(attn_symbols)
+    full_len = len(layers)
+
+    def padded_to_compact_and_full(provided):
+        compact = []
+        full = []
+        compact_iter = iter(provided)
+        for symbol in layers:
+            if symbol in ratio_symbols:
+                ratio = next(compact_iter)
+                expected = fixed_ratio_map[symbol]
+                assert ratio == expected, (
+                    f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                    f"'{symbol}', expected {expected}."
+                )
+                compact.append(ratio)
+                full.append(ratio)
+            else:
+                full.append(0)
+        return compact, full
+
+    if getattr(args, 'csa_compress_ratios', None) is None:
+        compact_ratios = [fixed_ratio_map[symbol] for symbol in attn_symbols]
+        args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(
+            compact_ratios
+        )
+    else:
+        provided = list(args.csa_compress_ratios)
+        if len(provided) == compact_len:
+            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
+                padded_to_compact_and_full(provided)
+            )
+        elif len(provided) == full_len:
+            compact = []
+            for ratio, symbol in zip(provided, layers):
+                if symbol in ratio_symbols:
+                    expected = fixed_ratio_map[symbol]
+                    assert ratio == expected, (
+                        f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                        f"'{symbol}', expected {expected}."
+                    )
+                    compact.append(ratio)
+                else:
+                    assert ratio == 0, (
+                        f"csa_compress_ratios should not pad non-attention hybrid symbol "
+                        f"'{symbol}' with non-zero ratio {ratio}."
+                    )
+            args.csa_compress_ratios = compact
+            kw_args['csa_compress_ratios'] = provided
+        else:
+            raise AssertionError(
+                f"csa_compress_ratios length ({len(provided)}) must equal either the "
+                f"number of W/C/H attention symbols ({compact_len}) or the legacy "
+                f"number of all layers in the hybrid pattern ({full_len}) for pattern "
+                f"'{pattern}'."
+            )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -375,71 +448,7 @@ def core_transformer_config_from_args(args, config_class=None):
             elif has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
 
-        variant = kw_args.get(
-            'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
-        )
-        if variant == 'dsv4_hybrid':
-            fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
-            ratio_symbols = set(fixed_ratio_map)
-            sections = pattern.split(Symbols.MTP_SEPARATOR)
-            layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)
-            attn_symbols = [symbol for symbol in layers if symbol in ratio_symbols]
-            compact_len = len(attn_symbols)
-            full_len = len(layers)
-
-            def padded_to_compact_and_full(provided):
-                compact = []
-                full = []
-                compact_iter = iter(provided)
-                for symbol in layers:
-                    if symbol in ratio_symbols:
-                        ratio = next(compact_iter)
-                        expected = fixed_ratio_map[symbol]
-                        assert ratio == expected, (
-                            f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
-                            f"'{symbol}', expected {expected}."
-                        )
-                        compact.append(ratio)
-                        full.append(ratio)
-                    else:
-                        full.append(0)
-                return compact, full
-
-            if getattr(args, 'csa_compress_ratios', None) is None:
-                compact_ratios = [fixed_ratio_map[symbol] for symbol in attn_symbols]
-                args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                    padded_to_compact_and_full(compact_ratios)
-                )
-            else:
-                provided = list(args.csa_compress_ratios)
-                if len(provided) == compact_len:
-                    args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                        padded_to_compact_and_full(provided)
-                    )
-                elif len(provided) == full_len:
-                    compact = []
-                    for ratio, symbol in zip(provided, layers):
-                        if symbol in ratio_symbols:
-                            expected = fixed_ratio_map[symbol]
-                            assert ratio == expected, (
-                                f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
-                                f"'{symbol}', expected {expected}."
-                            )
-                            compact.append(ratio)
-                        else:
-                            assert ratio == 0, (
-                                f"csa_compress_ratios should not pad non-attention hybrid symbol "
-                                f"'{symbol}' with non-zero ratio {ratio}."
-                            )
-                    args.csa_compress_ratios = compact
-                    kw_args['csa_compress_ratios'] = provided
-                else:
-                    raise AssertionError(
-                        f"csa_compress_ratios length ({len(provided)}) must equal either the "
-                        f"number of W/C/H attention symbols ({compact_len}) or the legacy "
-                        f"number of all layers in the hybrid pattern ({full_len}) for pattern "
-                        f"'{pattern}'."
-                    )
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
 
     kw_args['inference_sampling_seed'] = args.seed
 
