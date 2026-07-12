@@ -51,6 +51,14 @@ try:
 except ImportError:
     HAVE_FLA = False
 
+try:
+    from fla.ops.gdn2.chunk import chunk_gdn2
+
+    HAVE_FLA_GDN2 = True
+except ImportError:
+    chunk_gdn2 = None
+    HAVE_FLA_GDN2 = False
+
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
@@ -68,6 +76,7 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
     return unpacked_x
 
 
+@pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn1", "gdn2"])
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
     [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
@@ -77,7 +86,10 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size):
+    def setup_method(self, tp_size, sp, cp_size, use_gdn2):
+        if use_gdn2 and not HAVE_FLA_GDN2:
+            pytest.skip("FLA with GDN2 support is not installed.")
+
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -88,6 +100,7 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.use_gdn2 = use_gdn2
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -113,7 +126,7 @@ class TestGatedDeltaNet:
             tensor_model_parallel_size=tp_size,
             sequence_parallel=sp,
             context_parallel_size=cp_size,
-            experimental_attention_variant="gated_delta_net",
+            experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
@@ -247,6 +260,50 @@ class TestGatedDeltaNet:
                 rec_grads[name], base_grads[name]
             ), f"Grad not identical for {name} ({rank=})"
 
+    def test_module_construction(self):
+        gdn = self.gdn
+        if self.use_gdn2:
+            assert gdn.use_gdn2
+            assert gdn.gated_delta_rule is chunk_gdn2
+            assert gdn.in_proj_dim == 4 * gdn.qk_dim + 3 * gdn.v_dim
+            assert gdn.A_log.shape == (gdn.num_key_heads // self.tp_size,)
+            assert gdn.dt_bias.shape == (gdn.qk_dim // self.tp_size,)
+        else:
+            assert not gdn.use_gdn2
+            assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
+            assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
+            assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
+
+    def test_gpu_forward_backward(self):
+        gdn = self.gdn
+
+        micro_batch_size = 2
+        seq_length = 64
+        hidden_states = torch.rand(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        output, bias = gdn(hidden_states, None)
+
+        assert output.shape == (
+            seq_length // self.sp_size // self.cp_size,
+            micro_batch_size,
+            gdn.config.hidden_size,
+        ), f"Output shape mismatch ({output.shape=})"
+        assert (
+            output.dtype == hidden_states.dtype
+        ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+        output.float().sum().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all(), "Non-finite input grad"
+        for name, param in gdn.named_parameters():
+            if param.grad is not None:
+                assert torch.isfinite(param.grad).all(), f"Non-finite grad for {name}"
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 
@@ -254,68 +311,84 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
+        device = torch.cuda.current_device()
         num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+        num_k_heads_local = gdn.num_key_heads // gdn.tp_size // gdn.cp_size
+        qk_dim_local = gdn.qk_dim_local_tp // gdn.cp_size
+        v_dim_local = gdn.v_dim_local_tp // gdn.cp_size
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
         qkv = torch.randn(
-            batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+            batch, seq_len, 2 * qk_dim_local + v_dim_local, device=device, dtype=torch.bfloat16
         )
         gate = torch.randn(
             batch,
             seq_len,
             num_v_heads_local,
             gdn.value_head_dim,
-            device=torch.cuda.current_device(),
+            device=device,
             dtype=torch.bfloat16,
         )
-        beta = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        alpha = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
+        if self.use_gdn2:
+            gate_feats = (
+                torch.randn(batch, seq_len, qk_dim_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, qk_dim_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, v_dim_local, device=device, dtype=torch.bfloat16),
+            )  # f, b, w
+            A_log_mock = torch.randn(num_k_heads_local, device=device, dtype=torch.bfloat16)
+            dt_bias_mock = torch.randn(qk_dim_local, device=device, dtype=torch.bfloat16)
+            expected_keys = {"q", "k", "v", "g", "b", "w"}
+        else:
+            gate_feats = (
+                torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+            )  # beta, alpha
+            A_log_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+            dt_bias_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+            expected_keys = {"q", "k", "v", "g", "beta"}
 
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+            kernel_inputs, gate_out = gdn._prepare_input_for_gated_delta_rule(
+                qkv, gate, gate_feats, A_log_mock, dt_bias_mock, batch, seq_len
             )
 
+        assert set(kernel_inputs.keys()) == expected_keys
+        query, key, value, g = (kernel_inputs[name] for name in ("q", "k", "v", "g"))
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        assert query.is_contiguous()
-        assert key.is_contiguous()
-        assert value.is_contiguous()
-
-        A_log_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
-        )
-        dt_bias_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
-        )
-
-        with torch._dynamo.config.patch(disable=True):
-            g, beta_sig = gdn._compute_g_and_beta(A_log_mock, dt_bias_mock, alpha, beta)
-
+        # The log-decay must be in fp32
         assert g.dtype == torch.float32
-        assert g.shape == alpha.shape
-        assert beta_sig.shape == beta.shape
+        for t in (query, key, value, gate_out, g):
+            assert t.is_contiguous()
+
+        if self.use_gdn2:
+            # Per-channel decay and erase/write gates squashed to [0, 1]
+            b_out, w_out = kernel_inputs["b"], kernel_inputs["w"]
+            assert g.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+            assert b_out.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+            assert w_out.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
+            assert (g <= 0).all()
+            assert (b_out >= 0).all() and (b_out <= 1).all()
+            assert (w_out >= 0).all() and (w_out <= 1).all()
+            assert b_out.is_contiguous() and w_out.is_contiguous()
+        else:
+            # Per-head decay and write strength beta
+            assert g.shape == (batch, seq_len, num_v_heads_local)
+            assert kernel_inputs["beta"].shape == (batch, seq_len, num_v_heads_local)
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
 
-        atol, rtol = 3e-4, 3e-4
+        if self.use_gdn2:
+            # FLA uses different kernels for SBHD and THD:
+            # https://github.com/fla-org/flash-linear-attention/blob/ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0/fla/ops/gdn2/chunk_intra.py#L40-L53
+            # so we relax the error bound here
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 3e-4, 3e-4
 
         # Input shape
         sequence_length = 32
@@ -358,7 +431,12 @@ class TestGatedDeltaNet:
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
 
-        atol, rtol = 3e-4, 3e-4
+        if self.use_gdn2:
+            # See test_gpu_forward_thd_correctness: varlen vs batched kernel paths only
+            # match up to bf16 ULP-level differences for GDN2.
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 3e-4, 3e-4
         sequence_length = 32
         micro_batch_size = 4
 
@@ -485,6 +563,57 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+    )
+
+    transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config=transformer_config, vp_stage=None, pp_rank=0
+    )
+
+    if cp:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 5e-4, 5e-4
+
+    _test_parallel_attention_correctness(
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
+        micro_batch_size=4,
+        sequence_packing=sequence_packing,
+    )
+
+
+@pytest.mark.parametrize("sequence_packing", [False, True])
+@pytest.mark.parametrize(
+    ("tp", "sp", "cp"),
+    [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
+)
+@pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
+def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+    transformer_config = TransformerConfig(
+        hidden_size=128,
+        linear_conv_kernel_dim=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        layernorm_zero_centered_gamma=True,
+        num_attention_heads=8,
+        activation_func=F.silu,
+        bf16=True,
+        experimental_attention_variant="gdn2",
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )
