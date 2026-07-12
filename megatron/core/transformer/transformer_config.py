@@ -1303,8 +1303,20 @@ class TransformerConfig(ModelParallelConfig):
         if self.kv_channels is None:
             self.kv_channels = self.hidden_size // self.num_attention_heads
 
-        if self.num_query_groups is None:
+        # num_query_groups == 0 is treated the same as None (both mean "use num_attention_heads").
+        # This keeps minimal configs valid (num_attention_heads itself defaults to 0) and ensures
+        # a real attention config never reaches attention initialization with a zero query-group
+        # count, which would otherwise divide by zero downstream.
+        if self.num_query_groups is None or self.num_query_groups == 0:
             self.num_query_groups = self.num_attention_heads
+
+        if self.num_attention_heads > 0 and (
+            self.num_query_groups <= 0 or self.num_attention_heads % self.num_query_groups != 0
+        ):
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a positive divisor of "
+                f"num_attention_heads ({self.num_attention_heads})."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0
