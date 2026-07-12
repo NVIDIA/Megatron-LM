@@ -513,9 +513,10 @@ class GatedDeltaNet(MegatronModule):
         )
 
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs, gate = self._prepare_input_for_gated_delta_rule(
+        kernel_inputs = self._prepare_input_for_gated_delta_rule(
             qkv, gate, gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len
         )
+        gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -588,7 +589,7 @@ class GatedDeltaNet(MegatronModule):
     @jit_fuser
     def _prepare_input_for_gated_delta_rule(
         self, qkv, gate, gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs, for both GDN and GDN2.
 
@@ -660,9 +661,10 @@ class GatedDeltaNet(MegatronModule):
             "k": key.contiguous(),
             "v": value.contiguous(),
             "g": g.contiguous(),
+            "gate": gate.contiguous(),
             **variant_kernel_inputs,
         }
-        return kernel_inputs, gate.contiguous()
+        return kernel_inputs
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
