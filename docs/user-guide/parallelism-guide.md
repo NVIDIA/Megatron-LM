@@ -248,3 +248,4 @@ Reduces activation memory by sharding sequence dimension in LayerNorm and Dropou
 - **API Reference**: Refer to [Tensor Parallel](../api-guide/core/tensor_parallel.md) and [Pipeline Parallel](../api-guide/core/pipeline_parallel.md) in the API documentation
 - **Advanced Features**: Refer to [Megatron-FSDP](features/megatron_fsdp.md), [MoE](features/moe.md), and [Distributed Optimizer](features/dist_optimizer.md)
 - **Performance Tuning**: Refer to the [NVIDIA NeMo Performance Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html)
+- **Troubleshooting**: Refer to [Troubleshooting Parallelism Configuration Errors](troubleshooting-parallelism.md) for common validation failures and how to fix them
