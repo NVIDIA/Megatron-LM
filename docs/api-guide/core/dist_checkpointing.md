@@ -125,7 +125,7 @@ You can combine formats to optimize both flexibility and performance:
 
 ## Async Checkpoint Saving Strategy
 
-The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations. 
+The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations.
 
 We are transitioning to a new async saving implementation based on the **NVRx (NVIDIA Resiliency Extension)** package. The legacy async strategy (referred to as **mcore**) is being deprecated.
 

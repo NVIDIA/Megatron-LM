@@ -18,5 +18,5 @@ SKIP_PUBLIC_DOCS_FEATURES=true uv run --only-group docs sphinx-autobuild . _buil
 
 Docs will be generated at <http://localhost:8080/>.
 
-**Recommended:** set the environment variable `SKIP_AUTODOC=true` when generating docs 
+**Recommended:** set the environment variable `SKIP_AUTODOC=true` when generating docs
 to skip the generation of `apidocs`.
