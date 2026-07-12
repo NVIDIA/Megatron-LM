@@ -1315,6 +1315,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups})."
+            )
+
         if self.experimental_attention_variant == "gated_delta_net":
             assert (
                 self.linear_attention_freq is not None
