@@ -327,6 +327,7 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
                 full.append(0)
         return compact, full
 
+    # args keeps the compact CLI form; TransformerConfig gets the full form for per-layer indexing.
     if getattr(args, 'csa_compress_ratios', None) is None:
         compact_ratios = [fixed_ratio_map[symbol] for symbol in attn_symbols]
         args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(

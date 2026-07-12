@@ -13,7 +13,7 @@ MODEL_ARGS:
   --qk-head-dim: 16
   --qk-pos-emb-head-dim: 8
   --v-head-dim: 16
-  --hybrid-layer-pattern: W-C-|H-C-/W-
+  --hybrid-layer-pattern: WEC-|H-C-/W-
   --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_dsv4_stack_spec]"
   --experimental-attention-variant: dsv4_hybrid
   --dsa-indexer-n-heads: 64
@@ -25,6 +25,15 @@ MODEL_ARGS:
   --csa-compress-ratios: ([0,4,128,4,0])
   --csa-compress-rotary-base: 40000
   --no-dsa-kernel-fusion: true
+  --num-experts: 8
+  --expert-model-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --moe-router-topk: 2
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: aux_loss
+  --moe-aux-loss-coeff: 1.0e-4
   --enable-hyper-connections: true
   --num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
@@ -38,6 +47,19 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --global-batch-size: 32
   --seq-length: 1024
+  --use-varlen-dataset: true
+  --mock-data: true
+  --varlen-mock-dataset-config-json: '\''{\"mode\":\"distribution\",\"type\":\"lognormal\",\"format\":\"thd\",\"min_seq_len\":1024,\"max_seq_len\":1024,\"mean_seq_len\":1024,\"lognormal_sigma\":1.1}\'''
+  --sequence-packing-scheduler: dp_balanced
+  --max-seqlen-per-dp-cp-rank: 512
+  --pad-packed-seq-alignment: max
+  --no-pad-packed-seq-by-appending-dummy-seq: true
+  --calculate-per-token-loss: true
+  --thd-max-packed-sequences: 8
+  --cp-partition-mode: contiguous
+  --dataloader-type: single
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 100352
   --position-embedding-type: rope
   --max-position-embeddings: 1024
   --train-iters: 50
@@ -45,9 +67,6 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -63,12 +82,17 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
+  --context-parallel-size: 2
   --sequence-parallel: true
   --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
+  --cuda-graph-impl: transformer_engine
+  --cuda-graph-dynamic-microbatches: true
+  --cuda-graph-modules: "[attn moe_router moe_preprocess]"
+  --te-rng-tracker: true
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
