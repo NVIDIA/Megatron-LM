@@ -5,6 +5,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -78,6 +79,40 @@ def get_gated_delta_net_module_spec(
     return attention
 
 
+def get_kimi_delta_attention_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for KimiDeltaAttention.
+
+    KDA keeps separate q/k/v/beta projections plus two low-rank bottlenecks (``f_proj`` for the
+    per-channel forget gate, ``g_proj`` for the output gate), mirroring the FLA reference. Unlike
+    GatedDeltaNet, the input layernorm is not fused into the projection, so that every projection
+    consumes the same normalized hidden states.
+    """
+
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    rms_norm = config.normalization == "RMSNorm"
+    attention = ModuleSpec(
+        module=KimiDeltaAttention,
+        submodules=KimiDeltaAttentionSubmodules(
+            q_proj=backend.column_parallel_linear(),
+            k_proj=backend.column_parallel_linear(),
+            v_proj=backend.column_parallel_linear(),
+            b_proj=backend.column_parallel_linear(),
+            f_proj_down=backend.linear(),
+            f_proj_up=backend.column_parallel_linear(),
+            g_proj_down=backend.linear(),
+            g_proj_up=backend.column_parallel_linear(),
+            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+            out_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
 def get_dsa_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -140,6 +175,8 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "kimi_delta_attention":
+        return get_kimi_delta_attention_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     else:
@@ -332,7 +369,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "kimi_delta_attention"]
     return experimental_attention_variant in linear_attention_variants
 
 

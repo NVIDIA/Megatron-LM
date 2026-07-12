@@ -281,8 +281,11 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'kimi_delta_attention', 'dsa']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net,
+    kimi_delta_attention and dsa."""
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -1315,27 +1318,28 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.experimental_attention_variant in ("gated_delta_net", "kimi_delta_attention"):
+            variant = self.experimental_attention_variant
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), f"linear_attention_freq must be set for linear {variant}."
 
             # Check required parameters
             assert (
                 self.linear_conv_kernel_dim is not None
-            ), "linear_conv_kernel_dim must be set for gated delta net."
+            ), f"linear_conv_kernel_dim must be set for {variant}."
             assert (
                 self.linear_key_head_dim is not None
-            ), "linear_key_head_dim must be set for gated delta net."
+            ), f"linear_key_head_dim must be set for {variant}."
             assert (
                 self.linear_value_head_dim is not None
-            ), "linear_value_head_dim must be set for gated delta net."
+            ), f"linear_value_head_dim must be set for {variant}."
             assert (
                 self.linear_num_key_heads is not None
-            ), "linear_num_key_heads must be set for gated delta net."
+            ), f"linear_num_key_heads must be set for {variant}."
             assert (
                 self.linear_num_value_heads is not None
-            ), "linear_num_value_heads must be set for gated delta net."
+            ), f"linear_num_value_heads must be set for {variant}."
             assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
