@@ -211,3 +211,33 @@ def test_sequence_packing_rejects_unknown_scheduler():
 def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
     with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
         _make_packing_config(max_seqlen_per_dp_cp_rank=None)
+
+
+class TestTransformerConfig:
+    def test_num_query_groups_divides_num_attention_heads(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=32, num_query_groups=8
+        )
+        assert config.num_query_groups == 8
+
+    def test_num_query_groups_defaults_to_num_attention_heads(self):
+        config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=32)
+        assert config.num_query_groups == 32
+
+    def test_num_query_groups_not_dividing_num_attention_heads_raises(self):
+        with pytest.raises(ValueError, match="must be a divisor of num_attention_heads"):
+            TransformerConfig(
+                num_layers=2, hidden_size=128, num_attention_heads=32, num_query_groups=5
+            )
+
+    def test_num_query_groups_larger_than_num_attention_heads_raises(self):
+        with pytest.raises(ValueError, match="must be a divisor of num_attention_heads"):
+            TransformerConfig(
+                num_layers=2, hidden_size=128, num_attention_heads=4, num_query_groups=8
+            )
+
+    def test_minimal_config_without_attention_heads_is_allowed(self):
+        # num_attention_heads defaults to 0 in minimal configs used by many non-attention tests;
+        # num_query_groups then defaults to 0 and the check is skipped.
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        assert config.num_query_groups == 0
