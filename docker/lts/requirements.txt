@@ -7,8 +7,8 @@
 #      requirements.in containing the loose specs).
 #   2. Rebuild `docker/Dockerfile.ci.lts` and run the LTS CI lane.
 
-# TE 2.17 builds NCCL EP, which needs nccl_device.h that is not in the 25.09 LTS image.
-transformer-engine[pytorch,core_cu13]==2.16.0
+# Transformer Engine 2.16 (release_v2.16.post)
+transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@b9d690e042b1c4e455214e7dab65d6d3512c05d6
 tqdm==4.67.3
 einops==0.8.2                          # was: einops~=0.8
 tensorstore==0.1.84                    # was: tensorstore~=0.1,!=0.1.46,!=0.1.72

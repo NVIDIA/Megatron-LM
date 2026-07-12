@@ -77,7 +77,8 @@ COPY docker/lts/requirements.txt /workspace/docker/lts/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
-    uv pip install --no-build-isolation -r /workspace/docker/lts/requirements.txt
+    uv pip install --no-build-isolation-package transformer-engine \
+        -r /workspace/docker/lts/requirements.txt
 EOF
 
 # Install DeepEP
