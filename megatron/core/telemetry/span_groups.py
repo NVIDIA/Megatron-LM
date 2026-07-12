@@ -39,7 +39,7 @@ except ImportError:
         )
 
         GOODPUT_GROUPS: Final[frozenset] = frozenset(
-            [JOB, CHECKPOINT, EVALUATE, MODEL_INIT, LOAD_CHECKPOINT, STEP]
+            [JOB, CHECKPOINT, MODEL_INIT, LOAD_CHECKPOINT, STEP]
         )
 
         _PRESETS: ClassVar[dict] = {
@@ -150,11 +150,17 @@ class MegatronSpanGroup(SpanGroup):
     # installed nemo-lens without GOODPUT_GROUPS can't AttributeError at class
     # definition and take the whole training run down with it -- telemetry must
     # never break training.
+    # Goodput = resiliency overhead only: the cost of RESTART (job/container,
+    # python+megatron init, model init, checkpoint load, dataloader, first-
+    # iteration warmup) and the cost of DEFENSE (checkpoint save, sniff test, FT
+    # heartbeat, weight-hash check), plus STEP for the productive-time baseline.
+    # EVALUATE is deliberately NOT here -- evaluation is intended work, not a
+    # resiliency cost, so it must not count against goodput. Likewise energy/
+    # straggler monitors and steady-state logging are profiling, not goodput.
     GOODPUT_GROUPS: Final[frozenset] = frozenset(
         [
             SpanGroup.JOB,
             SpanGroup.CHECKPOINT,
-            SpanGroup.EVALUATE,
             SpanGroup.MODEL_INIT,
             SpanGroup.LOAD_CHECKPOINT,
             SpanGroup.STEP,
