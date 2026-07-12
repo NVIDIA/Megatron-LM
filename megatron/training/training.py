@@ -2565,6 +2565,11 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
+        # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
+        # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
+        # LOAD is uniform across ranks (~ms spread), so no meaningful skew
+        # serializes here -- left unspanned; megatron.checkpoint.load covers the
+        # (uniform) restart cost.
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -3445,6 +3450,22 @@ def save_checkpoint_and_time(
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
+    # OTel: single goodput span parenting ALL exposed (main-thread) checkpoint
+    # cost -- the total wall-clock the training loop is blocked on the checkpoint:
+    # pre-save buffer free, state-dict generation, the async dispatch, AND the
+    # post-save cross-rank skew wait at timers.log. Everything below nests under
+    # it (megatron.func.save_checkpoint_and_time, megatron.checkpoint.save,
+    # timers_log, post_save_barrier). start_span + context attach (not a `with`)
+    # so the whole body isn't re-indented; ended explicitly at the function end.
+    _exposed_save_span = None
+    _exposed_save_token = None
+    if _otel_sg_enabled('checkpoint'):
+        from opentelemetry import context as _octx, trace as _otr
+        _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
+        _otel_tag_span(_exposed_save_span, 'checkpoint')
+        _exposed_save_span.set_attribute('megatron.iteration', iteration)
+        _exposed_save_token = _octx.attach(_otr.set_span_in_context(_exposed_save_span))
+
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
         force_param_sync(model, optimizer=optimizer)
@@ -3521,7 +3542,11 @@ def save_checkpoint_and_time(
         # model checkpoint saving.
         gc.collect()
 
-    timers.log([timer_key])
+    # timers.log reports min & max across ranks -> a collective. Sitting right
+    # after the per-rank-imbalanced save (and outside the save spans), it's a
+    # prime spot for the fast ranks to serialize waiting for the slowest saver.
+    with _otel_managed_span('step', 'megatron.checkpoint.timers_log'):
+        timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
@@ -3535,7 +3560,17 @@ def save_checkpoint_and_time(
 
     # Recover timing
     energy_monitor.resume()
+    # Interval-time timer restarts with an explicit GLOBAL BARRIER -- the first
+    # hard sync after the checkpoint. If the skew didn't already serialize at
+    # timers.log above, it serializes HERE: fast ranks block for the slowest
+    # saver. Outside every save span, so it read as the dark post-checkpoint gap.
     timers('interval-time', log_level=0).start(barrier=True)
+
+    # OTel: close the exposed-save goodput span that parents all of the above.
+    if _exposed_save_span is not None:
+        from opentelemetry import context as _octx
+        _octx.detach(_exposed_save_token)
+        _exposed_save_span.end()
 
 
 def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
@@ -3627,7 +3662,9 @@ def post_training_step_callbacks(
     ):
         _run_gpu_sniff_test(f'iteration {iteration:7d}')
 
-    # Manual garbage collection.
+    # Manual garbage collection. With --manual-gc the interpreter's automatic
+    # collector is off; this synchronous full collection is the only GC. With
+    # manual_gc_interval=0 (the common case) it never fires.
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
@@ -3706,13 +3743,11 @@ def checkpoint_and_decide_exit(
         done_cuda = torch.tensor(
             [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
         )
-        # Per-iteration collective in checkpoint_and_decide_exit (which has no
-        # span of its own), right after the checkpoint dispatch. Being a
-        # collective it absorbs cross-rank skew, so it dominates the otherwise-
-        # dark post-checkpoint gap: fast ranks wait here for the heaviest
-        # fully-parallel-save writer. Spanning it makes that wait readable.
-        with _otel_managed_span('checkpoint', 'megatron.train.exit_barrier'):
-            torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
+        # MAX all-reduce so every rank makes the SAME exit decision despite each
+        # reading its own wall-clock (a determinism guarantee, not a sync point).
+        # ~0.1ms and left unspanned: the GPU is already drained by here, and the
+        # real post-checkpoint wait is the cross-rank save skew at timers.log.
+        torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
         if done:
             if args.save and not saved_checkpoint:
@@ -4442,15 +4477,38 @@ def train(
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
+        # OTel: super-span over the whole post-step REPORTING block (loss-scale
+        # sync, param-norm reduction, throughput/tensorboard/wandb logging). One
+        # goodput span that captures ALL the exposed reporting overhead --
+        # including the loss_scale.item() device sync and misc bookkeeping that
+        # would otherwise be dark -- WITHOUT instrumenting each line. params_norm
+        # and train.log nest under it; its own uninstrumented time is the blank
+        # you'd otherwise see. start_span + attach (no re-indent); closed after
+        # training_log below.
+        _report_span = None
+        _report_token = None
+        if _otel_sg_enabled('step'):
+            from opentelemetry import context as _octx, trace as _otr
+            _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
+            _otel_tag_span(_report_span, 'step')
+            _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
+
         # Logging.
         if optimizer is not None and not optimizer.is_stub_optimizer:
+            # First .item() after the train_step: a device sync draining the
+            # iteration's pending GPU queue (captured under iteration_report).
             loss_scale = optimizer.get_loss_scale().item()
         else:
             loss_scale = 1.0
         params_norm = None
 
         if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
+            # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
+            # + all-reduce that BLOCKS the training loop -- exposed goodput cost
+            # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
+            # cost span (it stalls the critical path), unlike passive monitors.
+            with _otel_managed_span('step', 'megatron.train.params_norm'):
+                params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -4475,6 +4533,12 @@ def train(
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
             )
+        # OTel: close the iteration-report super-span (parents params_norm + log;
+        # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
+        if _report_span is not None:
+            from opentelemetry import context as _octx
+            _octx.detach(_report_token)
+            _report_span.end()
         is_first_iteration = False
 
         # Evaluation.
