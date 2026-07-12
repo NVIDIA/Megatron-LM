@@ -4190,6 +4190,18 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        # Test-only deliberate fault injection (gated by env; a no-op in normal
+        # runs). Raises on ONE named rank after N seconds of training to exercise
+        # the goodput lost-work / recovery path. Only that rank fails; the others
+        # then hit the distributed timeout.
+        _finj = os.environ.get('LENS_INJECT_FAULT_RANK')
+        if (_finj is not None and torch.distributed.get_rank() == int(_finj)
+                and (time.time() - _TRAIN_START_TIME)
+                > float(os.environ.get('LENS_INJECT_FAULT_AFTER_S', '1e18'))):
+            raise RuntimeError(
+                f"[lens fault-injection] rank {int(_finj)} deliberate failure "
+                f"{time.time() - _TRAIN_START_TIME:.0f}s into training (iteration {iteration})"
+            )
         if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
