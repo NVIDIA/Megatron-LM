@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1194,15 +1194,20 @@ wheels = [
 
 [[package]]
 name = "fla-core"
-version = "0.4.2"
+version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
-    { name = "torch", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/f9/9e05c48f92b1388a8a357141eb557ed0dd6d4bb936e1d05d35f01976657f/fla_core-0.4.2.tar.gz", hash = "sha256:e9fef6fcdf122029f9feb7dccfeb85eb9650e6aabc72d2a65b36558e9c590edd", size = 377722, upload-time = "2026-03-12T14:45:46.101Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/62/99e149f19a447ce809d7f4fa64ae61c073da337505b9db7f389502470820/fla_core-0.5.1.tar.gz", hash = "sha256:7f3cf56edfbaa9115f4937d1181372e5c7b11809ad8eb2e411fffc3caf729f48", size = 498800, upload-time = "2026-06-18T18:17:15.377Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ee/36/3c303f92bafea7c3f97d68bbb83d18cc42e30cd0bfb1b7cfe589360f11d6/fla_core-0.4.2-py3-none-any.whl", hash = "sha256:cba3db29380002da3cbfc0db94d6efac19aaf528900d19c05c2765e8f3cc485b", size = 510239, upload-time = "2026-03-12T14:45:43.708Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/78/a55ee7a62515dcb9220770dd99dfe59ac6599da8af84ad1d20f9f407df4d/fla_core-0.5.1-py3-none-any.whl", hash = "sha256:02150d34aa1e37f6b8ed9b2feec5d29af93680573e5077ed981238179c11fb06", size = 702955, upload-time = "2026-06-18T18:17:12.229Z" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "triton", marker = "sys_platform == 'never'" },
 ]
 
 [[package]]
@@ -1221,15 +1226,20 @@ wheels = [
 
 [[package]]
 name = "flash-linear-attention"
-version = "0.4.2"
+version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fla-core" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d1/cb/46cc27a829a10b308927c5dbc99176906a021bb0770253699e93f3cd81a0/flash_linear_attention-0.4.2.tar.gz", hash = "sha256:f97c01ebe7cf390323af07dd3fb65ade07da16724339bf70c78607bc0c007c34", size = 148464, upload-time = "2026-03-12T14:45:46.945Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4c/e8/8f115be585a046795e4a1f7ade727889219bb66b8d96cc668b8c9e437c0e/flash_linear_attention-0.5.1.tar.gz", hash = "sha256:8840fd4c37de8b0612dc8fd493867f3d330672ba2f17c024a2ce37239634e247", size = 221733, upload-time = "2026-06-18T18:17:16.661Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/ee/a3cba17965482b35c4990af90bad108e82c32edcb59911c37f318b5f4198/flash_linear_attention-0.4.2-py3-none-any.whl", hash = "sha256:c08be006ce4dbe1be81f54938ee8e6fc7968cfba397c8d06c7669e97b8c44c0d", size = 284661, upload-time = "2026-03-12T14:45:44.905Z" },
+    { url = "https://files.pythonhosted.org/packages/68/3c/5819fb19dc071302ca818616a4e64d4454e1f1193929eb8365c8d38e9052/flash_linear_attention-0.5.1-py3-none-any.whl", hash = "sha256:9022862f0a238752372c81290694b8b2ed1cb2d13fc40d340ffeeb554d6bee5c", size = 403096, upload-time = "2026-06-18T18:17:14.025Z" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "fla-core", extra = ["cuda"] },
 ]
 
 [[package]]
@@ -2189,7 +2199,7 @@ dev = [
     { name = "emerging-optimizers" },
     { name = "fast-hadamard-transform" },
     { name = "fastapi" },
-    { name = "flash-linear-attention" },
+    { name = "flash-linear-attention", extra = ["cuda"] },
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "megatron-energon", extra = ["av-decode"] },
@@ -2294,7 +2304,7 @@ requires-dist = [
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = "~=0.4.0" },
+    { name = "flash-linear-attention", extras = ["cuda"], marker = "extra == 'dev'", specifier = ">=0.5.1" },
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.7.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
@@ -5129,14 +5139,14 @@ version = "2.12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
+    { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "fsspec", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "jinja2", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "networkx", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "setuptools", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "sympy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 
 [[package]]
