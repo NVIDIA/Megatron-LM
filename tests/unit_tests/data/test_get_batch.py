@@ -185,7 +185,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -415,7 +420,12 @@ def test_pretrain_batch(
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -644,7 +654,12 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     # Presence checks
     assert tokens is not None
