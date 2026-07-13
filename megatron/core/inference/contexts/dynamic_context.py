@@ -2222,10 +2222,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._cpu_mha_cu_kv_seq_lengths[real_bs]
             )
 
-        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
+        # Block table: [0:real_bs] real, [real_bs:padded_bs] = dummy block.
+        # Padded rows have kv_seq_length 0 and contribute no attention, but the
+        # external paged-attention kernels may still form addresses from row 0 of
+        # the table; a -1 sentinel resolves to one page below the KV buffer base,
+        # which under unified memory is unmapped VA and faults asynchronously
+        # during graph replay. The reserved dummy block keeps any speculative
+        # access in-bounds and matches the state the graphs were captured with.
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
-            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+            self._cpu_mha_block_table[real_bs:padded_bs] = (
+                self.kv_block_allocator.dummy_block_idx
+            )
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
