@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -31,12 +32,24 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
+    _TE_CAPTURE_TIME_HOOKS_PROTOCOL,
     CudaGraphManager,
     TECudaGraphHelper,
+    VisionTECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _get_model_with_decoder,
+    _get_te_capture_time_hooks_contract,
+    _layer_captures_attention,
     _layer_is_graphable,
+    _merge_observed_rotary_kwargs,
+    _validate_mrope_capture_inputs,
 )
+from megatron.core.transformer.cuda_graphs import (
+    set_current_microbatch as set_cuda_graph_current_microbatch,
+)
+from megatron.core.transformer.cuda_graphs import validate_te_cuda_graph_topology
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -59,8 +72,837 @@ from tests.unit_tests.test_utilities import Utils
 fp8_available, _ = check_fp8_support()
 
 
+class TestCudaGraphModelDiscovery:
+    def test_direct_decoder_model(self):
+        class Model:
+            pass
+
+        model = Model()
+        model.decoder = object()
+
+        assert _get_model_with_decoder(model) is model
+
+    def test_nested_multimodal_language_model(self):
+        class Model:
+            pass
+
+        language_model = Model()
+        language_model.decoder = object()
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+
+        assert _get_model_with_decoder(multimodal_model) is language_model
+
+    def test_wrapped_nested_multimodal_language_model(self):
+        class Model:
+            pass
+
+        language_model = Model()
+        language_model.decoder = object()
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+        wrapper = Model()
+        wrapper.module = multimodal_model
+
+        assert _get_model_with_decoder(wrapper) is language_model
+
+    def test_missing_decoder_raises(self):
+        class Model:
+            pass
+
+        with pytest.raises(RuntimeError, match="couldn't find attribute decoder"):
+            _get_model_with_decoder(Model())
+
+    def test_set_current_microbatch_finds_nested_language_decoder_and_mtp(self):
+        class Model:
+            pass
+
+        decoder_layer = Model()
+        decoder_layer.current_microbatch = None
+        mtp_model_layer = Model()
+        mtp_model_layer.current_microbatch = None
+        language_model = Model()
+        language_model.decoder = Model()
+        language_model.decoder.layers = [decoder_layer]
+        language_model.mtp = Model()
+        language_model.mtp.layers = [SimpleNamespace(mtp_model_layer=mtp_model_layer)]
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+        wrapper = Model()
+        wrapper.module = multimodal_model
+
+        set_cuda_graph_current_microbatch(wrapper, 7)
+
+        assert decoder_layer.current_microbatch == 7
+        assert mtp_model_layer.current_microbatch == 7
+
+    def test_set_current_microbatch_updates_vision_only_model_without_decoder(self):
+        class Model:
+            pass
+
+        vision_layer = Model()
+        vision_layer.current_microbatch = None
+        vision_encoder = Model()
+        vision_encoder.decoder = Model()
+        vision_encoder.decoder.layers = [vision_layer]
+        vision_only_model = Model()
+        vision_only_model.vision_model = vision_encoder
+
+        set_cuda_graph_current_microbatch(vision_only_model, 11)
+
+        assert vision_layer.current_microbatch == 11
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+class _ObservedKwargLayer(GraphableMegatronModule):
+    def __init__(self, config: TransformerConfig):
+        super().__init__(config=config)
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        return hidden_states * self.weight
+
+
+class _AttentionProbe(torch.nn.Module):
+    def __init__(self, supports_te_cuda_graph: bool):
+        super().__init__()
+        self.supports_te_cuda_graph = supports_te_cuda_graph
+
+
+def _bare_transformer_layer(
+    config: TransformerConfig, *, attention_supports_graph: bool = True
+) -> TransformerLayer:
+    layer = TransformerLayer.__new__(TransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = config
+    layer.self_attention = _AttentionProbe(attention_supports_graph)
+    layer.cross_attention = IdentityOp()
+    layer.mlp = IdentityOp()
+    return layer
+
+
+def _bare_mhc_wrapper(
+    config: TransformerConfig, inner_layer: TransformerLayer
+) -> HyperConnectionHybridLayer:
+    wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.config = config
+    wrapper.inner_layer = inner_layer
+    return wrapper
+
+
+def _use_cpu_static_inputs(layer):
+    """Override static-input creation so focused helper tests do not require CUDA."""
+
+    def get_layer_static_inputs(seq_length, micro_batch_size):
+        return {
+            "hidden_states": torch.ones(
+                seq_length,
+                micro_batch_size,
+                layer.config.hidden_size,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+        }
+
+    layer.get_layer_static_inputs = get_layer_static_inputs
+
+
+def _bare_vision_helper(config, layer, num_microbatches=1):
+    helper = VisionTECudaGraphHelper.__new__(VisionTECudaGraphHelper)
+    helper.config = config
+    helper.seq_length = 2
+    helper.num_microbatches = num_microbatches
+    helper.flattened_callables = [layer]
+    helper.vision_model = SimpleNamespace(_cuda_graph_requires_observed_rotary_inputs=True)
+    return helper
+
+
+def _force_cpu_zeros(monkeypatch):
+    """Keep Vision helper unit tests independent of a local CUDA device."""
+    original_zeros = torch.zeros
+
+    def cpu_zeros(*args, **kwargs):
+        kwargs["device"] = "cpu"
+        return original_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", cpu_zeros)
+
+
+class TestGdnCudaGraphOptIn:
+    def test_exact_env_opt_in_controls_direct_attention_scope(self):
+        """GDN capture is enabled only by the exact environment value 1."""
+        import importlib
+
+        from megatron.core.ssm import gated_delta_net
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        env_name = "MEGATRON_GDN_TE_CUDA_GRAPH"
+        missing = object()
+        original_value = os.environ.get(env_name, missing)
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+
+        try:
+            for env_value, expected in (
+                (None, False),
+                ("0", False),
+                ("false", False),
+                ("1", True),
+            ):
+                if env_value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = env_value
+                gdn_module = importlib.reload(gated_delta_net)
+
+                attention = gdn_module.GatedDeltaNet.__new__(gdn_module.GatedDeltaNet)
+                torch.nn.Module.__init__(attention)
+                layer = _bare_transformer_layer(config)
+                layer.self_attention = attention
+
+                assert gdn_module.GatedDeltaNet.supports_te_cuda_graph is expected
+                assert layer._cuda_graph_captures_attention() is expected
+                assert _layer_captures_attention(layer) is expected
+                assert _layer_is_graphable(layer, config) is expected
+
+                if env_value == "0":
+                    # An unsupported attention stays eager without hiding an
+                    # independently requested, graphable MoE-router region.
+                    moe = MoELayer.__new__(MoELayer)
+                    torch.nn.Module.__init__(moe)
+                    layer.mlp = moe
+                    config.cuda_graph_modules = [
+                        CudaGraphModule.attn,
+                        CudaGraphModule.moe_router,
+                    ]
+                    assert not layer._cuda_graph_captures_attention()
+                    assert _layer_is_graphable(layer, config)
+                    config.cuda_graph_modules = [CudaGraphModule.attn]
+        finally:
+            if original_value is missing:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = original_value
+            importlib.reload(gated_delta_net)
+
+
+class TestRotaryCudaGraphInputs:
+    def test_eager_observation_keeps_only_detached_rotary_allowlist(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        layer = _ObservedKwargLayer(config)
+        hidden_states = torch.randn(2, 1, 4, requires_grad=True)
+        rotary_pos_emb = torch.randn(2, 1, 1, 4, requires_grad=True)
+
+        layer(
+            hidden_states=hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            padding_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+
+        assert set(layer._cg_observed_tensor_kwargs) == {'rotary_pos_emb'}
+        observed = layer._cg_observed_tensor_kwargs['rotary_pos_emb']
+        assert observed.data_ptr() == rotary_pos_emb.data_ptr()
+        assert not observed.requires_grad
+        assert observed.grad_fn is None
+
+    def test_direct_layer_merges_rotary_and_cleans_observation(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        layer = _bare_transformer_layer(config)
+        rotary_pos_emb = torch.randn(2, 1, 1, 4, requires_grad=True)
+        layer._cg_observed_tensor_kwargs = {
+            'rotary_pos_emb': rotary_pos_emb,
+            'hidden_states': torch.randn(2, 1, 4, requires_grad=True),
+        }
+        static_inputs = {}
+
+        _merge_observed_rotary_kwargs(layer, static_inputs, 'mrope', True, {})
+
+        assert set(static_inputs) == {'rotary_pos_emb'}
+        assert static_inputs['rotary_pos_emb'].data_ptr() != rotary_pos_emb.data_ptr()
+        assert not static_inputs['rotary_pos_emb'].requires_grad
+        assert not hasattr(layer, '_cg_observed_tensor_kwargs')
+        assert _layer_captures_attention(layer)
+
+    def test_mhc_uses_outer_observation_and_cleans_inner(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        inner_layer = _bare_transformer_layer(config)
+        wrapper = _bare_mhc_wrapper(config, inner_layer)
+        outer_rotary = torch.randn(2, 1, 1, 4)
+        wrapper._cg_observed_tensor_kwargs = {'rotary_pos_cos_sin': outer_rotary}
+        inner_layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': torch.randn(2, 1, 1, 4)}
+        static_inputs = {}
+
+        _merge_observed_rotary_kwargs(wrapper, static_inputs, 'mrope', True, {})
+
+        assert set(static_inputs) == {'rotary_pos_cos_sin'}
+        assert torch.equal(static_inputs['rotary_pos_cos_sin'], outer_rotary)
+        assert not hasattr(wrapper, '_cg_observed_tensor_kwargs')
+        assert not hasattr(inner_layer, '_cg_observed_tensor_kwargs')
+        assert _layer_captures_attention(wrapper)
+
+    def test_mrope_requires_observation_and_tensor_kwarg_support(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        layer = _bare_transformer_layer(config)
+
+        with pytest.raises(RuntimeError, match='no rotary tensor kwargs were observed'):
+            _merge_observed_rotary_kwargs(layer, {}, 'mrope', True, {})
+
+        observed = {'rotary_pos_emb': torch.randn(2, 1, 1, 4)}
+        with pytest.raises(RuntimeError, match='TransformerEngine >= 1.10'):
+            _validate_mrope_capture_inputs(layer, 'mrope', True, observed, False)
+
+    def test_vision_helper_declares_rotary_for_each_microbatch(self, monkeypatch):
+        """Vision capture clones an independent static rotary buffer per microbatch."""
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        layer = _bare_transformer_layer(config)
+        _use_cpu_static_inputs(layer)
+        rotary_pos_emb = torch.randn(2, 1, 1, 4)
+        layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': rotary_pos_emb}
+        helper = _bare_vision_helper(config, layer, num_microbatches=2)
+        _force_cpu_zeros(monkeypatch)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.is_te_min_version", lambda version: True
+        )
+
+        sample_args, sample_kwargs = helper._get_sample_arguments(order=[1, -1])
+
+        assert len(sample_args) == 2
+        assert len(sample_kwargs) == 2
+        assert all(set(kwargs) == {'rotary_pos_emb'} for kwargs in sample_kwargs)
+        assert torch.equal(sample_kwargs[0]['rotary_pos_emb'], rotary_pos_emb)
+        assert torch.equal(sample_kwargs[1]['rotary_pos_emb'], rotary_pos_emb)
+        assert (
+            sample_kwargs[0]['rotary_pos_emb'].data_ptr()
+            != sample_kwargs[1]['rotary_pos_emb'].data_ptr()
+        )
+        assert not hasattr(layer, '_cg_observed_tensor_kwargs')
+
+    def test_vision_helper_requires_eager_rotary_observation(self, monkeypatch):
+        """Qwen-style vision attention fails loudly when capture has no warmup."""
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        layer = _bare_transformer_layer(config)
+        _use_cpu_static_inputs(layer)
+        helper = _bare_vision_helper(config, layer)
+        _force_cpu_zeros(monkeypatch)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.is_te_min_version", lambda version: True
+        )
+
+        with pytest.raises(RuntimeError, match='no rotary tensor kwargs were observed'):
+            helper._get_sample_arguments(order=[1, -1])
+
+    def test_vision_helper_requires_te_tensor_kwargs(self, monkeypatch):
+        """Observed vision rotary inputs require TE's tensor-kwarg graph API."""
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        layer = _bare_transformer_layer(config)
+        _use_cpu_static_inputs(layer)
+        layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': torch.randn(2, 1, 1, 4)}
+        helper = _bare_vision_helper(config, layer)
+        _force_cpu_zeros(monkeypatch)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.is_te_min_version", lambda version: False
+        )
+
+        with pytest.raises(RuntimeError, match='TransformerEngine >= 1.10'):
+            helper._get_sample_arguments(order=[1, -1])
+
+
+class TestMhcCudaGraphSafety:
+    def test_mhc_graphability_respects_attention_safety_and_mfsdp_gate(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        inner_layer = _bare_transformer_layer(config, attention_supports_graph=False)
+        wrapper = _bare_mhc_wrapper(config, inner_layer)
+
+        assert not wrapper._cuda_graph_captures_attention()
+        assert not _layer_captures_attention(wrapper)
+        assert not _layer_is_graphable(wrapper, config)
+
+        inner_layer.self_attention.supports_te_cuda_graph = True
+        assert wrapper._cuda_graph_captures_attention()
+        assert _layer_captures_attention(wrapper)
+        assert _layer_is_graphable(wrapper, config)
+        assert not _layer_is_graphable(wrapper, config, use_megatron_fsdp=True)
+        assert _layer_is_graphable(inner_layer, config, use_megatron_fsdp=True)
+
+        config.cuda_graph_modules = [CudaGraphModule.attn]
+        assert _layer_is_graphable(wrapper, config)
+        assert not _layer_is_graphable(wrapper, config, use_megatron_fsdp=True)
+
+
+    def test_mhc_discovery_stays_eager_with_megatron_fsdp(self, monkeypatch):
+        """The helper must pass its Megatron-FSDP state into layer discovery."""
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        wrapper = _bare_mhc_wrapper(config, _bare_transformer_layer(config))
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Module()
+        model.decoder.layers = torch.nn.ModuleList([wrapper])
+
+        messages = []
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage",
+            lambda **kwargs: messages.append(kwargs["msg"]),
+        )
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.model = [model]
+        helper.config = config
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        helper._uses_megatron_fsdp = True
+        helper._rotary_observation_roots = []
+        helper._discover_layers()
+
+        assert helper.flattened_callables == []
+        assert helper.callables_per_chunk == [[]]
+        assert any("HyperConnectionHybridLayer" in message for message in messages)
+
+
+class TestRotaryObservationLifecycle:
+    def test_observation_is_disabled_for_non_graphable_layers(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        layer = _ObservedKwargLayer(config)
+        layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': torch.randn(2, 1, 1, 4)}
+        sibling_layer = _ObservedKwargLayer(config)
+        sibling_layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': torch.randn(2, 1, 1, 4)}
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._rotary_observation_roots = [layer]
+
+        helper._disable_rotary_kwarg_observation()
+
+        assert not layer._cg_rotary_observation_enabled
+        assert not hasattr(layer, '_cg_observed_tensor_kwargs')
+        assert sibling_layer._cg_rotary_observation_enabled
+        assert hasattr(sibling_layer, '_cg_observed_tensor_kwargs')
+        layer(hidden_states=torch.ones(2, 1, 4), rotary_pos_emb=torch.randn(2, 1, 1, 4))
+        assert not hasattr(layer, '_cg_observed_tensor_kwargs')
+
+
+class TestCudaGraphAddressChecks:
+    @pytest.mark.parametrize('kill_switch', ['0', 'false'])
+    def test_address_check_kill_switch_only_accepts_one(self, monkeypatch, kill_switch):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        layer = _ObservedKwargLayer(config)
+        parameter = layer.weight
+        layer._cg_param_ptr_snapshot = {
+            'weight': (
+                parameter.data_ptr() + parameter.element_size(),
+                parameter.numel(),
+                parameter.dtype,
+            )
+        }
+        layer.cuda_graphs = [lambda *args, **kwargs: args[0]]
+        monkeypatch.setenv('MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK', kill_switch)
+
+        with pytest.raises(RuntimeError, match='buffer address changed'):
+            layer._te_cuda_graph_replay(torch.ones(1))
+
+        monkeypatch.setenv('MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK', '1')
+        assert torch.equal(layer._te_cuda_graph_replay(torch.ones(1)), torch.ones(1))
+
+
+def _bare_capture_lifecycle_helper(layer, helper_cls=TECudaGraphHelper):
+    """Build a CPU-only helper for focused capture-state tests."""
+    helper = helper_cls.__new__(helper_cls)
+    helper.config = SimpleNamespace(
+        sequence_parallel=False,
+        overlap_moe_expert_parallel_comm=False,
+        fine_grained_activation_offloading=False,
+    )
+    helper.model = []
+    helper.optimizers = []
+    helper.flattened_callables = [layer]
+    helper.callables_per_chunk = [[layer]]
+    helper._capture_finished = False
+    helper._capture_failed = False
+    helper._graphs_created = False
+    helper._capture_flag_owned = False
+    helper._capture_gc_frozen = False
+    helper._capture_restore_hooks = []
+    helper._fsdp_capture_param_states = []
+    return helper
+
+
+class TestTECaptureTimeHooksContract:
+    def test_explicit_protocol_marker_is_authoritative(self):
+        def marked_callable():
+            return None
+
+        marked_callable.__mcore_cuda_graph_protocols__ = {
+            _TE_CAPTURE_TIME_HOOKS_PROTOCOL
+        }
+        assert (
+            _get_te_capture_time_hooks_contract(marked_callable)
+            == "explicit-protocol-marker"
+        )
+
+        marked_callable.__mcore_cuda_graph_protocols__ = {"different_protocol"}
+        assert _get_te_capture_time_hooks_contract(marked_callable) is None
+
+    def test_module_protocol_marker_is_supported(self, monkeypatch):
+        def unmarked_callable():
+            return None
+
+        graph_module = SimpleNamespace(
+            __mcore_cuda_graph_protocols__=(_TE_CAPTURE_TIME_HOOKS_PROTOCOL,)
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.inspect.getmodule",
+            lambda unused: graph_module,
+        )
+
+        assert (
+            _get_te_capture_time_hooks_contract(unmarked_callable)
+            == "explicit-protocol-marker"
+        )
+
+    def test_argument_name_alone_does_not_claim_protocol(self, monkeypatch):
+        def public_callable(capture_time_hooks=None):
+            return capture_time_hooks
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.inspect.getmodule",
+            lambda unused: SimpleNamespace(),
+        )
+
+        assert _get_te_capture_time_hooks_contract(public_callable) is None
+
+
+class TestTECudaGraphCaptureFailClean:
+    @staticmethod
+    def _planned_fsdp_module():
+        return SimpleNamespace(
+            param_and_grad_buffer=SimpleNamespace(_uses_planned_allocator=True)
+        )
+
+    def test_feature_contract_fails_before_capture_mutation(self, monkeypatch):
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper._get_megatron_fsdp_instances = lambda: [self._planned_fsdp_module()]
+        events = []
+        helper._start_capturing = lambda: events.append("start-capturing")
+
+        def unsupported_callable():
+            return None
+
+        unsupported_callable.__mcore_cuda_graph_protocols__ = set()
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.make_graphed_callables",
+            unsupported_callable,
+        )
+
+        with pytest.raises(RuntimeError, match="capture-time-hooks protocol"):
+            helper.create_cudagraphs()
+
+        assert events == []
+        assert not helper._capture_failed
+
+    def test_no_graphable_callable_does_not_require_overlay(self, monkeypatch):
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper.flattened_callables = []
+        helper._get_megatron_fsdp_instances = lambda: [self._planned_fsdp_module()]
+
+        def unsupported_callable():
+            return None
+
+        unsupported_callable.__mcore_cuda_graph_protocols__ = set()
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.make_graphed_callables",
+            unsupported_callable,
+        )
+
+        helper.validate_capture_feature_contract()
+
+    def test_abort_restores_owned_state_callable_hooks_and_fsdp_exposure(self, monkeypatch):
+        layer = torch.nn.Linear(2, 2)
+
+        def forward_hook(*unused):
+            return None
+
+        layer._forward_hooks.clear()
+        helper = _bare_capture_lifecycle_helper(layer)
+        helper._capture_flag_owned = True
+        helper._capture_gc_frozen = True
+        helper._capture_restore_hooks = [
+            (layer, {'forward_hooks_restore': {7: forward_hook}})
+        ]
+        events = []
+        fsdp_module = SimpleNamespace(
+            _replace_param_with_distributed_if_needed=lambda: events.append('fsdp-distributed'),
+            _replace_param_with_raw_if_needed=lambda: events.append('fsdp-raw'),
+        )
+        helper._fsdp_capture_param_states = [(fsdp_module, True)]
+        helper._disable_rotary_kwarg_observation = lambda: None
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs._set_capture_end",
+            lambda: events.append('capture-end'),
+        )
+        monkeypatch.setattr(gc, "unfreeze", lambda: events.append('gc-unfreeze'))
+
+        helper._abort_capturing()
+
+        assert helper._capture_failed
+        assert not helper._capture_flag_owned
+        assert not helper._capture_gc_frozen
+        assert helper._capture_restore_hooks == []
+        assert helper._fsdp_capture_param_states == []
+        assert layer._forward_hooks == {7: forward_hook}
+        assert events == ['capture-end', 'fsdp-distributed', 'gc-unfreeze']
+
+    def test_start_failure_preserves_caller_owned_gc_freeze(self, monkeypatch):
+        layer = torch.nn.Linear(2, 2)
+        layer._cg_rotary_observation_enabled = True
+        layer._cg_observed_tensor_kwargs = {'rotary_pos_emb': torch.ones(1)}
+        helper = _bare_capture_lifecycle_helper(layer)
+        helper._rotary_observation_roots = [layer]
+        helper._prepare_fsdp_params_for_capture = lambda: (_ for _ in ()).throw(
+            RuntimeError("prepare failed")
+        )
+        helper._reset_after_capture = lambda: None
+
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+        monkeypatch.setattr(gc, "collect", lambda: None)
+        monkeypatch.setattr(gc, "get_freeze_count", lambda: 1)
+        monkeypatch.setattr(
+            gc,
+            "freeze",
+            lambda: (_ for _ in ()).throw(AssertionError("must not freeze caller state")),
+        )
+        monkeypatch.setattr(
+            gc,
+            "unfreeze",
+            lambda: (_ for _ in ()).throw(AssertionError("must not unfreeze caller state")),
+        )
+
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            helper.create_cudagraphs()
+
+        assert helper._capture_failed
+        assert not helper._capture_gc_frozen
+        assert not layer._cg_rotary_observation_enabled
+        assert not hasattr(layer, '_cg_observed_tensor_kwargs')
+        with pytest.raises(RuntimeError, match="cannot be retried"):
+            helper.create_cudagraphs()
+
+    def test_capture_state_guards_are_explicit(self, monkeypatch):
+        finished = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        finished._capture_finished = True
+        with pytest.raises(RuntimeError, match="already been finished"):
+            finished.create_cudagraphs()
+
+        active = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.is_graph_capturing", lambda: True
+        )
+        with pytest.raises(RuntimeError, match="Another CUDA Graph capture is already active"):
+            active.create_cudagraphs()
+        assert not active._capture_failed
+
+    @pytest.mark.parametrize(
+        "fsdp_unit_id",
+        [pytest.param(-1, id="non-unit"), pytest.param(0, id="wrapper-around-inner-unit")],
+    )
+    def test_planned_allocator_requires_hook_at_callable_boundary(self, fsdp_unit_id):
+        layer = torch.nn.Linear(2, 2)
+        parameter_group = SimpleNamespace(
+            fsdp_unit_id=fsdp_unit_id,
+            model_weight_buffer=SimpleNamespace(is_data_distributed=True),
+            transpose_weight_buffer=None,
+            main_grad_buffer=None,
+            hfsdp_helper_wbuf=None,
+            hfsdp_helper_gbuf=None,
+        )
+        param_and_grad_buffer = SimpleNamespace(
+            param_to_param_group={parameter: 0 for parameter in layer.parameters()},
+            parameter_groups=[parameter_group],
+        )
+        fsdp_module = SimpleNamespace(
+            all_gather_pipeline=None,
+            param_and_grad_buffer=param_and_grad_buffer,
+            _replace_param_with_raw_if_needed=lambda: None,
+        )
+        helper = _bare_capture_lifecycle_helper(layer)
+        helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
+
+        with pytest.raises(RuntimeError, match="must own.*pre-backward hook"):
+            helper._setup_fsdp_planned_allocators()
+
+    def test_planned_allocator_accepts_exact_fsdp_unit_hook_boundary(self, monkeypatch):
+        layer = torch.nn.Linear(2, 2)
+
+        def tagged_pre_backward_hook(*unused):
+            return None
+
+        tagged_pre_backward_hook._cuda_graph_backward_pre_handler = lambda *unused: None
+        layer.register_forward_hook(tagged_pre_backward_hook)
+
+        parameter_group = SimpleNamespace(
+            fsdp_unit_id=0,
+            model_weight_buffer=SimpleNamespace(is_data_distributed=True),
+            transpose_weight_buffer=None,
+            main_grad_buffer=None,
+            hfsdp_helper_wbuf=None,
+            hfsdp_helper_gbuf=None,
+        )
+        freeze_calls = []
+
+        def recording_allocator(name):
+            return SimpleNamespace(
+                freeze_plan=lambda bucket_ids: freeze_calls.append((name, set(bucket_ids)))
+            )
+
+        param_and_grad_buffer = SimpleNamespace(
+            param_to_param_group={parameter: 0 for parameter in layer.parameters()},
+            parameter_groups=[parameter_group],
+            weight_alloc=recording_allocator("weight"),
+            transpose_weight_alloc=recording_allocator("transpose"),
+            main_grad_alloc=recording_allocator("main-grad"),
+        )
+        fsdp_module = SimpleNamespace(
+            all_gather_pipeline=None,
+            param_and_grad_buffer=param_and_grad_buffer,
+            _replace_param_with_raw_if_needed=lambda: None,
+        )
+        helper = _bare_capture_lifecycle_helper(layer)
+        helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+
+        helper._setup_fsdp_planned_allocators()
+
+        assert freeze_calls == [
+            ("weight", {0}),
+            ("transpose", {0}),
+            ("main-grad", {0}),
+        ]
+
+
+class TestTECudaGraphTopologySignature:
+    @staticmethod
+    def _helper():
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper.config = SimpleNamespace(
+            microbatch_group_size_per_vp_stage=2,
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+            cuda_graph_dynamic_microbatches=False,
+            variable_seq_lengths=False,
+        )
+        helper.model = [object(), object()]
+        helper.callables_per_chunk = [[object()], [object(), object()]]
+        helper.pp_group = SimpleNamespace(size=lambda: 4, rank=lambda: 1)
+        helper.p2p_communicator = SimpleNamespace(
+            virtual_pipeline_model_parallel_size=2
+        )
+        helper.seq_length = 4096
+        helper.thd_sequence_length_upper_bound = None
+        helper._graphs_created = True
+        helper._fsdp_planned_topology_signature = (
+            helper._current_fsdp_planned_topology_signature(
+                num_microbatches=8,
+                micro_batch_size=1,
+            )
+        )
+        return helper
+
+    def test_matching_signature_passes_and_predictable_drift_fails(self):
+        helper = self._helper()
+
+        helper.validate_runtime_topology(
+            num_microbatches=8,
+            micro_batch_size=1,
+            phase="training",
+        )
+        with pytest.raises(RuntimeError, match="num_microbatches.*captured=8.*runtime=9"):
+            helper.validate_runtime_topology(
+                num_microbatches=9,
+                micro_batch_size=1,
+                phase="training",
+            )
+
+        helper.config.microbatch_group_size_per_vp_stage = 4
+        with pytest.raises(RuntimeError, match="microbatch_group_size_per_vp_stage"):
+            helper.validate_runtime_topology(
+                num_microbatches=8,
+                micro_batch_size=1,
+                phase="evaluation",
+            )
+
+        helper.config.microbatch_group_size_per_vp_stage = 2
+        helper.config.variable_seq_lengths = True
+        with pytest.raises(RuntimeError, match="variable_seq_lengths"):
+            helper.validate_runtime_topology(
+                num_microbatches=8,
+                micro_batch_size=1,
+                phase="evaluation",
+            )
+
+    def test_validator_is_installed_and_removed_with_graph_ownership(self):
+        helper = self._helper()
+        helper._install_fsdp_planned_topology_validator()
+
+        validate_te_cuda_graph_topology(
+            helper.config,
+            num_microbatches=8,
+            micro_batch_size=1,
+            phase="training",
+        )
+        helper._remove_fsdp_planned_topology_validator()
+        validate_te_cuda_graph_topology(
+            helper.config,
+            num_microbatches=99,
+            micro_batch_size=99,
+            phase="training",
+        )
+
+    def test_stock_te_config_without_validator_is_unchanged(self):
+        validate_te_cuda_graph_topology(
+            SimpleNamespace(),
+            num_microbatches=3,
+            micro_batch_size=2,
+            phase="evaluation",
+        )
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
