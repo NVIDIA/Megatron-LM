@@ -41,8 +41,8 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
-from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
