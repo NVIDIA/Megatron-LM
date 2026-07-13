@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -439,16 +439,27 @@ class Attention(MegatronModule, ABC):
         attn_mask_type=None,
         attention_bias=None,
         packed_seq_params=None,
+        core_attention_extra_kwargs=None,
     ):
         """Forward method with selective activation checkpointing."""
+        if core_attention_extra_kwargs is None:
+            core_attention_extra_kwargs = {}
+        tensor_kwarg_names = []
+        checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
+        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
+        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
+        # closing over the original forward tensors.
+        for name, kwarg_value in core_attention_extra_kwargs.items():
+            if torch.is_tensor(kwarg_value):
+                tensor_kwarg_names.append(name)
+                checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
+            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
+            extra_kwargs = dict(core_attention_extra_kwargs)
+            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
+                extra_kwargs[name] = kwarg_value
             output_ = self._run_core_attention(
                 query,
                 key,
@@ -457,15 +468,17 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                **extra_kwargs,
             )
             return output_
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
+        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
+        # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
-        )
+        checkpoint_inputs[5] = attn_mask_type
+        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
 
         return hidden_states
 
@@ -1331,18 +1344,16 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
             )
-        if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = off_interface.group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[]
-            )
+        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1489,6 +1500,9 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -1502,9 +1516,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
@@ -1541,10 +1553,9 @@ class Attention(MegatronModule, ABC):
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1563,12 +1574,10 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
