@@ -98,10 +98,10 @@ class TestMcoreAdapter:
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
         child_parameter_names = {
-            name for group in wrapped.module[0].parameter_groups() for name in group.parameter_names
+            name for group in wrapped.module[0].parameter_groups for name in group.parameter_names
         }
         root_parameter_names = {
-            name for group in wrapped.module.parameter_groups() for name in group.parameter_names
+            name for group in wrapped.module.parameter_groups for name in group.parameter_names
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
@@ -129,7 +129,7 @@ class TestMcoreAdapter:
         parameter_groups = [
             parameter_group
             for fsdp_module in fsdp_modules
-            for parameter_group in fsdp_module.parameter_groups()
+            for parameter_group in fsdp_module.parameter_groups
         ]
         for parameter_group in parameter_groups:
             assert parameter_group.main_weight.dtype == torch.float32

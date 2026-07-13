@@ -559,7 +559,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         for fsdp_module in module.modules():
             if not isinstance(fsdp_module, FsdpModule):
                 continue
-            for parameter_group in fsdp_module.parameter_groups():
+            for parameter_group in fsdp_module.parameter_groups:
                 if parameter_group.main_grad is None:
                     continue
                 for index, parameter in enumerate(parameter_group.sharded_parameters):
