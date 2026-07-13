@@ -323,7 +323,6 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -649,12 +648,13 @@ try:
         total_completion_tokens = 0
         prompt_tokens_counts = []
 
-        # The big response fields (prompt/generation token ids) are only useful to
-        # a client that echoes them back next turn for prevent_retokenization
-        # (default True). Gate them on that flag so a request that opts out gets a
-        # lean, vLLM-shaped response. The choice-level copies are dropped entirely
-        # (only the message level is ever read back).
         prevent_retokenization = req.get("prevent_retokenization", True)
+        # return_tokenized_data controls whether prompt/generation token ids are
+        # included in the response. It is independent of prevent_retokenization
+        # (a client may want token ids without prevent_retokenization, or vice versa),
+        # but prevent_retokenization implicitly requires token ids so the client
+        # can echo them back next turn.
+        return_tokenized_data = req.get("return_tokenized_data", False) or prevent_retokenization
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
@@ -728,9 +728,7 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Token ids are needed only to round-trip prevent_retokenization; gate
-            # them so the default response stays small and vLLM-shaped.
-            if prevent_retokenization:
+            if return_tokenized_data:
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
             # Small RL/debug scalars (a few bytes each); harmless to keep for
