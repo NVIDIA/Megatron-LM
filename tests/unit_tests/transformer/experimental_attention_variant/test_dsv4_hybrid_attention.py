@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -19,9 +20,11 @@ from tests.unit_tests.test_utilities import Utils
 if HAVE_TE:
     import transformer_engine.common.recipe as te_recipe
     import transformer_engine.pytorch as te_pytorch
+    from transformer_engine.pytorch.tensor import QuantizedTensor as TEQuantizedTensor
 else:
     te_recipe = None
     te_pytorch = None
+    TEQuantizedTensor = None
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -423,80 +426,131 @@ class TestDSv4HybridGroupedOutput:
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
         expected_in = (config.v_head_dim * config.num_attention_heads) // o_groups
-        assert attn.linear_o_group_proj.shape == (o_groups, o_lora_rank, expected_in)
-        assert attn.linear_o_group_proj.requires_grad
+        weight = attn._linear_o_group_proj_weight
+        assert weight.shape == (o_groups, o_lora_rank, expected_in)
+        assert weight.requires_grad
 
-    def test_o_group_proj_legacy_checkpoint_compatibility(self):
-        """Checkpoint I/O should retain the legacy 2D weight layout."""
+    @pytest.mark.parametrize(
+        "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]
+    )
+    def test_o_group_proj_legacy_checkpoint_compatibility(self, quantized_weight):
+        """Legacy 2D checkpoints should load into BF16 and quantized weights."""
+        recipe = None
+        if quantized_weight:
+            if not hasattr(te_pytorch, "BatchedLinear"):
+                pytest.skip("Transformer Engine BatchedLinear is not available")
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
         config = _make_config(o_groups=8, o_lora_rank=64)
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        attn = _build_attention(config, layer_number=1, pg_collection=pg)
-        runtime_weight = attn.linear_o_group_proj.detach().clone()
-        checkpoint_shape = (config.o_groups * config.o_lora_rank, attn.linear_o_group_proj.size(-1))
+        legacy_attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        runtime_weight = legacy_attn._linear_o_group_proj_weight.detach().clone()
+        checkpoint_shape = (
+            config.o_groups * config.o_lora_rank,
+            legacy_attn._linear_o_group_proj_weight.size(-1),
+        )
 
-        state_dict = attn.state_dict()
+        state_dict = legacy_attn.state_dict()
         assert state_dict["linear_o_group_proj"].shape == checkpoint_shape
+        assert "linear_o_group_proj.weight" not in state_dict
+        assert "linear_o_group_proj._extra_state" not in state_dict
 
-        reloaded_attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
+            reloaded_attn = _build_attention(config, layer_number=1, pg_collection=pg)
         incompatible_keys = reloaded_attn.load_state_dict(state_dict)
         assert not incompatible_keys.missing_keys
         assert not incompatible_keys.unexpected_keys
-        assert reloaded_attn.linear_o_group_proj.shape == runtime_weight.shape
-        torch.testing.assert_close(reloaded_attn.linear_o_group_proj, runtime_weight)
+        reloaded_weight = reloaded_attn._linear_o_group_proj_weight
+        assert (isinstance(reloaded_weight, TEQuantizedTensor)) == quantized_weight
+        assert reloaded_weight.shape == runtime_weight.shape
+        tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
+        torch.testing.assert_close(reloaded_weight, runtime_weight, **tolerances)
+        reloaded_state_dict = reloaded_attn.state_dict()
+        assert reloaded_state_dict["linear_o_group_proj"].shape == checkpoint_shape
+        assert "linear_o_group_proj.weight" not in reloaded_state_dict
+        assert "linear_o_group_proj._extra_state" not in reloaded_state_dict
 
-        sharded_state_dict = attn.sharded_state_dict()
+        sharded_state_dict = reloaded_attn.sharded_state_dict()
         factory = sharded_state_dict["linear_o_group_proj"]
         assert isinstance(factory, ShardedTensorFactory)
-        assert factory.data is attn.linear_o_group_proj
-        optim_param_map = get_param_id_to_sharded_param_map(
-            sharded_state_dict, [attn.linear_o_group_proj]
-        )
+        assert factory.data is reloaded_weight
+        optim_param_map = get_param_id_to_sharded_param_map(sharded_state_dict, [reloaded_weight])
         assert optim_param_map[0] is factory
         checkpoint_shard = factory.build()
         assert checkpoint_shard.data.shape == checkpoint_shape
+        assert checkpoint_shard.local_shape == checkpoint_shape
+        assert checkpoint_shard.global_shape == checkpoint_shape
+        assert checkpoint_shard.global_offset == (0, 0)
         restored_weight = factory.merge_fn(checkpoint_shard.data)
         assert restored_weight.shape == runtime_weight.shape
-        torch.testing.assert_close(restored_weight, runtime_weight)
+        torch.testing.assert_close(restored_weight, reloaded_weight, **tolerances)
 
-    @pytest.mark.parametrize("use_mxfp8", [False, True], ids=["bf16", "mxfp8"])
-    def test_o_group_proj_numerics_and_gradients(self, use_mxfp8):
-        """TE BatchedGEMM should match einsum in BF16 and MXFP8 forward/backward."""
-        if not hasattr(te_pytorch.ops, "BatchedGEMM"):
-            pytest.skip("Transformer Engine BatchedGEMM is not available")
+    @pytest.mark.parametrize(
+        ("use_mxfp8", "quantized_weight"),
+        [(False, False), (True, False), (True, True)],
+        ids=["bf16", "mxfp8", "mxfp8_quantized_weight"],
+    )
+    def test_o_group_proj_numerics_and_gradients(self, use_mxfp8, quantized_weight):
+        """TE BatchedLinear should match einsum with BF16 and MXFP8 weights."""
+        if not hasattr(te_pytorch, "BatchedLinear"):
+            pytest.skip("Transformer Engine BatchedLinear is not available")
         if use_mxfp8:
             available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
             if not available:
                 pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+        else:
+            recipe = None
 
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
         config = _make_config(o_groups=8, o_lora_rank=64)
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        attn = _build_attention(config, layer_number=1, pg_collection=pg)
-        op = attn._get_linear_o_group_proj_op()
-        assert "_linear_o_group_proj_op" not in attn._modules
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
+            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        module = attn.linear_o_group_proj
+        weight = module.weight
+        assert isinstance(module, te_pytorch.BatchedLinear)
+        assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
         group_proj_param_names = [
-            name
-            for name, param in attn.named_parameters(remove_duplicate=False)
-            if param is attn.linear_o_group_proj
+            name for name, param in attn.named_parameters(remove_duplicate=False) if param is weight
         ]
-        assert group_proj_param_names == ["linear_o_group_proj"]
+        assert group_proj_param_names == ["linear_o_group_proj.weight"]
 
         seq_len, batch_size = 4, 8
-        in_features = attn.linear_o_group_proj.size(-1)
+        in_features = weight.size(-1)
         input_ref = torch.empty(
             seq_len, batch_size, config.o_groups, in_features, device="cuda", dtype=torch.bfloat16
         ).uniform_(-0.25, 0.25)
         input_ref.requires_grad_(True)
         input_test = input_ref.detach().clone().requires_grad_(True)
 
-        weight_ref = torch.empty_like(attn.linear_o_group_proj).uniform_(-0.25, 0.25)
+        weight_ref = torch.empty(weight.shape, device="cuda", dtype=torch.bfloat16).uniform_(
+            -0.25, 0.25
+        )
         with torch.no_grad():
-            attn.linear_o_group_proj.copy_(weight_ref)
+            weight.copy_(weight_ref)
         weight_ref.requires_grad_(True)
 
         output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
@@ -504,46 +558,93 @@ class TestDSv4HybridGroupedOutput:
         output_ref.backward(grad_output)
 
         if use_mxfp8:
-            recipe = te_recipe.MXFP8BlockScaling(
-                fp8_format=te_recipe.Format.E4M3, backward_override=None
-            )
             with te_pytorch.autocast(enabled=True, recipe=recipe):
-                output_test = op(input_test)
+                output_test = module(input_test)
         else:
-            output_test = op(input_test)
+            output_test = module(input_test)
         output_test.backward(grad_output)
 
-        assert op is attn._get_linear_o_group_proj_op()
-        assert op.weight is attn.linear_o_group_proj
+        assert module is attn.linear_o_group_proj
+        assert module.weight is weight
         assert output_test.shape == output_ref.shape
         if use_mxfp8:
-            assert op.get_quantizer("forward", 0).__class__.__name__ == "MXFP8Quantizer"
             tolerances = {"rtol": 0.125, "atol": 0.0675}
         else:
             tolerances = {"rtol": 0.016, "atol": 1e-5}
         torch.testing.assert_close(output_test, output_ref, **tolerances)
         torch.testing.assert_close(input_test.grad, input_ref.grad, **tolerances)
-        torch.testing.assert_close(attn.linear_o_group_proj.grad, weight_ref.grad, **tolerances)
+        torch.testing.assert_close(weight.grad, weight_ref.grad, **tolerances)
 
-    def test_o_group_proj_falls_back_to_einsum(self, monkeypatch):
-        """Missing TE BatchedGEMM should retain the legacy forward/backward path."""
+    def test_o_group_proj_preserves_high_precision_init_val(self):
+        """TE BatchedLinear should retain the pre-quantization initialized weight."""
+        if not hasattr(te_pytorch, "BatchedLinear"):
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+        available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+        if not available:
+            pytest.skip(reason)
+
+        recipe = te_recipe.MXFP8BlockScaling(
+            fp8_format=te_recipe.Format.E4M3, backward_override=None
+        )
+        config = _make_config(o_groups=8, o_lora_rank=64)
+        config.init_method = lambda weight: torch.nn.init.constant_(weight, 0.25)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        with te_pytorch.quantized_model_init(
+            enabled=True, recipe=recipe, preserve_high_precision_init_val=True
+        ):
+            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+
+        weight = attn.linear_o_group_proj.weight
+        assert isinstance(weight, TEQuantizedTensor)
+        high_precision_weight = weight.get_high_precision_init_val()
+        assert high_precision_weight.device.type == "cpu"
+        assert high_precision_weight.shape == weight.shape
+        torch.testing.assert_close(
+            high_precision_weight, torch.full_like(high_precision_weight, 0.25), rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("use_quantized_model_init", [False, True], ids=["bf16", "qmi"])
+    def test_o_group_proj_falls_back_to_einsum(self, monkeypatch, use_quantized_model_init):
+        """Missing TE BatchedLinear should retain a BF16 einsum path."""
+        recipe = None
+        if use_quantized_model_init:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
+        monkeypatch.delattr(te_pytorch, "BatchedLinear", raising=False)
         config = _make_config(o_groups=8, o_lora_rank=64)
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        attn = _build_attention(config, layer_number=1, pg_collection=pg)
-        monkeypatch.delattr(te_pytorch.ops, "BatchedGEMM", raising=False)
-        assert attn._get_linear_o_group_proj_op() is None
+        init_context = (
+            te_pytorch.quantized_model_init(
+                enabled=True, recipe=recipe, preserve_high_precision_init_val=True
+            )
+            if use_quantized_model_init
+            else nullcontext()
+        )
+        with init_context:
+            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        assert not attn._uses_te_batched_linear
+        weight = attn._linear_o_group_proj_weight
+        assert weight is attn.linear_o_group_proj
+        assert not isinstance(weight, TEQuantizedTensor)
+        assert "linear_o_group_proj" in attn.state_dict()
+        assert "linear_o_group_proj.weight" not in attn.state_dict()
 
         seq_len, batch_size = 4, 8
-        in_features = attn.linear_o_group_proj.size(-1)
+        in_features = weight.size(-1)
         input_ref = torch.empty(
             seq_len, batch_size, config.o_groups, in_features, device="cuda", dtype=torch.bfloat16
         ).uniform_(-0.25, 0.25)
         input_ref.requires_grad_(True)
         input_test = input_ref.detach().clone().requires_grad_(True)
-        weight_ref = attn.linear_o_group_proj.detach().clone().requires_grad_(True)
+        weight_ref = weight.detach().clone().requires_grad_(True)
 
         output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
         output_test = attn._apply_linear_o_group_proj(input_test)
@@ -553,7 +654,7 @@ class TestDSv4HybridGroupedOutput:
 
         torch.testing.assert_close(output_test, output_ref)
         torch.testing.assert_close(input_test.grad, input_ref.grad)
-        torch.testing.assert_close(attn.linear_o_group_proj.grad, weight_ref.grad)
+        torch.testing.assert_close(weight.grad, weight_ref.grad)
 
 
 # ===========================================================================
