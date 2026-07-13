@@ -198,6 +198,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -268,6 +269,7 @@ class HybridStack(MegatronModule):
                     paired_layer,
                     moe_layer,
                     is_mamba=paired_type == LayerSymbols.MAMBA,
+                    is_mtp_layer=self.is_mtp_layer,
                     enable_cudagraph=enable_cudagraph,
                     overlap_a2a=self.config.moe_shortcut_parallel,
                 )

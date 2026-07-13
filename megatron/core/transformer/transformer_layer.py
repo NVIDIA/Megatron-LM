@@ -1802,28 +1802,53 @@ class MoETransformerLayer(TransformerLayer):
         self._router_dtoh_event.record()
         self._router_dtoh_event.synchronize()
 
-    def _capture_token_dispatcher_attrs(self):
-        """Retain dispatcher tensors produced by a shortcut CUDA graph."""
+    def _capture_token_dispatcher_attrs(self, token_dispatcher_attrs=None):
+        """Retain dispatcher tensors produced by a CUDA graph for eager dispatch."""
         if not is_graph_capturing() or is_graph_warmup():
             return
 
+        cached_attrs = (
+            self.token_dispatcher_attrs
+            if token_dispatcher_attrs is None
+            else token_dispatcher_attrs
+        )
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             attr = getattr(obj, name)
             if torch.is_tensor(attr):
                 attr.is_from_global_mempool = True
-                self.token_dispatcher_attrs[attr_name] = attr
+                cached_attrs[attr_name] = attr
 
-    def _weakref_token_dispatcher_attrs(self):
+    def _weakref_token_dispatcher_attrs(self, token_dispatcher_attrs=None):
         """Release strong references to captured dispatcher tensors after graph capture."""
         if not is_graph_capturing() or is_graph_warmup():
             return
 
-        for attr_name, attr in self.token_dispatcher_attrs.items():
+        cached_attrs = (
+            self.token_dispatcher_attrs
+            if token_dispatcher_attrs is None
+            else token_dispatcher_attrs
+        )
+        for attr_name, attr in cached_attrs.items():
             weak_ref = make_weakref(attr, inplace=False)
-            self.token_dispatcher_attrs[attr_name] = weak_ref
+            cached_attrs[attr_name] = weak_ref
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, weak_ref)
+
+    def _restore_token_dispatcher_attrs_for_dispatch(
+        self, probs, token_dispatcher_attrs=None
+    ):
+        """Restore cached dispatcher state while retaining the live router autograd edge."""
+        cached_attrs = (
+            self.token_dispatcher_attrs
+            if token_dispatcher_attrs is None
+            else token_dispatcher_attrs
+        )
+        if '_comm_manager.token_probs' in cached_attrs:
+            cached_attrs['_comm_manager.token_probs'] = probs
+        for attr_name, attr in cached_attrs.items():
+            obj, name = self._resolve_token_dispatcher_attr(attr_name)
+            setattr(obj, name, attr)
 
     def _forward_mlp_router(self, hidden_states, padding_mask=None, shortcut_hidden=None):
         """
@@ -1999,7 +2024,9 @@ class MoETransformerLayer(TransformerLayer):
                 shortcut_hidden=shortcut_hidden,
             )
 
-    def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
+    def shortcut_route_preprocess(
+        self, shortcut_hidden, padding_mask=None, token_dispatcher_attrs=None
+    ):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
         shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
         if padding_mask is not None:
@@ -2011,7 +2038,7 @@ class MoETransformerLayer(TransformerLayer):
             routing_map,
         )
         if getattr(self, '_shortcut_graph_shared_experts', False):
-            self._capture_token_dispatcher_attrs()
+            self._capture_token_dispatcher_attrs(token_dispatcher_attrs)
         return permuted_input, probs
 
     def shortcut_prepare_dispatch(self, shortcut_input, probs, routing_map):
@@ -2063,7 +2090,11 @@ class MoETransformerLayer(TransformerLayer):
         )
 
     def shortcut_postprocess_with_combined_output(
-        self, hidden_states, combined_output, shared_expert_output
+        self,
+        hidden_states,
+        combined_output,
+        shared_expert_output,
+        token_dispatcher_attrs=None,
     ):
         """Finish a shortcut layer after combine has completed."""
         residual = hidden_states
@@ -2074,5 +2105,5 @@ class MoETransformerLayer(TransformerLayer):
         output = self._forward_post_mlp((output, None), residual)
         if isinstance(output, tuple):
             output = output[0]
-        self._weakref_token_dispatcher_attrs()
+        self._weakref_token_dispatcher_attrs(token_dispatcher_attrs)
         return output

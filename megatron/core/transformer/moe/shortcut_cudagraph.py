@@ -234,22 +234,22 @@ class RouteGradFromPersistentBuffers(torch.autograd.Function):
     """Inject dispatch gradients into captured router backward at an external event."""
 
     @staticmethod
-    def forward(ctx, route_input, route_probs, target):
-        ctx.target_ref = weakref.ref(target)
+    def forward(ctx, route_input, route_probs, slot):
+        ctx.slot_ref = weakref.ref(slot)
         # This scalar is only an autograd dependency. Its value must not alter paired compute.
         return route_input.new_zeros(())
 
     @staticmethod
     def backward(ctx, grad_output):
-        target = ctx.target_ref()
-        assert target is not None
+        slot = ctx.slot_ref()
+        assert slot is not None
         # During backward capture this becomes an external wait node. Attention/SSM backward is
         # ordered before this node; router/preprocess backward consumes the buffers after the wait.
-        torch.cuda.current_stream().wait_event(target.route_grad_ready_event)
-        ctx.target_ref = None
+        torch.cuda.current_stream().wait_event(slot.route_grad_ready_event)
+        ctx.slot_ref = None
         return (
-            target.route_input_grad_buffer.tensor,
-            target.route_probs_grad_buffer.tensor,
+            slot.route_input_grad_buffer.tensor,
+            slot.route_probs_grad_buffer.tensor,
             None,
         )
 
