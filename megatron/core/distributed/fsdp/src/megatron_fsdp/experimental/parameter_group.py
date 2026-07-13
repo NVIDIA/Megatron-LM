@@ -13,8 +13,6 @@
 # limitations under the License.
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
-
-import dataclasses
 from contextlib import nullcontext
 
 import torch
@@ -33,14 +31,6 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 def contained_in_parameter_group(parameter: nn.Parameter) -> bool:
     """Return whether a parameter is already owned by an FsdpParameterGroup."""
     return hasattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR)
-
-
-@dataclasses.dataclass(frozen=True)
-class PendingReduction:
-    """Reduce-scatter buffers retained until the post-backward stream wait."""
-
-    partial_grad: DBuffer
-    reduced_grad: DBuffer | None
 
 
 class FsdpParameterGroup:
@@ -285,7 +275,7 @@ class FsdpParameterGroup:
         for parameter in self.unsharded_parameters:
             parameter.grad = None
 
-    def reduce_partial_gradients(self, partial_grad: DBuffer) -> PendingReduction:
+    def reduce_partial_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients."""
         assert self.main_grad is not None
 
@@ -325,8 +315,6 @@ class FsdpParameterGroup:
         if not has_sharded_grads:
             for index, parameter in enumerate(self.sharded_parameters):
                 parameter.grad = self.main_grad.get_dtensor(index)
-
-        return PendingReduction(partial_grad=partial_grad, reduced_grad=reduced_grad)
 
     def _require_unsharded_grads(self) -> tuple[torch.Tensor, ...]:
         grads: list[torch.Tensor] = []

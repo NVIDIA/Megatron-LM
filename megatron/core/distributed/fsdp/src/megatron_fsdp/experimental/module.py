@@ -25,7 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .parameter_group import FsdpParameterGroup, PendingReduction, contained_in_parameter_group
+from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
@@ -52,7 +52,6 @@ class FsdpContext:
     reduce_scatter_stream: torch.cuda.Stream
     delayed_releases: deque[DelayedRelease]
     prepared_reductions: deque[PreparedReduction]
-    pending_reductions: deque[PendingReduction]
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
@@ -70,7 +69,6 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.delayed_releases = deque()
         self.prepared_reductions = deque()
-        self.pending_reductions = deque()
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -92,10 +90,6 @@ class FsdpContext:
                     self.allgather_stream.wait_event(delayed_release.consumer_event)
                 delayed_release.module.release_unsharded_storage()
 
-    def enqueue_pending_reduction(self, pending_reduction: PendingReduction) -> None:
-        """Retain a scheduled reduction's temporary buffers until finalization."""
-        self.pending_reductions.append(pending_reduction)
-
     def enqueue_prepared_reduction(self, prepared_reduction: PreparedReduction) -> None:
         """Queue a packed partial gradient for a later reduce-scatter launch."""
         self.prepared_reductions.append(prepared_reduction)
@@ -110,10 +104,8 @@ class FsdpContext:
         with torch.cuda.stream(self.reduce_scatter_stream):
             while self.prepared_reductions:
                 prepared_reduction = self.prepared_reductions.popleft()
-                self.enqueue_pending_reduction(
-                    prepared_reduction.group.reduce_partial_gradients(
-                        prepared_reduction.partial_grad
-                    )
+                prepared_reduction.group.reduce_partial_gradients(
+                    prepared_reduction.partial_grad
                 )
 
     def register_post_backward_final_callback(self) -> None:
@@ -124,19 +116,15 @@ class FsdpContext:
         at autograd completion orders consumers after every descendant reduction.
         """
         torch.autograd.Variable._execution_engine.queue_callback(
-            self.finalize_pending_reductions
+            self.post_backward_final_callback
         )
 
-    def finalize_pending_reductions(self) -> None:
-        """Wait for scheduled reductions and release their temporary buffers."""
+    def post_backward_final_callback(self) -> None:
+        """Launch delayed reductions and order subsequent work after their stream."""
         self.launch_prepared_reductions()
-        if not self.pending_reductions:
-            return
 
         current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
         current_stream.wait_stream(self.reduce_scatter_stream)
-        with torch.cuda.stream(self.reduce_scatter_stream):
-            self.pending_reductions.clear()
 
 
 class FsdpModule:
