@@ -3599,22 +3599,19 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
-    decoder_exists = True
-    model_with_decoder = None
     try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
+        model_with_decoder = _get_model_with_decoder(model)
     except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
+        model_with_decoder = None
+
+    if model_with_decoder is not None:
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                assert hasattr(layer, 'mtp_model_layer'), (
+                    f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                )
                 layer.mtp_model_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
