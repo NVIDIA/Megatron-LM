@@ -61,7 +61,6 @@ BEFORE_SCRIPT: |
     --moe-router-load-balancing-type seq_aux_loss \
     --moe-shared-expert-intermediate-size 3712 \
     --moe-token-dispatcher-type alltoall \
-    --moe-permute-fusion \
     --moe-grouped-gemm \
     --use-fused-weighted-squared-relu \
     --attention-backend fused \
@@ -118,7 +117,6 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-shared-expert-intermediate-size: 3712
   --moe-token-dispatcher-type: alltoall
-  --moe-permute-fusion: true
   --moe-grouped-gemm: true
   --use-fused-weighted-squared-relu: true
   # Tokenizer
