@@ -13,8 +13,8 @@ Compared to :class:`SFTDataset`, this dataset adds:
 
   * **Multi-source loading** — accepts HuggingFace Hub repo ids
     (``owner/repo``), local ``.parquet`` files, and local ``.jsonl/.json``
-    files; the latter are read via pandas to sidestep pyarrow's per-chunk
-    JSON schema inference which fails when sample fields vary across rows.
+    files. Hub repos may expose multiple configs and splits; these are joined
+    logically without requiring their Arrow schemas to be identical.
 
   * **Auto schema detection** — four input layouts are auto-detected by column
     name. The three instruction-tuning layouts are normalized to the messages
@@ -40,17 +40,23 @@ Compared to :class:`SFTDataset`, this dataset adds:
 
 Limitations (raise a clear ``ValueError`` instead of silently mishandling):
 
-  * Sample content/value must be a plain string — multi-modal content lists
-    (image+text parts) are not supported.
+  * OpenAI/OpenCode text and tool-result content blocks are supported, but
+    image/audio/video content requires a multimodal dataset path.
   * Tree-structured (OpenAssistant oasst1) and preference (chosen/rejected)
     datasets are out of scope.
-  * For HF Hub repos, only ``split="train"`` is loaded.
+
+For HF Hub repos, all configs are selected. Each config uses its ``train``
+split when present, otherwise all of its thematic splits. If the Hub Arrow
+builder cannot unify heterogeneous JSON rows, the rows are streamed into a
+map-style single-payload-column cache so Megatron can still index them.
 """
 
 import json
+import logging
 import os
+from bisect import bisect_right
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -66,6 +72,10 @@ from megatron.training.datasets.sft_dataset import (
     SFTLowLevelDataset,
 )
 from megatron.training.datasets.utils import load_json_arg
+
+logger = logging.getLogger(__name__)
+
+_HF_PAYLOAD_COLUMN = "__varlen_json_payload__"
 
 # Field-name synonyms (probed in order; first non-empty wins).
 _INSTRUCTION_FIELDS: Tuple[str, ...] = ("instruction", "prompt", "query", "question")
@@ -141,6 +151,96 @@ def _ensure_str_content(content: Any, where: str) -> str:
     return content
 
 
+def _json_text(value: Any, where: str) -> str:
+    """Convert a structured text payload to its stable JSON representation."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"VarlenDataset: {where} is not JSON serializable.") from exc
+
+
+def _normalize_openai_content(content: Any, where: str) -> Tuple[str, Dict[str, str]]:
+    """Normalize text-only OpenAI/OpenCode content blocks to a string.
+
+    OpenCode stores tool outputs as ``tool-result`` blocks rather than plain
+    strings. Text blocks are losslessly flattened for text chat templates;
+    image/audio/video blocks remain unsupported by this text-only dataset.
+    """
+    if content is None:
+        return "", {}
+    if isinstance(content, str):
+        return content, {}
+    if not isinstance(content, list):
+        raise ValueError(
+            f"VarlenDataset: {where} content must be a string or a list of text blocks, "
+            f"got {type(content).__name__}."
+        )
+
+    pieces: List[str] = []
+    metadata: Dict[str, str] = {}
+    for index, block in enumerate(content):
+        block_where = f"{where} content block {index}"
+        if isinstance(block, str):
+            pieces.append(block)
+            continue
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"VarlenDataset: {block_where} must be a string or object, "
+                f"got {type(block).__name__}."
+            )
+
+        block_type = block.get("type")
+        if block_type in ("text", "input_text", "output_text"):
+            pieces.append(_json_text(block.get("text", block.get("value")), block_where))
+        elif block_type == "tool-result":
+            output = block.get("output")
+            if isinstance(output, dict):
+                output = output.get("value", output.get("content", output))
+            pieces.append(_json_text(output, f"{block_where} output"))
+            if block.get("toolCallId"):
+                metadata.setdefault("tool_call_id", str(block["toolCallId"]))
+            if block.get("toolName"):
+                metadata.setdefault("name", str(block["toolName"]))
+        else:
+            raise ValueError(
+                f"VarlenDataset: unsupported {block_where} type {block_type!r}. "
+                "Multimodal image/audio/video content requires a multimodal dataset path."
+            )
+
+    return "\n".join(pieces), metadata
+
+
+def _normalize_tools(tools: Any) -> List[Dict[str, Any]]:
+    """Convert OpenCode tool definitions; preserve OpenAI definitions."""
+    normalized_tools: List[Dict[str, Any]] = []
+    for index, tool in enumerate(_ensure_list_field(tools, "tools")):
+        if not isinstance(tool, dict):
+            raise ValueError(
+                f"VarlenDataset: tools[{index}] must be an object, got {type(tool).__name__}."
+            )
+        if "id" not in tool:
+            normalized_tools.append(tool)
+            continue
+        input_schema = tool.get("inputSchema") or {}
+        if not isinstance(input_schema, dict):
+            raise ValueError(f"VarlenDataset: tools[{index}].inputSchema must be an object.")
+        normalized_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": str(tool["id"]),
+                    "description": str(tool.get("description") or ""),
+                    "parameters": input_schema.get("jsonSchema", input_schema),
+                },
+            }
+        )
+    return normalized_tools
+
+
 def _ensure_list_field(value: Any, field_name: str) -> List[Any]:
     """Return a list field, decoding JSON-encoded parquet columns when needed."""
     if value in (None, ""):
@@ -201,22 +301,72 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
     ``nvidia/Nemotron-SFT-Math-v3``.
     """
     raw = _ensure_list_field(sample.get("messages"), "messages")
-    if raw and raw[0].get("role") != "system":
-        raw = [{"role": "system", "content": ""}] + raw
     out: List[Dict[str, Any]] = []
-    for m in raw:
-        role = m.get("role") or "user"
-        content = _ensure_str_content(m.get("content"), f"messages turn role={role}")
+    role_map = {"developer": "system"}
+    supported_roles = {"system", "user", "assistant", "tool"}
+    for index, m in enumerate(raw):
+        if not isinstance(m, dict):
+            raise ValueError(
+                f"VarlenDataset: messages[{index}] must be an object, " f"got {type(m).__name__}."
+            )
+        role = str(m.get("role") or "user").lower()
+        role = role_map.get(role, role)
+        if role not in supported_roles:
+            raise ValueError(f"VarlenDataset: unsupported messages[{index}] role {role!r}.")
+        content, content_metadata = _normalize_openai_content(
+            m.get("content"), f"messages turn {index} role={role}"
+        )
         normalized = dict(m)
         normalized["role"] = role
         normalized["content"] = content
+        for key, value in content_metadata.items():
+            normalized.setdefault(key, value)
+
+        tool_calls = normalized.get("tool_calls")
+        if tool_calls not in (None, ""):
+            normalized["tool_calls"] = _ensure_list_field(
+                tool_calls, f"messages[{index}].tool_calls"
+            )
+
+        function_call = normalized.get("function_call")
+        if function_call and not normalized.get("tool_calls"):
+            if isinstance(function_call, str):
+                try:
+                    function_call = json.loads(function_call)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"VarlenDataset: messages[{index}].function_call contains invalid JSON."
+                    ) from exc
+            if not isinstance(function_call, dict):
+                raise ValueError(
+                    f"VarlenDataset: messages[{index}].function_call must be an object."
+                )
+            normalized["tool_calls"] = [{"type": "function", "function": dict(function_call)}]
         out.append(normalized)
 
-    tools = _ensure_list_field(sample.get("tools"), "tools")
-    if not tools:
-        chat_template_kwargs: Dict[str, Any] = {}
-    else:
-        chat_template_kwargs = {"tools": tools}
+    if out and out[0]["role"] != "system":
+        out.insert(0, {"role": "system", "content": ""})
+
+    chat_template_kwargs = sample.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, str):
+        try:
+            chat_template_kwargs = json.loads(chat_template_kwargs)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "VarlenDataset: field 'chat_template_kwargs' contains invalid JSON."
+            ) from exc
+    if chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    if not isinstance(chat_template_kwargs, dict):
+        raise ValueError(
+            "VarlenDataset: field 'chat_template_kwargs' must be an object or a "
+            "JSON-encoded object."
+        )
+    chat_template_kwargs = dict(chat_template_kwargs)
+
+    tools = _normalize_tools(sample.get("tools"))
+    if tools:
+        chat_template_kwargs["tools"] = tools
     return ChatTemplateSample(out, chat_template_kwargs)
 
 
@@ -266,14 +416,51 @@ def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]
     )
 
 
+def _iter_hf_data_file_rows(data_file: str) -> Iterator[Dict[str, Any]]:
+    """Read raw JSONL or Parquet rows without a declared HF schema."""
+    import fsspec
+
+    normalized_path = data_file.lower().split("?", 1)[0]
+    if normalized_path.endswith(".parquet"):
+        import pyarrow.parquet as pq
+
+        with fsspec.open(data_file, "rb") as stream:
+            parquet_file = pq.ParquetFile(stream)
+            for batch in parquet_file.iter_batches(batch_size=1024):
+                yield from batch.to_pylist()
+        return
+
+    with fsspec.open(data_file, "rt", encoding="utf-8", compression="infer") as stream:
+        for line in stream:
+            if line.strip():
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError(f"VarlenDataset: expected JSON objects in {data_file!r}.")
+                yield row
+
+
+def _iter_hf_rows_as_json(data_files: List[str]):
+    """Stream raw heterogeneous Hub rows as one JSON payload column."""
+    for data_file in data_files:
+        for row in _iter_hf_data_file_rows(data_file):
+            yield {_HF_PAYLOAD_COLUMN: json.dumps(row, ensure_ascii=False)}
+
+
+def _json_payload_to_item(sample: Dict[str, Any]) -> Any:
+    """Decode and normalize a row produced by :func:`_iter_hf_rows_as_json`."""
+    row = json.loads(sample[_HF_PAYLOAD_COLUMN])
+    converter, _ = _select_converter(list(row))
+    return converter(row)
+
+
 class VarlenLowLevelDataset(SFTLowLevelDataset):
     """Low-level loader: HF Hub repo / local parquet / local jsonl, normalized.
 
     Dataset path interpretation:
 
-      * HF Hub repo id (e.g. ``Yukang/LongAlpaca-12k``) — contains ``/`` and
-        does not exist on the local filesystem; loaded via
-        ``datasets.load_dataset(path, split="train")``.
+      * HF Hub repo id (e.g. ``nvidia/Nemotron-SFT-Math-v4``) — contains ``/``
+        and does not exist locally. By default, all configs are considered;
+        each uses ``train`` when available, otherwise all thematic splits.
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
@@ -284,25 +471,88 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         chunk and fails with ``CastError`` when the union of fields varies
         between rows (e.g. LongAlpaca-12k).
 
-    A per-sample converter is selected once at construction time based on
-    column names and applied at access time. OpenAI-style samples retain both
-    messages and chat-template metadata, other instruction-tuning schemas
-    convert to a messages list, and the ``pretrain-text`` fallback returns the
-    raw string instead.
+    Each config/split remains a separate map-style component and is joined by
+    index arithmetic. This avoids requiring Arrow feature compatibility across
+    components. A per-component converter is selected from its columns. Hub
+    JSON that fails Arrow schema unification is streamed into a cached JSON
+    payload column and normalized per row.
     """
 
     def __init__(self, dataset_path: str) -> None:
         try:
-            from datasets import Dataset, load_dataset
+            from datasets import (
+                Dataset,
+                Features,
+                Value,
+                get_dataset_config_names,
+                get_dataset_split_names,
+                load_dataset,
+                load_dataset_builder,
+            )
+            from datasets.exceptions import DatasetGenerationError
         except ImportError as exc:
             raise ImportError(
                 "VarlenDataset requires the `datasets` library " "(pip install datasets)."
             ) from exc
+        try:
+            from datasets.table import CastError
+        except ImportError:
+            CastError = DatasetGenerationError
+
+        self._datasets: List[Any] = []
+        self._converters: List[Callable[[Dict[str, Any]], Any]] = []
+        self._schema_names: List[str] = []
+        self._cumulative_sizes: List[int] = []
+
+        def add_component(dataset: Any, payload: bool = False) -> None:
+            if payload:
+                converter = _json_payload_to_item
+                schema_name = "json-payload"
+            else:
+                converter, schema_name = _select_converter(list(dataset.column_names))
+            self._datasets.append(dataset)
+            self._converters.append(converter)
+            self._schema_names.append(schema_name)
+            previous_size = self._cumulative_sizes[-1] if self._cumulative_sizes else 0
+            self._cumulative_sizes.append(previous_size + len(dataset))
 
         if _looks_like_hf_id(dataset_path):
-            self.dataset = load_dataset(dataset_path, split="train")
+            selected_sources: List[Tuple[str, str]] = []
+            for selected_config in get_dataset_config_names(dataset_path):
+                available_splits = get_dataset_split_names(dataset_path, selected_config)
+                selected_splits = ["train"] if "train" in available_splits else available_splits
+                selected_sources.extend(
+                    (selected_config, selected_split) for selected_split in selected_splits
+                )
+
+            if not selected_sources:
+                raise ValueError(f"VarlenDataset: no config/split was found in {dataset_path}.")
+
+            for selected_config, selected_split in selected_sources:
+                source = f"{dataset_path}:{selected_config}/{selected_split}"
+                try:
+                    dataset = load_dataset(dataset_path, name=selected_config, split=selected_split)
+                    add_component(dataset)
+                except (DatasetGenerationError, CastError):
+                    builder = load_dataset_builder(dataset_path, name=selected_config)
+                    data_files = builder.config.data_files.get(selected_split)
+                    if not data_files:
+                        raise ValueError(
+                            f"VarlenDataset: could not resolve raw files for {source}."
+                        )
+                    logger.warning(
+                        "Arrow schema generation failed for %s; materializing a map-style "
+                        "JSON payload cache directly from the raw data files.",
+                        source,
+                    )
+                    dataset = Dataset.from_generator(
+                        _iter_hf_rows_as_json,
+                        features=Features({_HF_PAYLOAD_COLUMN: Value("string")}),
+                        gen_kwargs={"data_files": [str(data_file) for data_file in data_files]},
+                    )
+                    add_component(dataset, payload=True)
         elif dataset_path.endswith(".parquet"):
-            self.dataset = load_dataset("parquet", data_files=dataset_path, split="all")
+            add_component(load_dataset("parquet", data_files=dataset_path, split="all"))
         else:
             try:
                 import pandas as pd
@@ -312,21 +562,38 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
                     "files (pip install pandas)."
                 ) from exc
             df = pd.read_json(dataset_path, lines=True)
-            self.dataset = Dataset.from_pandas(df, preserve_index=False)
+            add_component(Dataset.from_pandas(df, preserve_index=False))
 
-        self._converter, self._schema_name = _select_converter(list(self.dataset.column_names))
+        if not self._datasets:
+            raise ValueError(f"VarlenDataset: no data was loaded from {dataset_path!r}.")
+        self.dataset = self._datasets[0] if len(self._datasets) == 1 else tuple(self._datasets)
+        unique_schema_names = list(dict.fromkeys(self._schema_names))
+        self._schema_name = (
+            unique_schema_names[0]
+            if len(unique_schema_names) == 1
+            else f"mixed({','.join(unique_schema_names)})"
+        )
 
     @property
     def schema_name(self) -> str:
         """Detected schema name: ``alpaca`` / ``sharegpt`` / ``openai-messages`` /
-        ``pretrain-text`` (the raw ``text``-column fallback)."""
+        ``pretrain-text`` / ``json-payload`` (the raw-schema fallback)."""
         return self._schema_name
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return self._cumulative_sizes[-1]
 
     def __getitem__(self, idx: int) -> Any:
-        return self._converter(self.dataset[idx])
+        idx = int(idx)
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        component_index = bisect_right(self._cumulative_sizes, idx)
+        component_start = self._cumulative_sizes[component_index - 1] if component_index > 0 else 0
+        return self._converters[component_index](
+            self._datasets[component_index][idx - component_start]
+        )
 
 
 class VarlenDataset(SFTDataset):

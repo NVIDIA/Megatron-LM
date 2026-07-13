@@ -235,6 +235,117 @@ def test_messages_passthrough_decodes_json_encoded_parquet_columns():
     assert sample.chat_template_kwargs == {"tools": tools}
 
 
+def test_messages_passthrough_decodes_swe_v3_tool_calls():
+    tool_calls = [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "execute_bash", "arguments": '{"command":"ls"}'},
+        }
+    ]
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should inspect the repository.",
+                    "tool_calls": json.dumps(tool_calls),
+                },
+            ]
+        }
+    )
+    assert sample.messages[2]["tool_calls"] == tool_calls
+
+
+def test_messages_passthrough_normalizes_opencode_tools_and_results():
+    sample = _messages_passthrough(
+        {
+            "tools": [
+                {
+                    "id": "shell",
+                    "description": "Run a command",
+                    "inputSchema": {
+                        "jsonSchema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                        }
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": '{"command":"ls"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": [
+                        {
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "toolName": "shell",
+                            "output": {"type": "text", "value": "a.txt"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    assert sample.chat_template_kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    assert sample.messages[3]["content"] == "a.txt"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+    assert sample.messages[3]["name"] == "shell"
+
+
+def test_messages_passthrough_normalizes_legacy_roles_and_function_call():
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "developer", "content": "Use tools."},
+                {"role": "user", "content": "calculate"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "python", "arguments": '{"code":"1+1"}'},
+                },
+            ]
+        }
+    )
+    assert [message["role"] for message in sample.messages] == ["system", "user", "assistant"]
+    assert sample.messages[2]["tool_calls"] == [
+        {"type": "function", "function": {"name": "python", "arguments": '{"code":"1+1"}'}}
+    ]
+
+
+def test_messages_passthrough_preserves_agentic_chat_template_kwargs():
+    sample = _messages_passthrough(
+        {
+            "messages": [{"role": "user", "content": "search"}],
+            "chat_template_kwargs": json.dumps({"thinking": True}),
+        }
+    )
+    assert sample.chat_template_kwargs == {"thinking": True}
+
+
 def test_ensure_list_field_rejects_invalid_json():
     with pytest.raises(ValueError, match="contains invalid JSON"):
         _ensure_list_field("[broken", "messages")
@@ -245,8 +356,8 @@ def test_ensure_list_field_rejects_invalid_json():
 # ----------------------------------------------------------------------------
 
 
-def test_messages_rejects_list_content():
-    with pytest.raises(ValueError, match="must be a string"):
+def test_messages_rejects_multimodal_list_content():
+    with pytest.raises(ValueError, match="unsupported.*type 'image'"):
         _messages_passthrough(
             {"messages": [{"role": "user", "content": [{"type": "image", "url": "x.png"}]}]}
         )
@@ -473,6 +584,92 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     # Each item is a raw string, NOT a messages list.
     assert ll[0] == "Doc one body..."
     assert ll[1] == "Doc two body..."
+
+
+class _FakeHubDataset:
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(dict.fromkeys(key for row in rows for key in row))
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+def test_low_level_hub_loads_all_configs_and_thematic_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(
+        datasets,
+        "get_dataset_split_names",
+        lambda path, config: ["train", "validation"] if config == "cfg-a" else ["python", "cpp"],
+    )
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"messages": [{"role": "user", "content": f"{name}/{split}"}]}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Test")
+
+    assert calls == [
+        ("nvidia/Nemotron-SFT-Test", "cfg-a", "train"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "python"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "cpp"),
+    ]
+    assert len(low_level) == 3
+    assert low_level[0].messages[1]["content"] == "cfg-a/train"
+    assert low_level[1].messages[1]["content"] == "cfg-b/python"
+    assert low_level[-1].messages[1]["content"] == "cfg-b/cpp"
+    with pytest.raises(IndexError):
+        low_level[3]
+
+
+def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
+    datasets = pytest.importorskip("datasets")
+    from datasets.exceptions import DatasetGenerationError
+
+    raw_path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            },
+            {"messages": [{"role": "user", "content": "not selected"}]},
+        ],
+    )
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset_builder",
+        lambda path, name: SimpleNamespace(
+            config=SimpleNamespace(data_files={"train": [raw_path]})
+        ),
+    )
+
+    def fake_load_dataset(path, name, split):
+        raise DatasetGenerationError("incompatible nested JSON schema")
+
+    def fake_from_generator(generator, features, gen_kwargs):
+        assert list(features) == ["__varlen_json_payload__"]
+        assert isinstance(gen_kwargs["data_files"], list)
+        return _FakeHubDataset(list(generator(**gen_kwargs)))
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(datasets.Dataset, "from_generator", staticmethod(fake_from_generator))
+
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Math-v4")
+    assert len(low_level) == 2
+    assert low_level.schema_name == "json-payload"
+    assert low_level[0].messages[2]["content"] == "answer"
 
 
 # ----------------------------------------------------------------------------
