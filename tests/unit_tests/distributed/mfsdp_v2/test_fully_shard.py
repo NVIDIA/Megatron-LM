@@ -514,10 +514,7 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(
-        nn.Linear(4, 4, bias=False),
-        nn.Linear(4, 4, bias=False),
-    )
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
     with torch.no_grad():
         model[0].weight.fill_(2.0)
         model[1].weight.fill_(3.0)
