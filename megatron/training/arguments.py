@@ -354,7 +354,8 @@ def _validate_megatron_fsdp_cuda_graph_buffers(args):
             "or disable CUDA graphs."
         )
 
-    if getattr(args, "data_parallel_sharding_strategy", "optim_grads_params") == "optim_grads":
+    sharding_strategy = getattr(args, "data_parallel_sharding_strategy", "optim_grads_params")
+    if sharding_strategy == "optim_grads":
         raise ValueError(
             "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not yet support "
             "--data-parallel-sharding-strategy=optim_grads. That strategy has no per-layer "
@@ -362,6 +363,20 @@ def _validate_megatron_fsdp_cuda_graph_buffers(args):
             "replay. If gradient sharding is required, use optim_grads_params; no_shard and "
             "optim are also supported because their main gradients are persistent."
         )
+
+    if sharding_strategy == "optim_grads_params":
+        if not args.overlap_param_gather:
+            raise ValueError(
+                "Megatron-FSDP planned allocation with fully sharded parameters requires "
+                "--overlap-param-gather. The frozen weight-buffer plan covers overlapped "
+                "per-unit residency, not a synchronous all-model gather."
+            )
+        if not args.overlap_grad_reduce:
+            raise ValueError(
+                "Megatron-FSDP planned allocation with fully sharded gradients requires "
+                "--overlap-grad-reduce. The frozen main-grad plan covers per-unit reduction "
+                "lifetimes, not delayed all-model gradient residency."
+            )
 
     if args.cuda_graph_impl == "transformer_engine" and getattr(args, "nccl_ub", False):
         raise ValueError(

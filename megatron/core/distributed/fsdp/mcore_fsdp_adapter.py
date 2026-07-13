@@ -97,6 +97,19 @@ def _validate_cuda_graph_config(config, ddp_config):
             "Megatron-FSDP planned allocation does not yet support optim_grads because "
             "that strategy has no per-layer pre-backward fused-main-grad claim hook."
         )
+    if ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+        if not ddp_config.overlap_param_gather:
+            raise ValueError(
+                "Megatron-FSDP planned allocation with fully sharded parameters requires "
+                "overlap_param_gather=True; its frozen weight-buffer plan does not cover "
+                "a synchronous all-model gather."
+            )
+        if not ddp_config.overlap_grad_reduce:
+            raise ValueError(
+                "Megatron-FSDP planned allocation with fully sharded gradients requires "
+                "overlap_grad_reduce=True; its frozen main-grad plan does not cover delayed "
+                "all-model gradient residency."
+            )
     if ddp_config.fsdp_double_buffer:
         raise ValueError(
             "Megatron-FSDP planned allocation does not support fsdp_double_buffer=True. "

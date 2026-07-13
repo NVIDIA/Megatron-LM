@@ -4040,7 +4040,10 @@ class GradReducePipeline:
                 )
 
     def wait_for_previous_grad_reduce(
-        self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
+        self,
+        suggested_queue_size: int = 1,
+        suggested_queue_capacity: Optional[int] = None,
+        wait_stream: Optional[torch.cuda.Stream] = None,
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
@@ -4049,6 +4052,8 @@ class GradReducePipeline:
                 buckets. Defaults to 1.
             suggested_queue_capacity (Optional[int], optional): The recommended queue capacity
                 in number of parameters in all buckets in the reduction queue. Defaults to None.
+            wait_stream (Optional[torch.cuda.Stream], optional): Consumer stream that must wait
+                for each released reduction bucket. Defaults to the current stream.
         """
         if suggested_queue_capacity is not None:
             queue_space = sum(
@@ -4059,7 +4064,10 @@ class GradReducePipeline:
             )
             while queue_space > suggested_queue_capacity:
                 grad_reduce_event, free_up_grad_bucket, bucket_id = self.grad_reduce_queue.pop(0)
-                grad_reduce_event.wait()
+                if wait_stream is None:
+                    grad_reduce_event.wait()
+                else:
+                    grad_reduce_event.wait(stream=wait_stream)
                 free_up_grad_bucket()
                 queue_space -= self.buffer.parameter_groups[
                     bucket_id
@@ -4068,8 +4076,33 @@ class GradReducePipeline:
             suggested_queue_size = max(0, min(suggested_queue_size, self.buffer.num_buckets - 1))
             while len(self.grad_reduce_queue) > suggested_queue_size:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
-                grad_reduce_event.wait()
+                if wait_stream is None:
+                    grad_reduce_event.wait()
+                else:
+                    grad_reduce_event.wait(stream=wait_stream)
                 free_up_grad_bucket()
+
+    def wait_for_pending_buckets(
+        self,
+        bucket_ids,
+        wait_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Drain queued reductions that still read any requested bucket."""
+        pending_bucket_ids = set(bucket_ids)
+        if not pending_bucket_ids or not self.grad_reduce_queue:
+            return
+
+        keep_n = 0
+        for _, _, bucket_id in reversed(self.grad_reduce_queue):
+            if bucket_id in pending_bucket_ids:
+                break
+            keep_n += 1
+        if keep_n == len(self.grad_reduce_queue):
+            return
+
+        if wait_stream is None:
+            wait_stream = torch.cuda.current_stream()
+        self.wait_for_previous_grad_reduce(keep_n, wait_stream=wait_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:

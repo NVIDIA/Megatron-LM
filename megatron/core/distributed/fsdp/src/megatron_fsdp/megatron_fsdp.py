@@ -476,6 +476,11 @@ class MegatronFSDP(torch.nn.Module):
                 if fused_wgrad:
                     bucket_claims[bucket_id] = claim
 
+        if bucket_claims:
+            # Graph-baked fused wgrad writes reuse the same bucket address.
+            # Finish any older reduction reading that bucket before replay.
+            self.grad_reduce_pipeline.wait_for_pending_buckets(sorted(bucket_claims))
+
         if record_graph_bucket_claim is not None:
             for bucket_id in sorted(record_claims):
                 size, dtype = record_claims[bucket_id]
@@ -1329,6 +1334,18 @@ class MegatronFSDP(torch.nn.Module):
                 other settings.
             force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
+        if (
+            force_sync
+            and self.data_parallel_sharding_strategy == "optim_grads_params"
+            and getattr(self.param_and_grad_buffer, '_uses_planned_allocator', False)
+        ):
+            raise RuntimeError(
+                "start_param_sync(force_sync=True) is incompatible with planned allocation "
+                "for fully sharded Megatron-FSDP. Force-sync promises that every unsharded "
+                "parameter remains ready on return, while the frozen plan covers only "
+                "overlapped per-unit residency."
+            )
+
         self._replace_param_with_raw_if_needed()
 
         if self.data_parallel_sharding_strategy == "no_shard":
