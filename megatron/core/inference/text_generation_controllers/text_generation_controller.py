@@ -1772,38 +1772,10 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return
 
-        if not context.config.materialize_only_last_token_logits:
-            raise RuntimeError("Async scheduling requires materialize_only_last_token_logits=True.")
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if context.is_hybrid_model:
-            raise RuntimeError("Async scheduling does not support hybrid/Mamba models.")
-        if context.enable_prefix_caching:
-            raise RuntimeError("Async scheduling does not support prefix caching.")
         if context.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
         if context.chunked_prefill_request_id != -1:
             raise RuntimeError("Async scheduling does not support chunked prefill.")
-        if self.model_config.expert_model_parallel_size > 1:
-            raise RuntimeError("Async scheduling does not support expert parallelism.")
-        if self.model_config.num_moe_experts is not None:
-            raise RuntimeError("Async scheduling does not support MoE models.")
-        if self.model_config.moe_enable_routing_replay:
-            raise RuntimeError("Async scheduling does not support routing replay.")
-
-        active_slice = slice(context.paused_request_count, context.total_request_count)
-        if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
-            raise RuntimeError(
-                "Async scheduling only supports greedy sampling " "(SamplingParams.top_k == 1)."
-            )
-        if not torch.all(context.request_metadata["top_p"][active_slice] == 0.0):
-            raise RuntimeError(
-                "Async scheduling only supports greedy sampling " "(SamplingParams.top_p == 0.0)."
-            )
-        if torch.any(context.request_metadata["return_log_probs"][active_slice]):
-            raise RuntimeError("Async scheduling does not support log probabilities.")
-        if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
-            raise RuntimeError("Async scheduling does not support top-n log probabilities.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> Optional[torch.cuda.Event]:
         """Compact cached logits from old active-row order into survivor order.
