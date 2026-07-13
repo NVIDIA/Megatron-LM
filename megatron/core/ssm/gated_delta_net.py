@@ -20,8 +20,6 @@ from megatron.core.context_parallel_layout import (
     contiguous_to_zigzag_chunks,
     zigzag_to_contiguous_chunks,
 )
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser

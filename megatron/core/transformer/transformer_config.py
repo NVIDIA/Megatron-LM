@@ -34,7 +34,6 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
-    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -327,39 +326,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
-    dsa_indexer_topk_freq: int = 1
-    """Frequency of DSA indexer top-k computation across layers.
-    A value greater than 1 enables cross-layer top-k sharing."""
-
-    dsa_indexer_skip_topk_offset: int = 0
-    """Layer offset for DSA cross-layer top-k sharing."""
-
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
-
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
-    """Optional fused DSA kernel backend.
-    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
-    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
-
-    dsa_indexer_rope_interleaved: bool = False
-    """Whether DSA indexer RoPE should use MLA-style interleaving."""
-
-    dsa_indexer_rotate_activation: bool = True
-    """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
-
-    dsa_indexer_scoring_relu: bool = True
-    """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
-
-    dsa_indexer_k_norm_epsilon: Optional[float] = None
-    """Optional epsilon override for the DSA indexer key LayerNorm."""
-
-    dsa_indexer_k_norm_fp32: bool = False
-    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -1641,21 +1613,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
-            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
-            if self.add_bias_linear:
-                raise ValueError(
-                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
-                    "Disable linear bias for DSA configs."
-                )
-            if self.dsa_indexer_topk_freq < 1:
-                raise ValueError(
-                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
-                )
-            if self.dsa_indexer_skip_topk_offset < 0:
-                raise ValueError(
-                    "dsa_indexer_skip_topk_offset must be non-negative, got "
-                    f"{self.dsa_indexer_skip_topk_offset}."
-                )
+            pass
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -3302,23 +3260,6 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
-
-        if self.experimental_attention_variant == "dsa":
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
-            if self.context_parallel_size > 1:
-                cp_comm_types = (
-                    self.cp_comm_type
-                    if isinstance(self.cp_comm_type, list)
-                    else [self.cp_comm_type]
-                )
-                assert all(
-                    cp_comm_type is not None
-                    and cp_comm_type.replace("_", "").lower() == "allgather"
-                    for cp_comm_type in cp_comm_types
-                ), (
-                    "DSAttention context parallelism currently supports "
-                    "cp_comm_type=allgather only."
-                )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
