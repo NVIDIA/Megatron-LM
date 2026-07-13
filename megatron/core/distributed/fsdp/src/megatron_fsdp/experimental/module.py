@@ -33,14 +33,16 @@ from .placement import MeshAxis, Placements
 class DelayedRelease:
     """A module whose unsharded storage can be released after its consumer event."""
 
-    consumer_event: torch.cuda.Event | None
+    consumer_event: torch.cuda.Event
     module: "FsdpModule"
 
 
 @dataclasses.dataclass(frozen=True)
-class PreparedReduction:
-    """A packed partial gradient waiting for a reduce-scatter launch point."""
+class DelayedReduction:
+    """A packed partial gradient whose reduce-scatter can be launched after its
+    packing consumer event completes, mirroring ``DelayedRelease``."""
 
+    consumer_event: torch.cuda.Event
     group: FsdpParameterGroup
     partial_grad: DBuffer
 
@@ -51,7 +53,7 @@ class FsdpContext:
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     delayed_releases: deque[DelayedRelease]
-    prepared_reductions: deque[PreparedReduction]
+    delayed_reductions: deque[DelayedReduction]
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
@@ -68,7 +70,7 @@ class FsdpContext:
         self.root_module = root_module
         self.is_last_microbatch = True
         self.delayed_releases = deque()
-        self.prepared_reductions = deque()
+        self.delayed_reductions = deque()
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -86,27 +88,31 @@ class FsdpContext:
         while len(self.delayed_releases) > target_length:
             delayed_release = self.delayed_releases.popleft()
             with torch.cuda.stream(self.allgather_stream):
-                if delayed_release.consumer_event is not None:
-                    self.allgather_stream.wait_event(delayed_release.consumer_event)
+                self.allgather_stream.wait_event(delayed_release.consumer_event)
                 delayed_release.module.release_unsharded_storage()
 
-    def enqueue_prepared_reduction(self, prepared_reduction: PreparedReduction) -> None:
-        """Queue a packed partial gradient for a later reduce-scatter launch."""
-        self.prepared_reductions.append(prepared_reduction)
+    def enqueue_reduction(self, group: "FsdpParameterGroup", partial_grad: DBuffer) -> None:
+        """Queue a packed partial gradient for a later reduce-scatter launch.
 
-    def launch_prepared_reductions(self) -> None:
-        """Launch queued reduce-scatters after work already ordered on the current stream."""
-        if not self.prepared_reductions:
-            return
+        Records a consumer event on the current (compute) stream where the
+        gradients were packed, so the reduce-scatter waits for only that packing
+        rather than all default-stream work -- mirroring ``enqueue_release``.
+        """
+        consumer_event = torch.cuda.current_stream(self.reduce_scatter_stream.device).record_event()
+        self.delayed_reductions.append(
+            DelayedReduction(consumer_event=consumer_event, group=group, partial_grad=partial_grad)
+        )
 
-        current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
-        self.reduce_scatter_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.reduce_scatter_stream):
-            while self.prepared_reductions:
-                prepared_reduction = self.prepared_reductions.popleft()
-                prepared_reduction.group.reduce_partial_gradients(
-                    prepared_reduction.partial_grad
-                )
+    def drain_delayed_reductions(self, target_length: int) -> None:
+        """Launch queued reduce-scatters FIFO until the queue reaches ``target_length``."""
+        if target_length < 0:
+            raise ValueError(f"target_length must be non-negative, got {target_length}.")
+
+        while len(self.delayed_reductions) > target_length:
+            delayed_reduction = self.delayed_reductions.popleft()
+            with torch.cuda.stream(self.reduce_scatter_stream):
+                self.reduce_scatter_stream.wait_event(delayed_reduction.consumer_event)
+                delayed_reduction.group.reduce_partial_gradients(delayed_reduction.partial_grad)
 
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
@@ -115,13 +121,11 @@ class FsdpContext:
         accumulated gradients; it may run before descendant reductions. Waiting
         at autograd completion orders consumers after every descendant reduction.
         """
-        torch.autograd.Variable._execution_engine.queue_callback(
-            self.post_backward_final_callback
-        )
+        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward_final_callback)
 
     def post_backward_final_callback(self) -> None:
-        """Launch delayed reductions and order subsequent work after their stream."""
-        self.launch_prepared_reductions()
+        """Launch remaining delayed reductions and order subsequent work after their stream."""
+        self.drain_delayed_reductions(target_length=0)
 
         current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
         current_stream.wait_stream(self.reduce_scatter_stream)
@@ -293,7 +297,7 @@ class FsdpModule:
         if self.is_root():
             self.context.register_post_backward_final_callback()
         self._unshard_parameter_groups(sync_model_weight=False)
-        self.context.launch_prepared_reductions()
+        self.context.drain_delayed_reductions(target_length=0)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -316,9 +320,7 @@ class FsdpModule:
                 current_stream.wait_stream(context.reduce_scatter_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
 
-                context.enqueue_prepared_reduction(
-                    PreparedReduction(group=group, partial_grad=partial_grad)
-                )
+                context.enqueue_reduction(group, partial_grad)
 
     def release_unsharded_storage(self) -> None:
         """Release unsharded storage owned by this FSDP unit."""
