@@ -72,17 +72,6 @@ def get_energy_monitor():
     _ensure_var_is_initialized(_GLOBAL_ENERGY_MONITOR, 'energy monitor')
     return _GLOBAL_ENERGY_MONITOR
 
-def get_signal_handler():
-    _ensure_var_is_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
-    return _GLOBAL_SIGNAL_HANDLER
-
-
-def _set_signal_handler(exit_signal):
-
-    global _GLOBAL_SIGNAL_HANDLER
-    _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
-    _GLOBAL_SIGNAL_HANDLER = DistributedSignalHandler(exit_signal).__enter__()
-
 
 def _graceful_shutdown(signum, frame):
     """
@@ -144,9 +133,6 @@ def set_global_variables(args, build_tokenizer=True):
 
     if args.enable_experimental:
         set_experimental_flag(True)
-
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
 
     if args.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)

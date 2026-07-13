@@ -169,7 +169,6 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
-    get_signal_handler,
     get_tensorboard_writer,
     get_timers,
     get_tokenizer,
@@ -1422,6 +1421,7 @@ def pretrain(
         args.curr_iteration = iteration
         if args.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
+                state,
                 forward_step_func,
                 model,
                 optimizer,
@@ -3146,6 +3146,7 @@ def post_training_step_callbacks(
 
 
 def checkpoint_and_decide_exit(
+    state: GlobalState,
     model,
     optimizer,
     opt_param_scheduler,
@@ -3163,7 +3164,7 @@ def checkpoint_and_decide_exit(
     # Exit based on signal handler.
     saved_checkpoint = False
     if args.exit_signal_handler:
-        signal_handler = get_signal_handler()
+        signal_handler = state.signal_handler
         if any(signal_handler.signals_received()):
             if args.save:
                 save_checkpoint_and_time(
@@ -3258,6 +3259,7 @@ def checkpoint_and_decide_exit(
 
 
 def train(
+    state: GlobalState,
     forward_step_func,
     model,
     optimizer,
@@ -3992,6 +3994,7 @@ def train(
 
         # Checkpoint and decide whether to exit.
         should_exit = checkpoint_and_decide_exit(
+            state,
             model,
             optimizer,
             opt_param_scheduler,
