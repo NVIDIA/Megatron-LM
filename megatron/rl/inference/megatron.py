@@ -65,7 +65,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                # TODO: These are non-standard fields that add significant memory overheads to the
+                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
+                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
+                # Set to False if not needed in MRL.
                 "return_tokenized_data": True,
+                "return_raw_text": True,
             },
         )
 
@@ -74,7 +79,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         return InferenceResponse(
             # TODO: Handle tool calls and reasoning in LLMChatMessage
             response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.message.content,
+            raw_text=choice.message.raw_text,
             token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
             logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,

@@ -655,6 +655,7 @@ try:
         # but prevent_retokenization implicitly requires token ids so the client
         # can echo them back next turn.
         return_tokenized_data = req.get("return_tokenized_data", False) or prevent_retokenization
+        return_raw_text = req.get("return_raw_text", False)
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
@@ -731,6 +732,9 @@ try:
             if return_tokenized_data:
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
+            if return_raw_text:
+                prompt_str = tokenizer.detokenize(result["prompt_tokens"])
+                message["raw_text"] = prompt_str + text_output
             # Small RL/debug scalars (a few bytes each); harmless to keep for
             # NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
