@@ -21,7 +21,7 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(**kwargs):
+def _run(*, packed_num_microbatches=None, events=None, **kwargs):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -38,12 +38,38 @@ def _run(**kwargs):
     )
     captured = {}
     model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+
+    def wrap_data_iterator(data_iterator, config, unused_num_microbatches):
+        assert config.sequence_packing_scheduler is not None
+        assert packed_num_microbatches is not None
+        if events is not None:
+            events.append(("wrap", packed_num_microbatches))
+        return data_iterator, packed_num_microbatches, 0, 0
+
+    def validate_topology(config, *, num_microbatches, micro_batch_size, phase):
+        if events is not None:
+            events.append(("validate", num_microbatches, micro_batch_size, phase))
+
+    def forward_backward(**forward_backward_kwargs):
+        captured.update(forward_backward_kwargs)
+        if events is not None:
+            events.append(("forward_backward", forward_backward_kwargs["num_microbatches"]))
+        return []
+
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(
+            training_mod, "wrap_data_iterator", side_effect=wrap_data_iterator
+        ),
+        mock.patch.object(
+            training_mod,
+            "validate_te_cuda_graph_topology",
+            side_effect=validate_topology,
+        ),
     ):
         training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
@@ -51,8 +77,12 @@ def _run(**kwargs):
             model=model,
             optimizer=SimpleNamespace(zero_grad=lambda: None),
             opt_param_scheduler=None,
-            config=SimpleNamespace(),
-            forward_backward_func=lambda **kw: captured.update(kw) or [],
+            config=SimpleNamespace(
+                sequence_packing_scheduler=(
+                    "dp_balanced" if packed_num_microbatches is not None else None
+                )
+            ),
+            forward_backward_func=forward_backward,
             iteration=0,
             **kwargs,
         )
@@ -68,3 +98,16 @@ def test_train_step_forwards_schedule_plumbing():
 def test_train_step_defaults_to_none():
     captured = _run()
     assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
+
+
+def test_train_step_validates_actual_packed_microbatch_count_before_forward_backward():
+    events = []
+
+    captured = _run(packed_num_microbatches=7, events=events)
+
+    assert captured["num_microbatches"] == 7
+    assert events == [
+        ("wrap", 7),
+        ("validate", 7, 1, "training-forward-backward"),
+        ("forward_backward", 7),
+    ]
