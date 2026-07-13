@@ -15,6 +15,8 @@ from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
     _finalize_dp_transfers,
     _plan_tp,
+    build_plan_from_rosters,
+    index_metadata_rosters,
 )
 from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor
 
@@ -360,3 +362,77 @@ class TestBuildDescriptors:
 
         descs = _build_descriptors_for_param(src, dst)
         assert descs == []
+
+
+# ===========================================================================
+# build_plan_from_rosters (local, deterministic planning + node-add stability)
+# ===========================================================================
+
+
+def _plan_edges(plans):
+    """Collect (task_id, src_rank, dst_rank) transfers from a {rank: ReshardPlan}.
+
+    Reads them once from every send op and once from every recv op; the two sets
+    must be equal for the plan to be consistent (a matching, same-task_id recv for
+    every send).
+    """
+    sends = {(op.task_id, r, op.peer_rank) for r, p in plans.items() for op in p.send_ops}
+    recvs = {(op.task_id, op.peer_rank, r) for r, p in plans.items() for op in p.recv_ops}
+    return sends, recvs
+
+
+def _build_all(gathered_pairs):
+    """Build every rank's plan from a rank-ordered list of (src_meta, dst_meta)."""
+    dst_by_rank, src_by_name = index_metadata_rosters(gathered_pairs)
+    return {rank: build_plan_from_rosters(dst_by_rank, src_by_name, rank) for rank in dst_by_rank}
+
+
+def _recv_sig(plan):
+    """Identity of a plan's recv ops (task_id + slices), for stability comparisons."""
+    return [(op.task_id, op.peer_rank, op.my_slice, op.peer_slice) for op in plan.recv_ops]
+
+
+class TestBuildPlanFromRosters:
+    """Local plan building replayed independently per rank."""
+
+    def test_task_ids_match_across_ranks(self):
+        """Sender and receiver, planned independently, agree on task_id per transfer.
+
+        rank 0 sources a replicated weight; ranks 1 and 2 each receive a full copy.
+        """
+        gathered = [
+            ([_meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0])], []),  # rank 0: source
+            ([], [_meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1])]),  # rank 1: dest
+            ([], [_meta(owner_rank=2, tp_ranks=[2], dp_ranks=[2])]),  # rank 2: dest
+        ]
+        plans = _build_all(gathered)
+        sends, recvs = _plan_edges(plans)
+
+        # Every send has a matching recv with the same task_id, and vice versa.
+        assert sends == recvs
+        # Two transfers: 0->1 and 0->2, with distinct task_ids.
+        assert len(sends) == 2
+        assert {(s, d) for _, s, d in sends} == {(0, 1), (0, 2)}
+        assert len({tid for tid, _, _ in sends}) == 2
+
+    def test_node_add_keeps_existing_task_ids_stable(self):
+        """Appending a rank rebuilds locally without renumbering existing transfers."""
+        base = [
+            ([_meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0])], []),
+            ([], [_meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1])]),
+            ([], [_meta(owner_rank=2, tp_ranks=[2], dp_ranks=[2])]),
+        ]
+        before = _build_all(base)
+
+        # A new destination rank 3 joins; everyone replays over the grown roster.
+        grown = base + [([], [_meta(owner_rank=3, tp_ranks=[3], dp_ranks=[3])])]
+        after = _build_all(grown)
+
+        sends_after, recvs_after = _plan_edges(after)
+        assert sends_after == recvs_after
+        # Existing receivers keep the exact same recv ops (task_id + slices).
+        for rank in (1, 2):
+            assert _recv_sig(before[rank]) == _recv_sig(after[rank])
+        # The new rank added exactly one transfer with a fresh task_id.
+        assert len(sends_after) == 3
+        assert {(s, d) for _, s, d in sends_after} == {(0, 1), (0, 2), (0, 3)}

@@ -64,7 +64,7 @@ def execute_reshard_plan(
     transform: Optional[ReshardTransform] = None,
 ) -> None:
     """
-    Execute a reshard plan (from centralized controller).
+    Execute a reshard plan (built locally on each rank).
     A communication service must be provided to abstract transport.
     Expected service API: submit_send(tensor, dest_rank, task_id),
     submit_recv(tensor, src_rank, task_id), run().
