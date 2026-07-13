@@ -26,15 +26,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.models.common.vision_module.vision_module import (
-    VisionModule,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -283,6 +278,10 @@ class Qwen35VLVisionEncoder(VisionModule):
         max_num_positions: Size of the learned position table.
     """
 
+    # This encoder computes 2-D RoPE from each microbatch's grid and passes it
+    # into Transformer layers at runtime; TE graph capture must observe it.
+    _cuda_graph_requires_observed_rotary_inputs = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -322,9 +321,7 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from examples.multimodal_dev.models.qwen35_vl.specs import (
-                get_qwen35_vl_vision_spec,
-            )
+            from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         self.decoder = TransformerBlock(
