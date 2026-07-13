@@ -22,6 +22,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -369,16 +370,47 @@ def reassemble_cp_sequence(local_tensors: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat([chunk for chunk in chunks if chunk is not None], dim=0).contiguous()
 
 
-def pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split 17-bit global indices into uint16 lower bits + bool 17th bit."""
-    low_bits = (indices & 0xFFFF).to(torch.uint16)
-    bit_17 = (indices >> 16).to(torch.bool)
-    return low_bits, bit_17
-
-
 def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor:
-    """Reconstruct indices from uint16 lower bits + bool 17th bit."""
+    """Reconstruct indices from uint16 lower bits + bool 17th bit.
+
+    v1-legacy only: v1 tars store ``bit_17`` as a ``torch.bool`` tensor.
+    v2 tars use :func:`v2_pack_indices` / :func:`v2_unpack_indices` instead.
+    """
     return (bit_17.long() << 16) | low_bits.long()
+
+
+def v2_pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split full-iteration v2 monolith indices into uint16 lower bits +
+    bit-packed 17th bit.
+
+    Must be called on the already-concatenated per-iteration monolith, not
+    per-microbatch: splitting off ``low_bits`` is elementwise and would
+    commute fine with concatenation, but ``numpy.packbits`` flattens and
+    packs bits globally, so packing each microbatch separately and then
+    concatenating the packed bytes would *not* reproduce the same bytes as
+    packing the concatenated monolith once. Both steps are therefore done
+    together here, at the monolith level, to match :func:`v2_unpack_indices`.
+    """
+    low_bits = (indices & 0xFFFF).to(torch.uint16)
+    bit_17 = (indices >> 16).to(torch.uint8)
+    packed_bit_17 = torch.from_numpy(np.packbits(bit_17.reshape(-1).numpy()))
+    return low_bits, packed_bit_17
+
+
+def v2_unpack_indices(low_bits: torch.Tensor, packed_bit_17: torch.Tensor) -> torch.Tensor:
+    """Reconstruct v2 monolith indices from uint16 lower bits + bit-packed 17th bit.
+
+    ``packed_bit_17`` is a 1-D uint8 tensor produced by ``numpy.packbits`` over
+    the flattened 17th-bit flags (1 bit/element, instead of ``torch.bool``'s
+    1 byte/element). Unlike v1's list-of-microbatches payload, v2 stores one
+    monolith per iteration, so ``low_bits`` already carries the full
+    ``(seq, samples_per_dp_per_iter, K)`` shape needed to reshape the unpacked
+    bits -- no separate shape field is required.
+    """
+    bit_17 = torch.from_numpy(
+        np.unpackbits(packed_bit_17.numpy(), count=low_bits.numel())
+    ).reshape(low_bits.shape).long()
+    return (bit_17 << 16) | low_bits.long()
 
 
 class LogprobsTarEntry(NamedTuple):
@@ -671,7 +703,7 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
     tensors = torch.load(io.BytesIO(data), weights_only=True)
     if tensors.get("format_version", 1) >= 2:
         values = tensors["values"]
-        indices = unpack_indices(tensors["indices_low"], tensors["bit_17"])
+        indices = v2_unpack_indices(tensors["indices_low"], tensors["bit_17"])
         return values, indices
     # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
     indices_list = [
