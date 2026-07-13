@@ -41,6 +41,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
@@ -1877,7 +1878,19 @@ class TextGenerationController:
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            routing_indices = self._router_record_bookkeeping()
+            context.kv_block_allocator.store_routing_per_block(routing_indices)
+
+            # Save routing indices.
+            tracer = get_moe_router_tracer()
+            if tracer is not None and routing_indices is not None:
+                layer_ids = [
+                    r.layer_number
+                    for r in RouterReplay.global_router_replay_instances
+                    if r.layer_number is not None
+                ] or None
+                tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
+                tracer.advance_step()
             range_pop()
 
         # This is the best place to yield control back to event loop.
