@@ -302,21 +302,23 @@ except ImportError:
 # end-spans-then-shutdown sequence. Closures defined inside pretrain() aren't
 # callable from there; these are.
 #
-# Hierarchy (when the launch script passes its timestamps through):
-#   slurm.job (outermost -- SLURM_JOB_START_TIME if available (Slurm's own
-#   |          record), else launch_script_start -> job end)
-#   |- slurm.job.prolog (only if SLURM_JOB_START_TIME predates launch_script_start
-#   |     -- prolog/scheduling overhead before the launch script's first line runs)
-#   |- slurm.startup (launch_script_start -> program_start; immediately closed,
+# Hierarchy (when the launch script passes its timestamps through). These are the
+# IN-PROCESS view -- named 'workload.*', NOT 'slurm.*': the authoritative SLURM
+# accounting (prolog/job_setup/step/teardown) is emitted out-of-band by the reckoner
+# from sacct. pre_startup is a coarse fallback for when no reckoner runs.
+#   pre_startup (SLURM_JOB_START_TIME -> launch_script_start; top-level, PRECEDES
+#   |            workload -- only if that gap is real; the queue tail / prolog overhead)
+#   workload (outermost -- launch_script_start -> job end; the prolog is excluded)
+#   |- workload.startup (launch_script_start -> program_start; immediately closed,
 #   |     fully backdated, nothing live happens "inside" it by the time it's built)
-#   |  |- slurm.startup.launch_script
-#   |  `- slurm.startup.container_load
+#   |  |- workload.startup.launch_script
+#   |  `- workload.startup.container_load
 #   `- megatron.pretrain (program_start -> job end)
 #      |- megatron.startup (program_start -> train() begins)
 #      `- megatron.train (decorated separately, started later)
 #
 # If the launch script didn't pass launch_script_start through (other entry
-# points), slurm.job/slurm.startup are skipped entirely and megatron.pretrain
+# points), workload/workload.startup are skipped entirely and megatron.pretrain
 # is the outermost span, matching prior behavior.
 _otel_slurm_job_span = None
 _otel_slurm_job_ctx_token = None
@@ -371,38 +373,38 @@ def _start_otel_job_spans(model_type, program_start):
     _program_start_ns = int(program_start * 1e9) if program_start is not None else None
 
     if launch_script_start is not None:
-        # slurm.job's true start: Slurm's own record if available, since it can
-        # predate launch_script_start (prolog/scheduling overhead the launch
-        # script's first line can't see). min() guards against SLURM_JOB_START_TIME
-        # somehow landing after our own first timestamp, which would otherwise
-        # produce a negative-duration slurm.job.prolog span below.
-        job_start = launch_script_start
-        if slurm_job_start_time is not None:
-            job_start = min(slurm_job_start_time, launch_script_start)
+        # pre_startup: the gap between Slurm marking the job started and our own launch
+        # script's first line actually running -- queue tail / prolog scripts / node setup.
+        # Kept as a COARSE fallback for when the out-of-band SLURM reckoner isn't available
+        # (which reconstructs this authoritatively from sacct). It is a top-level span that
+        # PRECEDES the workload -- NOT part of the 'workload' uber span, which begins when
+        # our first line runs -- so it's emitted here, before the workload context attaches.
+        # Only created if that gap is real and positive.
+        if slurm_job_start_time is not None and slurm_job_start_time < launch_script_start:
+            _backdated_otel_span('pre_startup', slurm_job_start_time, launch_script_start)
 
-        _otel_slurm_job_span = _otel_tracer.start_span('slurm.job', start_time=int(job_start * 1e9))
+        # workload: the uber span for THIS process's own view of its lifetime (launch
+        # script's first line -> job end). Named 'workload', not 'slurm.job' -- the
+        # authoritative SLURM accounting is emitted out-of-band by the reckoner, and these
+        # in-process spans must not masquerade as slurm.*. The prolog is deliberately
+        # excluded from this span (it lives in pre_startup above).
+        _otel_slurm_job_span = _otel_tracer.start_span('workload', start_time=int(launch_script_start * 1e9))
         _otel_tag_span(_otel_slurm_job_span, 'job')
         _otel_slurm_job_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_otel_slurm_job_span)
         )
 
-        # Gap between Slurm marking the job started and our own launch script's
-        # first line actually running -- prolog scripts, node setup, etc. Only
-        # meaningful (and only created) if that gap is real and positive.
-        if slurm_job_start_time is not None and slurm_job_start_time < launch_script_start:
-            _backdated_otel_span('slurm.job.prolog', slurm_job_start_time, launch_script_start)
-
-        # slurm.startup: sibling of megatron.pretrain under slurm.job, covering
+        # workload.startup: sibling of megatron.pretrain under workload, covering
         # everything before Python itself started running.
         _slurm_startup_span = _otel_tracer.start_span(
-            'slurm.startup', start_time=int(launch_script_start * 1e9)
+            'workload.startup', start_time=int(launch_script_start * 1e9)
         )
         _otel_tag_span(_slurm_startup_span, 'job')
         _slurm_startup_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_slurm_startup_span)
         )
-        _backdated_otel_span('slurm.startup.launch_script', launch_script_start, launch_script_presrun)
-        _backdated_otel_span('slurm.startup.container_load', launch_script_presrun, program_start)
+        _backdated_otel_span('workload.startup.launch_script', launch_script_start, launch_script_presrun)
+        _backdated_otel_span('workload.startup.container_load', launch_script_presrun, program_start)
         _otel_ctx.detach(_slurm_startup_ctx_token)
         _slurm_startup_span.end(end_time=_program_start_ns)
 
@@ -4194,13 +4196,22 @@ def train(
         # runs). Raises on ONE named rank after N seconds of training to exercise
         # the goodput lost-work / recovery path. Only that rank fails; the others
         # then hit the distributed timeout.
-        _finj = os.environ.get('LENS_INJECT_FAULT_RANK')
-        if (_finj is not None and torch.distributed.get_rank() == int(_finj)
-                and (time.time() - _TRAIN_START_TIME)
-                > float(os.environ.get('LENS_INJECT_FAULT_AFTER_S', '1e18'))):
+        #  - LENS_INJECT_FAULT_AT_ITER: ALL ranks raise once iteration >= that value -- a
+        #    fast, clean crash of the whole step (no survivor NCCL-timeout hang), for
+        #    requeue/trampoline tests where we just want the job to die and be requeued.
+        #  - LENS_INJECT_FAULT_RANK + LENS_INJECT_FAULT_AFTER_S: ONE rank raises after N
+        #    seconds; survivors then hit the distributed timeout -- for the lost-work path.
+        _finj_at_iter = os.environ.get('LENS_INJECT_FAULT_AT_ITER')
+        _finj_rank = os.environ.get('LENS_INJECT_FAULT_RANK')
+        _fault_iter = _finj_at_iter is not None and iteration >= int(_finj_at_iter)
+        _fault_time = (_finj_rank is not None
+                       and torch.distributed.get_rank() == int(_finj_rank)
+                       and (time.time() - _TRAIN_START_TIME)
+                       > float(os.environ.get('LENS_INJECT_FAULT_AFTER_S', '1e18')))
+        if _fault_iter or _fault_time:
             raise RuntimeError(
-                f"[lens fault-injection] rank {int(_finj)} deliberate failure "
-                f"{time.time() - _TRAIN_START_TIME:.0f}s into training (iteration {iteration})"
+                f"[lens fault-injection] rank {torch.distributed.get_rank()} deliberate failure "
+                f"at iteration {iteration} ({'iter-gated' if _fault_iter else 'time-gated'})"
             )
         if (args.profile
             and (len(args.profile_ranks) == 0 or
