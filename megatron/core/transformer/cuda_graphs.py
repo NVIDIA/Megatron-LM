@@ -752,6 +752,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 gtp_rs_stream.wait_stream(runner.stream)
                 with torch.cuda.stream(gtp_rs_stream):
                     for param in params:
+                        param.grad = None
+                        if hasattr(param, 'grad_added_to_main_grad'):
+                            param.grad_added_to_main_grad = True
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
                             hook()
