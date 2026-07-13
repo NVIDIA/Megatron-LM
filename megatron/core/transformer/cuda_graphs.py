@@ -6,6 +6,7 @@ import inspect
 import logging
 import math
 import os
+import random
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
@@ -1749,6 +1751,39 @@ class CudaGraphManager(torch.nn.Module):
         return out
 
 
+def _clone_rng_state(state):
+    """Clone a Tensor or graph-safe CUDA Generator state for later restoration."""
+    if hasattr(state, "clone_state"):
+        return state.clone_state()
+    if torch.is_tensor(state):
+        return state.clone()
+    return deepcopy(state)
+
+
+def _snapshot_training_rng_state():
+    """Capture RNG states that CUDA graph warmup must not expose to training."""
+    tracker = get_cuda_rng_tracker()
+    tracker_states = {}
+    for name, state in tracker.get_states().items():
+        tracker_states[name] = _clone_rng_state(state)
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": [state.clone() for state in torch.cuda.get_rng_state_all()],
+        "tracker": tracker_states,
+    }
+
+
+def _restore_training_rng_state(snapshot):
+    """Restore RNG states after CUDA graph capture/warmup."""
+    random.setstate(snapshot["python"])
+    np.random.set_state(snapshot["numpy"])
+    torch.set_rng_state(snapshot["torch_cpu"])
+    torch.cuda.set_rng_state_all(snapshot["torch_cuda"])
+    get_cuda_rng_tracker().set_states(snapshot["tracker"])
+
+
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
 def _get_effective_transformer_layer(layer):
     """Return the TransformerLayer whose attention is executed by ``layer``.
@@ -3170,10 +3205,27 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
-                )
+            rng_snapshot = _snapshot_training_rng_state()
+            try:
+                with rng_context:
+                    graphs = make_graphed_callables(
+                        tuple(self.flattened_callables), sample_args, **kwargs
+                    )
+            finally:
+                _restore_training_rng_state(rng_snapshot)
+
+            # Address-invariant safety net: freeze each graphed layer's parameter
+            # storage addresses as of capture. _te_cuda_graph_replay re-verifies
+            # them before every replay, turning any FSDP buffer re-slotting into
+            # an immediate hard error instead of silent numerical corruption.
+            for callable_module in self.flattened_callables:
+                if not isinstance(callable_module, torch.nn.Module):
+                    continue
+                snapshot = {}
+                for name, param in callable_module.named_parameters():
+                    data = getattr(param.data, '_local_tensor', param.data)
+                    snapshot[name] = (data.data_ptr(), data.numel(), data.dtype)
+                callable_module._cg_param_ptr_snapshot = snapshot
 
             # Restore original hooks to callables after CUDA Graph capture.
             # restore_hooks contains only the hooks cleared before capture; _with_kwargs flag dicts

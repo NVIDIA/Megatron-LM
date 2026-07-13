@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -335,6 +336,33 @@ class GraphableMegatronModule(MegatronModule):
             assert v is None or isinstance(
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
+
+        # Address-invariant safety net: the graph replays kernels against the
+        # absolute parameter addresses recorded at capture. If the FSDP
+        # allocator hands this layer's buckets a different address (slot
+        # re-assignment after eval/checkpoint/schedule perturbation), fail loudly
+        # instead of silently reading another bucket's weights.
+        snapshot = getattr(self, '_cg_param_ptr_snapshot', None)
+        if (
+            snapshot is not None
+            and os.environ.get('MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK', '0') != '1'
+        ):
+            for name, param in self.named_parameters():
+                expected = snapshot.get(name)
+                if expected is None:
+                    continue
+                data = getattr(param.data, '_local_tensor', param.data)
+                actual = (data.data_ptr(), data.numel(), data.dtype)
+                if actual != expected:
+                    raise RuntimeError(
+                        f"CUDA graph buffer address changed between capture and "
+                        f"replay for parameter '{name}' of {type(self).__name__}: "
+                        f"captured (ptr={expected[0]:#x}, numel={expected[1]}, "
+                        f"dtype={expected[2]}) vs current (ptr={actual[0]:#x}, "
+                        f"numel={actual[1]}, dtype={actual[2]}). FSDP double-buffer "
+                        f"slot re-assignment would silently corrupt training. Set "
+                        f"MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1 to bypass."
+                    )
 
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
