@@ -59,6 +59,51 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _validate_cuda_graph_config(config, ddp_config):
+    """Reject unsafe CUDA graph combinations for programmatic callers."""
+    cuda_graph_impl = config.cuda_graph_impl
+    if cuda_graph_impl == "local":
+        raise ValueError(
+            "Megatron-FSDP does not yet support cuda_graph_impl='local': local backward "
+            "graphs can write fused main_grad before FSDP bucket allocation and validation."
+        )
+
+    uses_planned_allocator = ddp_config.megatron_fsdp_use_planned_allocator
+    if uses_planned_allocator and cuda_graph_impl != "transformer_engine":
+        raise ValueError(
+            "megatron_fsdp_use_planned_allocator is supported only with "
+            "cuda_graph_impl='transformer_engine'."
+        )
+
+    if cuda_graph_impl in ("transformer_engine", "full_iteration"):
+        if not ddp_config.megatron_fsdp_cuda_graph_mode:
+            raise ValueError(
+                f"Megatron-FSDP with cuda_graph_impl='{cuda_graph_impl}' requires "
+                "megatron_fsdp_cuda_graph_mode=True so graph-owned gradient references "
+                "remain valid across zero_grad()."
+            )
+
+    if cuda_graph_impl != "transformer_engine":
+        return
+    if not uses_planned_allocator:
+        raise ValueError(
+            "Megatron-FSDP with cuda_graph_impl='transformer_engine' requires "
+            "megatron_fsdp_use_planned_allocator=True."
+        )
+    if ddp_config.nccl_ub:
+        raise ValueError("Megatron-FSDP planned allocation does not yet support NCCL user buffers.")
+    if ddp_config.data_parallel_sharding_strategy == "optim_grads":
+        raise ValueError(
+            "Megatron-FSDP planned allocation does not yet support optim_grads because "
+            "that strategy has no per-layer pre-backward fused-main-grad claim hook."
+        )
+    if ddp_config.fsdp_double_buffer:
+        raise ValueError(
+            "Megatron-FSDP planned allocation does not support fsdp_double_buffer=True. "
+            "Disable FSDP double buffering when using cuda_graph_impl='transformer_engine'."
+        )
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -110,6 +155,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.num_moe_experts = getattr(config, "num_moe_experts", None)
 
         self.ddp_config = ddp_config
+        _validate_cuda_graph_config(config, ddp_config)
         log_single_rank(
             logger,
             logging.INFO,

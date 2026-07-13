@@ -313,6 +313,46 @@ def _normalize_cuda_graph_modules_args(args):
     args.cuda_graph_modules = normalized_scopes
 
 
+def _validate_megatron_fsdp_cuda_graph_buffers(args):
+    """Validate stable temporary-buffer requirements for Megatron-FSDP CUDA graphs."""
+    if args.cuda_graph_impl in ("none", "full_iteration") or not args.use_megatron_fsdp:
+        return
+
+    if args.cuda_graph_impl == "local":
+        raise ValueError(
+            "Megatron-FSDP does not yet support --cuda-graph-impl=local. The local backward "
+            "graph replays fused weight-gradient writes before Megatron-FSDP can allocate, "
+            "throttle, and validate the live main_grad bucket, and its eager fixed/temporary "
+            "allocators can move graph-baked addresses. Use --cuda-graph-impl=transformer_engine "
+            "or disable CUDA graphs."
+        )
+
+    if getattr(args, "data_parallel_sharding_strategy", "optim_grads_params") == "optim_grads":
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not yet support "
+            "--data-parallel-sharding-strategy=optim_grads. That strategy has no per-layer "
+            "FSDP pre-backward unit hook to claim planned fused-main-grad slots before graph "
+            "replay. If gradient sharding is required, use optim_grads_params; no_shard and "
+            "optim are also supported because their main gradients are persistent."
+        )
+
+    if args.cuda_graph_impl == "transformer_engine" and getattr(args, "nccl_ub", False):
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not yet support "
+            "--use-nccl-ub. Planned graph slots are materialized after the current manual "
+            "NCCL user-buffer registration point, so those graph-baked allocations would "
+            "not be registered. Disable NCCL user buffers or use a different CUDA graph "
+            "implementation."
+        )
+
+    if args.fsdp_double_buffer:
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not support "
+            "--fsdp-double-buffer. Planned allocation owns graph-covered temporary buffers; "
+            "disable FSDP double buffering for this configuration."
+        )
+
+
 def _normalize_inference_cuda_graph_scope_arg(args):
     """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
     args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
@@ -2132,19 +2172,7 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-        if args.cuda_graph_impl != "full_iteration" and args.use_megatron_fsdp:
-            assert args.fsdp_double_buffer, (
-                "CUDA Graph requires --fsdp-double-buffer when using Megatron-FSDP. "
-                "Without double buffer, FSDP parameter buffers addresses are dynamic across "
-                "iterations, causing numerical errors during graph replay."
-            )
-            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
-                "CUDA Graph with Megatron-FSDP and MoE requires "
-                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
-                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
-                "You may disable this assertion if you are sure there is no allocation failure "
-                "in the CUDA graph scope."
-            )
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'

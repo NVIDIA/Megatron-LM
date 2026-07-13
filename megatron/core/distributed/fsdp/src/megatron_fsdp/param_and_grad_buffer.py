@@ -2111,6 +2111,27 @@ class ParamAndGradBuffer:
         )
 
         self.ddp_config = ddp_config
+        self._uses_planned_allocator = getattr(
+            self.ddp_config, 'megatron_fsdp_use_planned_allocator', False
+        )
+        if self.ddp_config.nccl_ub and self._uses_planned_allocator:
+            raise ValueError(
+                "Megatron-FSDP planned allocation does not yet support NCCL user buffers. "
+                "Planned graph slots are materialized after manual registration."
+            )
+        if self.ddp_config.fsdp_double_buffer and self._uses_planned_allocator:
+            raise ValueError(
+                "Megatron-FSDP planned allocation does not support fsdp_double_buffer=True. "
+                "Disable FSDP double buffering when using the planned allocator."
+            )
+        if (
+            self._uses_planned_allocator
+            and bucketing_policy.data_parallel_sharding_strategy == "optim_grads"
+        ):
+            raise ValueError(
+                "Megatron-FSDP planned allocation does not yet support optim_grads because "
+                "that strategy has no per-layer pre-backward fused-main-grad claim hook."
+            )
         self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
         self.module = module
         self._allocator_namespace = _get_allocator_namespace(module)
@@ -2638,6 +2659,34 @@ class ParamAndGradBuffer:
                 # Otherwise, this allocator will never be used.
                 self.hsdp_grad_comm_alloc = None
             self.double_buf_units = []
+
+        if self._uses_planned_allocator:
+            # CUDA graphs bake absolute bucket addresses at capture; wrap every
+            # allocator with the planned decorator so graph-covered buckets can
+            # be frozen onto lifetime-planned, address-stable slots while eager
+            # buckets continue to use the default allocator.
+            self.weight_alloc = PlannedBucketAllocator(
+                f"{self._allocator_namespace}_fsdp_params",
+                self.weight_alloc,
+                self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
+            self.transpose_weight_alloc = PlannedBucketAllocator(
+                f"{self._allocator_namespace}_fsdp_fp8_transpose_params",
+                self.transpose_weight_alloc,
+                self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
+            self.main_grad_alloc = PlannedBucketAllocator(
+                f"{self._allocator_namespace}_fsdp_grads",
+                (
+                    self.main_grad_alloc
+                    if self.main_grad_alloc is not None
+                    else TemporaryBucketAllocator()
+                ),
+                self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
 
         self.buffer_all_in_one = True
         buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}

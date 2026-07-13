@@ -176,6 +176,15 @@ class DistributedDataParallelConfig:
     a casted-copy of the gradient shard that cannot be dereferenced due to replay.
     """
 
+    megatron_fsdp_use_planned_allocator: bool = False
+    """If set to True, Megatron-FSDP uses the address-stable planned temporary-buffer
+    allocator for TransformerEngine per-layer CUDA graphs. Capture orchestration must
+    freeze the allocation plan before graph capture, so other CUDA graph implementations
+    must leave this disabled. The supported configuration also requires
+    ``fsdp_double_buffer=False``, ``nccl_ub=False``, and a sharding strategy other than
+    ``optim_grads``.
+    """
+
     megatron_fsdp_enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,
