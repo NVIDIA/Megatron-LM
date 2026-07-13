@@ -610,6 +610,20 @@ def validate_args(args, defaults={}):
         # Derive enforce_order after all resolution is complete.
         args.rl_enforce_generation_order = args.rl_generation_batch_size > 1
 
+        submit_rollouts_at_rollout_granularity = args.rl_submission_granularity == "R"
+        if args.rl_generation_lag > 0:
+            assert args.rl_partial_rollouts, "--rl-generation-lag requires --rl-partial-rollouts."
+        if submit_rollouts_at_rollout_granularity:
+            assert (
+                args.rl_partial_rollouts
+            ), "Rollout submission granularity requires streaming grouped rollouts."
+        assert (
+            args.rl_consumption_granularity != "R"
+        ), "--rl-consumption-granularity R is not currently supported."
+        assert not (
+            args.rl_submission_granularity == "B" and args.rl_consumption_granularity == "G"
+        ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
         if args.rl_use_sequence_packing:
@@ -1192,8 +1206,6 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
-    if args.grad_reduce_in_bf16:
-        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert (
@@ -1279,10 +1291,6 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        assert (
-            args.ckpt_format == "fsdp_dtensor"
-        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-
         if args.megatron_fsdp_prefetch_recompute_forward_weights:
             assert args.data_parallel_sharding_strategy == "optim_grads_params", (
                 "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
@@ -1296,6 +1304,25 @@ def validate_args(args, defaults={}):
                 "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
                 "with --overlap-moe-expert-parallel-comm."
             )
+
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            args.fsdp_double_buffer = True
+            warn_rank_0(
+                'FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!'
+            )
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
     else:
         assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
             "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
@@ -1303,18 +1330,6 @@ def validate_args(args, defaults={}):
         assert not args.megatron_fsdp_cache_param_bucket_views, (
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
-
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
-
-        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
-            raise ValueError(
-                "Meta device initialization (init_model_with_meta_device=True) is not "
-                "supported or necessary for the 'no_shard' / 0 sharding strategy."
-            )
 
     if args.fsdp_manual_registration:
         assert (
@@ -1451,6 +1466,12 @@ def validate_args(args, defaults={}):
             'seq-length should be a multiple of 2 * context-parallel-size '
             'if context-parallel-size > 1.'
         )
+
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -1607,8 +1628,7 @@ def validate_args(args, defaults={}):
         if args.pad_packed_seq_alignment != 'max':
             if args.pad_packed_seq_alignment <= 0:
                 raise ValueError(
-                    "--pad-packed-seq-alignment must be 'max' or a positive integer "
-                    "alignment."
+                    "--pad-packed-seq-alignment must be 'max' or a positive integer " "alignment."
                 )
             if args.pad_packed_seq_alignment > args.max_seqlen_per_dp_cp_rank:
                 raise ValueError(
@@ -1844,19 +1864,14 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
-    # Deterministic mode
+    # Deterministic mode — env vars + config overrides + torch global state.
+    # Implementation lives in ``megatron/training/determinism.py`` so the
+    # same setup is reachable from tests / profiling scripts that don't go
+    # through argparse.
     if args.deterministic_mode:
-        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
-        assert (
-            not args.cross_entropy_loss_fusion
-        ), "Cross Entropy Fusion is currently not deterministic."
+        from megatron.training.determinism import apply_determinism_to_args
 
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert (
-            os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices
-        ), f"NCCL_ALGO must be one of {all_reduce_choices}."
-
-        torch.use_deterministic_algorithms(True)
+        apply_determinism_to_args(args)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -2237,9 +2252,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
-        _has_dsv4_csa = (
-            (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
-        )
+        _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
             # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
@@ -2255,8 +2268,9 @@ def core_transformer_config_from_args(args, config_class=None):
         # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
         # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
         # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
-        _variant = kw_args.get('experimental_attention_variant',
-                               getattr(args, 'experimental_attention_variant', None))
+        _variant = kw_args.get(
+            'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
+        )
         if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
             _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
             # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
@@ -2608,6 +2622,25 @@ def _add_inference_args(parser):
         'is requested but the package is not installed.',
     )
     group.add_argument(
+        '--inference-dynamic-batching-async-sched-mode',
+        type=str,
+        default='legacy',
+        choices=['legacy', 'serial'],
+        help='Async scheduling mode for dynamic batching. '
+        '"legacy" (default) preserves the existing resolve-before-prepare '
+        'path. "serial" speculatively prepares and forwards decode-only '
+        'steps before resolving finished requests.',
+    )
+    group.add_argument(
+        '--inference-dynamic-batching-logprobs-mode',
+        type=str,
+        default='raw_logprobs',
+        choices=['raw_logprobs', 'processed_logprobs'],
+        help='How returned inference log-probs are computed engine-wide. '
+        '"raw_logprobs" (default) uses the unmodified model logits; '
+        '"processed_logprobs" uses temperature and filters by top-k/top-p.',
+    )
+    group.add_argument(
         '--inference-logging-step-interval',
         type=int,
         default=0,
@@ -2714,6 +2747,7 @@ def _add_network_size_args(parser):
         "output_layer_init_method",
         "embedding_init_method",
         "activation_func",
+        "experimental_attention_variant_loss_scale_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -2838,6 +2872,36 @@ def _add_network_size_args(parser):
         default='learned_absolute',
         choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
         help='Position embedding type.',
+    )
+    group.add_argument(
+        '--yarn-original-max-position-embeddings',
+        type=int,
+        default=None,
+        help='Original maximum position embeddings for YaRN RoPE frequency correction.',
+    )
+    group.add_argument(
+        '--yarn-beta-fast',
+        type=float,
+        default=None,
+        help='Beta fast for YaRN RoPE frequency correction.',
+    )
+    group.add_argument(
+        '--yarn-beta-slow',
+        type=float,
+        default=None,
+        help='Beta slow for YaRN RoPE frequency correction.',
+    )
+    group.add_argument(
+        '--yarn-correction-range-round-to-int',
+        action='store_true',
+        default=None,
+        help='Round YaRN correction range endpoints to integers.',
+    )
+    group.add_argument(
+        '--no-yarn-correction-range-round-to-int',
+        action='store_false',
+        dest='yarn_correction_range_round_to_int',
+        help='Do not round YaRN correction range endpoints to integers.',
     )
     group.add_argument(
         '--relative-attention-num-buckets',
@@ -3352,6 +3416,36 @@ def _add_rl_args(parser):
         help='Override the number of groups per generation batch. '
         'Defaults to grpo_prompts_per_step when '
         '--rl-num-parallel-generation-batches is set.',
+    )
+    group.add_argument(
+        '--rl-generation-lag',
+        type=int,
+        default=0,
+        help='Number of trainer batches of rollout generation lag to allow. '
+        'The number of in-flight trainer batches is this value plus one. '
+        'Requires --rl-partial-rollouts when greater than 0.',
+    )
+    # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
+    group.add_argument(
+        '--rl-submission-granularity',
+        type=str,
+        default="B",
+        choices=["R", "G", "B"],
+        help='Granularity for submitting rollout generation work. '
+        'R submits individual rollouts independently while still yielding '
+        'complete rollout groups to training. '
+        'G submits one rollout group at a time. '
+        'B submits grpo_prompts_per_step rollout groups together.',
+    )
+    group.add_argument(
+        '--rl-consumption-granularity',
+        type=str,
+        default="B",
+        choices=["R", "G", "B"],
+        help='Granularity for consuming generated rollout groups. '
+        'G consumes groups as they complete. '
+        'B consumes complete trainer batches in submission order. '
+        'R is not currently supported.',
     )
     group.add_argument(
         '--grpo-iterations',
@@ -4395,6 +4489,13 @@ def _add_data_args(parser):
         help='Reset self attention mask after ' 'end-of-document token.',
     )
     group.add_argument(
+        '--dataloader-inter-document-masking',
+        action='store_true',
+        help='Return cu_seqlens marking document boundaries '
+        'within each sample so that attention is restricted '
+        'to individual documents.',
+    )
+    group.add_argument(
         '--eod-mask-loss', action='store_true', help='Mask loss for the end of document tokens.'
     )
     group.add_argument(
@@ -5079,6 +5180,22 @@ def _add_experimental_args(parser):
         ),
     )
 
+    group.add_argument(
+        "--megatron-fsdp-max-pool-double-buffer",
+        action='store_true',
+        help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
+        "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
+        "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
+        "NCCL user buffer registration and CUDA graph replay for mixed-arch models.",
+    )
+    group.add_argument(
+        "--fsdp-db-use-persist-buf-on-alloc-fail",
+        action='store_true',
+        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
+        "are not included in the symmetric buffer pool. May be necessary for NCCL "
+        "UBR or CUDA Graphs on hybrid architectures.",
+    )
+
     return parser
 
 
@@ -5208,41 +5325,75 @@ def _add_varlen_dataset_args(parser):
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
 
-    group.add_argument('--logits-save-top-k', type=int, default=None,
-                       help='Number of top logits to save.')
-    group.add_argument('--logits-save-top-p', type=float, default=None,
-                       help='Top-P (nucleus) threshold applied after top-K '
-                            'selection when saving logits. Only the smallest '
-                            'set of entries whose cumulative probability mass '
-                            'reaches this threshold is kept. Must be in (0, 1].')
-    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
-                       help='Minimum number of entries kept per token when '
-                            'top-P masking is active, regardless of '
-                            'cumulative mass. Default: 1.')
-    group.add_argument('--logits-save-dir', type=str, default=None,
-                       help='Directory to save logits.')
-    group.add_argument('--logits-save-dtype', type=str, default='fp16',
-                       choices=['fp16', 'bf16', 'fp32'],
-                       help='Dtype for on-disk top-K log-probabilities.')
-    group.add_argument('--logits-load-dir', type=str, default=None,
-                       help='Directory to load logits.')
-    group.add_argument('--logits-load-decode-threads', type=int, default=4,
-                       help='Number of decode threads for cached-logits zstd '
-                            'decompression and torch.load processing.')
-    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
-                       help='PyTorch DataLoader prefetch factor for decoded '
-                            'cached-logits iterations. (Non-MSC only)')
-    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
-                       help='For MSC/object-storage logits tar shards, number '
-                            'of whole tar shards to prefetch into the MSC '
-                            'cache ahead of sequential tar consumption.')
-    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
-                       help='KD loss alpha for loading logits. Total loss is calculated as '
-                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
-    group.add_argument('--logits-load-ignore-errors', action='store_true',
-                       default=False,
-                       help='When set, KD loss errors are logged as warnings and '
-                            'training falls back to LM-only loss instead of crashing.')
+    group.add_argument(
+        '--logits-save-top-k', type=int, default=None, help='Number of top logits to save.'
+    )
+    group.add_argument(
+        '--logits-save-top-p',
+        type=float,
+        default=None,
+        help='Top-P (nucleus) threshold applied after top-K '
+        'selection when saving logits. Only the smallest '
+        'set of entries whose cumulative probability mass '
+        'reaches this threshold is kept. Must be in (0, 1].',
+    )
+    group.add_argument(
+        '--logits-save-top-p-min-k',
+        type=int,
+        default=1,
+        help='Minimum number of entries kept per token when '
+        'top-P masking is active, regardless of '
+        'cumulative mass. Default: 1.',
+    )
+    group.add_argument(
+        '--logits-save-dir', type=str, default=None, help='Directory to save logits.'
+    )
+    group.add_argument(
+        '--logits-save-dtype',
+        type=str,
+        default='fp16',
+        choices=['fp16', 'bf16', 'fp32'],
+        help='Dtype for on-disk top-K log-probabilities.',
+    )
+    group.add_argument(
+        '--logits-load-dir', type=str, default=None, help='Directory to load logits.'
+    )
+    group.add_argument(
+        '--logits-load-decode-threads',
+        type=int,
+        default=4,
+        help='Number of decode threads for cached-logits zstd '
+        'decompression and torch.load processing.',
+    )
+    group.add_argument(
+        '--logits-load-prefetch-factor',
+        type=int,
+        default=3,
+        help='PyTorch DataLoader prefetch factor for decoded '
+        'cached-logits iterations. (Non-MSC only)',
+    )
+    group.add_argument(
+        '--logits-load-msc-prefetch-depth',
+        type=int,
+        default=2,
+        help='For MSC/object-storage logits tar shards, number '
+        'of whole tar shards to prefetch into the MSC '
+        'cache ahead of sequential tar consumption.',
+    )
+    group.add_argument(
+        '--logits-load-kd-loss-alpha',
+        type=float,
+        default=1.0,
+        help='KD loss alpha for loading logits. Total loss is calculated as '
+        'alpha * kd_loss + (1 - alpha) * lm_loss.',
+    )
+    group.add_argument(
+        '--logits-load-ignore-errors',
+        action='store_true',
+        default=False,
+        help='When set, KD loss errors are logged as warnings and '
+        'training falls back to LM-only loss instead of crashing.',
+    )
     return parser
 
 

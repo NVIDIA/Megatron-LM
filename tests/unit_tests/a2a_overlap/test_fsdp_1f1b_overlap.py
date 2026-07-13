@@ -13,15 +13,15 @@ from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
+    apply_flex_backend_kwargs,
     assert_models_equal,
     build_gpt_model,
     build_input_data,
     deterministic_mode,
     fsdp_train_step,
     get_test_config,
-    get_valid_flex_dispatcher_backend,
+    get_valid_dispatcher_configs,
     get_valid_fp8_flags,
-    get_valid_token_dispatcher_types,
     overlap_train_step,
     reset_model,
 )
@@ -53,15 +53,24 @@ class TestFSDP1F1BOverlap:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
     def test_fsdp_1f1b_training_step(
-        self, dispatcher_type, fp8_flag, sharding_strategy, shared_expert_intermediate_size
+        self,
+        dispatcher_type,
+        flex_backend,
+        fp8_flag,
+        sharding_strategy,
+        shared_expert_intermediate_size,
     ):
         self._run_test_helper(
-            dispatcher_type, fp8_flag, sharding_strategy, shared_expert_intermediate_size
+            dispatcher_type,
+            fp8_flag,
+            sharding_strategy,
+            shared_expert_intermediate_size,
+            flex_backend=flex_backend,
         )
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
@@ -89,7 +98,7 @@ class TestFSDP1F1BOverlap:
         shared_expert_intermediate_size=None,
         recompute_modules=None,
         offload_modules=None,
-        **kwargs,
+        flex_backend=None,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -99,10 +108,8 @@ class TestFSDP1F1BOverlap:
         forward/backward; test uses combined_1f1b_schedule_for_no_pipelining.
         """
         num_layers = 2
-        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
-        extra_kwargs.update(kwargs)
-        if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
