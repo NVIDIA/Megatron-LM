@@ -313,6 +313,33 @@ def _normalize_cuda_graph_modules_args(args):
     args.cuda_graph_modules = normalized_scopes
 
 
+def _get_cuda_graph_recompute_overlap(
+    cuda_graph_modules,
+    recompute_modules,
+    router_captures_shared_experts=True,
+    captures_gdn_attention=False,
+):
+    """Return selectively recomputed modules that overlap a CUDA graph capture scope."""
+    if not cuda_graph_modules:
+        overlapping_modules = {"shared_experts", "moe_act", "mlp", "layernorm", "moe"}
+        if captures_gdn_attention:
+            overlapping_modules.add("gdn")
+    else:
+        overlapping_modules = set()
+        if CudaGraphModule.mlp in cuda_graph_modules:
+            overlapping_modules.update(("mlp", "layernorm"))
+        if CudaGraphModule.attn in cuda_graph_modules and captures_gdn_attention:
+            overlapping_modules.add("gdn")
+        if CudaGraphModule.moe in cuda_graph_modules:
+            overlapping_modules.update(("shared_experts", "moe_act", "layernorm", "moe"))
+        if CudaGraphModule.moe_router in cuda_graph_modules:
+            overlapping_modules.add("moe")
+            if router_captures_shared_experts:
+                overlapping_modules.add("shared_experts")
+
+    return [module for module in recompute_modules if module in overlapping_modules]
+
+
 def _validate_megatron_fsdp_cuda_graph_buffers(args):
     """Validate stable temporary-buffer requirements for Megatron-FSDP CUDA graphs."""
     if args.cuda_graph_impl in ("none", "full_iteration") or not args.use_megatron_fsdp:
@@ -1360,7 +1387,7 @@ def validate_args(args, defaults={}):
         assert (
             args.use_megatron_fsdp
         ), "FSDP manual registration is only supported with Megatron FSDP."
-        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+        assert args.nccl_ub, "FSDP manual registration is only supported with --use-nccl-ub."
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -2148,15 +2175,6 @@ def validate_args(args, defaults={}):
         args.cpu_offloading = True
 
     # CUDA Graphs
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
     if args.cuda_graph_impl != "none":
         if (
             "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
@@ -2173,6 +2191,49 @@ def validate_args(args, defaults={}):
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
         _validate_megatron_fsdp_cuda_graph_buffers(args)
+        # Activation recompute inside a captured scope is a silent numerical
+        # trap: tensor_parallel.checkpoint / CheckpointWithoutOutput pass through
+        # during graph capture (recompute cannot run inside a graph), so the
+        # captured region runs recompute-OFF while an otherwise-identical eager
+        # baseline runs recompute-ON. Megatron's checkpoint recompute backward is
+        # not bitwise-identical to the plain backward, so the graphed run silently
+        # diverges from eager. Warn only for recompute modules that genuinely fall
+        # inside the captured region:
+        #   - whole-layer capture covers dense MLPs and MoE layers;
+        #   - mlp capture overlaps dense mlp and pre-MLP layernorm recompute;
+        #   - moe capture overlaps full-MoE, shared-expert, MoE activation, and
+        #     pre-MLP layernorm recompute;
+        #   - moe_router capture overlaps full-MoE recompute because route/preprocess are
+        #     inside that checkpoint. It also overlaps shared_experts when they are captured;
+        #     pre-MLP layernorm has explicit cudagraph-aware support and experts run eager.
+        #   - attention capture overlaps whole-GDN recompute when GDN graph opt-in is active.
+        # See docs on partial CUDA graphs.
+        if (
+            args.cuda_graph_impl != "none"
+            and args.recompute_granularity == "selective"
+            and args.recompute_modules
+        ):
+            _cg_scopes = [scope.name for scope in args.cuda_graph_modules] or ["<whole-layer>"]
+            _overlap = _get_cuda_graph_recompute_overlap(
+                args.cuda_graph_modules,
+                args.recompute_modules,
+                router_captures_shared_experts=(
+                    args.moe_shared_expert_intermediate_size is not None
+                    and not args.moe_shared_expert_overlap
+                ),
+                captures_gdn_attention=(
+                    args.experimental_attention_variant == "gated_delta_net"
+                    and os.environ.get("MEGATRON_GDN_TE_CUDA_GRAPH", "0") == "1"
+                ),
+            )
+            if _overlap:
+                warn_rank_0(
+                    f"--recompute-modules {_overlap} overlaps the CUDA graph scope "
+                    f"{_cg_scopes}: the captured region runs recompute-off while eager "
+                    "runs recompute-on, which breaks bitwise CUDA-graph/eager alignment "
+                    "(Megatron checkpoint recompute backward differs from the plain "
+                    "backward). Remove these from --recompute-modules for bitwise runs."
+                )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
