@@ -1452,6 +1452,12 @@ def validate_args(args, defaults={}):
     )
 
     if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+        if args.fp4 and not args.fp4_param_gather:
+            raise ValueError(
+                "GTP (--tensor-parallel-num-weight-shards / "
+                "--expert-tensor-parallel-num-weight-shards > 1) with --fp4-format requires "
+                "--fp4-param-gather so NVFP4 weights are all-gathered as native NVFP4."
+            )
         gtp_weight_remat_size = args.gtp_weight_remat_size
         egtp_weight_remat_size = args.expert_gtp_weight_remat_size
         if get_device_arch_version() >= 10:
