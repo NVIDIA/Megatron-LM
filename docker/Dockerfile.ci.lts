@@ -71,14 +71,16 @@ EOF
 #
 # These used to live in `[project.optional-dependencies].lts` in pyproject.toml,
 # but were moved out so pyproject.toml can host meaningful per-module
-# extras. The pinned set lives in `docker/lts/requirements.txt` and is reviewed
-# at LTS bump time only.
+# extras. Most of the pinned set lives in `docker/lts/requirements.txt` and is
+# reviewed at LTS bump time only. Transformer Engine is installed separately
+# because its source extension needs the existing PyTorch/CUDA build environment.
 COPY docker/lts/requirements.txt /workspace/docker/lts/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
-    uv pip install --no-build-isolation-package transformer-engine \
-        -r /workspace/docker/lts/requirements.txt
+    uv pip install -r /workspace/docker/lts/requirements.txt
+    uv pip install --no-build-isolation \
+        "transformer-engine[pytorch,core_cu13]==2.17.0"
 EOF
 
 # Install DeepEP
