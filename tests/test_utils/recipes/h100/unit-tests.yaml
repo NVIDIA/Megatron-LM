@@ -39,6 +39,10 @@ spec:
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
 
+    if [[ "$BUCKET" == tests/unit_tests/distributed/mfsdp_v2/* ]]; then
+        export USE_MFSDP_V2=1
+    fi
+
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
     else
