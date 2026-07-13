@@ -64,11 +64,22 @@ class InferenceStepTracer:
         prefill: int,
         decode: int,
         active_tokens: int,
+        kv_blocks_used: Optional[int] = None,
+        kv_blocks_total: Optional[int] = None,
+        mamba_slots_used: Optional[int] = None,
+        mamba_slots_total: Optional[int] = None,
+        max_requests: Optional[int] = None,
     ) -> None:
         """Append one step's batch-size record (subject to the stride).
 
         ``dt`` = wall-clock seconds since the previous recorded step (``None``
         first); at stride 1 it is the preceding step's duration. No GPU sync.
+
+        ``kv_blocks_*`` / ``mamba_slots_*`` expose the live utilization of the two
+        memory pools (attention KV blocks vs. mamba state slots); ``max_requests`` is
+        the derived concurrency ceiling. Together they say which pool binds, i.e. how
+        to tune ``buffer-size-gb`` and ``mamba-memory-ratio``. ``None`` when
+        unavailable (e.g. a non-hybrid model has no mamba pool).
         """
         if step % self.stride != 0:
             return
@@ -87,6 +98,11 @@ class InferenceStepTracer:
             "prefill": int(prefill),
             "decode": int(decode),
             "active_tokens": int(active_tokens),
+            "kv_blocks_used": None if kv_blocks_used is None else int(kv_blocks_used),
+            "kv_blocks_total": None if kv_blocks_total is None else int(kv_blocks_total),
+            "mamba_slots_used": None if mamba_slots_used is None else int(mamba_slots_used),
+            "mamba_slots_total": None if mamba_slots_total is None else int(mamba_slots_total),
+            "max_requests": None if max_requests is None else int(max_requests),
         }
         for callback in self._callbacks:
             record.update(callback())

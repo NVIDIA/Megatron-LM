@@ -563,6 +563,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.num_speculative_tokens > 0:
             self.max_kv_block_count += 1
 
+        # Persist the mamba slot capacity for downstream telemetry (pool-utilization
+        # logging). float('inf') for non-hybrid models (no mamba state).
+        self.mamba_max_requests = mamba_max_requests
+
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.

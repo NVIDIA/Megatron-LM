@@ -16,7 +16,7 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --${PRECISION:-bf16} \
     --te-rng-tracker \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --inference-dynamic-batching-buffer-size-gb ${INFERENCE_BUFFER_SIZE_GB:-80} \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \
