@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import gc
+import hashlib
 import inspect
 import itertools
 import logging
@@ -899,6 +900,10 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
         self._lifetime_events = []  # [(op, bucket_id)] with op in {'claim', 'alloc', 'free'}
         self._recording_lifetimes = True
         self._plan = None  # {bucket_id: color}
+        # Stable digest of the frozen logical plan. The digest intentionally
+        # excludes process-local namespaces and data pointers so equivalent
+        # ranks/runs can compare it directly.
+        self._plan_checksum = None
         self._slot_using = {}  # {(color, bucket_offset): bucket_id}
         # Exact allocation sizes/dtypes observed during the recording window.
         # allocate() receives the padded bucket size, so these are ground
@@ -921,6 +926,212 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
 
     def _get_planned_buf_name(self, color: int, bucket_offset: int) -> str:
         return f"{self.name}_planned_{color}_{bucket_offset}"
+
+    @property
+    def storage_kind(self) -> str:
+        """Return the stable logical role represented by this allocator."""
+        if self.name.endswith("_fsdp_fp8_transpose_params"):
+            return "transpose_weight"
+        if self.name.endswith("_fsdp_params"):
+            return "weight"
+        if self.name.endswith("_fsdp_grads"):
+            return "main_grad"
+        return "unknown"
+
+    def _logical_slots(self) -> Dict[Tuple[int, int], List[int]]:
+        """Return the frozen slot membership without touching allocator state."""
+        slots = defaultdict(list)
+        for bucket_id, color in (self._plan or {}).items():
+            slots[(color, self._bucket_offset(bucket_id))].append(bucket_id)
+        return {slot: sorted(bucket_ids) for slot, bucket_ids in slots.items()}
+
+    def _compute_plan_checksum(self) -> str:
+        """Hash the logical plan without process-local names or addresses."""
+        digest = hashlib.sha256()
+        digest.update(b"megatron-fsdp-planned-bucket-v1\n")
+        digest.update(f"storage_kind={self.storage_kind}\n".encode())
+        for bucket_id, color in sorted((self._plan or {}).items()):
+            digest.update(
+                f"bucket={bucket_id}|color={color}|offset={self._bucket_offset(bucket_id)}\n".encode()
+            )
+        for slot in sorted(self._logical_slots()):
+            materialization = self._slot_materialization.get(slot)
+            if materialization is None:
+                dtype, capacity = "unmaterialized", "unmaterialized"
+            else:
+                dtype, capacity, _ = materialization
+            digest.update(
+                f"slot={slot[0]},{slot[1]}|dtype={dtype}|capacity={capacity}\n".encode()
+            )
+        return digest.hexdigest()
+
+    @staticmethod
+    def _summarize_materialized_storages(slots: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Return unique storage count and bytes without allocating tensors."""
+        storage_bytes = {}
+        for slot in slots:
+            data_ptr = slot["data_ptr"]
+            if data_ptr is None:
+                continue
+            storage_bytes[data_ptr] = max(
+                storage_bytes.get(data_ptr, 0), slot["materialized_bytes"]
+            )
+        return len(storage_bytes), sum(storage_bytes.values())
+
+    def get_plan_diagnostics(self) -> Dict[str, Any]:
+        """Return a deterministic, read-only snapshot of the frozen plan.
+
+        Materialized bytes are counted once per unique backing storage rather
+        than once per bucket sharing that storage. Calling this method performs
+        no tensor or GlobalMemoryBuffer allocations and does not mutate the
+        allocator.
+        """
+        bucket_to_slot = [
+            {
+                "bucket_id": bucket_id,
+                "color": color,
+                "bucket_offset": self._bucket_offset(bucket_id),
+            }
+            for bucket_id, color in sorted((self._plan or {}).items())
+        ]
+
+        slots = []
+        for (color, bucket_offset), bucket_ids in sorted(self._logical_slots().items()):
+            slot = (color, bucket_offset)
+            materialization = self._slot_materialization.get(slot)
+            if materialization is None:
+                dtype = "unmaterialized"
+                capacity = 0
+                data_ptr = None
+                materialized_bytes = 0
+            else:
+                materialized_dtype, capacity, data_ptr = materialization
+                dtype = str(materialized_dtype)
+                materialized_bytes = capacity * materialized_dtype.itemsize
+            slots.append(
+                {
+                    "color": color,
+                    "bucket_offset": bucket_offset,
+                    "bucket_ids": bucket_ids,
+                    "dtype": dtype,
+                    "capacity_elements": capacity,
+                    "data_ptr": data_ptr,
+                    "materialized_bytes": materialized_bytes,
+                    "occupant_bucket_id": self._slot_using.get(slot),
+                }
+            )
+
+        dtype_groups = defaultdict(list)
+        offset_dtype_groups = defaultdict(list)
+        for slot in slots:
+            dtype_groups[slot["dtype"]].append(slot)
+            offset_dtype_groups[(slot["bucket_offset"], slot["dtype"])].append(slot)
+
+        def summarize(group_slots):
+            unique_storage_count, materialized_bytes = self._summarize_materialized_storages(
+                group_slots
+            )
+            return {
+                "planned_bucket_count": sum(len(slot["bucket_ids"]) for slot in group_slots),
+                "distinct_color_id_count": len({slot["color"] for slot in group_slots}),
+                "slot_count": len(group_slots),
+                "unique_storage_count": unique_storage_count,
+                "capacity_elements": sum(slot["capacity_elements"] for slot in group_slots),
+                "materialized_bytes": materialized_bytes,
+            }
+
+        dtype_summaries = []
+        for dtype, group_slots in sorted(dtype_groups.items()):
+            dtype_summaries.append(
+                {"storage_kind": self.storage_kind, "dtype": dtype, **summarize(group_slots)}
+            )
+
+        offset_dtype_summaries = []
+        for (bucket_offset, dtype), group_slots in sorted(offset_dtype_groups.items()):
+            offset_dtype_summaries.append(
+                {
+                    "storage_kind": self.storage_kind,
+                    "bucket_offset": bucket_offset,
+                    "dtype": dtype,
+                    **summarize(group_slots),
+                }
+            )
+
+        unique_storage_count, materialized_bytes = self._summarize_materialized_storages(slots)
+        colors_by_offset = defaultdict(set)
+        for entry in bucket_to_slot:
+            colors_by_offset[entry["bucket_offset"]].add(entry["color"])
+        color_counts_by_offset = [
+            {"bucket_offset": offset, "color_count": len(colors)}
+            for offset, colors in sorted(colors_by_offset.items())
+        ]
+        return {
+            "allocator_name": self.name,
+            "storage_kind": self.storage_kind,
+            "plan_checksum": self._plan_checksum,
+            "plan_checksum_scope": "freeze-time-plan-and-materialization",
+            "planned_bucket_count": len(bucket_to_slot),
+            "color_counts_by_offset": color_counts_by_offset,
+            "max_color_count_per_offset": max(
+                (entry["color_count"] for entry in color_counts_by_offset), default=0
+            ),
+            "total_color_count_across_offsets": sum(
+                entry["color_count"] for entry in color_counts_by_offset
+            ),
+            "logical_slot_count": len(slots),
+            "materialized_slot_count": sum(slot["data_ptr"] is not None for slot in slots),
+            "occupied_slot_count": sum(
+                slot["occupant_bucket_id"] is not None for slot in slots
+            ),
+            "unique_storage_count": unique_storage_count,
+            "materialized_bytes": materialized_bytes,
+            "dtype_summaries": dtype_summaries,
+            "offset_dtype_summaries": offset_dtype_summaries,
+            "bucket_to_slot": bucket_to_slot,
+            "slots": slots,
+        }
+
+    def _log_plan_diagnostics(self) -> None:
+        """Log a compact rank-zero summary and per-rank DEBUG details."""
+        diagnostics = self.get_plan_diagnostics()
+        dtype_summary = ",".join(
+            f"{summary['dtype']}:slots={summary['slot_count']}:"
+            f"capacity={summary['capacity_elements']}:bytes={summary['materialized_bytes']}"
+            for summary in diagnostics["dtype_summaries"]
+        )
+        color_summary = ",".join(
+            f"{summary['bucket_offset']}:{summary['color_count']}"
+            for summary in diagnostics["color_counts_by_offset"]
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "[FSDP][PlannedBucketAllocator] storage_kind=%s buckets=%d max_colors_per_offset=%d "
+            "colors_by_offset=%s slots=%d occupied_slots=%d storages=%d materialized_bytes=%d "
+            "plan_checksum=%s dtypes=%s",
+            diagnostics["storage_kind"],
+            diagnostics["planned_bucket_count"],
+            diagnostics["max_color_count_per_offset"],
+            color_summary or "none",
+            diagnostics["materialized_slot_count"],
+            diagnostics["occupied_slot_count"],
+            diagnostics["unique_storage_count"],
+            diagnostics["materialized_bytes"],
+            diagnostics["plan_checksum"],
+            dtype_summary or "none",
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[FSDP][PlannedBucketAllocator] allocator=%s bucket_to_slot=%s",
+                self.name,
+                diagnostics["bucket_to_slot"],
+            )
+            for slot in diagnostics["slots"]:
+                logger.debug(
+                    "[FSDP][PlannedBucketAllocator] allocator=%s slot=%s",
+                    self.name,
+                    slot,
+                )
 
     def _record_lifetime_start(
         self, op: str, bucket_id: int, size: int, dtype: torch.dtype
@@ -1133,9 +1344,12 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
         """
         eligible = sorted(graph_bucket_ids)
         if not eligible:
-            if self._plan is None:
-                self._plan = {}
+            if self._plan is not None:
+                return
+            self._plan = {}
+            self._plan_checksum = self._compute_plan_checksum()
             self.stop_recording()
+            self._log_plan_diagnostics()
             return
         if self._plan is not None:
             missing = [b for b in eligible if b not in self._plan]
@@ -1215,7 +1429,9 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
             self._materialize_slot(slot, max_size, dtype)
 
         self._plan = plan
+        self._plan_checksum = self._compute_plan_checksum()
         self.stop_recording()
+        self._log_plan_diagnostics()
 
 
 class DataParallelBuffer:
