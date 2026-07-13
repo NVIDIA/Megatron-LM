@@ -58,19 +58,18 @@ _SEED = 1234
 #   forward output.
 #
 # Each constant covers the worst case across the whole parametrization for its
-# (path, direction) bucket. Values sit ~1.3-2.5x above the measured worst-case
-# drift over the full matrix (variant x ratio x seqlen x segment-layout); the
-# forward buckets have wide headroom (the layer output is a well-averaged
-# quantity), the backward buckets are near their physical floor:
+# (path, direction) bucket. The previous 2e-2 fused-backward budget covered
+# ``attn_sink`` drift caused by an in-place inverse RoPE mutation of the output
+# retained for DSA backward. With that output preserved by #5526, the remaining
+# backward floor is set by compressor / indexer gradients:
 #   * fused-fwd    worst ~8e-4  (layer ``out``)                       -> 2e-3
-#   * fused-bwd    worst ~1.6e-2 (``core_attention.attn_sink`` — a per-head
-#                  scalar grad with no spatial averaging; the binding param)  -> 2e-2
+#   * fused-bwd    compressor / indexer grads, ratio > 1             -> 3e-3
 #   * unfused-fwd  worst ~7e-4  (layer ``out``)                       -> 1.5e-3
 #   * unfused-bwd  worst ~2e-3  (compressor / indexer grads, ratio > 1) -> 3e-3
 # A real positioning/aggregation regression collapses cosine far below these
 # floors, so the budgets still trip on genuine bugs.
 _FUSED_FWD_SIMILARITY_EPS = 2e-3
-_FUSED_BWD_SIMILARITY_EPS = 2e-2
+_FUSED_BWD_SIMILARITY_EPS = 3e-3
 _UNFUSED_FWD_SIMILARITY_EPS = 1.5e-3
 _UNFUSED_BWD_SIMILARITY_EPS = 3e-3
 
