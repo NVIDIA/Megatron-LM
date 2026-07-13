@@ -378,15 +378,26 @@ def test_overlaps_communication_and_compute(distributed_setup):
     assert all_gather_streams.isdisjoint(gemm_streams)
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
-    assert any(
-        _events_overlap(all_gather_event, gemm_event)
+    all_gather_overlap_count = sum(
+        any(_events_overlap(all_gather_event, gemm_event) for gemm_event in gemm_events)
         for all_gather_event in all_gather_events
-        for gemm_event in gemm_events
     )
-    assert any(
-        _events_overlap(reduce_scatter_event, gemm_event)
+    reduce_scatter_overlap_count = sum(
+        any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
         for reduce_scatter_event in reduce_scatter_events
-        for gemm_event in gemm_events
+    )
+    # Forward pipelines each child after the first across the previous child's
+    # GEMM. Backward pipelines each completed child's reduce-scatter across the
+    # preceding child's GEMM.
+    expected_all_gather_overlap_count = num_children - 1
+    expected_reduce_scatter_overlap_count = num_children - 1
+    assert all_gather_overlap_count >= expected_all_gather_overlap_count, (
+        f"Expected at least {expected_all_gather_overlap_count} all-gather events to overlap "
+        f"compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
+    )
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
+        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatter events to "
+        f"overlap compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
 
 

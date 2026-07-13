@@ -71,7 +71,6 @@ class FsdpContext:
         self.delayed_releases = deque()
         self.prepared_reductions = deque()
         self.pending_reductions = deque()
-        self._post_backward_callback_queued = False
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -117,35 +116,27 @@ class FsdpContext:
                     )
                 )
 
-    def queue_post_backward_callback(self) -> None:
-        """Queue a final callback to order default-stream consumers after reduction."""
-        if self._post_backward_callback_queued:
-            return
+    def register_post_backward_final_callback(self) -> None:
+        """Register this root context's final callback for the current backward.
 
-        self._post_backward_callback_queued = True
-        try:
-            torch.autograd.Variable._execution_engine.queue_callback(
-                self.finalize_pending_reductions
-            )
-        except RuntimeError as error:
-            self._post_backward_callback_queued = False
-            if str(error) != "Final callbacks can only be installed during backward pass.":
-                raise
-            self.finalize_pending_reductions()
+        Root ``post_backward()`` means only that root-owned parameters have
+        accumulated gradients; it may run before descendant reductions. Waiting
+        at autograd completion orders consumers after every descendant reduction.
+        """
+        torch.autograd.Variable._execution_engine.queue_callback(
+            self.finalize_pending_reductions
+        )
 
     def finalize_pending_reductions(self) -> None:
         """Wait for scheduled reductions and release their temporary buffers."""
-        try:
-            self.launch_prepared_reductions()
-            if not self.pending_reductions:
-                return
+        self.launch_prepared_reductions()
+        if not self.pending_reductions:
+            return
 
-            current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
-            current_stream.wait_stream(self.reduce_scatter_stream)
-            with torch.cuda.stream(self.reduce_scatter_stream):
-                self.pending_reductions.clear()
-        finally:
-            self._post_backward_callback_queued = False
+        current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
+        current_stream.wait_stream(self.reduce_scatter_stream)
+        with torch.cuda.stream(self.reduce_scatter_stream):
+            self.pending_reductions.clear()
 
 
 class FsdpModule:
@@ -311,6 +302,8 @@ class FsdpModule:
     def pre_backward(self) -> None:
         """Prepare full parameters for backward compute."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        if self.is_root():
+            self.context.register_post_backward_final_callback()
         self._unshard_parameter_groups(sync_model_weight=False)
         self.context.launch_prepared_reductions()
 
@@ -327,7 +320,6 @@ class FsdpModule:
     def _reduce_gradient_groups(self) -> None:
         context = self.context
         current_stream = torch.cuda.current_stream(context.reduce_scatter_stream.device)
-        scheduled_reduction = False
         for group in self._parameter_groups:
             if group.requires_grad:
                 with torch.cuda.stream(context.reduce_scatter_stream):
@@ -339,10 +331,6 @@ class FsdpModule:
                 context.enqueue_prepared_reduction(
                     PreparedReduction(group=group, partial_grad=partial_grad)
                 )
-                scheduled_reduction = True
-
-        if scheduled_reduction:
-            context.queue_post_backward_callback()
 
     def release_unsharded_storage(self) -> None:
         """Release unsharded storage owned by this FSDP unit."""
