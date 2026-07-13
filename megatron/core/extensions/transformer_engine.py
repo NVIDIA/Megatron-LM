@@ -407,7 +407,7 @@ def _gtp_pre_init(
     ), f"_gtp_pre_init: output_size={output_size} not divisible by out_split_size={out_split_size}"
     per_rank, pad_length = gtp_remat_shard_dim0(output_size // out_split_size, gtp_remat_group)
     shard_out = per_rank * out_split_size
-    gtp_ctx = (gtp_remat_group, pad_length, gtp_remat_group.size(), output_size)
+    gtp_ctx = (gtp_remat_group, pad_length, output_size)
 
     tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
     if rng_via_kwarg:
@@ -424,8 +424,7 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     """
     from megatron.core.tensor_parallel.gtp import attach_gtp_to_presharded_module
 
-    gtp_remat_group, pad_length, gtp_remat_size, logical_out_features = gtp_ctx
-    module.gtp_remat_size = gtp_remat_size  # the TE-fork forward all-gather gate
+    gtp_remat_group, pad_length, logical_out_features = gtp_ctx
     # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
@@ -1326,7 +1325,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
@@ -1448,7 +1451,11 @@ class TEColumnParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
@@ -1693,7 +1700,11 @@ class TERowParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else "")
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
@@ -2539,9 +2550,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 super().backward_dw()
 
         def __repr__(self):
-            gtp_str = (
-                f", GTP_remat={self.gtp_remat_size}" if hasattr(self, "gtp_remat_size") else ""
-            )
+            gtp_remat = getattr(getattr(self, "weight0", None), "gtp_remat_size", None)
+            gtp_str = f", GTP_remat={gtp_remat}" if gtp_remat is not None else ""
             return (
                 f"{type(self).__name__}(per expert(["
                 f"in={self.in_features}, out={self.out_features}]) "

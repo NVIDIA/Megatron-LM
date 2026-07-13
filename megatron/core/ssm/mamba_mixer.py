@@ -1368,7 +1368,7 @@ class MambaMixer(MegatronModule):
         # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
         # (strip the trailing pad rows from the gathered tail) and fall through to the same
         # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
-        in_proj_gtp_remat_size = getattr(self.in_proj, "gtp_remat_size", 1)
+        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
         if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
             gtp_remat_group = self.in_proj.weight.group
             # in_proj.weight was already built at the sharded size by the submodule

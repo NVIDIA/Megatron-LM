@@ -759,6 +759,11 @@ class GTPShardedParam(torch.nn.Parameter):
     tickets, and the metadata the integrator needs to overlap with captured compute.
     """
 
+    # TransformerEngine DistributedWeight protocol (see te.pytorch.distributed_weight).
+    # `is_distributed_weight` is the capability marker TE dispatches on; no other
+    # GTP-specific state leaks to TE.
+    is_distributed_weight: bool = True
+
     # Per-chain linked-list state, keyed by chain_id; chains never cross-link (prev_w/next_w join
     # only same-chain params). Call reset_gtp_state() before rebuilding a GTP model in-process.
     _chain_state: Dict[str, dict] = {}
@@ -968,7 +973,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         return tensor[: -self.pad_length]
 
-    def _all_gather_weight(self, async_op, skip_weight_cast, cast_noop_flag, fwd, nvtx_label=None):
+    def _all_gather_weight(self, async_op, fwd, nvtx_label=None):
         """Quantize (if needed) and all-gather weight. Returns (weight_total, handle)."""
         if nvtx_label is None:
             nvtx_label = (
@@ -1103,22 +1108,14 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._prefetch_handle = None
                 self.ag_event.record()
 
-    def _all_gather_weight_on_demand(self, fwd, skip_weight_cast=False, cast_noop_flag=None):
-        result, _ = self._all_gather_weight(
-            async_op=False,
-            skip_weight_cast=skip_weight_cast,
-            cast_noop_flag=cast_noop_flag,
-            fwd=fwd,
-        )
+    def _all_gather_weight_on_demand(self, fwd):
+        result, _ = self._all_gather_weight(async_op=False, fwd=fwd)
         result = result if self.is_routed_expert else [result]
         result = [self._strip_padding(r) for r in result]
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
-    def _get_prefetched_weight(self, fwd, skip_weight_cast=False, cast_noop_flag=None):
-        # ``skip_weight_cast`` and ``cast_noop_flag`` are accepted to keep the
-        # signature symmetric with ``_all_gather_weight_on_demand``.
-        del skip_weight_cast, cast_noop_flag
+    def _get_prefetched_weight(self, fwd):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
         if GTP_CONFIG.check_param_states:
@@ -1171,13 +1168,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight skips the
         # AG-state transition under recompute, so target's dgrad state is untouched; result lands
         # in target._ag_ticket_fwd.
-        _, handle = target._all_gather_weight(
-            async_op=True,
-            skip_weight_cast=True,
-            cast_noop_flag=None,
-            fwd=True,
-            nvtx_label=nvtx_label,
-        )
+        _, handle = target._all_gather_weight(async_op=True, fwd=True, nvtx_label=nvtx_label)
         target._recompute_prefetch_handle = handle
 
     def _get_recompute_prefetched_weight(self):
@@ -1212,9 +1203,9 @@ class GTPShardedParam(torch.nn.Parameter):
         """
 
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
-            result = self._get_prefetched_weight(False, skip_weight_cast=True)
+            result = self._get_prefetched_weight(False)
         else:
-            result = self._all_gather_weight_on_demand(False, skip_weight_cast=True)
+            result = self._all_gather_weight_on_demand(False)
 
         if (
             GTP_CONFIG.weight_prefetch
@@ -1225,11 +1216,7 @@ class GTPShardedParam(torch.nn.Parameter):
             # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
             # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
             _, handle = self.prev_w._all_gather_weight(
-                async_op=True,
-                skip_weight_cast=True,
-                cast_noop_flag=None,
-                fwd=False,
-                nvtx_label=nvtx_label,
+                async_op=True, fwd=False, nvtx_label=nvtx_label
             )
             self.prev_w._prefetch_handle = handle
 
@@ -1250,13 +1237,7 @@ class GTPShardedParam(torch.nn.Parameter):
         assert self.is_routed_expert and self.weight_list is not None
         return self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
 
-    def all_gather_and_prefetch(
-        self,
-        fwd: bool = True,
-        skip_weight_cast: bool = False,
-        cast_noop_flag: torch.Tensor = None,
-        nvtx_label: str = None,
-    ):
+    def all_gather_and_prefetch(self, fwd: bool = True, nvtx_label: str = None):
         """All-gather the current weight and async-prefetch the next.
 
         Returns:
@@ -1272,10 +1253,10 @@ class GTPShardedParam(torch.nn.Parameter):
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
         elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
-            result = self._get_prefetched_weight(True, skip_weight_cast, cast_noop_flag)
+            result = self._get_prefetched_weight(True)
         else:
             # On-demand: chain head (fwd or recompute global-first) or first-iter build.
-            result = self._all_gather_weight_on_demand(True, skip_weight_cast, cast_noop_flag)
+            result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.
         if (
@@ -1293,11 +1274,7 @@ class GTPShardedParam(torch.nn.Parameter):
             # Pre-AG work on caller; NCCL wrap lives at the collective site
             # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
             _, handle = self.next_w._all_gather_weight(
-                async_op=True,
-                skip_weight_cast=skip_weight_cast,
-                cast_noop_flag=cast_noop_flag,
-                fwd=fwd,
-                nvtx_label=nvtx_label,
+                async_op=True, fwd=fwd, nvtx_label=nvtx_label
             )
             self.next_w._prefetch_handle = handle
 
@@ -1574,6 +1551,29 @@ class GTPShardedParam(torch.nn.Parameter):
         """Batched version of wgrad_reduce_scatter."""
         assert self.is_routed_expert and self.weight_list is not None
         return self.wgrad_reduce_scatter(wgrad_list, nvtx_label=nvtx_label)
+
+    # ------------------------------------------------------------------
+    # TransformerEngine DistributedWeight protocol. TE's fwd/bwd dispatch through these generic
+    # names (see te.pytorch.distributed_weight.materialize_weights_for_forward et al.). The leader
+    # param encapsulates the whole group via self._weights, so a single call covers both the Linear
+    # (one weight) and GroupedLinear (routed-expert list) cases; the underlying methods already
+    # return a single tensor or a list accordingly. These are thin adapters over the GTP methods.
+    # ------------------------------------------------------------------
+    def materialize_group_for_forward(self):
+        """Protocol: all-gather the group's shard(s) for the forward GEMM."""
+        return self.all_gather_and_prefetch(fwd=True)
+
+    def materialize_group_for_backward(self, nvtx_label=None):
+        """Protocol: re-materialize the group's weight(s) for the backward GEMMs."""
+        return self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
+
+    def finalize_group_grads(self, wgrads, nvtx_label=None):
+        """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
+        return self.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)
+
+    def grad_buffer(self):
+        """Protocol: the wgrad accumulation scratch buffer for this weight."""
+        return self.get_wgrad_tensor()
 
     def get_data_tensors(self):
         """Expose self as the lone data tensor for TE's offload-marking interface.
