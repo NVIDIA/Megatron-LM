@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import itertools
 import logging
 import math
 import traceback
@@ -14,7 +15,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -45,6 +46,22 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Standalone users do not have Megatron-LM's model-chunk wiring available. A
+# process-local sequence still keeps their GlobalMemoryBuffer names disjoint.
+# These names are local dictionary keys and do not need to match across ranks;
+# matching FSDP model and collective ordering is an independent requirement.
+_PARAM_AND_GRAD_BUFFER_INSTANCE_IDS = itertools.count()
+
+
+def _get_allocator_namespace(module: torch.nn.Module) -> str:
+    """Return the process-local namespace for one parameter-and-gradient buffer."""
+    instance_id = next(_PARAM_AND_GRAD_BUFFER_INSTANCE_IDS)
+    namespace = getattr(module, '_megatron_fsdp_buffer_namespace', None)
+    if namespace is not None:
+        return f"{namespace}_param_and_grad_buffer_{instance_id}"
+    return f"param_and_grad_buffer_{instance_id}"
 
 
 def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
@@ -823,6 +840,362 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             # If not managed by fixed pool allocator, delegate to the backup allocator.
             logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
             self.backup_allocator.free(bucket_id)
+
+
+
+class PlannedBucketAllocator(TemporaryBucketAllocator):
+    """Serve buckets from lifetime-planned, address-frozen slots.
+
+    Decorator over any base ``TemporaryBucketAllocator``: buckets covered by a
+    frozen plan (e.g. those whose addresses are baked into CUDA graphs) always
+    resolve to the same pre-materialized named slot, while every other bucket
+    falls through to the wrapped base allocator. The supported Megatron-FSDP TE
+    graph configuration uses the default eager base allocator; combining planned
+    allocation with ``fsdp_double_buffer`` is rejected. The decorator itself
+    remains allocator-agnostic for standalone use.
+
+    Lifecycle:
+      1. Until ``freeze_plan`` is called, allocate/free order and exact
+         (padded) allocation sizes are recorded.
+      2. ``freeze_plan(graph_bucket_ids)`` colors the recorded lifetimes
+         (colormates never overlap and share a dtype), pre-materializes each
+         slot at its colormates' observed maximum size, and freezes the
+         ``bucket -> (color, offset)`` assignment.
+      3. Planned buckets resolve in O(1) to their frozen slot; a same-color
+         occupancy conflict or an over-capacity request raises — never a
+         silent fallback, since graphs read the baked addresses blindly.
+
+    Args:
+        name: Process-unique prefix for named GlobalMemoryBuffer slots.
+        base: Allocator used for buckets outside the frozen plan.
+        fsdp_param_groups: Parameter-group metadata indexed by bucket ID.
+        mem_alloc_context: Optional context factory used when a planned slot is
+            first materialized, including during ``freeze_plan``.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        base: TemporaryBucketAllocator,
+        fsdp_param_groups: List["ParameterGroup"],
+        mem_alloc_context: Callable | None = None,
+    ) -> None:
+        self.name = name
+        self.base = base
+        self.fsdp_param_groups = fsdp_param_groups
+        self.mem_alloc_context = mem_alloc_context
+
+        # Stable bucket offset within each FSDP unit, precomputed for O(1) lookup.
+        bucket_offsets = {}
+        next_offset = defaultdict(int)
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            if param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None:
+                bucket_offsets[bucket_id] = 0
+                continue
+            bucket_offsets[bucket_id] = next_offset[param_group.fsdp_unit_id]
+            next_offset[param_group.fsdp_unit_id] += 1
+        self._bucket_offsets = bucket_offsets
+
+        self._lifetime_events = []  # [(op, bucket_id)] with op in {'alloc', 'free'}
+        self._recording_lifetimes = True
+        self._plan = None  # {bucket_id: color}
+        self._slot_using = {}  # {(color, bucket_offset): bucket_id}
+        # Exact allocation sizes/dtypes observed during the recording window.
+        # allocate() receives the padded bucket size, so these are ground
+        # truth (no padding-rule prediction involved).
+        self._observed_alloc_meta = {}  # {bucket_id: (size, dtype)}
+        # Frozen identity per materialized slot. This also protects fused
+        # wgrad main_grad buffers, which are not visible through
+        # Module.named_parameters() and therefore cannot be covered by the
+        # module-level parameter-address replay guard.
+        self._slot_materialization = {}  # {slot: (dtype, capacity, data_ptr)}
+        # Buckets whose pre-plan base-allocator state has been released.
+        self._base_released = set()
+
+    def _bucket_offset(self, bucket_id: int) -> int:
+        return self._bucket_offsets[bucket_id]
+
+    def _observed_dtype(self, bucket_id: int):
+        meta = self._observed_alloc_meta.get(bucket_id)
+        return meta[1] if meta else None
+
+    def _get_planned_buf_name(self, color: int, bucket_offset: int) -> str:
+        return f"{self.name}_planned_{color}_{bucket_offset}"
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        """Resolve a planned bucket to its frozen slot, else delegate to base."""
+        if self._plan is not None and bucket_id in self._plan:
+            return self._allocate_planned(bucket_id, size, dtype, device, mem_alloc_context)
+        if self._recording_lifetimes:
+            self._lifetime_events.append(('alloc', bucket_id))
+            observed = self._observed_alloc_meta.get(bucket_id)
+            if observed is not None and observed[1] != dtype:
+                raise RuntimeError(
+                    f"[FSDP][{self.name}] bucket {bucket_id} changed dtype during "
+                    f"planned-allocation warmup: {observed[1]} -> {dtype}."
+                )
+            max_size = max(size, observed[0]) if observed is not None else size
+            self._observed_alloc_meta[bucket_id] = (max_size, dtype)
+        return self.base.allocate(
+            bucket_id=bucket_id,
+            size=size,
+            dtype=dtype,
+            device=device,
+            mem_alloc_context=mem_alloc_context,
+        )
+
+    def free(self, bucket_id: int):
+        """Release a planned bucket's slot, else delegate to base."""
+        if self._plan is not None and bucket_id in self._plan:
+            slot = (self._plan[bucket_id], self._bucket_offset(bucket_id))
+            if self._slot_using.get(slot) == bucket_id:
+                del self._slot_using[slot]
+            # Release any pre-plan base-allocator state exactly once.
+            if bucket_id not in self._base_released:
+                self._base_released.add(bucket_id)
+                self.base.free(bucket_id)
+            return
+        if self._recording_lifetimes:
+            self._lifetime_events.append(('free', bucket_id))
+        self.base.free(bucket_id)
+
+    def stop_recording(self) -> None:
+        """Stop observing bucket lifetimes and release all observation metadata."""
+        self._recording_lifetimes = False
+        self._lifetime_events.clear()
+        self._observed_alloc_meta.clear()
+
+    def _effective_mem_alloc_context(
+        self, mem_alloc_context: Callable | None = None
+    ) -> Callable | None:
+        return mem_alloc_context if mem_alloc_context is not None else self.mem_alloc_context
+
+    def _materialize_slot(
+        self,
+        slot: Tuple[int, int],
+        size: int,
+        dtype: torch.dtype,
+        mem_alloc_context: Callable | None = None,
+    ) -> torch.Tensor:
+        """Materialize or verify one address-frozen GlobalMemoryBuffer slot."""
+        materialization = self._slot_materialization.get(slot)
+        if materialization is not None:
+            frozen_dtype, capacity, _ = materialization
+            if dtype != frozen_dtype:
+                raise RuntimeError(
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned "
+                    f"slot {slot} was materialized with dtype {frozen_dtype} but is now "
+                    f"requested with dtype {dtype}. Refusing to create a second physical "
+                    "buffer for one logical graph slot."
+                )
+            if size > capacity:
+                raise RuntimeError(
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned "
+                    f"slot {slot} materialized at {capacity} elements but now requests "
+                    f"{size}. Growing the named buffer would MOVE its storage and invalidate "
+                    "graph-baked addresses. Refusing."
+                )
+
+        data = get_global_memory_buffer().get_tensor(
+            [size],
+            dtype=dtype,
+            name=self._get_planned_buf_name(*slot),
+            mem_alloc_context=self._effective_mem_alloc_context(mem_alloc_context),
+        )
+        data_ptr = data.data_ptr()
+        if materialization is None:
+            self._slot_materialization[slot] = (dtype, size, data_ptr)
+        else:
+            _, capacity, frozen_data_ptr = materialization
+            if data_ptr != frozen_data_ptr:
+                raise RuntimeError(
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned "
+                    f"slot {slot} moved from address {frozen_data_ptr:#x} to {data_ptr:#x}. "
+                    "CUDA graphs may have baked the old address; refusing replay."
+                )
+        return data
+
+    def _allocate_planned(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        color = self._plan[bucket_id]
+        bucket_offset = self._bucket_offset(bucket_id)
+        slot = (color, bucket_offset)
+        occupant = self._slot_using.get(slot)
+        if occupant is not None and occupant != bucket_id:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned slot "
+                f"conflict: bucket {bucket_id} needs slot {slot} but it is held by bucket "
+                f"{occupant}. The frozen lifetime plan does not cover the current "
+                f"allocation order (e.g. an eval/checkpoint schedule overlapping two "
+                f"same-color buckets). Refusing to fall back silently."
+            )
+        data = self._materialize_slot(slot, size, dtype, mem_alloc_context)
+        # Do not claim the slot until all capacity, dtype, and pointer checks
+        # have succeeded; a failed request must not poison later allocations.
+        self._slot_using[slot] = bucket_id
+        return Bucket(data=data)
+
+    def claim_graph_bucket(self, bucket_id: int, size: int, dtype: torch.dtype) -> None:
+        """Validate and claim a materialized slot before graph-baked writes.
+
+        Fused-wgrad Transformer Engine backward graphs write directly to the
+        main_grad address captured earlier and therefore bypass allocate().
+        Claiming the bucket immediately before replay checks that the frozen
+        slot is still materialized at the captured address and restores the
+        normal occupancy lifecycle for the later reduction/free.
+
+        Args:
+            bucket_id: Parameter-group bucket whose graph-baked slot is needed.
+            size: Current unsharded main-gradient bucket size.
+            dtype: Current main-gradient accumulation/communication dtype.
+
+        Raises:
+            RuntimeError: If the bucket is not planned or materialized, its slot
+                is occupied by a colormate, or its live size, dtype, or pointer
+                differs from the frozen materialization.
+        """
+        if self._plan is None or bucket_id not in self._plan:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] graph bucket "
+                f"{bucket_id} is not covered by the frozen planned-allocation map."
+            )
+
+        slot = (self._plan[bucket_id], self._bucket_offset(bucket_id))
+        occupant = self._slot_using.get(slot)
+        if occupant is not None and occupant != bucket_id:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned slot "
+                f"conflict: graph bucket {bucket_id} needs slot {slot} but it is held by "
+                f"bucket {occupant}. Refusing graph replay before it writes to an "
+                "occupied address."
+            )
+
+        materialization = self._slot_materialization.get(slot)
+        if materialization is None:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned slot "
+                f"{slot} for graph bucket {bucket_id} was not materialized before "
+                "Transformer Engine backward graph replay."
+            )
+
+        self._materialize_slot(slot, size, dtype)
+        # Repeated claims by parameters in the same bucket are idempotent, but
+        # still re-run the pointer check above.
+        self._slot_using[slot] = bucket_id
+
+    def freeze_plan(self, graph_bucket_ids: Iterable[int]) -> None:
+        """Color graph-covered buckets by recorded lifetimes and freeze the plan.
+
+        Buckets sharing a color never had overlapping live ranges in the
+        recorded (warmup) schedule and share a dtype, so they can share one
+        pre-materialized slot while every bucket keeps an iteration-stable
+        address for CUDA graph capture/replay.
+
+        Args:
+            graph_bucket_ids: Bucket IDs whose addresses are baked into graphs.
+
+        Raises:
+            RuntimeError: If a later call attempts to add buckets that were not
+                present in the already frozen plan.
+        """
+        eligible = sorted(graph_bucket_ids)
+        if not eligible:
+            if self._plan is None:
+                self._plan = {}
+            self.stop_recording()
+            return
+        if self._plan is not None:
+            missing = [b for b in eligible if b not in self._plan]
+            if missing:
+                raise RuntimeError(
+                    f"[FSDP][{self.name}] plan already frozen but new graph "
+                    f"buckets appeared: {missing}"
+                )
+            return
+
+        # Build per-bucket lifetime intervals from the recorded event order.
+        intervals = defaultdict(list)
+        open_t = {}
+        for t, (op, b) in enumerate(self._lifetime_events):
+            if op == 'alloc':
+                open_t.setdefault(b, t)
+            elif b in open_t:
+                intervals[b].append((open_t.pop(b), t))
+        tail = len(self._lifetime_events)
+        for b, t0 in open_t.items():
+            intervals[b].append((t0, tail))
+
+        # Conflict edges only matter between buckets at the same bucket_offset
+        # (different offsets never share a slot name).
+        plan = {}
+        by_offset = defaultdict(list)
+        for b in eligible:
+            by_offset[self._bucket_offset(b)].append(b)
+        for offset, buckets in by_offset.items():
+            def overlaps(x, y):
+                for s1, e1 in intervals.get(x, []):
+                    for s2, e2 in intervals.get(y, []):
+                        if s1 < e2 and s2 < e1:
+                            return True
+                return False
+
+            conflicts = {b: set() for b in buckets}
+            for i, x in enumerate(buckets):
+                for y in buckets[i + 1 :]:
+                    # A bucket never observed during recording conservatively
+                    # conflicts with everything at its offset. Colormates must
+                    # share a dtype (GlobalMemoryBuffer keys buffers by
+                    # (name, dtype): cross-dtype sharing is physically two
+                    # buffers, no benefit). Size differences are fine — slots
+                    # are pre-materialized below at the colormates' observed
+                    # maximum, so the named buffer never grows or moves.
+                    if (
+                        self._observed_dtype(x) != self._observed_dtype(y)
+                        or not intervals.get(x)
+                        or not intervals.get(y)
+                        or overlaps(x, y)
+                    ):
+                        conflicts[x].add(y)
+                        conflicts[y].add(x)
+            for b in sorted(buckets, key=lambda b: -len(conflicts[b])):
+                used = {plan[n] for n in conflicts[b] if n in plan}
+                color = 0
+                while color in used:
+                    color += 1
+                plan[b] = color
+
+        # Pre-materialize each slot at its colormates' observed maximum size so
+        # the named buffer is allocated exactly once and its address never
+        # changes; later (smaller) requests return [0:size] views of the same
+        # storage.
+        slot_members = defaultdict(list)
+        for b, color in plan.items():
+            slot_members[(color, self._bucket_offset(b))].append(b)
+        for slot, members in slot_members.items():
+            observed = [
+                self._observed_alloc_meta[b] for b in members if b in self._observed_alloc_meta
+            ]
+            if not observed:
+                continue  # lazily materialized on first allocate
+            max_size = max(sz for sz, _ in observed)
+            dtype = observed[0][1]
+            self._materialize_slot(slot, max_size, dtype)
+
+        self._plan = plan
+        self.stop_recording()
 
 
 class DataParallelBuffer:
@@ -1720,6 +2093,7 @@ class ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
         self.module = module
+        self._allocator_namespace = _get_allocator_namespace(module)
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
         self.mp_policy = mixed_precision_policy
@@ -2201,19 +2575,19 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params",
+                name=f"{self._allocator_namespace}_fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
-                name="fsdp_fp8_transpose_params",
+                name=f"{self._allocator_namespace}_fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads",
+                name=f"{self._allocator_namespace}_fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=(
@@ -2226,7 +2600,7 @@ class ParamAndGradBuffer:
                 # low-precision gradient communication over DP-Outer for H(F)SDP.
                 # Otherwise, this allocator will never be used.
                 self.hsdp_grad_comm_alloc = FixedPoolAllocator(
-                    name="hsdp_grad_comm",
+                    name=f"{self._allocator_namespace}_hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,
                     fallback_to_persistent_buffer=(

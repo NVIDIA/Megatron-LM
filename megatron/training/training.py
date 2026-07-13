@@ -2017,9 +2017,14 @@ def wrap_model_chunks_with_ddp(
 
     # Wrap each chunk.
     wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+    for chunk_idx, (chunk, layout, disable_bucketing) in enumerate(
+        zip(model_chunks, per_chunk_layouts, disable_bucketing_per_chunk)
     ):
+        # Give every virtual-pipeline model chunk a stable human-readable label.
+        # ParamAndGradBuffer appends a process-local unique ID for GlobalMemoryBuffer;
+        # that storage key need not match across ranks (collective ordering must).
+        if not hasattr(chunk, '_megatron_fsdp_buffer_namespace'):
+            chunk._megatron_fsdp_buffer_namespace = f"model_chunk_{chunk_idx}"
         chunk_kwargs = {}
         # TorchFSDP takes process_group, not pg_collection.
         if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
