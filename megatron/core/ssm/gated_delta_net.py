@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
@@ -81,6 +82,15 @@ class GatedDeltaNet(MegatronModule):
     GDN layer takes input with size [s, b, h]
     and returns output of the same size.
     """
+
+    # The FLA GDN kernels replay bitwise-identically under TE CUDA graphs in
+    # isolation (single-module fwd/dgrad/wgrad probe, 2026-07-06); the earlier
+    # "replays different values" exclusion did not reproduce on current
+    # TE/FLA. Full-layer capture is gated behind an env switch while in-situ
+    # validation matures: set MEGATRON_GDN_TE_CUDA_GRAPH=1 to capture GDN
+    # attention inside per-layer TE graphs (default keeps GDN eager and only
+    # the layer's MoE router/preprocess region is captured).
+    supports_te_cuda_graph = os.environ.get("MEGATRON_GDN_TE_CUDA_GRAPH", "0") == "1"
 
     def __init__(
         self,
@@ -1431,7 +1441,10 @@ def torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim,
+            dtype=value.dtype, device=value.device,
+        )
         if initial_state is None
         else initial_state.to(value)
     )

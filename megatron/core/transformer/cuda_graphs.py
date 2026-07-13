@@ -30,7 +30,11 @@ from megatron.core.tensor_parallel.random import (
     is_checkpointing,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import (
+    _TE_CUDA_GRAPH_ROTARY_KWARGS,
+    GraphableMegatronModule,
+    MegatronModule,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
@@ -1746,18 +1750,141 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
-def _layer_is_graphable(layer, config):
+def _get_effective_transformer_layer(layer):
+    """Return the TransformerLayer whose attention is executed by ``layer``.
+
+    Hybrid mHC layers are graph callables in their own right, but their attention
+    implementation lives on ``inner_layer``. Keeping this unwrapping in one place
+    prevents graph discovery and static-input construction from disagreeing about
+    whether attention is part of the graph.
     """
-    Check if a layer is graphable.
+    # Import here to avoid a cuda_graphs <-> hybrid_block import cycle.
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    if isinstance(layer, HyperConnectionHybridLayer):
+        layer = layer.inner_layer
+    return layer if isinstance(layer, TransformerLayer) else None
+
+
+def _layer_captures_attention(layer):
+    """Whether ``layer`` has self-attention inside its TE graph region."""
+    from megatron.core.transformer.identity_op import IdentityOp
+
+    transformer_layer = _get_effective_transformer_layer(layer)
+    if transformer_layer is None or isinstance(transformer_layer.self_attention, IdentityOp):
+        return False
+    return getattr(layer, '_cuda_graph_captures_attention', lambda: True)()
+
+
+def _consume_observed_rotary_kwargs(layer, observed_cache):
+    """Consume eager-observed rotary kwargs and release layer-held references.
+
+    ``_get_sample_arguments`` may need multiple independent static buffers for a
+    layer, so the detached observations live in a call-local cache after the first
+    consumption. The attributes on both an mHC wrapper and its inner layer are
+    removed immediately; only the outer wrapper's values define its graph inputs.
+    """
+    cache_key = id(layer)
+    if cache_key in observed_cache:
+        return observed_cache[cache_key]
+
+    observed = {
+        key: value.detach()
+        for key, value in getattr(layer, '_cg_observed_tensor_kwargs', {}).items()
+        if key in _TE_CUDA_GRAPH_ROTARY_KWARGS and isinstance(value, torch.Tensor)
+    }
+    observed_cache[cache_key] = observed
+
+    owners = [layer]
+    effective_layer = _get_effective_transformer_layer(layer)
+    if effective_layer is not None and effective_layer is not layer:
+        owners.append(effective_layer)
+    for owner in owners:
+        if hasattr(owner, '_cg_observed_tensor_kwargs'):
+            delattr(owner, '_cg_observed_tensor_kwargs')
+
+    return observed
+
+
+def _validate_mrope_capture_inputs(
+    layer,
+    position_embedding_type,
+    captures_attention,
+    observed,
+    supports_tensor_kwargs,
+    requires_observed_rotary_inputs=False,
+):
+    """Reject attention capture without required replayable rotary tensor inputs."""
+    if not captures_attention:
+        return
+
+    requires_observation = position_embedding_type == 'mrope' or requires_observed_rotary_inputs
+    if not requires_observation:
+        return
+    rotary_mode = (
+        "position_embedding_type='mrope'"
+        if position_embedding_type == 'mrope'
+        else "runtime rotary tensor inputs"
+    )
+    if not observed:
+        raise RuntimeError(
+            f"Cannot capture TE CUDA graph attention with {rotary_mode} "
+            f"in {type(layer).__name__}: no rotary tensor kwargs were observed. Run at "
+            "least one eager warmup forward before capture (cuda_graph_warmup_steps > 0)."
+        )
+    if not supports_tensor_kwargs:
+        raise RuntimeError(
+            f"TE CUDA graph attention with {rotary_mode} requires "
+            "TransformerEngine >= 1.10 for tensor keyword inputs."
+        )
+
+
+def _merge_observed_rotary_kwargs(
+    layer,
+    static_inputs,
+    position_embedding_type,
+    captures_attention,
+    observed_cache,
+    *,
+    supports_tensor_kwargs=True,
+    requires_observed_rotary_inputs=False,
+):
+    """Declare observed rotary tensors as TE graph inputs.
+
+    Model-computed runtime rotary tensors, including language MRoPE and vision
+    2-D RoPE, cannot be synthesized from the layer config. Capturing attention
+    without first seeing required inputs would silently bake a no-position-
+    embedding graph, so reject that configuration explicitly.
+    """
+    observed = _consume_observed_rotary_kwargs(layer, observed_cache)
+    _validate_mrope_capture_inputs(
+        layer,
+        position_embedding_type,
+        captures_attention,
+        observed,
+        supports_tensor_kwargs,
+        requires_observed_rotary_inputs,
+    )
+    if not captures_attention:
+        return
+    for key, value in observed.items():
+        if key not in static_inputs:
+            static_inputs[key] = value.clone()
+
+
+def _layer_is_graphable(layer, config, *, use_megatron_fsdp=False):
+    """Check whether a layer can be captured by the TE CUDA graph helper.
+
+    Args:
+        layer: Candidate graph callable.
+        config: Transformer configuration that defines the requested graph scope.
+        use_megatron_fsdp: Whether the model is managed by Megatron-FSDP.
     """
 
     # Only GraphableMegatronModule can be graphed.
     if not isinstance(layer, GraphableMegatronModule):
         return False
-
-    # If cuda_graph_modules is not set, every layer is graphed.
-    if not config.cuda_graph_modules:
-        return True
 
     # import modules here to avoid a circular import
     from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
@@ -1766,6 +1893,22 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # Megatron-FSDP currently installs gather/release and pre-backward hooks on
+    # the inner TransformerLayer, while TE registers the outer mHC wrapper as
+    # the graph callable. Capturing the wrapper would bypass those inner hooks
+    # and could bake released parameter storage into the graph. Keep the whole
+    # wrapper eager until its FSDP lifecycle is explicitly lifted to this
+    # callable boundary.
+    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+        return False
+
+    # If cuda_graph_modules is not set, every layer is graphed (whole-layer
+    # capture includes attention, so it requires a TE-graph-safe attention).
+    if not config.cuda_graph_modules:
+        effective_layer = _get_effective_transformer_layer(layer)
+        attention = getattr(effective_layer or layer, 'self_attention', None)
+        return getattr(attention, 'supports_te_cuda_graph', True)
 
     # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
     # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
@@ -1777,6 +1920,20 @@ def _layer_is_graphable(layer, config):
         if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
             return True
         if isinstance(inner, TransformerLayer):
+            has_attention = not isinstance(inner.self_attention, IdentityOp)
+            has_mlp = not isinstance(inner.mlp, IdentityOp)
+            if has_attention and has_mlp:
+                # Non-empty scopes require splitting the wrapper around eager
+                # regions. HyperConnectionHybridLayer currently only implements
+                # that split for an MoE-only inner layer; pretending a composite
+                # attention+MLP layer were partial would silently skip or capture
+                # the wrong branch.
+                logger.warning(
+                    "Leaving composite HyperConnectionHybridLayer eager because partial TE "
+                    "CUDA graph capture is not implemented for an inner TransformerLayer "
+                    "that contains both attention and MLP."
+                )
+                return False
             if isinstance(inner.mlp, MoELayer):
                 # MoE inner: graphable via partial (router/preprocess) capture.
                 if (
@@ -1788,9 +1945,13 @@ def _layer_is_graphable(layer, config):
                 # attn-only scope on an MoE inner: the (identity) attention prefix has
                 # nothing graph-worthy, so leave eager.
                 return False
-            if CudaGraphModule.attn in config.cuda_graph_modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
+            if (
+                CudaGraphModule.attn in config.cuda_graph_modules
+                and layer._cuda_graph_captures_attention()
+                and not (
+                    isinstance(inner.self_attention, IdentityOp)
+                    and isinstance(inner.cross_attention, IdentityOp)
+                )
             ):
                 return True
             if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
@@ -1801,11 +1962,18 @@ def _layer_is_graphable(layer, config):
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
+        if (
+            CudaGraphModule.attn in config.cuda_graph_modules
+            and _layer_captures_attention(layer)
+            and not (
+                isinstance(layer.self_attention, IdentityOp)
+                and isinstance(layer.cross_attention, IdentityOp)
+            )
         ):
-            # attn layer.
+            # attn layer. Layers whose attention cannot replay safely under TE
+            # graphs (e.g. GatedDeltaNet) fall through: they are still graphable
+            # via the MoE scopes below, with attention kept eager per
+            # TransformerLayer._cuda_graph_captures_attention().
             return True
         if (
             CudaGraphModule.moe in config.cuda_graph_modules
@@ -1818,6 +1986,29 @@ def _layer_is_graphable(layer, config):
             # mlp layer.
             return True
     return False
+
+
+def _get_model_with_decoder(model_chunk):
+    """Return the decoder-bearing model for a training model chunk.
+
+    Standard GPT chunks expose ``decoder`` directly (possibly through a
+    ``.module`` wrapper). Multimodal models keep the GPT model under
+    ``language_model``, so resolve that nested module as a fallback.
+    """
+    try:
+        return get_attr_wrapped_model(
+            model_chunk, 'decoder', allow_none=False, return_model_obj=True
+        )
+    except RuntimeError as direct_error:
+        try:
+            language_model = get_attr_wrapped_model(
+                model_chunk, 'language_model', allow_none=False
+            )
+            return get_attr_wrapped_model(
+                language_model, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            raise direct_error
 
 
 class TECudaGraphHelper:
@@ -1871,6 +2062,10 @@ class TECudaGraphHelper:
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
 
+        # mHC wrappers cannot yet own the inner TransformerLayer's Megatron-FSDP hook lifecycle.
+        self._uses_megatron_fsdp = bool(self._get_megatron_fsdp_instances())
+
+        self._rotary_observation_roots = []
         self._discover_layers()
 
         # Flags to track CUDA Graph state:
@@ -1889,11 +2084,14 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+
+        use_megatron_fsdp = getattr(self, '_uses_megatron_fsdp', False)
+        num_mhc_layers_skipped_for_megatron_fsdp = 0
+
         for chunk_number, model_chunk in enumerate(self.model):
             try:
-                chunk_with_decoder = get_attr_wrapped_model(
-                    model_chunk, 'decoder', allow_none=False, return_model_obj=True
-                )
+                chunk_with_decoder = _get_model_with_decoder(model_chunk)
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
@@ -1914,13 +2112,19 @@ class TECudaGraphHelper:
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
+                    self._rotary_observation_roots.append(layer)
+                    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+                        num_mhc_layers_skipped_for_megatron_fsdp += 1
+                    if _layer_is_graphable(layer, self.config, use_megatron_fsdp=use_megatron_fsdp):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
+                    self._rotary_observation_roots.append(layer)
+                    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+                        num_mhc_layers_skipped_for_megatron_fsdp += 1
+                    if _layer_is_graphable(layer, self.config, use_megatron_fsdp=use_megatron_fsdp):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
@@ -1946,6 +2150,19 @@ class TECudaGraphHelper:
                     self.num_layers_per_chunk.append(0)
                     self.callables_per_chunk.append([])
                     self.callables_per_chunk_is_mtp.append([])
+
+        if num_mhc_layers_skipped_for_megatron_fsdp:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg=(
+                    f'Leaving {num_mhc_layers_skipped_for_megatron_fsdp} '
+                    'HyperConnectionHybridLayer callable(s) eager: TE CUDA graph capture '
+                    'does not yet support the inner-layer hook lifecycle used by Megatron-FSDP.'
+                ),
+            )
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -1974,6 +2191,28 @@ class TECudaGraphHelper:
         were found, and True if at least one graph was successfully created.
         """
         return self._graphs_created
+
+    def _disable_rotary_kwarg_observation(self):
+        """Permanently stop eager rotary-kwarg observation for this capture lifecycle.
+
+        Layers excluded by graph discovery never receive ``cuda_graphs``, so the
+        normal ``not self.cuda_graphs`` recording condition alone would retain and
+        replace a rotary tensor on every later eager step. Clear every module under
+        this helper's decoder roots, including non-graphable wrappers, without
+        consuming observations owned by a sibling language or vision helper.
+        """
+        seen_modules = set()
+        for root in self._rotary_observation_roots:
+            if not isinstance(root, torch.nn.Module):
+                continue
+            for module in root.modules():
+                if id(module) in seen_modules:
+                    continue
+                seen_modules.add(id(module))
+                if hasattr(module, '_cg_rotary_observation_enabled'):
+                    module._cg_rotary_observation_enabled = False
+                if hasattr(module, '_cg_observed_tensor_kwargs'):
+                    delattr(module, '_cg_observed_tensor_kwargs')
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
@@ -2039,6 +2278,8 @@ class TECudaGraphHelper:
         sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
+        observed_rotary_kwargs_cache = {}
+        supports_tensor_kwargs = is_te_min_version("1.10.0")
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
@@ -2047,6 +2288,13 @@ class TECudaGraphHelper:
             assert layer in chunk_of_the_layer.decoder.layers or any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
+
+            attn_in_graph = _layer_captures_attention(layer)
+            position_embedding_type = getattr(
+                chunk_of_the_layer,
+                'position_embedding_type',
+                getattr(self.config, 'position_embedding_type', None),
+            )
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
                 if (
@@ -2072,29 +2320,47 @@ class TECudaGraphHelper:
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
                 )
 
-            from megatron.core.transformer.identity_op import IdentityOp
-            from megatron.core.transformer.transformer_layer import TransformerLayer
-
-            contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
-                and (
-                    not self.config.cuda_graph_modules
-                    or CudaGraphModule.attn in self.config.cuda_graph_modules
-                )
-            )
-
             _sample_kwargs = {}
-            if is_te_min_version("1.10.0"):
+            if supports_tensor_kwargs:
                 # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
-                if contains_self_attn:
+                if attn_in_graph:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                # Declare the rotary tensor kwargs observed on the layer's
+                # eager pre-capture calls as static graph inputs. Config-derived
+                # synthesis above only understands position_embedding_type ==
+                # 'rope'; models that compute positional inputs at the model
+                # level and pass them into layers per microbatch (e.g.
+                # Qwen3.5-VL mrope) captured graphs without them, and TE replay
+                # silently dropped the runtime kwargs — graphed attention ran
+                # with no positional embedding at all. TE copies runtime kwargs
+                # into the static buffers on every replay, so data-dependent
+                # values stay correct per microbatch. Restricted to rotary
+                # inputs: forwarding arbitrary observed kwargs can flip other
+                # modules onto capture-unsafe branches (e.g. the fused MoE aux
+                # loss converting a tensor token count to int during capture).
+                _merge_observed_rotary_kwargs(
+                    layer,
+                    static_inputs,
+                    position_embedding_type,
+                    attn_in_graph,
+                    observed_rotary_kwargs_cache,
+                )
                 _sample_kwargs = static_inputs
-            elif contains_self_attn:
+            elif attn_in_graph:
+                observed_rotary_kwargs = _consume_observed_rotary_kwargs(
+                    layer, observed_rotary_kwargs_cache
+                )
+                _validate_mrope_capture_inputs(
+                    layer,
+                    position_embedding_type,
+                    attn_in_graph,
+                    observed_rotary_kwargs,
+                    supports_tensor_kwargs,
+                )
                 _sample_args = (
                     static_inputs.pop("hidden_states"),
                     static_inputs.pop("attention_mask"),
@@ -2536,7 +2802,10 @@ class TECudaGraphHelper:
             )
 
         # Generate sample arguments and keyword arguments for capturing.
-        sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
+        try:
+            sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
+        finally:
+            self._disable_rotary_kwarg_observation()
 
         # Extract hooks from callables for manual invocation during CUDA Graph capture/replay.
         # Two-phase approach:
@@ -2893,6 +3162,7 @@ class TECudaGraphHelper:
             logger.warning(
                 'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
             )
+            self._disable_rotary_kwarg_observation()
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
@@ -3236,16 +3506,17 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     * num_model_chunks is always 1 (vision has no virtual pipeline stages).
     * Batch dimension is always 1 (images are concatenated along the sequence
       dimension).
-    * Sample argument generation uses a simple loop (no rotary embeddings or
-      buffer-reuse optimization).
+    * Sample argument generation uses a simple loop and merges rotary tensors
+      observed during eager vision warmup.
     * _finish_capturing wraps captured graphs to filter None values that arise
       from vision encoder layers returning (output, None), and skips cleanup
       that is handled by the LM decoder helper.
 
     Note:
         With pipeline parallelism > 1, only the first pipeline stage typically
-        has vision layers. Ranks without vision layers can safely skip calling
-        create_cudagraphs() or will gracefully return with no graphs created.
+        has vision layers. Ranks without vision layers take a no-op capture path,
+        but every rank participating in the default-process-group cleanup barrier
+        must still call ``create_cudagraphs()`` in the same order.
 
     Args:
         model: The full model (list of model chunks) containing vision_model.
@@ -3295,7 +3566,12 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _layer_is_graphable(layer, self.config):
+                    self._rotary_observation_roots.append(layer)
+                    if _layer_is_graphable(
+                        layer,
+                        self.config,
+                        use_megatron_fsdp=getattr(self, '_uses_megatron_fsdp', False),
+                    ):
                         vision_layers.append(layer)
 
         if vision_layers:
@@ -3353,9 +3629,9 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """Generate sample arguments for vision encoder CUDA Graph capturing.
 
-        Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
-        and no rotary embeddings (unlike the parent's buffer-reuse
-        optimization). The order and chunk_id_list arguments are
+        Vision uses a simple per-layer-per-microbatch loop with batch_dim=1.
+        Runtime rotary tensors observed during eager warmup are cloned into
+        each microbatch's static kwargs. The order and chunk_id_list arguments are
         unused because vision has num_model_chunks=1 and does not need
         the pipeline-schedule-aware buffer lifecycle tracking.
 
@@ -3369,6 +3645,17 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         sample_args = []
         sample_kwargs_list = []
         hidden_size = self.config.hidden_size
+        observed_rotary_kwargs_cache = {}
+        vision_model = getattr(self, 'vision_model', None)
+        position_embedding_type = getattr(
+            vision_model,
+            'position_embedding_type',
+            getattr(self.config, 'position_embedding_type', None),
+        )
+        requires_observed_rotary_inputs = getattr(
+            vision_model, '_cuda_graph_requires_observed_rotary_inputs', False
+        )
+        supports_tensor_kwargs = is_te_min_version("1.10.0")
 
         for _microbatch_idx in range(self.num_microbatches):
             for layer in self.flattened_callables:
@@ -3381,14 +3668,22 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                     requires_grad=True,
                 )
 
+                static_inputs = {}
                 if hasattr(layer, 'get_layer_static_inputs'):
                     static_inputs = layer.get_layer_static_inputs(self.seq_length, 1)
                     hidden_states = static_inputs.pop('hidden_states', hidden_states)
-                    sample_args.append((hidden_states,))
-                    sample_kwargs_list.append(static_inputs)
-                else:
-                    sample_args.append((hidden_states,))
-                    sample_kwargs_list.append({})
+
+                _merge_observed_rotary_kwargs(
+                    layer,
+                    static_inputs,
+                    position_embedding_type,
+                    _layer_captures_attention(layer),
+                    observed_rotary_kwargs_cache,
+                    supports_tensor_kwargs=supports_tensor_kwargs,
+                    requires_observed_rotary_inputs=requires_observed_rotary_inputs,
+                )
+                sample_args.append((hidden_states,))
+                sample_kwargs_list.append(static_inputs)
 
         return sample_args, sample_kwargs_list
 

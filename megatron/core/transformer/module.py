@@ -21,6 +21,15 @@ _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
+# Tensor kwargs that carry rotary-position data into a transformer layer. TE
+# CUDA graphs must declare these as static inputs so replay copies each
+# microbatch's runtime values into the captured buffers. Keep this allowlist
+# narrow: observing arbitrary tensor kwargs can change capture-time control
+# flow in unrelated modules (for example, the fused MoE auxiliary loss).
+_TE_CUDA_GRAPH_ROTARY_KWARGS = frozenset(
+    {'rotary_pos_emb', 'rotary_pos_cos', 'rotary_pos_sin', 'rotary_pos_cos_sin'}
+)
+
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
@@ -176,6 +185,7 @@ class GraphableMegatronModule(MegatronModule):
 
                 self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
+            self._cg_rotary_observation_enabled = True
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
             # pipelining which requires running FWD graph of multiple microbatches before BWD
@@ -379,7 +389,26 @@ class GraphableMegatronModule(MegatronModule):
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
-        elif self._should_call_te_cudagraph(*args, **kwargs):
+        # Record the tensor kwargs of eager pre-capture calls so capture can
+        # declare them as static graph inputs. Predicting them from config
+        # misses model-computed inputs (e.g. multimodal mrope rotary tensors
+        # passed down per microbatch); a graph captured without them bakes an
+        # attention that silently drops those inputs on replay.
+        if (
+            getattr(self.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and self.training
+            and not self.cuda_graphs
+            and getattr(self, '_cg_rotary_observation_enabled', True)
+        ):
+            from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+            if not is_graph_capturing():
+                self._cg_observed_tensor_kwargs = {
+                    k: v.detach()
+                    for k, v in kwargs.items()
+                    if k in _TE_CUDA_GRAPH_ROTARY_KWARGS and isinstance(v, torch.Tensor)
+                }
+        if self._should_call_te_cudagraph(*args, **kwargs):
             # Temporarily replace forward with cuda graph function
             self._original_forward = self.forward
             try:
