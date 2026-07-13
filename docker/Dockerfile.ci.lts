@@ -80,7 +80,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export NVTE_CUDA_ARCHS="80;90;100"
     uv pip install -r /workspace/docker/lts/requirements.txt
     uv pip install --no-build-isolation \
-        "transformer-engine[pytorch,core_cu13]==2.17.0"
+        "transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@b9d690e042b1c4e455214e7dab65d6d3512c05d6"
 EOF
 
 # Install DeepEP
