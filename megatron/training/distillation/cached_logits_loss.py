@@ -1305,6 +1305,9 @@ class LossFuncCallable:
             loss_kd = self._mask_loss(loss_kd, loss_mask)
             # Requires extra TP reduction
             dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+        except StopIteration as e:
+            logger.warning(f"Cached-logits dataloader exhausted on rank {safe_get_rank()} — stopping. {e}")
+            raise SystemExit(0) from None
         except Exception as e:
             if not self.ignore_errors:
                 raise
