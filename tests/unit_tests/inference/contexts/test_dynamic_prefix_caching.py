@@ -379,6 +379,47 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert kv_available
 
     @pytest.mark.internal
+    def test_find_kv_match_count_tolerates_eviction_hole(self):
+        """A chain with a hole (shallower block evicted, deeper one cached) must
+        not raise; the match is the longest contiguous prefix from the start.
+
+        Eviction is not parent-aware, so it can drop a parent block while a
+        child of the same chain stays cached. _find_kv_match_count must return
+        only the contiguous run before the hole instead of indexing the gap.
+        """
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        # Cache a 3-block chain [b0, b1, b2] then release it (blocks stay cached).
+        prompt = self._prompt(bs * 3)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        b0, b1, b2 = self._block_ids(ctx, 0, 3)
+        req_hashes = self._req(ctx, prompt.clone(), request_id=99).precomputed_block_hashes
+        h0, h1, h2 = req_hashes
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+        assert all(h in alloc.kv_hash_to_block_id for h in (h0, h1, h2))
+
+        # Punch a hole in the middle of the chain (evict b1 only).
+        alloc._deregister_blocks(torch.tensor([b1]))
+        assert h1 not in alloc.kv_hash_to_block_id
+        assert h0 in alloc.kv_hash_to_block_id and h2 in alloc.kv_hash_to_block_id
+
+        # A new request over the full prompt must match only the contiguous
+        # prefix before the hole ([b0]) and must not raise KeyError on h1.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        assert req2.precomputed_block_hashes == req_hashes
+        matched, parent_hash = ctx._find_kv_match_count(req2, 0, 3)
+        assert matched == [b0]
+        assert parent_hash == h0
+
+        # Hole at the very first block -> no usable prefix.
+        alloc._deregister_blocks(torch.tensor([b0]))
+        matched, parent_hash = ctx._find_kv_match_count(req2, 0, 3)
+        assert matched == [] and parent_hash == 0
+
+    @pytest.mark.internal
     def test_ref_count_lru(self):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
