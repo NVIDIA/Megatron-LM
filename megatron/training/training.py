@@ -118,7 +118,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, validate_te_cuda_graph_topology
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.utils import (
@@ -2737,6 +2737,12 @@ def train_step(
             num_microbatches = get_num_microbatches()
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
+        validate_te_cuda_graph_topology(
+            config,
+            num_microbatches=num_microbatches,
+            micro_batch_size=args.micro_batch_size,
+            phase="training-forward-backward",
+        )
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -3366,6 +3372,9 @@ def _capture_cudagraphs_with_forward_pre_hook_restore(
 ):
     """Capture TE graphs and always restore temporarily disabled DDP hooks."""
     disabled_model_chunks = []
+    validate_contract = getattr(cuda_graph_helper, 'validate_capture_feature_contract', None)
+    if validate_contract is not None:
+        validate_contract()
     capture_error = None
     try:
         if disable_forward_pre_hooks:
@@ -4113,6 +4122,14 @@ def train(
                 model, cuda_graph_helper, disable_forward_pre_hooks
             )
 
+        if args.cuda_graph_impl == "transformer_engine":
+            validate_te_cuda_graph_topology(
+                config,
+                num_microbatches=get_num_microbatches(),
+                micro_batch_size=args.micro_batch_size,
+                phase="training",
+            )
+
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
@@ -4606,6 +4623,12 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+            validate_te_cuda_graph_topology(
+                config,
+                num_microbatches=scheduled_eval_num_microbatches,
+                micro_batch_size=eval_micro_batch_size,
+                phase="evaluation",
+            )
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=packed_data_iterator,
@@ -4678,6 +4701,12 @@ def evaluate(
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
         elif process_non_loss_data_func is not None and is_last_rank():
+            validate_te_cuda_graph_topology(
+                config,
+                num_microbatches=eval_num_microbatches,
+                micro_batch_size=eval_micro_batch_size,
+                phase="evaluation-non-loss",
+            )
             collected_non_loss_data = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,

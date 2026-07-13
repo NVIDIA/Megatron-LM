@@ -353,6 +353,19 @@ def _validate_megatron_fsdp_cuda_graph_buffers(args):
             "allocators can move graph-baked addresses. Use --cuda-graph-impl=transformer_engine "
             "or disable CUDA graphs."
         )
+    if (
+        getattr(args, "cuda_graph_dynamic_microbatches", False)
+        or getattr(args, "variable_seq_lengths", False)
+        or getattr(args, "sequence_packing_scheduler", None) is not None
+        or getattr(args, "rl_use_sequence_packing", False)
+    ):
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not support "
+            "dynamic microbatch/topology inputs in this core path. Disable "
+            "--cuda-graph-dynamic-microbatches, variable sequence lengths, and sequence "
+            "packing; safe retrace and recapture support is deferred."
+        )
+
 
     sharding_strategy = getattr(args, "data_parallel_sharding_strategy", "optim_grads_params")
     if sharding_strategy == "optim_grads":

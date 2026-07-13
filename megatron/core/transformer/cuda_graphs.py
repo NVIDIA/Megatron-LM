@@ -75,6 +75,76 @@ _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
+_TE_CAPTURE_TIME_HOOKS_PROTOCOL = "mcore_fsdp_capture_time_hooks_v1"
+_TE_CUDA_GRAPH_PROTOCOLS_ATTR = "__mcore_cuda_graph_protocols__"
+_TE_CUDA_GRAPH_TOPOLOGY_VALIDATOR_ATTR = "_mcore_fsdp_te_cuda_graph_topology_validator"
+
+
+def _get_te_capture_time_hooks_contract(make_graphed_callables_fn) -> str | None:
+    """Return how TE satisfies MCore's capture-time-hooks contract, if at all.
+
+    The marker is published only after the repository-owned loader verifies
+    the content-pinned TE overlay. Signatures and source-code strings are not
+    sufficient evidence for the four required hook phases.
+    """
+
+    graph_module = inspect.getmodule(make_graphed_callables_fn)
+    for owner in (make_graphed_callables_fn, graph_module):
+        if owner is None or not hasattr(owner, _TE_CUDA_GRAPH_PROTOCOLS_ATTR):
+            continue
+        protocols = getattr(owner, _TE_CUDA_GRAPH_PROTOCOLS_ATTR)
+        if isinstance(protocols, str):
+            protocols = (protocols,)
+        try:
+            if _TE_CAPTURE_TIME_HOOKS_PROTOCOL in protocols:
+                return "explicit-protocol-marker"
+        except TypeError:
+            pass
+    return None
+
+
+@dataclass(frozen=True)
+class _TECudaGraphTopologySignature:
+    """Predictable PP/VPP schedule inputs frozen with a planned FSDP graph."""
+
+    pipeline_parallel_size: int
+    pipeline_parallel_rank: int
+    virtual_pipeline_parallel_size: int | None
+    num_model_chunks: int
+    num_microbatches: int
+    micro_batch_size: int
+    microbatch_group_size_per_vp_stage: int
+    graphable_callables_per_chunk: tuple[int, ...]
+    cuda_graph_modules: tuple[str, ...]
+    overlap_moe_expert_parallel_comm: bool
+    delay_wgrad_compute: bool
+    dynamic_microbatches: bool
+    variable_seq_lengths: bool
+    sequence_length: int
+    thd_sequence_length_upper_bound: int | None
+
+
+def validate_te_cuda_graph_topology(
+    config: TransformerConfig,
+    *,
+    num_microbatches: int,
+    micro_batch_size: int,
+    phase: str,
+) -> None:
+    """Validate a frozen Megatron-FSDP TE graph at an iteration boundary.
+
+    Stock TE graphs and non-FSDP configurations do not install a validator and
+    therefore remain unaffected.
+    """
+
+    validator = getattr(config, _TE_CUDA_GRAPH_TOPOLOGY_VALIDATOR_ATTR, None)
+    if validator is not None:
+        validator(
+            num_microbatches=num_microbatches,
+            micro_batch_size=micro_batch_size,
+            phase=phase,
+        )
+
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
     """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
@@ -2114,6 +2184,7 @@ class TECudaGraphHelper:
         self._capture_gc_frozen = False
         self._capture_restore_hooks = []
         self._fsdp_capture_param_states = []
+        self._fsdp_planned_topology_signature = None
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -3118,6 +3189,131 @@ class TECudaGraphHelper:
                 fsdp_instances.append(obj)
         return fsdp_instances
 
+    def _uses_fsdp_planned_allocator(self) -> bool:
+        """Return whether this helper owns an active planned FSDP allocator."""
+
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            pgb = getattr(fsdp_module, 'param_and_grad_buffer', None)
+            if pgb is None:
+                continue
+            uses_planned = getattr(pgb, '_uses_planned_allocator', None)
+            if uses_planned is None:
+                ddp_config = getattr(pgb, 'ddp_config', None)
+                uses_planned = getattr(
+                    ddp_config, 'megatron_fsdp_use_planned_allocator', False
+                )
+            if uses_planned:
+                return True
+        return False
+
+    def validate_capture_feature_contract(self) -> None:
+        """Fail before mutating capture state when planned FSDP hooks are unsupported."""
+
+        if not self.flattened_callables or not self._uses_fsdp_planned_allocator():
+            return
+        contract = _get_te_capture_time_hooks_contract(make_graphed_callables)
+        if contract is None:
+            raise RuntimeError(
+                "Megatron-FSDP planned allocation requires Transformer Engine's versioned "
+                "capture-time-hooks protocol so FSDP unshard, reshard, and fused-main-grad "
+                "claims run around TE warmup and capture. Install a compatible TE build or "
+                "content-validated overlay that advertises "
+                f"{_TE_CAPTURE_TIME_HOOKS_PROTOCOL!r}. Refusing before changing hooks, FSDP "
+                "parameter exposure, allocator plans, GC, or global capture state."
+            )
+
+    def _current_fsdp_planned_topology_signature(
+        self, *, num_microbatches: int, micro_batch_size: int
+    ) -> _TECudaGraphTopologySignature:
+        """Build the predictable local PP/VPP schedule signature."""
+
+        pipeline_parallel_size = self.pp_group.size()
+        pipeline_parallel_rank = self.pp_group.rank()
+        virtual_pipeline_parallel_size = getattr(
+            self.p2p_communicator,
+            'virtual_pipeline_model_parallel_size',
+            getattr(self.config, 'virtual_pipeline_model_parallel_size', None),
+        )
+        microbatch_group_size = getattr(
+            self.config, 'microbatch_group_size_per_vp_stage', None
+        )
+        if microbatch_group_size is None:
+            microbatch_group_size = pipeline_parallel_size
+        cuda_graph_modules = tuple(
+            sorted(
+                str(getattr(module, 'value', module))
+                for module in (getattr(self.config, 'cuda_graph_modules', None) or ())
+            )
+        )
+        return _TECudaGraphTopologySignature(
+            pipeline_parallel_size=pipeline_parallel_size,
+            pipeline_parallel_rank=pipeline_parallel_rank,
+            virtual_pipeline_parallel_size=virtual_pipeline_parallel_size,
+            num_model_chunks=len(self.model),
+            num_microbatches=int(num_microbatches),
+            micro_batch_size=int(micro_batch_size),
+            microbatch_group_size_per_vp_stage=int(microbatch_group_size),
+            graphable_callables_per_chunk=tuple(len(layers) for layers in self.callables_per_chunk),
+            cuda_graph_modules=cuda_graph_modules,
+            overlap_moe_expert_parallel_comm=bool(
+                getattr(self.config, 'overlap_moe_expert_parallel_comm', False)
+            ),
+            delay_wgrad_compute=bool(getattr(self.config, 'delay_wgrad_compute', False)),
+            dynamic_microbatches=bool(
+                getattr(self.config, 'cuda_graph_dynamic_microbatches', False)
+            ),
+            variable_seq_lengths=bool(getattr(self.config, 'variable_seq_lengths', False)),
+            sequence_length=int(self.seq_length),
+            thd_sequence_length_upper_bound=self.thd_sequence_length_upper_bound,
+        )
+
+    def validate_runtime_topology(
+        self, *, num_microbatches: int, micro_batch_size: int, phase: str
+    ) -> None:
+        """Reject predictable topology changes before entering a graph iteration."""
+
+        expected = getattr(self, '_fsdp_planned_topology_signature', None)
+        if expected is None or not self._graphs_created:
+            return
+        current = self._current_fsdp_planned_topology_signature(
+            num_microbatches=num_microbatches,
+            micro_batch_size=micro_batch_size,
+        )
+        differences = [
+            f"{field.name}: captured={getattr(expected, field.name)!r}, "
+            f"runtime={getattr(current, field.name)!r}"
+            for field in dataclasses.fields(expected)
+            if getattr(expected, field.name) != getattr(current, field.name)
+        ]
+        if differences:
+            raise RuntimeError(
+                "Megatron-FSDP planned TE CUDA graph topology/schedule changed at the "
+                f"{phase} iteration boundary ({'; '.join(differences)}). Automatic retrace "
+                "is not supported; restart with a stable topology. Runtime allocator "
+                "occupancy, capacity, dtype, and pointer guards remain authoritative for "
+                "changes that cannot be predicted at the boundary."
+            )
+
+    def _install_fsdp_planned_topology_validator(self) -> None:
+        """Publish validation only after graph capture has fully succeeded."""
+
+        if (
+            self._graphs_created
+            and getattr(self, '_fsdp_planned_topology_signature', None) is not None
+        ):
+            setattr(
+                self.config,
+                _TE_CUDA_GRAPH_TOPOLOGY_VALIDATOR_ATTR,
+                self.validate_runtime_topology,
+            )
+
+    def _remove_fsdp_planned_topology_validator(self) -> None:
+        """Remove this helper's boundary validator without disturbing another helper."""
+
+        validator = getattr(self.config, _TE_CUDA_GRAPH_TOPOLOGY_VALIDATOR_ATTR, None)
+        if getattr(validator, '__self__', None) is self:
+            delattr(self.config, _TE_CUDA_GRAPH_TOPOLOGY_VALIDATOR_ATTR)
+
     def _prepare_fsdp_params_for_capture(self):
         """
         Switch Megatron-FSDP modules to raw parameters before TE capture.
@@ -3247,6 +3443,7 @@ class TECudaGraphHelper:
                 finally:
                     self._capture_gc_frozen = False
 
+        cleanup("remove the topology validator", self._remove_fsdp_planned_topology_validator)
         cleanup("end the global capture state", end_capture)
         cleanup("disable rotary keyword observation", self._disable_rotary_kwarg_observation)
         cleanup("restore callable hooks", self._restore_callable_hooks)
@@ -3331,6 +3528,7 @@ class TECudaGraphHelper:
         torch.cuda.empty_cache()
 
         self._capture_finished = True
+        self._install_fsdp_planned_topology_validator()
 
     def create_cudagraphs(self):
         """Capture graphs and restore lightweight caller-owned state on failure."""
@@ -3340,6 +3538,17 @@ class TECudaGraphHelper:
             raise RuntimeError("A failed CUDA Graph capture cannot be retried with this helper.")
         if is_graph_capturing():
             raise RuntimeError("Another CUDA Graph capture is already active.")
+
+        # This must precede _start_capturing(), which freezes GC, switches FSDP
+        # parameter exposure, resets gather state, and freezes allocator plans.
+        self.validate_capture_feature_contract()
+        if self.flattened_callables and self._uses_fsdp_planned_allocator():
+            self._fsdp_planned_topology_signature = (
+                self._current_fsdp_planned_topology_signature(
+                    num_microbatches=get_num_microbatches(),
+                    micro_batch_size=self.micro_batch_size,
+                )
+            )
         try:
             self._create_cudagraphs()
         except BaseException:
@@ -3431,6 +3640,7 @@ class TECudaGraphHelper:
         Delete all CUDA graphs.
         """
         assert self._graphs_created, "No CUDA Graphs were created to delete."
+        self._remove_fsdp_planned_topology_validator()
 
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
