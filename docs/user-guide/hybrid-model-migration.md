@@ -224,6 +224,8 @@ its MoE is Hybrid layer 1; source layer 1 attention is Hybrid layer 2 and its
 MoE is Hybrid layer 3. Expand attention-only lists with inactive entries for
 the intervening MLP or MoE positions.
 
+### Configure pipeline parallelism
+
 For pipeline parallelism, add `|` separators without changing the ordered layer
 symbols. For example, the converted pattern `*-*-*-*-` can be trained with two
 pipeline segments as `*-*-|*-*-`. The number of pipe-delimited segments must be
@@ -238,6 +240,13 @@ remove `--decoder-first-pipeline-num-layers` and
 `--decoder-last-pipeline-num-layers`. Express virtual-pipeline segmentation
 with additional pipe-delimited segments instead.
 
+The declarative `HybridModelBuilder` currently rejects virtual pipeline
+parallelism. Pipe-defined virtual stages are supported by the
+`pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or use
+a path that explicitly supports it.
+
+### Update custom providers and conversion mappings
+
 Custom providers and conversion mappings also need to account for these API and
 state-dict differences:
 
@@ -250,10 +259,6 @@ state-dict differences:
   `decoder.final_layernorm`.
 - Expand per-layer settings such as attention-window schedules to the full
   HybridModel pattern.
-- The declarative `HybridModelBuilder` currently rejects virtual pipeline
-  parallelism. Pipe-defined virtual stages are supported by the
-  `pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or
-  use a path that explicitly supports it.
 
 ### Validate before scaling up
 
