@@ -72,6 +72,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": True,
+    "cuda_graph_dynamic_microbatches": False,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
@@ -281,6 +282,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "test_mode": False,
+    "thd_max_packed_sequences": 32,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -336,11 +338,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "sequence_packing_scheduler": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "pad_packed_seq_by_appending_dummy_seq"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:
