@@ -14,7 +14,8 @@ from uvicorn.config import LOGGING_CONFIG
 
 LOGGING_CONFIG['root'] = {"handlers": ["default"], "level": "INFO"}
 
-from ... import import_class, inference
+from ... import inference
+from ...agent.registry import get_agent_class
 from ...agent.api import (
     Agent,
     ContrastiveRollout,
@@ -24,6 +25,7 @@ from ...agent.api import (
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     RolloutGenerator,
     RolloutRequest,
     TokenRollout,
@@ -116,14 +118,19 @@ class FastAPIEnvServer(EnvironmentServer):
         rollouts = [ContrastiveRollout.model_validate(r) for r in response.json()]
         return rollouts
 
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
-        submission_gate: asyncio.Semaphore | None = None,
-    ):
-        assert (
-            False
-        ), "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
+    ) -> GroupRolloutParams:
+        raise NotImplementedError(
+            "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
+        )
+
+    async def get_rollout_response(self, request, inference_request):
+        raise NotImplementedError(
+            "FastAPIEnvServer overrides get_grouped_rollouts/get_reward_rollouts/run_evaluation; "
+            "get_rollout_response is not used."
+        )
 
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest
@@ -144,11 +151,6 @@ class FastAPIEnvServer(EnvironmentServer):
         rollouts = [[TokenRollout.model_validate(r) for r in group] for group in response.json()]
         for rollout in rollouts:
             yield rollout
-
-    async def rollout(self, request: RolloutRequest) -> TokenRollout:
-        assert (
-            False
-        ), "Calling rollout on FastAPIEnvServer is not supported, use get_reward_rollouts"
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
         assert isinstance(
@@ -199,6 +201,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with open(args.env_config, 'r') as f:
         config = yaml.safe_load(f)[0]
-    agent_cls = import_class(config['agent_type'])
+    agent_cls = get_agent_class(config['agent_type'])
     cls_args = config['agent_args']
     run(agent_cls, cls_args, port=args.port)
