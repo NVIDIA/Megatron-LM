@@ -20,7 +20,8 @@ For efficient global top-K log-prob computation across TP ranks:
 
 Index storage optimization:
 - Global vocab requires 17 bits, so we store lower 16 bits as uint16
-- The 17th bit is stored separately as torch.bool (same shape as indices)
+- The 17th bit is stored separately, bit-packed 1 bit/element (not torch.bool,
+  which is 1 byte/element) via v2_pack_indices/v2_unpack_indices
 - To reconstruct: global_index = (bit_17 << 16) | low_16_bits
 """
 
@@ -59,12 +60,12 @@ from megatron.training.distillation.utils import (
     get_current_iteration,
     is_remote_storage_path,
     open_logit_file,
-    pack_indices,
     quarantine_contained_tars,
     reassemble_cp_sequence,
     storage_makedirs,
     storage_move,
     v2_batched_tar_filename,
+    v2_pack_indices,
 )
 from megatron.training.utils import print_rank_0
 
@@ -332,18 +333,15 @@ class LogitsSaverHooks:
             return
 
         all_values = []
-        all_indices_low = []
-        all_high_bits = []
+        all_indices = []
 
         for values, indices in self._accumulated_results:
             gathered = self._gather_full_cp_microbatch(values, indices)
             if gathered is None:
                 continue
             full_values, full_indices = gathered
-            indices_low, high_bit = pack_indices(full_indices)
             all_values.append(full_values.cpu())
-            all_indices_low.append(indices_low.cpu())
-            all_high_bits.append(high_bit.cpu())
+            all_indices.append(full_indices.cpu())
 
         if self.cp_rank != 0:
             self._topp_kept_counts.clear()
@@ -351,8 +349,12 @@ class LogitsSaverHooks:
 
         if all_values:
             values_tensor = torch.cat(all_values, dim=1)
-            indices_low_tensor = torch.cat(all_indices_low, dim=1)
-            bit_17_tensor = torch.cat(all_high_bits, dim=1)
+            # v2_pack_indices bit-packs the 17th bit, which must happen on the
+            # full per-iteration monolith (see its docstring) -- so indices are
+            # concatenated across microbatches *before* splitting/packing here,
+            # rather than packed per-microbatch and concatenated after.
+            indices_tensor = torch.cat(all_indices, dim=1)
+            indices_low_tensor, bit_17_tensor = v2_pack_indices(indices_tensor)
             self._buffer_iteration(values_tensor, indices_low_tensor, bit_17_tensor)
 
         if self._topp_kept_counts:
@@ -596,7 +598,7 @@ class LogitsSaverHooks:
         # Mask out-of-nucleus entries
         values = torch.where(keep_mask, values, CACHED_LOGITS_LOGPROB_SENTINEL)
         indices = torch.where(keep_mask, indices, CACHED_LOGITS_INDEX_SENTINEL)
-        # The index sentinel does not survive pack_indices()/unpack_indices();
+        # The index sentinel does not survive v2_pack_indices()/v2_unpack_indices();
         # topk_kl_div() also masks by the value sentinel to compensate.
 
         return values, indices
@@ -615,8 +617,9 @@ class LogitsSaverHooks:
           log-probabilities in ``self._save_dtype`` (default ``torch.float16``)
         - ``indices_low``: ``(seq, samples_per_dp_per_iter, K_max)`` uint16
           tensor (lower 16 bits of vocab indices)
-        - ``bit_17``: ``(seq, samples_per_dp_per_iter, K_max)`` bool tensor
-          (17th bit, same shape as ``indices_low``)
+        - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in
+          ``indices_low`` bit-packed via ``numpy.packbits`` (see
+          :func:`~megatron.training.distillation.utils.v2_pack_indices`)
         - ``format_version``: integer payload-format identifier
 
         Storing one monolith per iteration (rather than a list of per-mb
