@@ -50,7 +50,8 @@
 #    history. The first change is an ordinary fast-forward push. A later attempt
 #    may amend only the exact bot commit returned by the preceding attempt, with
 #    an exact force-with-lease. Contributor history and concurrent branch
-#    updates cannot be replaced. Every new SHA is checked by DCO and CI again.
+#    updates cannot be replaced. Every service-account commit has a validated
+#    Signed-off-by trailer, and every new SHA is checked by CI again.
 #
 # 5. The service account posts a fixed terminal result. Detailed
 #    per-published-SHA what/why comments are posted separately by that account
@@ -114,6 +115,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GitHub comments can preserve CRLF line endings from pasted commands.
+          COMMENT_BODY=${COMMENT_BODY//$'\r\n'/$'\n'}
           echo "should_run=false" >> "$GITHUB_OUTPUT"
           case "$COMMENT_BODY" in
             "/claude fix"|"/claude fix "*|$'/claude fix\n'*) ;;
