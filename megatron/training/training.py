@@ -3350,6 +3350,54 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+def _restore_forward_pre_hook_after_cuda_graph_capture(model_chunk):
+    """Rebuild a complete DDP hook set even if disabling stopped partway."""
+    handles = getattr(model_chunk, 'remove_forward_pre_hook_handles', None)
+    if handles:
+        for handle in tuple(handles.values()):
+            if handle is not None:
+                handle.remove()
+        handles.clear()
+    enable_forward_pre_hook([model_chunk])
+
+
+def _capture_cudagraphs_with_forward_pre_hook_restore(
+    model, cuda_graph_helper, disable_forward_pre_hooks
+):
+    """Capture TE graphs and always restore temporarily disabled DDP hooks."""
+    disabled_model_chunks = []
+    capture_error = None
+    try:
+        if disable_forward_pre_hooks:
+            for model_chunk in model:
+                disabled_model_chunks.append(model_chunk)
+                disable_forward_pre_hook([model_chunk], param_sync=False)
+        cuda_graph_helper.create_cudagraphs()
+    except BaseException as error:
+        capture_error = error
+        raise
+    finally:
+        first_restore_error = None
+        for model_chunk in reversed(disabled_model_chunks):
+            try:
+                _restore_forward_pre_hook_after_cuda_graph_capture(model_chunk)
+            except BaseException as restore_error:
+                if capture_error is not None:
+                    logging.exception(
+                        "Failed to restore a DDP forward pre-hook after CUDA graph capture failed."
+                    )
+                    if hasattr(capture_error, 'add_note'):
+                        capture_error.add_note(
+                            f"forward pre-hook restoration also failed: {restore_error!r}"
+                        )
+                elif first_restore_error is None:
+                    first_restore_error = restore_error
+        if capture_error is None and first_restore_error is not None:
+            raise first_restore_error
+    if disabled_model_chunks:
+        cuda_graph_helper.cuda_graph_set_manual_hooks()
+
+
 def force_param_sync(model_chunks: list[DDP]) -> None:
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
@@ -4058,12 +4106,12 @@ def train(
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model, param_sync=False)
-            cuda_graph_helper.create_cudagraphs()
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                enable_forward_pre_hook(model)
-                cuda_graph_helper.cuda_graph_set_manual_hooks()
+            disable_forward_pre_hooks = (
+                args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args)
+            )
+            _capture_cudagraphs_with_forward_pre_hook_restore(
+                model, cuda_graph_helper, disable_forward_pre_hooks
+            )
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:

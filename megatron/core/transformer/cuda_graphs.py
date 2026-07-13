@@ -2108,7 +2108,11 @@ class TECudaGraphHelper:
         # - _graphs_created: Whether any graphs were actually created (may be False if no
         #   layers found)
         self._capture_finished = False
+        self._capture_failed = False
         self._graphs_created = False
+        self._capture_flag_owned = False
+        self._capture_gc_frozen = False
+        self._capture_restore_hooks = []
         self._fsdp_capture_param_states = []
 
     def _discover_layers(self):
@@ -2844,13 +2848,13 @@ class TECudaGraphHelper:
 
         # Extract hooks from callables for manual invocation during CUDA Graph capture/replay.
         # Two-phase approach:
-        #   Phase 1 (_extract_module_hooks): general — copies ALL 4 hook dicts uniformly, clears them.
+        #   Phase 1 snapshots all 4 hook dicts before any module mutation.
         #   Phase 2 (_apply_fsdp_hook_transforms): FSDP-specific — reroutes FSDP wrappers so their
         #     inner backward handlers land in the right TE-facing key while the wrappers themselves
         #     are withheld from TE. *_restore keys are never modified in Phase 2.
 
-        def _extract_module_hooks(module):
-            """Phase 1 (general): copy all 4 PyTorch hook dicts; clear them from module.
+        def _snapshot_module_hooks(module):
+            """Phase 1 (general): copy all 4 PyTorch hook dicts without mutating the module.
 
             Every hook goes into both its TE-facing key and its *_restore key (independent copy).
             *_with_kwargs flag sets are populated where applicable.
@@ -2866,7 +2870,6 @@ class TECudaGraphHelper:
                 fph_kw = {hid: True for hid in fph if hid in with_kw}
                 if fph_kw:
                     hooks_dict['forward_pre_hooks_with_kwargs'] = fph_kw
-                module._forward_pre_hooks.clear()
 
             if getattr(module, '_forward_hooks', None):
                 with_kw = getattr(module, '_forward_hooks_with_kwargs', set())
@@ -2876,21 +2879,28 @@ class TECudaGraphHelper:
                 fh_kw = {hid: True for hid in fh if hid in with_kw}
                 if fh_kw:
                     hooks_dict['forward_hooks_with_kwargs'] = fh_kw
-                module._forward_hooks.clear()
 
             if getattr(module, '_backward_pre_hooks', None):
                 bph = dict(module._backward_pre_hooks)
                 hooks_dict['backward_pre_hooks'] = bph
                 hooks_dict['backward_pre_hooks_restore'] = dict(bph)
-                module._backward_pre_hooks.clear()
 
             if getattr(module, '_backward_hooks', None):
                 bh = dict(module._backward_hooks)
                 hooks_dict['backward_hooks'] = bh
                 hooks_dict['backward_hooks_restore'] = dict(bh)
-                module._backward_hooks.clear()
 
             return hooks_dict
+
+        def _clear_module_hooks(module):
+            """Clear hooks only after their restoration snapshot has been registered."""
+            for hook_attr in (
+                '_forward_pre_hooks',
+                '_forward_hooks',
+                '_backward_pre_hooks',
+                '_backward_hooks',
+            ):
+                getattr(module, hook_attr, {}).clear()
 
         def _apply_fsdp_hook_transforms(hooks_dict):
             """Phase 2 (FSDP-specific): reroute forward hooks that wrap backward handlers.
@@ -2945,18 +2955,20 @@ class TECudaGraphHelper:
                     hooks_dict.pop('forward_hooks_with_kwargs', None)
 
         extracted_hooks = []  # TE-facing: passed to make_graphed_callables as capture_time_hooks
-        restore_hooks = []  # restore-only: applied to modules after graph capture
+        self._capture_restore_hooks = []
         for callable_module in self.flattened_callables:
             if isinstance(callable_module, torch.nn.Module):
-                hooks_dict = _extract_module_hooks(callable_module)
+                hooks_dict = _snapshot_module_hooks(callable_module)
+                restore = {k: v for k, v in hooks_dict.items() if k in _RESTORE_KEYS}
+                if restore:
+                    # Persist the restoration state before the first destructive clear.
+                    self._capture_restore_hooks.append((callable_module, restore))
+                _clear_module_hooks(callable_module)
                 _apply_fsdp_hook_transforms(hooks_dict)
                 te_hooks = {k: v for k, v in hooks_dict.items() if k in _TE_HOOK_KEYS}
-                restore = {k: v for k, v in hooks_dict.items() if k in _RESTORE_KEYS}
                 extracted_hooks.append(te_hooks if te_hooks else None)
-                restore_hooks.append(restore if restore else None)
             else:
                 extracted_hooks.append(None)
-                restore_hooks.append(None)
 
         def get_make_graphed_callables_kwargs():
             kwargs = {
@@ -3071,7 +3083,26 @@ class TECudaGraphHelper:
 
             kwargs['capture_time_hooks'] = [_wrap_hooks_dict(h) for h in extracted_hooks]
 
-        return sample_args, kwargs, restore_hooks
+        return sample_args, kwargs
+
+    @staticmethod
+    def _restore_callable_hook_state(callable_module, restore):
+        """Restore one callable's hook dictionaries."""
+        for hook_id, hook_fn in restore.get('forward_pre_hooks_restore', {}).items():
+            callable_module._forward_pre_hooks[hook_id] = hook_fn
+        for hook_id, hook_fn in restore.get('forward_hooks_restore', {}).items():
+            callable_module._forward_hooks[hook_id] = hook_fn
+        for hook_id, hook_fn in restore.get('backward_pre_hooks_restore', {}).items():
+            callable_module._backward_pre_hooks[hook_id] = hook_fn
+        for hook_id, hook_fn in restore.get('backward_hooks_restore', {}).items():
+            callable_module._backward_hooks[hook_id] = hook_fn
+
+    def _restore_callable_hooks(self):
+        """Restore hooks removed for TE capture; safe to call more than once."""
+        restore_states = getattr(self, '_capture_restore_hooks', [])
+        for callable_module, restore in restore_states:
+            self._restore_callable_hook_state(callable_module, restore)
+        self._capture_restore_hooks = []
 
     def _get_megatron_fsdp_instances(self):
         """Find Megatron-FSDP instances from possibly wrapped model chunks."""
@@ -3192,21 +3223,52 @@ class TECudaGraphHelper:
                 fsdp_module._replace_param_with_raw_if_needed()
         self._fsdp_capture_param_states = []
 
+    def _abort_capturing(self):
+        """Restore lightweight caller-owned state after a failed capture."""
+        self._capture_failed = True
+
+        def cleanup(description, action):
+            try:
+                action()
+            except BaseException:
+                logger.exception("Failed to %s after TE capture failed.", description)
+
+        def end_capture():
+            if self._capture_flag_owned:
+                try:
+                    _set_capture_end()
+                finally:
+                    self._capture_flag_owned = False
+
+        def unfreeze_gc():
+            if self._capture_gc_frozen:
+                try:
+                    gc.unfreeze()
+                finally:
+                    self._capture_gc_frozen = False
+
+        cleanup("end the global capture state", end_capture)
+        cleanup("disable rotary keyword observation", self._disable_rotary_kwarg_observation)
+        cleanup("restore callable hooks", self._restore_callable_hooks)
+        cleanup("restore FSDP parameter exposure", self._restore_fsdp_params_after_capture)
+        cleanup("unfreeze garbage collection", unfreeze_gc)
+
     def _start_capturing(self):
         """
         Start capturing CUDA Graphs.
         """
-        assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
-        if FREEZE_GC:
+        if FREEZE_GC and gc.get_freeze_count() == 0:
             gc.freeze()
+            self._capture_gc_frozen = True
 
         self._prepare_fsdp_params_for_capture()
         self._setup_fsdp_planned_allocators()
         _set_capture_start()
+        self._capture_flag_owned = True
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
 
@@ -3234,7 +3296,11 @@ class TECudaGraphHelper:
             f'Time spent in CUDA Graphs capture on rank {torch.distributed.get_rank()}: '
             f'{time.time() - start_time}s',
         )
-        _set_capture_end()
+        if self._capture_flag_owned:
+            try:
+                _set_capture_end()
+            finally:
+                self._capture_flag_owned = False
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -3258,14 +3324,29 @@ class TECudaGraphHelper:
         self._reset_after_capture()
         self._restore_fsdp_params_after_capture()
 
-        if FREEZE_GC:
+        if self._capture_gc_frozen:
             gc.unfreeze()
+            self._capture_gc_frozen = False
         gc.collect()
         torch.cuda.empty_cache()
 
         self._capture_finished = True
 
     def create_cudagraphs(self):
+        """Capture graphs and restore lightweight caller-owned state on failure."""
+        if self._capture_finished:
+            raise RuntimeError("CUDA Graph capture has already been finished.")
+        if self._capture_failed:
+            raise RuntimeError("A failed CUDA Graph capture cannot be retried with this helper.")
+        if is_graph_capturing():
+            raise RuntimeError("Another CUDA Graph capture is already active.")
+        try:
+            self._create_cudagraphs()
+        except BaseException:
+            self._abort_capturing()
+            raise
+
+    def _create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
@@ -3280,7 +3361,7 @@ class TECudaGraphHelper:
             self._disable_rotary_kwarg_observation()
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
+            sample_args, kwargs = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
@@ -3307,24 +3388,10 @@ class TECudaGraphHelper:
                     snapshot[name] = (data.data_ptr(), data.numel(), data.dtype)
                 callable_module._cg_param_ptr_snapshot = snapshot
 
-            # Restore original hooks to callables after CUDA Graph capture.
-            # restore_hooks contains only the hooks cleared before capture; _with_kwargs flag dicts
-            # survive .clear() and need no explicit restoration.
-            if restore_hooks and any(h for h in restore_hooks):
-                for callable_module, restore in zip(self.flattened_callables, restore_hooks):
-                    if isinstance(callable_module, torch.nn.Module) and restore:
-                        if 'forward_pre_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['forward_pre_hooks_restore'].items():
-                                callable_module._forward_pre_hooks[hook_id] = hook_fn
-                        if 'forward_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['forward_hooks_restore'].items():
-                                callable_module._forward_hooks[hook_id] = hook_fn
-                        if 'backward_pre_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['backward_pre_hooks_restore'].items():
-                                callable_module._backward_pre_hooks[hook_id] = hook_fn
-                        if 'backward_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['backward_hooks_restore'].items():
-                                callable_module._backward_hooks[hook_id] = hook_fn
+            # Hook dictionaries are cleared while TE extracts capture-time hooks.
+            # Restore them as soon as capture succeeds; the failure path restores
+            # the same snapshot from _abort_capturing().
+            self._restore_callable_hooks()
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0
