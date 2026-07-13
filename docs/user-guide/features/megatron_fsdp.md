@@ -398,16 +398,117 @@ To implement these "unit-periodic" mechanics, Megatron-FSDP uses `Module` hooks 
 
 Megatron-FSDP uses a `Tensor._typed_storage()._resize_(bytes)`-based allocator to instantly allocate and de-allocate memory without depending on the `CUDACachingAllocator` for un-sharded parameters and gradients by default. (Cache fragmentation and garbage collection can procrastinate large quantities of `cudaMalloc` and `cudaFree` operations that can block programs and spike memory, particularly when memory utilization is maxed out.) However, modifying the underlying storage of a buffer is not compatible with NCCL symmetric registration or CUDA graphability, which require a persistent state during runtime.
 
-To support these optimizations, Megatron-FSDP uses **double-buffering**, which assigns 2 persistently-allocated buffers to FSDP units in an alternating pattern, hard-limiting the memory overhead for parameter and gradient buffer allocation and ensuring that no more than 2 FSDP units are computed or communicated concurrently.
+To support these optimizations, Megatron-FSDP uses **double-buffering**, which maintains two
+reusable buffer groups for eligible FSDP units and limits concurrent pool ownership to two units. A
+group is not one physical tensor: it can contain a named allocation for each bucket offset, dtype,
+and allocator kind (parameter, transpose-parameter, `main_grad`, and optional HSDP communication
+buffers). Persistent spill buffers can add further allocations.
 
 ```{figure} ../../images/megatron_fsdp/fsdp_double_buffer.png
 :alt: FSDP Double Buffering
 :align: center
 
-Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP units share the same un-sharded parameter and gradient buffers, overwriting incumbent data as needed during runtime. Megatron-FSDP ensures that no more than two FSDP units are un-sharded at any point during runtime.
+Visualization of double buffering in Megatron-FSDP. Eligible FSDP units rotate through either
+available buffer group, reusing its per-offset unsharded parameter and gradient allocations. No
+more than two eligible units own the pool concurrently.
 ```
 
-With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
+Once named allocations reach their required capacities, double-buffering avoids steady-state
+allocation for compatible units, reducing fragmentation. NCCL-compatible homogeneous mode selects
+the largest group of units with matching bucket layouts; non-matching units use the resize-based
+allocator or persistent spill buffers.
+
+#### Planned Buffers for Transformer Engine CUDA Graphs
+
+Per-layer Transformer Engine CUDA graphs retain absolute addresses for the unsharded parameter and
+fused weight-gradient buffers used during capture. Runtime allocation order is not a sufficient
+address-stability guarantee: a resize-based allocator can return new storage, and a fixed pool can
+assign a different bucket to the same slot. Megatron-FSDP therefore installs a planned allocator
+only for `--cuda-graph-impl transformer_engine`.
+
+During eager warmup, the allocator records exact padded sizes, dtypes, and allocate/free lifetimes.
+At capture start it colors non-overlapping graph-covered bucket lifetimes and pre-materializes one
+slot per used `(color, bucket-offset)` pair at the maximum observed size. Graph-covered
+parameter, transpose-parameter, and `main_grad` buckets then resolve to those slots in constant
+time; other buckets delegate to their existing eager allocators. Observation stops and its metadata
+is released once the plan is frozen, including when no buckets are covered.
+
+Planned allocation is the only supported temporary-buffer policy for Megatron-FSDP per-layer TE
+graphs. `fsdp_double_buffer=True` is rejected. Planned colors represent peak overlapping observed
+lifetimes plus conservative conflicts, rather than a fixed pair of buffers. A bucket offset may
+therefore require one, two, or more colors. Its color count is a graph-coloring result, not an exact
+instantaneous peak-live measurement: unobserved or different-dtype buckets add conflicts, and the
+greedy coloring may use more colors than the minimum. Each slot's capacity is the maximum padded
+size observed among the same-dtype buckets assigned to that `(color, bucket-offset)` pair.
+
+`PlannedBucketAllocator.get_plan_diagnostics()` returns a read-only structured snapshot. It reports
+per-offset color counts; logical and materialized slot counts; each slot's dtype, capacity, members,
+and current occupant; and materialized bytes deduplicated by backing storage. Per-offset counts are
+authoritative because equal color IDs at different offsets name different slots. The stable,
+freeze-time plan checksum includes storage kind, bucket-to-`(color, offset)` assignments, and slot
+dtype/capacity known at freeze (or an unmaterialized marker), while excluding the process-local
+allocator namespace and `data_ptr`. If an unobserved slot materializes lazily afterward, the
+checksum remains the freeze-time identity; the current slot records and materialized-byte summaries
+report its live dtype/capacity/storage. Freeze logs a compact rank-zero INFO summary; DEBUG logs
+contain the complete bucket-to-slot mapping and slot details.
+
+Fully sharded (`optim_grads_params`) planned allocation requires both
+`--overlap-param-gather` and `--overlap-grad-reduce`: its frozen plan covers the observed per-unit
+all-gather and reduce-scatter lifetimes, not synchronous or delayed full-model residency.
+`start_param_sync(force_sync=True)` is therefore rejected before changing parameter or pipeline
+state in this configuration. Releasing each unit immediately would satisfy the plan's capacity but
+would violate force-sync's contract that all unsharded parameters remain ready when it returns.
+
+Dynamic microbatch/topology inputs are outside this core path:
+`--cuda-graph-dynamic-microbatches`, variable sequence lengths, sequence-packing schedulers, and
+RL sequence packing are rejected during configuration. They require a later all-rank
+retrace/recapture lifecycle.
+
+Each parameter-and-gradient buffer has a distinct process-local namespace that combines a
+human-readable model-chunk label with a monotonic buffer instance ID. The instance ID prevents
+collisions between independently wrapped model groups that both contain a `model_chunk_0`, while
+the label keeps diagnostics readable. Every materialized slot records its dtype, capacity, and
+device pointer; later allocations fail on occupancy conflicts, capacity growth, dtype changes, or
+pointer changes. A frozen plan also rejects any later attempt to add newly discovered graph
+buckets. The pointer invariant includes fused-wgrad `main_grad`
+storage, which is not visible through `Module.named_parameters()`: after pre-backward parameter
+all-gather, Megatron-FSDP claims and revalidates each planned fused-wgrad slot before TE backward
+graph replay can write to it.
+
+Planned slots use the FSDP memory-allocation context, but current manual NCCL user-buffer
+registration can finish before capture materializes those slots. TE planned allocation with
+`nccl_ub=True` is therefore not yet supported; post-freeze registration of planned slots must be
+implemented and GPU-validated first. NCCL user buffers also imply FSDP double buffering, which this
+path independently rejects.
+
+The `optim_grads` strategy is also excluded from TE per-layer graphs until it has a per-layer
+pre-backward fused-main-grad claim hook; use `optim_grads_params` for gradient sharding, while
+`no_shard` and `optim` use persistent main-gradient storage and do not need the claim. Every
+graph-covered callable with distributed weights or gradients must be configured as an FSDP unit;
+non-unit Mamba/custom callables fail at capture setup. The `local` CUDA graph implementation is not
+supported with Megatron-FSDP: its backward replay can write fused gradients before bucket
+allocation/throttling, and its eager allocators can move captured parameter addresses. Full-iteration
+capture keeps its existing allocator behavior.
+
+Programmatic callers must set `megatron_fsdp_cuda_graph_mode=True` for both TE and full-iteration
+capture so `zero_grad()` preserves graph-owned gradient references. TE additionally requires
+`megatron_fsdp_use_planned_allocator=True`; the planned flag is rejected for other graph backends.
+CLI validation and the Megatron-FSDP adapter both reject TE planned allocation with double
+buffering, NCCL user buffers, or the `optim_grads` sharding strategy.
+
+Capture failure uses lightweight, one-shot cleanup. The stock training loop restores temporarily
+disabled DDP forward-pre hooks, while the TE helper restores callable hooks, Megatron-FSDP
+parameter exposure, and only the capture flag and GC freeze state that it owns. The failure is
+re-raised and the helper cannot retry. This is not a distributed transaction: it does not perform
+cross-rank failure consensus, reset partially created graphs, or promise exhaustive rollback of
+all model, optimizer, activation-offload, and RNG side effects. Treat capture failure as fatal and
+restart the job.
+
+`HyperConnectionHybridLayer` callables are currently excluded from per-layer TE graph capture when
+using Megatron-FSDP and remain eager. Megatron-FSDP installs the relevant parameter and backward
+hooks on the wrapper's inner Transformer layer, while TE would capture the outer wrapper; capturing
+that boundary before the hook lifecycle is lifted to the wrapper can bake released parameter
+storage into a graph.
 
 ### Data-Parallel Sharding Strategies
 

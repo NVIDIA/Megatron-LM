@@ -59,6 +59,12 @@ Operationally, this path is tightly integrated into MCore training and inference
 --cuda-graph-impl local
 ```
 
+`local` is not currently supported with Megatron-FSDP. Its backward graph can replay fused
+weight-gradient writes before FSDP allocates, throttles, and validates the live `main_grad` bucket;
+its eager allocators can also move graph-baked parameter addresses. This configuration fails
+explicitly even when double buffering or NCCL user buffers are enabled. Use
+`--cuda-graph-impl transformer_engine` for per-layer Megatron-FSDP graphs, or disable CUDA graphs.
+
 ### `--cuda-graph-modules` options
 
 | Module | What is captured |
@@ -98,6 +104,10 @@ wired into custom training loops. The trade-off is that it requires more manual 
 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
+Programmatic Megatron-FSDP callers must also keep the DDP allocation policy consistent with the
+selected graph backend: TE capture requires both `megatron_fsdp_cuda_graph_mode=True` and
+`megatron_fsdp_use_planned_allocator=True`; full-iteration capture requires the graph-mode flag but
+does not use the planned allocator. The Megatron-FSDP adapter rejects inconsistent combinations.
 
 ### Usage
 
@@ -108,6 +118,127 @@ but custom training scripts must do the same work themselves.
 
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
+
+### Megatron-FSDP buffer planning
+
+Transformer Engine graphs record absolute addresses for unsharded parameter buffers and fused
+weight-gradient (`main_grad`) buffers. With Megatron-FSDP, the helper observes bucket lifetimes
+during eager warmup and freezes graph-covered buckets onto pre-materialized, address-stable slots
+before capture. Planned allocation is the only supported temporary-buffer policy for this TE and
+Megatron-FSDP path: `--fsdp-double-buffer` is rejected. Buckets outside the frozen graph plan
+continue to use their existing eager allocators. Every parameter-and-gradient buffer receives a
+namespace composed of its human-readable model-chunk label and a process-local monotonic instance
+ID. This keeps both virtual-pipeline chunks and separately wrapped model groups disjoint.
+
+This path requires a Transformer Engine build that implements MCore's versioned
+`capture_time_hooks` contract for all four forward/backward pre/post hook phases. Compatible builds
+advertise `mcore_fsdp_capture_time_hooks_v1` through the `__mcore_cuda_graph_protocols__` marker on
+`make_graphed_callables()` or its module. The repository validation loader publishes this marker
+only after verifying TE commit `4251467130ce88595f584a5160e6350176333923` and the pinned
+`graph.py` SHA-256 `71188f41bd37611075f520222f9408249372c2e8a2356f68760dd36429a5cfe9`.
+An argument named `capture_time_hooks` alone does not establish the required semantics. Models
+that pass runtime tensors through keyword arguments need TE 1.10 or newer for the public
+`sample_kwargs` API and the pinned overlay's mixed positional/keyword-input fix. In particular,
+model-computed rotary inputs must be observed during eager warmup and declared as graph inputs.
+
+After capture succeeds, the planned-FSDP path freezes a local PP/VPP topology and schedule
+signature. Every training and evaluation iteration must retain the captured topology, graph scope,
+microbatch size, and number of microbatches; evaluation therefore uses the same microbatch size and
+microbatch count as capture. A predictable mismatch is a fatal error and requires restarting the
+job; automatic reset or retrace is not supported. Allocator occupancy, capacity, dtype, and pointer
+checks remain authoritative for runtime changes that the boundary signature cannot predict.
+
+The core planned-FSDP path rejects `--cuda-graph-dynamic-microbatches`, variable sequence
+lengths, sequence-packing schedulers, and RL sequence packing during configuration. Supporting
+those dynamic schedules requires the later all-rank retrace/recapture lifecycle; they must remain
+eager in this PR.
+
+The number of planned slots is not fixed at two. Warmup records each bucket's exact padded size,
+dtype, and allocate/free lifetime. At freeze, non-overlapping graph-covered lifetimes are colored,
+and each used `(color, bucket-offset)` pair is materialized at the maximum observed size of the
+buckets assigned to it. A workload may therefore need one, two, or more colors according to the
+conservative conflict graph inferred from observed lifetimes; greedy coloring can exceed both the
+instantaneous peak-live count and the minimum coloring. These lifetime-planned slots are not FSDP
+double buffers.
+
+NCCL user buffers are a separate unsupported combination. Planned slots retain the FSDP
+memory-allocation context, but the current manual NCCL registration can run before those slots are
+materialized. Consequently, TE planned allocation rejects `--use-nccl-ub` until post-freeze
+registration is implemented and GPU-validated. NCCL user buffers also imply FSDP double buffering,
+which this path independently rejects.
+
+The `optim_grads` sharding strategy is also not yet supported with TE per-layer graphs because it
+has no per-layer FSDP pre-backward hook to claim a fused `main_grad` slot before replay.
+`optim_grads_params` supplies that hook and is the supported gradient-sharding strategy;
+`no_shard` and `optim` use persistent main gradients and do not need the claim. Every graph callable
+with distributed weights or gradients must also be an FSDP unit module.
+
+The allocator rejects an overlapping slot user, a request larger than the frozen capacity, a dtype
+change, or a storage-address change. These are hard errors because falling back to another buffer
+would let a graph silently read or write stale storage. Buckets outside the TE graph continue to use
+the configured eager allocator. A frozen plan cannot later be extended with newly discovered graph
+buckets. Fused `main_grad` slots are claimed and their pointers revalidated after parameter
+all-gather and before TE backward graph replay. The claim verifies that the frozen slot is
+materialized, unoccupied or already owned by the same bucket, and unchanged in dtype, capacity, and
+device pointer. It then records occupancy so relocation or a live colormate conflict fails before
+the graph can write to a capture-era address.
+
+TE capture is one-shot. If capture fails, the stock training integration restores temporarily
+disabled DDP forward-pre hooks in a `finally` block. The helper restores callable hooks and
+Megatron-FSDP parameter exposure, and clears only the global capture flag and GC freeze state that
+it owns, before re-raising the original failure. The same helper rejects a retry after failure.
+
+This cleanup is intentionally not a distributed transaction. It does not reset partially
+constructed graphs, provide cross-rank failure consensus, or promise exhaustive rollback of
+model/optimizer, activation-offload, and RNG side effects outside the state listed above. Treat a
+capture failure as fatal and restart the job after correcting the underlying problem.
+
+### Model-computed rotary inputs
+
+Models such as Qwen3.5-VL compute language MRoPE above the Transformer layer and pass it as
+per-microbatch keyword arguments. TE capture declares the rotary tensors observed during eager
+warmup as graph inputs so replay copies each microbatch's values into independent static buffers.
+Observation is restricted to known rotary arguments.
+
+If captured attention requires model-computed rotary inputs, at least one eager warmup forward is
+required. Capture fails rather than producing a graph without positional embeddings when no rotary
+inputs were observed or when the installed TE version cannot accept keyword graph inputs. This
+applies to `position_embedding_type="mrope"` language layers. Rotary inputs are not declared when
+attention remains eager under a partial capture scope.
+
+The stock training loop creates `TECudaGraphHelper` for the language decoder only. Qwen3.5-VL
+vision layers, including their per-microbatch 2-D RoPE path, remain eager. Custom multimodal loops
+may explicitly construct `VisionTECudaGraphHelper`; that opt-in path is not part of the stock
+training integration and requires at least one eager vision forward before capture. The helper then
+declares the observed 2-D RoPE inputs or fails loudly if they are unavailable. Every rank that
+participates in the helper's default-group capture barrier must invoke it in the same order,
+including ranks with no vision layers; those ranks take the no-graph path but still complete the
+capture phase. There is no cross-rank capture-failure consensus in this core path.
+Dynamic-microbatch capture is not supported by this custom Vision helper. Without Megatron-FSDP, a
+custom loop may use both helpers; each helper consumes and cleans only the decoder subtree it owns,
+so one capture does not erase the other's observation. Multiple
+helpers cannot currently freeze disjoint bucket subsets of the same Megatron-FSDP
+parameter-and-gradient buffer: the first frozen plan is immutable and a second helper fails if it
+discovers new buckets. Keep vision eager in that configuration, as the stock training loop does.
+
+For hybrid mHC wrappers, capture discovery inspects the effective inner Transformer layer. An inner
+attention implementation that opts out of TE graphs remains eager, and a partial wrapper split that
+is not implemented is skipped instead of capturing a different region than requested. When the
+model uses Megatron-FSDP, every `HyperConnectionHybridLayer` is deliberately kept eager: FSDP's
+parameter gather/release and pre-backward hooks currently belong to the inner layer and cannot be
+safely driven by a graph whose callable boundary is the outer wrapper.
+
+Two temporary environment controls cover behavior that does not yet have a public config field:
+
+- `MEGATRON_GDN_TE_CUDA_GRAPH=1` opts Gated DeltaNet attention into TE graph capture. It remains
+  eager by default while graph validation matures.
+- `MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1` disables the module-level replay pointer check. Only
+  the exact value `1` is accepted. This is a dangerous debugging escape hatch: replay may silently
+  access stale storage if an address moves. Planned fused-`main_grad` claims still perform their
+  allocator-level checks.
+
+These controls are internal and may be replaced by explicit configuration fields. Do not set them
+in a production recipe without validating the resulting memory use and numerical behavior.
 
 ---
 
@@ -187,7 +318,20 @@ models as well:
 - `--cuda-graph-warmup-steps` (default: 3) controls how many warmup steps run before CUDA graph
   capture. Setting it to 0 is not recommended: some operations rely on the first few iterations
   for lazy initialization or autotuning, and capturing too early may produce incorrect or
-  suboptimal graphs.
+  suboptimal graphs. It is invalid for TE attention capture with model-computed runtime rotary
+  inputs such as language MRoPE because they must be observed before capture. The same restriction
+  applies when a custom loop opts into `VisionTECudaGraphHelper` for vision 2-D RoPE.
+- `--cuda-graph-dynamic-microbatches` assumes every rank in a pipeline group enters the same
+  dynamic-slot discovery collective and that the capture topology stays fixed. Mixing ranks with
+  graphable callables and empty ranks is unsupported. The planned-FSDP iteration-boundary signature
+  detects later local schedule changes, but it does not provide pre-capture, cross-rank consensus
+  for custom or empty-stage layouts. Those layouts must disable dynamic microbatch slots or remain
+  eager. The custom Vision helper does not support dynamic-microbatch capture.
+- Selective activation recomputation must not overlap a captured region when bitwise agreement with
+  eager execution is required. Argument validation reports overlapping modules; in particular,
+  `moe_router` capture overlaps full-`moe` recompute and any captured `shared_experts`, while
+  whole-layer, `mlp`, and `moe` capture cover their respective full MLP regions.
+  Opted-in GDN attention capture also overlaps whole-``gdn`` recompute.
 - Inference CUDA graphs (serving or RL rollout) currently require
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
