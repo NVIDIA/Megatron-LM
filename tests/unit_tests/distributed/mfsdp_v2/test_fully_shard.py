@@ -6,7 +6,6 @@ import logging
 
 import pytest
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -14,7 +13,6 @@ from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
-    Partial,
     Placements,
     Replicate,
     fully_shard,
@@ -104,13 +102,13 @@ def _flat_placements() -> Placements:
 
 
 def _hsdp_placements() -> Placements:
-    """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
-    DP-inner (axis 1); gradients rest DP-outer-Partial and reduce on the last
-    microbatch."""
+    """HSDP: params/gradients/optimizer replicated across DP-outer (axis 0),
+    sharded within DP-inner (axis 1). main_grad rests DP-outer-replicated and
+    backs .grad; the DP-outer all-reduce is deferred to the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
         parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        gradient=[Replicate(), Flat()],
         optimizer=[Replicate(), Flat()],
     )
 
@@ -183,14 +181,17 @@ def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
     )
 
 
+@pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches):
+def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
     """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
 
-    Gradients reduce-scatter within DP-inner every backward and accumulate at a
-    DP-outer-Partial resting state; the DP-outer reduction runs only on the last
-    microbatch, scoped via ``microbatch(...)``. Every rank sees identical data, so
-    the averaged gradient equals the single-rank gradient and losses must match.
+    Gradients reduce-scatter within DP-inner every backward and accumulate into
+    main_grad; the DP-outer all-reduce runs only on the last microbatch, scoped
+    via ``microbatch(...)``. Every rank sees identical data, so the averaged
+    gradient equals the single-rank gradient and losses must match. Both
+    ``zero_grad`` modes are covered: ``set_to_none=True`` overwrites main_grad,
+    ``set_to_none=False`` accumulates into a zeroed main_grad.
     """
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -221,7 +222,7 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches):
     def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
         losses = []
         for step in range(5):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=set_to_none)
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
