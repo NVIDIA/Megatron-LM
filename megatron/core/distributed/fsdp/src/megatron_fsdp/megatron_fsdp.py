@@ -438,6 +438,53 @@ class MegatronFSDP(torch.nn.Module):
                 self.module.parameters(), self.all_gather_pipeline
             )
 
+    def _claim_cuda_graph_fused_wgrad_buckets(self, params: List[torch.nn.Parameter]) -> None:
+        """Record warmup lifetimes or claim planned slots before graph replay."""
+        pgb = self.param_and_grad_buffer
+        main_grad_alloc = getattr(pgb, 'main_grad_alloc', None)
+        record_graph_bucket_claim = getattr(
+            main_grad_alloc, 'record_graph_bucket_claim', None
+        )
+        claim_graph_bucket = getattr(main_grad_alloc, 'claim_graph_bucket', None)
+        if record_graph_bucket_claim is None and claim_graph_bucket is None:
+            return
+
+        record_claims = {}
+        bucket_claims = {}
+        for param in params:
+            orig_param = getattr(param, 'orig_param', param)
+            fused_wgrad = (
+                id(param) in self._cuda_graph_fused_wgrad_params
+                or id(orig_param) in self._cuda_graph_fused_wgrad_params
+            )
+            bucket_id = pgb.param_to_param_group.get(param)
+            if bucket_id is None:
+                bucket_id = pgb.param_to_param_group.get(orig_param)
+            if bucket_id is None:
+                continue
+
+            group = pgb.parameter_groups[bucket_id]
+            grad_buffer = getattr(group, 'hfsdp_helper_gbuf', None) or getattr(
+                group, 'main_grad_buffer', None
+            )
+            # Unsharded/no-DP buffers are persistent and never resolve through
+            # main_grad_alloc, so they have no planned slot to claim.
+            if grad_buffer is not None and grad_buffer.is_data_distributed:
+                expected_dtype = pgb.mp_policy.grad_comm_dtype or grad_buffer.dtype
+                claim = (grad_buffer.bucket_index.size, expected_dtype)
+                record_claims[bucket_id] = claim
+                if fused_wgrad:
+                    bucket_claims[bucket_id] = claim
+
+        if record_graph_bucket_claim is not None:
+            for bucket_id in sorted(record_claims):
+                size, dtype = record_claims[bucket_id]
+                record_graph_bucket_claim(bucket_id, size, dtype)
+        if claim_graph_bucket is not None:
+            for bucket_id in sorted(bucket_claims):
+                size, dtype = bucket_claims[bucket_id]
+                claim_graph_bucket(bucket_id, size, dtype)
+
     def _import_class_from_path(self, class_path: str):
         """Helper function to import classes from string paths."""
         module_path, class_name = class_path.rsplit(".", 1)
@@ -692,8 +739,8 @@ class MegatronFSDP(torch.nn.Module):
             """
             # During CUDA graph capture, fused wgrad GEMMs allocate main_grad
             # buffers and write into addresses that are baked into the graph.
-            # Remember those params for replay and free the fixed-pool slots so
-            # capture itself does not exhaust the double-buffer pool.
+            # Remember those params for replay and release planned-slot
+            # occupancy after the capture-time write completes.
             if is_graph_capturing():
                 for param in param_list:
                     if hasattr(param, 'main_grad') and param.main_grad is not None:
@@ -912,6 +959,8 @@ class MegatronFSDP(torch.nn.Module):
                 self.all_gather_and_wait_parameters_ready(
                     param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
                 )
+
+            self._claim_cuda_graph_fused_wgrad_buckets(param_list)
 
         self._root_pre_backward_hook_issued = False
 

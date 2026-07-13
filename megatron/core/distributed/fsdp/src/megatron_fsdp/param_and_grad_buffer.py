@@ -896,7 +896,7 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
             next_offset[param_group.fsdp_unit_id] += 1
         self._bucket_offsets = bucket_offsets
 
-        self._lifetime_events = []  # [(op, bucket_id)] with op in {'alloc', 'free'}
+        self._lifetime_events = []  # [(op, bucket_id)] with op in {'claim', 'alloc', 'free'}
         self._recording_lifetimes = True
         self._plan = None  # {bucket_id: color}
         self._slot_using = {}  # {(color, bucket_offset): bucket_id}
@@ -922,6 +922,34 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
     def _get_planned_buf_name(self, color: int, bucket_offset: int) -> str:
         return f"{self.name}_planned_{color}_{bucket_offset}"
 
+    def _record_lifetime_start(
+        self, op: str, bucket_id: int, size: int, dtype: torch.dtype
+    ) -> None:
+        """Record a prospective or actual bucket lifetime start."""
+        self._lifetime_events.append((op, bucket_id))
+        observed = self._observed_alloc_meta.get(bucket_id)
+        if observed is not None and observed[1] != dtype:
+            raise RuntimeError(
+                f"[FSDP][{self.name}] bucket {bucket_id} changed dtype during "
+                f"planned-allocation warmup: {observed[1]} -> {dtype}."
+            )
+        max_size = max(size, observed[0]) if observed is not None else size
+        self._observed_alloc_meta[bucket_id] = (max_size, dtype)
+
+    def record_graph_bucket_claim(
+        self, bucket_id: int, size: int, dtype: torch.dtype
+    ) -> None:
+        """Record the earlier pre-write lifetime boundary used by graph replay.
+
+        Eager fused-wgrad warmup reaches allocate inside the GEMM, while replay
+        claims the graph-baked main-grad address in the FSDP pre-backward hook.
+        Recording that prospective claim makes coloring cover the replay interval.
+        Once the plan is frozen this method is a no-op; replay uses
+        claim_graph_bucket for the actual pointer and occupancy checks.
+        """
+        if self._recording_lifetimes:
+            self._record_lifetime_start('claim', bucket_id, size, dtype)
+
     def allocate(
         self,
         bucket_id: int,
@@ -934,15 +962,7 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
         if self._plan is not None and bucket_id in self._plan:
             return self._allocate_planned(bucket_id, size, dtype, device, mem_alloc_context)
         if self._recording_lifetimes:
-            self._lifetime_events.append(('alloc', bucket_id))
-            observed = self._observed_alloc_meta.get(bucket_id)
-            if observed is not None and observed[1] != dtype:
-                raise RuntimeError(
-                    f"[FSDP][{self.name}] bucket {bucket_id} changed dtype during "
-                    f"planned-allocation warmup: {observed[1]} -> {dtype}."
-                )
-            max_size = max(size, observed[0]) if observed is not None else size
-            self._observed_alloc_meta[bucket_id] = (max_size, dtype)
+            self._record_lifetime_start('alloc', bucket_id, size, dtype)
         return self.base.allocate(
             bucket_id=bucket_id,
             size=size,
@@ -1130,7 +1150,7 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
         intervals = defaultdict(list)
         open_t = {}
         for t, (op, b) in enumerate(self._lifetime_events):
-            if op == 'alloc':
+            if op in ('claim', 'alloc'):
                 open_t.setdefault(b, t)
             elif b in open_t:
                 intervals[b].append((open_t.pop(b), t))
