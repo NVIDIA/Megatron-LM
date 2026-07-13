@@ -392,8 +392,9 @@ class MoELayer(BaseMoELayer):
         `InferenceMode.is_active()`.
           - 'nccl' / 'nvls': swap to a dedicated AllGather-style inference dispatcher
             in eval mode; train() swaps back to the standard dispatcher.
-          - 'deepep_v2': the existing MoEFlexTokenDispatcher already handles inference
-            via DeepEP V2 ElasticBuffer; no dispatcher swap is needed.
+          - 'deepep_v2': the existing MoEFlexTokenDispatcher handles both training and
+            inference; both _training_token_dispatcher and _inference_token_dispatcher
+            point to the same dispatcher, so no swap occurs.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
 
@@ -402,6 +403,8 @@ class MoELayer(BaseMoELayer):
                 "inference_moe_token_dispatcher_type='deepep_v2' requires "
                 "moe_token_dispatcher_type='flex' (the DeepEP-backed dispatcher)."
             )
+            self._training_token_dispatcher = self.token_dispatcher
+            self._inference_token_dispatcher = self.token_dispatcher
             return
 
         self._training_token_dispatcher = self.token_dispatcher
