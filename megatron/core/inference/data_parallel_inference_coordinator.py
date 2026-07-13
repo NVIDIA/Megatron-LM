@@ -255,8 +255,37 @@ class DataParallelInferenceCoordinator:
         )
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from the routing pool."""
+        """Remove a disconnected engine from all routing bookkeeping.
+        Note that this is only called during shutdown, so do not worry about
+        optimizing this method. This needs to be optimized iff we want to support
+        dynamic engine registration and deregistration during normal operation,
+        which is not a current use case.
+        """
         self.identities_of_data_parallel_ranks.remove(identity)
+        idx = self.identity_to_rank_index.pop(identity, None)
+        if idx is None:
+            return
+        self._identities_list.pop(idx)
+        self._pending_counts = np.delete(self._pending_counts, idx)
+        # Shift indices for engines that came after the removed slot.
+        for ident in self.identity_to_rank_index:
+            if self.identity_to_rank_index[ident] > idx:
+                self.identity_to_rank_index[ident] -= 1
+        # Drop hash-table entries for the removed rank; shift indices above it.
+        new_hash_table = {}
+        for h, rank_ts in self._hash_table.items():
+            # h is hash index
+            # rank_ts is a dict mapping rank_idx → timestamp
+            new_row = {}
+            for r, ts in rank_ts.items():
+                if r == idx:
+                    # skip this rank as it is removed
+                    continue
+                new_r = r - 1 if r > idx else r
+                new_row[new_r] = ts
+            if new_row:
+                new_hash_table[h] = new_row
+        self._hash_table = new_hash_table
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
