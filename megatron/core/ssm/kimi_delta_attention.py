@@ -13,7 +13,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.contexts import BaseInferenceContext
