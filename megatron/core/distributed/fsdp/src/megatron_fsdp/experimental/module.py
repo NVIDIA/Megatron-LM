@@ -167,14 +167,14 @@ class FsdpModule:
 
     @property
     def name(self) -> str:
-        """Return this FSDP unit's name."""
+        """Return this FsdpModule's name."""
         name = self._name
         if name is None:
             raise RuntimeError("FSDP module name has not been initialized.")
         return name
 
     def is_root(self) -> bool:
-        """Return whether this module is the outermost FSDP unit in its context."""
+        """Return whether this module is the outermost FsdpModule in its context."""
         return self.context.root_module is self
 
     def _register_hooks(self) -> None:
@@ -183,7 +183,7 @@ class FsdpModule:
         module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
         module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
         # Gradient reduction is parameter-completion based: once every owned
-        # Parameter has accumulated its grad, this FSDP unit can reduce and
+        # Parameter has accumulated its grad, this FsdpModule can reduce and
         # reshard. Module full-backward hooks can fire before that when module
         # inputs do not require grad.
         for group in self._parameter_groups:
@@ -211,7 +211,7 @@ class FsdpModule:
         self._unshard_parameter_groups(sync_model_weight=True)
 
     def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
-        """Materialize full parameters for this FSDP unit."""
+        """Materialize full parameters for this FsdpModule."""
         self.context.drain_delayed_releases(target_length=1)
 
         allgather_stream = self.context.allgather_stream
@@ -256,13 +256,13 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def release_unsharded_storage(self) -> None:
-        """Release unsharded storage owned by this FSDP unit."""
+        """Release unsharded storage owned by this FsdpModule."""
         for group in self._parameter_groups:
             group.release_unsharded_storage()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
-        """Parameter groups owned by this FSDP unit."""
+        """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
 
     def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
@@ -296,7 +296,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
             )
             if contained_in_parameter_group(parameter):
-                raise ValueError(f"Parameter {parameter_fqn!r} is already owned by an FSDP unit.")
+                raise ValueError(f"Parameter {parameter_fqn!r} is already owned by another FsdpModule.")
             parameters[parameter_fqn] = parameter
 
         for child_name, child_module in submodule.named_children():
