@@ -359,6 +359,7 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
     context.initialize_attention_state = mock.Mock(return_value="bookkeeping")
     context.current_input_and_position_ids = mock.Mock(return_value=(input_ids, position_ids))
     model_config = SimpleNamespace(
+        params_dtype=torch.float32,
         symmetric_ar_type=None,
         nccl_all_reduce_for_prefill=False,
         moe_pad_experts_for_cuda_graph_inference=False,
