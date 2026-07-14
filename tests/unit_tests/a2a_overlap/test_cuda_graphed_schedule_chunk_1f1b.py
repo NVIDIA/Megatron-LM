@@ -28,6 +28,9 @@ from megatron.training.global_vars import (
 from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
+# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
+pytestmark = pytest.mark.flaky_in_dev
+
 
 def is_deep_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
@@ -274,7 +277,7 @@ class TestPartialCudaGraphedA2AOverlap:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 

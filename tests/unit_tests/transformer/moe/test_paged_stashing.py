@@ -21,6 +21,11 @@ from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+# These tests configure mxfp8 + the TE op fuser, so they only run on Blackwell (sm100+). Mark the
+# whole module for the GB200 CI bucket (selection there is marker-driven; see
+# tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
     """Per-expert token counts from a local routing map, summed across the default process group.
@@ -112,6 +117,7 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            moe_ncclep_static_shape=kwargs.get("moe_ncclep_static_shape", False),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
@@ -177,6 +183,12 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
+
+
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
 
 
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
@@ -412,3 +424,105 @@ class TestPagedStashingOverBudget:
             f"overflow {overflow_set} should match total_tokens > stash_buffer_size "
             f"({total_tokens} > {stash_buffer_size})"
         )
+
+
+@pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
+@pytest.mark.skipif(
+    not _te_grouped_mlp_op_fuser_environment_supported(),
+    reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
+)
+@pytest.mark.skipif(not is_nccl_ep_available(), reason="NCCL EP is not available")
+class TestNcclEpPagedStashing:
+    """Paged stashing with the NCCL EP flex backend in its static-shape path.
+
+    ncclep's CUDA-graph / paged-stash path requires moe_ncclep_static_shape=True, which feeds the
+    experts the full fixed-size recv buffer and is only valid with fp8/fp4 + the CuTe DSL grouped
+    GEMM (the container always configures mxfp8; NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 must be set in the
+    environment). This mirrors TestPagedStashing: run the paged-stash path twice and assert the two
+    passes agree (a determinism guard for the static ncclep path), plus no paged-stash overflow.
+    """
+
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.internal
+    def test_forward_backward_4_layers(self):
+        """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match."""
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+
+        config.ENABLE_EXPERIMENTAL = True
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            num_layers=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend="ncclep",
+            moe_ncclep_static_shape=True,
+            test_dtype=torch.bfloat16,
+            moe_grouped_gemm=True,
+            moe_use_legacy_grouped_gemm=False,
+            moe_paged_stash=True,
+            moe_expert_rank_capacity_factor=1.5,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            moe_router_padding_for_quantization=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+        )
+
+        seq_length = 1024
+        batch_size = 1
+        hidden_size = container.config.hidden_size
+        hidden_states = torch.randn((seq_length, batch_size, hidden_size), dtype=torch.bfloat16)
+
+        # First iteration: capture schedule, capacity, etc.
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output_ref, hidden_states_grad_ref, routing_map_ref, tokens_per_expert_ref = (
+            _forward_backward_all_layers(container, hidden_states)
+        )
+
+        container.zero_grad()
+
+        # Second iteration: run with paged stash.
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output, hidden_states_grad, routing_map, tokens_per_expert = _forward_backward_all_layers(
+            container, hidden_states
+        )
+
+        overflow = check_paged_stash_overflow()
+        assert overflow.any().item() == 0
+
+        assert torch.allclose(
+            output, output_ref, atol=1e-4, rtol=1e-4
+        ), f"output != output_ref: max diff = {(output - output_ref).abs().max().item()}"
+        assert torch.allclose(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4), (
+            f"hidden_states_grad != ref: max diff = "
+            f"{(hidden_states_grad - hidden_states_grad_ref).abs().max().item()}"
+        )
+        if routing_map is not None and tokens_per_expert is not None:
+            num_tokens_per_ep_rank = tokens_per_expert.sum().item()
+            assert (
+                num_tokens_per_ep_rank > 0
+            ), f"num_tokens_per_ep_rank={num_tokens_per_ep_rank} (expected > 0)"
+            assert routing_map_ref is not None and tokens_per_expert_ref is not None
+            tpe_f = tokens_per_expert.float()
+            ref_f = tokens_per_expert_ref.float()
+            assert torch.allclose(
+                tpe_f, ref_f, atol=1e-4, rtol=1e-4
+            ), f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
