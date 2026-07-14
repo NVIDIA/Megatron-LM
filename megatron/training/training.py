@@ -2140,7 +2140,8 @@ def setup_model_and_optimizer(
         )
         state.train_state.step = 1
         save_checkpoint(
-            state.train_state.step, model, None, None, args.num_floating_point_operations_so_far
+            state.train_state.step, model, None, None, args.num_floating_point_operations_so_far,
+            state=state,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -2236,6 +2237,7 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            state=state,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -3022,6 +3024,7 @@ def save_checkpoint_and_time(
         dp_group=dp_group,
         expt_dp_group=expt_dp_group,
         rng_state_key_prefix=rng_state_key_prefix,
+        state=state,
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.

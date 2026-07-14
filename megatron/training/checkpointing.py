@@ -19,6 +19,7 @@ from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
 
+from megatron.training.state import GlobalState
 import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
@@ -72,6 +73,8 @@ try:
 except Exception:
     has_nvidia_modelopt = False
 
+TRAIN_STATE_FILE = "train_state.pt"
+TRACKER_PREFIX = "latest"
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -507,9 +510,45 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+def join_paths(*paths: str) -> str:
+    """Join paths, using MultiStorageClient when needed"""
+    if not paths:
+        raise ValueError("Empty paths")
+
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        path_cls = msc.Path
+    else:
+        path_cls = Path
+
+    path = path_cls(paths[0])
+    for part in paths[1:]:
+        path = path / part
+
+    return str(path)
+
+
+def get_checkpoint_train_state_filename(checkpoints_path: str, prefix: str | None = None) -> str:
+    """Get the filename for the train state tracker file.
+
+    This file typically stores metadata about the latest checkpoint, like the iteration number.
+
+    Args:
+        checkpoints_path: Base directory where checkpoints are stored.
+        prefix: Optional prefix (e.g., 'latest') to prepend to the filename.
+
+    Returns:
+        The full path to the train state tracker file.
+    """
+    if prefix is None:
+        return join_paths(checkpoints_path, TRAIN_STATE_FILE)
+    else:
+        return join_paths(checkpoints_path, f"{prefix}_{TRAIN_STATE_FILE}")
+
+
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = '', state: GlobalState | None = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -531,6 +570,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     """
     start_ckpt = time()
     args = get_args()
+    train_state = state.train_state if state is not None else None
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
@@ -784,6 +824,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         f"Local checkpointing does not support optimizer sharding type '{sharded_sd_metadata['distrib_optim_sharding_type']}'. "
                         "Don't use '--dist-ckpt-optim-fully-reshardable' when saving local checkpoints."
                     )
+
+                # Embed TrainState so consumed_train_samples and other counters
+                # survive a local-checkpoint resume.  Goes into the ``common``
+                # part of MCoreTensorAwareStateDict (replicated, atomic).
+                if train_state is not None:
+                    state_dict["train_state_metadata"] = train_state.state_dict()
+
                 algo = args.non_persistent_local_ckpt_algo
                 cached_metadata = None
                 if args.ckpt_assume_constant_structure and 'local_checkpoint_cache' in checkpointing_context:
@@ -818,6 +865,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if not torch.distributed.is_initialized() \
             or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
+        train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
+        train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=TRACKER_PREFIX)
 
         if ckpt_type == CheckpointType.LOCAL:
             def iter_finalize_fn():
@@ -827,6 +876,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     append_to_progress_log(args.save, f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
         else:
+            train_state_dict = train_state.state_dict() if train_state is not None else None
+
             def _rank_and_size(explicit_rank, group, mpu_rank_fn, mpu_size_fn):
                 rank = (
                     explicit_rank if explicit_rank is not None
@@ -852,6 +903,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
                         with open_file(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
+                if train_state_dict is not None:
+                    train_state_dict["floating_point_operations_so_far"] = torch.tensor(
+                        num_floating_point_operations_so_far, dtype=torch.float32
+                    )
+                    torch.save(train_state_dict, train_state_local_filename)
+                    shutil.copy(train_state_local_filename, train_state_global_filename)
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
