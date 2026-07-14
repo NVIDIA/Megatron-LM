@@ -251,7 +251,11 @@ class FsdpParameterGroup:
         # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
         # Preserve AVG semantics by reducing SUM and scaling the output below.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
-        grads = self._require_unsharded_grads()
+        grads: list[torch.Tensor] = []
+        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
+            if parameter.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
+            grads.append(parameter.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -263,32 +267,39 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        grads = self._require_unsharded_grads()
         # A future fused-wgrad path can write directly into these buffer views.
-        for index, grad in enumerate(grads):
-            partial_grad.get_local_tensor(index).copy_(grad)
-        for parameter in self.unsharded_parameters:
+        for index, parameter in enumerate(self.unsharded_parameters):
+            partial_grad.get_local_tensor(index).copy_(parameter.grad)
             parameter.grad = None
 
     def reduce_partial_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients."""
         assert self.main_grad is not None
 
+        def has_grad(parameters: tuple[nn.Parameter, ...]) -> bool:
+            has_any_grad = False
+            has_any_missing_grad = False
+            for parameter in parameters:
+                if parameter.grad is None:
+                    has_any_missing_grad = True
+                else:
+                    has_any_grad = True
+            if has_any_grad and has_any_missing_grad:
+                raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+            return has_any_grad
+
         # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
-        has_sharded_grads = self._sharded_parameters_have_grad()
+        has_sharded_grads = has_grad(self.sharded_parameters)
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        partial_placement = partial_grad.placements[reduce_axis]
-        assert isinstance(partial_placement, Partial)
-        grad_divisor = (
-            self.mesh.size(reduce_axis) if partial_placement.reduce_op == dist.ReduceOp.SUM else 1
-        )
+        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
+        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
@@ -307,26 +318,6 @@ class FsdpParameterGroup:
         if not has_sharded_grads:
             for index, parameter in enumerate(self.sharded_parameters):
                 parameter.grad = self.main_grad.get_dtensor(index)
-
-    def _require_unsharded_grads(self) -> tuple[torch.Tensor, ...]:
-        grads: list[torch.Tensor] = []
-        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
-            if parameter.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            grads.append(parameter.grad)
-        return tuple(grads)
-
-    def _sharded_parameters_have_grad(self) -> bool:
-        has_any_grad = False
-        has_any_missing_grad = False
-        for parameter in self.sharded_parameters:
-            if parameter.grad is None:
-                has_any_missing_grad = True
-            else:
-                has_any_grad = True
-        if has_any_grad and has_any_missing_grad:
-            raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
-        return has_any_grad
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
