@@ -369,6 +369,16 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    thd_static_pp_communication: bool = False
+    """Derived (do not set directly): THD full-iteration CUDA graph mode uses static PP shapes.
+        Set by TransformerConfig.__post_init__ when cuda_graph_impl='full_iteration' is combined
+        with a sequence packing scheduler. Overrides the variable_seq_lengths shape handshake:
+        packed batches are canonicalized to the static per-rank token capacity
+        max_seqlen_per_dp_cp_rank before entering the graph, so all PP send/recv tensors have a
+        fixed sequence dimension and the per-step shape negotiation (which is not
+        graph-capturable) is skipped.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
