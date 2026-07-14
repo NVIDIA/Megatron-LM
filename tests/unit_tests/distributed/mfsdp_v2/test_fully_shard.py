@@ -319,7 +319,7 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
+    dim = 8192
     num_children = 4
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
