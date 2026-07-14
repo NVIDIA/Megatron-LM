@@ -242,7 +242,13 @@ class FsdpModule:
             next_module._unshard_parameter_groups(sync_model_weight=True)
 
     def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
-        """Unshard this FsdpModule's parameter groups on the all-gather stream."""
+        """Unshard this FsdpModule's parameter groups on the all-gather stream.
+
+        If ``_unshard_event`` is already set, this FsdpModule was already
+        unsharded or prefetched and this method is a no-op. Otherwise, this
+        method records ``_unshard_event`` after materialization so compute
+        can wait without depending on later release work.
+        """
         if self._unshard_event is not None:
             return
 
@@ -255,8 +261,7 @@ class FsdpModule:
                     # optimizer post-step hook instead of running it every microbatch.
                     group.sync_model_weight_from_main_weight()
                 group.unshard_parameters()
-            unshard_event = allgather_stream.record_event()
-            self._unshard_event = unshard_event
+            self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -264,7 +269,11 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reshard_parameter_groups(self) -> None:
-        """Reshard parameter groups and release unsharded storage after compute."""
+        """Reshard parameter groups and release unsharded storage after compute.
+
+        This method clears ``_unshard_event`` after queuing the release, so
+        future users enqueue a fresh all-gather.
+        """
         for group in self._parameter_groups:
             group.reshard_parameters()
 
