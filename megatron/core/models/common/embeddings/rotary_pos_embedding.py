@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
@@ -31,6 +32,49 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding']
+
+
+@dataclass
+class RoPEConfig:
+    """Configuration for rotary position embeddings."""
+
+    rotary_base: float = 10000.0
+    """Base to use for rotary positional embeddings, default 10000."""
+
+    rotary_percent: float = 1.0
+    """Percent of rotary dimension to use, default 100%."""
+
+    rotary_seq_len_interpolation_factor: float | None = None
+    """Sequence length interpolation factor for rotary embeddings. Disabled if None, must be a float
+    larger than 1.0.
+    """
+
+    use_rotary_scaling: bool = False
+    """Apply RoPE scaling as used in Llama-3.x."""
+
+    rotary_scaling_factor: float = 8.0
+    """RoPE scaling factor in Llama-3.x models."""
+
+    yarn_rotary_scaling_factor: float = 1.0
+    """Rotary scaling factor for the rotary embeddings."""
+
+    yarn_original_max_position_embeddings: int = 4096
+    """Original maximum position embeddings for YaRN RoPE frequency correction."""
+
+    yarn_beta_fast: float = 32.0
+    """Beta fast for YaRN RoPE frequency correction."""
+
+    yarn_beta_slow: float = 1.0
+    """Beta slow for YaRN RoPE frequency correction."""
+
+    yarn_correction_range_round_to_int: bool = True
+    """Whether to round YaRN correction range endpoints to integers."""
+
+    yarn_mscale: float = 1.0
+    """Mscale for YaRN RoPE in multi-latent attention."""
+
+    yarn_mscale_all_dim: float = 0.0
+    """Mscale all dimensions for YaRN RoPE in multi-latent attention."""
 
 
 class RotaryEmbedding(nn.Module):
