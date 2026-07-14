@@ -81,7 +81,7 @@ class TestSaveModeloptState:
         with (
             mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
             mock.patch.object(mto, "modelopt_state", side_effect=[{"i": i} for i in range(2)]),
-            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.mpu"),
+            mock.patch("megatron.core.post_training.modelopt.checkpointing.mpu"),
         ):
             save_modelopt_state([mock.MagicMock(), mock.MagicMock()], state_dict)
         assert "modelopt_state_0" in state_dict
@@ -102,7 +102,7 @@ class TestSaveShardedModeloptState:
             mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
             mock.patch.object(mto, "modelopt_state", return_value={"modelopt_state_dict": []}),
             mock.patch.object(mdist, "is_master", return_value=True),
-            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.save") as mock_save,
+            mock.patch("megatron.core.post_training.modelopt.checkpointing.save") as mock_save,
         ):
             save_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
         mock_save.assert_called_once()
@@ -127,9 +127,9 @@ class TestRestoreShardedModeloptState:
         with (
             mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=False),
             mock.patch.object(mto, "restore_from_modelopt_state", side_effect=lambda m, _s: m) as mock_restore,
-            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.load_common_state_dict", return_value={"modelopt_version": "1.0"}),
-            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt._load_extra_state_from_sharded_checkpoint"),
-            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.logger", create=True),
+            mock.patch("megatron.core.post_training.modelopt.checkpointing.load_common_state_dict", return_value={"modelopt_version": "1.0"}),
+            mock.patch("megatron.core.post_training.modelopt.checkpointing._load_extra_state_from_sharded_checkpoint"),
+            mock.patch("megatron.core.post_training.modelopt.checkpointing.logger", create=True),
         ):
             restore_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
         mock_restore.assert_called_once()
@@ -145,7 +145,7 @@ class TestLoadExtraStateFromShardedCheckpoint:
         }
         loaded = {f"{prefix}layer._extra_state": torch.tensor([1.0])}
 
-        with mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.load", return_value=loaded) as mock_load:
+        with mock.patch("megatron.core.post_training.modelopt.checkpointing.load", return_value=loaded) as mock_load:
             _load_extra_state_from_sharded_checkpoint(model, str(tmp_path), prefix)
 
         passed = mock_load.call_args.args[0]
