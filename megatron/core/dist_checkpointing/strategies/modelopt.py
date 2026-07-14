@@ -17,17 +17,6 @@ from ..serialization import load, load_common_state_dict, save
 from ..validation import StrictHandling
 from .torch import TorchDistLoadShardedStrategy
 
-try:
-    import modelopt
-    import modelopt.torch.opt as mto
-    import modelopt.torch.utils.distributed as dist
-
-    has_nvidia_modelopt = True
-except ImportError:
-    has_nvidia_modelopt = False
-
-logger = logging.getLogger(__name__)
-
 
 def remove_per_module_state(modelopt_state: dict[str, Any]) -> None:
     """Remove metadata from the modelopt_state.
@@ -63,6 +52,8 @@ def save_modelopt_state(model: list[torch.nn.Module], state_dict: dict[str, Any]
         model: the modelopt optimized model
         state_dict: the current modelopt optimized model state_dict to store
     """
+    import modelopt.torch.opt as mto
+
     if not mto.ModeloptStateManager.is_converted(model[0]):
         return
     if len(model) == 1:
@@ -87,6 +78,9 @@ def save_sharded_modelopt_state(
         sharded_strategy: configures sharded tensors saving behavior and backend
         prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
     """
+    import modelopt.torch.opt as mto
+    import modelopt.torch.utils.distributed as dist
+
     if not mto.ModeloptStateManager.is_converted(model[0]):
         return
     if len(model) > 1:
@@ -156,6 +150,9 @@ def restore_sharded_modelopt_state(
         is set to `True` (was not set before) in megatron-core-0.15.0. This flag affects the
         sharded state_dict format and must be consistent between saving and loading.
     """
+    import modelopt
+    import modelopt.torch.opt as mto
+
     if len(model) > 1:
         raise ValueError("sharded_modelopt_state does not support virtual pipeline parallel!")
 
