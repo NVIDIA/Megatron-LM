@@ -39,7 +39,7 @@ class FsdpContext:
     root_module: "FsdpModule"
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._is_unsharded``.
+    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
@@ -84,9 +84,10 @@ class FsdpModule:
     _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
     _num_trainable_parameters: int
-    # Whether this FsdpModule's full parameters are currently materialized. Lets
-    # pre_forward skip re-gathering a module that an earlier FsdpModule prefetched.
-    _is_unsharded: bool
+    # Event recorded after this FsdpModule's full parameters are materialized.
+    # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
+    # already prefetched this module.
+    _unshard_event: torch.cuda.Event | None
 
     def __init__(
         self,
@@ -98,7 +99,7 @@ class FsdpModule:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = None
         self._name = None
-        self._is_unsharded = False
+        self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -230,19 +231,21 @@ class FsdpModule:
         if self.is_root():
             allgather_stream.wait_stream(current_stream)
 
-        # Gather this module's parameters unless a prior FsdpModule already prefetched them.
-        if not self._is_unsharded:
-            self._unshard_parameter_groups(sync_model_weight=True)
+        self._unshard_parameter_groups(sync_model_weight=True)
+        assert self._unshard_event is not None
         # Compute waits only for this FsdpModule's all-gather (the prefetch below is
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
-        current_stream.wait_stream(allgather_stream)
+        current_stream.wait_event(self._unshard_event)
 
         next_module = context.forward_order.next_item(self)
-        if next_module is not None and not next_module._is_unsharded:
+        if next_module is not None:
             next_module._unshard_parameter_groups(sync_model_weight=True)
 
     def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream."""
+        if self._unshard_event is not None:
+            return
+
         context = self.context
         allgather_stream = context.allgather_stream
         with torch.cuda.stream(allgather_stream):
@@ -252,7 +255,8 @@ class FsdpModule:
                     # optimizer post-step hook instead of running it every microbatch.
                     group.sync_model_weight_from_main_weight()
                 group.unshard_parameters()
-        self._is_unsharded = True
+            unshard_event = allgather_stream.record_event()
+            self._unshard_event = unshard_event
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -271,7 +275,7 @@ class FsdpModule:
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
                 group.release_unsharded_storage()
-            self._is_unsharded = False
+            self._unshard_event = None
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
@@ -282,12 +286,12 @@ class FsdpModule:
         allgather_stream = context.allgather_stream
         current_stream = torch.cuda.current_stream(allgather_stream.device)
 
-        if not self._is_unsharded:
-            self._unshard_parameter_groups(sync_model_weight=False)
-        current_stream.wait_stream(allgather_stream)
+        self._unshard_parameter_groups(sync_model_weight=False)
+        assert self._unshard_event is not None
+        current_stream.wait_event(self._unshard_event)
 
         next_module = context.backward_order.next_item(self)
-        if next_module is not None and not next_module._is_unsharded:
+        if next_module is not None:
             next_module._unshard_parameter_groups(sync_model_weight=False)
 
     def post_backward(self) -> None:
