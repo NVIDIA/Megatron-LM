@@ -635,6 +635,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.transformer_impl == "transformer_engine"
         )
 
+        # NVLS multicast dispatcher (the remaining EP>1 case). Its one-sided
+        # symmetric-memory collectives pair anonymous barriers across the EP
+        # group, so a rank replaying a captured decode graph must never
+        # rendezvous with a peer running an eager prefill: graph-vs-eager has
+        # to be an EP-wide decision, like the nccl dispatcher already enforces.
+        self._nvls_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and not self._nccl_ep_dispatcher
+            and not self._training_ep_dispatcher
+        )
+
         # We only allow non-decode cuda graphs for the nvls dispatcher
         force_disable_non_decode_cuda_graphs = (
             self._nccl_ep_dispatcher or self._training_ep_dispatcher
@@ -2094,7 +2105,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+            match_ep_token_counts=self._nccl_ep_dispatcher
+            or self._training_ep_dispatcher
+            or self._nvls_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
