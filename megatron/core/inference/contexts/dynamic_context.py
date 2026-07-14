@@ -2105,9 +2105,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher
-            or self._training_ep_dispatcher
-            or self._nvls_ep_dispatcher,
+            # During graph capture the dims are prescribed by the capture loop;
+            # EP adjustment there mismatches whenever engines capture staggered.
+            match_ep_token_counts=(
+                self._nccl_ep_dispatcher
+                or self._training_ep_dispatcher
+                or self._nvls_ep_dispatcher
+            )
+            and construct_graph_dimensions is None,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
