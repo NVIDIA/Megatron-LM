@@ -382,9 +382,9 @@ def _worker_pre_init_tp_padding(rank, world_size, port, tp_size, gtp_remat_size)
         )
         assert per_gpu == 64, f"rank {rank}: expected per-GPU 64, got {per_gpu}"
         # pad_length is measured on the per-TP slice: 128 - 96 = 32.
-        _, pad_length, gtp_size, logical = gtp_ctx
+        gtp_remat_group_ctx, pad_length, logical = gtp_ctx
         assert pad_length == 32, f"rank {rank}: expected pad_length 32, got {pad_length}"
-        assert gtp_size == gtp_remat_size and logical == out_features
+        assert gtp_remat_group_ctx.size() == gtp_remat_size and logical == out_features
     finally:
         update_gtp_config(pad_for_alignment=orig_pad)
 
