@@ -49,12 +49,7 @@ NEMOTRON_V3_CASES = [
     ("<think>hello</think>", {"force_nonempty_content": True}, "hello", {}),
     ("<think>hello", {"force_nonempty_content": True}, "hello", {}),
     # The override only fires when there would otherwise be no content.
-    (
-        "<think>hello</think>world",
-        {"enable_thinking": False},
-        "world",
-        {"reasoning": "hello"},
-    ),
+    ("<think>hello</think>world", {"enable_thinking": False}, "world", {"reasoning": "hello"}),
     # Text preceding `<think>` is discarded, override still applies past it.
     ("prefix<think>hello</think>", {"enable_thinking": False}, "hello", {}),
     # enable_thinking=True (or omitted) must not trigger the override.
@@ -70,13 +65,7 @@ def test_nemotron_v3_reasoning_parser_matches_vllm(text, kwargs, expected_conten
 
 
 @pytest.mark.parametrize(
-    "text",
-    [
-        "<think>hello",
-        "<think>hello</think>world",
-        "<think>hello</think>",
-        "just an answer",
-    ],
+    "text", ["<think>hello", "<think>hello</think>world", "<think>hello</think>", "just an answer"]
 )
 def test_nemotron_v3_reasoning_parser_without_override_matches_deepseek_r1(text):
     """With no `enable_thinking`/`force_nonempty_content` kwargs, the Nemotron 3
