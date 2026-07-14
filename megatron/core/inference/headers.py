@@ -21,6 +21,8 @@ class Headers(Enum):
     DISCONNECT = auto()
     SHUTDOWN = auto()
     TP_BROADCAST = auto()
+    START_CUDA_PROFILER = auto()
+    STOP_CUDA_PROFILER = auto()
 
 
 class UnknownHeaderError(Exception):

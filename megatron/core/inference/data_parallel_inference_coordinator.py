@@ -533,6 +533,16 @@ class DataParallelInferenceCoordinator:
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
 
+            elif header in (Headers.START_CUDA_PROFILER, Headers.STOP_CUDA_PROFILER):
+                # Profiler control: broadcast to every connected DP engine. Not a
+                # state transition, so no CoordinatorState checks — just forward.
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring profiler signal from unknown client.")
+                    continue
+                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
+                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
+                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
