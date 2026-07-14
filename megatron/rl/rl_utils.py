@@ -567,9 +567,59 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
+def _eager_train_comm_warmup():
+    """Force NCCL communicator creation for training-time process groups while
+    GPU memory is still free.
+
+    NCCL communicators are created lazily on the first collective over a group.
+    Groups first exercised at the initial training step — grad allreduce
+    (dp/dp_cp, expert_dp), the MoE router expert-bias tokens_per_expert
+    allreduce (tp_dp_cp in finalize_model_grads), grad-norm (mp) — therefore
+    init only after the inference engine has claimed its persistent KV buffer.
+    On NVL72 the NVLS transport must cudaMalloc multicast buffers at comm init,
+    and with the engine slab resident that allocation can fail with NCCL
+    'Cuda failure 2 out of memory'. Running one tiny allreduce per group here,
+    before the engine is constructed, moves all comm-init allocations to
+    startup when memory is plentiful. Disable with MRL_EAGER_COMM_WARMUP=0.
+    """
+    if os.environ.get('MRL_EAGER_COMM_WARMUP', '1') != '1':
+        return
+    group_getters = {
+        'dp': partial(mpu.get_data_parallel_group),
+        'dp_cp': partial(mpu.get_data_parallel_group, with_context_parallel=True),
+        'cp': mpu.get_context_parallel_group,
+        'mp': mpu.get_model_parallel_group,
+        'tp_dp_cp': partial(
+            mpu.get_tensor_and_data_parallel_group, with_context_parallel=True
+        ),
+        'expert_dp': mpu.get_expert_data_parallel_group,
+        'expert_tp': mpu.get_expert_tensor_parallel_group,
+        'expert_mp': mpu.get_expert_model_parallel_group,
+    }
+    warmed = []
+    for name, getter in group_getters.items():
+        try:
+            group = getter()
+        except AssertionError:
+            # Group kind not initialized for this parallel config; uniform
+            # across ranks, so skipping keeps the collective schedule aligned.
+            continue
+        if group is None:
+            continue
+        dist.all_reduce(torch.zeros(1, device='cuda'), group=group)
+        warmed.append(name)
+    torch.cuda.synchronize()
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f'[EagerCommWarmup] initialized NCCL communicators for: {warmed}',
+    )
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
+        _eager_train_comm_warmup()
         inference_model = model[0]
 
         # Speculative rollout: back the inference engine with a fast early-exit
@@ -1547,9 +1597,14 @@ def compute_group_stats(
             # Token-weighted first/avg/last epoch from the per-turn RLE boundaries.
             policy_summary = rollout_epoch_summary(rollout.policy_epoch, roll_turn_lens)
             kv_summary = rollout_epoch_summary(rollout.kv_cache_epoch, roll_turn_lens)
-            assert (
-                policy_summary is not None and kv_summary is not None
-            ), "Rollout has no tokens to summarize epochs over"
+            if policy_summary is None or kv_summary is None:
+                # Zero-token placeholder rollout (failed gym episode). There are no
+                # tokens to weight, so summarize with the first recorded epoch
+                # boundary instead of crashing the wave on a routine empty trajectory.
+                e_p = rollout.policy_epoch[0][0][1]
+                e_k = rollout.kv_cache_epoch[0][0][1]
+                policy_summary = (e_p, float(e_p), e_p)
+                kv_summary = (e_k, float(e_k), e_k)
             group_policy_first.append(policy_summary[0])
             group_policy_avg.append(policy_summary[1])
             group_policy_last.append(policy_summary[2])
@@ -1665,6 +1720,16 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    # All-empty wave (every gym episode failed and was dropped): there is
+    # nothing to aggregate, and the stats below divide by len(advantages) and
+    # take max()/min() over the reward lists. Skip rollout metrics for this
+    # iteration instead of crashing the writer rank mid-collective.
+    if len(advantages) == 0 or not rewards:
+        logger.warning(
+            "prep_wandb_metrics: empty wave (0 usable rollouts); "
+            "skipping rollout metrics this iteration."
+        )
+        return {}
 
     def _flat(grouped):
         return [x for g in grouped for x in g]

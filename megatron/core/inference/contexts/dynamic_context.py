@@ -563,6 +563,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.num_speculative_tokens > 0:
             self.max_kv_block_count += 1
 
+        # Persist the mamba slot capacity for downstream telemetry (pool-utilization
+        # logging). float('inf') for non-hybrid models (no mamba state).
+        self.mamba_max_requests = mamba_max_requests
+
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
@@ -629,6 +633,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._training_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.transformer_impl == "transformer_engine"
+        )
+
+        # NVLS multicast dispatcher (the remaining EP>1 case). Its one-sided
+        # symmetric-memory collectives pair anonymous barriers across the EP
+        # group, so a rank replaying a captured decode graph must never
+        # rendezvous with a peer running an eager prefill: graph-vs-eager has
+        # to be an EP-wide decision, like the nccl dispatcher already enforces.
+        self._nvls_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and not self._nccl_ep_dispatcher
+            and not self._training_ep_dispatcher
         )
 
         # We only allow non-decode cuda graphs for the nvls dispatcher
@@ -2090,7 +2105,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+            # During graph capture the dims are prescribed by the capture loop;
+            # EP adjustment there mismatches whenever engines capture staggered.
+            match_ep_token_counts=(
+                self._nccl_ep_dispatcher
+                or self._training_ep_dispatcher
+                or self._nvls_ep_dispatcher
+            )
+            and construct_graph_dimensions is None,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -2218,10 +2240,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._cpu_mha_cu_kv_seq_lengths[real_bs]
             )
 
-        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
+        # Block table: [0:real_bs] real, [real_bs:padded_bs] = dummy block.
+        # Padded rows have kv_seq_length 0 and contribute no attention, but the
+        # external paged-attention kernels may still form addresses from row 0 of
+        # the table; a -1 sentinel resolves to one page below the KV buffer base,
+        # which under unified memory is unmapped VA and faults asynchronously
+        # during graph replay. The reserved dummy block keeps any speculative
+        # access in-bounds and matches the state the graphs were captured with.
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
-            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+            self._cpu_mha_block_table[real_bs:padded_bs] = (
+                self.kv_block_allocator.dummy_block_idx
+            )
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:

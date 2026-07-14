@@ -515,6 +515,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_p = self.__class__._symm_agv_probs
 
         per_rank_max = self._per_rank_worst_case_token_count
+        # Tripwire: the symmetric windows are sized for per_rank_max rows per
+        # rank; a larger local batch would silently corrupt peers via the
+        # one-sided multicast writes and surface later as an async illegal
+        # memory access. Fail loudly on the writing rank instead.
+        assert hidden_states.shape[0] <= per_rank_max, (
+            f"NVLS dispatch overflow: {hidden_states.shape[0]} local tokens > "
+            f"symmetric window capacity {per_rank_max}"
+        )
         global_max = per_rank_max * self.ep_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
