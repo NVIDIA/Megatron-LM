@@ -19,7 +19,8 @@ from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
 
-from megatron.training.state import GlobalState
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.training.state import GlobalState, TrainState
 import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
@@ -1774,8 +1775,99 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def file_exists(path: str) -> bool:
+    """Check if a file exists.
+
+    Args:
+        path: The path to the file. Can be a local path or an MSC URL.
+
+    Returns:
+        True if the file exists, False otherwise.
+    """
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.exists(path)
+    else:
+        return os.path.exists(path)
+
+
+def read_train_state(train_state_filename: str) -> TrainState:
+    """Read the train state metadata from a YAML file (rank 0 only).
+
+    Reads the file on rank 0 and broadcasts the result to other ranks if
+    torch.distributed is initialized. Otherwise, loads the file locally.
+
+    Args:
+        train_state_filename: Path to the train state YAML file.
+
+    Returns:
+        An initialized TrainState object.
+    """
+    if torch.distributed.is_initialized():
+        state_obj = [None]
+        if safe_get_rank() == 0:
+            try:
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    state_dict = msc.torch.load(train_state_filename, map_location="cpu", weights_only=True)
+                else:
+                    state_dict = torch.load(train_state_filename, map_location="cpu", weights_only=True)
+                ts = TrainState()
+                ts.load_state_dict(state_dict)
+                state_obj[0] = ts
+            except Exception as e:
+                error_msg = f"ERROR: Unable to load train state file {train_state_filename}: {e}"
+                sys.stderr.write(error_msg + "\n")
+                state_obj[0] = {"error": True, "msg": error_msg}
+
+        print_rank_0(f"Broadcasting TrainState from rank 0 to all {safe_get_world_size()} ranks")
+        torch.distributed.broadcast_object_list(state_obj, src=0)
+
+        if isinstance(state_obj[0], dict) and state_obj[0].get("error", False):
+            raise RuntimeError(state_obj[0]["msg"])
+
+        return state_obj[0]
+
+    try:
+        if MultiStorageClientFeature.is_enabled():
+            msc = MultiStorageClientFeature.import_package()
+            state_dict = msc.torch.load(train_state_filename, map_location="cpu", weights_only=True)
+        else:
+            state_dict = torch.load(train_state_filename, map_location="cpu", weights_only=True)
+        ts = TrainState()
+        ts.load_state_dict(state_dict)
+        return ts
+    except Exception as e:
+        raise RuntimeError(f"Unable to load train state file {train_state_filename}: {e}") from e
+
+
+def _get_train_state_from_state_dict(state_dict: dict[str, Any]) -> TrainState:
+    """Create a TrainState from the state dict from a Megatron-LM checkpoint."""
+    legacy_train_state = TrainState()
+    legacy_train_state.step = state_dict.get("iteration", 0)
+
+    # Extract training progress from checkpoint args (like Megatron-LM does)
+    checkpoint_args = state_dict.get("args", None)
+    if checkpoint_args is not None:
+        legacy_train_state.consumed_train_samples = getattr(checkpoint_args, "consumed_train_samples", 0)
+        legacy_train_state.skipped_train_samples = getattr(checkpoint_args, "skipped_train_samples", 0)
+        legacy_train_state.consumed_valid_samples = getattr(checkpoint_args, "consumed_valid_samples", 0)
+    else:
+        # Fallback if args not found
+        legacy_train_state.consumed_train_samples = 0
+        legacy_train_state.skipped_train_samples = 0
+        legacy_train_state.consumed_valid_samples = 0
+
+    # Extract floating point operations count from state_dict (like Megatron-LM does)
+    legacy_train_state.floating_point_operations_so_far = state_dict.get("num_floating_point_operations_so_far", 0)
+    legacy_train_state.do_train = False
+    legacy_train_state.do_valid = False
+    legacy_train_state.do_test = False
+    return legacy_train_state
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = '', state: GlobalState | None = None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -2034,10 +2126,31 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
+    if state is not None and not args.finetune:
+        if ckpt_type == CheckpointType.LOCAL:
+            # Local checkpoints embed train_state_metadata in the state dict.
+            if "train_state_metadata" in state_dict:
+                print_rank_0("Restoring TrainState from local checkpoint (train_state_metadata)")
+                state.train_state = TrainState()
+                state.train_state.load_state_dict(state_dict["train_state_metadata"])
+            else:
+                print_rank_0("WARNING: train_state_metadata not found in local checkpoint, counters reset")
+                state.train_state = TrainState(step=state_dict.get("iteration", 0))
+        else:
+            train_state_filename = get_checkpoint_train_state_filename(checkpoint_name)
+            if file_exists(train_state_filename):
+                state.train_state = read_train_state(train_state_filename)
+            else:
+                print_rank_0(f"{train_state_filename} not found, creating TrainState from checkpoint state dict")
+                state.train_state = _get_train_state_from_state_dict(state_dict)
+
+
     # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
     if getattr(args, 'override_ckpt_iteration', None) is not None:
         target_iter = args.override_ckpt_iteration
         state_dict['iteration'] = target_iter
+        if state is not None:
+            state.train_state.step = target_iter
         if 'args' in state_dict:
             checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
             if (
@@ -2053,6 +2166,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 )
             state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
             state_dict['args'].skipped_train_samples = 0
+            if state is not None:
+                state.train_state.consumed_train_samples = state_dict['args'].consumed_train_samples
+                state.train_state.skipped_train_samples = state_dict['args'].skipped_train_samples
         print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
                      f'(consumed_train_samples = {target_iter * args.global_batch_size})')
 
@@ -2067,6 +2183,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Set iteration.
     if args.finetune or release:
         iteration = 0
+        if state is not None:
+            state.train_state.step = 0
     else:
         try:
             iteration = state_dict['iteration']

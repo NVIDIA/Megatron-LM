@@ -1101,6 +1101,8 @@ def pretrain(
 
     args = get_args()
     timers = state.timers
+    if getattr(args, "iteration", None) is not None:
+        state.train_state.step = args.iteration
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
