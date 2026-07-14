@@ -156,6 +156,9 @@ class InferenceSetupConfig:
     """Extend prefill/mixed CUDA graph capture up to `max_tokens`. By default, all graphs are
     limited by the decode limit of `max_requests * (num_speculative_tokens + 1)`."""
 
+    inference_cuda_graph_max_tokens: int = 512
+    """Token ceiling for the largest captured prefill/mixed CUDA graph (default: 512)."""
+
     # ---------------- Chunked prefill / speculation ----------------
 
     enable_chunked_prefill: bool = False
@@ -337,6 +340,7 @@ class InferenceSetupConfig:
             ),
             use_cuda_graphs_for_non_decode_steps=not self.decode_only_cuda_graphs,
             cuda_graph_all_prefills=self.inference_cuda_graph_all_prefills,
+            cuda_graph_max_tokens=self.inference_cuda_graph_max_tokens,
             static_kv_memory_pointers=static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
