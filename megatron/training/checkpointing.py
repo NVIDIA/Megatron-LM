@@ -7,6 +7,7 @@ import inspect
 import multiprocessing
 import os
 import random
+import re
 import shutil
 import sys
 import threading
@@ -1717,6 +1718,67 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
+    """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
+
+    Returns the layer maps used to retarget the run's sharded state dict at the
+    GPT checkpoint's keys (see ``megatron.core.models.hybrid.gpt_checkpoint_interop``),
+    or None when checkpoint and runtime already agree. Raises RuntimeError for
+    combinations that cannot be loaded.
+    """
+    from megatron.core.models.hybrid.gpt_checkpoint_interop import gpt_compatible_layer_maps
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    runtime_is_hybrid = any(isinstance(m, HybridModel) for m in model)
+    ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
+        ckpt_args, 'hybrid_override_pattern', None
+    )
+    if runtime_is_hybrid == bool(ckpt_pattern):
+        return None
+    if not runtime_is_hybrid:
+        raise RuntimeError(
+            f"The checkpoint was saved by a hybrid model run (hybrid layer pattern "
+            f"{ckpt_pattern!r}) but the current run builds a non-hybrid model. Load it "
+            f"with the hybrid training entrypoint instead."
+        )
+
+    # GPT checkpoint feeding a HybridModel run: translate the sharded state
+    # dict at load time instead of converting the checkpoint on disk.
+    if not args.hybrid_layer_pattern:
+        raise RuntimeError(
+            "Loading a GPT checkpoint into a hybrid model requires "
+            "--hybrid-layer-pattern so checkpoint layers can be paired with "
+            "hybrid layer positions."
+        )
+    if not args.finetune or not args.no_load_optim:
+        raise RuntimeError(
+            "Loading a GPT checkpoint into a hybrid model requires --finetune and "
+            "--no-load-optim: hybrid layers without a GPT counterpart keep their "
+            "fresh initialization, so optimizer state and iteration bookkeeping "
+            "from the GPT run do not carry over."
+        )
+    try:
+        layer_maps = gpt_compatible_layer_maps(args.hybrid_layer_pattern)
+    except ValueError as exc:
+        raise RuntimeError(f"Cannot load a GPT checkpoint into this hybrid model: {exc}") from exc
+
+    ckpt_num_layers = getattr(ckpt_args, 'num_layers', None)
+    if ckpt_num_layers is not None and ckpt_num_layers != layer_maps.num_gpt_layers:
+        raise RuntimeError(
+            f"Hybrid layer pattern {args.hybrid_layer_pattern!r} pairs with a GPT "
+            f"checkpoint of {layer_maps.num_gpt_layers} layers, but the checkpoint "
+            f"has num_layers={ckpt_num_layers}."
+        )
+
+    print_rank_0(
+        f"> loading a GPT checkpoint into the hybrid model: {layer_maps.num_gpt_layers} "
+        f"GPT layers feed {len(layer_maps.attention_to_gpt)} attention and "
+        f"{len(layer_maps.mlp_to_gpt)} MLP positions; {len(layer_maps.fresh_init)} "
+        f"hybrid layers keep their fresh initialization."
+    )
+    return layer_maps
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
@@ -1797,6 +1859,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         run_dp = getattr(args, 'data_parallel_size', 0)
         mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
+        )
+
+        # Preloaded state_dict is None when no checkpoint was found; nothing to
+        # translate then (the run starts from scratch further down).
+        gpt_compat_layer_maps = (
+            _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model)
+            if state_dict is not None
+            else None
         )
 
         # Determine if RNG state will be loaded
@@ -1901,6 +1971,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state
             )
+
+        if gpt_compat_layer_maps is not None:
+            from megatron.core.models.hybrid.gpt_checkpoint_interop import (
+                retarget_sharded_state_dict_to_gpt_checkpoint,
+            )
+
+            for sd_key, model_sd in load_kwargs['sharded_state_dict'].items():
+                if sd_key == 'model' or re.fullmatch(r'model\d+', sd_key):
+                    retarget_sharded_state_dict_to_gpt_checkpoint(model_sd, gpt_compat_layer_maps)
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
