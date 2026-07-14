@@ -1674,6 +1674,16 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    # All-empty wave (every gym episode failed and was dropped): there is
+    # nothing to aggregate, and the stats below divide by len(advantages) and
+    # take max()/min() over the reward lists. Skip rollout metrics for this
+    # iteration instead of crashing the writer rank mid-collective.
+    if len(advantages) == 0 or not rewards:
+        logger.warning(
+            "prep_wandb_metrics: empty wave (0 usable rollouts); "
+            "skipping rollout metrics this iteration."
+        )
+        return {}
 
     def _flat(grouped):
         return [x for g in grouped for x in g]
