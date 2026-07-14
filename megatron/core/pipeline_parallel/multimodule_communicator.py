@@ -269,11 +269,15 @@ class MultiModulePipelineCommunicator:
             stage = 0
 
         assert stage < total, f"current_stage: {stage} must be less than total_stages: {total}"
-        logging.debug(
-            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"current_stage: {stage} total_stages: {total} "
-            f"num_warmup_microbatches: {total - stage - 1}"
-        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "[Rank %s ][MultiModulePipelineCommunicator] "
+                "current_stage: %s total_stages: %s num_warmup_microbatches: %s",
+                dist.get_rank(),
+                stage,
+                total,
+                total - stage - 1,
+            )
         return stage
 
     def _build_rank_module_info_map(self):
@@ -331,10 +335,14 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        logging.debug(
-            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"[receive_forward] tensors_shape: {tensor_shape}, is_first_stage: {is_first_stage}"
-        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "[Rank %s ][MultiModulePipelineCommunicator] "
+                "[receive_forward] tensors_shape: %s, is_first_stage: %s",
+                dist.get_rank(),
+                tensor_shape,
+                is_first_stage,
+            )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
 
@@ -449,10 +457,14 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        logging.debug(
-            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"[recv_backward] tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
-        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "[Rank %s ][MultiModulePipelineCommunicator] "
+                "[recv_backward] tensor_shape: %s, is_last_stage: %s",
+                dist.get_rank(),
+                tensor_shape,
+                is_last_stage,
+            )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:

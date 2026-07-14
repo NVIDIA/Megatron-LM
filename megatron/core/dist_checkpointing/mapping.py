@@ -535,7 +535,7 @@ def apply_factory_merges(
                 f"Cannot merge two lists with different lengths "
                 f"({len(x1)} and {len(x2)}, encountered at key {key})"
             )
-            logger.error(err_msg + f"\nx1: {x1}\nx2: {x2}")
+            logger.error("%s\nx1: %s\nx2: %s", err_msg, x1, x2)
             raise ValueError(err_msg)
         for i, v2 in enumerate(x2):
             x1[i] = apply_factory_merges(x1[i], v2, key=key + (i,))

@@ -57,7 +57,10 @@ class BlendedMegatronDatasetBuilder(object):
         log_single_rank(
             logger,
             logging.INFO,
-            f"Building {cls.__name__} splits with sizes={self.sizes} and config={self.config}",
+            "Building %s splits with sizes=%s and config=%s",
+            cls.__name__,
+            self.sizes,
+            self.config,
         )
 
         if not self.config.mock:
