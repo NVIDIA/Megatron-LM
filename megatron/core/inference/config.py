@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
@@ -351,8 +352,9 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
-    """Which sampling kernels to use during inference."""
+    sampling_backend: Literal['torch', 'flashinfer'] = 'flashinfer'
+    """Which sampling kernels to use during inference. Defaults to 'flashinfer' and
+    falls back to 'torch' with a warning if the flashinfer package is not installed."""
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
@@ -420,8 +422,9 @@ class InferenceConfig:
         if self.sampling_backend == 'flashinfer':
             try:
                 import flashinfer  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "sampling_backend='flashinfer' requires the flashinfer package; "
-                    "install it or set sampling_backend='torch'."
-                ) from e
+            except ImportError:
+                warnings.warn(
+                    "sampling_backend='flashinfer' was requested but the flashinfer "
+                    "package is not installed; falling back to sampling_backend='torch'."
+                )
+                self.sampling_backend = 'torch'

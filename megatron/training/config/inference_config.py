@@ -132,9 +132,9 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
-    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "torch"
-    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
-    "flashinfer" is requested but the package is not installed."""
+    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
+    """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
+    "torch" with a warning if the flashinfer package is not installed."""
 
     inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the

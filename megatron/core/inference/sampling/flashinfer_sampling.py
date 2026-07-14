@@ -103,9 +103,15 @@ class FlashInferSampling(Sampling):
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
         if no_top_k and no_top_p:
             # No nucleus / top-k filtering: sample the full temperature-scaled
-            # distribution. (torch.multinomial keeps this rare branch dependency-free.)
+            # distribution. Use FlashInfer's kernel rather than torch.multinomial:
+            # multinomial forces a device-to-host sync, whereas sampling_from_probs
+            # stays on-device and keeps the RNG's philox offset advancing per launch.
             probs = torch.softmax(scaled, dim=-1)
-            output.copy_(torch.multinomial(probs, num_samples=1, generator=self._rng).view(-1))
+            output.copy_(
+                flashinfer.sampling.sampling_from_probs(
+                    probs, deterministic=True, generator=self._rng
+                )
+            )
         elif no_top_k:
             # Top-p only -> dedicated exact nucleus kernel.
             probs = torch.softmax(scaled, dim=-1)

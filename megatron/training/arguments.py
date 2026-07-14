@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import types
+import warnings
 
 import torch
 
@@ -1059,12 +1060,13 @@ def validate_args(args, defaults={}):
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
-                "the flashinfer package; install it or pass "
+        except ImportError:
+            warnings.warn(
+                "--inference-dynamic-batching-sampling-backend=flashinfer was requested "
+                "but the flashinfer package is not installed; falling back to "
                 "--inference-dynamic-batching-sampling-backend=torch."
-            ) from e
+            )
+            args.inference_dynamic_batching_sampling_backend = 'torch'
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -1986,11 +1988,11 @@ def _add_inference_args(parser):
                             'log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
-                       type=str, default='torch',
+                       type=str, default='flashinfer',
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
-                            'Falls back to "torch" with a warning if "flashinfer" '
-                            'is requested but the package is not installed.')
+                            'Defaults to "flashinfer" and falls back to "torch" with '
+                            'a warning if the flashinfer package is not installed.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
                        choices=['legacy', 'serial'],
