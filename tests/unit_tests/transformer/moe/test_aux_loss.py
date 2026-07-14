@@ -414,6 +414,10 @@ class TestRouterAuxLoss:
             moe_aux_loss_coeff=1.0,
             moe_router_dtype="fp64",
             calculate_per_token_loss=True,
+            # fp32 weights so the MBS=1 gradient (accumulated over N backward passes)
+            # is not degraded by bf16 rounding relative to the single MBS=N backward.
+            params_dtype=torch.float32,
+            bf16=False,
             tensor_model_parallel_size=tp_size,
             expert_tensor_parallel_size=ep_size,
             context_parallel_size=cp_size,
@@ -425,7 +429,7 @@ class TestRouterAuxLoss:
             hidden_states = torch.randn(
                 (seq_len, num_seqs, router.config.hidden_size),
                 device=torch.device("cuda"),
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
             )
         padding_mask = None
         if with_padding:
