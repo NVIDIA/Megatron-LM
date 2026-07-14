@@ -453,6 +453,34 @@ def build_telemetry_resource_attrs(args):
         val = os.environ.get(env)
         if val:
             resource_attrs[attr] = val
+
+    # ---- Run identity: deterministic UUIDs shared by every rank AND the ckpt worker with ZERO
+    # communication (both compute from the same inherited env). No sacct -> scales to 12k ranks.
+    #   job_uuid = the logical training job, stable across every restart/requeue.
+    #   run_uuid = one incarnation, bumps per restart. Built topology-adaptively: each restart
+    #   counter is folded in ONLY where it is rank-invariant --
+    #     * SLURM_RESTART_COUNT is global only for NON-array jobs (arrays requeue per-element ->
+    #       the count desyncs across elements, so it is EXCLUDED for arrays);
+    #     * TORCHELASTIC_RESTART_COUNT is global & monotonic via nvrx's persistent rendezvous
+    #       TCPStore (its presence also signals nvrx is in use).
+    #   Cases: A plain / B plain+requeue / C nvrx+plain+requeue / D nvrx+array. For arrays the
+    #   anchor is the BASE array job id (SLURM_ARRAY_JOB_ID), never the per-element SLURM_JOB_ID.
+    import uuid
+    cluster = os.environ.get('SLURM_CLUSTER_NAME', 'nocluster')
+    is_array = 'SLURM_ARRAY_TASK_ID' in os.environ
+    job_key = (os.environ.get('SLURM_ARRAY_JOB_ID') if is_array
+               else os.environ.get('SLURM_JOB_ID')) or 'nojob'
+    run_parts = [cluster, job_key]
+    if not is_array:  # SLURM requeue is global (rank-invariant) only for non-array jobs
+        run_parts.append('sr' + os.environ.get('SLURM_RESTART_COUNT', '0'))
+    te = os.environ.get('TORCHELASTIC_RESTART_COUNT')  # nvrx store-backed global monotonic count
+    if te is not None:
+        run_parts.append('te' + te)
+        resource_attrs['slurm.torchelastic.restart_count'] = te
+    resource_attrs['nemo.lens.job_uuid'] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.job/' + f'{cluster}/{job_key}'))
+    resource_attrs['nemo.lens.run_uuid'] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.run/' + '/'.join(run_parts)))
     return resource_attrs
 
 
