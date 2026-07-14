@@ -37,6 +37,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP_V2, prepare_deepep_v2_buffer
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -333,6 +334,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # DeepEP V2 dispatches over tp_ep (expert-TP x EP); the ElasticBuffer must match that group.
+        if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
+            self.expert_tp_ep_group = pg_collection.tp_ep
+        else:
+            _get_tp_ep = getattr(parallel_state, 'get_expert_tensor_and_model_parallel_group', None)
+            tp_ep_group = _get_tp_ep(check_initialized=False) if _get_tp_ep is not None else None
+            self.expert_tp_ep_group = (
+                tp_ep_group if tp_ep_group is not None else self.expert_model_parallel_group
+            )
+
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
@@ -625,6 +636,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
+        ep_size = get_pg_size(self.expert_model_parallel_group)
+        self._deepep_v2_ep_dispatcher = (
+            ep_size > 1 and model_config.inference_moe_token_dispatcher_type == 'deepep_v2'
+        )
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
@@ -679,6 +694,38 @@ class DynamicInferenceContext(BaseInferenceContext):
         # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
         if model_config.inference_moe_token_dispatcher_type == 'nccl':
             NCCLAllGatherDispatcher.allocate_buffers()
+        elif self._deepep_v2_ep_dispatcher:
+            assert HAVE_DEEP_EP_V2, (
+                "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
+                "ElasticBuffer (available on deep_ep main)."
+            )
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # Pre-allocate two ElasticBuffers (symmetric NVLink memory) — one for fixed-shape
+            # decode steps, one for chunked-prefill steps. All ranks must use the same capacity,
+            # so we size to worst-case upfront rather than lazily reallocating per local x.shape[0].
+            deepep_decode_per_rank_cap = (
+                self.round_up_tokens(self.max_requests * (self.num_speculative_tokens + 1))
+                // tp_size
+            )
+            deepep_prefill_per_rank_cap = self.round_up_tokens(self.max_tokens) // tp_size
+            deepep_prefill_per_rank_cap = max(
+                deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
+            )
+            self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
+            self.deepep_v2_prefill_per_rank_cap = deepep_prefill_per_rank_cap
+            prepare_deepep_v2_buffer(
+                group=self.expert_tp_ep_group,
+                num_max_tokens_per_rank=deepep_decode_per_rank_cap,
+                hidden=moe_hidden_size,
+                num_topk=model_config.moe_router_topk,
+            )
+            if deepep_prefill_per_rank_cap != deepep_decode_per_rank_cap:
+                prepare_deepep_v2_buffer(
+                    group=self.expert_tp_ep_group,
+                    num_max_tokens_per_rank=deepep_prefill_per_rank_cap,
+                    hidden=moe_hidden_size,
+                    num_topk=model_config.moe_router_topk,
+                )
         elif get_pg_size(self.expert_model_parallel_group) > 1:
             # Use moe_latent_size if set, else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
@@ -2217,6 +2264,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        # Select the pre-allocated ElasticBuffer for this step. is_decode_only() is already
+        # EP-synced via padded_batch_dimensions, so all ranks pick the same buffer.
+        if self._deepep_v2_ep_dispatcher:
+            from megatron.core.transformer.moe.fused_a2a import set_deepep_v2_active_dispatch_size
+
+            if self.is_decode_only():
+                set_deepep_v2_active_dispatch_size(self.deepep_v2_decode_per_rank_cap)
+            else:
+                set_deepep_v2_active_dispatch_size(self.deepep_v2_prefill_per_rank_cap)
 
         self.build_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)

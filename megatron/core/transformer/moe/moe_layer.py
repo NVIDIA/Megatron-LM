@@ -390,13 +390,27 @@ class MoELayer(BaseMoELayer):
         by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
         The active dispatcher is selected at the start of `forward` based on
         `InferenceMode.is_active()`.
+          - 'nccl' / 'nvls': swap to a dedicated AllGather-style inference dispatcher
+            in eval mode; train() swaps back to the standard dispatcher.
+          - 'deepep_v2': the existing MoEFlexTokenDispatcher handles both training and
+            inference; both _training_token_dispatcher and _inference_token_dispatcher
+            point to the same dispatcher, so no swap occurs.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
+
+        if dispatcher_type == 'deepep_v2':
+            assert self.config.moe_token_dispatcher_type == 'flex', (
+                "inference_moe_token_dispatcher_type='deepep_v2' requires "
+                "moe_token_dispatcher_type='flex' (the DeepEP-backed dispatcher)."
+            )
+            self._training_token_dispatcher = self.token_dispatcher
+            self._inference_token_dispatcher = self.token_dispatcher
+            return
+
+        self._training_token_dispatcher = self.token_dispatcher
         dispatcher_cls = (
             NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
         )
-
-        self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
@@ -570,7 +584,6 @@ class MoELayer(BaseMoELayer):
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
-
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)

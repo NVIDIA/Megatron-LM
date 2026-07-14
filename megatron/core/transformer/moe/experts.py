@@ -902,7 +902,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets
     """
 
     def __init__(
@@ -926,12 +926,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
-        if HAVE_FLASHINFER:
-            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
-
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+        # DeepEP V2 delivers tensors already in per-expert layout; FlashInfer/mcore_fused_moe
+        # (which expect a gathered global tensor + valid_tokens) don't apply.
+        self._deepep_v2_dispatcher = config.inference_moe_token_dispatcher_type == 'deepep_v2'
+
+        if not self._deepep_v2_dispatcher:
+            if HAVE_FLASHINFER:
+                self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+            self._mcore_activation_type = self._resolve_mcore_activation_type()
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1019,7 +1023,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         This allows:
         - TE's forward to work correctly (same Parameter objects, same internal state)
         - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        - torch._grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -1087,6 +1091,57 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _deepep_v2_expand_forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None]:
+        """Expert forward for the DeepEP V2 expand-layout dispatch.
+
+        do_expand=True writes one slot per (token, expert) into a worst-case-sized recv buffer.
+        We bypass TE GroupedLinear (requires a .tolist() host sync) and call grouped_mm directly
+        with on-device cumsum offsets. Padding rows are harmless — combine() ignores them.
+        This is necessary to make this graph captureable.
+        """
+        grouped_mm = getattr(torch, "_grouped_mm", None)
+        if grouped_mm is None:
+            raise ImportError("deepep_v2 expand-layout forward requires torch._grouped_mm.")
+
+        assert (
+            permuted_local_hidden_states.dtype == torch.bfloat16
+        ), "deepep_v2 expand-layout forward currently supports BF16 only."
+        assert (
+            not self.config.add_bias_linear
+        ), "deepep_v2 expand-layout forward does not yet support add_bias_linear=True."
+
+        # grouped_mm requires offs[-1] == mat1.shape[0], but the recv buffer is padded
+        # beyond the routed prefix. Extend the last expert's range to cover the padding
+        # using device-side arithmetic (avoids host->device copies that break graph capture).
+        N_padded = permuted_local_hidden_states.shape[0]
+        sum_first = tokens_per_expert[:-1].sum()
+        adjusted_last = (N_padded - sum_first).unsqueeze(0)
+        tokens_per_expert_padded = torch.cat([tokens_per_expert[:-1], adjusted_last])
+        offs = tokens_per_expert_padded.cumsum(0).to(torch.int32)
+
+        # _fc1_weight is [E, ffn_hidden_out, hidden]; grouped_mm wants [G, K, N] so transpose.
+        fc1_output = grouped_mm(
+            permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
+        )
+
+        # Activation + per-row prob weighting (mirrors TEGroupedMLP).
+        probs_col = permuted_probs.unsqueeze(-1).to(fc1_output.dtype)
+        if self.config.gated_linear_unit:
+            gate, up = fc1_output.chunk(2, dim=-1)
+            activation_out = self.config.activation_func(gate) * up
+        else:
+            activation_out = self.config.activation_func(fc1_output)
+        activation_out = activation_out * probs_col
+
+        # FC2: [N, ffn_hidden] @ weight^T → [N, hidden]
+        output = grouped_mm(activation_out, self._fc2_weight.transpose(1, 2), offs=offs)
+        return output, None
+
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1118,7 +1173,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
           is not used in this path; the FlashInfer kernel operates directly on
           routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -1136,6 +1191,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
+        # Must happen before _deepep_v2_expand_forward since self._fc1_weight / self._fc2_weight
+        # is read directly.
         if not self._concatenated_weights_built:
             w = self.linear_fc1.weight0
             if isinstance(w, MXFP8Tensor) or (
@@ -1145,6 +1202,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
+
+        if self._deepep_v2_dispatcher:
+            return self._deepep_v2_expand_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."

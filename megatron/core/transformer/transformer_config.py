@@ -1132,12 +1132,15 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
-    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
+    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls', 'deepep_v2'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
       decode-only CUDA graphs (forced automatically).
     - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
       Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
+    - 'deepep_v2': DeepEP V2 (ElasticBuffer) all-to-all with expanded-layout
+      (one-slot-per-expert, gather-free, CUDA-graph-capturable). Requires
+      moe_token_dispatcher_type='flex' and deep_ep main or later.
     Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     mrope_section: Optional[List[int]] = None

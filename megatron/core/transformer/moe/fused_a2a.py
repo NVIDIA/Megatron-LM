@@ -3,16 +3,35 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import os
 from typing import Optional
 
 from megatron.core.utils import internal_api
 
 try:
-    from deep_ep import Buffer
-    from deep_ep.utils import EventHandle, EventOverlap
+    import deep_ep
 
-    HAVE_DEEP_EP = True
+    Buffer = getattr(deep_ep, "Buffer", None)
+    ElasticBuffer = getattr(deep_ep, "ElasticBuffer", None)
+
+    try:
+        from deep_ep.utils import EventHandle, EventOverlap
+    except ImportError:
+        EventHandle = getattr(deep_ep, "EventHandle", None)
+        EventOverlap = getattr(deep_ep, "EventOverlap", None)
+
+    HAVE_DEEP_EP_LEGACY = (
+        Buffer is not None and EventHandle is not None and EventOverlap is not None
+    )
+    HAVE_DEEP_EP_V2 = ElasticBuffer is not None
+    HAVE_DEEP_EP = HAVE_DEEP_EP_LEGACY or HAVE_DEEP_EP_V2
 except ImportError:
+    Buffer = None
+    ElasticBuffer = None
+    EventHandle = None
+    EventOverlap = None
+    HAVE_DEEP_EP_LEGACY = False
+    HAVE_DEEP_EP_V2 = False
     HAVE_DEEP_EP = False
 
 import torch
@@ -209,7 +228,7 @@ class FusedCombine(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-if HAVE_DEEP_EP:
+if HAVE_DEEP_EP_LEGACY:
 
     def fused_dispatch(
         x,
@@ -265,6 +284,193 @@ else:
     fused_dispatch = None
     fused_combine = None
     set_deepep_num_sms = None
+
+
+# Pool of pre-allocated ElasticBuffers keyed by (group, num_max_tokens_per_rank).
+# Multiple sizes may be pinned (e.g. one for decode, one for prefill) so the
+# engine can pick the right capacity per step without reallocation.
+_deepep_v2_buffer_pool = {}
+
+# Set by the engine via set_deepep_v2_active_dispatch_size before each forward step.
+# Must be identical across all ranks in the dispatch group.
+_deepep_v2_active_dispatch_size = None
+
+_deepep_v2_num_sms = 0
+_deepep_v2_num_sms_group = None
+_deepep_v2_num_sms_num_experts = None
+_deepep_v2_num_sms_num_topk = None
+
+
+def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
+    """Set the per-rank dispatch cap for the next forward step.
+
+    Must be called with the same value on all ranks before dispatch; pass None
+    to fall back to the largest pinned buffer.
+    """
+    global _deepep_v2_active_dispatch_size
+    _deepep_v2_active_dispatch_size = num_max_tokens_per_rank
+
+
+def _select_deepep_v2_buffer(group: torch.distributed.ProcessGroup, requested_size: int):
+    """Return the smallest pinned buffer for `group` with capacity >= requested_size.
+
+    Raises if no such buffer exists since all needed sizes must be pre-allocated at init.
+    """
+    matching = [
+        ((g, sz), buf)
+        for (g, sz), buf in _deepep_v2_buffer_pool.items()
+        if g is group and sz >= requested_size
+    ]
+    if not matching:
+        sizes = sorted(sz for (g, sz) in _deepep_v2_buffer_pool if g is group)
+        raise RuntimeError(
+            f"No pre-allocated DeepEP V2 buffer can hold requested size "
+            f"{requested_size} (pool has sizes {sizes} for this group). "
+            f"Call prepare_deepep_v2_buffer at init with a size >= {requested_size}."
+        )
+    matching.sort(key=lambda kv: kv[0][1])
+    return matching[0][1]
+
+
+def _get_deepep_v2_buffer(
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+):
+    """Look up the pinned ElasticBuffer for this group and per-rank size."""
+    return _select_deepep_v2_buffer(group, num_max_tokens_per_rank)
+
+
+def prepare_deepep_v2_buffer(
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+) -> None:
+    """Allocate and pin an ElasticBuffer in the pool. Call at model init, outside graph capture."""
+    if not HAVE_DEEP_EP_V2:
+        raise RuntimeError("prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). ")
+    key = (group, num_max_tokens_per_rank)
+    if key in _deepep_v2_buffer_pool:
+        return  # already pinned
+    _deepep_v2_buffer_pool[key] = ElasticBuffer(
+        group,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        hidden=hidden,
+        num_topk=num_topk,
+        use_fp8_dispatch=False,
+    )
+
+
+def _tokens_per_expert_from_psum(psum: torch.Tensor) -> torch.Tensor:
+    """Recover per-expert token counts from the device-resident inclusive prefix sum.
+
+    Avoids torch.tensor(handle.num_recv_tokens_per_expert_list), which is a host sync
+    that breaks CUDA graph capture.
+    """
+    return torch.diff(psum, prepend=psum.new_zeros(1))
+
+
+def _get_deepep_v2_num_sms(
+    buffer, group: torch.distributed.ProcessGroup, num_experts: int, num_topk: int
+) -> int:
+    """Return the SM count for dispatch, caching across calls with identical (group, experts, topk).
+
+    Override with MCORE_DEEPEP_V2_NUM_SMS to pin a fixed SM count (each new value triggers a JIT
+    recompile in deep_ep).
+    """
+    _override = os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
+    if _override is not None:
+        return int(_override)
+
+    global _deepep_v2_num_sms
+    global _deepep_v2_num_sms_group
+    global _deepep_v2_num_sms_num_experts
+    global _deepep_v2_num_sms_num_topk
+
+    if (
+        _deepep_v2_num_sms == 0
+        or _deepep_v2_num_sms_group != group
+        or _deepep_v2_num_sms_num_experts != num_experts
+        or _deepep_v2_num_sms_num_topk != num_topk
+    ):
+        _deepep_v2_num_sms = buffer.get_theoretical_num_sms(num_experts, num_topk)
+        _deepep_v2_num_sms_group = group
+        _deepep_v2_num_sms_num_experts = num_experts
+        _deepep_v2_num_sms_num_topk = num_topk
+    return _deepep_v2_num_sms
+
+
+if HAVE_DEEP_EP_V2:
+
+    def deepep_v2_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        use_expanded_layout=False,
+    ):
+        """Inference-only dispatch using DeepEP V2 ElasticBuffer."""
+        local_num_tokens, hidden = x.shape
+        num_topk = token_indices.shape[1]
+        # Use the engine-set active size rather than local_num_tokens: ElasticBuffer is symmetric
+        # NVLink memory and all ranks must pass the same num_max_tokens_per_rank to dispatch.
+        requested_size = (
+            _deepep_v2_active_dispatch_size
+            if _deepep_v2_active_dispatch_size is not None
+            else max(
+                (sz for (g, sz) in _deepep_v2_buffer_pool if g is group), default=local_num_tokens
+            )
+        )
+        buffer = _get_deepep_v2_buffer(group, requested_size, hidden, num_topk)
+        num_max_tokens_per_rank = buffer.num_max_tokens_per_rank
+        assert local_num_tokens <= num_max_tokens_per_rank, (
+            f"deepep_v2 dispatch local_num_tokens={local_num_tokens} exceeds "
+            f"pre-allocated num_max_tokens_per_rank={num_max_tokens_per_rank}; "
+            f"increase the cap in dynamic_context._deepep_v2_ep_dispatcher init."
+        )
+        num_sms = _get_deepep_v2_num_sms(buffer, group, num_experts, num_topk)
+        # expanded layout skips the CPU sync so tokens_per_expert is recovered from the
+        # device-resident psum below — required for CUDA graph capture.
+        do_cpu_sync = False if use_expanded_layout else None
+        recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
+            x.contiguous(),
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            expert_alignment=32,
+            num_sms=num_sms,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            do_cpu_sync=do_cpu_sync,
+            do_expand=use_expanded_layout,
+        )
+        if use_expanded_layout:
+            assert recv_token_indices is None
+            assert recv_token_probs is not None and recv_token_probs.dim() == 1
+        if async_finish:
+            event.current_stream_wait()
+        tokens_per_expert = _tokens_per_expert_from_psum(handle.psum_num_recv_tokens_per_expert)
+        return recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle
+
+    def deepep_v2_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Inference-only combine using DeepEP V2 ElasticBuffer."""
+        num_topk = handle.topk_idx.shape[1]
+        hidden = x.shape[1]
+        buffer = _get_deepep_v2_buffer(group, handle.num_max_tokens_per_rank, hidden, num_topk)
+        combined_x, _, event = buffer.combine(
+            x,
+            handle=handle,
+            num_sms=handle.num_sms,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            event.current_stream_wait()
+        return combined_x, None
+
+else:
+    deepep_v2_dispatch = None
+    deepep_v2_combine = None
 
 
 try:

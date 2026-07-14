@@ -181,6 +181,7 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
+        skip_prompt_log_probs=args.skip_prompt_log_probs,
         top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=-1,

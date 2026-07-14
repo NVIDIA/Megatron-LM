@@ -708,6 +708,16 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
+    def _apply_routing_overrides(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply benchmark/debug routing-override flags to logits."""
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+        if self.config.moe_router_force_biased is not None:
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
+        return logits
+
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
@@ -724,16 +734,7 @@ class TopKRouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
-        if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
-
-        if self.config.moe_router_force_biased is not None:
-            # Apply biased logits with shared random bias across all ranks
-            logits = apply_biased_logits(
-                logits, self.config.moe_router_force_biased, self.layer_number
-            )
-
+        logits = self._apply_routing_overrides(logits)
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map
@@ -785,6 +786,14 @@ class InferenceTopKRouter(TopKRouter):
 
         super().__init__(config=config, pg_collection=pg_collection)
 
+        # The deepep_v2 inference dispatcher reuses the training MoEFlexTokenDispatcher,
+        # whose `_initialize_metadata` expects a multihot routing map of shape
+        # [num_tokens, num_experts]. The dense [num_tokens, topk] form used by the
+        # FlashInfer / mcore_fused_moe paths is incompatible.
+        self._emit_multihot = (
+            getattr(config, 'inference_moe_token_dispatcher_type', None) == 'deepep_v2'
+        )
+
     @staticmethod
     @torch.compile
     def _compiled_topk_routing(
@@ -817,7 +826,12 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        probs, top_indices = self._compiled_topk_routing(
+        # Honour debug/benchmark routing-override flags at inference. The parent
+        # TopKRouter.forward applies these via _apply_routing_overrides. This
+        # inference path bypasses forward(), so we call it explicitly.
+        logits = self._apply_routing_overrides(logits)
+
+        probs, routing = self._compiled_topk_routing(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -828,9 +842,11 @@ class InferenceTopKRouter(TopKRouter):
             expert_bias=self.expert_bias,
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
-            dense_output=True,
+            dense_output=not self._emit_multihot,
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        # squeeze(1) is a no-op when the second dim != 1; safe for both
+        # [num_tokens, topk] (dense_output=True) and [num_tokens, num_experts] (False).
+        return probs.squeeze(1), routing.squeeze(1)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Simplified forward pass for inference - returns dense tensors only.
