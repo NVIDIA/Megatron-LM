@@ -161,6 +161,7 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        ncclep_zero_copy: bool = False,
     ):
         """Initialize a schedule node.
 
@@ -185,6 +186,7 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
 
@@ -234,7 +236,11 @@ class ScheduleNode:
                 if input is not None:
                     input.record_stream(self.stream)
                     # Skip symmetric-memory (zero-copy EP) buffers
-                    if is_symm_backed is None or not is_symm_backed(input):
+                    if not (
+                        self.ncclep_zero_copy
+                        and is_symm_backed is not None
+                        and is_symm_backed(input)
+                    ):
                         input.untyped_storage().resize_(0)
 
         return self.output
