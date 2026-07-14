@@ -438,6 +438,15 @@ def build_telemetry_resource_attrs(args):
         resource_attrs['megatron.precision'] = 'fp32'
 
     resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+
+    # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
+    # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's
+    # assigned at submit) and exports it as LENS_SLURM_SLUID; the rest are standard env vars.
+    for attr, env in (('slurm.job.id', 'SLURM_JOB_ID'), ('slurm.sluid', 'LENS_SLURM_SLUID'),
+                      ('slurm.cluster', 'SLURM_CLUSTER_NAME')):
+        val = os.environ.get(env)
+        if val:
+            resource_attrs[attr] = val
     return resource_attrs
 
 
