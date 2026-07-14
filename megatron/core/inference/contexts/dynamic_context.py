@@ -2412,13 +2412,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
+        The coalesced H2D from the pinned `_cpu_bookkeeping_buf` uses
+        ``non_blocking=False``: that buffer is re-staged in place on the next
+        step, so an async copy can race with host writes and corrupt GPU
+        bookkeeping (see the inline comment at the copy site).
 
         The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        and one contiguous GPU buffer; a single memcpy covers the whole
+        transfer. Request-level staging slots are refreshed from the persistent
+        CPU tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
         n_active = self.total_request_count - self.paused_request_count
