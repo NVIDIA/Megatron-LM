@@ -17,6 +17,8 @@ from ..serialization import load, load_common_state_dict, save
 from ..validation import StrictHandling
 from .torch import TorchDistLoadShardedStrategy
 
+logger = logging.getLogger(__name__)
+
 
 def remove_per_module_state(modelopt_state: dict[str, Any]) -> None:
     """Remove metadata from the modelopt_state.
