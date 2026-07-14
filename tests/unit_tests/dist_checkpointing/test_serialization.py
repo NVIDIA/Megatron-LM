@@ -33,7 +33,6 @@ from megatron.core.dist_checkpointing.serialization import (
     load_sharded_metadata,
     load_tensors_metadata,
 )
-from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.utils import is_torch_min_version
@@ -563,6 +562,7 @@ class TestSerialization:
             fs_reader = FileSystemReader(ckpt_dir)
             original_metadata = fs_reader.read_metadata()
             assert set(original_metadata.state_dict_metadata.keys()) == {
+                'common_state/shard_0_1',
                 'keyA',
                 'prefix_key_to_remove',
             }
@@ -839,7 +839,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -910,7 +910,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -974,7 +974,7 @@ class TestNonStrictLoad:
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -1011,7 +1011,7 @@ class TestNonStrictLoad:
 
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
             sharded_metadata = load_sharded_metadata(ckpt_dir)
@@ -1021,12 +1021,14 @@ class TestNonStrictLoad:
                 'TenC',
                 'ObjA',
                 'ObjB',
+                'common_state',
             }
             assert set(sharded_metadata.keys()) == {
                 'TenA',
                 'TenB',
                 'TenC',
                 'ObjA/shard_0_1',
+                'common_state/shard_0_1',
                 *(f'ObjB/shard_0.{i}_1.8' for i in range(8)),
             }
 

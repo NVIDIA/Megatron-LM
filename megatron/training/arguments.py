@@ -1032,8 +1032,6 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
-    if args.grad_reduce_in_bf16:
-        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1110,7 +1108,12 @@ def validate_args(args, defaults={}):
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
             args.fsdp_manual_registration = True
-            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
+            args.fsdp_double_buffer = True
+            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
 
         if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
             raise ValueError(
@@ -1502,16 +1505,14 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
-    # Deterministic mode
+    # Deterministic mode — env vars + config overrides + torch global state.
+    # Implementation lives in ``megatron/training/determinism.py`` so the
+    # same setup is reachable from tests / profiling scripts that don't go
+    # through argparse.
     if args.deterministic_mode:
-        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
-        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
+        from megatron.training.determinism import apply_determinism_to_args
 
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}."
-
-        torch.use_deterministic_algorithms(True)
+        apply_determinism_to_args(args)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -3383,6 +3384,16 @@ def _add_experimental_args(parser):
                 'recomputation will be unsharded.'
             ),
         )
+
+    group.add_argument("--megatron-fsdp-max-pool-double-buffer", action='store_true',
+                        help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
+                             "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
+                             "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
+                             "NCCL user buffer registration and CUDA graph replay for mixed-arch models.")
+    group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
+                        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
+                             "are not included in the symmetric buffer pool. May be necessary for NCCL "
+                             "UBR or CUDA Graphs on hybrid architectures.")
 
     return parser
 

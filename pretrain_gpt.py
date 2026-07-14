@@ -325,6 +325,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             max_seqlen_kv=int(max_seqlen.item()),
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
+            tokens_per_sample=args.seq_length,
         )
 
     timers('batch-generator').stop()
