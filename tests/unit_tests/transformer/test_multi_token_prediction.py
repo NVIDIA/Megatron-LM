@@ -4,6 +4,7 @@ import os
 import sys
 import types
 
+from megatron.training.state import GlobalState
 import pytest
 import torch
 
@@ -800,11 +801,10 @@ class TestMultiTokenPrediction:
         model_parallel_cuda_manual_seed(_SEED)
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            self.model_provider,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            state, ModelType.encoder_or_decoder, self.model_provider, pg_collection=pg_collection
         )
 
         # Forward pass with packed sequences
@@ -868,11 +868,10 @@ class TestMultiTokenPrediction:
         model_parallel_cuda_manual_seed(_SEED)
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         gpt_model, _, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            self.model_provider,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            state, ModelType.encoder_or_decoder, self.model_provider, pg_collection=pg_collection
         )
 
         output = gpt_model[0].forward(
@@ -1413,11 +1412,10 @@ class TestMultiTokenPredictionHybrid:
         model_parallel_cuda_manual_seed(_SEED)
         cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            self.model_provider,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            state, ModelType.encoder_or_decoder, self.model_provider, pg_collection=pg_collection
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1463,10 +1461,12 @@ class TestMultiTokenPredictionHybrid:
             model_parallel_cuda_manual_seed(_SEED)
             cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            state = GlobalState()
+            state.cfg = cfg_container
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+                state,
                 ModelType.encoder_or_decoder,
                 self.model_provider,
-                cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)

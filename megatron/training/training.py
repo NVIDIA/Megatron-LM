@@ -171,7 +171,6 @@ from .global_vars import (
     get_energy_monitor,
     get_one_logger,
     get_tensorboard_writer,
-    get_timers,
     get_tokenizer,
     get_wandb_writer,
 )
@@ -1224,6 +1223,7 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        state,
         model_type,
         model_provider_func=model_provider,
         checkpointing_context=checkpointing_context,
@@ -2001,16 +2001,17 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
+    state: GlobalState,
     model_type,
     model_provider_func=None,
     checkpointing_context=None,
     *,
-    cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
+    cfg_container = state.cfg
     one_logger = get_one_logger()
 
     # Typically, --skip-train is the only thing needed to disable the optimizer.

@@ -2,6 +2,7 @@
 import os
 import sys
 
+from megatron.training.state import GlobalState
 import pytest
 import torch
 import torch.distributed
@@ -191,11 +192,10 @@ class TestGPTModel:
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            model_provider,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            state, ModelType.encoder_or_decoder, model_provider, pg_collection=pg_collection
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -281,11 +281,10 @@ class TestGPTModel:
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            model_provider,
-            cfg_container=cfg_container,
-            pg_collection=pg_collection,
+            state, ModelType.encoder_or_decoder, model_provider, pg_collection=pg_collection
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
