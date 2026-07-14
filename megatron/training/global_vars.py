@@ -448,7 +448,8 @@ def build_telemetry_resource_attrs(args):
                       ('slurm.cluster', 'SLURM_CLUSTER_NAME'),
                       ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
                       ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID'),
-                      ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID')):
+                      ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID'),
+                      ('slurm.restart_count', 'SLURM_RESTART_COUNT')):
         val = os.environ.get(env)
         if val:
             resource_attrs[attr] = val
