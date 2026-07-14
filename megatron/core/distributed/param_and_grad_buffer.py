@@ -312,6 +312,33 @@ class _ParamAndGradBucketGroup:
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
 
+    def _finalize_layerwise_param_sync(self):
+        """Copy gathered LayerWise (non-DistOpt) params back and release the reused grad buffer.
+
+        Every path that completes a LayerWise param all-gather must run this before
+        ``_post_param_sync``: the gathered (possibly bf16-staged fp8) whole params sit in
+        ``bucket.layerwise_gather_list`` (views into ``grad_data``) until they are unflattened
+        into ``param.data``, and ``grad_data`` must be re-zeroed afterwards so the next
+        backward's accumulation into ``main_grad`` does not start from the gather payload.
+        """
+        if self.ddp_config.use_distributed_optimizer:
+            return
+        for bucket in self.buckets:
+            if bucket.layerwise_gather_list is None:
+                continue
+            # Unflatten and copy gathered params for each rank (FP8-aware: see helper).
+            _layerwise_copy_back_gathered_params(
+                bucket,
+                self.intra_distributed_optimizer_instance_rank,
+                fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
+            )
+            bucket.layerwise_gather_list = None
+            # Zero out grad_data since it was reused as the all-gather
+            # receive buffer. Without this, accumulation into main_grad
+            # (a view into grad_data) would start from the result of the
+            # latest parameter all-gather instead of zero.
+            bucket.grad_data.zero_()
+
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
@@ -407,6 +434,10 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                # A pending LayerWise gather normally lands in finish_param_sync (forward
+                # pre-hook), which force_sync bypasses -- finalize it here or every rank
+                # keeps stale ``param.data`` and the gather payload pollutes ``grad_data``.
+                self._finalize_layerwise_param_sync()
                 self._post_param_sync()
                 return
         else:
@@ -511,20 +542,7 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
                 # Synchronous: unflatten and copy gathered params immediately.
-                for bucket in self.buckets:
-                    if bucket.layerwise_gather_list is None:
-                        continue
-                    _layerwise_copy_back_gathered_params(
-                        bucket,
-                        local_rank,
-                        fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
-                    )
-                    bucket.layerwise_gather_list = None
-                    # Zero out grad_data since it was reused as the all-gather
-                    # receive buffer. Without this, accumulation into main_grad
-                    # (a view into grad_data) would start from the result of the
-                    # latest parameter all-gather instead of zero.
-                    bucket.grad_data.zero_()
+                self._finalize_layerwise_param_sync()
                 self.param_gather_handle = None
 
         else:
@@ -596,22 +614,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            if not self.ddp_config.use_distributed_optimizer:
-                for bucket in self.buckets:
-                    if bucket.layerwise_gather_list is None:
-                        continue
-                    # Unflatten and copy gathered params for each rank (FP8-aware: see helper).
-                    _layerwise_copy_back_gathered_params(
-                        bucket,
-                        self.intra_distributed_optimizer_instance_rank,
-                        fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
-                    )
-                    bucket.layerwise_gather_list = None
-                    # Zero out grad_data since it was reused as the all-gather
-                    # receive buffer. Without this, accumulation into main_grad
-                    # (a view into grad_data) would start from the result of the
-                    # latest parameter all-gather instead of zero.
-                    bucket.grad_data.zero_()
+            self._finalize_layerwise_param_sync()
             self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -840,6 +843,10 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            # Finalize a pending LayerWise gather before dropping its receive views:
+            # discarding layerwise_gather_list here would leave stale ``param.data``
+            # (checkpointed weights) and gather payload in ``grad_data``.
+            self._finalize_layerwise_param_sync()
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
 

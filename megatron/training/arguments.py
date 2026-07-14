@@ -1897,12 +1897,14 @@ def validate_args(args, defaults={}):
         if not args.use_layer_wise_param_layout:
             # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
             # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
-            # reuse_grad_buf.
+            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
+            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
+            # flatten path.
+            assert not getattr(args, 'fp4_param_gather', False), (
+                "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
+                "(mxfp8 or blockwise); fp4_param_gather is out of scope."
+            )
             if args.fp8_param_gather:
-                assert not getattr(args, 'fp4_param_gather', False), (
-                    "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
-                    "(mxfp8 or blockwise); fp4_param_gather is out of scope."
-                )
                 assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
                     "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
                     f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."

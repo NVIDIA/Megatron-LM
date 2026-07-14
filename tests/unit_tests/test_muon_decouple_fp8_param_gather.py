@@ -118,7 +118,14 @@ class TestMuonDecoupleFP8ParamGather:
             position_embedding_type=args.position_embedding_type,
         )
 
-    def _create_args(self, fp8_param_gather, fp8_recipe, overlap):
+    def _create_args(
+        self,
+        fp8_param_gather,
+        fp8_recipe,
+        overlap,
+        num_experts=0,
+        expert_model_parallel_size=1,
+    ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         sys.argv = ['test_muon_decouple_fp8_param_gather.py']
@@ -135,8 +142,12 @@ class TestMuonDecoupleFP8ParamGather:
         args.tensor_model_parallel_size = 1
         args.pipeline_model_parallel_size = 1
         args.context_parallel_size = 1
+        args.expert_model_parallel_size = expert_model_parallel_size
         args.train_iters = 10
-        args.lr = 3e-5
+        # Larger lr than a real run: amplifies any fp8-path discrepancy so an ON-vs-OFF
+        # mismatch (if one exists) shows up within a handful of steps rather than being
+        # lost in the low bits (per PR #5470 review). The model is tiny so this stays stable.
+        args.lr = 1e-3
         args.clip_grad = 0.0
         args.bf16 = True
         args.add_bias_linear = False
@@ -167,6 +178,20 @@ class TestMuonDecoupleFP8ParamGather:
             args.reuse_grad_buf_for_mxfp8_param_ag = (
                 True  # mxfp8 columnwise needs the bf16 round-trip
             )
+        if num_experts > 0:
+            # MoE variant: expert weights are 2D matrices -> Muon-managed, so they ride the
+            # LayerWise param path. At expt_dp == 1 (expert_model_parallel_size == world size)
+            # the experts are NOT all-gathered and only get the fp8 master->model copy-back; at
+            # expt_dp > 1 they are gathered. This covers both branches (PR #5470 review).
+            args.num_experts = num_experts
+            args.moe_router_topk = 2
+            args.moe_ffn_hidden_size = args.ffn_hidden_size
+            args.moe_token_dispatcher_type = 'alltoall'
+            args.moe_grouped_gemm = False
+            # Deterministic routing comes from the fixed seed + deterministic_mode; drop the
+            # aux-loss gradient term so ON and OFF compare cleanly without router-bias drift.
+            args.moe_router_load_balancing_type = 'none'
+            args.moe_aux_loss_coeff = 0.0
         args.ddp_bucket_size = 1024  # more buckets -> exercise rs/ag overlap
         validate_args(args)
         set_global_variables(args, False)
@@ -183,8 +208,21 @@ class TestMuonDecoupleFP8ParamGather:
         loss_mask = torch.ones(self.seq_length).repeat((self.micro_batch_size, 1)).cuda()
         return ids, labels, pos, mask, loss_mask
 
-    def _build(self, fp8_param_gather, fp8_recipe, overlap):
-        args = self._create_args(fp8_param_gather, fp8_recipe, overlap)
+    def _build(
+        self,
+        fp8_param_gather,
+        fp8_recipe,
+        overlap,
+        num_experts=0,
+        expert_model_parallel_size=1,
+    ):
+        args = self._create_args(
+            fp8_param_gather,
+            fp8_recipe,
+            overlap,
+            num_experts=num_experts,
+            expert_model_parallel_size=expert_model_parallel_size,
+        )
         set_args(args)
         torch.manual_seed(_SEED)
         model, optimizer, _ = setup_model_and_optimizer(
@@ -239,24 +277,19 @@ class TestMuonDecoupleFP8ParamGather:
             outs.append(out.detach().clone())
         return losses, outs, grads, masters, params
 
-    @pytest.mark.parametrize("overlap", [False, True])
-    @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
-    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
-    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
-    def test_on_vs_off_bitwise_identical(self, fp8_recipe, overlap):
-        """fp8_param_gather ON must match OFF bitwise on the decoupled layout, for
-        overlap grad-reduce + param-gather both ON and OFF."""
-        arch = get_device_arch_version()
-        if fp8_recipe == "blockwise" and arch != 9:
-            pytest.skip("blockwise FP8 is Hopper-only")
-        if fp8_recipe == "mxfp8" and arch < 10:
-            pytest.skip("mxfp8 requires Blackwell architecture or newer")
-        n = 5
-
+    def _check_on_vs_off(
+        self, fp8_recipe, overlap, n, num_experts=0, expert_model_parallel_size=1
+    ):
+        """fp8_param_gather ON must match OFF bitwise for ``n`` deterministic steps on
+        per-step loss / forward output / per-param main_grad / fp32 master / bf16 param."""
         with deterministic_mode():
-            off_args, off_model, off_opt = self._build(False, fp8_recipe, overlap)
+            off_args, off_model, off_opt = self._build(
+                False, fp8_recipe, overlap, num_experts, expert_model_parallel_size
+            )
             params0, masters0 = _snapshot_params(off_model[0]), _snapshot_masters(off_model[0])
-            on_args, on_model, on_opt = self._build(True, fp8_recipe, overlap)
+            on_args, on_model, on_opt = self._build(
+                True, fp8_recipe, overlap, num_experts, expert_model_parallel_size
+            )
             _restore_initial_state(on_model[0], on_opt, params0, masters0)
 
             off = [[], [], [], [], []]  # loss, out, grad, master, param
@@ -285,3 +318,154 @@ class TestMuonDecoupleFP8ParamGather:
             assert common, f"no common masters step {s}"
             for k in common:
                 _assert_equal(mn[s][k], mo[s][k], f"master step {s} {k}")
+
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_on_vs_off_bitwise_identical(self, fp8_recipe, overlap):
+        """fp8_param_gather ON must match OFF bitwise on the decoupled layout, for
+        overlap grad-reduce + param-gather both ON and OFF."""
+        arch = get_device_arch_version()
+        if fp8_recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise FP8 is Hopper-only")
+        if fp8_recipe == "mxfp8" and arch < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+        # 30 steps: fp8-quantization ON-vs-OFF mismatches often only surface after many
+        # iterations (PR #5470 review), so a handful of steps can miss a real divergence.
+        self._check_on_vs_off(fp8_recipe, overlap, n=30)
+
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("expt_dp_gt_1", [False, True])
+    @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_moe_on_vs_off_bitwise_identical(self, fp8_recipe, overlap, expt_dp_gt_1):
+        """MoE variant (PR #5470 review): the 2D expert weights are Muon-managed, so they
+        ride the LayerWise param path. Covers both expert-data-parallel regimes:
+
+        - ``expt_dp == 1`` (expert_model_parallel_size == world size): experts are NOT
+          all-gathered — they only get the fp8 master->model copy-back
+          (``_copy_main_params_to_model_params``'s non-gathered branch).
+        - ``expt_dp > 1`` (expert_model_parallel_size == 1): experts ARE gathered.
+
+        Needs world size >= 2 to realize both regimes (at dp==1 only expt_dp==1 exists);
+        run with ``torchrun --nproc_per_node>=2``.
+        """
+        world = torch.distributed.get_world_size()
+        if world < 2:
+            pytest.skip(
+                "MoE expt_dp coverage needs data-parallel size >= 2 (dp==1 only realizes "
+                "expt_dp==1); run with --nproc_per_node>=2"
+            )
+        arch = get_device_arch_version()
+        if fp8_recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise FP8 is Hopper-only")
+        if fp8_recipe == "mxfp8" and arch < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        # expt_dp = world_size / expert_model_parallel_size.
+        ep = 1 if expt_dp_gt_1 else world
+        # setup_method initialized model parallel with ep=1; re-init with the target EP.
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=ep,
+        )
+        self._check_on_vs_off(
+            fp8_recipe, overlap, n=30, num_experts=8, expert_model_parallel_size=ep
+        )
+
+    @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_force_sync_finalizes_pending_layerwise_gather(self, fp8_recipe):
+        """``start_param_sync(force_sync=True)`` with a PENDING async LayerWise gather
+        (the ``disable_forward_pre_hook`` path taken before eval / checkpoint save) must
+        finalize the gather exactly like the forward-pre-hook (``finish_param_sync``) path:
+        the gathered whole-params must land in every rank's ``param.data`` (for gathered fp8
+        params the optimizer's own master->model copy is skipped via
+        ``_layer_wise_fp8_gathered``, so without the copy-back even the owner rank keeps stale
+        weights), and the reused grad buffer must be re-zeroed so the next backward does not
+        accumulate on top of the gather payload. Both are asserted as equality against the
+        finish_param_sync reference path.
+
+        Requires data-parallel size >= 2: at dp==1 the LayerWise all-gather early-returns
+        (no gather, no grad-buffer reuse, no copy-back), so the force_sync finalize is a
+        no-op and the bug/fix is not exercised. Run this file with ``torchrun
+        --nproc_per_node>=2``.
+        """
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip(
+                "force_sync LayerWise gather copy-back is only exercised at data-parallel "
+                "size >= 2 (dp==1 skips the all-gather); run with --nproc_per_node>=2"
+            )
+        arch = get_device_arch_version()
+        if fp8_recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise FP8 is Hopper-only")
+        if fp8_recipe == "mxfp8" and arch < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        def _snapshot_params(model):
+            # fp8 params compared via dequantize (stale fp8 bytes => different dequant).
+            return {
+                n: (p.data.dequantize() if _is_quantized(p) else p.data).detach().clone().float()
+                for n, p in model.named_parameters()
+            }
+
+        def _snapshot_layerwise_grad(ddp):
+            # grad_data of the non-DistOpt LayerWise buffers, which the fp8 all-gather reuses
+            # as its bf16 receive buffer and the finalize must re-zero.
+            return [
+                buf.grad_data.detach().clone()
+                for buf in (ddp.buffers + ddp.expert_parallel_buffers)
+                if not buf.ddp_config.use_distributed_optimizer
+            ]
+
+        def _step_and_dispatch():
+            # fp8_param_gather ON + overlap ON; one full train step, then dispatch the
+            # post-step async param all-gather explicitly (the training loop's next
+            # forward pre-hook would otherwise do it lazily).
+            args, model, opt = self._build(True, fp8_recipe, True)
+            self._run_steps(args, model, opt, 1)
+            ddp = model[0]
+            ddp.start_param_sync()
+            groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
+            assert any(
+                g.param_gather_handle is not None for g in groups
+            ), "test precondition: expected a pending async param-gather handle"
+            return model, ddp, groups
+
+        with deterministic_mode():
+            # Reference: finish the pending gather through the normal overlap path.
+            ref_model, ref_ddp, ref_groups = _step_and_dispatch()
+            for g in ref_groups:
+                if g.param_gather_handle is not None:
+                    g.finish_param_sync(skip_next_bucket_dispatch=True)
+            ref_params = _snapshot_params(ref_model[0])
+            ref_grads = _snapshot_layerwise_grad(ref_ddp)
+            del ref_model, ref_ddp, ref_groups
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Under test: force-sync with the handle still pending (eval/ckpt path). Both
+            # builds start from the same deterministic init + identical step, so the
+            # force_sync result must match the finish_param_sync reference exactly.
+            model, ddp, groups = _step_and_dispatch()
+            ddp.disable_forward_pre_hook(param_sync=True)
+            got_params = _snapshot_params(model[0])
+            got_grads = _snapshot_layerwise_grad(ddp)
+
+            for g in groups:
+                for bucket in g.buckets:
+                    assert (
+                        getattr(bucket, 'layerwise_gather_list', None) is None
+                    ), "force_sync left an unconsumed layerwise_gather_list"
+
+        assert ref_params.keys() == got_params.keys()
+        for k in ref_params:
+            _assert_equal(got_params[k], ref_params[k], f"param after force_sync {k}")
+        assert len(ref_grads) == len(got_grads) and ref_grads, "expected LayerWise grad buffers"
+        for i, (gr, gg) in enumerate(zip(ref_grads, got_grads)):
+            _assert_equal(gg, gr, f"grad_data buffer {i} after force_sync")

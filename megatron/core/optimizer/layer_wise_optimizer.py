@@ -480,6 +480,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # ``_copy_main_params_to_param_buffer``); the gather staging reuses the grad buffer.
                 optimizers[i]._layer_wise_non_distopt_child = True
 
+            # shard_params() removed non-owned params from the local optimizer groups, so the
+            # Float16 wrapping above only clears the TE high-precision init copy (a full-size CPU
+            # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
+            # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
+            # run. The per-rank ownership lists cover all gathered params (owned entries were
+            # already cleared during master creation; TE's clear is a no-op then). Scoped to
+            # LayerWise-managed params only: sibling DistOpt params must keep their init val
+            # until their own optimizer's master creation consumes it.
+            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+                if not params_list:
+                    continue
+                for per_rank_params in params_list:
+                    for p in per_rank_params:
+                        if hasattr(p, 'clear_high_precision_init_val'):
+                            p.clear_high_precision_init_val()
+
         super().__init__(optimizers)
 
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
