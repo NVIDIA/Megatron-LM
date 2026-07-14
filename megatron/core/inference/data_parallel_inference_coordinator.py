@@ -626,10 +626,6 @@ class DataParallelInferenceCoordinator:
             finished_request (dict): The serialized merged request containing the
                 generated tokens to be detokenized. It is modified in place.
         """
-        if finished_request["prompt"] is None:
-            finished_request["prompt"] = TextGenerationController.detokenize(
-                self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
-            )
         detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
             "detokenize_stop_sequence", False
         )
