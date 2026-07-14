@@ -869,11 +869,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         if self.pg_collection is None:
             return
-        helper = _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
+
+        def _dispatch(params_list, group):
+            # Split each rank's owned params by transport dtype. fp8 and bf16 params ride the
+            # bf16 transport (the fp8 helper stages master->bf16 / requantizes, a no-op in
+            # precision for bf16); native fp32 params (e.g. weights marked keep_in_fp32 such as
+            # the DeepSeek-V4 CSA ``ape``) must be gathered in fp32 -- routing them through the
+            # bf16-staged path would silently downcast them, and mixing fp32 with bf16 in one
+            # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
+            # empty and this collapses to the original single-helper dispatch.
+            staged = [
+                [p for p in owned if is_float8tensor(p) or p.dtype != torch.float32]
+                for owned in params_list
+            ]
+            native = [
+                [p for p in owned if not is_float8tensor(p) and p.dtype == torch.float32]
+                for owned in params_list
+            ]
+            if any(owned for owned in staged):
+                staged_helper = _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
+                staged_helper(staged, group)
+            if any(owned for owned in native):
+                _allgather_helper(native, group)
+
         if self.dp_cp_params_list:
-            helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            _dispatch(self.dp_cp_params_list, self.pg_collection.dp_cp)
         if self.expt_dp_params_list:
-            helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _dispatch(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
