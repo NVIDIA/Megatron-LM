@@ -2860,24 +2860,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         hashes = req.precomputed_block_hashes[start_block:end_block]
         kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
 
-        # Return the longest contiguous cached prefix by scanning from the start
-        # and stopping at the first missing block. Eviction is not parent-aware,
-        # so a chain can have holes (a shallower block evicted while a deeper one
-        # stays cached); a deeper match is unusable unless every preceding block
-        # is also resident, since prefix reuse requires the full contiguous KV
-        # prefix.
-        matched_blocks = []
-        for h in hashes:
-            block_id = kv_hash_to_block.get(h)
-            if block_id is None:
-                break
-            matched_blocks.append(block_id)
+        # Find longest KV prefix by iterating block hashes from end.
+        # Parent-chained hashes guarantee: if hash at position N exists,
+        # all hashes 0..N also exist. So first match from end = longest prefix.
+        for i in range(len(hashes) - 1, -1, -1):
+            if hashes[i] in kv_hash_to_block:
+                num_matched = i + 1
+                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
+                parent_hash = hashes[num_matched - 1]
+                return matched_blocks, parent_hash
 
-        if not matched_blocks:
-            return [], 0
-
-        parent_hash = hashes[len(matched_blocks) - 1]
-        return matched_blocks, parent_hash
+        return [], 0
 
     def add_request(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
