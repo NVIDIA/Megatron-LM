@@ -55,8 +55,8 @@ class DataParallelInferenceCoordinator:
         `InferenceClient`, and performs a simple handshake.
     3.  **Request Forwarding**: It receives inference requests from clients, assigns a
         unique server-side request ID, tokenizes the prompt, and forwards the request
-        to one of the available data parallel rank using a round-robin scheduling
-        strategy.
+        to one of the available data parallel ranks using load-balanced (and,
+        when prefix caching is enabled, prefix-affinity-aware) routing.
     4.  **Response Routing**: It receives completed results from
         the data parallel ranks and routes them back to the original client that made the
         request.
@@ -67,7 +67,7 @@ class DataParallelInferenceCoordinator:
         router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
-            identities of connected TP-coordinators, used for round-robin scheduling.
+            identities of connected data parallel instances, used for request routing.
         request_id_to_client_id (dict): Maps server-side request IDs to the ZMQ
             identity of the client that initiated the request.
         request_id_to_client_request_id (dict): Maps server-side request IDs to the
@@ -109,7 +109,7 @@ class DataParallelInferenceCoordinator:
 
         Args:
             pipe_connection (Connection): A connecting pipe to the parent process.
-            data_parallel_size (int): The number of TP-coordinator workers that are
+            data_parallel_size (int): The number of data parallel instances that are
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
@@ -182,7 +182,6 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks = deque(
                 sorted(self.identities_of_data_parallel_ranks)
             )
-        self._round_robin_idx = 0
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -221,19 +220,19 @@ class DataParallelInferenceCoordinator:
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
 
-    def get_next_data_parallel_rank(self):
+    def get_least_loaded_data_parallel_rank(self):
         """
-        Selects the next data parallel rank using round-robin scheduling.
+        Selects the data parallel rank with the fewest in-flight requests.
+
+        Ties are broken by lowest rank index for deterministic behavior.
 
         Returns:
-            bytes: The ZMQ identity of the next data parallel rank to receive a request.
+            bytes: The ZMQ identity of the least-loaded data parallel rank.
         """
-        identities = self.identities_of_data_parallel_ranks
-        if not identities:
+        if not self._identities_list:
             raise RuntimeError("No engines connected")
-        idx = self._round_robin_idx % len(identities)
-        self._round_robin_idx = idx + 1
-        return identities[idx]
+        best_idx = int(np.argmin(self._pending_counts))
+        return self._identities_list[best_idx]
 
     def _register_rank_identity(self, identity):
         """Register a new rank identity in the scoring data structures.
@@ -256,8 +255,37 @@ class DataParallelInferenceCoordinator:
         )
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from the routing pool."""
+        """Remove a disconnected engine from all routing bookkeeping.
+        Called both during shutdown and when an engine becomes unreachable mid-operation
+        (e.g. zmq.EHOSTUNREACH in _send_to_engine). The O(n) index-shifting and hash-table
+        rebuild are acceptable because the number of connected engines is small; optimize
+        only if dynamic registration/deregistration at high engine counts becomes a use case.
+        """
         self.identities_of_data_parallel_ranks.remove(identity)
+        idx = self.identity_to_rank_index.pop(identity, None)
+        if idx is None:
+            return
+        self._identities_list.pop(idx)
+        self._pending_counts = np.delete(self._pending_counts, idx)
+        # Shift indices for engines that came after the removed slot.
+        for ident in self.identity_to_rank_index:
+            if self.identity_to_rank_index[ident] > idx:
+                self.identity_to_rank_index[ident] -= 1
+        # Drop hash-table entries for the removed rank; shift indices above it.
+        new_hash_table = {}
+        for h, rank_ts in self._hash_table.items():
+            # h is hash index
+            # rank_ts is a dict mapping rank_idx → timestamp
+            new_row = {}
+            for r, ts in rank_ts.items():
+                if r == idx:
+                    # skip this rank as it is removed
+                    continue
+                new_r = r - 1 if r > idx else r
+                new_row[new_r] = ts
+            if new_row:
+                new_hash_table[h] = new_row
+        self._hash_table = new_hash_table
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -312,11 +340,13 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN:
-            return self.get_next_data_parallel_rank()
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
+            return self.get_least_loaded_data_parallel_rank()
 
+        # Without prefix caching (or when the request has no hashes to match on)
+        # fall back to load-balanced routing.
         if not self.enable_prefix_caching or not request_hashes:
-            return self.get_next_data_parallel_rank()
+            return self.get_least_loaded_data_parallel_rank()
 
         match, recency = self._match_vector(request_hashes)
 
@@ -639,7 +669,7 @@ class DataParallelInferenceCoordinator:
             ready_event (Event): A threading or multiprocessing event object that is set()
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
-            data_parallel_size (int): The number of expected TP-coordinators.
+            data_parallel_size (int): The number of expected data parallel instances.
             deterministic_mode (bool): Whether to enable deterministic scheduling.
             block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
             enable_prefix_caching (bool): Whether prefix caching is enabled.
