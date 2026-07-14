@@ -1457,7 +1457,7 @@ def pretrain(
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
-        iteration = args.iteration
+        iteration = state.train_state.step
 
     if train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
@@ -2138,9 +2138,9 @@ def setup_model_and_optimizer(
                 'opt_param_scheduler': None,
             },
         )
-        args.iteration = 1
+        state.train_state.step = 1
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            state.train_state.step, model, None, None, args.num_floating_point_operations_so_far
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -2157,7 +2157,7 @@ def setup_model_and_optimizer(
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
         ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        state.train_state.step, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
             opt_param_scheduler,
@@ -2181,7 +2181,7 @@ def setup_model_and_optimizer(
             }
         )
     else:
-        args.iteration = 0
+        state.train_state.step = 0
         args.num_floating_point_operations_so_far = 0
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
@@ -2213,7 +2213,7 @@ def setup_model_and_optimizer(
 
     # get model without FP16 and/or DDP wrappers
     if (
-        args.iteration == 0
+        state.train_state.step == 0
         and len(unwrapped_model) == 1
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert')
     ):
@@ -2230,7 +2230,7 @@ def setup_model_and_optimizer(
         update_use_dist_ckpt(args)
 
         save_checkpoint(
-            args.iteration,
+            state.train_state.step,
             model,
             optimizer,
             opt_param_scheduler,
@@ -3293,6 +3293,7 @@ def train(
     """
     args = get_args()
     timers = state.timers
+    train_state = state.train_state
     injected_forward_step_func = prepare_forward_step_func(forward_step_func, state)
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -3419,7 +3420,7 @@ def train(
             print_rank_0("workload inspector module not found.")
 
     # Write args to tensorboard
-    write_args_to_tensorboard()
+    write_args_to_tensorboard(train_state.step)
 
     # Turn on training mode which enables dropout.
     for model_module in model:
@@ -3431,17 +3432,17 @@ def train(
     total_loss_dict = {}
 
     # Iterations.
-    iteration = args.iteration
+    iteration = train_state.step
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
-    if rerun_state_machine.current_iteration != iteration:
+    if rerun_state_machine.current_iteration != train_state.step:
         print_rank_0(f"Overwriting rerun_state_machine.current_iteration from "
-                     f"{rerun_state_machine.current_iteration} to {iteration}...")
-        rerun_state_machine.current_iteration = iteration
+                     f"{rerun_state_machine.current_iteration} to {train_state.step}...")
+        rerun_state_machine.current_iteration = train_state.step
 
     # Track E2E metrics at the start of training.
     one_logger_utils.on_train_start(
-        iteration=iteration,
+        iteration=train_state.step,
         consumed_train_samples=args.consumed_train_samples,
         train_samples=args.train_samples,
         seq_length=args.seq_length,
@@ -3571,7 +3572,7 @@ def train(
             num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
         )
         return {
-            'iteration': iteration,
+            'iteration': train_state.step,
             'train_duration': timers('interval-time').active_time(),
             'eval_duration': eval_duration,
             'eval_iterations': eval_iterations,
@@ -3619,7 +3620,7 @@ def train(
         )
         prof.start()
 
-    start_iteration = iteration
+    start_iteration = train_state.step
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -3636,7 +3637,7 @@ def train(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
-        print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+        print_rank_0(f">>> Weight hashes match after {train_state.step} iterations...")
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
@@ -3650,16 +3651,16 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
-    while iteration < args.train_iters:
+    while train_state.step < args.train_iters:
         if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
-            if iteration == args.profile_step_start and args.nvtx_ranges:
+            if train_state.step == args.profile_step_start and args.nvtx_ranges:
                 configure_nvtx_profiling(True)
             if args.use_pytorch_profiler:
                 prof.step()
-            elif iteration == args.profile_step_start:
+            elif train_state.step == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
                 nsys_nvtx_context.__enter__()
@@ -3670,7 +3671,7 @@ def train(
         # Update the timeout for all process groups after initialization
         # We update the timeout after the first successful iteration,
         # which takes longer than others usually
-        if args.distributed_timeout_seconds_after_init is not None and iteration == start_iteration+1:
+        if args.distributed_timeout_seconds_after_init is not None and train_state.step == start_iteration+1:
             # TODO: some dynamic timeout setting is required
             # based on the iteration time considering interval-based steps (e.g. eval, checkpoint)
             # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
@@ -3685,10 +3686,10 @@ def train(
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
-        if get_num_microbatches() != num_microbatches and iteration != 0:
+        if get_num_microbatches() != num_microbatches and train_state.step != 0:
             if args.rl_use_sequence_packing:
                 print_rank_0(
-                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
+                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {train_state.step} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
             else:
@@ -3699,7 +3700,7 @@ def train(
                 if args.save is not None:
                     save_checkpoint_and_time(
                             state,
-                        iteration,
+                        train_state.step,
                         model,
                         optimizer,
                         opt_param_scheduler,
@@ -3714,7 +3715,7 @@ def train(
         if (
             args.cuda_graph_impl == "transformer_engine"
             and not cuda_graph_helper.capture_finished()
-            and iteration - start_iteration == args.cuda_graph_warmup_steps
+            and train_state.step - start_iteration == args.cuda_graph_warmup_steps
         ):
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
@@ -3724,12 +3725,12 @@ def train(
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
-        if (iteration + 1) in args.iterations_to_skip:
+        if (train_state.step + 1) in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
-            if iteration == start_iteration:
-                start_iteration = iteration + 1
-            iteration += 1
+            if train_state.step == start_iteration:
+                start_iteration = train_state.step + 1
+            train_state.step += 1
             batch_size = (
                 _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
@@ -3737,7 +3738,7 @@ def train(
             args.skipped_train_samples += batch_size
             continue
 
-        args.curr_iteration = iteration
+        args.curr_iteration = train_state.step
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -3747,7 +3748,7 @@ def train(
                 torch.cuda.empty_cache()
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict,
+                    model, inference_model, optimizer, train_state.step, ref_state_dict,
                     grpo_iterations=args.grpo_iterations,
                     grpo_prompts_per_step=args.grpo_prompts_per_step,
                     grpo_group_size=args.grpo_group_size,
@@ -3784,24 +3785,24 @@ def train(
                 max_attention_logit,
             ) = train_step(
                 state,
-                injected_forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                injected_forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=train_state.step,
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
-            if _maybe_raise_workload_exception is not None and iteration != start_iteration:
+            if _maybe_raise_workload_exception is not None and train_state.step != start_iteration:
                 _maybe_raise_workload_exception()
             # Fault delay timing can start at the end of iteration N. Self-firing faults
             # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
             # configured delay; workload-exception faults manifest on a later poll.
             if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(
-                fault_injector_config, iteration
+                fault_injector_config, train_state.step
             ):
                 setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
                 state,
-                iteration,
+                train_state.step,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -3815,12 +3816,12 @@ def train(
         # Enable forward pre-hooks after first set of forward and backward passes.
         # When running in fp16, skip all NaN iterations until steady-state loss scaling value
         # is reached.
-        if iteration == start_iteration:
+        if train_state.step == start_iteration:
             if skipped_iter:
                 # Only enable forward pre-hook after a training step has successfully run. Relevant
                 # for fp16 codepath where first XX iterations are skipped until steady-state loss
                 # scale value is reached.
-                start_iteration = iteration + 1
+                start_iteration = train_state.step + 1
             else:
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
@@ -3839,14 +3840,14 @@ def train(
                         ), "CUDA Graph capture should have been finished."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-        iteration += 1
+        train_state.step += 1
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
             and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
-            and iteration ==  start_iteration + 1
+            and train_state.step ==  start_iteration + 1
         ):
             for model_chunk in model:
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
@@ -3918,7 +3919,7 @@ def train(
             loss_dict,
             total_loss_dict,
             learning_rate,
-            iteration,
+            train_state.step,
             loss_scale,
             report_memory_flag,
             skipped_iter,
@@ -3934,8 +3935,8 @@ def train(
         is_first_iteration = False
 
         # Evaluation.
-        if args.eval_interval and iteration % args.eval_interval == 0 and train_state.do_valid \
-                and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
+        if args.eval_interval and train_state.step % args.eval_interval == 0 and train_state.do_valid \
+                and (args.start_eval_at_iter is None or train_state.step >= args.start_eval_at_iter):
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
@@ -3945,7 +3946,7 @@ def train(
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
-            prefix = f'iteration {iteration}'
+            prefix = f'iteration {train_state.step}'
             timers('eval-time', log_level=0).start(barrier=True)
             if args.perform_rl_step:
                 rl_eval_model = model
@@ -3964,14 +3965,14 @@ def train(
                     valid_data_iterator,
                     rl_eval_model,
                     optimizer,
-                    iteration,
+                    train_state.step,
                     write_to_tensorboard=True,
                     training_model=rl_training_model,
                 )
             else:
                 evaluate_and_print_results(state, prefix, injected_forward_step_func,
                                        valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
+                                       train_state.step, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
@@ -4002,7 +4003,7 @@ def train(
             model,
             optimizer,
             opt_param_scheduler,
-            iteration,
+            train_state.step,
             prof,
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
@@ -4014,7 +4015,7 @@ def train(
             model,
             optimizer,
             opt_param_scheduler,
-            iteration,
+            train_state.step,
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
@@ -4078,7 +4079,7 @@ def train(
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
-    return iteration, num_floating_point_operations_so_far
+    return train_state.step, num_floating_point_operations_so_far
 
 
 def evaluate(
@@ -4384,7 +4385,7 @@ def cyclic_iter(iterable):
             )
 
 
-def get_train_valid_test_num_samples():
+def get_train_valid_test_num_samples(curr_iteration: int):
     """Train/valid/test num samples."""
 
     args = get_args()
@@ -4412,7 +4413,7 @@ def get_train_valid_test_num_samples():
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
         phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
-        current_sample = args.iteration * args.global_batch_size
+        current_sample = curr_iteration * args.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
         train_samples_in_current_phase = next_transition_sample - last_transition_sample
@@ -4422,10 +4423,10 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
+def build_train_valid_test_datasets(train_state: TrainState, build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
-        train_valid_test_num_samples = get_train_valid_test_num_samples()
+        train_valid_test_num_samples = get_train_valid_test_num_samples(train_state.step)
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
@@ -4443,26 +4444,26 @@ def build_train_valid_test_data_loaders(train_state: TrainState, build_train_val
     print_rank_0('> building train, validation, and test datasets ...')
 
     # Backward compatibility, assume fixed batch size.
-    if args.iteration > 0 and args.consumed_train_samples == 0:
+    if train_state.step > 0 and args.consumed_train_samples == 0:
         assert (
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
 
-        args.consumed_train_samples = args.iteration * args.global_batch_size
-    if args.iteration > 0 and args.consumed_valid_samples == 0:
+        args.consumed_train_samples = train_state.step * args.global_batch_size
+    if train_state.step > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // args.eval_interval
             args.consumed_valid_samples = (
-                max(0, args.iteration // args.eval_interval - skipped_intervals)
+                max(0, train_state.step // args.eval_interval - skipped_intervals)
                 * args.eval_iters
                 * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
 
     # Get consumed train samples in this phase.
     if args.phase_transition_iterations:
-        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
-        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
+        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= train_state.step)
+        consumed_train_samples_in_current_phase = (train_state.step - last_transition) * args.global_batch_size
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
 
@@ -4484,7 +4485,7 @@ def build_train_valid_test_data_loaders(train_state: TrainState, build_train_val
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(train_state, build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None

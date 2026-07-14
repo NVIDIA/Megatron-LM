@@ -445,13 +445,13 @@ def _set_random_seed(
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
-def write_args_to_tensorboard():
+def write_args_to_tensorboard(iteration: int):
     """Write arguments to tensorboard."""
     args = get_args()
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
+            writer.add_text(arg, str(getattr(args, arg)), global_step=iteration)
 
 
 def set_jit_fusion_options(tp_size=None):
