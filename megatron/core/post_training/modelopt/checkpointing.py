@@ -13,9 +13,9 @@ import torch
 from megatron.core import mpu
 from megatron.core.safe_globals import safe_load_from_bytes
 
-from ..serialization import load, load_common_state_dict, save
-from ..validation import StrictHandling
-from .torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.serialization import load, load_common_state_dict, save
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.validation import StrictHandling
 
 logger = logging.getLogger(__name__)
 

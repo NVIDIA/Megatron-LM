@@ -1,35 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for megatron/core/dist_checkpointing/strategies/modelopt.py."""
+"""Unit tests for megatron/core/dist_checkpointing/strategies/modelopt.py.
 
-import importlib
+Skipped automatically when modelopt is not installed.
+"""
+
 import sys
-import types
 from unittest import mock
 
 import pytest
 import torch
 
-# ---------------------------------------------------------------------------
-# Install modelopt stubs before the strategy module is imported.
-# _MTO and _DIST are MagicMocks so attribute access auto-creates child mocks;
-# we configure return values in each test's setup_method.
-# ---------------------------------------------------------------------------
-_MTO = mock.MagicMock(name="modelopt.torch.opt")
-_DIST = mock.MagicMock(name="modelopt.torch.utils.distributed")
-_MODELOPT_ROOT = types.ModuleType("modelopt")
-_MODELOPT_ROOT.__version__ = "0.0.0-test"
+pytest.importorskip("modelopt", reason="modelopt is not installed")
 
-for _key, _val in {
-    "modelopt": _MODELOPT_ROOT,
-    "modelopt.torch": mock.MagicMock(name="modelopt.torch"),
-    "modelopt.torch.opt": _MTO,
-    "modelopt.torch.utils": mock.MagicMock(name="modelopt.torch.utils"),
-    "modelopt.torch.utils.distributed": _DIST,
-}.items():
-    sys.modules.setdefault(_key, _val)
+import modelopt.torch.opt as mto
+import modelopt.torch.utils.distributed as mdist
 
-from megatron.core.dist_checkpointing.strategies.modelopt import (
+from megatron.core.post_training.modelopt.checkpointing import (
     _load_extra_state_from_sharded_checkpoint,
     remove_per_module_state,
     restore_sharded_modelopt_state,
@@ -38,16 +25,13 @@ from megatron.core.dist_checkpointing.strategies.modelopt import (
 )
 
 
-class TestModeloptLazyImport:
-    def test_modelopt_not_imported_at_module_level(self):
-        strategy_key = "megatron.core"
+class TestModelOptImports:
+    def test_modelopt_imports(self):
         modelopt_keys = [k for k in sys.modules if k == "modelopt" or k.startswith("modelopt.")]
-        saved = {k: sys.modules.pop(k) for k in modelopt_keys + [strategy_key] if k in sys.modules}
+        saved = {k: sys.modules.pop(k) for k in modelopt_keys}
         try:
-            importlib.import_module(strategy_key)
+            import megatron.core  # noqa: F401
             assert "modelopt" not in sys.modules
-            assert "modelopt.torch.opt" not in sys.modules
-            assert "modelopt.torch.utils.distributed" not in sys.modules
         finally:
             sys.modules.update(saved)
 
@@ -76,31 +60,79 @@ class TestRemovePerModuleState:
 
 
 class TestSaveModeloptState:
-    def setup_method(self):
-        _MTO.reset_mock()
-        _MTO.ModeloptStateManager.is_converted.return_value = True
-        _MTO.modelopt_state.return_value = {"modelopt_state_dict": []}
-
     def test_not_converted_is_noop(self):
-        _MTO.ModeloptStateManager.is_converted.return_value = False
         state_dict = {}
-        save_modelopt_state([mock.MagicMock()], state_dict)
+        with mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=False):
+            save_modelopt_state([mock.MagicMock()], state_dict)
         assert state_dict == {}
+
+    def test_single_model_saved(self):
+        fake_state = {"modelopt_state_dict": []}
+        state_dict = {}
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mto, "modelopt_state", return_value=fake_state),
+        ):
+            save_modelopt_state([mock.MagicMock()], state_dict)
+        assert state_dict["modelopt_state"] is fake_state
+
+    def test_multiple_models_use_indexed_keys(self):
+        state_dict = {}
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mto, "modelopt_state", side_effect=[{"i": i} for i in range(2)]),
+            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.mpu"),
+        ):
+            save_modelopt_state([mock.MagicMock(), mock.MagicMock()], state_dict)
+        assert "modelopt_state_0" in state_dict
+        assert "modelopt_state_1" in state_dict
+
+
+class TestSaveShardedModeloptState:
+    def test_multiple_models_raises(self):
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mdist, "is_master", return_value=True),
+            pytest.raises(ValueError, match="virtual pipeline"),
+        ):
+            save_sharded_modelopt_state([mock.MagicMock(), mock.MagicMock()], "/ckpt")
+
+    def test_single_model_calls_save(self, tmp_path):
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mto, "modelopt_state", return_value={"modelopt_state_dict": []}),
+            mock.patch.object(mdist, "is_master", return_value=True),
+            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.save") as mock_save,
+        ):
+            save_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
+        mock_save.assert_called_once()
+        assert mock_save.call_args.args[1] == f"{tmp_path}/modelopt_state"
 
 
 class TestRestoreShardedModeloptState:
-    def setup_method(self):
-        _MTO.reset_mock()
-        _MTO.ModeloptStateManager.is_converted.return_value = False
-        _MTO.restore_from_modelopt_state.side_effect = lambda m, _s: m
-
     def test_multiple_models_raises(self):
         with pytest.raises(ValueError, match="virtual pipeline"):
             restore_sharded_modelopt_state([mock.MagicMock(), mock.MagicMock()], "/ckpt")
 
     def test_missing_checkpoint_returns_early(self, tmp_path):
-        restore_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
-        _MTO.restore_from_modelopt_state.assert_not_called()
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=False),
+            mock.patch.object(mto, "restore_from_modelopt_state") as mock_restore,
+        ):
+            restore_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
+        mock_restore.assert_not_called()
+
+    def test_restores_model(self, tmp_path):
+        (tmp_path / "modelopt_state").mkdir()
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=False),
+            mock.patch.object(mto, "restore_from_modelopt_state", side_effect=lambda m, _s: m) as mock_restore,
+            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.load_common_state_dict", return_value={"modelopt_version": "1.0"}),
+            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt._load_extra_state_from_sharded_checkpoint"),
+            mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.logger", create=True),
+        ):
+            restore_sharded_modelopt_state([mock.MagicMock()], str(tmp_path))
+        mock_restore.assert_called_once()
 
 
 class TestLoadExtraStateFromShardedCheckpoint:
@@ -116,10 +148,10 @@ class TestLoadExtraStateFromShardedCheckpoint:
         with mock.patch("megatron.core.dist_checkpointing.strategies.modelopt.load", return_value=loaded) as mock_load:
             _load_extra_state_from_sharded_checkpoint(model, str(tmp_path), prefix)
 
-        passed = mock_load.call_args[0][0]
+        passed = mock_load.call_args.args[0]
         assert f"{prefix}layer._extra_state" in passed
         assert f"{prefix}layer.weight" not in passed
 
-        loaded_dict = model.load_state_dict.call_args[0][0]
+        loaded_dict = model.load_state_dict.call_args.args[0]
         assert "layer._extra_state" in loaded_dict
         assert f"{prefix}layer._extra_state" not in loaded_dict
