@@ -1499,6 +1499,11 @@ class TextGenerationController:
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
         self._dynamic_step_forward_logits(input_ids, position_ids)
+        if os.environ.get("MRL_SYNC_AFTER_FORWARD"):
+            # Debug probe (mirrors the real-step probe): surface a dummy-forward
+            # fault at the replayed forward itself rather than at the engine's
+            # step_end_event.synchronize().
+            torch.cuda.synchronize()
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
