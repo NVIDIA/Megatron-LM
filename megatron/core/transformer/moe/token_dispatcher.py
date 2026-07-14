@@ -1406,6 +1406,32 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _StageDispatchBwdGrad(torch.autograd.Function):
+    """Zero-copy + 1F1B overlap only: redirect the dispatch-backward grad into the persistent symm
+    buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the overlap schedule the dispatch output is a detached leaf with multiple downstream
+    consumers, so autograd hands ``dispatch_bwd`` a non-symm AccumulateGrad clone. Inserting this
+    identity node as the sole consumer of ``recv_tokens`` moves that accumulation to *our* output;
+    the backward then does a single plain->symm copy into ``_zc_bwd_token_buf`` (which under overlap
+    is not the op-fuser's fc1-dgrad target -- see ``get_expert_zero_copy_buffers`` -- so it is free
+    to stage into). Forward is identity (no numeric effect)."""
+
+    @staticmethod
+    def forward(ctx, recv_tokens):  # type: ignore[override]
+        return recv_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        buf = _NCCLEPManager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert buf.shape == grad.shape, (
+            f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        )
+        buf.copy_(grad)
+        return buf
+
+
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
     Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
@@ -1570,8 +1596,7 @@ class _NCCLEPManager(_DispatchManager):
             # Allocate once, shared across all managers. These are all persistent.
             if self.config.overlap_moe_expert_parallel_comm:
                 # The 1F1B overlap schedule detaches the dispatch input, so autograd hands the
-                # dispatch-backward a non-symm clone of the grad_input buffer; TE stages it into a
-                # symm buffer with one extra copy per dispatch-backward; forward legs zero-copy.
+                # dispatch-backward a non-symm clone of the grad_input buffer
                 warnings.warn(
                     "moe_ncclep_zero_copy + overlap_moe_expert_parallel_comm (1F1B EP overlap): "
                     "dispatch-backward gradient is not symm-mem-backed under the overlap schedule, "
@@ -1635,6 +1660,8 @@ class _NCCLEPManager(_DispatchManager):
         # next layer's dispatch reuses; copy it out so it stays valid through this layer's backward.
         # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
+        if self.zero_copy and self.config.overlap_moe_expert_parallel_comm:
+            recv_tokens = _StageDispatchBwdGrad.apply(recv_tokens)
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1762,7 +1789,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         # output_buffer (fc2 out / combine in) = _zc_fwd_token_buf; grad_input_buffer (fc1 dgrad /
         # dispatch-bwd scatter) = _zc_bwd_token_buf.
-        return _detached("_zc_fwd_token_buf"), _detached("_zc_bwd_token_buf")
+        # Under 1F1B overlap, feeding a symm grad_input_buffer is wasted: the overlap schedule's
+        # AccumulateGrad clones the fc1 dgrad into a plain buffer anyway. Return None so the op-fuser
+        # writes a plain dgrad;
+        dispatch_grad_input = (
+            None
+            if self.config.overlap_moe_expert_parallel_comm
+            else _detached("_zc_bwd_token_buf")
+        )
+        return _detached("_zc_fwd_token_buf"), dispatch_grad_input
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
