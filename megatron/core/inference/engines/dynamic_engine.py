@@ -405,6 +405,21 @@ class DynamicInferenceEngine(AbstractEngine):
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
 
+        # Pre-size the GlobalMemoryBuffer sequence-parallel all-gather buffer ("mpu")
+        # to the worst case BEFORE capturing graphs. get_tensor() is grow-only: in
+        # training the shape is static so it settles before capture, but dynamic
+        # inference issues forwards of varying token counts. A forward larger than
+        # the capture-time size would reallocate (and free) the buffer whose address
+        # a captured graph still writes to on replay, corrupting whatever later
+        # reuses that freed block. Allocating the max size up front keeps the address
+        # stable for the graph's lifetime. Only needed when sequence parallel is on
+        # (otherwise the "mpu" all-gather path is not taken).
+        if getattr(model_config, "sequence_parallel", False):
+            from megatron.core.parallel_state import get_global_memory_buffer
+
+            max_ag_numel = self.context.max_tokens * model_config.hidden_size
+            get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
+
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
@@ -2349,6 +2364,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
+            elif header == Headers.START_CUDA_PROFILER:
+                # Side-effect, not a state transition: apply immediately on every
+                # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
+                torch.cuda.cudart().cudaProfilerStart()
+            elif header == Headers.STOP_CUDA_PROFILER:
+                torch.cuda.cudart().cudaProfilerStop()
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
