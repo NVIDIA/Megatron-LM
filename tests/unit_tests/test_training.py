@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
+from megatron.training.state import TrainState
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
@@ -65,24 +66,29 @@ class TestTraining:
         set_args(args)
 
     def test_build_train_valid_test_data_iterators(self):
+        train_state = TrainState()
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
-            mock_train_valid_test_datasets_provider
+            train_state, mock_train_valid_test_datasets_provider
         )
         train_data = next(train_iter)
         valid_data = next(valid_iter)
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
+        assert train_state.do_train == True
+        assert train_state.do_valid == True
+        assert train_state.do_test == True
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self):
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets args.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
+        train_state = TrainState()
         args = create_test_args()
         args.multiple_validation_sets = True
         args.full_validation = True
         set_args(args)
         _, valid_iters, _ = build_train_valid_test_data_iterators(
-            mock_multi_valid_full_datasets_provider
+            train_state, mock_multi_valid_full_datasets_provider
         )
         assert isinstance(valid_iters, list)
         assert len(valid_iters) == 2
@@ -90,6 +96,9 @@ class TestTraining:
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
         assert args.eval_iters == [2, 3]
+        assert train_state.do_train == True
+        assert train_state.do_valid == True
+        assert train_state.do_test == True
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):

@@ -150,7 +150,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import is_hybrid_model
-from megatron.training.state import GlobalState
+from megatron.training.state import GlobalState, TrainState
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -1352,6 +1352,7 @@ def pretrain(
             if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                 vp_stage_train_valid_test_dataset_provider.is_distributed = True
             iterators = build_train_valid_test_data_iterators(
+                state.train_state,
                 vp_stage_train_valid_test_dataset_provider
             )
             train_data_iterator.append(iterators[0])
@@ -1359,7 +1360,7 @@ def pretrain(
             test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            build_train_valid_test_data_iterators(state.train_state, train_valid_test_dataset_provider)
         )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -1369,9 +1370,9 @@ def pretrain(
     one_logger_utils.track_config_flags(
         args.train_iters,
         cfg_container.validation.skip_train,
-        args.do_train,
-        args.do_valid,
-        args.do_test,
+        train_state.do_train,
+        train_state.do_valid,
+        train_state.do_test,
         args.dataloader_type,
     )
 
@@ -1419,7 +1420,7 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
+        if train_state.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 state,
                 forward_step_func,
@@ -1459,7 +1460,7 @@ def pretrain(
 
         iteration = args.iteration
 
-    if args.do_valid:
+    if train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1490,7 +1491,7 @@ def pretrain(
                 pg_collection=pg_collection, p2p_communicator=p2p_communicator
             )
 
-    if args.do_test:
+    if train_state.do_test:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -3919,7 +3920,7 @@ def train(
         is_first_iteration = False
 
         # Evaluation.
-        if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
+        if args.eval_interval and iteration % args.eval_interval == 0 and train_state.do_valid \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
             if args.log_energy:
                 energy_monitor.pause()
@@ -4413,7 +4414,7 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(train_state: TrainState, build_train_valid_test_datasets_provider):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -4495,19 +4496,20 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     torch.distributed.broadcast(flags, 0)
 
-    args.do_train = getattr(args, "do_train", False) or flags[0].item()
-    args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
-    args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    train_state.do_train = getattr(args, "do_train", False) or flags[0].item()
+    train_state.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+    train_state.do_test = getattr(args, "do_test", False) or flags[2].item()
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(train_state: TrainState, build_train_valid_test_datasets_provider):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
+        train_state,
         build_train_valid_test_datasets_provider
     )
 
