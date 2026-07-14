@@ -114,7 +114,8 @@ RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
-USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
+# Recent VERL always uses the unified engine workers; the launcher sets no
+# worker-path override.
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS=("$@")
 
@@ -163,8 +164,8 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${CACHE_ROOT}/triton_${USER:-user}}
 
 ALGORITHM=(
   "algorithm.adv_estimator=grpo"
-  "algorithm.use_kl_in_reward=False"
-  "algorithm.kl_ctrl.kl_coef=0.0"
+  "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD:-False}"
+  "algorithm.kl_ctrl.kl_coef=${KL_COEF:-0.0}"
   "algorithm.rollout_correction.bypass_mode=True"
   "algorithm.norm_adv_by_std_in_grpo=False"
 )
@@ -200,8 +201,8 @@ ACTOR=(
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}"
   "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}"
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}"
-  "actor_rollout_ref.actor.use_kl_loss=False"
-  "actor_rollout_ref.actor.kl_loss_coef=0.0"
+  "actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS:-False}"
+  "actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.0}"
   "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}"
   "actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE}"
   "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}"
@@ -228,6 +229,15 @@ if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "$
     "+actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=${USE_PRECISION_AWARE_OPTIMIZER}"
     "+actor_rollout_ref.actor.optim.override_optimizer_config.decoupled_weight_decay=${DECOUPLED_WEIGHT_DECAY}"
   )
+fi
+
+# Reference policy: only built when KL loss/reward is enabled. Route it through
+# the mlite engine (forward-only) so it runs on the same mesh as the actor;
+# otherwise the ref worker falls back to the FSDP engine config and mlite's
+# get_data_parallel_size() raises AttributeError on the missing `tp` field. Left
+# off the default path so KL-free GRPO never composes the ref override.
+if [[ "${USE_KL_LOSS:-False}" =~ ^(True|true|1)$ || "${USE_KL_IN_REWARD:-False}" =~ ^(True|true|1)$ ]]; then
+  ACTOR+=("ref@actor_rollout_ref.ref=mlite_ref")
 fi
 
 ROLLOUT=(
@@ -279,7 +289,6 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
-  "trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
 )
 
 COMMAND=(

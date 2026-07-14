@@ -66,10 +66,10 @@ class GatedDeltaNet(nn.Module):
         rms_norm_eps: float,
         ps: ParallelState,
         deterministic: bool = False,
-        cp_mode: str = "fla_allgather",
+        cp_mode: str = "replicated",
     ):
         super().__init__()
-        if cp_mode not in {"fla_allgather", "legacy_full_gather"}:
+        if cp_mode not in {"sharded", "replicated"}:
             raise ValueError(f"Unsupported GatedDeltaNet CP mode: {cp_mode!r}.")
         self.ps = ps
         self.deterministic = bool(deterministic)
@@ -125,13 +125,13 @@ class GatedDeltaNet(nn.Module):
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
         cp_context = None
-        legacy_full_gather = False
+        replicated = False
         if self.ps.cp_size > 1:
             if self.ps.cp_group is None:
                 raise RuntimeError("CP>1 requires ParallelState.cp_group.")
-            if self.cp_mode == "legacy_full_gather":
-                qkvzba, cu_seqlens = self._legacy_full_gather_qkvzba(qkvzba, cu_seqlens)
-                legacy_full_gather = True
+            if self.cp_mode == "replicated":
+                qkvzba, cu_seqlens = self._replicate_cp_qkvzba(qkvzba, cu_seqlens)
+                replicated = True
             else:
                 if not _HAS_FLA or _fla_build_cp_context is None:
                     raise NotImplementedError(
@@ -181,8 +181,8 @@ class GatedDeltaNet(nn.Module):
         out = self._apply_gated_norm(out, gate)
         out = out.reshape(batch, seq_len, self.v_dim_local)
         if self.ps.cp_size > 1:
-            if legacy_full_gather:
-                out = self._legacy_slice_output(out, cu_seqlens)
+            if replicated:
+                out = self._slice_replicated_output(out, cu_seqlens)
             else:
                 out = self._cp_swap_qkvzba(
                     out,
@@ -205,7 +205,7 @@ class GatedDeltaNet(nn.Module):
             torch.distributed.all_gather(parts, tensor, group=self.ps.cp_group)
             return parts
 
-    def _legacy_full_gather_qkvzba(
+    def _replicate_cp_qkvzba(
         self,
         qkvzba: torch.Tensor,
         cu_seqlens: torch.Tensor | None,
@@ -224,7 +224,7 @@ class GatedDeltaNet(nn.Module):
         )
         return full.unsqueeze(0).contiguous(), cu_seqlens
 
-    def _legacy_slice_output(
+    def _slice_replicated_output(
         self,
         out: torch.Tensor,
         cu_seqlens: torch.Tensor | None,
@@ -432,6 +432,7 @@ class GatedDeltaNet(nn.Module):
             a.reshape(batch, seq_len, self.num_v_heads_local),
         )
 
+    @jit_fuser
     def _prepare_qkv(
         self, qkv: torch.Tensor, gate, beta, alpha, batch: int, seq_len: int
     ):
@@ -440,9 +441,8 @@ class GatedDeltaNet(nn.Module):
             batch, seq_len, 2 * self.num_k_heads_local, self.dk
         )
         value = value.reshape(batch, seq_len, self.num_v_heads_local, self.dv)
+        query_key = self._l2norm(query_key.contiguous())
         query, key = query_key.split(self.num_k_heads_local, dim=2)
-        query = self._l2norm(query.contiguous())
-        key = self._l2norm(key.contiguous())
         if self.v_heads_per_k_head > 1:
             query = query.repeat_interleave(self.v_heads_per_k_head, dim=2)
             key = key.repeat_interleave(self.v_heads_per_k_head, dim=2)
@@ -455,10 +455,13 @@ class GatedDeltaNet(nn.Module):
             alpha.contiguous(),
         )
 
-    def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    @jit_fuser
+    def _l2norm(x: torch.Tensor) -> torch.Tensor:
         return l2norm(x)
 
     @staticmethod
+    @jit_fuser
     def _compute_g_and_beta(A_log, dt_bias, alpha, beta):
         g = -A_log.exp() * F.softplus(alpha.float() + dt_bias)
         return g, beta.sigmoid()

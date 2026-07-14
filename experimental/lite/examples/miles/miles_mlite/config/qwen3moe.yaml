@@ -1,0 +1,12 @@
+# Reference settings consumed by the example shell launchers.
+model_name: qwen3_moe
+mlite_impl: lite
+train_backend: megatron
+megatron_to_hf_mode: raw
+optimizer_backend: dist_opt
+default_parallel:
+  tp: 2
+  pp: 1
+  cp: 1
+  ep: 8
+  etp: 1
