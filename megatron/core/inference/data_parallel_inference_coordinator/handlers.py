@@ -169,6 +169,19 @@ def handle_control_signal(coordinator, sender_identity, payload):
         coordinator.state = CoordinatorState.RUNNING
 
 
+@message_handler(Headers.START_CUDA_PROFILER, Headers.STOP_CUDA_PROFILER)
+def handle_cuda_profiler_signal(coordinator, sender_identity, payload):
+    """Broadcast a CUDA profiler control signal to every connected DP engine.
+
+    Profiler control is not a coordinator state transition, so there are no
+    CoordinatorState checks — the signal is simply forwarded to all engines.
+    """
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring profiler signal from unknown client.")
+        return
+    coordinator._broadcast_to_engines(payload)
+
+
 @message_handler(Headers.ENGINE_REPLY)
 def handle_engine_reply(coordinator, sender_identity, payload):
     """Route completed requests from an engine back to their originating clients."""

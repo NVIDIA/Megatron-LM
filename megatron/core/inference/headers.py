@@ -38,6 +38,8 @@ class Control(IntEnum):
     RESUME = 43
     SET_GENERATION_EPOCH = 44
     STOP = 45
+    START_CUDA_PROFILER = 46
+    STOP_CUDA_PROFILER = 47
 
 
 class Lifecycle(IntEnum):
