@@ -442,8 +442,12 @@ def build_telemetry_resource_attrs(args):
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's
     # assigned at submit) and exports it as LENS_SLURM_SLUID; the rest are standard env vars.
+    # SLUID is unique per (array element x requeue attempt) -- the finest execution-episode key.
+    # array.job_id/task_id (empty on non-array jobs -> self-skip) reconstruct the array structure.
     for attr, env in (('slurm.job.id', 'SLURM_JOB_ID'), ('slurm.sluid', 'LENS_SLURM_SLUID'),
-                      ('slurm.cluster', 'SLURM_CLUSTER_NAME')):
+                      ('slurm.cluster', 'SLURM_CLUSTER_NAME'),
+                      ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
+                      ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID')):
         val = os.environ.get(env)
         if val:
             resource_attrs[attr] = val
