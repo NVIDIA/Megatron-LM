@@ -74,16 +74,10 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", record_pop)
 
 
-def _get_distributed_setup(request: pytest.FixtureRequest):
-    try:
-        return request.getfixturevalue("distributed_setup")
-    except pytest.FixtureLookupError:
-        pytest.skip("distributed_setup fixture is only available in the Megatron-FSDP test bucket")
-
-
-def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(request, monkeypatch):
+def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
+    distributed_setup, monkeypatch
+):
     """Independent FSDP roots should each emit root-labeled NVTX ranges."""
-    distributed_setup = _get_distributed_setup(request)
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
@@ -105,9 +99,8 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(request, m
     ]
 
 
-def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(request, monkeypatch):
+def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeypatch):
     """Nested training hooks should emit concise NVTX ranges."""
-    distributed_setup = _get_distributed_setup(request)
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
@@ -134,9 +127,8 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(request, monkeypatch):
     ]
 
 
-def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(request, monkeypatch):
+def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_setup, monkeypatch):
     """Frozen FSDP units should still balance backward NVTX ranges."""
-    distributed_setup = _get_distributed_setup(request)
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
     model = nn.Linear(4, 4, bias=False).to(distributed_setup.device)
@@ -156,9 +148,10 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(request, monke
     ]
 
 
-def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(request, monkeypatch):
+def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
+    distributed_setup, monkeypatch
+):
     """Frozen FSDP children outside the backward graph should not emit backward ranges."""
-    distributed_setup = _get_distributed_setup(request)
     events: list[NvtxEvent] = []
     _setup_nvtx_recording(monkeypatch, events)
     model = FrozenFirstLayerModel(dim=4).to(distributed_setup.device)
