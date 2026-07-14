@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import math
@@ -339,7 +339,8 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -347,10 +348,7 @@ class MultiLatentAttention(Attention):
                 packed_seq_params,
                 inference_context=inference_context,
             )
-        if self.offload_qkv_linear:
-            query = off_interface.group_commit(
-                query, name="qkv_linear", forced_released_tensors=[hidden_states]
-            )
+        query = qkv_linear_manager.group_offload(query, forced_released_tensors=[hidden_states])
 
         # ===================================================
         # Adjust key, value for inference
@@ -378,6 +376,9 @@ class MultiLatentAttention(Attention):
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         needs_output_trim = False
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
@@ -390,9 +391,7 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = self._run_core_attention(
                         query,
                         key,
@@ -426,10 +425,9 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -460,12 +458,10 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
 
@@ -1332,11 +1328,31 @@ class FusedMLASelfAttention(MLASelfAttention):
     def _qkv_down_projection(self, hidden_states):
         """Fused q/kv down projection path."""
         qkv, _ = self.linear_qkv_down_proj(hidden_states)
-        q_compressed, kv_combined = torch.split(
-            qkv,
-            [self.config.q_lora_rank, self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim],
-            dim=-1,
-        )
+
+        q_split = self.config.q_lora_rank
+        kv_split = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
+        tp_size = get_pg_size(self.tp_group)
+        is_tensor_parallel = tp_size > 1
+
+        if is_tensor_parallel:
+            assert q_split % tp_size == 0, (
+                "q_lora_rank must be divisible by tensor model parallel size when "
+                "using MLA down projection fusion"
+            )
+            assert kv_split % tp_size == 0, (
+                "kv_lora_rank + qk_pos_emb_head_dim must be divisible by tensor model "
+                "parallel size when using MLA down projection fusion"
+            )
+            q_split //= tp_size
+            kv_split //= tp_size
+
+        q_compressed, kv_combined = torch.split(qkv, [q_split, kv_split], dim=-1)
+
+        if is_tensor_parallel:
+            q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+            if self.config.sequence_parallel:
+                q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+
         return q_compressed, kv_combined
 
     def backward_dw(self) -> NoReturn:

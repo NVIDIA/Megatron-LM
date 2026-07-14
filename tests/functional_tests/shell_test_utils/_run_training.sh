@@ -180,7 +180,7 @@ set -x
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
