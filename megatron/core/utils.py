@@ -859,6 +859,8 @@ def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0)
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    level: int,
+    msg: object,
     *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -869,23 +871,32 @@ def log_on_each_pipeline_stage(
     Args:
         logger (logging.Logger): The logger to write the logs
 
-        args (Tuple[Any]): All logging.Logger.log positional arguments
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
 
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
     if tp_group is None and dp_cp_group is None:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    elif tp_group is not None and dp_cp_group is not None:
+    else:
+        assert tp_group is not None and dp_cp_group is not None
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
-    else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
 
     if tp_rank == 0 and dp_cp_rank == 0:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
