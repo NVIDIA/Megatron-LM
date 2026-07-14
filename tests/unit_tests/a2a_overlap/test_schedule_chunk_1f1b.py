@@ -23,6 +23,7 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+
 def build_model(config, use_padding_mask=False):
     seq_len = 32
     max_seq_len = 300

@@ -28,6 +28,7 @@ from megatron.training.global_vars import (
 from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
+
 def is_deep_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 

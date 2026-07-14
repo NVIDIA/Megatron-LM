@@ -27,6 +27,7 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
     """
     Runs the model in reference mode and captures outputs and gradients.
