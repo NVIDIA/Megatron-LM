@@ -251,6 +251,8 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         assert q.stride(-1) == 1
         assert cos.is_contiguous()
         assert sin.is_contiguous()
+        assert cos.shape[-1] == emb_dim
+        assert sin.shape[-1] == emb_dim
         assert headdim == qk_head_dim + emb_dim
         assert emb_dim % 4 == 0
 
@@ -628,6 +630,8 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         assert k_pos_emb.stride(-1) == 1
         assert cos.is_contiguous()
         assert sin.is_contiguous()
+        assert cos.shape[-1] == emb_dim
+        assert sin.shape[-1] == emb_dim
         assert emb_dim % 4 == 0
 
         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
