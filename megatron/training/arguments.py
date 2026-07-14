@@ -1192,8 +1192,6 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
-    if args.grad_reduce_in_bf16:
-        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert (
@@ -1290,9 +1288,24 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        assert (
-            args.ckpt_format == "fsdp_dtensor"
-        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            args.fsdp_double_buffer = True
+            warn_rank_0(
+                'FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!'
+            )
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
 
         if args.megatron_fsdp_prefetch_recompute_forward_weights:
             assert args.data_parallel_sharding_strategy == "optim_grads_params", (
@@ -1315,16 +1328,21 @@ def validate_args(args, defaults={}):
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
 
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
-
-        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
-            raise ValueError(
-                "Meta device initialization (init_model_with_meta_device=True) is not "
-                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+    if args.fsdp_zero_sm_allgather:
+        assert (
+            args.use_megatron_fsdp
+        ), "Megatron-FSDP zero-SM all-gather requires --use-megatron-fsdp."
+        assert args.nccl_ub, "Megatron-FSDP zero-SM all-gather requires --use-nccl-ub."
+        assert not args.disable_symmetric_registration, (
+            "Megatron-FSDP zero-SM all-gather requires symmetric NCCL registration. "
+            "Do not set --disable-symmetric-registration."
+        )
+        if not args.create_all_gather_group:
+            args.create_all_gather_group = True
+            warn_rank_0(
+                'Megatron-FSDP zero-SM all-gather requires a dedicated all-gather '
+                'process group. Enabling --create-all-gather-group.',
+                args.rank,
             )
 
     if args.fsdp_manual_registration:
@@ -2248,9 +2266,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
-        _has_dsv4_csa = (
-            (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
-        )
+        _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
             # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
@@ -2266,8 +2282,9 @@ def core_transformer_config_from_args(args, config_class=None):
         # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
         # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
         # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
-        _variant = kw_args.get('experimental_attention_variant',
-                               getattr(args, 'experimental_attention_variant', None))
+        _variant = kw_args.get(
+            'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
+        )
         if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
             _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
             # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
@@ -4133,12 +4150,43 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
+        '--fsdp-zero-sm-allgather',
+        action='store_true',
+        dest='fsdp_zero_sm_allgather',
+        default=False,
+        help='Request NCCL zero-CTA/copy-engine collectives for eligible Megatron-FSDP '
+        'parameter all-gather buffers. Requires --use-megatron-fsdp, --use-nccl-ub, '
+        'symmetric registration, and dedicated all-gather process groups.',
+    )
+    group.add_argument(
         '--fsdp-manual-registration',
         action='store_true',
         dest='fsdp_manual_registration',
         default=False,
         help='Manually register the FSDP communication buffers to NCCL user buffer.'
         'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.',
+    )
+    group.add_argument(
+        '--megatron-fsdp-max-pool-double-buffer',
+        action='store_true',
+        help='Use MaxPoolAllocator for Megatron-FSDP persistent buffers so asymmetric '
+        'FSDP units can use NCCL user-buffer registration or CUDA graph replay.',
+    )
+    group.add_argument(
+        '--megatron-fsdp-max-pool-buffer-count',
+        type=int,
+        default=2,
+        help='Number of persistent buffer groups in the Megatron-FSDP MaxPoolAllocator. '
+        'Values above 2 support schedules with more than two simultaneously live FSDP units.',
+    )
+    group.add_argument(
+        '--fsdp-db-use-persist-buf-on-alloc-fail',
+        action='store_true',
+        dest='fsdp_db_use_persist_buf_on_alloc_fail',
+        default=False,
+        help='Fall back to a persistent buffer when a bucket does not fit the FSDP double '
+        'buffer size, instead of a dynamic allocation. Required with Megatron-FSDP + MoE + '
+        'CUDA graph to avoid illegal memory access during graph replay (NVIDIA/Megatron-LM#4232).',
     )
     group.add_argument(
         '--create-all-gather-group',

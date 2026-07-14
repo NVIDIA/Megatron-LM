@@ -172,6 +172,9 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 --use-nccl-ub
 --fsdp-double-buffer
 --fsdp-manual-registration
+
+# Request NCCL zero-CTA/copy-engine collectives for eligible Megatron-FSDP parameter all-gather buffers. Requires NCCL user buffers and symmetric registration.
+--fsdp-zero-sm-allgather
 ```
 
 ### 🤖 Megatron-Core
@@ -345,6 +348,7 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 |--------------|-------------|----------------------|----------------------|
 | **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to supported Megatron-Core modules (`TransformerLayer`, etc.) in Megatron-LM. | `fsdp_unit_modules=[...]` |
 | **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` | `fsdp_double_buffer=True` |
+| **FSDP Max Pool Allocator** | Megatron-FSDP uses the `MaxPoolAllocator`, which supports double buffering hybrid / asymmetrical model architectures by taking the maximum of all layers. Automatically sets `--fsdp-double-buffer`. | `--megatron-fsdp-max-pool-double-buffer` | `maxpool_double_buffer=True` |
 | **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` | `overlap_param_gather=True` |
 | **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` | `overlap_grad_reduce=True` |
 | **FSDP Communication Size** | Customize the size (in `numel()` elements) of AG and RS communications in Megatron-FSDP, by limiting how many elements are concurrently pre-fetched or reduced for AG and RS. Effectively suggests how many FSDP units are processed concurrently, which may launch collectives earlier and improve performance. Optionally, tune this value depending on system memory and performance requirements. | `--suggested-communication-unit-size <num-elements>` | N/A (Megatron-Core Only) |
@@ -408,6 +412,15 @@ Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP u
 ```
 
 With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
+
+Not all model architectures support depth-wise model symmetry. For example, hybrid architectures like **Nemotron** are a combination of Transformer, Mamba, and MoE blocks that are asymmetrical in size and data-type. To double-buffer these model architectures, we need a pool of buffers that can support any FSDP unit, which can be computed from the _**maximum**_ of all FSDP units, and this "MaxPool" of (now symmetric) buffers of maximum size, shape, and dtype can be double-buffered.
+
+```{figure} ../../images/megatron_fsdp/maxpool_allocator.png
+:alt: MaxPoolAllocator
+:align: center
+
+Visualizing the MaxPoolAllocator initialization in Megatron-FSDP. Iterating through all FSDP units, data buckets are categorized by data-type, sorted from small to large, and compared to the current MaxPool. If there are not enough buckets in the pool to support the unit, buckets are added to the pool (with size 0). If the largest buckets of the pool are not large enough to support the buckets in the unit (assigned to the pool from smallest to largest), the buckets in the pool are enlarged. After this process, we arrive at a minimal set of buckets that can double-buffer every FSDP unit in the model.
+```
 
 ### Data-Parallel Sharding Strategies
 
@@ -591,6 +604,7 @@ Megatron-FSDP sharding and communication buffers support mixed-precision, such t
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
 |--------------|-------------|----------------------|----------------------|
 | **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Uses double buffering. | `--use-nccl-ub` | `nccl_ub=True` |
+| **Zero-SM All-Gather** | Request NCCL zero-CTA/copy-engine policy on dedicated Megatron-FSDP parameter all-gather groups. NCCL uses copy engines for eligible symmetrically registered buffers and falls back otherwise. | `--fsdp-zero-sm-allgather` | `fsdp_zero_sm_allgather=True` |
 | **NCCL Manual Registration** | Instead of registering NCCL user buffers on first allocation, batch registration of all communication buffers at the end of the initial training step. Reduces registration latency. | `--fsdp-manual-registration` | N/A (Megatron-Core Only) |
 | **Disable Symmetric Registration** | Disable symmetric registration with NCCL. Optional, as symmetric registration failure defaults to normal registration. | `--disable-symmetric-registration` | `disable_symmetric_registration=True` |
 
@@ -604,5 +618,7 @@ NCCL (`v2.27+`) supports symmetric allocation or registration for communicators 
 - **NVSwitch SHARP Offloading** - To further minimize SM utilization for AG and RS collectives, NCCL SHARP offloads reduction and aggregation work to NVLink and IB Switch hardware that uses 1-6 SM depending on the domain: NVL, IB, or NVL + IB.
 - **Copy-Engine (CE) Collectives**: Instead of using SMs (or CTAs) for common non-computational collectives like AG in Megatron-FSDP, copy engines are instead used to perform all-gather collectives, dedicating SM resources to compute and reduction during FSDP. Requires NCCL `v2.28+`.
 - **High-Precision Reduction**: When training large models, high-precision gradient reduction and accumulation is desired for accuracy and convergence, but communicating FP32 gradients is expensive. With symmetric registration, FP32 accumulators enable gradients to be reduced in FP32 but communicated in BF16, which decreases gradient RS communication latency while maintaining high accuracy during training. Megatron-FSDP supports FP32 main gradient accumulation but BF16 gradient communication, customizable through `megatron_fsdp.MixedPrecisionPolicy`.
+
+`--fsdp-zero-sm-allgather` sets `NCCL_CTA_POLICY_ZERO` only on dedicated parameter all-gather communicators. With HSDP, separate communicators mirror the inner dense/expert shard groups and the outer distributed-optimizer group so parameter gathers use zero CTA without changing gradient collectives on the original groups. Zero-CTA requires CUDA driver `12.5+` and NCCL `v2.28+` within supported NVLink domains; network transport requires NCCL `v2.30.6+`. The policy is best-effort: buffers that are not symmetrically registered, including FSDP buckets that fall back outside the fixed double-buffer pool, use NCCL's kernel path. The zero-CTA policy prioritizes SM availability and may increase isolated collective latency, so evaluate end-to-end compute/communication overlap rather than collective latency alone.
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).

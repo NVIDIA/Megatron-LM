@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -291,7 +291,7 @@ def forward_step_func(data_iterator, model, return_schedule_plan=False):
     return output, loss_func
 
 
-def overlap_train_step(model, optimizer, config, data):
+def overlap_train_step(model, optimizer, config, data, num_microbatches=1):
     """One overlap forward-backward-optimizer step. Return scalar loss."""
     from contextlib import nullcontext
 
@@ -303,9 +303,9 @@ def overlap_train_step(model, optimizer, config, data):
     forward_data_store = []
     combined_1f1b_schedule_for_no_pipelining(
         forward_step_func=forward_step_func,
-        data_iterator=iter([data]),
+        data_iterator=iter([data] * num_microbatches),
         model=model,
-        num_microbatches=1,
+        num_microbatches=num_microbatches,
         input_tensor=None,
         output_tensor_grad=None,
         forward_data_store=forward_data_store,
@@ -318,21 +318,24 @@ def overlap_train_step(model, optimizer, config, data):
         check_first_val_step=lambda cond: cond,
     )
     torch.cuda.synchronize()
-    loss = forward_data_store[0]['lm loss'].detach().clone()
+    loss = torch.stack([item['lm loss'].detach() for item in forward_data_store]).sum()
     optimizer.step()
     return loss
 
 
-def fsdp_train_step(model, optimizer, data):
+def fsdp_train_step(model, optimizer, data, num_microbatches=1):
     """One standard forward-backward-optimizer step through FSDP. Return scalar loss."""
     from megatron.core.transformer.module import float16_to_fp32
 
     optimizer.zero_grad()
-    loss = model(**data)
-    loss = float16_to_fp32(loss).sum()
-    loss.backward()
+    losses = []
+    for _ in range(num_microbatches):
+        loss = model(**data)
+        loss = float16_to_fp32(loss).sum() / num_microbatches
+        loss.backward()
+        losses.append(loss.detach())
     optimizer.step()
-    return loss.detach().clone()
+    return torch.stack(losses).sum()
 
 
 def assert_models_equal(ref_model, test_model):

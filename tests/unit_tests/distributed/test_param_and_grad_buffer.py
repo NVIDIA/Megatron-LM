@@ -1,7 +1,8 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 import math
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -10,10 +11,174 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
+    DistributedDataParallelConfig as StandaloneFSDPDistributedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    AllGatherPipeline,
+    BucketStatus,
+)
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
+
+
+def test_fsdp_zero_sm_allgather_config_valid(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True, nccl_ub=True, fsdp_zero_sm_allgather=True
+    )
+
+    assert ddp_config.fsdp_zero_sm_allgather
+
+
+def test_standalone_fsdp_zero_sm_allgather_config_valid(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = StandaloneFSDPDistributedDataParallelConfig(
+        nccl_ub=True, fsdp_zero_sm_allgather=True
+    )
+
+    assert ddp_config.fsdp_zero_sm_allgather
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_zero_sm_allgather_preserves_allocator_fallback(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    ddp_config = config_cls(
+        nccl_ub=True,
+        fsdp_zero_sm_allgather=True,
+        fsdp_db_use_persist_buf_on_alloc_fail=False,
+        **kwargs,
+    )
+
+    assert not ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+
+
+def test_fsdp_zero_sm_allgather_config_requires_megatron_fsdp(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="only supported with Megatron-FSDP"):
+        DistributedDataParallelConfig(nccl_ub=True, fsdp_zero_sm_allgather=True)
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_zero_sm_allgather_config_requires_nccl_ub(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="requires NCCL user-buffer registration"):
+        config_cls(fsdp_zero_sm_allgather=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_zero_sm_allgather_config_requires_symmetric_registration(
+    config_cls, kwargs, monkeypatch
+):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="requires symmetric NCCL registration"):
+        config_cls(
+            nccl_ub=True, disable_symmetric_registration=True, fsdp_zero_sm_allgather=True, **kwargs
+        )
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_max_pool_buffer_count_accepts_three(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    config = config_cls(
+        megatron_fsdp_max_pool_double_buffer=True, megatron_fsdp_max_pool_buffer_count=3, **kwargs
+    )
+
+    assert config.fsdp_double_buffer
+    assert config.megatron_fsdp_max_pool_buffer_count == 3
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_max_pool_buffer_count_requires_max_pool(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="requires megatron_fsdp_max_pool_double_buffer"):
+        config_cls(megatron_fsdp_max_pool_buffer_count=3, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "config_cls, kwargs",
+    [
+        (DistributedDataParallelConfig, {"use_megatron_fsdp": True}),
+        (StandaloneFSDPDistributedDataParallelConfig, {}),
+    ],
+)
+def test_fsdp_max_pool_buffer_count_requires_two(config_cls, kwargs, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with pytest.raises(ValueError, match="must be at least 2"):
+        config_cls(megatron_fsdp_max_pool_buffer_count=1, **kwargs)
+
+
+def _make_live_unit_pipeline(pool_size):
+    params = [object() for _ in range(3)]
+    parameter_groups = [
+        SimpleNamespace(
+            fsdp_unit_id=unit_id,
+            transpose_weight_buffer=None,
+            model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=1)),
+        )
+        for unit_id in range(3)
+    ]
+    buffer = SimpleNamespace(
+        num_buckets=3,
+        parameter_groups=parameter_groups,
+        param_to_param_group={param: index for index, param in enumerate(params)},
+        double_buf_units=[0, 1, 2],
+        weight_alloc=SimpleNamespace(size=pool_size),
+        ddp_config=SimpleNamespace(fsdp_double_buffer=True, outer_dp_sharding_strategy="no_shard"),
+        bucket_to_bucket_group={index: [index] for index in range(3)},
+        dist_index=SimpleNamespace(use_hybrid_fsdp=False),
+    )
+    pipeline = AllGatherPipeline(buffer)
+    for bucket_id in range(3):
+        bucket_key = pipeline.get_bucket_key(bucket_id, bwd=False)
+        pipeline.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+        pipeline.bucket_can_be_released[bucket_key] = False
+    return pipeline, params
+
+
+def test_all_gather_pipeline_uses_parameter_pool_capacity():
+    pipeline, params = _make_live_unit_pipeline(pool_size=3)
+
+    pipeline.all_gather_params([params[-1]], prefetch=False)
+
+
+def test_all_gather_pipeline_rejects_units_beyond_parameter_pool_capacity():
+    pipeline, params = _make_live_unit_pipeline(pool_size=2)
+
+    with pytest.raises(ValueError, match="no more than 2 FSDP units"):
+        pipeline.all_gather_params([params[-1]], prefetch=False)
 
 
 class TestModelWithExperts(torch.nn.Module):

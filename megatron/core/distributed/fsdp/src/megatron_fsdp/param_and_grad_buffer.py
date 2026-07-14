@@ -9,6 +9,7 @@ import gc
 import inspect
 import logging
 import math
+import operator
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -100,8 +101,6 @@ except ImportError:
         NCCL_ALLOCATOR = "APEX"
     except ImportError:
         nccl_allocator = None
-
-NCCL_MEMORY_POOL = None
 
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
@@ -504,6 +503,7 @@ class TemporaryBucketAllocator:
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -537,6 +537,7 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -600,6 +601,7 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -654,19 +656,22 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         name: str,
         fsdp_param_groups: List["ParameterGroup"],
         size: int = 2,
+        dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
         self.allocation_tracker = {}  # tracking the global buffer allocation status
+        self.dtype_fn = dtype_fn
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
-        fsdp_unit_buckets = defaultdict(list)
+        fsdp_unit_buckets = defaultdict(dict)
         for bucket_id, param_group in enumerate(fsdp_param_groups):
-            if param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None:
+            if param_group.fsdp_unit_id is None:
                 continue
-            fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
+            bucket_offset = len(fsdp_unit_buckets[param_group.fsdp_unit_id])
+            fsdp_unit_buckets[param_group.fsdp_unit_id][bucket_id] = (-1, bucket_offset)
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
         # Identify the largest group of FSDP units that share the same buffer storage.
@@ -674,7 +679,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
             same_storage_fsdp_units = []
             for i in fsdp_unit_buckets:
-                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
+                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids.keys()):
                     same_storage_fsdp_units.append(i)
             # Track the largest group of FSDP units sharing the same buffer storage
             if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
@@ -687,29 +692,34 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             len(fsdp_units_to_double_buffer) > 0
         ), "Found no FSDP units to use fixed-size buffering"
         self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
-
-        if torch.distributed.get_rank() == 0:
-            for bucket_id, param_group in enumerate(fsdp_param_groups):
-                if (
-                    param_group.fsdp_unit_id == -1
-                    or param_group.fsdp_unit_id is None
-                    or param_group.fsdp_unit_id not in self.fsdp_double_buffer_units
-                ):
-                    logging.info(
-                        f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit "
-                        "in FixedPoolAllcator"
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            if (
+                param_group.fsdp_unit_id is None
+                or param_group.fsdp_unit_id not in self.fsdp_double_buffer_units
+            ):
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    (
+                        f"FSDP Unit ID {param_group.fsdp_unit_id} is not symmetrical to "
+                        f"the FixedPoolAlloc double buffer units: {self.fsdp_double_buffer_units}"
+                    ),
+                )
+                if fallback_to_persistent_buffer is False:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "Will fallback to dynamic memory allocator, NCCL UBR not supported.",
                     )
-                    if fallback_to_persistent_buffer is False:
-                        logging.info(
-                            "It will fall back to dynamic memory allocator, NCCL user "
-                            "buffer is not supported"
-                        )
-                    else:
-                        logging.info(
-                            "It will be allocated a persistent buffer. If the memory "
-                            "budget is tight, set "
-                            "trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
-                        )
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        (
+                            "Will be persistently allocated. If the memory budget is tight, "
+                            "set fsdp_db_use_persist_buf_on_alloc_fail=False."
+                        ),
+                    )
 
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
@@ -736,7 +746,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             pg_b = self.fsdp_param_groups[b]
             a_size = sum(p.numel() for p in pg_a.params)
             b_size = sum(p.numel() for p in pg_b.params)
-            if pg_a.dtype != pg_b.dtype or a_size != b_size:
+            if self.dtype_fn(pg_a) != self.dtype_fn(pg_b) or a_size != b_size:
                 return False
         return True
 
@@ -747,26 +757,69 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
-        allocate a temporary bucket.
+        Allocate a temporary bucket from the symmetric buffer pool.
+
+        Only FSDP units selected for double-buffering will allocate
+        from the pool of double buffers. The most frequently appearing
+        FSDP unit modules with a symmetric dtype and size are chosen.
+
+        Other units will either be dynamically allocated, or allocated
+        persistently if fallback_to_persistent_buffer=True.
+
+        If strict_assignments=True, this allocator will track a buffer
+        and bucket offset, and subsequently attempt to re-allocate the
+        same buffer for every bucket ID. Otherwise, it will warn the
+        user that a different buffer will be allocated for the bucket.
         """
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             # Try to allocate from the buffer pool.
-            bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+            buffer_offset, bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id][bucket_id]
             buffer_name = None
             if bucket_id in self.using_buffer:
                 # If this bucket is already using a buffer, reuse it.
                 buf_group_id, bucket_offset = self.using_buffer[bucket_id]
                 buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
+            elif (
+                strict_assignments
+                and buffer_offset >= 0
+                and (buffer_offset, bucket_offset) in self.idle_buffer
+            ):
+                # Able to allocate the planned buffer for this bucket.
+                self.using_buffer[bucket_id] = (buffer_offset, bucket_offset)
+                buffer_name = self._get_gbuf_name(buffer_offset, bucket_offset)
+                self.idle_buffer.remove((buffer_offset, bucket_offset))
             else:
+                # If we failed to allocate a planned buffer, then warn the user!
+                if strict_assignments and buffer_offset >= 0:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"[FixedPool][{self.name}] Failed to allocate Bucket {bucket_id} to "
+                        f"FixedPool Buffer {buffer_offset}. Looking for new buffer...",
+                    )
                 # Otherwise, find an available buffer group for this bucket offset.
                 for buf_group_id in range(self.size):
                     if (buf_group_id, bucket_offset) in self.idle_buffer:
                         self.using_buffer[bucket_id] = (buf_group_id, bucket_offset)
                         buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
+                        if strict_assignments and buffer_offset < 0:
+                            # Save the exact buffer that this bucket should reside in!
+                            # Future allocations should try to use this buffer if possible.
+                            self.fsdp_unit_buckets[fsdp_unit_id][bucket_id] = (
+                                buf_group_id,
+                                bucket_offset,
+                            )
+                            log_single_rank(
+                                logger,
+                                logging.INFO,
+                                f"[FixedPool][{self.name}] Assigned Bucket {bucket_id} "
+                                f"to FixedPool Buffer {buf_group_id}.",
+                            )
                         break
 
             assert buffer_name is not None, (
@@ -808,7 +861,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
     def free(self, bucket_id: int):
         """
-        free a temporary bucket.
+        Free a temporary bucket.
         """
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         if fsdp_unit_id in self.fsdp_double_buffer_units:
@@ -822,6 +875,304 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         if self.fallback_to_persistent_buffer is False:
             # If not managed by fixed pool allocator, delegate to the backup allocator.
             logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+            self.backup_allocator.free(bucket_id)
+
+
+class MaxPoolAllocator(TemporaryBucketAllocator):
+    """
+    A specialized temporary bucket allocator that implements a buffer recycling strategy
+    to minimize memory fragmentation in FSDP operations.
+
+    This allocator maintains a fixed pool of pre-allocated buffers, reusing them
+    to reduce the overhead and fragmentation caused by frequent allocation and
+    deallocation of temporary buffers during FSDP operations.
+
+    For every parameter group / bucket, the maximum storage required across all FSDP units
+    is pre-computed to recycle buffers across different FSDP units. To efficiently allocate
+    buckets, size maxima are stratified by dtype, and FSDP unit bucket assignments are
+    sorted such that the smallest bucket is assigned to the smallest buffer in the pool.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        fsdp_param_groups: List["ParameterGroup"],
+        size: int = 2,
+        dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
+        fallback_to_persistent_buffer: bool = False,
+    ):
+        self.name = name
+        self.fsdp_param_groups = fsdp_param_groups
+        self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
+        self.allocation_tracker = {}  # tracking the global buffer allocation status
+        self.bucket_alloc_index = {}  # map bucket ID to offset
+        self.max_dtype_bucket_sizes = {}  # dtype -> [bucket sizes from smallest to largest]
+        self.dtype_fn = dtype_fn
+
+        # Build a mapping from FSDP unit id to its associated bucket ids.
+        fsdp_unit_buckets = defaultdict(list)
+        for bucket_id, param_group in enumerate(self.fsdp_param_groups):
+            # Filter out FSDP non-units. Only FSDP units can be double-buffered.
+            if param_group.fsdp_unit_id is None:
+                continue
+            fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
+        self.fsdp_unit_buckets = fsdp_unit_buckets
+
+        # Asymmetrical Max-Pool Double Buffers
+        self._build_fixed_max_pool()
+
+        # --- Fixed Pool Buffering Check ---
+        # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
+        # If not, the allocator cannot provide its intended memory recycling benefits.
+        self.fsdp_double_buffer_units = list(self.fsdp_unit_buckets.keys())
+        assert (
+            len(self.fsdp_double_buffer_units) > 0
+        ), "Found no FSDP units to use max-sized buffering."
+        if any(pg.fsdp_unit_id is None for pg in self.fsdp_param_groups):
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[MaxPoolAllocator] Non-unit FSDP modules will not be double-buffered.",
+            )
+            if fallback_to_persistent_buffer is False:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "Will fallback to dynamic memory allocator, NCCL UBR not supported.",
+                )
+            else:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    (
+                        "Will be persistently allocated. If the memory budget is tight, "
+                        "set fsdp_db_use_persist_buf_on_alloc_fail=False."
+                    ),
+                )
+
+        # Initialize buffer group status.
+        # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
+        self.idle_buffer = []  # List of available (buf_group_id, dtype, offset) tuples.
+        self.using_buffer = {}  # Map from bucket_id to (buf_group_id, dtype, offset) in use.
+
+        # Populate the idle buffer pool with all buffer group and bucket offset combinations.
+        for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
+            for dtype, bucket_sizes in self.max_dtype_bucket_sizes.items():
+                for bucket_offset in range(len(bucket_sizes)):
+                    self.idle_buffer.append((buf_group_id, dtype, bucket_offset))
+
+        # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
+        self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
+        self.backup_allocator = StorageResizeBasedBucketAllocator()
+
+    def _build_fixed_max_pool(self):
+        """
+        Compute the maximum double-buffer pool required to support all FSDP units.
+        """
+        # For every FSDP unit, track the size of every bucket of every dtype to
+        # construct the maximum number of buckets of maximum size for each dtype.
+        dtype_max_bucket_id = {}
+        for fsdp_unit_id, fsdp_unit_bucket_ids in self.fsdp_unit_buckets.items():
+            unit_dtype_bucket_sizes = {}
+            for bucket_id in fsdp_unit_bucket_ids:
+                # Get the parameter group dtype and size.
+                pg = self.fsdp_param_groups[bucket_id]
+                num_group_elements = sum(p.numel() for p in pg.params)
+                bucket_dtype = self.dtype_fn(pg)
+                dtype_bucket_sizes = unit_dtype_bucket_sizes.setdefault(bucket_dtype, [])
+                dtype_bucket_sizes.append(
+                    (num_group_elements, bucket_id)  # For immediate assignment later.
+                )
+            for dtype, bucket_sizes in unit_dtype_bucket_sizes.items():
+                # Sort bucket sizes for each dtype category from largest to smallest.
+                bucket_sizes.sort(reverse=True)
+                # Get maximum dtype bucket sizes.
+                if dtype == "float8":
+                    # Map to actual dtype, which is uint8.
+                    dtype = torch.uint8
+                max_bucket_sizes = self.max_dtype_bucket_sizes.setdefault(dtype, [])
+                max_bucket_ids = dtype_max_bucket_id.setdefault(dtype, [])
+                # If more buckets are needed for this unit, extend the pool with 0's.
+                if len(bucket_sizes) > len(max_bucket_sizes):
+                    extend_len = len(bucket_sizes) - len(max_bucket_sizes)
+                    max_bucket_sizes.extend([0] * extend_len)
+                    max_bucket_ids.extend([-1] * extend_len)
+                # Update maximum bucket pool from largest to smallest.
+                # Assign FSDP unit bucket ID's to the pool, as subsequent units
+                # can only increase the length and bucket sizes of the offsets
+                # registered to this dtype in the pool.
+                for bucket_size_id, (bucket_offset, max_offset_size) in zip(
+                    bucket_sizes,
+                    # Find the largest buckets we have in the pool that
+                    # can support this entire FSDP unit.
+                    list(enumerate(max_bucket_sizes))[0 : len(bucket_sizes)],
+                ):
+                    # Update max bucket size at this offset.
+                    bucket_size, bucket_id = bucket_size_id
+                    if bucket_size > max_offset_size:
+                        max_bucket_sizes[bucket_offset] = bucket_size
+                        # Track which bucket IDs define the maxima.
+                        max_bucket_ids[bucket_offset] = (fsdp_unit_id, bucket_id)
+                    # Assign bucket ID to this offset for this dtype,
+                    # to recycle the appropriate buffer.
+                    self.bucket_alloc_index[bucket_id] = (-1, bucket_offset)
+
+        # Log the max pool bucket sizes and bucket IDs responsible.
+        for dtype, bucket_sizes in self.max_dtype_bucket_sizes.items():
+            max_bucket_ids = dtype_max_bucket_id[dtype]
+            log_single_rank(
+                logger,
+                logging.INFO,
+                (
+                    f"[MaxPoolAllocator][{self.name}][Buffers={self.size}][{dtype}] \n"
+                    f"\tBucket Sizes: {bucket_sizes} / Max (Unit, Bucket): {max_bucket_ids}"
+                ),
+            )
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
+    ) -> Bucket:
+        """
+        Allocate a bucket from the FSDP unit maximum pool managed by this allocator.
+
+        Args:
+            bucket_id (int): ID of the bucket to allocate memory for.
+                During initialization, this bucket is assigned to an
+                offset that can support this bucket's size. If strict
+                assignment is active, then this allocator will attempt
+                to allocate the same buffer to this bucket as well to
+                induce persistent memory allocation for CUDA Graphs.
+            size (int):
+                Number of elements to allocate a buffer for.
+            dtype (torch.dtype):
+                The data-type of the allocated buffer.
+            device (torch.device):
+                The device to allocate the memory on.
+            mem_alloc_context (Callable):
+                Allocation context manager, such as the NCCL allocator
+                context manager for NCCL UBR.
+            strict_assignments (bool):
+                If set, then try to use previously allocated buffers
+                for the bucket ID when using double-buffer allocators.
+                Otherwise, warn the user that a different buffer will
+                be assigned to support the bucket.
+        """
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id is not None:
+            # Try to allocate from the buffer pool.
+            buffer_offset, bucket_offset = self.bucket_alloc_index[bucket_id]
+            buffer_name = None
+            if bucket_id in self.using_buffer:
+                # If this bucket is already using a buffer, reuse it.
+                buf_group_id, buffer_dtype, bucket_offset = self.using_buffer[bucket_id]
+                assert buffer_dtype == dtype, (
+                    f"[MaxPoolAllocator] Requested allocation dtype ({dtype}) does not "
+                    f"match pre-allocated buffer dtype ({buffer_dtype})!"
+                )
+                buffer_name = self._get_gbuf_name(buf_group_id, dtype, bucket_offset)
+            elif (
+                strict_assignments
+                and buffer_offset >= 0
+                and (buffer_offset, dtype, bucket_offset) in self.idle_buffer
+            ):
+                # Able to allocate the planned buffer for this bucket.
+                self.using_buffer[bucket_id] = (buffer_offset, dtype, bucket_offset)
+                buffer_name = self._get_gbuf_name(buffer_offset, dtype, bucket_offset)
+                self.idle_buffer.remove((buffer_offset, dtype, bucket_offset))
+            else:
+                # If we failed to allocate a planned buffer, then warn the user!
+                if strict_assignments and buffer_offset >= 0:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"[MaxPool][{self.name}] Failed to allocate Bucket {bucket_id} to "
+                        f"MaxPool Buffer {buffer_offset}. Looking for new buffer...",
+                    )
+                # Otherwise, find an available buffer group for this bucket offset.
+                for buf_group_id in range(self.size):
+                    if (buf_group_id, dtype, bucket_offset) in self.idle_buffer:
+                        self.using_buffer[bucket_id] = (buf_group_id, dtype, bucket_offset)
+                        buffer_name = self._get_gbuf_name(buf_group_id, dtype, bucket_offset)
+                        self.idle_buffer.remove((buf_group_id, dtype, bucket_offset))
+                        if strict_assignments and buffer_offset < 0:
+                            # Save the exact buffer that this bucket should reside in!
+                            # Future allocations should try to use this buffer if possible.
+                            self.bucket_alloc_index[bucket_id] = (buf_group_id, bucket_offset)
+                            log_single_rank(
+                                logger,
+                                logging.INFO,
+                                f"[MaxPool][{self.name}] Assigned Bucket {bucket_id} "
+                                f"to MaxPool Buffer {buf_group_id}.",
+                            )
+                        break
+
+            assert buffer_name is not None, (
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                f"No buffer found for Bucket ID {bucket_id} & FSDP Unit ID {fsdp_unit_id} "
+                f"(Bucket Index / Offset: {bucket_offset}) \n"
+                f"Bucket dtype: {dtype} \n"
+                f"Reserved Buffers: {self.using_buffer} \n"
+                f"Available Buffers: {self.idle_buffer}"
+            )
+        elif self.fallback_to_persistent_buffer is True:
+            buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
+        else:
+            # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
+            # fall back to dynamic allocation via the backup allocator. This means that we
+            # will do dynamic memory allocation.
+            logging.debug(
+                "[MaxPoolAllocator] Using backup allocator for "
+                f"Bucket ID {bucket_id} in FSDP Unit {fsdp_unit_id}."
+            )
+            return self.backup_allocator.allocate(
+                bucket_id=bucket_id, size=size, dtype=dtype, device=device
+            )
+
+        # Use buffer_name to get memory from global memory.
+        if mem_alloc_context is not None and mem_alloc_context != nullcontext:
+            # Check if a new buffer allocation is required. Mirror the logic in
+            # GlobalMemoryBuffer.get_tensor() to ensure MALLOC synchronization.
+            if (
+                self.allocation_tracker.get((buffer_name, dtype), None) is None
+                or self.allocation_tracker[(buffer_name, dtype)] < size
+            ):
+                # Requires synchronization for new buffer allocation
+                self.allocation_tracker[(buffer_name, dtype)] = size
+                torch.cuda.synchronize()
+        return Bucket(
+            data=get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )
+        )
+
+    def _get_gbuf_name(self, buf_group_id: int, dtype: torch.dtype, bucket_index: int):
+        return f"{self.name}_{buf_group_id}_{dtype}_{bucket_index}"
+
+    def free(self, bucket_id: int):
+        """
+        Free a temporary bucket.
+        """
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id is not None:
+            if bucket_id not in self.using_buffer:
+                # This bucket is already deallocated.
+                return
+            # Return the buffer to the idle pool.
+            self.idle_buffer.append(self.using_buffer[bucket_id])
+            del self.using_buffer[bucket_id]
+            return
+        if self.fallback_to_persistent_buffer is False:
+            # If not persistent, free the storage allocated by the backup allocator.
+            logging.debug(
+                "[MaxPoolAllocator] Free backup allocation for "
+                f"Bucket ID {bucket_id} in FSDP Unit {fsdp_unit_id}."
+            )
             self.backup_allocator.free(bucket_id)
 
 
@@ -938,7 +1289,10 @@ class DataParallelBuffer:
         self.data = data
 
     def fetch_bucket(
-        self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
+        self,
+        dtype: Optional[torch.dtype] = None,
+        set_param_data: bool = False,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         Fetch a communication buffer for data-parallel operations. If the buffer
@@ -950,6 +1304,15 @@ class DataParallelBuffer:
         Args:
             dtype (Optional[torch.dtype]): The data type of the tensor
                 to fetch a buffer for. Defaults to None.
+            set_param_data (bool):
+                Attach the allocated data to the parameters managed by
+                this buffer. Required for all allocators that generate
+                new pointers to the allocated data.
+            strict_assignments (bool):
+                If set, then try to use previously allocated buffers
+                for the bucket ID when using double-buffer allocators.
+                Otherwise, warn the user that a different buffer will
+                be assigned to support the bucket.
 
         Returns:
             Bucket: The communication buffer for the specified data type.
@@ -968,7 +1331,9 @@ class DataParallelBuffer:
             )
         else:
             # Sharded or dtype-custom buffers require un-sharded bucket allocation.
-            bucket = self.allocate_bucket_storage(dtype=dtype, device=self.device)
+            bucket = self.allocate_bucket_storage(
+                dtype=dtype, device=self.device, strict_assignments=strict_assignments
+            )
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
@@ -1029,6 +1394,7 @@ class DataParallelBuffer:
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         init_values: Optional[torch.Tensor] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         Allocate a temporary flat communication buffer using the cached
@@ -1052,6 +1418,11 @@ class DataParallelBuffer:
             init_values (Optional[torch.Tensor]):
                 If provided, the allocated storage will be initialized
                 to the values of this (flattened) Tensor.
+            strict_assignments (bool):
+                If set, then try to use previously allocated buffers
+                for the bucket ID when using double-buffer allocators.
+                Otherwise, warn the user that a different buffer will
+                be assigned to support the bucket.
 
         Returns:
             Bucket: The communication buffer for the specified data type.
@@ -1069,6 +1440,7 @@ class DataParallelBuffer:
             dtype=dtype,
             device=device,
             mem_alloc_context=self.mem_alloc_context,
+            strict_assignments=strict_assignments,
         )
         # Copy Tensor values into Bucket data.
         if init_values is not None:
@@ -1340,6 +1712,8 @@ class ParameterGroup:
             The list of model parameters grouped together.
         dtype (Optional[torch.dtype]):
             The desired data type for the parameters.
+        grad_dtype (Optional[torch.dtype]):
+            The desired data type for the weight gradients.
         is_expert_param (bool):
             Indicates if this group contains expert parameters
             (e.g., in mixture-of-experts).
@@ -1375,6 +1749,7 @@ class ParameterGroup:
 
     params: List[torch.nn.Parameter]
     dtype: Optional[torch.dtype] = None
+    grad_dtype: Optional[torch.dtype] = None
     is_expert_param: bool = False
     requires_grad: Optional[bool] = None
     fsdp_unit_id: Optional[int] = None
@@ -1736,6 +2111,51 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
+        self.nccl_memory_pool = None
+        self.nccl_weight_memory_pool = None
+        if self.ddp_config.fsdp_zero_sm_allgather:
+            assert self.ddp_config.nccl_ub, (
+                "Megatron-FSDP zero-SM all-gather requires NCCL user-buffer registration. "
+                "Please set nccl_ub=True."
+            )
+            assert not self.ddp_config.disable_symmetric_registration, (
+                "Megatron-FSDP zero-SM all-gather requires symmetric NCCL registration. "
+                "Please leave disable_symmetric_registration=False."
+            )
+            assert NCCL_ALLOCATOR == "MCORE", (
+                "Megatron-FSDP zero-SM all-gather requires megatron.core.nccl_allocator "
+                "for symmetric NCCL memory allocation."
+            )
+            assert (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                is not None
+            ), (
+                "Megatron-FSDP zero-SM all-gather requires a dedicated parameter "
+                "all-gather process group."
+            )
+            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
+                assert (
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=True, independent_all_gather=True
+                    )
+                    is not None
+                ), (
+                    "Megatron-FSDP zero-SM all-gather with expert parallelism requires "
+                    "a dedicated expert parameter all-gather process group."
+                )
+            if (
+                self.dist_index.use_hybrid_fsdp
+                and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            ):
+                assert (
+                    self.dist_index.get_outer_fsdp_group(independent_all_gather=True)
+                    is not self.dist_index.get_outer_fsdp_group()
+                ), (
+                    "Megatron-FSDP zero-SM all-gather with outer-DP sharding requires "
+                    "a dedicated outer-DP parameter all-gather process group."
+                )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -1745,13 +2165,19 @@ class ParamAndGradBuffer:
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
-            # Initialize the NCCL memory pool.
-            global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
-            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+            # Gradient and optimizer allocations can differ between ranks. Keep them out of
+            # the symmetric pool whose layout must match for zero-CTA parameter all-gather.
+            self.nccl_memory_pool = nccl_allocator.create_nccl_mem_pool(
+                symmetric=(
+                    not self.ddp_config.disable_symmetric_registration
+                    and not self.ddp_config.fsdp_zero_sm_allgather
+                )
             )
+            self.nccl_weight_memory_pool = self.nccl_memory_pool
+            if self.ddp_config.fsdp_zero_sm_allgather:
+                self.nccl_weight_memory_pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -1791,8 +2217,14 @@ class ParamAndGradBuffer:
                     )
                 )
             if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
+                # Outer/Inter-FSDP group when using hybrid FSDP.
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+            outer_fsdp_group_ag = self.dist_index.get_outer_fsdp_group(independent_all_gather=True)
+            if (
+                outer_fsdp_group_ag is not None
+                and outer_fsdp_group_ag is not self.dist_index.get_outer_fsdp_group()
+            ):
+                self.ubr_groups.append(outer_fsdp_group_ag)
 
             log_single_rank(
                 logger,
@@ -1822,8 +2254,18 @@ class ParamAndGradBuffer:
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
         self.mem_alloc_context = self.get_mem_alloc_context(
-            groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
+            pool=self.nccl_memory_pool,
+            groups=self.ubr_groups,
+            symmetric=(
+                not self.ddp_config.disable_symmetric_registration
+                and not self.ddp_config.fsdp_zero_sm_allgather
+            ),
         )
+        self.weight_mem_alloc_context = self.mem_alloc_context
+        if self.ddp_config.fsdp_zero_sm_allgather:
+            self.weight_mem_alloc_context = self.get_mem_alloc_context(
+                pool=self.nccl_weight_memory_pool, groups=self.ubr_groups, symmetric=True
+            )
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -1854,7 +2296,7 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
-    def get_mem_alloc_context(self, groups=None, symmetric=True):
+    def get_mem_alloc_context(self, pool=None, groups=None, symmetric=True):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
@@ -1863,7 +2305,7 @@ class ParamAndGradBuffer:
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
-            global NCCL_MEMORY_POOL
+            assert pool is not None, "NCCL memory pool must be initialized before allocation"
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
@@ -1871,20 +2313,17 @@ class ParamAndGradBuffer:
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
                     return functools.partial(
-                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, pool
                     )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem,
-                        NCCL_MEMORY_POOL,
-                        group=groups[0],
-                        symmetric=symmetric,
+                        nccl_allocator.nccl_mem, pool, group=groups[0], symmetric=symmetric
                     )
                 else:
                     mem_alloc_context = functools.partial(
                         nccl_allocator.MultiGroupMemPoolAllocator,
-                        NCCL_MEMORY_POOL,
+                        pool,
                         groups=groups,
                         symmetric=symmetric,
                     )
@@ -1905,12 +2344,12 @@ class ParamAndGradBuffer:
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                        nccl_allocator.nccl_mem, pool, group=groups[0]
                     )
                 else:
                     # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
-                        MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
+                        MultiGroupUBRAllocator, pool, groups=groups
                     )
             else:
                 raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
@@ -1929,29 +2368,40 @@ class ParamAndGradBuffer:
 
         self.already_registered = True
 
-        global NCCL_MEMORY_POOL
         torch.cuda.synchronize()
         torch.distributed.barrier(async_op=False)
         torch.cuda.synchronize()
 
-        for group in self.ubr_groups:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+        pool_registrations = [
+            (
+                self.nccl_memory_pool,
+                (
+                    not self.ddp_config.disable_symmetric_registration
+                    and not self.ddp_config.fsdp_zero_sm_allgather
+                ),
+                "communication",
             )
-            nccl_allocator.register_mem_pool(
-                NCCL_MEMORY_POOL,
-                group,
-                symmetric=not self.ddp_config.disable_symmetric_registration,
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
-            )
+        ]
+        if self.nccl_weight_memory_pool is not self.nccl_memory_pool:
+            pool_registrations.append((self.nccl_weight_memory_pool, True, "weight"))
+
+        for pool, symmetric, pool_name in pool_registrations:
+            for group in self.ubr_groups:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registering {pool_name} mem pool to "
+                    f"group {group}, group.group_desc:{group.group_desc}, "
+                    f"group.size(): {group.size()}, symmetric:{symmetric}",
+                )
+                nccl_allocator.register_mem_pool(pool, group, symmetric=symmetric)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registered {pool_name} mem pool to "
+                    f"group {group}, group.group_desc:{group.group_desc}, "
+                    f"group.size(): {group.size()}, symmetric:{symmetric}",
+                )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -2001,6 +2451,17 @@ class ParamAndGradBuffer:
         )
 
         log_single_rank(logger, logging.INFO, "\n".join(log_lines))
+
+    def _resolve_group_grad_dtype(
+        self, group: "ParameterGroup", meta_device_init_fp8_params: Dict[str, Tuple[bool, bool]]
+    ) -> torch.dtype:
+        """Resolve the main gradient dtype for a parameter group."""
+        if self.mp_policy.main_grads_dtype is not None:
+            # Custom gradient accumulation precision.
+            return self.mp_policy.main_grads_dtype
+        is_fp8 = isinstance(group.dtype, str) and group.dtype == "float8"
+        # BF16 for FP8 parameters, otherwise grad.dtype == param.dtype.
+        return torch.bfloat16 if is_fp8 else group.dtype
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -2198,24 +2659,48 @@ class ParamAndGradBuffer:
                 "NCCL UB is only supported with FSDP double buffer. "
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
+
+        # Set ParameterGroup.grad_dtype.
+        for group in self.parameter_groups:
+            group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            UB_BUFFER_NUM = 2
-            self.weight_alloc = FixedPoolAllocator(
+            # Double Buffering
+            UB_BUFFER_NUM = (
+                self.ddp_config.megatron_fsdp_max_pool_buffer_count
+                if self.ddp_config.megatron_fsdp_max_pool_double_buffer
+                else 2
+            )
+            # Double Buffer Allocator Choice
+            FIXED_POOL_ALLOC_TYPE = (
+                MaxPoolAllocator
+                if self.ddp_config.megatron_fsdp_max_pool_double_buffer
+                else FixedPoolAllocator
+            )
+            self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
-            self.transpose_weight_alloc = FixedPoolAllocator(
+            self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
-            self.main_grad_alloc = FixedPoolAllocator(
+            # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
+            # planning and FixedPoolAllocator unit symmetries. Falls back to each
+            # parameter group's main `grad_dtype` when no comm-dtype override is set.
+            grad_comm_dtype = self.mp_policy.grad_comm_dtype
+            if grad_comm_dtype is not None:
+                grad_dtype_fn = lambda pg: grad_comm_dtype  # noqa: E731
+            else:
+                grad_dtype_fn = operator.attrgetter("grad_dtype")
+            self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
+                dtype_fn=grad_dtype_fn,
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
@@ -2225,10 +2710,11 @@ class ParamAndGradBuffer:
                 # to leverage NCCL UBR for high-precision gradient reduction with
                 # low-precision gradient communication over DP-Outer for H(F)SDP.
                 # Otherwise, this allocator will never be used.
-                self.hsdp_grad_comm_alloc = FixedPoolAllocator(
+                self.hsdp_grad_comm_alloc = FIXED_POOL_ALLOC_TYPE(
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,
+                    dtype_fn=grad_dtype_fn,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
@@ -2273,11 +2759,11 @@ class ParamAndGradBuffer:
             # to enable overlap with gradient reduction operations (main_grad_buffer).
             # This avoids head-of-line blocking between forward all-gather and backward
             # reduce-scatter on the same communicator.
+            ag_group = self.dist_index.get_fsdp_group(
+                is_expert_parallel=group.is_expert_param, independent_all_gather=True
+            )
             model_wbuf_dp_group = main_buf_dp_group
             if not should_create_hfsdp_helper_buffers:
-                ag_group = self.dist_index.get_fsdp_group(
-                    is_expert_parallel=group.is_expert_param, independent_all_gather=True
-                )
                 if ag_group is not None:
                     model_wbuf_dp_group = ag_group
 
@@ -2286,26 +2772,14 @@ class ParamAndGradBuffer:
                 if not group.is_expert_param
                 else self.expert_gradient_scaling_factor
             )
-            # Check if the parameter group is FP8.
-            one_param = group.params[0]
-            is_dtype_float8 = (
-                is_float8tensor(one_param)
-                or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
-            )
 
-            # Designate buffer data-types for compute parameters and main gradients.
-            if is_dtype_float8:
-                param_dtype = torch.uint8
-                main_grads_dtype = torch.bfloat16
-            else:
-                param_dtype = group.params[0].dtype
-                main_grads_dtype = param_dtype
-            # Use a custom main gradient data-type.
-            if self.mp_policy.main_grads_dtype is not None:
-                main_grads_dtype = self.mp_policy.main_grads_dtype
+            # Model weight buffer (compute) precision.
+            is_dtype_float8 = isinstance(group.dtype, str) and group.dtype == "float8"
+            param_dtype = torch.uint8 if is_dtype_float8 else group.dtype
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
+            one_param = group.params[0]
             need_transpose_data = is_float8tensor(one_param) and fp8_need_transpose_data(one_param)
             need_transpose_data_for_meta_device_init = meta_device_init_fp8_params.get(
                 self.param_to_name[one_param], (False, False)
@@ -2337,7 +2811,7 @@ class ParamAndGradBuffer:
                     temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=self.weight_mem_alloc_context,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2353,7 +2827,7 @@ class ParamAndGradBuffer:
                         temporary_bucket_allocator=self.transpose_weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
-                        mem_alloc_context=self.mem_alloc_context,
+                        mem_alloc_context=self.weight_mem_alloc_context,
                         **main_buf_extra_kwargs,
                     )
 
@@ -2380,15 +2854,15 @@ class ParamAndGradBuffer:
             # Initialize the main grad buffer.
             if should_create_grad_buffer_or_main_weight_buffer:
                 assert (
-                    main_grads_dtype.is_floating_point
-                ), f"Main gradient dtype ({main_grads_dtype}) must be Float."
+                    group.grad_dtype.is_floating_point
+                ), f"Main gradient dtype ({group.grad_dtype}) must be Float."
                 group.main_grad_buffer = DataParallelBuffer(
                     self.ddp_config,
                     # Proxy because the number of gradient parameters is the same
                     # as the number of model parameters.
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
-                    dtype=main_grads_dtype,
+                    dtype=group.grad_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding
                     # the optimizer state in HFSDP, else just DP-Shard when
@@ -2412,7 +2886,7 @@ class ParamAndGradBuffer:
                 wbuf = group.model_weight_buffer
                 group.hfsdp_helper_wbuf = _create_hfsdp_helper_buffer(
                     group.model_weight_buffer,
-                    inner_dp_group=inner_dp_group,
+                    inner_dp_group=ag_group if ag_group is not None else inner_dp_group,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and inner_dp_group.size() > 1,
                 )
@@ -2420,7 +2894,7 @@ class ParamAndGradBuffer:
                 if group.transpose_weight_buffer is not None:
                     group.hfsdp_helper_wtbuf = _create_hfsdp_helper_buffer(
                         group.transpose_weight_buffer,
-                        inner_dp_group=inner_dp_group,
+                        inner_dp_group=ag_group if ag_group is not None else inner_dp_group,
                         is_data_distributed=is_main_weight_buffer_distributed
                         and inner_dp_group.size() > 1,
                     )
@@ -2507,7 +2981,7 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
-                with self.mem_alloc_context():
+                with self.weight_mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wbuf,
@@ -2524,11 +2998,12 @@ class ParamAndGradBuffer:
                         wbuf.init_data(
                             torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
                         )
-                bucket = wbuf.fetch_bucket()
+                # Allocate some memory to initialize the model.
+                bucket = wbuf.fetch_bucket(strict_assignments=False)
 
             tbuf = group.transpose_weight_buffer
             if tbuf:
-                with self.mem_alloc_context():
+                with self.weight_mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
@@ -2545,7 +3020,8 @@ class ParamAndGradBuffer:
                         tbuf.init_data(
                             torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device)
                         )
-                transpose_bucket = tbuf.fetch_bucket()
+                # Allocate some memory to initialize the model.
+                transpose_bucket = tbuf.fetch_bucket(strict_assignments=False)
 
             mbuf = group.main_weight_buffer
             if mbuf:
@@ -4093,19 +4569,51 @@ class AllGatherPipeline:
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
+            max_buffered_units = self.buffer.weight_alloc.size
             double_buf_units = set()
+            # A 1F1B schedule may issue this gather while the opposite pass still owns
+            # a pool slot. Include those live allocations when deciding whether another
+            # unit can be prefetched; otherwise each pass independently admits two units
+            # and overcommits the shared two-buffer pool.
+            for active_bucket_id in range(self.buffer.num_buckets):
+                active_bucket_key = self.get_bucket_key(active_bucket_id, bwd)
+                active_unit_id = parameter_groups[active_bucket_id].fsdp_unit_id
+                if (
+                    active_unit_id in self.buffer.double_buf_units
+                    and self.bucket_status[active_bucket_key] != BucketStatus.EMPTY
+                    and not self.bucket_can_be_released[active_bucket_key]
+                ):
+                    double_buf_units.add(active_unit_id)
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
                     double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > max_buffered_units:
                 raise ValueError(
                     f"{double_buf_units} FSDP units were requested, "
-                    "but double buffers can support no more than 2 FSDP units."
+                    f"but the parameter buffer pool can support no more than "
+                    f"{max_buffered_units} FSDP units."
                 )
 
+        # Do not release the buckets that are being all-gathered.
+        no_fsdp_units = True
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
+            fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id is not None and fsdp_unit_id >= 0:
+                no_fsdp_units = False
+
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
-        if prefetch:
+        if prefetch and not (
+            # When double buffering, if parameters are not members of FSDP units,
+            # we should skip pre-fetch to efficiently supply buffers from the pool.
+            # Non-unit module pre-fetch can run inside other FSDP unit modules and
+            # un-shard irrelevant model components that pointlessly steal buffer
+            # allocations from the expected FSDP unit allocation and violating
+            # the maximum limit of 2 buffers allocated at any point in time.
+            self.buffer.ddp_config.fsdp_double_buffer
+            and no_fsdp_units
+        ):
 
             def next_bucket_id(ag_buckets):
                 """
@@ -4136,9 +4644,9 @@ class AllGatherPipeline:
                 if self.buffer.ddp_config.fsdp_double_buffer:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                     double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
+                    if len(double_buf_units) > max_buffered_units:
                         # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
+                        # the parameter buffer pool, so we need to stop prefetching.
                         return True
                 return False
 
@@ -4208,7 +4716,7 @@ class AllGatherPipeline:
                 with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
                     is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
                     outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
-                        is_expert_parallel=is_expert_parallel
+                        is_expert_parallel=is_expert_parallel, independent_all_gather=True
                     )
                     with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:

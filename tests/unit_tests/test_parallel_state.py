@@ -1,6 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from math import log2
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,67 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+class _FakeNCCLOptions:
+    def __init__(self, is_high_priority_stream=False):
+        self.is_high_priority_stream = is_high_priority_stream
+        self.config = SimpleNamespace()
+
+
+@pytest.fixture
+def fake_process_group_nccl(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "ProcessGroupNCCL",
+        SimpleNamespace(
+            Options=_FakeNCCLOptions,
+            NCCL_CTA_POLICY_DEFAULT=0,
+            NCCL_CTA_POLICY_EFFICIENCY=1,
+            NCCL_CTA_POLICY_ZERO=2,
+        ),
+        raising=False,
+    )
+
+
+def test_get_nccl_options_sets_cta_policy(fake_process_group_nccl):
+    options = ps.get_nccl_options(
+        "dp_cp_ag",
+        {"dp_cp_ag": {"is_high_priority_stream": True, "min_ctas": 2, "cta_policy": "zero"}},
+    )
+
+    assert options.is_high_priority_stream
+    assert options.config.min_ctas == 2
+    assert options.config.cta_policy == 2
+
+
+def test_get_nccl_options_with_fallback_merges_base_options(fake_process_group_nccl):
+    options = ps._get_nccl_options_with_fallback(
+        "dp_cp_ag",
+        "dp_cp",
+        {
+            "dp_cp": {"is_high_priority_stream": True, "min_ctas": 1},
+            "dp_cp_ag": {"min_ctas": 2, "cta_policy": "zero"},
+        },
+    )
+
+    assert options.is_high_priority_stream
+    assert options.config.min_ctas == 2
+    assert options.config.cta_policy == 2
+
+
+def test_fsdp_zero_sm_allgather_options_include_hsdp_groups():
+    nccl_comm_cfgs = {}
+
+    ps._apply_fsdp_zero_sm_allgather_group_options(
+        nccl_comm_cfgs, for_expert_parallelism=True, use_hsdp=True
+    )
+
+    assert nccl_comm_cfgs == {
+        "dp_cp_ag": {"cta_policy": "zero"},
+        "ep_dp_ag": {"cta_policy": "zero"},
+        "inter_dist_opt_ag": {"cta_policy": "zero"},
+    }
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
@@ -539,7 +601,7 @@ def test_separate_all_gather_group():
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    dp_cp_ag_group, _expt_ag, _outer_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
@@ -549,6 +611,36 @@ def test_separate_all_gather_group():
     pg_collection.dp_cp_ag = dp_cp_ag_group
     assert pg_collection.dp_cp_ag is not None
     assert pg_collection.dp_cp_ag == dp_cp_ag_group
+
+    Utils.destroy_model_parallel()
+
+
+def test_hsdp_all_gather_groups_match_hsdp_topology():
+    """HSDP AG-only communicators must match the groups that gather parameter shards."""
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+    )
+
+    dp_cp_ag, expt_dp_ag, inter_dist_opt_ag = ps.create_all_gather_groups(
+        for_expert_parallelism=True, num_distributed_optimizer_instances=2
+    )
+
+    intra_dp_cp = ps.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
+    intra_expt_dp = ps.get_expert_data_parallel_group(partial_expert_data_parallel=True)
+    inter_dist_opt = ps.get_inter_distributed_optimizer_instance_group()
+
+    assert torch.distributed.get_process_group_ranks(
+        dp_cp_ag
+    ) == torch.distributed.get_process_group_ranks(intra_dp_cp)
+    assert torch.distributed.get_process_group_ranks(
+        expt_dp_ag
+    ) == torch.distributed.get_process_group_ranks(intra_expt_dp)
+    assert torch.distributed.get_process_group_ranks(
+        inter_dist_opt_ag
+    ) == torch.distributed.get_process_group_ranks(inter_dist_opt)
+    assert dp_cp_ag is not intra_dp_cp
+    assert expt_dp_ag is not intra_expt_dp
+    assert inter_dist_opt_ag is not inter_dist_opt
 
     Utils.destroy_model_parallel()
 
@@ -606,8 +698,10 @@ def test_process_group_collection_defaults():
     # AG groups should be None by default (users must create them explicitly)
     assert hasattr(pg_collection, 'dp_cp_ag')
     assert hasattr(pg_collection, 'expt_dp_ag')
+    assert hasattr(pg_collection, 'inter_dist_opt_ag')
     assert pg_collection.dp_cp_ag is None, "dp_cp_ag should default to None"
     assert pg_collection.expt_dp_ag is None, "expt_dp_ag should default to None"
+    assert pg_collection.inter_dist_opt_ag is None, "inter_dist_opt_ag should default to None"
 
     # Regular groups should still work
     assert pg_collection.dp is not None

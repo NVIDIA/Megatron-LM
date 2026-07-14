@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -117,17 +117,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
-            # Grandfathered Argument: grad_reduce_in_fp32
-            main_grads_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_main_grads_dtype
-            ),
-            grad_comm_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_grad_comm_dtype
-            ),
+            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
+            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
         )
         log_single_rank(
             logger,
@@ -159,10 +150,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
+            if ddp_config.fsdp_double_buffer:
+                assert ddp_config.megatron_fsdp_max_pool_double_buffer, (
+                    "1F1B overlap with FSDP double buffering requires "
+                    "megatron_fsdp_max_pool_double_buffer=True."
+                )
             assert config.cuda_graph_impl in ("none", "full_iteration"), (
                 "1F1B overlap with FSDP does not support per-layer CUDA graphs "
                 f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
@@ -383,6 +375,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         expt_dp_ag = (
             getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
         )
+        inter_dist_opt_ag = (
+            getattr(pg_collection, 'inter_dist_opt_ag', None) if pg_collection is not None else None
+        )
 
         if enable_hsdp:
             if self.num_moe_experts is not None:
@@ -414,6 +409,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
                 fsdp_group_ag=dp_cp_ag,
                 expt_fsdp_group_ag=expt_dp_ag,
+                outer_fsdp_group_ag=inter_dist_opt_ag,
             )
         else:
             if self.num_moe_experts is not None:

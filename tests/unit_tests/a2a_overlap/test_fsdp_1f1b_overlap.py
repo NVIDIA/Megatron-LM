@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 
@@ -81,6 +81,18 @@ class TestFSDP1F1BOverlap:
             offload_modules=offload_modules,
         )
 
+    def test_fsdp_1f1b_max_pool_double_buffer(self):
+        """Verify 1F1B overlap with persistent buffers across an odd layer count."""
+        self._run_test_helper(
+            dispatcher_type="alltoall",
+            sharding_strategy="optim_grads_params",
+            num_layers=3,
+            num_microbatches=2,
+            fsdp_double_buffer=True,
+            megatron_fsdp_max_pool_double_buffer=True,
+            nccl_ub=True,
+        )
+
     def _run_test_helper(
         self,
         dispatcher_type="alltoall",
@@ -89,6 +101,11 @@ class TestFSDP1F1BOverlap:
         shared_expert_intermediate_size=None,
         recompute_modules=None,
         offload_modules=None,
+        num_layers=2,
+        num_microbatches=1,
+        fsdp_double_buffer=False,
+        megatron_fsdp_max_pool_double_buffer=False,
+        nccl_ub=False,
         **kwargs,
     ):
         """Verify multi-step FSDP training with overlap produces identical
@@ -98,7 +115,6 @@ class TestFSDP1F1BOverlap:
         different token dispatcher types.  Reference uses standard
         forward/backward; test uses combined_1f1b_schedule_for_no_pipelining.
         """
-        num_layers = 2
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         extra_kwargs.update(kwargs)
         if dispatcher_type == "flex":
@@ -122,6 +138,9 @@ class TestFSDP1F1BOverlap:
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 megatron_fsdp_main_params_dtype=None,
+                fsdp_double_buffer=fsdp_double_buffer,
+                megatron_fsdp_max_pool_double_buffer=megatron_fsdp_max_pool_double_buffer,
+                nccl_ub=nccl_ub,
             )
 
         with deterministic_mode():
@@ -160,8 +179,12 @@ class TestFSDP1F1BOverlap:
             for step in range(NUM_STEPS):
                 if hasattr(ref_fsdp, 'set_is_first_microbatch'):
                     ref_fsdp.set_is_first_microbatch()
-                ref_loss = fsdp_train_step(ref_fsdp, ref_opt, data)
-                test_loss = overlap_train_step(test_fsdp, test_opt, test_config, data)
+                ref_loss = fsdp_train_step(
+                    ref_fsdp, ref_opt, data, num_microbatches=num_microbatches
+                )
+                test_loss = overlap_train_step(
+                    test_fsdp, test_opt, test_config, data, num_microbatches=num_microbatches
+                )
 
                 assert torch.equal(ref_loss, test_loss), (
                     f"[rank {rank}] Loss mismatch at step {step}: "

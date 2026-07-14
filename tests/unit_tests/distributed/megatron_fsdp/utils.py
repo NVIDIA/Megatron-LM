@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import sys
 from functools import partial
 
@@ -58,6 +58,8 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         hidden_size=128,
         num_attention_heads=2,
         max_position_embeddings=128,
+        mamba_num_groups=4,
+        mamba_num_heads=16,
         bf16=False,
         add_bias_linear=False,
         swiglu=True,

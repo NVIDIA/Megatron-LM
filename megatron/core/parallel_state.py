@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -146,6 +146,70 @@ _GLOBAL_MEMORY_BUFFER = None
 _global_process_group_list = None
 
 
+def _get_nccl_cta_policy_value(cta_policy):
+    """Map a NCCL CTA policy config value to ProcessGroupNCCL's enum value."""
+    if isinstance(cta_policy, int):
+        return cta_policy
+    if not isinstance(cta_policy, str):
+        raise RuntimeError(
+            f"cta_policy ({cta_policy}) must be an int or one of "
+            "'default', 'efficiency', or 'zero'."
+        )
+
+    policy_name = cta_policy.lower()
+    pg_nccl = torch.distributed.ProcessGroupNCCL
+    cta_policies = {
+        "default": "NCCL_CTA_POLICY_DEFAULT",
+        "efficiency": "NCCL_CTA_POLICY_EFFICIENCY",
+        "zero": "NCCL_CTA_POLICY_ZERO",
+    }
+    if policy_name not in cta_policies:
+        raise RuntimeError(
+            f"cta_policy ({cta_policy}) is not supported. "
+            "Accepted values: 'default', 'efficiency', 'zero', or an integer NCCL policy value."
+        )
+    attr_name = cta_policies[policy_name]
+    if not hasattr(pg_nccl, attr_name):
+        raise RuntimeError(
+            f"cta_policy={cta_policy!r} requires torch.distributed.ProcessGroupNCCL.{attr_name}, "
+            "which is not available in this PyTorch build."
+        )
+    return getattr(pg_nccl, attr_name)
+
+
+def _load_nccl_comm_cfgs(nccl_communicator_config_path):
+    """Load NCCL communicator configs from YAML, returning an empty dict when unset."""
+    if nccl_communicator_config_path is None:
+        return {}
+
+    try:
+        import yaml
+    except ImportError:
+        raise RuntimeError(
+            "Cannot import `yaml`. Setting custom nccl communicator configs "
+            "requires the yaml package."
+        )
+
+    with open(nccl_communicator_config_path, "r") as stream:
+        return yaml.safe_load(stream) or {}
+
+
+def _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_groups):
+    """Apply high-priority stream overrides to a NCCL communicator config map."""
+    high_priority_stream_groups = high_priority_stream_groups or []
+    for pg_name in high_priority_stream_groups:
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
+
+
+def _apply_fsdp_zero_sm_allgather_group_options(nccl_comm_cfgs, for_expert_parallelism, use_hsdp):
+    """Configure FSDP all-gather groups to use NCCL's zero-CTA policy."""
+    overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "dp_cp_ag", ("cta_policy", "zero"))
+    if for_expert_parallelism:
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "ep_dp_ag", ("cta_policy", "zero"))
+    if use_hsdp:
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, "inter_dist_opt_ag", ("cta_policy", "zero"))
+
+
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
 
@@ -168,6 +232,10 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
             nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name]["max_ctas"]
         if "min_ctas" in nccl_comm_cfgs[pg_name]:
             nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name]["min_ctas"]
+        if "cta_policy" in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.cta_policy = _get_nccl_cta_policy_value(
+                nccl_comm_cfgs[pg_name]["cta_policy"]
+            )
         if "net_name" in nccl_comm_cfgs[pg_name]:
             nccl_options.config.net_name = nccl_comm_cfgs[pg_name]["net_name"]
             # verify net_name value
@@ -179,6 +247,19 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         return nccl_options
     else:
         return None
+
+
+def _get_nccl_options_with_fallback(primary_pg_name, fallback_pg_name, nccl_comm_cfgs):
+    """Get NCCL options for a process group, inheriting base-group config when present."""
+    if primary_pg_name in nccl_comm_cfgs and fallback_pg_name in nccl_comm_cfgs:
+        merged_cfgs = {
+            primary_pg_name: {**nccl_comm_cfgs[fallback_pg_name], **nccl_comm_cfgs[primary_pg_name]}
+        }
+        return get_nccl_options(primary_pg_name, merged_cfgs)
+
+    return get_nccl_options(primary_pg_name, nccl_comm_cfgs) or get_nccl_options(
+        fallback_pg_name, nccl_comm_cfgs
+    )
 
 
 def update_pg_timeout(
@@ -641,8 +722,8 @@ def initialize_model_parallel(
 
         nccl_communicator_config_path (str, default = None):
             Path to the yaml file of NCCL communicator configurations.
-            `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set
-            for each communicator.
+            `min_ctas`, `max_ctas`, `cga_cluster_size`, and `cta_policy`
+            can be set for each communicator.
 
         distributed_timeout_minutes (int, default = 30): Timeout, in
             minutes,for operations executed against distributed
@@ -748,23 +829,8 @@ def initialize_model_parallel(
 
     rank = torch.distributed.get_rank()
 
-    nccl_comm_cfgs = {}
-    if nccl_communicator_config_path is not None:
-        try:
-            import yaml
-        except ImportError:
-            raise RuntimeError(
-                "Cannot import `yaml`. Setting custom nccl communicator configs "
-                "requires the yaml package."
-            )
-
-        with open(nccl_communicator_config_path, "r") as stream:
-            nccl_comm_cfgs = yaml.safe_load(stream)
-
-    # Set is_high_priority_stream flag to the nccl_comm_cfgs if it is in high_priority_stream_groups
-    high_priority_stream_groups = high_priority_stream_groups or []
-    for pg_name in high_priority_stream_groups:
-        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
+    nccl_comm_cfgs = _load_nccl_comm_cfgs(nccl_communicator_config_path)
+    _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_groups)
 
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
@@ -1353,7 +1419,15 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
-def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+def create_all_gather_groups(
+    for_expert_parallelism=False,
+    num_distributed_optimizer_instances=1,
+    timeout=None,
+    nccl_comm_cfgs=None,
+    nccl_communicator_config_path=None,
+    high_priority_stream_groups=None,
+    fsdp_zero_sm_allgather=False,
+):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
 
@@ -1362,16 +1436,24 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
 
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
+        num_distributed_optimizer_instances (int): Number of HSDP outer-DP groups. When
+            greater than one, the dense and expert AG groups match the corresponding inner
+            FSDP shard groups, and an AG-only outer-DP group is also created.
         timeout (timedelta): Timeout for distributed collectives.
         nccl_comm_cfgs (dict): NCCL communicator configurations.
+        nccl_communicator_config_path (str): Path to NCCL communicator YAML.
+        high_priority_stream_groups (List[str]): Communicator groups that should use
+            high priority streams.
+        fsdp_zero_sm_allgather (bool): If true, request NCCL's zero-CTA policy on the
+            dedicated all-gather groups. NCCL falls back for ineligible buffers.
 
     Returns:
-        tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
-               if for_expert_parallelism=False.
+        tuple: (dp_cp_ag_group, expt_dp_ag_group, inter_dist_opt_ag_group), where expert
+            and inter groups are None when they are not needed.
 
     Example:
         # After initialize_model_parallel():
-        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+        dp_cp_ag, expt_dp_ag, inter_dist_opt_ag = parallel_state.create_all_gather_groups(
             for_expert_parallelism=True
         )
 
@@ -1379,11 +1461,21 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp_ag = dp_cp_ag
         pg_collection.expt_dp_ag = expt_dp_ag
+        pg_collection.inter_dist_opt_ag = inter_dist_opt_ag
     """
     if not is_initialized():
         raise RuntimeError(
             "create_all_gather_groups() requires parallel state to be initialized. "
             "Call initialize_model_parallel() first."
+        )
+
+    if nccl_comm_cfgs is None:
+        nccl_comm_cfgs = _load_nccl_comm_cfgs(nccl_communicator_config_path)
+    _apply_high_priority_stream_groups(nccl_comm_cfgs, high_priority_stream_groups)
+    use_hsdp = num_distributed_optimizer_instances > 1
+    if fsdp_zero_sm_allgather:
+        _apply_fsdp_zero_sm_allgather_group_options(
+            nccl_comm_cfgs, for_expert_parallelism, use_hsdp
         )
 
     rank = torch.distributed.get_rank()
@@ -1393,25 +1485,50 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     ep_size = get_expert_model_parallel_world_size()
     dp_size = get_data_parallel_world_size()
 
+    if num_distributed_optimizer_instances < 1:
+        raise ValueError("num_distributed_optimizer_instances must be at least one")
+    if (dp_size * cp_size) % num_distributed_optimizer_instances != 0:
+        raise ValueError(
+            "The data-parallel and context-parallel domain must be divisible by "
+            "num_distributed_optimizer_instances"
+        )
+
     # Create regular DP all-gather group
     dp_cp_ag_group = None
     decoder_rank_gen = RankGenerator(
         tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
     )
 
+    inner_dp_cp_size = (dp_size * cp_size) // num_distributed_optimizer_instances
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
-        if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+        if use_hsdp:
+            ag_rank_groups = [
+                ranks_with_cp[offset : offset + inner_dp_cp_size]
+                for offset in range(0, len(ranks_with_cp), inner_dp_cp_size)
+            ]
+            fallback_group_name = 'intra_dp_cp'
+            group_desc = 'INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_AG'
+        else:
+            ag_rank_groups = [ranks_with_cp]
+            fallback_group_name = 'dp_cp'
+            group_desc = 'DATA_PARALLEL_GROUP_WITH_CP_AG'
+
+        for ag_ranks in ag_rank_groups:
+            group_with_cp_ag = create_group(
+                ag_ranks,
+                timeout=timeout,
+                pg_options=_get_nccl_options_with_fallback(
+                    'dp_cp_ag', fallback_group_name, nccl_comm_cfgs
+                ),
+                group_desc=group_desc,
+            )
+            if rank in ag_ranks:
+                dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
-    if for_expert_parallelism and ep_size > 1:
+    inter_dist_opt_ag_group = None
+    if (for_expert_parallelism and ep_size > 1) or use_hsdp:
         expert_tp_size = get_expert_tensor_parallel_world_size()
         expert_dp_size = get_expert_data_parallel_world_size()
 
@@ -1425,17 +1542,43 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             rank_offset=0,
         )
 
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+        if expert_dp_size % num_distributed_optimizer_instances != 0:
+            raise ValueError(
+                "The expert data-parallel domain must be divisible by "
+                "num_distributed_optimizer_instances"
             )
-            if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
 
-    return dp_cp_ag_group, expt_dp_ag_group
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+            if use_hsdp:
+                inner_expert_dp_size = expert_dp_size // num_distributed_optimizer_instances
+                hierarchical_ag_groups, _ = create_hierarchical_groups(
+                    rank,
+                    expert_dp_ranks,
+                    [inner_expert_dp_size, num_distributed_optimizer_instances],
+                    pg_options=[
+                        _get_nccl_options_with_fallback("ep_dp_ag", "intra_ep_dp", nccl_comm_cfgs),
+                        _get_nccl_options_with_fallback(
+                            "inter_dist_opt_ag", "inter_ep_dp", nccl_comm_cfgs
+                        ),
+                    ],
+                    timeout=timeout,
+                    group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
+                )
+                if rank in expert_dp_ranks:
+                    if for_expert_parallelism and ep_size > 1:
+                        expt_dp_ag_group = hierarchical_ag_groups[0]
+                    inter_dist_opt_ag_group = hierarchical_ag_groups[1]
+            else:
+                expert_dp_ag = create_group(
+                    expert_dp_ranks,
+                    timeout=timeout,
+                    pg_options=_get_nccl_options_with_fallback("ep_dp_ag", "ep_dp", nccl_comm_cfgs),
+                    group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                )
+                if rank in expert_dp_ranks:
+                    expt_dp_ag_group = expert_dp_ag
+
+    return dp_cp_ag_group, expt_dp_ag_group, inter_dist_opt_ag_group
 
 
 def is_initialized():

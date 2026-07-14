@@ -44,6 +44,9 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
+  --megatron-fsdp-main-params-dtype: fp32
+  --megatron-fsdp-main-grads-dtype: fp32
+  --megatron-fsdp-grad-comm-dtype: fp32
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true

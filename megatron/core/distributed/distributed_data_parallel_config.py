@@ -177,6 +177,13 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    fsdp_zero_sm_allgather: bool = False
+    """If true, request NCCL zero-CTA for Megatron-FSDP parameter all-gather
+      copy-engine collectives. Requires Megatron-FSDP, NCCL user-buffer registration,
+      symmetric registration, and dedicated all-gather process groups. NCCL uses zero
+      CTA whenever the collective and its buffers are eligible.
+    """
+
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
       This option is only effective when use_megatron_fsdp and nccl_ub is set.
@@ -253,6 +260,23 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
+    megatron_fsdp_max_pool_buffer_count: int = 2
+    """Number of persistent buffer groups used by the Megatron-FSDP MaxPoolAllocator.
+
+    Two preserves standard double-buffer behavior. Schedules that intentionally keep
+    more FSDP units live may increase this value when
+    ``megatron_fsdp_max_pool_double_buffer`` is enabled.
+    """
+
     def __post_init__(self):
         import os
 
@@ -281,6 +305,13 @@ class DistributedDataParallelConfig:
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
 
+        if self.fsdp_zero_sm_allgather:
+            if not self.use_megatron_fsdp:
+                raise ValueError("fsdp_zero_sm_allgather is only supported with Megatron-FSDP.")
+            if not self.nccl_ub:
+                raise ValueError("fsdp_zero_sm_allgather requires NCCL user-buffer registration.")
+            if self.disable_symmetric_registration:
+                raise ValueError("fsdp_zero_sm_allgather requires symmetric NCCL registration.")
         if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
             assert not self.grad_reduce_in_fp32, (
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
@@ -290,3 +321,17 @@ class DistributedDataParallelConfig:
         if self.num_buckets is not None:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+        if self.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            self.fsdp_double_buffer = True
+        if self.megatron_fsdp_max_pool_buffer_count < 2:
+            raise ValueError("Megatron-FSDP MaxPool buffer count must be at least 2.")
+        if (
+            self.megatron_fsdp_max_pool_buffer_count != 2
+            and not self.megatron_fsdp_max_pool_double_buffer
+        ):
+            raise ValueError(
+                "A non-default Megatron-FSDP MaxPool buffer count requires "
+                "megatron_fsdp_max_pool_double_buffer=True."
+            )

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
 import inspect
@@ -50,7 +50,12 @@ from ..mapping import (
 )
 from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
-from .nvrx import has_nvrx_async_support, make_nvrx_async_request
+from .nvrx import (
+    NVRX_MIN_VERSION,
+    has_nvrx_async_support,
+    is_nvrx_min_version,
+    make_nvrx_async_request,
+)
 
 if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
@@ -1041,6 +1046,12 @@ class TorchDistLoadShardedStrategy:
 def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tuple:
     """Returns async strategy and related async imported modules"""
     if async_strategy == "nvrx":
+        if not is_nvrx_min_version():
+            raise ModuleNotFoundError(
+                "A compatible `nvidia-resiliency-ext` installation is required for "
+                f'`async_strategy="nvrx"`; minimum version is {NVRX_MIN_VERSION}. '
+                'Please install it or set `async_strategy` to `mcore`.'
+            )
         try:
             # nvrx async imports
             from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
