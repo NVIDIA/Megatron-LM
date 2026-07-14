@@ -1021,9 +1021,12 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
+        if is_mfsdp_v2:
+            raise ValueError("MFSDP v2 currently supports only standard Adam/AdamW/SGD.")
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
@@ -1033,14 +1036,13 @@ def get_megatron_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
-    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     if is_mfsdp_v2:
         if len(model_chunks) != 1:
             raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
-        if config.optimizer != "adam":
-            raise ValueError("MFSDP v2 currently supports only Adam/AdamW.")
-        if config.use_distributed_optimizer:
-            raise ValueError("MFSDP v2 does not use Megatron's DistributedOptimizer.")
+        if not config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 requires Megatron's DistributedOptimizer wrapper.")
+        if not config.bf16 or config.fp16 or config.loss_scale is not None:
+            raise ValueError("MFSDP v2 currently supports only unscaled BF16 training.")
         if config.overlap_param_gather_with_optimizer_step:
             raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
         unsupported_optimizer_features = {
@@ -1103,9 +1105,21 @@ def get_megatron_optimizer(
         ):
             if is_mfsdp_v2:
                 param_groups = _get_param_groups(model_chunk, config, config_overrides)
+                # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
+                # https://github.com/NVIDIA/TransformerEngine/issues/3207.
+                # Empty local shards have no optimizer state or data to update, so omit them.
+                for param_group in param_groups:
+                    param_group['params'] = [
+                        parameter
+                        for parameter in param_group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
+                param_groups = [
+                    param_group for param_group in param_groups if param_group['params']
+                ]
+                # MFSDP v2 owns its sharded parameter and gradient storage, so
+                # DistributedOptimizer returns before initializing per_model_buffers.
                 buffers = None
-                if any(group['is_expert_parallel'] for group in param_groups):
-                    raise ValueError("MFSDP v2 does not currently support expert parameters.")
             else:
                 param_groups, buffers = _get_param_groups_and_buffers(
                     model_chunk,

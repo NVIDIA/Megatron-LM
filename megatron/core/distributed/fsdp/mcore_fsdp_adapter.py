@@ -59,7 +59,6 @@ try:
         Placements,
         fully_shard,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -552,18 +551,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
         fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
         super().__init__(config=config, module=module)
-
-        # MCore optimizer wrappers consume reduced gradients through ``main_grad``.
-        # The v2 parameter groups own that persistent storage, so expose DTensor
-        # views of it on the resting sharded parameters without allocating copies.
-        for fsdp_module in module.modules():
-            if not isinstance(fsdp_module, FsdpModule):
-                continue
-            for parameter_group in fsdp_module.parameter_groups:
-                if parameter_group.main_grad is None:
-                    continue
-                for index, parameter in enumerate(parameter_group.sharded_parameters):
-                    parameter.main_grad = parameter_group.main_grad.get_dtensor(index)
 
     @staticmethod
     def _validate_config(
