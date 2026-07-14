@@ -115,6 +115,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GitHub comments can preserve CRLF line endings from pasted commands.
+          COMMENT_BODY=${COMMENT_BODY//$'\r\n'/$'\n'}
           echo "should_run=false" >> "$GITHUB_OUTPUT"
           case "$COMMENT_BODY" in
             "/claude fix"|"/claude fix "*|$'/claude fix\n'*) ;;

@@ -1505,16 +1505,14 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
-    # Deterministic mode
+    # Deterministic mode — env vars + config overrides + torch global state.
+    # Implementation lives in ``megatron/training/determinism.py`` so the
+    # same setup is reachable from tests / profiling scripts that don't go
+    # through argparse.
     if args.deterministic_mode:
-        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
-        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
+        from megatron.training.determinism import apply_determinism_to_args
 
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}."
-
-        torch.use_deterministic_algorithms(True)
+        apply_determinism_to_args(args)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -1945,14 +1943,18 @@ def _add_inference_args(parser):
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='first_prefix_block',
-                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
+                       type=str, default='load_balanced',
+                       choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
                        help='Coordinator routing policy for prefix caching. '
-                       '"first_prefix_block" (default) routes based on the first '
-                       'block hash only. "longest_prefix" routes to the rank with '
-                       'the longest matching prefix. "round_robin" ignores prefix '
-                       'affinity and cycles through ranks.')
+                       '"load_balanced" (default) routes to the rank with the fewest '
+                       'in-flight requests, ignoring prefix affinity. '
+                       '"first_prefix_block" routes based on the first block hash only. '
+                       '"longest_prefix" routes to the rank with the longest matching '
+                       'prefix. "first_prefix_block" and "longest_prefix" both combine '
+                       'prefix affinity with load balancing and fall back to '
+                       'load-balanced routing when prefix caching is disabled or no '
+                       'prefix match exists.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
                        type=float, default=0.5,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
