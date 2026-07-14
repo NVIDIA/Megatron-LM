@@ -300,7 +300,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.

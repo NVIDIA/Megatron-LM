@@ -256,10 +256,10 @@ class DataParallelInferenceCoordinator:
 
     def _remove_engine(self, identity):
         """Remove a disconnected engine from all routing bookkeeping.
-        Note that this is only called during shutdown, so do not worry about
-        optimizing this method. This needs to be optimized iff we want to support
-        dynamic engine registration and deregistration during normal operation,
-        which is not a current use case.
+        Called both during shutdown and when an engine becomes unreachable mid-operation
+        (e.g. zmq.EHOSTUNREACH in _send_to_engine). The O(n) index-shifting and hash-table
+        rebuild are acceptable because the number of connected engines is small; optimize
+        only if dynamic registration/deregistration at high engine counts becomes a use case.
         """
         self.identities_of_data_parallel_ranks.remove(identity)
         idx = self.identity_to_rank_index.pop(identity, None)

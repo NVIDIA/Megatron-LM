@@ -177,12 +177,13 @@ class InferenceSetupConfig:
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
-    ] = "first_prefix_block"
-    """Coordinator routing policy for prefix caching. "first_prefix_block" (default) routes based on
-    the first block hash only. "longest_prefix" routes to the rank with the longest matching prefix.
-    Both combine prefix affinity with load balancing and fall back to load-balanced routing when
-    prefix caching is disabled or no prefix match exists. "load_balanced" routes to the rank with
-    the fewest in-flight requests, ignoring prefix affinity."""
+    ] = "load_balanced"
+    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
+    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
+    balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
+    match exists."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
