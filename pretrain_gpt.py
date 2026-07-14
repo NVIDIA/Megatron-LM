@@ -286,7 +286,7 @@ def forward_step(state: GlobalState, data_iterator, model: GPTModel, return_sche
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()

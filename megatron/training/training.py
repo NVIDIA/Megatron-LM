@@ -1101,10 +1101,7 @@ def pretrain(
     timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
-    timers = get_timers()
-    # Inject the legacy timers directly; GlobalState.timers intentionally exposes
-    # no public setter (overriding it is not supported behavior). Temporary.
-    state._timers = timers
+    timers = state.timers
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1443,6 +1440,7 @@ def pretrain(
 
         if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
             save_checkpoint_and_time(
+                state,
                 iteration,
                 model,
                 optimizer,
@@ -2293,7 +2291,7 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def train_step(state: GlobalState, forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
@@ -2302,7 +2300,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         preserves the default behavior.
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2516,6 +2514,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def training_log(
+    state: GlobalState,
     loss_dict,
     total_loss_dict,
     learning_rate: float | None,
@@ -2534,7 +2533,7 @@ def training_log(
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
@@ -2951,6 +2950,7 @@ def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
 
 
 def save_checkpoint_and_time(
+    state: GlobalState,
     iteration,
     model,
     optimizer,
@@ -2961,7 +2961,7 @@ def save_checkpoint_and_time(
     train_data_iterator=None,
 ):
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
     energy_monitor = get_energy_monitor()
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
@@ -3056,7 +3056,7 @@ def save_checkpoint_and_time(
     timers('interval-time', log_level=0).start(barrier=True)
 
 
-def _run_gpu_sniff_test(tag):
+def _run_gpu_sniff_test(tag, timers):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
@@ -3064,7 +3064,6 @@ def _run_gpu_sniff_test(tag):
         required_pgs=['ep', 'dp', 'tp'],
     )
     print_datetime(f'running GPU sniff test ({tag})')
-    timers = get_timers()
     timers('gpu-sniff-test', log_level=0).start(barrier=True)
     run_gpu_sniff_test(tag, pg_collection=pg_collection)
     timers('gpu-sniff-test').stop(barrier=True)
@@ -3073,6 +3072,7 @@ def _run_gpu_sniff_test(tag):
 
 
 def post_training_step_callbacks(
+    state: GlobalState,
     model,
     optimizer,
     opt_param_scheduler,
@@ -3138,7 +3138,7 @@ def post_training_step_callbacks(
         args.gpu_sniff_test_interval is not None
         and iteration % args.gpu_sniff_test_interval == 0
     ):
-        _run_gpu_sniff_test(f'iteration {iteration:7d}')
+        _run_gpu_sniff_test(f'iteration {iteration:7d}', state.timers)
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -3163,7 +3163,7 @@ def checkpoint_and_decide_exit(
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     # Exit based on signal handler.
     saved_checkpoint = False
@@ -3172,6 +3172,7 @@ def checkpoint_and_decide_exit(
         if any(signal_handler.signals_received()):
             if args.save:
                 save_checkpoint_and_time(
+                    state,
                     iteration,
                     model,
                     optimizer,
@@ -3187,6 +3188,7 @@ def checkpoint_and_decide_exit(
     # Regular save (persistent and non-persistent).
     if args.save and args.save_interval and iteration % args.save_interval == 0:
         save_checkpoint_and_time(
+            state,
             iteration,
             model,
             optimizer,
@@ -3203,6 +3205,7 @@ def checkpoint_and_decide_exit(
         and iteration % args.non_persistent_save_interval == 0
     ):
         save_checkpoint_and_time(
+            state,
             iteration,
             model,
             optimizer,
@@ -3225,6 +3228,7 @@ def checkpoint_and_decide_exit(
         if done:
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(
+                    state,
                     iteration,
                     model,
                     optimizer,
@@ -3247,6 +3251,7 @@ def checkpoint_and_decide_exit(
     ):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
+                state,
                 iteration,
                 model,
                 optimizer,
@@ -3286,7 +3291,7 @@ def train(
         preserves the default behavior.
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
     injected_forward_step_func = prepare_forward_step_func(forward_step_func, state)
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -3480,7 +3485,7 @@ def train(
 
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
-        _run_gpu_sniff_test('before training')
+        _run_gpu_sniff_test('before training', timers)
 
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
@@ -3692,6 +3697,7 @@ def train(
                 )
                 if args.save is not None:
                     save_checkpoint_and_time(
+                            state,
                         iteration,
                         model,
                         optimizer,
@@ -3776,6 +3782,7 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
+                state,
                 injected_forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
@@ -3792,6 +3799,7 @@ def train(
                 setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
+                state,
                 iteration,
                 model,
                 optimizer,
@@ -3905,6 +3913,7 @@ def train(
         else:
             learning_rate = None
         report_memory_flag = training_log(
+            state,
             loss_dict,
             total_loss_dict,
             learning_rate,
@@ -3988,6 +3997,7 @@ def train(
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
         # (it is reset inside the callback after logging).
         num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
+            state,
             model,
             optimizer,
             opt_param_scheduler,
@@ -4085,7 +4095,7 @@ def evaluate(
 ):
     """Evaluation."""
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
     injected_forward_step_func = prepare_forward_step_func(forward_step_func, state)
 
     timers('evaluate', log_level=0).start(barrier=True)
@@ -4167,7 +4177,7 @@ def evaluate(
                 p2p_communicator=p2p_communicator,
             )
             ft_integration.on_eval_step_end()
-            config.timers = get_timers()
+            config.timers = state.timers
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:

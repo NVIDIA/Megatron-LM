@@ -369,7 +369,7 @@ def forward_step(state: GlobalState, data_iterator, model: HybridModel):
         model (HybridModel): The GPT Model
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     # One-time per-component params-norm breakdown (mirrors calc_params_l2_norm).
     global _logged_params_norm

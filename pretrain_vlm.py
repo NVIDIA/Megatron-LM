@@ -393,7 +393,7 @@ def forward_step(state: GlobalState, data_iterator, model: LLaVAModel):
         output_tensor (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         loss_func (callable): Loss function with a loss mask specified.
     """
-    timers = get_timers()
+    timers = state.timers
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()

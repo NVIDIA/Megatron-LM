@@ -282,7 +282,7 @@ def forward_step(state: GlobalState, data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
-    timers = get_timers()
+    timers = state.timers
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()

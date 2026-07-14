@@ -201,7 +201,7 @@ def forward_step(state: GlobalState, data_iterator, model: GPTModel, loss_only: 
     """
     runtime_state = get_rl_runtime_state()
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     timers('batch-generator', log_level=2).start()
     global stimer
