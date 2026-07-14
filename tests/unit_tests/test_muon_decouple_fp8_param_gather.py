@@ -67,9 +67,27 @@ def _snapshot_masters(model):
     }
 
 
-def _snapshot_params(model):
-    # Only non-quantized (bf16) params; fp8 weights are compared via master + grad.
-    return {n: p.detach().clone() for n, p in model.named_parameters() if not _is_quantized(p)}
+def _snapshot_params(model, include_quantized=False):
+    # By default only non-quantized (bf16) params; fp8 weights are compared via master + grad.
+    # With include_quantized, fp8 params are dequantized so gathered fp8 bytes are checked directly.
+    out = {}
+    for n, p in model.named_parameters():
+        if _is_quantized(p):
+            if include_quantized:
+                out[n] = p.data.dequantize().detach().clone().float()
+        else:
+            out[n] = p.detach().clone()
+    return out
+
+
+def _snapshot_layerwise_grad_data(ddp):
+    # grad_data of the non-DistOpt LayerWise buffers (reused as the fp8 all-gather's bf16
+    # receive buffer, which the param-sync finalize must re-zero).
+    return [
+        buf.grad_data.detach().clone()
+        for buf in (ddp.buffers + ddp.expert_parallel_buffers)
+        if not buf.ddp_config.use_distributed_optimizer
+    ]
 
 
 @torch.no_grad()
@@ -381,20 +399,11 @@ class TestMuonDecoupleFP8ParamGather:
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     def test_force_sync_finalizes_pending_layerwise_gather(self, fp8_recipe):
-        """``start_param_sync(force_sync=True)`` with a PENDING async LayerWise gather
-        (the ``disable_forward_pre_hook`` path taken before eval / checkpoint save) must
-        finalize the gather exactly like the forward-pre-hook (``finish_param_sync``) path:
-        the gathered whole-params must land in every rank's ``param.data`` (for gathered fp8
-        params the optimizer's own master->model copy is skipped via
-        ``_layer_wise_fp8_gathered``, so without the copy-back even the owner rank keeps stale
-        weights), and the reused grad buffer must be re-zeroed so the next backward does not
-        accumulate on top of the gather payload. Both are asserted as equality against the
-        finish_param_sync reference path.
-
-        Requires data-parallel size >= 2: at dp==1 the LayerWise all-gather early-returns
-        (no gather, no grad-buffer reuse, no copy-back), so the force_sync finalize is a
-        no-op and the bug/fix is not exercised. Run this file with ``torchrun
-        --nproc_per_node>=2``.
+        """force_sync finalize (eval/ckpt ``disable_forward_pre_hook`` path) must match the
+        ``finish_param_sync`` forward-pre-hook path: gathered params land in every rank's
+        ``param.data`` and the reused grad buffer is re-zeroed. Both asserted equal against
+        the reference path. Needs dp>=2 (dp==1 early-returns the all-gather); run with
+        ``torchrun --nproc_per_node>=2``.
         """
         if torch.distributed.get_world_size() < 2:
             pytest.skip(
@@ -407,26 +416,7 @@ class TestMuonDecoupleFP8ParamGather:
         if fp8_recipe == "mxfp8" and arch < 10:
             pytest.skip("mxfp8 requires Blackwell architecture or newer")
 
-        def _snapshot_params(model):
-            # fp8 params compared via dequantize (stale fp8 bytes => different dequant).
-            return {
-                n: (p.data.dequantize() if _is_quantized(p) else p.data).detach().clone().float()
-                for n, p in model.named_parameters()
-            }
-
-        def _snapshot_layerwise_grad(ddp):
-            # grad_data of the non-DistOpt LayerWise buffers, which the fp8 all-gather reuses
-            # as its bf16 receive buffer and the finalize must re-zero.
-            return [
-                buf.grad_data.detach().clone()
-                for buf in (ddp.buffers + ddp.expert_parallel_buffers)
-                if not buf.ddp_config.use_distributed_optimizer
-            ]
-
         def _step_and_dispatch():
-            # fp8_param_gather ON + overlap ON; one full train step, then dispatch the
-            # post-step async param all-gather explicitly (the training loop's next
-            # forward pre-hook would otherwise do it lazily).
             args, model, opt = self._build(True, fp8_recipe, True)
             self._run_steps(args, model, opt, 1)
             ddp = model[0]
@@ -438,24 +428,22 @@ class TestMuonDecoupleFP8ParamGather:
             return model, ddp, groups
 
         with deterministic_mode():
-            # Reference: finish the pending gather through the normal overlap path.
+            # Reference: finish the pending gather through the forward-pre-hook path.
             ref_model, ref_ddp, ref_groups = _step_and_dispatch()
             for g in ref_groups:
                 if g.param_gather_handle is not None:
                     g.finish_param_sync(skip_next_bucket_dispatch=True)
-            ref_params = _snapshot_params(ref_model[0])
-            ref_grads = _snapshot_layerwise_grad(ref_ddp)
+            ref_params = _snapshot_params(ref_model[0], include_quantized=True)
+            ref_grads = _snapshot_layerwise_grad_data(ref_ddp)
             del ref_model, ref_ddp, ref_groups
             gc.collect()
             torch.cuda.empty_cache()
 
-            # Under test: force-sync with the handle still pending (eval/ckpt path). Both
-            # builds start from the same deterministic init + identical step, so the
-            # force_sync result must match the finish_param_sync reference exactly.
+            # Under test: force-sync with the handle still pending.
             model, ddp, groups = _step_and_dispatch()
             ddp.disable_forward_pre_hook(param_sync=True)
-            got_params = _snapshot_params(model[0])
-            got_grads = _snapshot_layerwise_grad(ddp)
+            got_params = _snapshot_params(model[0], include_quantized=True)
+            got_grads = _snapshot_layerwise_grad_data(ddp)
 
             for g in groups:
                 for bucket in g.buckets:
