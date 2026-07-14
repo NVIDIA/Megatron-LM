@@ -6,6 +6,7 @@ import logging
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -13,6 +14,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
+    Partial,
     Placements,
     Replicate,
     fully_shard,
@@ -102,13 +104,13 @@ def _flat_placements() -> Placements:
 
 
 def _hsdp_placements() -> Placements:
-    """HSDP: params/gradients/optimizer replicated across DP-outer (axis 0),
-    sharded within DP-inner (axis 1). main_grad rests DP-outer-replicated and
-    backs .grad; the DP-outer all-reduce is deferred to the last microbatch."""
+    """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
+    DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
+    all-reduced to [Replicate, Flat] on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
         parameter=[Replicate(), Flat()],
-        gradient=[Replicate(), Flat()],
+        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
         optimizer=[Replicate(), Flat()],
     )
 

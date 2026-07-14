@@ -261,14 +261,17 @@ class FsdpParameterGroup:
     def reduce_gradients(self, is_last_microbatch: bool = True) -> None:
         """Reduce full local gradients into sharded parameter gradients.
 
-        Sharded (Flat) mesh axes are reduce-scattered into main_grad every
-        backward and accumulated through the standard zero_grad contract:
-        ``set_to_none=True`` clears the sharded grads so main_grad is overwritten,
-        while ``set_to_none=False`` keeps them as views into a zeroed main_grad so
-        they accumulate. Replicated (DP-outer) mesh axes are all-reduced only on
-        the last microbatch, in place, so ``.grad`` -- a view into main_grad --
-        becomes the fully reduced gradient before ``optimizer.step()``. With every
-        axis Flat (plain DP) this is the previous every-backward behavior.
+        main_grad rests DP-outer-Partial (Partial where main_weight is Replicate)
+        between microbatches: each backward reduce-scatters DP-inner into it and
+        accumulates through the standard zero_grad contract (``set_to_none=True``
+        clears the sharded grads so main_grad is overwritten; ``set_to_none=False``
+        keeps them as views into a zeroed main_grad so they accumulate). The last
+        microbatch all-reduces the DP-outer axes in place, finalizing main_grad to
+        main_weight's placements so ``.grad`` -- a view into main_grad -- is the
+        fully reduced gradient before ``optimizer.step()``. A finalized main_grad
+        marks a completed step, so the next reduction resets it back to the
+        accumulation placement. With every axis Flat (plain DP) main_grad is
+        already finalized and this is the previous every-backward behavior.
         """
         assert self.main_grad is not None
 
@@ -298,11 +301,11 @@ class FsdpParameterGroup:
                 grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
             )
 
-        # Reduce-scatter the sharded (Flat) axes now; keep replicated (DP-outer)
-        # axes Partial so their all-reduce can be deferred to the last microbatch.
+        # DP-outer axes (Replicate in main_weight) accumulate as Partial and are
+        # all-reduced only on the last microbatch.
         deferred_axes = [
             axis
-            for axis, placement in enumerate(self.main_grad.placements)
+            for axis, placement in enumerate(self.main_weight.placements)
             if isinstance(placement, Replicate)
         ]
         if deferred_axes and self._symm_mem_pool is not None:
@@ -311,12 +314,17 @@ class FsdpParameterGroup:
             )
         accumulation_placements = tuple(
             Partial(partial_op) if isinstance(placement, Replicate) else placement
-            for placement in self.main_grad.placements
+            for placement in self.main_weight.placements
         )
+
+        # A finalized main_grad (placements == main_weight) means the previous step
+        # is done; reset it to the DP-outer-Partial accumulation placement.
+        if self.main_grad.placements == self.main_weight.placements:
+            self.main_grad.placements = accumulation_placements
         reduced = self._reduce_grad_axis(partial_grad, accumulation_placements)
 
-        # set_to_none=True cleared the sharded grads -> overwrite main_grad; else
-        # they are views into a zeroed main_grad -> accumulate into it.
+        # set_to_none=True cleared the sharded grads -> overwrite main_grad and
+        # install .grad; else they are views into a zeroed main_grad -> accumulate.
         if has_grad(self.sharded_parameters):
             self.main_grad.local_buffer.add_(reduced.local_buffer)
         else:
@@ -331,6 +339,9 @@ class FsdpParameterGroup:
                     op=dist.ReduceOp.AVG,
                     group=self.mesh.get_group(axis),
                 )
+            self.main_grad.placements = self.main_weight.placements
+            for index, sharded_parameter in enumerate(self.sharded_parameters):
+                sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
         for parameter in self.unsharded_parameters:
             parameter.grad = None
