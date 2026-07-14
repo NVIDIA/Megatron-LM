@@ -579,17 +579,12 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
         seq_len_each = align
     total_seq_len = n_seqs * seq_len_each
 
-    text = torch.randint(
-        0, 10000, (total_seq_len + 1,), dtype=torch.int64, device=device
-    )
+    text = torch.randint(0, 10000, (total_seq_len + 1,), dtype=torch.int64, device=device)
     tokens = text[:-1].contiguous()  # (total_seq_len,)
     labels = text[1:].contiguous()  # (total_seq_len,)
     loss_mask = torch.ones((total_seq_len,), dtype=torch.float32, device=device)
     position_ids = torch.cat(
-        [
-            torch.arange(seq_len_each, dtype=torch.int64, device=device)
-            for _ in range(n_seqs)
-        ]
+        [torch.arange(seq_len_each, dtype=torch.int64, device=device) for _ in range(n_seqs)]
     )  # (total_seq_len,)
 
     cu_seqlens = torch.cat(
