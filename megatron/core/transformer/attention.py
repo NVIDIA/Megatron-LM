@@ -82,10 +82,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
