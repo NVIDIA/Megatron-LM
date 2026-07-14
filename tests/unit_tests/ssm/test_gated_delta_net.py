@@ -349,9 +349,10 @@ class TestGatedDeltaNet:
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
-            kernel_inputs, gate_out = gdn._prepare_input_for_gated_delta_rule(
+            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
                 qkv, gate, gate_feats, A_log_mock, dt_bias_mock, batch, seq_len
             )
+            gate_out = kernel_inputs.pop("gate")
 
         assert set(kernel_inputs.keys()) == expected_keys
         query, key, value, g = (kernel_inputs[name] for name in ("q", "k", "v", "g"))
