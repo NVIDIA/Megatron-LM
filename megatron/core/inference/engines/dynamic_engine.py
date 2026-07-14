@@ -23,6 +23,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.communication_utils import is_pipeline_first_stage
 from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -40,6 +41,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -1148,13 +1150,37 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        imgs: Optional[Tensor] = None,
+        num_tiles: Optional[Tensor] = None,
+        num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[Tensor] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
+
+        Supports both text-only and multimodal requests. For text-only, call
+        with just (request_id, prompt, sampling_params). For multimodal, also
+        pass imgs and either (num_tiles + num_img_embeddings_per_tile) for static
+        resolution or imgs_sizes for dynamic resolution.
+
+        When multimodal kwargs are provided the method will:
+        1. Expand image tokens in the prompt (replace <image> with padding).
+        2. Run the vision encoder to produce image embeddings.
+        3. Store the embeddings and mask in the context for later use by the
+           controller's forward step.
 
         Args:
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] or
+                [1, total_patches, patch_features] (or None).
+            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None).
+                Static resolution.
+            num_img_embeddings_per_tile (int): Number of image embeddings per tile.
+                Static resolution.
+            imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
+                Dynamic resolution.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1189,18 +1215,110 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        # Initialize request.
-        request = DynamicInferenceRequest(
+        if imgs is not None or num_tiles is not None or imgs_sizes is not None:
+            request = self._build_vlm_request(
+                request_id=request_id,
+                prompt_str=prompt_str,
+                tokens=tokens,
+                sampling_params=sampling_params,
+                imgs=imgs,
+                num_tiles=num_tiles,
+                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                imgs_sizes=imgs_sizes,
+            )
+        else:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt=prompt_str,
+                prompt_tokens=tokens,
+                sampling_params=sampling_params,
+                block_size_tokens=self.context.block_size_tokens,
+                enable_prefix_caching=self.context.enable_prefix_caching,
+            )
+
+        return self._add_request(request)
+
+    def _build_vlm_request(
+        self,
+        *,
+        request_id: int,
+        prompt_str: Optional[str],
+        tokens: Tensor,
+        sampling_params: Optional[SamplingParams],
+        imgs: Optional[Tensor],
+        num_tiles: Optional[Tensor],
+        num_img_embeddings_per_tile: int,
+        imgs_sizes: Optional[Tensor],
+    ) -> DynamicVLMInferenceRequest:
+        """Expand image tokens, run the vision encoder, register per-request
+        image data on the context, and return a DynamicVLMInferenceRequest.
+        """
+        # PP>1 needs a non-first-stage embedding recv path (the wrapper's
+        # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
+        # correct: non-first stages would see None embeddings but a non-None
+        # mask and silently skip image splicing.
+        pp_group = self.controller.pp_group
+        if pp_group is not None and torch.distributed.is_initialized():
+            pp_world_size = torch.distributed.get_world_size(pp_group)
+            if pp_world_size > 1:
+                raise NotImplementedError(
+                    "Dynamic VLM inference currently supports pipeline-parallel "
+                    "world size 1 only; PP>1 requires the non-first-stage "
+                    "embedding recv path which is not yet available upstream."
+                )
+
+        device = torch.cuda.current_device()
+        if imgs is not None:
+            imgs = imgs.to(device=device)
+        if num_tiles is not None:
+            num_tiles = num_tiles.to(device=device)
+        if imgs_sizes is not None:
+            imgs_sizes = imgs_sizes.to(device=device)
+
+        is_dynamic_resolution = imgs_sizes is not None and imgs is not None
+        total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
+        num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+        has_images = is_dynamic_resolution or num_img_embeddings > 0
+
+        mask_tensor: Optional[Tensor] = None
+        image_embeddings: Optional[Tensor] = None
+
+        if has_images:
+            token_list: List[List[int]] = [tokens.tolist()]
+            expanded_tokens_list, mask_list = (
+                self.controller.inference_wrapped_model.expand_image_tokens(
+                    token_list, num_tiles=num_tiles, imgs_sizes=imgs_sizes
+                )
+            )
+            tokens = torch.tensor(expanded_tokens_list[0], dtype=torch.int64, device=device)
+            mask_tensor = torch.tensor(
+                [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+            )
+
+        if has_images and imgs is not None and is_pipeline_first_stage(self.controller.pp_group):
+            with torch.inference_mode():
+                image_embeddings = self.controller.inference_wrapped_model._forward_vision_encoder(
+                    imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
+                )
+
+        self.context.add_vlm_request_data(
+            request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
+        )
+
+        return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            decoder_seq_length=0,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
         )
-
-        # Add request.
-        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -1523,6 +1641,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
+
+        # Remove VLM data for finished requests from the context.
+        for record in finished_request_records:
+            req = record[-1]
+            self.context.remove_vlm_request_data(req.request_id)
 
         return active_request_ids, finished_request_records
 
