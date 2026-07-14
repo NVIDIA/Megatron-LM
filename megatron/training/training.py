@@ -150,6 +150,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import is_hybrid_model
+from megatron.training.utils.utils import prepare_forward_step_func
 from megatron.training.state import GlobalState, TrainState
 
 # Local.
@@ -1483,6 +1484,7 @@ def pretrain(
             )
         else:
             evaluate_and_print_results(
+                state,
                 prefix, forward_step_func,
                 valid_data_iterator, model,
                 iteration, process_non_loss_data_func, model_cfg,
@@ -1494,6 +1496,7 @@ def pretrain(
     if train_state.do_test:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
+            state,
             prefix,
             forward_step_func,
             test_data_iterator,
@@ -3284,6 +3287,7 @@ def train(
     """
     args = get_args()
     timers = get_timers()
+    injected_forward_step_func = prepare_forward_step_func(forward_step_func, state)
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -3772,7 +3776,7 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                injected_forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
@@ -3955,7 +3959,7 @@ def train(
                     training_model=rl_training_model,
                 )
             else:
-                evaluate_and_print_results(prefix, forward_step_func,
+                evaluate_and_print_results(state, prefix, injected_forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
@@ -4067,6 +4071,7 @@ def train(
 
 
 def evaluate(
+    state: GlobalState,
     forward_step_func,
     data_iterator,
     model,
@@ -4081,6 +4086,7 @@ def evaluate(
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+    injected_forward_step_func = prepare_forward_step_func(forward_step_func, state)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -4148,7 +4154,7 @@ def evaluate(
             config.timers = None
             ft_integration.on_eval_step_start()
             loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
+                forward_step_func=injected_forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
@@ -4214,7 +4220,7 @@ def evaluate(
             collected_non_loss_data = non_loss_data_func(model)
         elif process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
-                forward_step_func=forward_step_func,
+                forward_step_func=injected_forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
@@ -4244,6 +4250,7 @@ def evaluate(
 
 
 def evaluate_and_print_results(
+    state: GlobalState,
     prefix,
     forward_step_func,
     data_iterator,
@@ -4304,6 +4311,7 @@ def evaluate_and_print_results(
             else:
                 suffix = f"-{index}"
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+            state,
             forward_step_func,
             iterator,
             model,

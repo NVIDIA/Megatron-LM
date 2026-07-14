@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import get_submodules, import_module
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.state import GlobalState
 from pretrain_gpt import loss_func
 
 
@@ -381,7 +382,7 @@ def get_batch(data_iterator):
     return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
 
 
-def forward_step(data_iterator, model: LLaVAModel):
+def forward_step(state: GlobalState, data_iterator, model: LLaVAModel):
     """Forward training step.
 
     Args:
