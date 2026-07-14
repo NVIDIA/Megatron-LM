@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
@@ -30,10 +31,13 @@ def _make_param(shape, dtype=torch.bfloat16, **attrs):
     return param
 
 
-def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
+def _make_ddp_config(
+    pad_for_high_busbw=False, grad_reduce_in_fp32=True, use_layer_wise_param_layout=True
+):
     cfg = mock.Mock()
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
+    cfg.use_layer_wise_param_layout = use_layer_wise_param_layout
     return cfg
 
 
@@ -391,3 +395,38 @@ class TestLayerwiseFullParamLayout:
         cfg = _make_ddp_config()
         layout = _LWO.compute_full_param_layout([dense, expert], None, dp_size, cfg)
         assert len(layout.layouts) == 2
+
+    def test_layerwise_layout_falls_back_when_padding_overhead_is_high(self):
+        """High-padding LayerWise buffers should fall back to byte-level DistOpt layout."""
+        dp_size = 4
+        param = _make_param((32, 32), is_managed_by_layer_wise_optimizer=True)
+        cfg = _make_ddp_config()
+
+        full_layout = _LWO.compute_full_param_layout([param], None, dp_size, cfg)
+        key = BufferKey(torch.bfloat16, torch.float, False, True)
+        layout = full_layout.layouts[key]
+
+        expected_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+            [param], None, dp_size, cfg, [0]
+        )
+        assert layout.layerwise_fallback is True
+        assert layout.param_index_map == expected_layout.param_index_map
+        assert layout.bucket_indices == expected_layout.bucket_indices
+        assert layout.per_bucket_numel_unpadded == expected_layout.per_bucket_numel_unpadded
+        assert layout.param_indices == [0]
+
+    def test_decoupled_layerwise_layout_uses_compact_default_without_fallback(self):
+        """Decoupled LayerWise buffers keep the compact non-DistOpt layout."""
+        dp_size = 4
+        param = _make_param((32, 32), is_managed_by_layer_wise_optimizer=True)
+        cfg = _make_ddp_config(use_layer_wise_param_layout=False)
+
+        full_layout = _LWO.compute_full_param_layout([param], None, dp_size, cfg)
+        key = BufferKey(torch.bfloat16, torch.float, False, True)
+        layout = full_layout.layouts[key]
+
+        assert layout.layerwise_fallback is False
+        assert layout.param_index_map[param] == (0, param.numel(), 0)
+        assert layout.bucket_indices == [(0, param.numel())]
+        assert layout.per_bucket_numel_unpadded == [param.numel()]
+        assert layout.param_indices == [0]
