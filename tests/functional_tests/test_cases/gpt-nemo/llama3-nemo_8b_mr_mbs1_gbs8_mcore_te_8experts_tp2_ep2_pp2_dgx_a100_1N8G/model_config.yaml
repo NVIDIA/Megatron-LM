@@ -1,0 +1,32 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  SKIP_PYTEST: 1
+  NVTE_APPLY_QK_LAYER_SCALING: 1
+MODEL_ARGS:
+  trainer.num_nodes: 1
+  trainer.devices: 8
+  trainer.max_steps: 50
+  trainer.val_check_interval: 50
+  trainer.limit_val_batches: 50
+  trainer.strategy.tensor_model_parallel_size: 2
+  trainer.strategy.pipeline_model_parallel_size: 2
+  trainer.strategy.expert_model_parallel_size: 2
+  trainer.strategy.context_parallel_size: 1
+  trainer.strategy.sequence_parallel: True
+  model.config.num_layers: 12
+  model.config.hidden_size: 768
+  model.config.num_attention_heads: 16
+  model.config.ffn_hidden_size: 3072
+  model.config.apply_query_key_layer_scaling: True
+  model.config.bias_activation_fusion: False
+  model.config.add_bias_linear: False
+  model.config.num_moe_experts: 8
+  model.config.moe_grouped_gemm: True
+  model.config.moe_router_load_balancing_type: aux_loss
+  model.config.moe_router_topk: 2
+  model.config.moe_aux_loss_coeff: 1e-2
+  data.micro_batch_size: 1
+  data.global_batch_size: 8
+  data.seq_length: 2048
+  log.log_dir: ${CHECKPOINT_SAVE_PATH}
+TEST_TYPE: regular
