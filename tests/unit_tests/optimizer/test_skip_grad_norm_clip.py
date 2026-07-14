@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Targeted tests for the Muon skip-grad-norm-clip PR (#5395, revision 937d8677d).
+"""Targeted tests for the Muon skip-grad-norm-clip PR (#5395).
 
 Covers the four reviewer findings:
   B1 (Bug1, critical): skip_grad_norm_clip is set on the *bf16 wrapper* members of
@@ -7,10 +7,13 @@ Covers the four reviewer findings:
       results-empty (Muon-only) DIRECT path; Adam subs in a mix stay unflagged.
   B2 (Bug2, high): the flag is gated on isinstance(opt, OrthogonalizedOptimizer) so only
       the Muon family is flagged; SOAP/Lion keep clipping.
-  B3 (Bug3, medium): ChainedOptimizer._get_grad_norm_skip_threshold() excludes flagged
-      subs' grads so a Muon sub's huge grad cannot trip the skip threshold for an Adam sub.
+  B3 (Bug3, medium): the norm used for clipping and the skip threshold
+      (_get_grad_norm_over over the non-exempt subs) excludes flagged subs' grads so a
+      Muon sub's huge grad cannot trip the skip threshold for an Adam sub.
   B4 (Bug4, low): should_clip is False for a Muon-only chain, so _compute_grad_norms_by_group
       (and its AllReduce) is not run; a clippable Adam chain still runs it.
+  B5 (review point 5): clip_grad_by_total_norm_fp32 receives the narrowed norm (clippable
+      subs only), so Adam is not clipped according to Muon's huge grads.
 
 Run: torchrun --nproc_per_node=2 -m pytest tests/unit_tests/optimizer/test_skip_grad_norm_clip.py
      with NVIDIA_PYTORCH_VERSION>25.05 set.
@@ -132,12 +135,12 @@ class TestSkipGradNormClip:
         _, opt = self._build(MuonOnly(), 'muon', use_layer_wise=True)
         assert isinstance(opt, LayerWiseDistributedOptimizer)
         # The DIRECT path returns the container; the container flag must be True (all-orthog).
-        assert getattr(opt, 'skip_grad_norm_clip', False) is True
+        assert opt.skip_grad_norm_clip is True
         assert len(opt.chained_optimizers) >= 1
         for i, sub in enumerate(opt.chained_optimizers):
             # bf16 re-wraps base optimizers in Float16OptimizerWithFloat16Params; the flag must
             # be visible on the WRAPPER (not only the raw sub it forwards to).
-            assert getattr(sub, 'skip_grad_norm_clip', False) is True, (
+            assert sub.skip_grad_norm_clip is True, (
                 f"member {i} ({type(sub).__name__}) wrapping {type(_inner(sub)).__name__} "
                 f"is not flagged"
             )
@@ -148,10 +151,7 @@ class TestSkipGradNormClip:
         the container must NOT be flagged (not all base subs are orthogonalizing)."""
         _, opt = self._build(MuonAdamMix(), 'muon', use_layer_wise=True)
         assert isinstance(opt, ChainedOptimizer)
-        flagged = {
-            i: getattr(s, 'skip_grad_norm_clip', False)
-            for i, s in enumerate(opt.chained_optimizers)
-        }
+        flagged = {i: s.skip_grad_norm_clip for i, s in enumerate(opt.chained_optimizers)}
         orthog = {i: _is_orthogonalizing(s) for i, s in enumerate(opt.chained_optimizers)}
         # exactly the orthogonalizing (Muon) subs are flagged
         for i, s in enumerate(opt.chained_optimizers):
@@ -161,24 +161,24 @@ class TestSkipGradNormClip:
         assert any(orthog.values()), "expected a Muon sub"
         assert not all(orthog.values()), "expected an Adam sub in the mix"
         # container must not claim skip when a non-orthogonalizing sub is present
-        assert getattr(opt, 'skip_grad_norm_clip', False) is False
+        assert opt.skip_grad_norm_clip is False
 
     # ================================ B2 (Bug2) ================================
     def test_b2_muon_flagged_lion_not(self):
         """isinstance(OrthogonalizedOptimizer) gate: muon flagged, lion (scalar) not flagged."""
         _, muon_opt = self._build(nn.Linear(64, 32, bias=False), 'muon', use_layer_wise=False)
-        assert any(getattr(s, 'skip_grad_norm_clip', False) for s in muon_opt.chained_optimizers)
+        assert any(s.skip_grad_norm_clip for s in muon_opt.chained_optimizers)
         for s in muon_opt.chained_optimizers:
-            assert getattr(s, 'skip_grad_norm_clip', False) == _is_orthogonalizing(s)
+            assert s.skip_grad_norm_clip == _is_orthogonalizing(s)
 
         _, lion_opt = self._build(nn.Linear(64, 32, bias=False), 'lion', use_layer_wise=False)
         for s in lion_opt.chained_optimizers:
-            assert getattr(s, 'skip_grad_norm_clip', False) is False, "Lion must keep clipping"
+            assert s.skip_grad_norm_clip is False, "Lion must keep clipping"
             assert not _is_orthogonalizing(s)
 
     # ================================ B3 (Bug3) ================================
     def test_b3_threshold_excludes_muon_grad(self):
-        """_get_grad_norm_skip_threshold() excludes the flagged (Muon) sub's huge grad, so a
+        """The narrowed clippable-subs norm excludes the flagged (Muon) sub's huge grad, so a
         well-behaved Adam sub is not wrongly skipped. Contrast with get_grad_norm() (full)."""
         model, opt = self._build(MuonAdamMix(), 'muon', use_layer_wise=True, clip_grad=1.0)
         assert isinstance(opt, ChainedOptimizer)
@@ -203,10 +203,11 @@ class TestSkipGradNormClip:
 
         opt.prepare_grads()
         full = float(opt.get_grad_norm())
-        threshold_norm = float(opt._get_grad_norm_skip_threshold())
+        clippable = [s for s in opt.chained_optimizers if not s.skip_grad_norm_clip]
+        threshold_norm = float(opt._get_grad_norm_over(clippable))
         if Utils.rank == 0:
             print(
-                f"\n[B3] get_grad_norm()={full:.3e}  _get_grad_norm_skip_threshold()={threshold_norm:.3e}"
+                f"\n[B3] get_grad_norm()={full:.3e}  narrowed clippable norm={threshold_norm:.3e}"
             )
         # the skip-threshold norm must be far smaller than the full norm (Muon grad excluded)
         assert threshold_norm < full
@@ -228,6 +229,37 @@ class TestSkipGradNormClip:
             g.fill_(1.0e5 if p.dim() >= 2 else 1.0e-4)
         update_successful, grad_norm, _ = opt.step()
         assert update_successful is True, "update was wrongly skipped despite small non-Muon norm"
+
+    # ================================ B5 (review point 5) ================================
+    def test_b5_clip_uses_narrowed_norm(self):
+        """clip_grad_by_total_norm_fp32 must receive the norm over clippable (non-Muon)
+        subs only, so Adam is not clipped according to Muon's huge grads."""
+        import megatron.core.optimizer.optimizer as opt_mod
+
+        model, opt = self._build(MuonAdamMix(), 'muon', use_layer_wise=True, clip_grad=1.0)
+        self._forward_backward(model)
+        for p in model.parameters():
+            g = p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
+            if g is None:
+                continue
+            g.fill_(1.0e5 if p.dim() >= 2 else 1.0e-4)
+
+        captured = []
+        orig = opt_mod.clip_grad_by_total_norm_fp32
+
+        def capturing(params, max_norm, total_norm, **kwargs):
+            captured.append(float(total_norm))
+            return orig(params, max_norm=max_norm, total_norm=total_norm, **kwargs)
+
+        opt_mod.clip_grad_by_total_norm_fp32 = capturing
+        try:
+            update_successful, full_norm, _ = opt.step()
+        finally:
+            opt_mod.clip_grad_by_total_norm_fp32 = orig
+        assert update_successful is True
+        assert captured, "expected the Adam sub to be clipped"
+        assert all(n < 10.0 for n in captured), f"clip used un-narrowed norm(s): {captured}"
+        assert float(full_norm) > 1.0e4, "reported grad_norm should remain the full norm"
 
     # ================================ B4 (Bug4) ================================
     def test_b4_muon_only_skips_clip_norm_compute(self):
@@ -266,7 +298,7 @@ class TestSkipGradNormClip:
     # ===== distributed-optimizer path: step() must succeed (was the f207dc2-fixed regression) =====
     def test_distopt_path_step_succeeds(self):
         """Muon LayerWise chained with an Adam DistributedOptimizer => non-shared grad-stats
-        groups. _get_grad_norm_skip_threshold() must handle that (per-sub fallback) instead of
+        groups. _get_grad_norm_over() must handle that (per-sub fallback) instead of
         asserting a shared group. Regressed in 937d8677d, fixed in f207dc2."""
         from megatron.training.training import wrap_model_chunks_with_ddp
 

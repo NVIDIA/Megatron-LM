@@ -143,6 +143,10 @@ class MegatronOptimizer(ABC):
         init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
+    # Orthogonalizing (Muon-family) optimizers are exempt from magnitude-based grad-norm
+    # clipping and the grad-norm skip threshold; their updates are scale-invariant (#5394).
+    skip_grad_norm_clip: bool = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -1568,80 +1572,43 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_grad_norm()
-        if self.grads_states_parallel_group_is_shared():
-            grads_for_norm = []
-            for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_grads_for_grad_norm()
-            grad_norm = get_grad_norm_fp32(
-                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-            )
-        else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
-        return grad_norm
+        return self._get_grad_norm_over(self.chained_optimizers)
 
     @torch.no_grad()
-    def _get_grad_norm_skip_threshold(self):
-        """Grad norm used for the ``grad_norm_skip_threshold`` comparison.
+    def _get_grad_norm_over(self, optimizers: List[MegatronOptimizer]):
+        """Combined grad norm over ``optimizers`` (a subset of ``chained_optimizers``).
 
-        This is the same quantity as :meth:`get_grad_norm` but EXCLUDES the gradients of
-        sub-optimizers flagged with ``skip_grad_norm_clip`` (orthogonalizing / Muon-family,
-        see issue #5394). A Muon-managed sub can produce a combined grad norm of order 1e7
-        whose magnitude is irrelevant (Newton-Schulz discards it); folding it into the
-        shared norm would wrongly trip the skip threshold for well-behaved Adam-managed
-        subs. Excluding those grads gives each non-skipped sub a threshold check against a
-        norm computed only over the params that are actually magnitude-clipped.
-
-        When no sub is flagged, this returns exactly :meth:`get_grad_norm` (no behavior
-        change for non-Muon users). The distributed all-reduce semantics of
-        :func:`get_grad_norm_fp32` are preserved; because ``skip_grad_norm_clip`` is fixed
-        at construction it is identical across ranks, so the set of collectives issued here
-        is globally consistent.
+        One code path serves :meth:`get_grad_norm` (all subs) and the clip / skip-threshold
+        norm (non-exempt subs only, see #5394), mirroring the shared / non-shared
+        grad-stats-group handling for any subset.
         """
-        # Fast path / no-op-equivalence: if nothing is flagged, reuse get_grad_norm so the
-        # value (and the collectives issued) are bit-for-bit the existing behavior.
-        if not any(
-            getattr(optimizer, 'skip_grad_norm_clip', False)
-            for optimizer in self.chained_optimizers
-        ):
-            return self.get_grad_norm()
-
-        non_skip = [
-            optimizer
-            for optimizer in self.chained_optimizers
-            if not getattr(optimizer, 'skip_grad_norm_clip', False)
-        ]
-        if not non_skip:
-            # Everything is skip-flagged (e.g. a Muon-only chain). There is nothing to
-            # threshold; skip-flagged subs are exempt from the threshold check anyway.
+        if not optimizers:
             return 0.0
-        if len(non_skip) == 1:
-            # Single non-skip sub: defer to its own norm (handles its own group sharedness).
-            return non_skip[0].get_grad_norm()
-
-        # Determine grad-stats sharedness over the NON-SKIP subs only, not the whole
-        # container: the container-level get_grad_stats_parallel_group() asserts that ALL
-        # subs share a group, which fails on the distributed-optimizer path where a Muon
-        # LayerWise sub and an Adam DistributedOptimizer sub have different grad-stats
-        # groups. This mirrors get_grad_norm()'s shared / non-shared handling.
+        if len(optimizers) == 1:
+            return optimizers[0].get_grad_norm()
         try:
-            ref_group = non_skip[0].get_grad_stats_parallel_group()
-            shared = all(o.get_grad_stats_parallel_group() == ref_group for o in non_skip)
+            reference_group = optimizers[0].get_grad_stats_parallel_group()
+            shared = all(
+                optimizer.get_grad_stats_parallel_group() == reference_group
+                for optimizer in optimizers
+            )
         except AssertionError:
+            # A nested ChainedOptimizer member cannot report a single group.
             shared = False
         if shared:
             grads_for_norm = []
-            for optimizer in non_skip:
+            for optimizer in optimizers:
                 grads_for_norm += optimizer.get_grads_for_grad_norm()
-            return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=ref_group)
-        # Non-shared groups: combine per-sub norms (mirrors get_grad_norm()'s fallback).
-        grad_norms = [o.get_grad_norm() or 0.0 for o in non_skip]
-        return math.sqrt(sum(x * x for x in grad_norms))
+            return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=reference_group)
+        grad_norms = [optimizer.get_grad_norm() or 0.0 for optimizer in optimizers]
+        return math.sqrt(sum(x**2 for x in grad_norms))
+
+    @property
+    def skip_grad_norm_clip(self) -> bool:
+        """A chained container is exempt from clipping only if every sub-optimizer is."""
+        return bool(self.chained_optimizers) and all(
+            optimizer.skip_grad_norm_clip for optimizer in self.chained_optimizers
+        )
 
     @torch.no_grad()
     def count_zeros(self):
@@ -1730,20 +1697,22 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
-        # Norm used for the grad_norm_skip_threshold comparison only. It excludes the grads
-        # of skip-flagged (orthogonalizing / Muon) sub-optimizers so a Muon sub's huge but
-        # meaningless grad magnitude cannot wrongly trip the skip threshold for well-behaved
-        # Adam subs (see issue #5394). Equals ``grad_norm`` when nothing is flagged.
-        # NOTE: scoped to the threshold check; the clip ``total_norm`` below still uses the
-        # full ``grad_norm`` (a separate follow-up may narrow the clip norm too).
-        threshold_grad_norm = self._get_grad_norm_skip_threshold()
+        # Norm over the subs that participate in magnitude clipping / the skip-threshold
+        # check. Orthogonalizing (Muon) subs are excluded: their grad magnitude is
+        # discarded by Newton-Schulz, so it must distort neither decision (#5394).
+        clippable_optimizers = [
+            optimizer for optimizer in self.chained_optimizers if not optimizer.skip_grad_norm_clip
+        ]
+        if len(clippable_optimizers) == len(self.chained_optimizers):
+            clippable_grad_norm = grad_norm
+        else:
+            clippable_grad_norm = self._get_grad_norm_over(clippable_optimizers)
         should_skip_update = False
 
         should_clip = any(
             not (hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer)
             and optimizer.config.clip_grad > 0.0
-            and not getattr(optimizer, 'skip_grad_norm_clip', False)
-            for optimizer in self.chained_optimizers
+            for optimizer in clippable_optimizers
         )
         if should_clip:
             self._compute_grad_norms_by_group()
@@ -1775,20 +1744,12 @@ class ChainedOptimizer(MegatronOptimizer):
                 else:
                     main_params.append(p)
 
-            # Skip magnitude-based gradient clipping for orthogonalizing optimizers
-            # (e.g. Muon): their update is scale-invariant (Newton-Schulz discards the
-            # gradient magnitude), so clipping is a no-op at best. At worst, when the
-            # global ``grad_norm`` is large the tiny clip coefficient pushes per-matrix
-            # gradients below Newton-Schulz's normalization floor, silently degenerating
-            # the orthogonalization and stalling training. See issue #5394.
-            if optimizer.config.clip_grad > 0.0 and not getattr(
-                optimizer, "skip_grad_norm_clip", False
-            ):
+            if optimizer.config.clip_grad > 0.0 and not optimizer.skip_grad_norm_clip:
                 if main_params:
                     clip_grad_by_total_norm_fp32(
                         main_params,
                         max_norm=optimizer.config.clip_grad,
-                        total_norm=grad_norm,
+                        total_norm=clippable_grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
                     )
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
@@ -1802,20 +1763,16 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
 
-            # Skip-flagged (Muon) subs are exempt from the magnitude-based skip threshold:
-            # their grad magnitude is discarded by Newton-Schulz, so it is not a meaningful
-            # signal for skipping the update. For all other subs, compare against the
-            # narrower ``threshold_grad_norm`` (which excludes the Muon subs' grads).
             if (
-                not getattr(optimizer, "skip_grad_norm_clip", False)
-                and threshold_grad_norm > optimizer.config.grad_norm_skip_threshold
+                not optimizer.skip_grad_norm_clip
+                and clippable_grad_norm > optimizer.config.grad_norm_skip_threshold
                 and main_params
             ):
                 log_single_rank(
                     logger,
                     logging.INFO,
                     "skipping grad norm because it's too large %s",
-                    threshold_grad_norm,
+                    clippable_grad_norm,
                 )
                 should_skip_update = True
 
