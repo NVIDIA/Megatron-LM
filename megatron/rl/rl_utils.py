@@ -1551,9 +1551,14 @@ def compute_group_stats(
             # Token-weighted first/avg/last epoch from the per-turn RLE boundaries.
             policy_summary = rollout_epoch_summary(rollout.policy_epoch, roll_turn_lens)
             kv_summary = rollout_epoch_summary(rollout.kv_cache_epoch, roll_turn_lens)
-            assert (
-                policy_summary is not None and kv_summary is not None
-            ), "Rollout has no tokens to summarize epochs over"
+            if policy_summary is None or kv_summary is None:
+                # Zero-token placeholder rollout (failed gym episode). There are no
+                # tokens to weight, so summarize with the first recorded epoch
+                # boundary instead of crashing the wave on a routine empty trajectory.
+                e_p = rollout.policy_epoch[0][0][1]
+                e_k = rollout.kv_cache_epoch[0][0][1]
+                policy_summary = (e_p, float(e_p), e_p)
+                kv_summary = (e_k, float(e_k), e_k)
             group_policy_first.append(policy_summary[0])
             group_policy_avg.append(policy_summary[1])
             group_policy_last.append(policy_summary[2])
