@@ -1872,7 +1872,7 @@ class BatchedNVFP4AllGatherAsyncHandle:
         for output_handle in self.output_handles:
             if output_handle is not None:
                 assert output_handle.async_handle is None
-                output_handle.post_process_nvfp4_gather()
+                output_handle.wait()
                 # release any tensor references just in case
                 output_handle.output = None
                 output_handle.columnwise_data_interleaved = None
@@ -1912,7 +1912,7 @@ def grouped_gather_along_first_dim(
                 process_group,
                 quantizer=quantizers[i],
                 output_tensor=output_tensors[i] if output_tensors is not None else None,
-                grouped=True,
+                external_coalescing=True,
             )
             weights_all.append(weight_all)
             weight_handles.append(weight_handle)
@@ -1925,7 +1925,7 @@ def grouped_gather_along_first_dim(
     else:
         for wh in weight_handles:
             if isinstance(wh, _NVFP4AllGatherAsyncHandle):
-                wh.post_process_nvfp4_gather()
+                wh.wait()
         handle = None
 
     return weights_all, handle
