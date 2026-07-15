@@ -1612,6 +1612,17 @@ def validate_args(args, defaults={}):
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
         )
+        assert args.rampup_batch_size is None, (
+            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
+            'mapping assumes a fixed global batch size.'
+        )
+        if not args.freeze_all_layers:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers: LM loss is still '
+                'computed and gradients will update the model. This is fine when '
+                'intentionally dumping logits during active training; for frozen '
+                'teacher dumps use --freeze-all-layers.'
+            )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
