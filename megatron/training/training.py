@@ -42,7 +42,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -1973,7 +1973,6 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
-    use_layer_wise_param_layout=True,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -1984,12 +1983,13 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
-    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
-    for reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
-    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
-    to its legacy ``allgather_params`` sync path.
+    For ``use_layer_wise_distributed_optimizer=True``: forces
+    ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed for reduce-scatter)
+    and computes per-chunk layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. That method picks the
+    padded shard-aligned LayerWise layout or the compact decoupled layout per
+    ``ddp_config.use_layer_wise_param_layout`` (True → padded, False → compact, with LayerWise
+    buffers treated as non-DistOpt and synced via legacy ``allgather_params``).
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -2005,11 +2005,9 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+            ``use_layer_wise_distributed_optimizer=True``. Its ``use_layer_wise_param_layout``
+            field selects the padded vs compact decoupled LayerWise layout (default).
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout
-            to DDP. ``False`` keeps LayerWise on its legacy sync path.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -2032,13 +2030,18 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+        if use_layer_wise_distributed_optimizer:
+            # LayerWise (Muon) optimizer. Force use_distributed_optimizer=True so sibling
+            # non-LayerWise buffers (embeddings, biases, layernorm) shard with the byte-level
+            # DistributedOptimizer layout, and tag params so DDP buffer grouping routes
+            # LayerWise-managed matrices (Muon's Newton-Schulz domain) to a separate buffer.
+            # The padded-vs-compact LayerWise layout decision is made inside
+            # compute_full_param_layout / _ParamAndGradBuffer from use_layer_wise_param_layout:
+            # by default (compact) LayerWise buffers get the no-padding layout and the per-buffer
+            # override flips use_distributed_optimizer off for them; with
+            # --use-layer-wise-param-layout they stay on the padded DistOpt layout.
             ddp_config.use_distributed_optimizer = True
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
             tag_params_for_buffer_routing(model_chunks)
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
@@ -2281,7 +2284,6 @@ def get_model(
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
-                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -2739,8 +2741,12 @@ def train_step(
     """
     args = get_args()
     timers = get_timers()
+    num_microbatches = get_num_microbatches()
 
     rerun_state_machine = get_rerun_state_machine()
+    packed_data_iterator = None
+    has_wrapped_data_iterator = False
+    rerun_data_iterator = data_iterator
     save_params_in_this_iteration = (
         args.save_params_interval is not None and (iteration + 1) % args.save_params_interval == 0
     )
@@ -2758,7 +2764,7 @@ def train_step(
     save_dgrads_in_this_iteration = (
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2807,11 +2813,30 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if getattr(config, 'sequence_packing_scheduler', None) is not None:
+            # Dynamic-CP / sequence packing must happen after the rerun state machine has
+            # observed the original RerunDataIterator. The scheduler returns another
+            # RerunDataIterator containing the packed microbatches for this step.
+            if not has_wrapped_data_iterator:
+                (
+                    packed_data_iterator,
+                    num_microbatches,
+                    seqlen_sum_this_global_batch,
+                    seqlen_squared_sum_this_global_batch,
+                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                has_wrapped_data_iterator = True
+                rerun_data_iterator = packed_data_iterator
+            forward_backward_data_iterator = packed_data_iterator
+        else:
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
+            forward_backward_data_iterator = data_iterator
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
+            data_iterator=forward_backward_data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -2860,7 +2885,19 @@ def train_step(
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2954,6 +2991,9 @@ def train_step(
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
     return (
         {},
@@ -2964,6 +3004,9 @@ def train_step(
         grad_norm,
         num_zeros_in_grad,
         log_max_attention_logit,
+        num_microbatches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
     )
 
 
@@ -2983,6 +3026,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3162,7 +3206,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -3202,7 +3246,9 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        # Sequence-packing schedulers may change the number of microbatches for
+        # this step, so scale by the count returned from train_step.
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -3216,6 +3262,9 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            csa_compress_ratios=args.csa_compress_ratios,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3858,9 +3907,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.dynamic_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
-
     if args.run_workload_inspector_server:
         try:
             import threading
@@ -4100,6 +4146,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
     # Run training iterations till done.
@@ -4143,9 +4190,9 @@ def train(
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
-        # as it intentionally reconfigures microbatches
+        # as it intentionally reconfigures microbatches.
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -4231,6 +4278,9 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = None
+            seqlen_squared_sum_this_global_batch = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -4242,6 +4292,9 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = train_step(
                 forward_step_func,
                 train_data_iterator,
@@ -4345,14 +4398,22 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        # Drain the per-iteration packed-sequence stats so the FLOPs computation
-        # reflects THD per-chunk causal attention AND excludes padding tokens
-        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
-        # runs (no collective issued), letting ``num_floating_point_operations``
-        # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
-        )
+        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
+            # The scheduler computed these from the real sequence lengths before
+            # CP padding and rerouting, so use them directly for FLOPs accounting.
+            assert seqlen_sum_this_global_batch is not None
+            assert seqlen_squared_sum_this_global_batch is not None
+            total_real_tokens_in_batch = seqlen_sum_this_global_batch
+            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
+        else:
+            # Drain the per-iteration packed-sequence stats so the FLOPs computation
+            # reflects THD per-chunk causal attention AND excludes padding tokens
+            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+            # runs (no collective issued), letting ``num_floating_point_operations``
+            # fall back to its closed-form defaults.
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+                consume_seqlen_stats_in_iteration()
+            )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -4391,6 +4452,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            num_microbatches=num_microbatches,
         )
         is_first_iteration = False
 
@@ -4632,11 +4694,24 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, 'sequence_packing_scheduler', None) is not None:
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    )
+                except StopIteration:
+                    # Validation data iterator exhausted, stop evaluation early.
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -5124,3 +5199,40 @@ def should_disable_forward_pre_hook(args):
         )
         and args.overlap_param_gather
     )
+
+
+def _get_thd_sequence_length_upper_bound(args):
+    """Return the padded per-sample THD length upper bound used for graph sizing."""
+    max_sequence_length = getattr(args, "seq_length", None)
+    mock_config_spec = None
+    if getattr(args, "use_varlen_dataset", False):
+        mock_config_spec = getattr(args, "varlen_mock_dataset_config_json", None)
+    elif getattr(args, "sft", False):
+        mock_config_spec = getattr(args, "sft_mock_dataset_config_json", None)
+
+    if mock_config_spec is not None:
+        from megatron.training.datasets.utils import load_json_arg
+
+        mock_config = load_json_arg(mock_config_spec)
+        if isinstance(mock_config, dict) and mock_config.get("max_seq_len") is not None:
+            max_sequence_length = int(mock_config["max_seq_len"])
+
+    if max_sequence_length is None:
+        return None
+
+    if getattr(args, "seq_length", None) is not None:
+        max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
+
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    pad_granularity = cp_pad * sp_pad
+    return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)
