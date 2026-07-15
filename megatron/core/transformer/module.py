@@ -106,11 +106,13 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
         if (
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or getattr(self.config, 'quant_recipe', None) is not None
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []

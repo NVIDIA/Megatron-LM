@@ -92,7 +92,7 @@ def get_grad_norm_fp32(
 
     # Calculate norm.
     if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        total_norm = max((grad.abs().max() for grad in grads_for_norm), default=torch.tensor(0.0))
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
@@ -105,24 +105,20 @@ def get_grad_norm_fp32(
         total_norm = total_norm_cuda[0].item()
 
     else:
-        if norm_type == 2.0:
+        total_norm = torch.zeros(1, dtype=torch.float, device='cuda')
+        if not grads_for_norm:
+            pass
+        elif norm_type == 2.0:
             dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
-                    l2_norm_impl,
-                    dummy_overflow_buf,
-                    [grads_for_norm],
-                    False,  # no per-parameter norm
-                )
-            else:
-                grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
+            grad_norm, _ = multi_tensor_applier(
+                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
+            )
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm**norm_type
-
         else:
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
