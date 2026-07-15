@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.inference.contexts.dynamic_context as dynamic_context_module
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
@@ -14,13 +15,14 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.contexts.fused_kv_append_kernel import HAVE_TRITON
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -3562,3 +3564,220 @@ class TestDynamicContext:
         expected_len = ctx.num_last_token_logits
         assert indices.numel() == expected_len
         assert indices.data_ptr() == ctx.active_logit_idxs.data_ptr()
+
+    def _get_mla_dynamic_context(self, params_dtype=torch.bfloat16):
+        return DynamicInferenceContext(
+            model_config=MLATransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=4,
+                kv_lora_rank=512,
+                qk_pos_emb_head_dim=64,
+                cache_mla_latents=True,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.01,
+                block_size_tokens=64,
+                max_tokens=128,
+                max_requests=4,
+                unified_memory_level=0,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+
+    def _seed_mla_append_state(self, ctx, padded_tokens=5):
+        total_blocks = ctx.kv_block_allocator.total_count
+        dummy_block = ctx.kv_block_allocator.dummy_block_idx
+        block_idx = torch.tensor(
+            [0, 2, 0, dummy_block, dummy_block][:padded_tokens],
+            device='cuda',
+            dtype=ctx.gpu_view.token_to_block_idx.dtype,
+        )
+        local_pos = torch.tensor(
+            [62, 63, 0, 0, 1][:padded_tokens],
+            device='cuda',
+            dtype=ctx.gpu_view.token_to_local_position_within_kv_block.dtype,
+        )
+        assert total_blocks > 3
+        ctx.padded_active_token_count = padded_tokens
+        ctx.gpu_view.token_to_block_idx[:padded_tokens] = block_idx
+        ctx.gpu_view.token_to_local_position_within_kv_block[:padded_tokens] = local_pos
+        return block_idx, local_pos
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mla_append_eager_uses_indexed_assignment_fallback(self, monkeypatch):
+        ctx = self._get_mla_dynamic_context()
+        block_idx, local_pos = self._seed_mla_append_state(ctx)
+        key = torch.randn(
+            ctx.padded_active_token_count, ctx.kv_reduced_dim, device='cuda', dtype=ctx.params_dtype
+        )
+        ctx.memory_buffer.fill_(-5)
+        expected = ctx.memory_buffer.clone()
+        expected[0, block_idx, local_pos] = key
+        guard_block = 1
+        guard_before = ctx.memory_buffer[0, guard_block].clone()
+        calls = []
+
+        def fake_mla_append(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("MLA Triton append must not run outside CUDA Graph capture")
+
+        monkeypatch.setattr(
+            dynamic_context_module, "triton_append_mla_latent_cache", fake_mla_append
+        )
+        ctx.append_key_value_cache(1, key, None)
+
+        assert calls == []
+        assert torch.equal(ctx.memory_buffer, expected)
+        assert torch.equal(ctx.memory_buffer[0, guard_block], guard_before)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.skipif(not HAVE_TRITON, reason="Triton required")
+    def test_mla_append_cuda_graph_capture_uses_triton_and_replays(self, monkeypatch):
+        ctx = self._get_mla_dynamic_context()
+        block_idx, local_pos = self._seed_mla_append_state(ctx)
+        key = torch.randn(
+            ctx.padded_active_token_count, ctx.kv_reduced_dim, device='cuda', dtype=ctx.params_dtype
+        )
+        sentinel = -9.0
+        calls = []
+        original_append = dynamic_context_module.triton_append_mla_latent_cache
+
+        def recording_mla_append(*args, **kwargs):
+            calls.append(torch.cuda.is_current_stream_capturing())
+            return original_append(*args, **kwargs)
+
+        warmup_memory = ctx.memory_buffer.clone()
+        warmup_memory.fill_(sentinel)
+        assert original_append(
+            layer_number=0,
+            key=key,
+            memory_buffer=warmup_memory,
+            padded_active_token_count=ctx.padded_active_token_count,
+            token_to_block_idx=ctx.gpu_view.token_to_block_idx,
+            token_to_local_position_within_kv_block=(
+                ctx.gpu_view.token_to_local_position_within_kv_block
+            ),
+        )
+        torch.cuda.synchronize()
+
+        ctx.memory_buffer.fill_(sentinel)
+        expected = ctx.memory_buffer.clone()
+        expected[0, block_idx, local_pos] = key
+        ctx._using_cuda_graph_this_step = True
+        monkeypatch.setattr(
+            dynamic_context_module, "triton_append_mla_latent_cache", recording_mla_append
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            ctx.append_key_value_cache(1, key, None)
+        torch.cuda.synchronize()
+
+        assert calls == [True]
+        ctx.memory_buffer.fill_(sentinel)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(ctx.memory_buffer, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mla_append_falls_back_when_triton_hook_unavailable(self, monkeypatch):
+        ctx = self._get_mla_dynamic_context()
+        block_idx, local_pos = self._seed_mla_append_state(ctx)
+        key = torch.randn(
+            ctx.padded_active_token_count, ctx.kv_reduced_dim, device='cuda', dtype=ctx.params_dtype
+        )
+        ctx.memory_buffer.fill_(11)
+        active_tokens = 3
+        guard_block = 1
+        guard_before = ctx.memory_buffer[0, guard_block].clone()
+
+        monkeypatch.setattr(dynamic_context_module, "triton_append_mla_latent_cache", None)
+        ctx.append_key_value_cache(1, key, None)
+
+        assert torch.equal(
+            ctx.memory_buffer[0, block_idx[:active_tokens], local_pos[:active_tokens]],
+            key[:active_tokens],
+        )
+        assert torch.equal(ctx.memory_buffer[0, guard_block], guard_before)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_regular_kv_append_keeps_existing_triton_hook(self, monkeypatch):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=1,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            max_requests=4,
+        )
+        padded_tokens = 3
+        block_idx = torch.tensor(
+            [0, 1, 0], device='cuda', dtype=ctx.gpu_view.token_to_block_idx.dtype
+        )
+        local_pos = torch.tensor(
+            [14, 15, 0],
+            device='cuda',
+            dtype=ctx.gpu_view.token_to_local_position_within_kv_block.dtype,
+        )
+        ctx.padded_active_token_count = padded_tokens
+        ctx.gpu_view.token_to_block_idx[:padded_tokens] = block_idx
+        ctx.gpu_view.token_to_local_position_within_kv_block[:padded_tokens] = local_pos
+
+        shape = (
+            padded_tokens,
+            1,
+            ctx.num_attention_heads_per_partition,
+            ctx.hidden_size_per_attention_head,
+        )
+        key = torch.randn(shape, device='cuda', dtype=ctx.params_dtype)
+        value = torch.randn(shape, device='cuda', dtype=ctx.params_dtype)
+        ctx.memory_buffer.zero_()
+        expected = ctx.memory_buffer.clone()
+        expected[0, 0, block_idx, local_pos] = key.squeeze(1)
+        expected[1, 0, block_idx, local_pos] = value.squeeze(1)
+        calls = []
+
+        def fake_regular_append(
+            layer_number,
+            key,
+            value,
+            memory_buffer,
+            padded_active_token_count,
+            token_to_block_idx,
+            token_to_local_position_within_kv_block,
+        ):
+            calls.append(layer_number)
+            memory_buffer[
+                0,
+                layer_number,
+                token_to_block_idx[:padded_active_token_count],
+                token_to_local_position_within_kv_block[:padded_active_token_count],
+            ] = key.squeeze(1)[:padded_active_token_count]
+            memory_buffer[
+                1,
+                layer_number,
+                token_to_block_idx[:padded_active_token_count],
+                token_to_local_position_within_kv_block[:padded_active_token_count],
+            ] = value.squeeze(1)[:padded_active_token_count]
+
+        monkeypatch.setattr(
+            dynamic_context_module, "triton_append_key_value_cache", fake_regular_append
+        )
+        monkeypatch.setattr(dynamic_context_module, "triton_append_mla_latent_cache", None)
+        ctx.append_key_value_cache(1, key, value)
+
+        assert calls == [0]
+        assert torch.equal(ctx.memory_buffer, expected)
