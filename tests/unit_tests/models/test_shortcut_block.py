@@ -318,11 +318,13 @@ def test_async_dispatch_bridge_publishes_both_route_gradients():
     dispatcher.shared_experts = None
     dispatcher._comm_manager = manager
     module = SimpleNamespace(dispatch=dispatcher.token_dispatch)
+    backward_dependency = torch.zeros((), device="cuda", requires_grad=True)
 
     dispatch_stream.wait_stream(torch.cuda.current_stream())
     dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
         route_input,
         route_probs,
+        backward_dependency,
         module,
         dispatch_stream,
         route_input_grad_buffer,
@@ -352,6 +354,7 @@ def test_async_dispatch_bridge_publishes_both_route_gradients():
     torch.testing.assert_close(route_probs_grad_buffer, 3 * grad_probs)
     assert route_input.grad is None
     assert route_probs.grad is None
+    assert backward_dependency.grad is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -366,11 +369,13 @@ def test_async_dispatch_bridge_zero_fills_an_unused_private_input():
     module = SimpleNamespace(
         dispatch=lambda inputs, probs: (2 * inputs, inputs + 0)
     )
+    backward_dependency = torch.zeros((), device="cuda", requires_grad=True)
 
     dispatch_stream.wait_stream(torch.cuda.current_stream())
     dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
         route_input,
         route_probs,
+        backward_dependency,
         module,
         dispatch_stream,
         route_input_grad_buffer,
@@ -390,6 +395,66 @@ def test_async_dispatch_bridge_zero_fills_an_unused_private_input():
     assert route_grad_ready_event.query()
     torch.testing.assert_close(route_input_grad_buffer, 2 * grad_input + grad_probs)
     torch.testing.assert_close(route_probs_grad_buffer, torch.zeros_like(route_probs))
+    assert backward_dependency.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_async_dispatch_bridge_orders_paired_backward_after_dispatch_backward():
+    calls = []
+
+    class RecordDispatchBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, tensor):
+            return 2 * tensor
+
+        @staticmethod
+        def backward(ctx, grad):
+            calls.append("dispatch_backward")
+            return 2 * grad
+
+    class RecordPairedBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, tensor):
+            return tensor.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            calls.append("paired_backward")
+            return grad
+
+    route_input = torch.randn(8, 4, device="cuda", requires_grad=True)
+    route_probs = torch.randn_like(route_input, requires_grad=True)
+    paired_leaf = torch.randn((), device="cuda", requires_grad=True)
+    backward_dependency = RecordPairedBackward.apply(paired_leaf)
+    route_input_grad_buffer = torch.empty_like(route_input)
+    route_probs_grad_buffer = torch.empty_like(route_probs)
+    dispatch_stream = torch.cuda.Stream()
+    route_grad_ready_event = torch.cuda.Event(external=True)
+    module = SimpleNamespace(
+        dispatch=lambda inputs, probs: (RecordDispatchBackward.apply(inputs), 3 * probs)
+    )
+
+    dispatch_stream.wait_stream(torch.cuda.current_stream())
+    dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+        route_input,
+        route_probs,
+        backward_dependency,
+        module,
+        dispatch_stream,
+        route_input_grad_buffer,
+        route_probs_grad_buffer,
+        route_grad_ready_event,
+    )
+    torch.cuda.current_stream().wait_stream(dispatch_stream)
+
+    # The ordinary paired path supplies its real gradient. The bridge contributes None,
+    # but its edge prevents the paired node from running until dispatch backward returns.
+    loss = dispatched_input.sum() + dispatched_probs.sum() + backward_dependency
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert calls == ["dispatch_backward", "paired_backward"]
+    assert route_grad_ready_event.query()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -481,7 +546,7 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
         def shortcut_launch_dispatch(self, route_input, route_probs, ready_event):
             self._dispatch_output = self.mlp.dispatch(route_input, route_probs)
 
-        def shortcut_wait_dispatch_and_launch_combine(self, backward_dependency):
+        def shortcut_wait_dispatch_and_launch_combine(self):
             dispatched_input, dispatched_probs = self._dispatch_output
             routed_output, _ = self.mlp.routed_experts_compute(
                 dispatched_input, dispatched_probs

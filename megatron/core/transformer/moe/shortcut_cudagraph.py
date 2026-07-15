@@ -105,6 +105,7 @@ class AsyncDispatchToPersistentGradBuffers(torch.autograd.Function):
         ctx,
         route_input,
         route_probs,
+        backward_dependency,
         moe_layer,
         dispatch_stream,
         route_input_grad_buffer,
@@ -172,7 +173,9 @@ class AsyncDispatchToPersistentGradBuffers(torch.autograd.Function):
         ctx.route_input_grad_buffer = None
         ctx.route_probs_grad_buffer = None
         ctx.route_grad_ready_event = None
-        return None, None, None, None, None, None, None
+        # The dependency receives no gradient, but returning it only after the private
+        # dispatch backward and event record makes the ordering an autograd invariant.
+        return None, None, None, None, None, None, None, None
 
 
 class AsyncCombineToPersistentBuffer(torch.autograd.Function):

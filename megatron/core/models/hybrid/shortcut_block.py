@@ -421,7 +421,7 @@ class ShortcutMoEBlock:
             persistent_slot=persistent_slot,
         )
 
-    def launch_dispatch(self, persistent_slot: int):
+    def launch_dispatch(self, persistent_slot: int, backward_dependency: torch.Tensor):
         """Launch dispatch from persistent inputs after the route/input graph is queued."""
         target = self.route_input_compute
         if not target._enable_cudagraph:
@@ -437,6 +437,7 @@ class ShortcutMoEBlock:
             route_input,
             route_probs,
             slot.route_ready_event,
+            backward_dependency=backward_dependency,
             route_grad_buffers=(
                 slot.route_input_grad_buffer.tensor,
                 slot.route_probs_grad_buffer.tensor,
@@ -554,7 +555,11 @@ class ShortcutMoEBlock:
         )
 
         with quant_context_factory(quant_config, layer_number):
-            moe_layer.shortcut_wait_dispatch_and_launch_combine(paired_state[0])
+            # Eager autograd already joins the routed and paired branches at their shared
+            # inputs. Do not add the CUDA-graph-only backward scheduling dependency here:
+            # repeated MTP invocations can otherwise make multiple same-priority HybridEP
+            # collectives ready at once, with no cross-rank ordering guarantee.
+            moe_layer.shortcut_wait_dispatch_and_launch_combine()
             projected_hidden, shared_expert_output = self.output_and_shared(
                 *paired_state,
                 inference_context=inference_context,
@@ -598,12 +603,11 @@ class ShortcutMoEBlock:
                 persistent_slot=persistent_slot,
             )
 
-        self.launch_dispatch(persistent_slot)
+        self.launch_dispatch(persistent_slot, paired_state[0])
 
         with quant_context_factory(quant_config, layer_number):
             output_slot = self.output_shared.get_persistent_slot(persistent_slot)
             combined_output = moe_layer.shortcut_wait_dispatch_and_launch_combine(
-                paired_state[0],
                 persistent_output_factory=partial(
                     self.output_shared.get_persistent_combined_output_buffer,
                     persistent_slot,

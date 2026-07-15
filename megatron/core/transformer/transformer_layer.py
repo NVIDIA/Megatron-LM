@@ -2056,12 +2056,14 @@ class MoETransformerLayer(TransformerLayer):
         route_ready_event=None,
         route_grad_buffers=None,
         route_grad_ready_event=None,
+        backward_dependency=None,
     ):
         """Launch A2A dispatch after paired attention has been submitted."""
         self.mlp.launch_dispatch_async(
             permuted_input,
             probs,
             route_ready_event,
+            backward_dependency=backward_dependency,
             route_grad_buffers=route_grad_buffers,
             route_grad_ready_event=route_grad_ready_event,
         )
@@ -2072,15 +2074,12 @@ class MoETransformerLayer(TransformerLayer):
 
     def shortcut_wait_dispatch_and_launch_combine(
         self,
-        backward_dependency: torch.Tensor,
         persistent_output_factory: Callable[[torch.Tensor], torch.Tensor] | None = None,
         ready_event: torch.cuda.Event | None = None,
         grad_ready_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Finish dispatch and routed experts, then launch combine asynchronously."""
-        dispatched_input, probs = self.mlp.wait_dispatch(
-            backward_dependency=backward_dependency
-        )
+        dispatched_input, probs = self.mlp.wait_dispatch()
         output, _ = self.mlp.routed_experts_compute(dispatched_input, probs)
         return self.mlp.launch_combine_async(
             output,

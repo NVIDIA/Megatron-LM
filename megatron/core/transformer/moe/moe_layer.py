@@ -752,6 +752,7 @@ class MoELayer(BaseMoELayer):
         ready_event: torch.cuda.Event = None,
         route_grad_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         route_grad_ready_event: Optional[torch.cuda.Event] = None,
+        backward_dependency: Optional[torch.Tensor] = None,
     ):
         """Launch ONLY the A2A dispatch on a side CUDA stream.
 
@@ -765,6 +766,7 @@ class MoELayer(BaseMoELayer):
             ready_event: Event recorded when the forward inputs are ready for the side stream.
             route_grad_buffers: Stable destinations for dispatch backward's two input gradients.
             route_grad_ready_event: Event recorded after both gradient buffers are populated.
+            backward_dependency: CUDA-graph output whose backward must wait for dispatch backward.
         """
         if MoELayer._parallel_stream is None:
             # High-priority side stream so the hybrid-ep A2A collectives are not
@@ -782,13 +784,15 @@ class MoELayer(BaseMoELayer):
         probs.record_stream(s)
 
         if route_grad_buffers is not None:
-            if route_grad_ready_event is None:
+            if route_grad_ready_event is None or backward_dependency is None:
                 raise ValueError(
-                    "Persistent async dispatch requires a route-gradient-ready event"
+                    "Persistent async dispatch requires a backward dependency and "
+                    "route-gradient-ready event"
                 )
             dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
                 hidden_states,
                 probs,
+                backward_dependency,
                 self,
                 s,
                 route_grad_buffers[0],
@@ -800,14 +804,8 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, dispatched_probs = self.dispatch(hidden_states, probs)
         self._cached_dispatch_output = (dispatched_input, dispatched_probs)
 
-    def wait_dispatch(self, backward_dependency: Optional[torch.Tensor] = None):
+    def wait_dispatch(self):
         """Wait for A2A dispatch to complete and return results to the main stream.
-
-        Args:
-            backward_dependency: Optional tensor whose backward is held until gradients
-                for both dispatch outputs are available. This lets dispatch backward
-                launch its side-stream combine before releasing an independent compute
-                branch, without adding a CUDA stream dependency between the branches.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (dispatched_input, probs)
@@ -822,19 +820,6 @@ class MoELayer(BaseMoELayer):
         main_stream = torch.cuda.current_stream()
         dispatched_input.record_stream(main_stream)
         dispatched_probs.record_stream(main_stream)
-
-        # The dispatch bridge launches HybridEPDispatch.backward reentrantly. Prioritize it so the
-        # route-gradient event record is submitted before the paired backward graph is replayed.
-        backward_combine_priority = torch.iinfo(torch.int).max
-        set_tensor_grad_fn_sequence_sr(dispatched_input, backward_combine_priority)
-        set_tensor_grad_fn_sequence_sr(dispatched_probs, backward_combine_priority)
-        if backward_dependency is not None:
-            dispatched_input, dispatched_probs = _DispatchBackwardLaunchBarrier.apply(
-                dispatched_input, dispatched_probs, backward_dependency
-            )
-            # Run the host-only barrier as soon as both expert-output gradients arrive.
-            set_tensor_grad_fn_sequence_sr(dispatched_input, backward_combine_priority)
-            set_tensor_grad_fn_sequence_sr(dispatched_probs, backward_combine_priority)
 
         return dispatched_input, dispatched_probs
 
@@ -1080,25 +1065,6 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
-
-
-class _DispatchBackwardLaunchBarrier(torch.autograd.Function):
-    """Release dispatch and paired compute backward branches at the same time.
-
-    The paired compute tensor is a dependency only: returning ``None`` for it adds no
-    gradient. Its real gradient arrives through the normal model paths, but autograd does
-    not schedule that node until this additional edge is satisfied. Dispatch is prioritized
-    immediately after this barrier; its completion is enforced later by the route-grad event
-    captured between paired-compute and router backward.
-    """
-
-    @staticmethod
-    def forward(ctx, dispatched_input, dispatched_probs, backward_dependency):
-        return dispatched_input, dispatched_probs
-
-    @staticmethod
-    def backward(ctx, grad_input, grad_probs):
-        return grad_input, grad_probs, None
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):
