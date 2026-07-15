@@ -22,6 +22,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.enums import ModelType
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -110,6 +111,12 @@ class TestMuonDecoupleFP8ParamGather:
         self.seq_length = 128
         self.micro_batch_size = 1
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        # InferenceMode is a process-global (class-level) flag. Another test file
+        # in the same pytest shard can leave it active (e.g. an inference engine
+        # test that aborts before unset). These are training tests, so the GPT
+        # postprocess "Inference must always gather TP logits" assertion would
+        # then fire spuriously. Force training mode before each test.
+        InferenceMode.unset_active()
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
@@ -117,6 +124,7 @@ class TestMuonDecoupleFP8ParamGather:
         )
 
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
