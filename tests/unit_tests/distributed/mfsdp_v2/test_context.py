@@ -27,7 +27,7 @@ class NestedModel(nn.Module):
 
 
 class MultiChildModel(nn.Module):
-    """Model with direct parameters and multiple child FSDP units."""
+    """Model with direct parameters and multiple child FsdpModules."""
 
     def __init__(self, dim: int, num_children: int) -> None:
         super().__init__()
@@ -47,7 +47,7 @@ def _flat_placements() -> Placements:
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
-    """A parent FSDP unit should lazily create one context for its subtree."""
+    """A parent FsdpModule should lazily create one context for its subtree."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
