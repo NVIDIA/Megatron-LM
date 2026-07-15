@@ -1470,6 +1470,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
         "rollout_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
         "rollout_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+        "rollout_pipeline_filter_queue_size": pipeline.filter_queue.qsize(),
         "rollout_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
         "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
         "rollout_pipeline_gate_capacity": gate.capacity,
@@ -1484,12 +1485,14 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_prepared_count": pipeline.prepared_count,
         "rollout_pipeline_inferred_count": pipeline.inferred_count,
         "rollout_pipeline_assembled_count": pipeline.assembled_count,
+        "rollout_pipeline_filtered_count": pipeline.filtered_count,
         "rollout_pipeline_yielded_count": pipeline.yielded_count,
     })
     for name, samples in (
         ("infer_queue_dwell", pipeline.infer_queue_dwell),
         ("engine_dwell", pipeline.engine_dwell),
         ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+        ("filter_queue_dwell", pipeline.filter_queue_dwell),
         ("output_queue_dwell", pipeline.output_queue_dwell),
     ):
         if samples:
@@ -1519,10 +1522,12 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.infer_queue_dwell = []
     pipeline.engine_dwell = []
     pipeline.assemble_queue_dwell = []
+    pipeline.filter_queue_dwell = []
     pipeline.output_queue_dwell = []
     pipeline.prepared_count = 0
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
+    pipeline.filtered_count = 0
     pipeline.yielded_count = 0
     pipeline.prepared_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
     pipeline.assembled_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
