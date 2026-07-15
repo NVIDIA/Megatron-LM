@@ -535,7 +535,9 @@ def _run_eager_batches_and_capture(model, batches):
     return output_values, gradients
 
 
-def _make_mhc_numerical_config(overlap=True, recompute=True, mhc_post_on_compute_stream=False):
+def _make_mhc_numerical_config(
+    overlap=True, recompute=True, mhc_post_on_compute_stream=False, extra_config=None
+):
     recompute_kwargs = (
         {
             "recompute_granularity": "selective",
@@ -545,17 +547,29 @@ def _make_mhc_numerical_config(overlap=True, recompute=True, mhc_post_on_compute
         if recompute
         else {"recompute_granularity": None, "recompute_modules": []}
     )
-    return get_test_config(
-        num_layers=2,
-        extra_kwargs={
-            "moe_token_dispatcher_type": "alltoall",
-            "overlap_moe_expert_parallel_comm": overlap,
-            "enable_hyper_connections": True,
-            "mhc_sinkhorn_iterations": 5,
-            "mhc_post_on_compute_stream": mhc_post_on_compute_stream,
-            **recompute_kwargs,
-        },
-    )
+    extra_kwargs = {
+        "moe_token_dispatcher_type": "alltoall",
+        "overlap_moe_expert_parallel_comm": overlap,
+        "enable_hyper_connections": True,
+        "mhc_sinkhorn_iterations": 5,
+        "mhc_post_on_compute_stream": mhc_post_on_compute_stream,
+        **recompute_kwargs,
+    }
+    if extra_config:
+        extra_kwargs.update(extra_config)
+    return get_test_config(num_layers=2, extra_kwargs=extra_kwargs)
+
+
+def _assert_close_grads(overlap_gradients, reference_gradients):
+    assert overlap_gradients.keys() == reference_gradients.keys()
+    for name in reference_gradients:
+        torch.testing.assert_close(
+            overlap_gradients[name],
+            reference_gradients[name],
+            rtol=5e-3,
+            atol=5e-3,
+            msg=f"Gradient mismatch for {name}",
+        )
 
 
 class TestMhcA2AOverlapNumerics:
@@ -639,3 +653,98 @@ class TestMhcA2AOverlapNumerics:
                 atol=5e-3,
                 msg=f"Gradient mismatch for {name}",
             )
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "mhc_post_on_compute_stream", (False, True), ids=("merged", "compute-stream")
+    )
+    def test_dense_final_layer_schedule_matches_eager(self, mhc_post_on_compute_stream):
+        # moe_layer_freq=[1, 0] makes the last decoder layer dense, so its terminal schedule
+        # node is the dense MLP rather than moe_combine / mhc_post. The decoder boundary
+        # (mHC output contraction + final layer norm) must still run there; otherwise an
+        # uncontracted [s, b, n*h] tensor reaches postprocessing (wrong shape / values).
+        dense_final = {"moe_layer_freq": [1, 0]}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=False, extra_config=dense_final
+        )
+        overlap_config = _make_mhc_numerical_config(
+            recompute=False,
+            mhc_post_on_compute_stream=mhc_post_on_compute_stream,
+            extra_config=dense_final,
+        )
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "mhc_post_on_compute_stream", (False, True), ids=("merged", "compute-stream")
+    )
+    def test_mtp_schedule_matches_eager(self, mhc_post_on_compute_stream):
+        # With MTP (mtp_num_layers=1, default mtp_detach_heads=False) the decoder boundary
+        # produces the pre-contraction mHC multi-stream consumed by the MTP depths. It must be
+        # detached at its producer so MTP backward does not traverse the decoder mHC graph out
+        # of schedule order; this node's backward_impl reconnects the accumulated gradient.
+        mtp = {"mtp_num_layers": 1}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=False, extra_config=mtp
+        )
+        overlap_config = _make_mhc_numerical_config(
+            recompute=False, mhc_post_on_compute_stream=mhc_post_on_compute_stream, extra_config=mtp
+        )
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "mhc_post_on_compute_stream", (False, True), ids=("merged", "compute-stream")
+    )
+    def test_mtp_two_inflight_plans_match_eager(self, mhc_post_on_compute_stream):
+        # Two in-flight schedule plans verify that the per-chunk mHC multi-stream (and hence
+        # the reconnected MTP side gradient) stays bound to the correct microbatch.
+        mtp = {"mtp_num_layers": 1}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=False, extra_config=mtp
+        )
+        overlap_config = _make_mhc_numerical_config(
+            recompute=False, mhc_post_on_compute_stream=mhc_post_on_compute_stream, extra_config=mtp
+        )
+        with deterministic_mode():
+            batches = [build_input_data(seq_len=16) for _ in range(2)]
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_outputs, reference_gradients = _run_eager_batches_and_capture(
+                reference_model, batches
+            )
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_outputs, overlap_gradients = _run_interleaved_schedule_and_capture(
+                overlap_model, batches
+            )
+
+        for overlap_output, reference_output in zip(overlap_outputs, reference_outputs):
+            torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
