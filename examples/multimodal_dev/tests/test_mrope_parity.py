@@ -26,6 +26,7 @@ import math
 import os
 import sys
 from itertools import accumulate
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +41,10 @@ if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
 
+from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.packed_seq_params import PackedSeqParams
+
+from examples.multimodal_dev.models.qwen35_vl.specs import _apply_rope_fp32_no_cp
 
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 
@@ -647,6 +651,35 @@ def test_thd_batch_size_2_with_vision():
             f"seg {k} does not start at 0 — positions leaked from "
             f"previous segment: first col = {thd_slice[:, 0]}"
         )
+
+
+def test_vision_rope_wrapper_forwards_max_seqlen_to_thd(monkeypatch):
+    calls = {}
+
+    def fake_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, **kwargs):
+        calls.update(kwargs)
+        return t
+
+    monkeypatch.setattr(
+        rope_utils, "_apply_rotary_pos_emb_thd", fake_apply_rotary_pos_emb_thd
+    )
+
+    config = SimpleNamespace(
+        rotary_interleaved=False,
+        multi_latent_attention=False,
+    )
+    t = torch.zeros(6, 2, 8, dtype=torch.bfloat16)
+    freqs = torch.zeros(3, 1, 1, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+    out = _apply_rope_fp32_no_cp(
+        t, freqs, config, cu_seqlens=cu_seqlens, max_seqlen=3
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert calls["max_seqlen"] == 3
+    assert calls["cp_group"].size() == 1
+    assert calls["cp_group"].rank() == 0
 
 
 if __name__ == "__main__":
