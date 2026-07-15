@@ -1435,6 +1435,14 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             return [optimizer.state_dict() for optimizer in self.chained_optimizers]
 
+    def save_state_dict_to_file(self, filename: str) -> None:
+        """Save this optimizer's per-rank state for torch checkpoints."""
+        torch.save(self.state_dict(), filename)
+
+    def load_state_dict_from_file(self, filename: str) -> None:
+        """Load this optimizer's per-rank state from a torch checkpoint."""
+        self.load_state_dict(torch.load(filename))
+
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):

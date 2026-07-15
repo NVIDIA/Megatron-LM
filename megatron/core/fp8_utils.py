@@ -62,6 +62,14 @@ except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
 
+try:
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
+    HAVE_TE_GROUPED_TENSOR_CLASS = True
+except (ImportError, ModuleNotFoundError):
+    GroupedTensor = None
+    HAVE_TE_GROUPED_TENSOR_CLASS = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -93,6 +101,24 @@ except ImportError:
     te_post_all_gather_processing = None
 
 
+def _unwrap_parameter_data(tensor: torch.Tensor) -> torch.Tensor:
+    """Return underlying tensor data when PyTorch wraps a tensor subclass as a Parameter."""
+    if HAVE_TE_GROUPED_TENSOR_CLASS and isinstance(tensor, GroupedTensor):
+        # TE GroupedTensor stores its real payload in Python-side metadata fields
+        # such as rowwise_data/scale_inv. PyTorch marks tensor-subclass parameters
+        # as Parameters, so tensor.data would create a detached wrapper copy. Return
+        # the live wrapper so storage metadata mutations update the module parameter.
+        return tensor
+    return tensor.data if isinstance(tensor, torch.nn.Parameter) else tensor
+
+
+def _is_instance_or_param_data(tensor: torch.Tensor, tensor_class: type) -> bool:
+    """Check a tensor subclass, including when wrapped by torch.nn.Parameter."""
+    return isinstance(tensor, tensor_class) or isinstance(
+        _unwrap_parameter_data(tensor), tensor_class
+    )
+
+
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor.
 
@@ -102,12 +128,136 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
     are both inherited from QuantizedTensor. So, for TE1.x, FP8_TENSOR_CLASS is Float8Tensor,
     and for TE2.x, FP8_TENSOR_CLASS is QuantizedTensor.
     """
-    return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
+    return HAVE_TE_FP8_TENSOR_CLASS and _is_instance_or_param_data(tensor, FP8_TENSOR_CLASS)
 
 
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
-    return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
+    return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
+
+
+def is_grouped_tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine GroupedTensor."""
+    return HAVE_TE_GROUPED_TENSOR_CLASS and _is_instance_or_param_data(tensor, GroupedTensor)
+
+
+def is_grouped_tensor_with_quantized_storage(tensor: torch.Tensor) -> bool:
+    """Check if a Transformer Engine GroupedTensor owns quantized primary storage."""
+    tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor(tensor):
+        return False
+    rowwise_data = getattr(tensor, "rowwise_data", None)
+    return rowwise_data is not None and rowwise_data.dtype == torch.uint8
+
+
+def _get_grouped_quantized_recipe(tensor: torch.Tensor):
+    """Return TE recipe for grouped quantized storage, or None if unavailable."""
+    tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor_with_quantized_storage(tensor):
+        return None
+
+    quantizer = getattr(tensor, "quantizer", None)
+    if quantizer is None or not hasattr(quantizer, "_get_compatible_recipe"):
+        return None
+    return quantizer._get_compatible_recipe()
+
+
+def is_grouped_mxfp8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a TE GroupedTensor stores MXFP8 member tensors."""
+    if not HAVE_TE_MXFP8TENSOR:
+        return False
+    recipe = _get_grouped_quantized_recipe(tensor)
+    return recipe is not None and hasattr(recipe, "mxfp8") and recipe.mxfp8()
+
+
+def get_grouped_quantized_members(
+    tensor: torch.Tensor, *, create_if_missing: bool = False
+) -> List[torch.Tensor]:
+    """Return cached per-member views for a grouped quantized tensor."""
+    grouped_tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor_with_quantized_storage(grouped_tensor):
+        raise ValueError("get_grouped_quantized_members expects grouped quantized storage.")
+
+    quantized_members = getattr(grouped_tensor, "quantized_tensors", None)
+    if quantized_members is None:
+        if not create_if_missing:
+            raise RuntimeError(
+                "Grouped quantized parameter is missing cached member tensors. "
+                "Create them outside the training critical path."
+            )
+        quantized_members = grouped_tensor.split_into_quantized_tensors()
+        grouped_tensor.quantized_tensors = quantized_members
+    return quantized_members
+
+
+def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy high-precision values into TE quantized parameter storage."""
+    dst = _unwrap_parameter_data(param)
+
+    if is_grouped_tensor_with_quantized_storage(dst):
+        if src.numel() != dst.numel():
+            raise ValueError(
+                "Grouped quantized parameter copy size mismatch: "
+                f"src numel={src.numel()}, dst numel={dst.numel()}"
+            )
+        if not dst.all_same_shape():
+            raise NotImplementedError(
+                "Copying into grouped quantized parameters requires uniform member shapes."
+            )
+
+        # Grouped quantized tensors cannot use GroupedTensor.copy_ here because
+        # the generic grouped path can rebuild member tensors through
+        # split_into_quantized_tensors(), which is not graph safe. Update cached
+        # member tensors in place instead.
+        quantized_members = get_grouped_quantized_members(dst)
+        src_members = src.view(dst.shape).unbind(dim=0)
+        if len(src_members) != len(quantized_members):
+            raise RuntimeError(
+                "Grouped quantized parameter member count mismatch: "
+                f"src members={len(src_members)}, dst members={len(quantized_members)}"
+            )
+
+        for src_member, dst_member in zip(src_members, quantized_members):
+            dst.quantizer.update_quantized(src_member, dst_member)
+        return
+
+    # Plain TE quantized tensors override copy_ to requantize into their
+    # backing storage.
+    dst.copy_(src.view(dst.shape))
+
+
+def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
+    """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
+    tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor(tensor):
+        raise ValueError("modify_grouped_tensor_rowwise_storage expects a GroupedTensor.")
+    if is_grouped_tensor_with_quantized_storage(tensor):
+        raise ValueError(
+            "modify_grouped_tensor_rowwise_storage only supports high-precision GroupedTensor "
+            "storage. Quantized grouped storage also owns scale buffers."
+        )
+
+    old_rowwise_data = getattr(tensor, "rowwise_data", None)
+    if old_rowwise_data is None:
+        raise RuntimeError("GroupedTensor is missing rowwise_data.")
+
+    new_storage = new_storage.view(-1)
+    if old_rowwise_data.numel() != new_storage.numel():
+        raise ValueError(
+            "GroupedTensor backing storage size mismatch: "
+            f"old numel={old_rowwise_data.numel()}, new numel={new_storage.numel()}"
+        )
+    if old_rowwise_data.dtype != new_storage.dtype:
+        raise ValueError(
+            "GroupedTensor backing storage dtype mismatch: "
+            f"old dtype={old_rowwise_data.dtype}, new dtype={new_storage.dtype}"
+        )
+
+    new_storage.detach().copy_(old_rowwise_data)
+    tensor.rowwise_data = new_storage
+    tensor.columnwise_data = None
+    tensor.quantized_tensors = None
+    del old_rowwise_data
 
 
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
@@ -527,8 +677,18 @@ def post_all_gather_processing(model_params):
     - tensorwise: may need to create a transposed view to match backend GEMM.
     - blockwise: create column-wise storage.
     """
+    if not isinstance(model_params, list):
+        model_params = [model_params]
+
+    expanded_model_params = []
+    for param in model_params:
+        if is_grouped_tensor_with_quantized_storage(param):
+            expanded_model_params.extend(get_grouped_quantized_members(param))
+        else:
+            expanded_model_params.append(param)
+
     if te_post_all_gather_processing is not None:
-        te_post_all_gather_processing(model_params)
+        te_post_all_gather_processing(expanded_model_params)
     else:
         # If the TE version is old and does not have post_all_gather_processing function, this is
         # a no-op, and the transpose/columnwise data will be created in the next forward pass.
