@@ -1,10 +1,14 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
+megatron/core/models/bert/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
+
 megatron/core/models/common/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
+
+megatron/core/models/audio/ @NVIDIA/mcore-audio
 
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model

@@ -66,6 +66,8 @@ from model_provider import model_provider
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    from megatron.post_training.model_builder import ModelOptModelConfig
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -98,6 +100,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
+    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -107,7 +110,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not has_cu_seqlens
+    ):
         return [None for _ in BATCH_KEYS]
 
     batch = {}
@@ -124,7 +131,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
-        is_sft=is_sft,
+        has_cu_seqlens=has_cu_seqlens,
         is_hybrid_cp=is_hybrid_cp,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
@@ -140,7 +147,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert is_sft
+        assert has_cu_seqlens
         return (
             None,
             batch['cu_seqlens'],
@@ -159,6 +166,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -319,6 +327,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             max_seqlen_kv=int(max_seqlen.item()),
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
+            tokens_per_sample=args.seq_length,
         )
 
     timers('batch-generator').stop()
@@ -402,6 +411,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
+        "inter_document_masking": args.dataloader_inter_document_masking,
     }
 
     # add FIM args to the config
@@ -496,12 +506,16 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    model_cfg = gpt_config_from_args(args)
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
+    else:
+        model_cfg = gpt_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         store=store,
