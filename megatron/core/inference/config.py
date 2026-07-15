@@ -100,8 +100,8 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
 class KVCacheManagementMode(str, Enum):
@@ -300,7 +300,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.

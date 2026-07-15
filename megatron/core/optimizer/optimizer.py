@@ -1728,7 +1728,12 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
+            grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
+            if (
+                main_params
+                and math.isfinite(grad_norm_skip_threshold)
+                and grad_norm > grad_norm_skip_threshold
+            ):
                 log_single_rank(
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )

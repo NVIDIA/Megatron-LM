@@ -21,6 +21,12 @@ class DistributedSetup:
 @pytest.fixture(scope="function")
 def distributed_setup() -> Iterator[DistributedSetup]:
     """Read torchrun rank state and set up this rank's local device."""
+    # Some MFSDP v2 tests are sensitive to NCCL algorithm/channel choices. Clear
+    # CI launcher overrides before init_device_mesh initializes NCCL communicators
+    # so this bucket uses NCCL settings closer to production.
+    os.environ.pop("NCCL_MAX_NCHANNELS", None)
+    os.environ.pop("NCCL_NVLS_ENABLE", None)
+
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
 
