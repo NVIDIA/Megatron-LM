@@ -290,10 +290,18 @@ class FsdpModule:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        if self.is_root():
-            context.register_post_backward_final_callback()
         allgather_stream = context.allgather_stream
         current_stream = torch.cuda.current_stream(allgather_stream.device)
+        if self.is_root():
+            context.register_post_backward_final_callback()
+            # Fork the reduce-scatter stream from the current stream once, at the
+            # start of backward, so every module's post-backward reduce-scatter is
+            # part of any active CUDA-graph capture. A stream only joins the
+            # capture via this wait_stream edge; without it the first allocation on
+            # the reduce-scatter stream falls back to a raw cudaMalloc, which is
+            # illegal during capture. Later modules are covered by the post-copy
+            # fork each preceding module issues before its collective.
+            context.reduce_scatter_stream.wait_stream(current_stream)
 
         self._unshard_parameter_groups(sync_model_weight=False)
         assert self._unshard_event is not None
