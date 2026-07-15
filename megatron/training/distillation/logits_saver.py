@@ -285,14 +285,18 @@ class LogitsSaverHooks:
             self._curr_mtp_passes += 1
 
     def attach_hooks(self, model: LanguageModule) -> None:
-        """Attach logits-saving hooks and skip expensive LM loss computation.
+        """Attach logits-saving hooks.
+
+        When ``--freeze-all-layers`` is set, also replaces LM loss with a
+        zero-valued tensor (avoids wasted CE when weights are frozen).
 
         Args:
-            model: Model to instrument.
+            model: Model to instrument. Must own ``output_layer`` (last PP stage).
         """
         fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
         self._hook_handles.append(fwd_handle)
-        self._override_language_model_loss(model)
+        if get_args().freeze_all_layers:
+            self._override_language_model_loss(model)
 
     def _override_language_model_loss(self, model: LanguageModule) -> None:
         """Replace LM loss with a zero-valued tensor that preserves gradient edges."""
