@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import warnings
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Callable, NoReturn, Optional, Union
@@ -38,11 +39,8 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version
 
 if HAVE_TE:
-    import transformer_engine as te
-
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
 else:
-    te = None
     (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
 
 
@@ -70,6 +68,7 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_o_group_proj: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -192,10 +191,14 @@ class DSv4HybridAttention(Attention):
         ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
         device = torch.device("cuda", torch.cuda.current_device())
-        te_pytorch = getattr(te, "pytorch", None)
-        batched_linear_cls = getattr(te_pytorch, "BatchedLinear", None)
-        self._uses_te_batched_linear = batched_linear_cls is not None
+        self._uses_te_batched_linear = submodules.linear_o_group_proj is not None
         if not self._uses_te_batched_linear:
+            warnings.warn(
+                "transformer_engine.pytorch.BatchedLinear is unavailable. Please upgrade "
+                "Transformer Engine to avoid a performance regression; "
+                "DSv4HybridAttention.linear_o_group_proj is falling back to torch.einsum.",
+                stacklevel=2,
+            )
             group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
             linear_o_group_proj = torch.empty(
                 group_proj_out_size,
@@ -209,7 +212,8 @@ class DSv4HybridAttention(Attention):
             )
             self.linear_o_group_proj = torch.nn.Parameter(linear_o_group_proj)
         else:
-            self.linear_o_group_proj = batched_linear_cls(
+            self.linear_o_group_proj = build_module(
+                submodules.linear_o_group_proj,
                 self.o_local_groups,
                 group_proj_in_size,
                 self.config.o_lora_rank,

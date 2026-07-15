@@ -628,8 +628,9 @@ class TestDSv4HybridGroupedOutput:
             if use_quantized_model_init
             else nullcontext()
         )
-        with init_context:
-            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        with pytest.warns(UserWarning, match="upgrade Transformer Engine.*performance regression"):
+            with init_context:
+                attn = _build_attention(config, layer_number=1, pg_collection=pg)
         assert not attn._uses_te_batched_linear
         weight = attn._linear_o_group_proj_weight
         assert weight is attn.linear_o_group_proj
