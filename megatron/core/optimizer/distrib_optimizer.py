@@ -680,12 +680,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
-            if self._uses_mfsdp_v2():
-                # V1 sets this marker inside MegatronFSDP's param-and-grad buffer setup. V2
-                # bypasses that buffer path, so mark optimizer params here for generic MCore
-                # gradient statistics to consume the local shard of MFSDP DTensor gradients.
-                for parameter in self.get_parameters():
-                    parameter.__fsdp_param__ = True
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 

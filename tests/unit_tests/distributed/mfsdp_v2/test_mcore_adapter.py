@@ -136,31 +136,40 @@ class TestMcoreAdapter:
         )
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
 
-        batches = [
-            torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        steps = [
+            [
+                torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+                for _ in range(2)
+            ]
             for _ in range(3)
         ]
 
         reference_losses = []
-        for batch in batches:
+        for microbatches in steps:
             reference_optimizer.zero_grad(set_to_none=True)
-            reference_output = reference_model(hidden_states=batch, attention_mask=None)
-            reference_loss = reference_output.square().mean()
-            reference_loss.backward()
+            microbatch_losses = []
+            for batch in microbatches:
+                reference_output = reference_model(hidden_states=batch, attention_mask=None)
+                reference_loss = reference_output.square().mean()
+                (reference_loss / len(microbatches)).backward()
+                microbatch_losses.append(reference_loss.detach())
             reference_success, _, _ = reference_optimizer.step()
             assert reference_success
-            reference_losses.append(reference_loss.detach())
+            reference_losses.append(torch.stack(microbatch_losses).mean())
 
         losses = []
-        for batch in batches:
+        for microbatches in steps:
             model.zero_grad_buffer()
             optimizer.zero_grad(set_to_none=True)
-            output = model(hidden_states=batch, attention_mask=None)
-            loss = output.square().mean()
-            loss.backward()
+            microbatch_losses = []
+            for batch in microbatches:
+                output = model(hidden_states=batch, attention_mask=None)
+                loss = output.square().mean()
+                (loss / len(microbatches)).backward()
+                microbatch_losses.append(loss.detach())
             success, _, _ = optimizer.step()
             assert success
-            losses.append(loss.detach())
+            losses.append(torch.stack(microbatch_losses).mean())
 
         losses = torch.stack(losses)
         reference_losses = torch.stack(reference_losses)
