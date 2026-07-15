@@ -296,7 +296,9 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
             )
             if contained_in_parameter_group(parameter):
-                raise ValueError(f"Parameter {parameter_fqn!r} is already owned by another FsdpModule.")
+                raise ValueError(
+                    f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
+                )
             parameters[parameter_fqn] = parameter
 
         for child_name, child_module in submodule.named_children():
