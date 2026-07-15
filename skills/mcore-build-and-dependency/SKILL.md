@@ -1,24 +1,45 @@
 ---
 name: mcore-build-and-dependency
-description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock.
+description: Megatron-LM installation-path routing, container-based development setup, and dependency management. Covers choosing between the supported container and bare-metal CUDA path, acquiring and launching the CI container, uv package management, and updating uv.lock.
 license: Apache-2.0
-when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
+when_to_use: Routing a request to install Megatron; adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Build & Dependency Guide
 
-The core principle: **build and develop inside containers** — the CI container
-ships the correct CUDA toolkit, PyTorch build, and pre-compiled native extensions
-(TransformerEngine, DeepEP, …) that cannot be reproduced on a bare host.
+Choose the installation environment before giving commands. The CI container is
+the supported, reproducible development path; bare-metal CUDA is a separate path
+with its own Transformer Engine installation workflow.
+
+## Installation Path Decision
+
+For an otherwise unspecified request such as "Install Megatron", ask this one
+question before selecting commands or an installation skill:
+
+> Are you setting up the supported NGC/CI container path, or a bare-metal CUDA
+> host without Docker?
+
+Do not assume a container from an ambiguous installation request. Route the
+answer as follows:
+
+- **Container, NGC, CI, Docker, or reproducible development environment:** use
+  this skill's container workflow.
+- **Bare metal, CUDA host, no Docker, Colab, or source install with Transformer
+  Engine:** use `mcore-transformer-engine-install` for the pinned-PyPI TE
+  install and CUDA smoke test.
+- **PyPI-only Megatron Core package:** use the README's `uv pip install
+  megatron-core` path; do not introduce a container or Transformer Engine unless
+  the user needs GPU-native components.
 
 ## Answer-First Constants
 
 For text-only dependency or container questions, give these repo-specific facts
 up front before the longer workflow:
 
-- Run dependency work inside the Megatron-LM CI container, not on the host.
+- For a user who chooses the supported development path, run dependency work
+  inside the Megatron-LM CI container, not on the host.
 - The container venv is `/opt/venv`, already on `PATH`.
 - Default `dev` uses `docker/.ngc_version.dev` and the `dev` extra; `lts`
   uses `docker/.ngc_version.lts` and `docker/lts/requirements.txt`. The
