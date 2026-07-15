@@ -614,35 +614,32 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
             raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 
-        unsupported_v1_options = {
-            "fsdp_double_buffer": ddp_config.fsdp_double_buffer,
-            "fsdp_db_use_persist_buf_on_alloc_fail": (
-                ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-            ),
-            "fsdp_all_gather_in_start_param_sync=False": (
-                not ddp_config.fsdp_all_gather_in_start_param_sync
-            ),
-            "nccl_ub": ddp_config.nccl_ub,
-            "disable_symmetric_registration": ddp_config.disable_symmetric_registration,
-            "fsdp_manual_registration": ddp_config.fsdp_manual_registration,
-            "delay_wgrad_compute": ddp_config.delay_wgrad_compute,
-            "suggested_communication_unit_size": (
-                ddp_config.suggested_communication_unit_size is not None
-            ),
-            "num_buckets": ddp_config.num_buckets is not None,
-            "megatron_fsdp_use_decoupled_grad": ddp_config.megatron_fsdp_use_decoupled_grad,
-            "megatron_fsdp_enable_fine_grained_param_gather": (
-                ddp_config.megatron_fsdp_enable_fine_grained_param_gather
-            ),
-            "megatron_fsdp_max_pool_double_buffer": (
-                ddp_config.megatron_fsdp_max_pool_double_buffer
-            ),
-        }
-        enabled_v1_options = [name for name, enabled in unsupported_v1_options.items() if enabled]
-        if enabled_v1_options:
+        if ddp_config.fsdp_double_buffer:
+            raise ValueError("MFSDP v2 does not support fsdp_double_buffer.")
+        if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
+            raise ValueError("MFSDP v2 does not support fsdp_db_use_persist_buf_on_alloc_fail.")
+        if ddp_config.fsdp_all_gather_in_start_param_sync:
+            raise ValueError("MFSDP v2 does not support fsdp_all_gather_in_start_param_sync.")
+        if ddp_config.nccl_ub:
+            raise ValueError("MFSDP v2 does not support nccl_ub.")
+        if ddp_config.disable_symmetric_registration:
+            raise ValueError("MFSDP v2 does not support disable_symmetric_registration.")
+        if ddp_config.fsdp_manual_registration:
+            raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
+        if ddp_config.delay_wgrad_compute:
+            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if ddp_config.suggested_communication_unit_size is not None:
+            raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
+        if ddp_config.num_buckets is not None:
+            raise ValueError("MFSDP v2 does not support num_buckets.")
+        if ddp_config.megatron_fsdp_use_decoupled_grad:
+            raise ValueError("MFSDP v2 does not support megatron_fsdp_use_decoupled_grad.")
+        if ddp_config.megatron_fsdp_enable_fine_grained_param_gather:
             raise ValueError(
-                "MFSDP v2 does not support v1 tuning options: " + ", ".join(enabled_v1_options)
+                "MFSDP v2 does not support megatron_fsdp_enable_fine_grained_param_gather."
             )
+        if ddp_config.megatron_fsdp_max_pool_double_buffer:
+            raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gathers parameters from its forward pre-hook."""

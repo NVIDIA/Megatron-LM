@@ -69,6 +69,7 @@ class TestMcoreAdapter:
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.float32,
+                fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -115,6 +116,7 @@ class TestMcoreAdapter:
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
         )
