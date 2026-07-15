@@ -143,9 +143,7 @@ def finalize_decoder_layer_output(node, hidden_states):
     )
     # postprocess_for_layer_schedule already makes final-layernorm outputs viewless; keep
     # this wrapper for the no-layernorm and mHC contraction-only exits.
-    output = make_viewless_tensor(
-        inp=output, requires_grad=output.requires_grad, keep_graph=True
-    )
+    output = make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
     # Detach the pre-contraction multi-stream at its producer so MTP reads a leaf and this
     # node's backward_impl reconnects the accumulated gradient under scheduler control.
     node.chunk_state.mhc_multistream = (
@@ -967,13 +965,7 @@ def build_mtp_layer_callables(layer):
     combine_func = partial(rng_context_wrapper, combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
-    forward_funcs = [
-        attn_func,
-        dispatch_func,
-        mlp_func,
-        combine_func,
-        mtp_post_process_func,
-    ]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
     if isinstance(backward_dw["attn"], list):
         backward_dw["attn"].append(layer.eh_proj)
     else:
