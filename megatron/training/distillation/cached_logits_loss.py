@@ -133,7 +133,10 @@ class StudentLogitsCapture:
         self._hook_handles: List[Any] = []
 
     def attach_hooks(self, model: LanguageModule) -> None:
-        """Attach forward hooks to the model's output layer."""
+        """Attach forward hooks to the model's output layer.
+
+        ``model`` must own ``output_layer`` (last PP stage).
+        """
         handle = model.output_layer.register_forward_hook(self._capture_logits)
         self._hook_handles.append(handle)
 
