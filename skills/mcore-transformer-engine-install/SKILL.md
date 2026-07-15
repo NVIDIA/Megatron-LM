@@ -29,8 +29,7 @@ For text-only Transformer Engine install questions, give these facts first:
   diagnosing a missing GPU or broken driver.
 - Do not download or install a CUDA Toolkit automatically when `nvcc` is
   missing. Report the prerequisite and ask whether the user wants the PyTorch
-  NGC Container or has approved CUDA Toolkit provisioning; a local runfile is a
-  multi-gigabyte host-setup step, not a normal TE install step.
+  NGC Container or a separately provisioned CUDA Toolkit.
 - Set `CUDNN_PATH` and `CUDNN_HOME` to the venv's cuDNN package when cuDNN comes
   from Python wheels.
 - Limit parallel native compilation with `MAX_JOBS`, starting at `4`, and set
@@ -67,31 +66,6 @@ bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
 bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
   --torch-backend cu128
 ```
-
-## CUDA Toolkit Without Sudo
-
-On a driver-only host, `nvidia-smi` can work while `nvcc` is absent. Prefer the
-[PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/pytorch)
-when it is available. Use this recovery only after the user explicitly chooses
-bare metal and approves the multi-gigabyte Toolkit download. For a required
-bare-metal install without sudo, install a CUDA Toolkit matching the PyTorch
-CUDA **major** version into a writable directory. Do not install or replace the
-NVIDIA driver.
-
-Download the appropriate Linux runfile from the
-[CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive), then:
-
-```bash
-sh cuda_<version>_linux.run --silent --toolkit --toolkitpath="$PWD/.cuda"
-export CUDA_PATH="$PWD/.cuda"
-export PATH="$CUDA_PATH/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_PATH/lib64:${LD_LIBRARY_PATH:-}"
-nvcc --version
-```
-
-Then run the helper's `--preflight` command. Do not assume the
-`nvidia-cuda-nvcc-cu12` Python wheel supplies a usable Linux `nvcc`; verify with
-`nvcc --version` before starting a TE build.
 
 ## Sandbox GPU Visibility
 
@@ -256,7 +230,7 @@ change. Source-install smoke tests can still use the helper in this skill.
 | `torch.cuda.is_available()` is false | CPU PyTorch wheel, hidden GPU, or driver/toolkit mismatch | Reinstall PyTorch with `--no-config --torch-backend=<cuXXX>` and check `nvidia-smi` |
 | `nvidia-smi` fails only in an agent sandbox | The sandbox does not expose NVIDIA device nodes | Re-run `nvidia-smi` on the host after approval; do not diagnose a broken driver from the sandbox result |
 | `cmake: command not found` or `ninja: command not found` | Build tools missing from the venv | Install `cmake ninja` before TE |
-| `nvcc` is missing or `CUDA_PATH` has no `bin/nvcc` | Driver-only host, incomplete toolkit, or a Python CUDA wheel without a usable `nvcc` executable | Report the prerequisite and ask whether to use the PyTorch NGC Container or explicitly provision a matching CUDA Toolkit. For the latter, use `--toolkit --toolkitpath=<writable-dir>` (no `--driver`), export `CUDA_PATH`, then rerun `--preflight` |
+| `nvcc` is missing or `CUDA_PATH` has no `bin/nvcc` | Driver-only host or incomplete toolkit | Ask whether to use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/pytorch) or provision a matching CUDA Toolkit, then set `CUDA_PATH` and rerun `--preflight` |
 | `fatal error: nccl.h: No such file or directory` | NVIDIA wheel headers not on include path | Export `${VENV_SITE}/nvidia/*/include` into `CPATH` |
 | `fatal error: cudnn.h: No such file or directory` | cuDNN wheel headers not on include path | Export NVIDIA include dirs and keep `--no-build-isolation` |
 | Linker cannot find CUDA/NCCL/cuDNN libraries | NVIDIA wheel libs not on library paths | Export `${VENV_SITE}/nvidia/*/lib` into `LIBRARY_PATH` and `LD_LIBRARY_PATH` |
