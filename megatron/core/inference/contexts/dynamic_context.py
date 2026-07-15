@@ -2455,13 +2455,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
+        The coalesced H2D from the pinned `_cpu_bookkeeping_buf` uses
+        ``non_blocking=False``: that buffer is re-staged in place on the next
+        step, so an async copy can race with host writes and corrupt GPU
+        bookkeeping (see the inline comment at the copy site).
 
         The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        and one contiguous GPU buffer; a single memcpy covers the whole
+        transfer. Request-level staging slots are refreshed from the persistent
+        CPU tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
         n_active = self.total_request_count - self.paused_request_count
@@ -2509,7 +2511,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        # This copy MUST be blocking. `_cpu_bookkeeping_buf` is a pinned host
+        # buffer that is re-staged in place on the very next step (the staging
+        # writes above plus `initialize_attention_state()`). A non_blocking copy
+        # lets the host overwrite those bytes while the async H2D is still in
+        # flight, so the GPU reads corrupted bookkeeping (token/block indices)
+        # and dereferences out-of-bounds memory -> async `CUDA error: an illegal
+        # memory access`. The CUDA-graph warmup loop makes the race fire
+        # reliably. Blocking costs a per-step host<->device sync, but that is
+        # negligible relative to the forward pass (benchmarked: no measurable
+        # generation-throughput difference vs. an async double-buffered copy).
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=False)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
