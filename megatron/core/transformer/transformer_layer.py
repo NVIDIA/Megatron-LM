@@ -18,7 +18,12 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
+from megatron.core.transformer.cuda_graphs import (
+    is_cuda_graph_replay_suspended,
+    is_graph_capturing,
+    is_graph_warmup,
+    make_weakref,
+)
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1714,6 +1719,15 @@ class MoETransformerLayer(TransformerLayer):
                 "Partial cudagraphs for MoEs were detected during inference!"
                 "Please do not use --cuda-graph-modules moe_router moe_preprocess "
                 "alongside inference."
+            )
+
+        if self.use_partial_cudagraphs and is_cuda_graph_replay_suspended():
+            # The partial-graph path restores graph-owned dispatcher metadata before expert
+            # dispatch. An eager router produces its own metadata, so run the complete eager
+            # MoE path instead when graph replay is suspended.
+            self.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+            return super()._forward_mlp(
+                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
             )
 
         def _forward_mlp_partial_cudagraphs(

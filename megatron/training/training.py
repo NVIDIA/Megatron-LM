@@ -114,7 +114,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, suspend_cuda_graph_replay
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -2375,11 +2375,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         and iteration is not None
         and (iteration + 1) % dgrad_raw_moment_interval == 0
     )
-    if (
+    log_layer_raw_moments_in_this_iteration = (
         log_activation_raw_moments_in_this_iteration or log_dgrad_raw_moments_in_this_iteration
-    ) and getattr(args, 'cuda_graph_impl', 'none') != 'none':
+    )
+    if log_layer_raw_moments_in_this_iteration and getattr(
+        args, 'cuda_graph_impl', 'none'
+    ) == 'full_iteration':
         raise RuntimeError(
-            "Activation/dgrad raw moment logging is not supported with CUDA graph modes."
+            "Activation/dgrad raw moment logging is not supported with full-iteration CUDA graphs."
         )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -2437,20 +2440,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             if optimizer is not None and not optimizer.is_stub_optimizer:
                 loss_scale_for_dgrad_raw_moments = optimizer.get_loss_scale().item()
             enable_dgrad_raw_moment_logging(model, loss_scale=loss_scale_for_dgrad_raw_moments)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=pg_collection,
+        cuda_graph_context = (
+            suspend_cuda_graph_replay()
+            if log_layer_raw_moments_in_this_iteration
+            else nullcontext()
         )
+        with cuda_graph_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()

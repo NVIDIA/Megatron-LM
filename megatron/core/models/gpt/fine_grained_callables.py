@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.transformer.cuda_graphs import is_cuda_graph_replay_suspended
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -41,6 +42,15 @@ def weak_method(method):
         return method_ref()(*args, **kwarg)
 
     return wrapped_func
+
+
+def _is_te_cuda_graph_replay(layer):
+    """Return whether this call should use an available TE CUDA graph."""
+    return (
+        isinstance(layer, GraphableMegatronModule)
+        and bool(getattr(layer, 'cuda_graphs', None))
+        and not is_cuda_graph_replay_suspended()
+    )
 
 
 @internal_api
@@ -441,7 +451,7 @@ class _BackwardDWWrapper:
 
     def backward_dw(self):
         """Execute weight gradients, skipping CUDA graphed components during replay."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
+        is_replay = _is_te_cuda_graph_replay(self.layer)
         if self.shared_expert_dw_callable is not None and (
             not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
@@ -516,11 +526,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             pre mlp layernorm->router->dispatch preprocess
         """
 
-        if (
-            isinstance(layer, GraphableMegatronModule)
-            and hasattr(layer, 'cuda_graphs')
-            and layer.cuda_graphs
-        ):
+        if _is_te_cuda_graph_replay(layer):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -660,7 +666,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
-        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+        if _is_te_cuda_graph_replay(layer):
             layer.mlp.cudagraph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
