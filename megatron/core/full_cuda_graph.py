@@ -122,7 +122,6 @@ class StaticBufferLoader:
             inputs = inputs[0]
 
         assert isinstance(inputs, dict)
-        print (f'{torch.distributed.get_rank()} - microbatch {microbatch} len_static_buffers[{stage}]={len(StaticBufferLoader.static_buffers[stage])}-{StaticBufferLoader.static_buffers[stage]} inputs {inputs}')
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
