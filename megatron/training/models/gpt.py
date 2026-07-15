@@ -52,6 +52,14 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if transformer_cfg.transformer_impl == "inference_optimized":
+        if transformer_cfg.num_moe_experts is not None:
+            return get_gpt_decoder_block_spec(
+                transformer_cfg,
+                use_transformer_engine=False,
+                normalization=transformer_cfg.normalization,
+                qk_l2_norm=transformer_cfg.qk_l2_norm,
+                vp_stage=vp_stage,
+            )
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
