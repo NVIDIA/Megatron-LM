@@ -665,8 +665,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         assert (
-            self._uses_mfsdp_v2()
-            or isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
             or optimizer is None
         ), (
             "Only Adam and HybridDeviceOptimizer currently supported, "

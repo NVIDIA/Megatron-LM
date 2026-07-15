@@ -664,7 +664,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
 
 FullyShardedDataParallel = (
-    FullyShardedDataParallelV2 if os.getenv("USE_MFSDP_V2") == "1" else FullyShardedDataParallelV1
+    FullyShardedDataParallelV2 if os.getenv("MFSDP_VERSION") == "2" else FullyShardedDataParallelV1
 )
 
 
