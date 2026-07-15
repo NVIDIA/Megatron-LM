@@ -876,6 +876,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                     intermediate_abs_positions.unsqueeze(1).long()
                     + conv_gather_offsets.unsqueeze(0).long()
                 )  # [n, d_conv]
+                # Clamp into the valid token range. Padding/warmup slots use the
+                # safe-default abs_position == d_conv, which yields gather indices
+                # [0..d_conv-1]; when the prefill sequence is shorter than d_conv
+                # (e.g. a small CUDA-graph warmup bucket with fewer than d_conv
+                # tokens), those indices overrun the token axis. Clamping keeps the
+                # gather in bounds. Real slots are always in range, so this is a
+                # no-op for them, and padding-slot results are never read (callers
+                # consult per_request_intermediate_counts).
+                seq_len = xBC_pre_conv.shape[1]
+                gather_positions = gather_positions.clamp_(0, seq_len - 1)
                 intermediate_conv = xBC_pre_conv[0, gather_positions, :]
                 # [n, d_conv, conv_dim]
                 intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))

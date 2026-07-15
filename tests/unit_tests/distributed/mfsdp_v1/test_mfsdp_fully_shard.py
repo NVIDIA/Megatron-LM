@@ -136,6 +136,23 @@ class ToyTransformer(torch.nn.Module):
         return x
 
 
+class RootParamModel(torch.nn.Module):
+    """Toy model with parameters owned directly by the root module."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(DIM_SIZE, DIM_SIZE))
+        self.bias = torch.nn.Parameter(torch.empty(DIM_SIZE))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
 class ToyTETransformer(torch.nn.Module):
     """Toy Transformer model for testing Megatron-FSDP with Transformer Engine."""
 
@@ -290,6 +307,7 @@ class TestMegatronFsdpFullyShard:
                 "preserve_fp32_weights": True,
                 "init_model_with_meta_device": True,
                 "torch_compile": True,
+                "maxpool_double_buffer": True,
             },
             {
                 "preserve_fp32_weights": False,
@@ -313,12 +331,27 @@ class TestMegatronFsdpFullyShard:
         preserve_fp32_weights = common_args["preserve_fp32_weights"]
         init_model_with_meta_device = common_args["init_model_with_meta_device"]
         torch_compile = common_args["torch_compile"]
+        maxpool_double_buffer = common_args.get("maxpool_double_buffer", False)
 
         # Skip due to lack of functionality.
         if init_model_with_meta_device and dp_shard_strategy == NO_SHARD:
             pytest.skip(
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
+        elif dp_shard_strategy == NO_SHARD and dp_outer_strategy == NO_SHARD:
+            # When both inner and outer DP are unsharded, the optimizer state is a
+            # fully-replicated DTensor. Starting with the PyTorch shipped in
+            # nvcr.io/nvidia/pytorch:26.06-py3, the Adam step's in-place
+            # `aten.lerp.Scalar` on a Replicate() DTensor raises
+            # "in-place operations that require placement changes are not supported".
+            # This is a PyTorch DTensor behavior change, not a Megatron-FSDP
+            # regression; skip until Megatron-FSDP's NO_SHARD optimizer path avoids
+            # the in-place op. See https://github.com/NVIDIA/Megatron-LM/issues/4611.
+            pytest.skip(
+                "Fully-unsharded ('no_shard'/'no_shard') optimizer step uses an in-place "
+                "lerp on a Replicate() DTensor, which is unsupported by the DTensor "
+                "dispatcher in PyTorch 26.06+."
             )
         elif dp_outer_strategy == OPTIM and dp_shard_strategy != OPTIM_GRADS_PARAMS:
             # TODO(@shjwudp, @cspades): Requires various modifications to support.
@@ -356,6 +389,7 @@ class TestMegatronFsdpFullyShard:
             ),
             init_model_with_meta_device=init_model_with_meta_device,
             report_nan_in_param_grad=True,
+            maxpool_double_buffer=maxpool_double_buffer,
         )
         model = torch.compile(model) if torch_compile else model
 
@@ -713,6 +747,33 @@ class TestMegatronFsdpFullyShard:
             # Optimizer step.
             optimizer.step()
             optimizer.zero_grad()
+
+    def test_root_module_forward_uses_gathered_parameters(self):
+        """
+        Test that root-owned parameters are gathered before the root forward.
+        """
+
+        model = RootParamModel().cuda()
+        with torch.no_grad():
+            model.weight.copy_(
+                torch.arange(DIM_SIZE * DIM_SIZE, dtype=torch.float32, device="cuda").view(
+                    DIM_SIZE, DIM_SIZE
+                )
+            )
+            model.bias.copy_(torch.arange(DIM_SIZE, dtype=torch.float32, device="cuda"))
+
+        model_input = torch.arange(DIM_SIZE * DIM_SIZE, dtype=torch.float32, device="cuda").view(
+            DIM_SIZE, DIM_SIZE
+        )
+        expected_output = model(model_input)
+
+        mfsdp_model = fully_shard_model(
+            module=model, fsdp_unit_modules=[RootParamModel], zero_dp_strategy=OPTIM_GRADS_PARAMS
+        )
+
+        output = mfsdp_model(model_input)
+
+        torch.testing.assert_close(output, expected_output)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
