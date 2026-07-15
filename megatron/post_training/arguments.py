@@ -114,6 +114,15 @@ def add_modelopt_args(parser):
         'parameters and only train MTP heads.',
     )
 
+    # Scale-learning QAD (LSQ): the checkpoint is assumed to already have LSQ enabled
+    group.add_argument(
+        '--lsq-scale-lr',
+        type=float,
+        default=None,
+        help='Optional separate learning rate for LSQ scale (amax) parameters. If unset, they '
+        'use the base learning rate.',
+    )
+
     # Special model architecture option
     group.add_argument(
         '--export-qk-l2-norm',

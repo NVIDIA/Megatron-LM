@@ -5,6 +5,8 @@
 import logging
 import os
 from argparse import Namespace
+
+import torch
 from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
@@ -218,6 +220,34 @@ def _freeze_base_for_mtp(model):
     _freeze_for_qad(model, "mtp")
 
 
+def _propagate_expert_allreduce_to_lsq_params(model):
+    """Copy each weight's MCore ``allreduce`` flag onto its LSQ ``_amax_{pre,post}`` params.
+
+    Without the flag, expert amax params get bucketed into the global data-parallel group
+    instead of the expert-data-parallel group (wrong grad reduction under expert parallelism).
+    """
+    module_by_name = dict(model.named_modules())
+    for name, param in model.named_parameters():
+        if not (name.endswith("_amax_pre") or name.endswith("_amax_post")):
+            continue
+        marker = ".weight_quantizer"
+        if marker not in name:
+            continue
+        linear = module_by_name.get(name.split(marker, 1)[0])
+        if linear is None:
+            continue
+        allreduce = next(
+            (
+                w.allreduce
+                for wname, w in linear.named_parameters(recurse=False)
+                if "weight" in wname and hasattr(w, "allreduce")
+            ),
+            None,
+        )
+        if allreduce is not None:
+            param.allreduce = allreduce
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -426,6 +456,26 @@ def modelopt_gpt_hybrid_builder(
         qad_train_target = 'mtp'
     if qad_train_target is not None:
         _freeze_for_qad(model, qad_train_target)
+
+    # LSQ _amax_* params lack MCore's ``allreduce`` attribute; propagate it from each weight
+    # before get_model() builds DDP and the distributed optimizer. No-op without LSQ params.
+    _propagate_expert_allreduce_to_lsq_params(model)
+
+    # LSQ scale-only diagnostic: freeze every non-amax parameter so ONLY the learnable NVFP4 scales
+    # (_amax_pre / _amax_post) train. Env-gated; runs before get_model() wraps DDP and builds the
+    # optimizer, so frozen weights are excluded from the grad buffer and optimizer state entirely.
+    if os.environ.get("LSQ_SCALE_ONLY") == "1":
+        n_frozen = n_train = 0
+        for pname, p in model.named_parameters():
+            if pname.endswith("_amax_pre") or pname.endswith("_amax_post"):
+                p.requires_grad = True
+                n_train += 1
+            else:
+                p.requires_grad = False
+                n_frozen += 1
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"[LSQ_SCALE_ONLY] froze {n_frozen} non-amax params, training {n_train} amax params",
+                  flush=True)
 
     _add_load_convert_hooks(model)
 

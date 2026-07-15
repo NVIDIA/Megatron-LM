@@ -1955,6 +1955,17 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
 
+    # Scale-learning QAD (LSQ): route the learnable scale (amax) parameters into their own
+    # optimizer param group with a (typically higher) learning rate. 
+    lsq_scale_lr = getattr(args, "lsq_scale_lr", None)
+    if lsq_scale_lr is not None:
+        from megatron.core.optimizer.optimizer_config import ParamKey
+        from megatron.core.optimizer_param_scheduler import ParamGroupOverride
+
+        config_overrides[ParamKey(name=("*_amax_pre", "*_amax_post"))] = ParamGroupOverride(
+            max_lr=lsq_scale_lr
+        )
+
     return config, config_overrides
 
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
