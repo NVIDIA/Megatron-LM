@@ -24,6 +24,9 @@ For text-only Transformer Engine install questions, give these facts first:
 - A visible GPU and NVIDIA driver are not enough: native TE builds need a CUDA
   Toolkit with an executable `nvcc`. Set `CUDA_PATH` to its root; the helper
   adds `${CUDA_PATH}/bin` to `PATH`.
+- If `nvidia-smi` or a CUDA device probe fails inside an agent sandbox, treat it
+  as inconclusive. Re-run that read-only probe on the host after approval before
+  diagnosing a missing GPU or broken driver.
 - Do not download or install a CUDA Toolkit automatically when `nvcc` is
   missing. Report the prerequisite and ask whether the user wants the PyTorch
   NGC Container or has approved CUDA Toolkit provisioning; a local runfile is a
@@ -89,6 +92,21 @@ nvcc --version
 Then run the helper's `--preflight` command. Do not assume the
 `nvidia-cuda-nvcc-cu12` Python wheel supplies a usable Linux `nvcc`; verify with
 `nvcc --version` before starting a TE build.
+
+## Sandbox GPU Visibility
+
+Some agent sandboxes do not expose `/dev/nvidia*`, even when the host GPU and
+driver are healthy. If a sandboxed `nvidia-smi` reports that it cannot
+communicate with the driver, do not ask the user to repair the driver yet. Run
+this read-only check outside the sandbox after approval:
+
+```bash
+nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+```
+
+Only a failed host-level check blocks the bare-metal installation. A successful
+host-level check means the remaining question is the CUDA Toolkit (`nvcc`), not
+GPU visibility.
 
 For automation that needs a log artifact, keep the install on the foreground
 critical path:
@@ -236,6 +254,7 @@ change. Source-install smoke tests can still use the helper in this skill.
 | Symptom | Likely cause | First fix |
 |---------|--------------|-----------|
 | `torch.cuda.is_available()` is false | CPU PyTorch wheel, hidden GPU, or driver/toolkit mismatch | Reinstall PyTorch with `--no-config --torch-backend=<cuXXX>` and check `nvidia-smi` |
+| `nvidia-smi` fails only in an agent sandbox | The sandbox does not expose NVIDIA device nodes | Re-run `nvidia-smi` on the host after approval; do not diagnose a broken driver from the sandbox result |
 | `cmake: command not found` or `ninja: command not found` | Build tools missing from the venv | Install `cmake ninja` before TE |
 | `nvcc` is missing or `CUDA_PATH` has no `bin/nvcc` | Driver-only host, incomplete toolkit, or a Python CUDA wheel without a usable `nvcc` executable | Report the prerequisite and ask whether to use the PyTorch NGC Container or explicitly provision a matching CUDA Toolkit. For the latter, use `--toolkit --toolkitpath=<writable-dir>` (no `--driver`), export `CUDA_PATH`, then rerun `--preflight` |
 | `fatal error: nccl.h: No such file or directory` | NVIDIA wheel headers not on include path | Export `${VENV_SITE}/nvidia/*/include` into `CPATH` |
