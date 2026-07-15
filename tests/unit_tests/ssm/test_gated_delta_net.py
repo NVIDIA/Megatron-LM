@@ -51,6 +51,13 @@ try:
 except ImportError:
     HAVE_FLA = False
 
+try:
+    from fla.modules.fused_norm_gate import rms_norm_gated  # noqa: F401
+
+    HAVE_FUSED_GATED_NORM = True
+except ImportError:
+    HAVE_FUSED_GATED_NORM = False
+
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
@@ -166,6 +173,41 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    @pytest.mark.skipif(
+        not HAVE_FUSED_GATED_NORM, reason="fused gated-RMSNorm requires fla.rms_norm_gated"
+    )
+    def test_fused_gated_norm_matches_ref(self):
+        # This config (RMSNorm out_norm + SiLU gate) must enable the fused path;
+        # compare the fused _apply_gated_norm against the reference two-step path
+        # on the real module (real out_norm.weight / eps / zero_centered gamma).
+        gdn = self.gdn
+        assert gdn._fused_gated_norm is not None, (
+            "fused gated-RMSNorm should be enabled for RMSNorm out_norm + SiLU gate"
+        )
+        assert gdn._fused_gated_norm_zero_centered is True  # config sets zero-centered
+
+        torch.manual_seed(0)
+        n_tokens, head_dim = 128, gdn.value_head_dim
+        x = torch.randn(n_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(n_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+
+        def run(fn):
+            xr = x.clone().requires_grad_(True)
+            gr = gate.clone().requires_grad_(True)
+            y = fn(xr, gr)
+            y.float().pow(2).sum().backward()
+            return y.float().detach(), xr.grad.float(), gr.grad.float()
+
+        y_f, xg_f, gg_f = run(gdn._apply_gated_norm)  # fused
+        y_r, xg_r, gg_r = run(gdn._apply_gated_norm_ref)  # reference
+
+        def rel(a, b):
+            return (a - b).abs().max().item() / (b.abs().max().item() + 1e-12)
+
+        assert rel(y_f, y_r) < 3e-3, f"forward rel dev {rel(y_f, y_r):.2e}"
+        assert rel(xg_f, xg_r) < 1e-2, f"grad_x rel dev {rel(xg_f, xg_r):.2e}"
+        assert rel(gg_f, gg_r) < 1e-2, f"grad_gate rel dev {rel(gg_f, gg_r):.2e}"
+
     def test_selective_recompute_norm_out(self):
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
@@ -224,6 +266,11 @@ class TestGatedDeltaNet:
         torch.manual_seed(42)
         base_gdn = build_gdn(base_config)
         assert base_gdn.recompute_norm_out is False
+        if HAVE_FUSED_GATED_NORM:
+            # This config enables the fused gated-RMSNorm, so the recompute-vs-
+            # baseline exact-equality checks below also cover the fused path
+            # composing with CheckpointWithoutOutput.
+            assert base_gdn._fused_gated_norm is not None
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
         assert base_gdn.norm_out_checkpoint is None
