@@ -232,7 +232,8 @@ else
   NVCC_PATH="$(command -v nvcc || true)"
   if [[ -z "${NVCC_PATH}" ]]; then
     echo "nvcc is required for Transformer Engine native builds but was not found." >&2
-    echo "Use the PyTorch NGC Container, or install a matching CUDA Toolkit and set CUDA_PATH." >&2
+    echo "This helper does not install a CUDA Toolkit automatically." >&2
+    echo "Choose the PyTorch NGC Container, or explicitly provision a matching CUDA Toolkit and set CUDA_PATH." >&2
     echo "For a user-local install, install only the toolkit into a writable directory; do not install a driver." >&2
     exit 1
   fi
