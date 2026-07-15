@@ -139,10 +139,6 @@ def loss_func(
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
 
-    # With context parallelism every rank holds the full logprobs (gathered after the
-    # CP forward pass in get_logprobs) and therefore computes the identical loss.
-    # No cross-CP reduction is required here.
-
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
