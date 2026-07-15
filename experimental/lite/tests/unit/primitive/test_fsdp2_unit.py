@@ -389,6 +389,9 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     param.grad = torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
     optimizer.step()
     state = optimizer.state_dict()
+    expected = {key: state[key][0].clone() for key in ("master_params", "exp_avgs", "exp_avg_sqs")}
+    for key, value in expected.items():
+        state[key][0] = SimpleNamespace(_local_tensor=value)
 
     loaded_param = nn.Parameter(torch.tensor([9.0, 9.0], dtype=torch.bfloat16))
     loaded_optimizer = build_adamw_optimizer(
@@ -408,11 +411,9 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     loaded_state = loaded_optimizer.state_dict()
 
     assert loaded_state["step_count"] == state["step_count"]
-    for key in ("master_params", "exp_avgs", "exp_avg_sqs", "steps"):
-        assert len(loaded_state[key]) == len(state[key])
-    torch.testing.assert_close(loaded_state["master_params"][0], state["master_params"][0])
-    torch.testing.assert_close(loaded_state["exp_avgs"][0], state["exp_avgs"][0])
-    torch.testing.assert_close(loaded_state["exp_avg_sqs"][0], state["exp_avg_sqs"][0])
+    torch.testing.assert_close(loaded_param, expected["master_params"].to(torch.bfloat16))
+    for key, value in expected.items():
+        torch.testing.assert_close(loaded_state[key][0], value)
     assert loaded_state["steps"] == state["steps"]
 
 

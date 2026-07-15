@@ -790,7 +790,9 @@ class TestNVFP4IndexMaps:
                 'megatron.core.distributed.param_and_grad_buffer.get_nvfp4_rowwise_packed_shape',
                 side_effect=mock_packed_shape,
             ),
-            mock.patch('megatron.core.fp4_utils.modify_nvfp4_rowwise_storage'),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.modify_nvfp4_rowwise_storage'
+            ),
             mock.patch('torch.cuda.current_device', return_value='cpu'),
             mock.patch(
                 'megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'

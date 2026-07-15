@@ -786,11 +786,6 @@ class BridgeRuntime(RuntimeBase):
             micro_batch_size=1,
         )
 
-        if not forward_only:
-            from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-
-            finalize_model_grads(model_list)
-
         loss_val = last_loss[0]
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             loss_t = torch.tensor([loss_val or 0.0], device="cuda")

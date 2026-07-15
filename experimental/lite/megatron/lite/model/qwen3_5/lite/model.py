@@ -15,7 +15,6 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
@@ -165,6 +164,7 @@ class MoELayer(nn.Module):
         router_dtype: torch.dtype | None = None,
         preserve_3d_graph: bool = False,
         shared_expert_plain_te: bool = False,
+        moe_permute_fusion: bool | None = None,
     ):
         super().__init__()
         if fp8:
@@ -178,7 +178,11 @@ class MoELayer(nn.Module):
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            use_deepep=use_deepep,
+            moe_permute_fusion=moe_permute_fusion,
         )
         self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
         self.preserve_3d_graph = bool(preserve_3d_graph)
@@ -233,7 +237,7 @@ class Qwen35Layer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         deterministic: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -279,9 +283,10 @@ class Qwen35Layer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
-            router_dtype=torch.float32 if deterministic else None,
+            router_dtype=torch.float32,
             preserve_3d_graph=deterministic,
             shared_expert_plain_te=deterministic,
+            moe_permute_fusion=True,
         )
 
     def forward(
@@ -336,7 +341,7 @@ class Qwen35Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
-        gdn_cp_mode: str = "fla_allgather",
+        gdn_cp_mode: str = "replicated",
     ):
         super().__init__()
         del attention_backend_override

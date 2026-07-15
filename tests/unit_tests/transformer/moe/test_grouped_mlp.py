@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
 import sys
@@ -88,6 +88,9 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
 
+        def register_forward_hook(self, hook):
+            self.forward_post_hook = hook
+
     fake_te = SimpleNamespace(
         pytorch=SimpleNamespace(
             GroupedLinear=FakeGroupedLinear,
@@ -148,6 +151,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     assert ops[2].device == "meta"
     assert ops[2].weight is module.linear_fc2.weight
     assert hasattr(ops, "forward_pre_hook")
+    assert hasattr(ops, "forward_post_hook")
 
 
 def test_fused_forward_caches_ops_and_forwards_expected_arguments():
@@ -254,6 +258,34 @@ def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
         hook(object())
 
 
+def test_make_fused_impl_post_forward_hook_dispatches_submodule_hooks():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    fc1_child = torch.nn.Linear(2, 2)
+    fc2_child = torch.nn.Linear(2, 2)
+    module.linear_fc1 = torch.nn.Sequential(fc1_child)
+    module.linear_fc2 = torch.nn.Sequential(fc2_child)
+
+    calls = []
+
+    def fc1_hook(submodule, _inputs, output):
+        calls.append(("fc1", submodule))
+        return output + 1
+
+    def fc2_hook(submodule, _inputs, _kwargs, output):
+        calls.append(("fc2", submodule))
+        return output + 1
+
+    fc1_child.register_forward_hook(fc1_hook)
+    fc2_child.register_forward_hook(fc2_hook, with_kwargs=True)
+
+    hook = module._make_fused_impl_post_forward_hook()
+    output = hook(None, (), torch.zeros(2, 2))
+
+    assert {label for label, _ in calls} == {"fc1", "fc2"}
+    torch.testing.assert_close(output, torch.full_like(output, 2))
+
+
 def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(
@@ -294,6 +326,9 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
+
+        def register_forward_hook(self, hook):
+            self.forward_post_hook = hook
 
     fake_te = SimpleNamespace(
         pytorch=SimpleNamespace(
@@ -347,6 +382,12 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     ops = module._make_fused_ops()
 
     assert ops[0].weight is module.linear_fc1.weight
+    assert ops[0].weight0 is None
+    assert ops[0].weight1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["weight"] is module.linear_fc1.weight
+    assert "weight0" not in fc1_named_params
+    assert "weight1" not in fc1_named_params
     assert ops[1].glu_interleave_size == 8
     assert ops[1].activation_recompute_in_mlp is True
     assert ops[2].weight0 is module.linear_fc2.weight0
@@ -419,6 +460,9 @@ def _make_fake_te_namespace():
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
+
+        def register_forward_hook(self, hook):
+            self.forward_post_hook = hook
 
     return (
         SimpleNamespace(
@@ -626,24 +670,6 @@ def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
     assert module._is_fused_impl_supported() is False
 
 
-def test_is_fused_impl_supported_requires_glu_interleave_32(monkeypatch):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-        moe_mlp_glu_interleave_size=16,
-    )
-
-    assert module._is_fused_impl_supported() is False
-
-
 @pytest.mark.parametrize(
     (
         "use_fused_weighted_squared_relu",
@@ -727,10 +753,13 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     assert ops[0].weight0 is module.linear_fc1.weight0
     assert ops[0].weight1 is module.linear_fc1.weight1
-    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
-    assert not hasattr(
-        ops[0], "bias0"
-    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+    assert ops[0].bias is module.linear_fc1.bias
+    assert ops[0].bias0 is None
+    assert ops[0].bias1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["bias"] is module.linear_fc1.bias
+    assert "bias0" not in fc1_named_params
+    assert "bias1" not in fc1_named_params
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():

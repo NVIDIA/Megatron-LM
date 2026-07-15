@@ -42,6 +42,12 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    use_layer_wise_param_layout: bool = False
+    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
+       the shard-aligned padded LayerWise param layout. When False (default), the compact
+       decoupled layout is selected instead.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.

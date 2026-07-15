@@ -1,3 +1,4 @@
-# Reference VERL release for the Megatron Lite VERL example.
-# Latest GitHub release checked on 2026-06-06: v0.8.0.
-verl @ git+https://github.com/verl-project/verl.git@v0.8.0
+# Reference VERL source for the Megatron Lite VERL example.
+# Requires verl latest main (engine-worker / V1 trainer architecture).
+# Pinned reference commit: a6ef5009 (verl main as of 2026-06-22).
+verl @ git+https://github.com/verl-project/verl.git@a6ef5009

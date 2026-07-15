@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import fnmatch
 import functools
 import logging
@@ -20,10 +21,21 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
-from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
+from ..fp4_utils import (
+    get_nvfp4_rowwise_packed_shape,
+    is_grouped_nvfp4tensor,
+    is_nvfp4tensor,
+    modify_grouped_nvfp4_rowwise_storage,
+    modify_nvfp4_rowwise_storage,
+)
 from ..fp8_utils import (
+    copy_tensor_to_quantized_param,
     is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
     is_mxfp8tensor,
+    modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
     post_all_gather_processing,
 )
@@ -73,6 +85,17 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
+    """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
+    # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
+    # Grouped quantized params are GroupedTensor wrappers, so check their backing storage.
+    return (
+        is_float8tensor(param)
+        or is_nvfp4tensor(param)
+        or is_grouped_tensor_with_quantized_storage(param)
+    )
 
 
 class _ParamAndGradBucket:
@@ -291,17 +314,18 @@ class _ParamAndGradBucketGroup:
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
-                is_bf16_weight_bucket = False
+                has_non_quantized_weight = False
                 for param in bucket.params:
-                    # Skip copying since bf16 weights in the mxfp8 model
-                    # are already mapped to param.data.
-                    if not is_float8tensor(param):
-                        is_bf16_weight_bucket = True
+                    # Non-quantized weights are already mapped to param.data. Skip
+                    # mixed buckets because zeroing bucket.param_data would also
+                    # clear those model weights.
+                    if not _param_uses_quantized_storage(param):
+                        has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
                     param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    param.data.copy_(param_slice.view(param.data.shape))
-                if is_bf16_weight_bucket:
+                    copy_tensor_to_quantized_param(param, param_slice)
+                if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
                 # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
@@ -314,7 +338,7 @@ class _ParamAndGradBucketGroup:
         quantized_params = []
         for bucket in self.buckets:
             for param in bucket.params:
-                if is_float8tensor(param) or is_nvfp4tensor(param):
+                if _param_uses_quantized_storage(param):
                     quantized_params.append(param)
         if len(quantized_params) > 0:
             post_all_gather_processing(quantized_params)
@@ -614,9 +638,11 @@ class _ParamAndGradBucketGroup:
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        for bucket in self.buckets:
-            if bucket.gradient_scaling_factor != 1.0:
-                bucket.grad_data *= bucket.gradient_scaling_factor
+        # This mutates gradient communication state and must not be tracked by autograd.
+        with torch.no_grad():
+            for bucket in self.buckets:
+                if bucket.gradient_scaling_factor != 1.0:
+                    bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -864,7 +890,7 @@ def group_params_for_buffers(
         assert param.requires_grad
 
         param_dtype = param.dtype
-        if is_float8tensor(param) or is_nvfp4tensor(param):
+        if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -1013,6 +1039,18 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+
+        self._is_layer_wise_buffer = bool(
+            self.params and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        # Bake the per-buffer DistOpt decision into this buffer's ddp_config (single source of
+        # truth; bucket groups inherit it): a LayerWise (Muon) buffer on the compact decoupled
+        # layout disables DistributedOptimizer, while sibling buffers keep the model-level setting.
+        if self._is_layer_wise_buffer and not getattr(
+            self.ddp_config, "use_layer_wise_param_layout", True
+        ):
+            self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
+
         disable_grad_buffers_cpu_backup = self.ddp_config.disable_grad_buffers_cpu_backup
         disable_param_buffers_cpu_backup = (
             self.ddp_config.disable_param_buffers_cpu_backup
@@ -1051,7 +1089,9 @@ class _ParamAndGradBuffer:
         # The packed index map is derived from param_index_map by iterating through
         # the already-computed layout and halving numel for NVFP4 tensors.
         #
-        self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
+        self.has_nvfp4_params = any(
+            is_nvfp4tensor(p) or is_grouped_nvfp4tensor(p) for p in self.params
+        )
         self.nvfp4_packed_param_index_map = None
         self.nvfp4_packed_bucket_indices = None
         if self.has_nvfp4_params:
@@ -1066,6 +1106,27 @@ class _ParamAndGradBuffer:
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
 
         assert self.numel_unpadded <= self.numel
+
+        # Diagnostic: log persistent buffer size vs. unpadded payload so the cost of any
+        # optimizer-driven padding (e.g. the LayerWise shard-aligned ``dp_size * max(shard_load)``
+        # layout) is visible per buffer. Emit at INFO only when it is interesting — a
+        # LayerWise-managed buffer or one that actually carries padding — and DEBUG otherwise, so
+        # ordinary (zero-padding) buffers do not spam non-experimental runs.
+        _padding = self.numel - self.numel_unpadded
+        _pad_frac = _padding / max(self.numel_unpadded, 1)
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO if (self._is_layer_wise_buffer or _padding > 0) else logging.DEBUG,
+            f"ParamAndGradBuffer layout: param_dtype={self.param_dtype} "
+            f"grad_dtype={self.grad_dtype} dp_world_size={self.data_parallel_world_size} "
+            f"layerwise={self._is_layer_wise_buffer} "
+            f"distopt={self.ddp_config.use_distributed_optimizer} "
+            f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
+            f"padding={_padding} ({_pad_frac:.1%})",
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
+
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:
@@ -1080,7 +1141,7 @@ class _ParamAndGradBuffer:
         self.extra_main_grads = []
         self.nccl_mem_pool = None
         shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
-            is_mxfp8tensor(p) for p in self.params
+            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
         )
         if (
             HAVE_TORCH_MEMORY_SAVER
@@ -1234,50 +1295,129 @@ class _ParamAndGradBuffer:
             nvfp4_packed_param_start_index = None
             if self.has_nvfp4_params:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
-            # For MXFP8 param:
-            # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
+            # This branch remaps the parameter storage into persistent DDP param_data buffer.
+            #
+            # Enter when:
+            # - `reuse_grad_buf_for_mxfp8_param_ag` is off: param AG has a persistent
+            #   param_data buffer instead of sharing storage with grad_data,
+            #   so every parameter must be backed by param_data.
+            # - param is not quantized: BF16/FP16/plain params still need persistent
+            #   param_data even when quantized params use grad_data as temporary AG storage.
+            #
+            # Skip only when both are true: AG reuses grad_data and the param is quantized.
+            # In that case AG writes into grad_data, then _post_param_sync copies the
+            # gathered values back into TE quantized storage.
+            #
+            # Remap cases below:
+            #   non-grouped TE NVFP4 tensor   -> remap packed rowwise bytes
+            #   non-grouped TE quantized      -> remap TE quantized storage
+            #   regular torch.Tensor param    -> replace param.data with param_data view
+            #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
+            #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
+            #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
+            if (
+                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                or not _param_uses_quantized_storage(param)
+            ):
                 if self.param_data is not None:
-                    if is_nvfp4tensor(param):
-                        # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
-                        # points into the contiguous DDP param buffer. This enables the
-                        # all-gather to communicate packed NVFP4 bytes directly.
-                        from ..fp4_utils import modify_nvfp4_rowwise_storage
-
-                        packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
-                        rowwise_bytes_view = self._get(
-                            packed_shape,
-                            nvfp4_packed_param_start_index,
-                            buffer_type=BufferType.PARAM,
-                        )
-                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
-                    elif is_float8tensor(param):
-                        new_param_data = self._get(
-                            param.data.shape,
-                            (
-                                nvfp4_packed_param_start_index
-                                if self.has_nvfp4_params
-                                else param_start_index
-                            ),
-                            buffer_type=BufferType.PARAM,
-                        )
-                        modify_underlying_storage(param, new_param_data)
+                    if not is_grouped_tensor(param):
+                        # Plain NVFP4: remap packed rowwise bytes only.
+                        if is_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                        # In TE2, is_float8tensor() checks QuantizedTensor, including MXFP8.
+                        # NVFP4 is handled by the branch above.
+                        elif is_float8tensor(param):
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_underlying_storage(param, new_param_data)
+                        # Plain torch param: replace param.data with DDP buffer view.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            old_param_data = param.data
+                            param.data = new_param_data
+                            assert old_param_data._base is None
+                            # Copy tensor values (from initialization or checkpoint).
+                            param.data.detach().copy_(old_param_data)
+                            del old_param_data
                     else:
-                        new_param_data = self._get(
-                            param.data.shape,
-                            (
-                                nvfp4_packed_param_start_index
-                                if self.has_nvfp4_params
-                                else param_start_index
-                            ),
-                            buffer_type=BufferType.PARAM,
-                        )
-                        old_param_data = param.data
-                        param.data = new_param_data
-                        assert old_param_data._base is None
-                        # Copy tensor values (from initialization or checkpoint).
-                        param.data.detach().copy_(old_param_data)
-                        del old_param_data
+                        # GroupedTensor: preserve wrapper/metadata; remap backing storage only.
+                        # Grouped NVFP4: only rowwise bytes live in DDP param_data.
+                        if is_grouped_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != rowwise_bytes_view.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap grouped NVFP4 rowwise storage into DDP "
+                                    "param_data."
+                                )
+                        # Grouped MXFP8: do not remap grouped quantized storage into param_data.
+                        # Use grad-buffer AG reuse and copy gathered values back after AG.
+                        elif is_grouped_mxfp8tensor(param):
+                            raise RuntimeError(
+                                "Single grouped MXFP8 params require "
+                                "--reuse-grad-buf-for-mxfp8-param-ag."
+                            )
+                        elif is_grouped_tensor_with_quantized_storage(param):
+                            raise RuntimeError(
+                                "Unsupported single grouped quantized parameter recipe."
+                            )
+                        # Grouped BF16/FP16: remap full rowwise_data.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_tensor_rowwise_storage(param, new_param_data)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != new_param_data.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap high-precision TE GroupedTensor parameter "
+                                    "storage into DDP param_data."
+                                )
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
@@ -1410,7 +1550,7 @@ class _ParamAndGradBuffer:
                 cur_bucket_id = bucket_id
 
             # NVFP4 tensors use half the numel in the packed param buffer.
-            if is_nvfp4tensor(param):
+            if is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param):
                 assert (
                     param_numel % 2 == 0
                 ), f"NVFP4 requires even numel for packing, got {param_numel}"
@@ -1626,22 +1766,72 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
+    # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
+    # all-reduce otherwise), so buckets merged into one group must agree on the effective
+    # per-buffer ``use_distributed_optimizer``. The decoupled LayerWise layout
+    # (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
+    # ``use_distributed_optimizer=False`` while sibling buffers keep True; the no-fp8 Case 2 below
+    # keeps every bucket in its own group so they never mix, but the merging Cases 1/3 must assert
+    # consistency.
+    _ddp_config = buffers[0].ddp_config
+    _decouple = not getattr(_ddp_config, "use_layer_wise_param_layout", True)
+
+    def _bucket_distopt(bucket):
+        """This bucket's effective ``use_distributed_optimizer``."""
+        is_lw = bool(
+            bucket.params_list
+            and getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        if _decouple and is_lw:
+            return False
+        return _ddp_config.use_distributed_optimizer
+
+    def _merged_use_distributed_optimizer(merge_buckets):
+        values = {_bucket_distopt(bucket) for bucket in merge_buckets}
+        assert len(values) == 1, (
+            "Cannot merge buckets with differing effective use_distributed_optimizer into one "
+            "bucket group. This happens when the decoupled LayerWise layout "
+            "(use_layer_wise_param_layout=False) mixes LayerWise (all-reduce) and non-LayerWise "
+            "(reduce-scatter) buffers under a merging bucketing strategy (e.g. the fp8 merge "
+            "path). Disable bucket merging for the decoupled LayerWise path."
+        )
+        return values.pop()
+
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True
+    # (e.g. disable_bucketing / non-first VPP chunks). A bucket group performs a single
+    # collective type, so when the decoupled LayerWise layout (use_layer_wise_param_layout=False)
+    # mixes LayerWise (all-reduce, non-DistOpt) and non-LayerWise (reduce-scatter, DistOpt)
+    # buffers in one chunk, we cannot
+    # merge them into a single group. Split by the effective per-bucket use_distributed_optimizer
+    # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
+    # to exactly one group, identical to the previous behavior.
     if force_single_bucket_group:
-        buckets = []
-        ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
+        ordered_distopt_values = []
+        buckets_by_distopt = {}
+        # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
+        ddp_config_by_distopt = {}
         for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
+            distopt = buffer.ddp_config.use_distributed_optimizer
+            ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
+            for bucket in buffer.buckets:
+                if distopt not in buckets_by_distopt:
+                    buckets_by_distopt[distopt] = []
+                    ordered_distopt_values.append(distopt)
+                buckets_by_distopt[distopt].append(bucket)
 
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
+        return [
+            _ParamAndGradBucketGroup(
+                buckets_by_distopt[distopt],
+                ddp_config_by_distopt[distopt],
+                data_parallel_group,
+                data_parallel_world_size,
+            )
+            for distopt in ordered_distopt_values
+        ]
 
     if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
@@ -1660,11 +1850,12 @@ def partition_buckets(
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
+        # Track each non-fp8 bucket with its buffer's (authoritative) ddp_config.
+        non_fp8_buckets = []  # list of (bucket, ddp_config)
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
+                    non_fp8_buckets.append((bucket, buffer.ddp_config))
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1678,17 +1869,17 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
+                            fp8_buffer.ddp_config,
                             buffer.data_parallel_group,
                             buffer.data_parallel_world_size,
                         )
                     )
                     if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
+                        for non_fp8_bucket, non_fp8_ddp_config in non_fp8_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
+                                    non_fp8_ddp_config,
                                     buffer.data_parallel_group,
                                     buffer.data_parallel_world_size,
                                 )
@@ -1696,14 +1887,19 @@ def partition_buckets(
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + non_fp8_buckets
+                    group_buckets = [bucket] + [b for b, _ in non_fp8_buckets]
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
+            # Merged buckets must share the fp8 group's effective use_distributed_optimizer.
+            assert (
+                _merged_use_distributed_optimizer(group_buckets)
+                == fp8_buffer.ddp_config.use_distributed_optimizer
+            )
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
+                    fp8_buffer.ddp_config,
                     buffer.data_parallel_group,
                     buffer.data_parallel_world_size,
                 )

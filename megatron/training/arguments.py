@@ -1251,6 +1251,17 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
+            # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
+            # grouped backing storage remapped instead; quantized grouped tensors also need
+            # grouped scale/amax handling. DDP has a separate GroupedTensor-aware path.
+            raise ValueError(
+                "Megatron-FSDP does not currently support moe_single_grouped_weight or "
+                "moe_single_grouped_bias. Disable single grouped MoE parameters or use the "
+                "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
+                "GroupedTensor param buffers."
+            )
         # Optimizer compatibility check.
         assert args.optimizer in (
             'sgd',
@@ -1892,6 +1903,21 @@ def validate_args(args, defaults={}):
             "torch",
             "torch_dist",
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+    if args.use_layer_wise_distributed_optimizer:
+        assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+            "Layer-wise (Muon) distributed optimizer does not support FP8/FP4 parameter gather "
+            "(fp8_param_gather / fp4_param_gather). Use fp8_param_gather=False (e.g. blockwise/"
+            "MXFP8 compute with parameters persisted in bf16)."
+        )
+        if not args.use_layer_wise_param_layout:
+            assert args.num_distributed_optimizer_instances == 1, (
+                "the decoupled compact LayerWise DDP layout (the default; pass "
+                "--use-layer-wise-param-layout for the padded layout) requires "
+                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
+                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
+                "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -4218,17 +4244,16 @@ def _add_distributed_args(parser):
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
     group.add_argument(
-        '--no-use-layer-wise-param-layout',
-        action='store_false',
+        '--use-layer-wise-param-layout',
+        action='store_true',
         dest='use_layer_wise_param_layout',
-        help='Opt out of the precomputed LayerWise param layout. When set, '
-        'falls back to the legacy LayerWise ping-pong path: all params '
-        '(including non-Muon embeddings, biases, layernorm) live in a single '
-        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-        'The default (precomputed layout) routes non-Muon params through a '
-        'separate DistributedOptimizer with byte-level sharding, which is faster '
-        'and uses less padding but produces different bf16 reduction ordering '
-        'and so will not match legacy-path loss curves bit-for-bit.',
+        default=False,
+        help='Opt INTO the padded shard-aligned LayerWise param layout. The default is the compact '
+        'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
+        'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
+        'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
+        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
+        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 

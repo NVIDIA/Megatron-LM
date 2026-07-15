@@ -1,0 +1,41 @@
+# Megatron Lite reference-model config for VERL's new engine worker path.
+#
+# The reference policy is built by ActorRolloutRefWorker from
+# `actor_rollout_ref.ref.engine`, independently of the actor. Without an mlite
+# ref config the ref worker falls back to the default FSDP engine config, whose
+# object has no `tp`/`cp`/`pp`, so mlite's get_data_parallel_size() raises
+# `AttributeError: 'FSDPEngineConfig' object has no attribute 'tp'` as soon as a
+# reference policy is requested (use_kl_loss / use_kl_in_reward). This config
+# routes the ref worker through the mlite engine, forward-only, mirroring the
+# actor's parallel layout so the reference log-probs are computed on the same
+# mesh as the actor.
+#
+# Wire it from the launcher with:  ref@actor_rollout_ref.ref=mlite_ref
+defaults:
+  - ref
+  - /optim@optim: megatron
+  - /engine@engine: mlite
+  - _self_
+
+_target_: verl.workers.config.ActorConfig
+
+strategy: mlite
+
+engine:
+  # ref model is forward-only (no optimizer / backward)
+  forward_only: True
+  # mirror the actor's parallel layout so ref runs on the same mesh
+  model_name: ${oc.select:actor_rollout_ref.actor.engine.model_name,auto}
+  impl: ${oc.select:actor_rollout_ref.actor.engine.impl,lite}
+  dtype: ${oc.select:actor_rollout_ref.actor.engine.dtype,bfloat16}
+  tp: ${oc.select:actor_rollout_ref.actor.engine.tp,1}
+  pp: ${oc.select:actor_rollout_ref.actor.engine.pp,1}
+  vpp: ${oc.select:actor_rollout_ref.actor.engine.vpp,1}
+  cp: ${oc.select:actor_rollout_ref.actor.engine.cp,1}
+  ep: ${oc.select:actor_rollout_ref.actor.engine.ep,1}
+  etp: ${oc.select:actor_rollout_ref.actor.engine.etp,null}
+  attention_backend_override: ${oc.select:actor_rollout_ref.actor.engine.attention_backend_override,flash}
+  # ref only runs forward, so default to offloading params to free GPU memory
+  param_offload: ${oc.select:actor_rollout_ref.ref.param_offload,True}
+  impl_cfg:
+    use_thd: ${oc.select:actor_rollout_ref.actor.engine.impl_cfg.use_thd,true}

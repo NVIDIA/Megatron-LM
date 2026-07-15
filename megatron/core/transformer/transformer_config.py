@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 import math
 import warnings
@@ -307,6 +308,9 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
+
     ####################
     # DSA
     ####################
@@ -378,6 +382,11 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
     ####################
     # initialization
@@ -850,7 +859,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
+    ``use_transformer_engine_op_fuser=True``.
     """
 
     moe_single_grouped_bias: bool = False
@@ -890,10 +900,12 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
     moe_hybridep_pad_variable_tokens: bool = False
-    """Pad uneven local token counts to the HybridEP group maximum before dispatch.
+    """Dynamically pad uneven local token counts to the HybridEP group maximum before dispatch.
 
-    This is needed when the frontend supplies locally packed THD inputs whose token counts
-    can differ across ranks, without using Megatron Core's sequence_packing_scheduler.
+    Enable this when local token counts can differ across ranks. When disabled, the caller must
+    guarantee equal token counts across the HybridEP communication group, for example by padding
+    THD inputs to a fixed maximum before dispatch. CUDA Graph inputs should be statically padded
+    upstream and leave this option disabled.
     """
 
     moe_per_layer_logging: bool = False
@@ -978,6 +990,8 @@ class TransformerConfig(ModelParallelConfig):
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
     cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    This option controls standard attention layers. Linear-attention layers use
+    `linear_cp_mode` instead.
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
@@ -987,6 +1001,19 @@ class TransformerConfig(ModelParallelConfig):
     "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
+    """
+
+    linear_cp_mode: Optional[str] = "chunkwise"
+    """Context-parallel execution mode for linear-attention layers
+    (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
+    Can be "chunkwise" or "headwise":
+    "chunkwise": Keep sequence chunks sharded across CP ranks and use CP-aware linear kernels
+    (e.g. chunk_gated_delta_rule + causal_conv1d with a CP context). This follows the chunkwise
+    DeltaNet idea of storing state at chunk boundaries and doing chunk-local matrix work, avoiding
+    a full per-token recurrent state materialization while keeping tensor-core-friendly matmuls.
+    See https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet.
+    "headwise": Scatter heads across the CP group with all-to-all (Ulysses-style); each rank runs
+    the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
     """
 
     ##################
@@ -1457,6 +1484,30 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.experimental_attention_variant == "dsv4_hybrid" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+
+        if self.context_parallel_size > 1:
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.cp_partition_mode != "contiguous"
+            ):
+                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+            if (
+                self.experimental_attention_variant != "dsv4_hybrid"
+                and self.cp_partition_mode != "zigzag"
+            ):
+                raise ValueError(
+                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                )
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1489,16 +1540,36 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.gdn_conv_pad_alignment > 0, (
+                        f"gdn_conv_pad_alignment must be positive when set, "
+                        f"got {self.gdn_conv_pad_alignment}."
+                    )
 
-            # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-            assert self.linear_num_key_heads % tp_cp_size == 0, (
+            if self.context_parallel_size > 1:
+                assert self.linear_cp_mode in ("headwise", "chunkwise"), (
+                    f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
+                    f"got {self.linear_cp_mode!r}."
+                )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.linear_cp_mode != "chunkwise", (
+                        "gdn_conv_pad_alignment is incompatible with "
+                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
+                        "Padding chunk-local GDN causal-conv inputs can change later "
+                        "chunk numerics."
+                    )
+            # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            linear_head_parallel_size = self.tensor_model_parallel_size
+            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
+                linear_head_parallel_size *= self.context_parallel_size
+            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
-            assert self.linear_num_value_heads % tp_cp_size == 0, (
+            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
             pass
@@ -1530,10 +1601,23 @@ class TransformerConfig(ModelParallelConfig):
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
                 sm = torch.cuda.get_device_capability()
-                assert sm[0] >= 10, (
-                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                assert sm[0] >= 9, (
+                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
+                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if (
+                    sm[0] == 9
+                    and uses_ratio4_indexer
+                    and indexer_loss_enabled
+                    and not self.dsa_indexer_use_sparse_loss
+                ):
+                    raise ValueError(
+                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
+                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
+                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                    )
 
                 _flash_mla_available = True
                 try:
@@ -1562,6 +1646,31 @@ class TransformerConfig(ModelParallelConfig):
                         f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
                         f"PyTorch fallback."
                     )
+
+                if (
+                    self.context_parallel_size > 1 or self.dynamic_context_parallel
+                ) and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or disable DSA kernel fusion."
+                        )
 
         if (
             self.gdn_pre_gated_delta_rule_fusion
@@ -1740,16 +1849,23 @@ class TransformerConfig(ModelParallelConfig):
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
         if self.moe_single_grouped_weight:
-            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
-            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
-            # combinations have a known numerical issue tracked in upstream PR
-            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
-            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
-            # biases aren't quantized, so they don't enter the buggy code path.)
-            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+            # Single grouped weights are supported for high-precision primary weights
+            # (BF16/FP16), MXFP8 primary weights, and NVFP4 primary weights.
+            # Other quantized primary-weight paths need grouped partial-cast support
+            # before they are safe to enable.
+            if (self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8) or (
+                self.fp4 and self.fp4_recipe != Fp4Recipe.nvfp4
+            ):
                 raise ValueError(
-                    "moe_single_grouped_weight is currently supported only with fp8 mode "
-                    "and fp8_recipe='mxfp8'."
+                    "moe_single_grouped_weight is currently supported with high-precision "
+                    "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
+                )
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_single_grouped_weight requires "
+                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
+                    "path splits the grouped parameter into per-expert tensors and does not "
+                    "support single-grouped-weight training."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
