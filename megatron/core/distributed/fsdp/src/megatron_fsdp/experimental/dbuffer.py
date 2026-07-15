@@ -284,13 +284,21 @@ class DBuffer:
         return destination
 
     def redistribute(
-        self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
+        self,
+        new_placements: Iterable[Placement],
+        *,
+        out: "DBuffer | None" = None,
+        reduce_group: "dist.ProcessGroup | None" = None,
     ) -> "DBuffer":
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
         Flat -> Replicate, Partial -> Replicate, Partial -> Flat, and
         Replicate -> Flat. Other placement changes are intentionally unsupported.
+
+        ``reduce_group`` optionally overrides the process group for the
+        Partial -> Flat reduce-scatter, letting the caller run reduce-scatter on a
+        communicator separate from the mesh's default (all-gather) group.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -316,7 +324,7 @@ class DBuffer:
         if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
             return self.allreduce(axis, out=out)
         if isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
-            return self.reduce_scatter(axis, new_placement, out=out)
+            return self.reduce_scatter(axis, new_placement, out=out, group=reduce_group)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
             return self.scatter(axis, new_placement, out=out)
         raise NotImplementedError(
@@ -359,9 +367,18 @@ class DBuffer:
         return out
 
     def reduce_scatter(
-        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
+        self,
+        mesh_axis: int,
+        new_placement: Placement,
+        *,
+        out: "DBuffer | None" = None,
+        group: "dist.ProcessGroup | None" = None,
     ) -> "DBuffer":
-        """Reduce-scatter a Partial axis into ``new_placement``."""
+        """Reduce-scatter a Partial axis into ``new_placement``.
+
+        ``group`` defaults to the mesh's axis group; pass a dedicated communicator
+        to run reduce-scatter separately from all-gather.
+        """
         axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
@@ -377,7 +394,7 @@ class DBuffer:
             output=out.local_buffer,
             input=self.local_buffer,
             op=partial_placement.reduce_op,
-            group=self.mesh.get_group(axis),
+            group=group if group is not None else self.mesh.get_group(axis),
         )
         return out
 

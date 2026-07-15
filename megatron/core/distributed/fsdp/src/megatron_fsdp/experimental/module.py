@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Literal, cast
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
 
@@ -37,9 +38,11 @@ class DelayedRelease:
 
 
 class FsdpContext:
-    """Runtime state, stream, and release scheduler shared by one FSDP subtree."""
+    """Runtime state, streams, and release scheduler shared by one FSDP subtree."""
 
     allgather_stream: torch.cuda.Stream
+    reduce_scatter_stream: torch.cuda.Stream
+    reduce_scatter_group: dist.ProcessGroup
     delayed_releases: deque[DelayedRelease]
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
@@ -57,8 +60,27 @@ class FsdpContext:
         self.root_module = root_module
         self.is_last_microbatch = True
         self.delayed_releases = deque()
+        self._post_backward_callback_queued = False
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
+            self.reduce_scatter_stream = torch.cuda.Stream()
+        # Dedicated NCCL communicator for reduce-scatter, distinct from the mesh's
+        # all-gather group. A separate communicator lets an eager reduce-scatter run
+        # concurrently with the next unit's all-gather instead of contending on one
+        # comm's ordered stream -- which is what makes it safe to drop the delayed
+        # reduction and launch reduce-scatter immediately in post_backward. new_group
+        # is collective, so every rank reaches this on the first forward through the
+        # root. Prototype: 1D DP mesh only (the general case needs one dedicated group
+        # per mesh-axis subgroup, mirroring DeviceMesh construction).
+        mesh = root_module._parameter_groups[0].mesh
+        if mesh.ndim != 1:
+            raise NotImplementedError(
+                "Prototype dedicated reduce-scatter communicator supports a 1D DP mesh "
+                f"only; got a {mesh.ndim}D mesh."
+            )
+        self.reduce_scatter_group = dist.new_group(
+            ranks=dist.get_process_group_ranks(mesh.get_group(0))
+        )
 
     def enqueue_release(self, module: "FsdpModule") -> None:
         """Queue a module's unsharded storage for delayed release."""
@@ -76,6 +98,36 @@ class FsdpContext:
                 if delayed_release.consumer_event is not None:
                     self.allgather_stream.wait_event(delayed_release.consumer_event)
                 delayed_release.module.release_unsharded_storage()
+
+    def queue_post_backward_callback(self) -> None:
+        """Queue an end-of-backward callback so the optimizer waits for reduce-scatter."""
+        if self._post_backward_callback_queued:
+            return
+
+        self._post_backward_callback_queued = True
+        try:
+            torch.autograd.Variable._execution_engine.queue_callback(self.finalize_reductions)
+        except RuntimeError as error:
+            self._post_backward_callback_queued = False
+            if str(error) != "Final callbacks can only be installed during backward pass.":
+                raise
+            self.finalize_reductions()
+
+    def finalize_reductions(self) -> None:
+        """Order the default stream (the optimizer's) after all eager reduce-scatters.
+
+        Reduce-scatters are launched eagerly in ``post_backward`` on
+        ``reduce_scatter_stream``; their input and output buffers are allocated on and
+        consumed by that stream, so the CUDA caching allocator keeps the storage alive
+        until each collective completes -- no explicit pending-buffer retention needed.
+        This single stream barrier makes the default stream, where the optimizer reads
+        the reduced gradients, wait for those reductions to finish.
+        """
+        try:
+            default_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
+            default_stream.wait_stream(self.reduce_scatter_stream)
+        finally:
+            self._post_backward_callback_queued = False
 
 
 class FsdpModule:
@@ -245,15 +297,48 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        for group in self._parameter_groups:
-            if group.requires_grad:
-                group.reduce_gradients()
+        self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self.context.enqueue_release(self)
         if self.is_root():
             self.context.drain_delayed_releases(target_length=0)
         self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
+
+    def _reduce_gradient_groups(self) -> None:
+        # Eagerly launch each group's reduce-scatter on the dedicated reduce-scatter
+        # communicator/stream as soon as its gradients are packed. Because that comm is
+        # separate from the all-gather group, an eager reduce-scatter does not serialize
+        # against the next unit's all-gather, so no deferral to the next pre_backward and
+        # no prepared/pending buffer bookkeeping are needed -- only the end-of-backward
+        # barrier in finalize_reductions. Delayed *releases* are unchanged.
+        context = self.context
+        default_stream = torch.cuda.current_stream(context.reduce_scatter_stream.device)
+        scheduled_reduction = False
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            with torch.cuda.stream(context.reduce_scatter_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+
+            # Pack on the default stream (where grads are produced), so reads of
+            # parameter.grad and the subsequent `.grad = None` stay same-stream.
+            default_stream.wait_stream(context.reduce_scatter_stream)
+            group.copy_gradients_to_partial_buffer(partial_grad)
+
+            # Reduce-scatter waits for the pack, then runs eagerly on the reduce-scatter
+            # stream. partial_grad was allocated on that stream, so dropping the reference
+            # here is safe: the caching allocator retains the storage until the collective
+            # completes.
+            context.reduce_scatter_stream.wait_stream(default_stream)
+            with torch.cuda.stream(context.reduce_scatter_stream):
+                group.reduce_partial_gradients(
+                    partial_grad, reduce_group=context.reduce_scatter_group
+                )
+            scheduled_reduction = True
+
+        if scheduled_reduction:
+            context.queue_post_backward_callback()
 
     def release_unsharded_storage(self) -> None:
         """Release unsharded storage owned by this FSDP unit."""
