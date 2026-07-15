@@ -14,6 +14,8 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+import dataclasses
+from collections import deque
 from collections.abc import Callable
 from typing import Literal, cast
 
@@ -26,23 +28,54 @@ from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
-class FsdpContext:
-    """Runtime state shared by one experimental FSDP subtree."""
+@dataclasses.dataclass(frozen=True)
+class DelayedRelease:
+    """A module whose unsharded storage can be released after its consumer event."""
 
+    consumer_event: torch.cuda.Event | None
+    module: "FsdpModule"
+
+
+class FsdpContext:
+    """Runtime state, stream, and release scheduler shared by one FSDP subtree."""
+
+    allgather_stream: torch.cuda.Stream
+    delayed_releases: deque[DelayedRelease]
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
     root_module: "FsdpModule"
 
-    def __init__(self, root_module: "FsdpModule") -> None:
+    def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
         """Create rank-local runtime state for a root FSDP subtree.
 
         Args:
+            device: Device on which this context schedules communication.
             root_module: Outermost module that owns this context.
         """
         self.root_module = root_module
         self.is_last_microbatch = True
+        self.delayed_releases = deque()
+        with torch.cuda.device(device):
+            self.allgather_stream = torch.cuda.Stream()
+
+    def enqueue_release(self, module: "FsdpModule") -> None:
+        """Queue a module's unsharded storage for delayed release."""
+        consumer_event = torch.cuda.current_stream(self.allgather_stream.device).record_event()
+        self.delayed_releases.append(DelayedRelease(consumer_event=consumer_event, module=module))
+
+    def drain_delayed_releases(self, target_length: int) -> None:
+        """Release queued module storages FIFO until the queue reaches ``target_length``."""
+        if target_length < 0:
+            raise ValueError(f"target_length must be non-negative, got {target_length}.")
+
+        while len(self.delayed_releases) > target_length:
+            delayed_release = self.delayed_releases.popleft()
+            with torch.cuda.stream(self.allgather_stream):
+                if delayed_release.consumer_event is not None:
+                    self.allgather_stream.wait_event(delayed_release.consumer_event)
+                delayed_release.module.release_unsharded_storage()
 
 
 class FsdpModule:
@@ -114,7 +147,7 @@ class FsdpModule:
         if self._context is not None:
             return
 
-        context = FsdpContext(root_module=self)
+        context = FsdpContext(device=self._parameter_groups[0].main_weight.device, root_module=self)
         for submodule_name, submodule in cast(nn.Module, self).named_modules():
             if not isinstance(submodule, FsdpModule):
                 continue
@@ -134,14 +167,14 @@ class FsdpModule:
 
     @property
     def name(self) -> str:
-        """Return this FSDP unit's name."""
+        """Return this FsdpModule's name."""
         name = self._name
         if name is None:
             raise RuntimeError("FSDP module name has not been initialized.")
         return name
 
     def is_root(self) -> bool:
-        """Return whether this module is the outermost FSDP unit in its context."""
+        """Return whether this module is the outermost FsdpModule in its context."""
         return self.context.root_module is self
 
     def _register_hooks(self) -> None:
@@ -156,8 +189,8 @@ class FsdpModule:
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
-        # based: once every owned Parameter has accumulated its grad, this FSDP
-        # unit can reduce and reshard. Module full-backward hooks can fire
+        # based: once every owned Parameter has accumulated its grad, this
+        # FsdpModule can reduce and reshard. Module full-backward hooks can fire
         # before that when module inputs do not require grad.
         for group in self._parameter_groups:
             if not group.requires_grad:
@@ -178,33 +211,64 @@ class FsdpModule:
         self._lazy_init_context()
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
-        for group in self._parameter_groups:
-            group.sync_model_weight_from_main_weight()
-            group.unshard_parameters()
+        if self.is_root():
+            allgather_stream = self.context.allgather_stream
+            allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        self._unshard_parameter_groups(sync_model_weight=True)
+
+    def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
+        """Materialize full parameters for this FsdpModule."""
+        self.context.drain_delayed_releases(target_length=1)
+
+        allgather_stream = self.context.allgather_stream
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+
+        with torch.cuda.stream(allgather_stream):
+            for group in self._parameter_groups:
+                if sync_model_weight:
+                    # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
+                    # optimizer post-step hook instead of running it every microbatch.
+                    group.sync_model_weight_from_main_weight()
+                group.unshard_parameters()
+        current_stream.wait_stream(allgather_stream)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        self._reshard_parameter_groups()
+        self.context.enqueue_release(self)
+        if self.is_root():
+            self.context.drain_delayed_releases(target_length=0)
+        torch.cuda.nvtx.range_pop()
+
+    def _reshard_parameter_groups(self) -> None:
         for group in self._parameter_groups:
             group.reshard_parameters()
-        torch.cuda.nvtx.range_pop()
 
     def pre_backward(self) -> None:
         """Prepare full parameters for backward compute."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
-        for group in self._parameter_groups:
-            group.unshard_parameters()
+        self._unshard_parameter_groups(sync_model_weight=False)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         for group in self._parameter_groups:
             if group.requires_grad:
                 group.reduce_gradients()
-            group.reshard_parameters()
+        self._reshard_parameter_groups()
+        self.context.enqueue_release(self)
+        if self.is_root():
+            self.context.drain_delayed_releases(target_length=0)
         self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
 
+    def release_unsharded_storage(self) -> None:
+        """Release unsharded storage owned by this FsdpModule."""
+        for group in self._parameter_groups:
+            group.release_unsharded_storage()
+
+    @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
-        """Return parameter groups owned by this FSDP unit."""
+        """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
 
     def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
@@ -238,7 +302,9 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
             )
             if contained_in_parameter_group(parameter):
-                raise ValueError(f"Parameter {parameter_fqn!r} is already owned by an FSDP unit.")
+                raise ValueError(
+                    f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
+                )
             parameters[parameter_fqn] = parameter
 
         for child_name, child_module in submodule.named_children():

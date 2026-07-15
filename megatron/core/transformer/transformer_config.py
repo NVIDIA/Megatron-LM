@@ -718,6 +718,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
+    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
+    (`moe_aux_loss_coeff` = 0) when QB is selected.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -790,6 +793,12 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    moe_router_quantile_balancing_ema: float = 0.0
+    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
+    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
+    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
+    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
@@ -846,10 +855,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
-    the MNNVL case."""
+    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
+    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
+    transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -895,12 +905,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
-    moe_deepep_num_sms: int = 20
-    """Number of SMs to use for DeepEP."""
+    moe_flex_dispatcher_num_sms: Optional[int] = None
+    """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
+    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
+    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+
+    moe_deepep_num_sms: Optional[int] = None
+    """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
+    default 20). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
     moe_hybridep_num_sms: Optional[int] = None
-    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
-    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
+    """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for HybridEP (None uses the
+    default from DeepEP). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
     moe_hybridep_num_blocks_permute: Optional[int] = None
     """Number of CUDA thread blocks for the permute part in HybridEP.
@@ -915,6 +931,23 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_ncclep_static_shape: bool = False
+    """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
+    instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
+    and dynamic shapes from the dispatch (required for CUDA-graph capture of the MoE A2A and for the
+    1F1B EP comm overlap). The fused grouped GEMM consumes the ragged per-expert counts on device
+    and walks only the received tokens (no slack GEMM, no last-expert padding). This requires the
+    CuTe DSL / device-offset grouped GEMM, so it is only supported with the fused op
+    (use_transformer_engine_op_fuser, NVTE_CUTEDSL_FUSED_GROUPED_MLP=1) on sm100+ (Blackwell or
+    later); the dispatcher asserts this. On older GPUs leave it False (dynamic shape). Defaults to
+    False (narrow to the received tokens)."""
+
+    moe_ncclep_use_symm_mem: bool = False
+    """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
+    (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
+    staged-copy path. NOT SUPPORTED YET -- the dispatcher rejects this if set; the cross-stream
+    reuse ordering for the persistent symm-mem buffer is not implemented. Leave False."""
+
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
@@ -924,9 +957,11 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
-    exceeding this budget will be dropped. None means no token will be dropped.
-    The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
+    per-rank token budget. None means no token will be dropped. The default is None.
+    With the 'hybridep' backend, tokens exceeding this budget are dropped. With the 'ncclep'
+    backend, exceeding the budget is a hard error (TransformerEngine/NCCL traps) — set it
+    generously."""
 
     ##################
     # Context Parallel
@@ -1544,6 +1579,34 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_flex_dispatcher_backend == "ncclep":
+            if self.moe_token_dispatcher_type != "flex":
+                raise ValueError(
+                    "moe_flex_dispatcher_backend='ncclep' requires "
+                    "moe_token_dispatcher_type='flex'."
+                )
+
+        # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
+        # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
+        # moe_flex_dispatcher_num_sms takes precedence) and warn.
+        _deprecated_num_sms = {
+            name: getattr(self, name)
+            for name in ("moe_deepep_num_sms", "moe_hybridep_num_sms")
+            if getattr(self, name) is not None
+        }
+        if _deprecated_num_sms:
+            warnings.warn(
+                f"{', '.join(_deprecated_num_sms)} is deprecated. "
+                "Use moe_flex_dispatcher_num_sms instead."
+            )
+            if self.moe_flex_dispatcher_num_sms is None:
+                if len(set(_deprecated_num_sms.values())) > 1:
+                    raise ValueError(
+                        f"Conflicting deprecated SM-count knobs {_deprecated_num_sms}; set a "
+                        "single moe_flex_dispatcher_num_sms instead."
+                    )
+                self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -1600,15 +1663,18 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
-                    "be enabled."
-                )
-            if self.moe_flex_dispatcher_backend != "hybridep":
+            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
-                    "'hybridep'."
+                    "'hybridep' or 'ncclep'."
+                )
+            if (
+                self.moe_flex_dispatcher_backend == "hybridep"
+                and not self.use_transformer_engine_op_fuser
+            ):
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor with the 'hybridep' backend requires "
+                    "use_transformer_engine_op_fuser to be enabled."
                 )
 
         if self.cpu_offloading and (
@@ -2595,6 +2661,29 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+
+            # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
+            # configs are not yet safe under the 1F1B split and are gated here.
+            if (
+                self.moe_token_dispatcher_type == 'flex'
+                and self.moe_flex_dispatcher_backend == 'ncclep'
+            ):
+                if not self.moe_ncclep_static_shape:
+                    warnings.warn(
+                        'overlap_moe_expert_parallel_comm with ncclep and '
+                        'moe_ncclep_static_shape=False: get_permuted_hidden_states_by_experts '
+                        'does a device-to-host sync that serializes the 1F1B overlap (correct, '
+                        'but loses the overlap benefit). Set moe_ncclep_static_shape=True for '
+                        'the overlapped path (needs the fused op on sm100+).'
+                    )
+                assert not (
+                    self.fine_grained_activation_offloading
+                    and 'expert_fc1' in (self.offload_modules or [])
+                ), (
+                    "overlap_moe_expert_parallel_comm with ncclep does not support offloading "
+                    "'expert_fc1': it forces expert FC1 to save the raw bf16 input, which the "
+                    'overlap path eagerly frees.'
+                )
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
