@@ -58,6 +58,10 @@ class FsdpContext:
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
 
+    def current_stream(self) -> torch.cuda.Stream:
+        """Current stream on this context's device."""
+        return torch.cuda.current_stream(self.allgather_stream.device)
+
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
 
@@ -68,8 +72,7 @@ class FsdpContext:
         """
 
         def post_backward_final_callback() -> None:
-            current_stream = torch.cuda.current_stream(self.reduce_scatter_stream.device)
-            current_stream.wait_stream(self.reduce_scatter_stream)
+            self.current_stream().wait_stream(self.reduce_scatter_stream)
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -226,7 +229,7 @@ class FsdpModule:
         self._ready_grad_parameters.clear()
         context = self.context
         allgather_stream = context.allgather_stream
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
+        current_stream = context.current_stream()
 
         if self.is_root():
             allgather_stream.wait_stream(current_stream)
@@ -252,8 +255,7 @@ class FsdpModule:
         if self._unshard_event is not None:
             return
 
-        context = self.context
-        allgather_stream = context.allgather_stream
+        allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
                 if sync_model_weight:
@@ -278,7 +280,7 @@ class FsdpModule:
             group.reshard_parameters()
 
         allgather_stream = self.context.allgather_stream
-        allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
         # so no record_stream() call is required for the storage.
         with torch.cuda.stream(allgather_stream):
@@ -290,8 +292,7 @@ class FsdpModule:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        allgather_stream = context.allgather_stream
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
+        current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
@@ -322,7 +323,7 @@ class FsdpModule:
         """Pack gradients and immediately launch their reduce-scatters."""
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
-        current_stream = torch.cuda.current_stream(reduce_scatter_stream.device)
+        current_stream = context.current_stream()
 
         for group in self._parameter_groups:
             if not group.requires_grad:
