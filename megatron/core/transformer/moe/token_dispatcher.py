@@ -1506,12 +1506,13 @@ class _NCCLEPManager(_DispatchManager):
             )
         if self.static_shape:
             # static shape needs a fused grouped GEMM that consumes ragged per-expert counts on
-            # device (no host-side split narrowing). Both dtype paths qualify: fp8/fp4 via the CuTe
-            # DSL fused grouped MLP, bf16 via the op-fuser GroupedLinear grouped-tensor path.
-            if not (config.use_transformer_engine_op_fuser or config.moe_grouped_gemm):
+            # device (no host-side split narrowing): moe_grouped_gemm selects the grouped experts
+            # and use_transformer_engine_op_fuser fuses FC1+act+FC2 over them (fp8/fp4 via the CuTe
+            # DSL fused grouped MLP, bf16 via the op-fuser GroupedLinear grouped-tensor path).
+            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_ncclep_static_shape=True requires the fused grouped GEMM; enable "
-                    "use_transformer_engine_op_fuser (or moe_grouped_gemm)."
+                    "moe_ncclep_static_shape=True requires BOTH use_transformer_engine_op_fuser "
+                    "and moe_grouped_gemm (the fused grouped GEMM over device-side per-expert counts)."
                 )
             if config.fp8 or config.fp4:
                 if torch.cuda.get_device_capability()[0] < 10:
