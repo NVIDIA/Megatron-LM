@@ -459,9 +459,7 @@ functional:smoke_notify:
   rules:
     - if: $BUILD == "no"
       when: never
-    # Report smoke failures for every functional pipeline, including API- and
-    # web-triggered runs on non-main branches.
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")
       when: always
     - when: never
 
@@ -510,8 +508,7 @@ functional:x_notify:
     paths:
       - scripts
   rules:
-    # Always report functional results, regardless of pipeline source or branch.
-    - if: $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 
