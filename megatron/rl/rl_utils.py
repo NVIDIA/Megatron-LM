@@ -1126,6 +1126,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
             # Queue sizes and gate held are point-in-time reads.
             f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
             f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+            f"{env_id}_pipeline_filter_queue_size": pipeline.filter_queue.qsize(),
             f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
             f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
             f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
@@ -1141,12 +1142,14 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+            f"{env_id}_pipeline_filtered_count": pipeline.filtered_count,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
         })
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
             ("engine_dwell", pipeline.engine_dwell),
             ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+            ("filter_queue_dwell", pipeline.filter_queue_dwell),
             ("output_queue_dwell", pipeline.output_queue_dwell),
         ):
             if samples:
@@ -1159,10 +1162,12 @@ def _collect_rollout_pipeline_metrics() -> dict:
         pipeline.infer_queue_dwell = []
         pipeline.engine_dwell = []
         pipeline.assemble_queue_dwell = []
+        pipeline.filter_queue_dwell = []
         pipeline.output_queue_dwell = []
         pipeline.prepared_count = 0
         pipeline.inferred_count = 0
         pipeline.assembled_count = 0
+        pipeline.filtered_count = 0
         pipeline.yielded_count = 0
         gate.prepare_blocked_seconds = 0.0
         gate.acquire_calls = 0

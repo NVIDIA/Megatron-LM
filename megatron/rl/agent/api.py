@@ -219,11 +219,6 @@ class _GranularityConfig(NamedTuple):
         assert not (
             request.submission_granularity == "B" and request.consumption_granularity == "G"
         ), "Batch submission with group consumption is not supported."
-        assert not request.filter_groups_with_same_reward, (
-            "filter_groups_with_same_reward is not currently supported: dropped groups "
-            "are not regenerated, so non-streaming callers receive fewer groups than "
-            "requested and batch-order consumers stall on incomplete batches."
-        )
 
 
 class _SubmissionGate:
@@ -239,10 +234,10 @@ class _SubmissionGate:
         self._submission = submission
         self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
         self.capacity = capacity
-        # Observability counters, updated only on the configured submission
-        # granularity (the only path that touches the semaphore). `held`
-        # counts slots currently held; `prepare_blocked_seconds` accumulates
-        # time stage_prepare spent waiting on the semaphore.
+        # Observability counters, updated only on the configured submission granularity
+        # (the only path that touches the semaphore). `held` counts slots currently held;
+        # `prepare_blocked_seconds` accumulates time submitters
+        # (stage_prepare and stage_filter regeneration) spent waiting on the semaphore.
         self.held = 0
         self.prepare_blocked_seconds = 0.0
         self.acquire_calls = 0
@@ -288,6 +283,13 @@ class _InferredItem(NamedTuple):
     inferred_at: float = 0.0
 
 
+class _AssembledGroup(NamedTuple):
+    """One complete group flowing from assemble to filter."""
+
+    group: RolloutGroup
+    assembled_at: float = 0.0
+
+
 class _RolloutPipeline:
     """Per-call orchestrator for grouped rollout generation."""
 
@@ -316,10 +318,13 @@ class _RolloutPipeline:
             )
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
-        # Unbounded: flow control is owned entirely by the submission gate.
-        # Bounding this queue would add a second backpressure that silently
-        # clamps the run-ahead configured via --rl-generation-lag.
+        self.filter_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        # Regenerated groups draw ids from a negative namespace to avoid collisions.
+        self._next_regen_group_id = -1
+        # Groups submitted but not yet delivered by stage_filter.
+        self._groups_in_flight = 0
+        self._prepare_done = False
         # Buffer of pending groups (incomplete groups being filled by
         # stage_assemble). Held here so metric collection can report its size.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -334,11 +339,36 @@ class _RolloutPipeline:
         self.infer_queue_dwell: list[float] = []
         self.engine_dwell: list[float] = []
         self.assemble_queue_dwell: list[float] = []
+        self.filter_queue_dwell: list[float] = []
         self.output_queue_dwell: list[float] = []
         self.prepared_count = 0
         self.inferred_count = 0
         self.assembled_count = 0
+        self.filtered_count = 0
         self.yielded_count = 0
+
+    async def _submit_group(self, *, group_id: int, batch_id: int, index_in_batch: int) -> None:
+        """Acquire sub-batch gate slots and enqueue one group's inference items."""
+        await self.gate.acquire_for("G")
+        params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
+
+        for rollout_idx in range(self.request.rollouts_per_group):
+            await self.gate.acquire_for("R")
+            item = _InferWorkItem(
+                group_id=group_id,
+                rollout_idx=rollout_idx,
+                batch_id=batch_id,
+                index_in_batch=index_in_batch,
+                params=params,
+                prepared_at=time.monotonic(),
+            )
+            await self.infer_queue.put(item)
+            self.prepared_count += 1
+
+    def _maybe_close_intake(self) -> None:
+        """Shut down infer_queue once no work can ever be submitted again."""
+        if self._prepare_done and self._groups_in_flight <= 0:
+            self.infer_queue.shutdown()
 
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
@@ -353,24 +383,17 @@ class _RolloutPipeline:
                 batch_id = group_id // self.gran_policy.num_groups_per_batch
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    await self.gate.acquire_for("G")
-                    params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
-
-                    for rollout_idx in range(self.request.rollouts_per_group):
-                        await self.gate.acquire_for("R")
-                        item = _InferWorkItem(
-                            group_id=group_id,
-                            rollout_idx=rollout_idx,
-                            batch_id=batch_id,
-                            index_in_batch=index_in_batch,
-                            params=params,
-                            prepared_at=time.monotonic(),
-                        )
-                        await self.infer_queue.put(item)
-                        self.prepared_count += 1
+                    self._groups_in_flight += 1
+                    await self._submit_group(
+                        group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
+                    )
                     group_id += 1
-        finally:
+        except BaseException:
             self.infer_queue.shutdown()
+            raise
+        finally:
+            self._prepare_done = True
+            self._maybe_close_intake()
 
     async def stage_infer(self) -> None:
         """Run a persistent pool of inference workers, spawned once per pipeline."""
@@ -432,30 +455,64 @@ class _RolloutPipeline:
                 )
                 self.gate.release_after("assembled")
                 self.assembled_count += 1
-                # NOTE: this filter is currently non-functional dead code:
-                # _GranularityConfig._validate rejects filter_groups_with_same_reward
-                # at pipeline construction, so `keep` is always True. Kept for a
-                # future PR that regenerates dropped groups instead of
-                # under-delivering to the caller.
-                keep = (
-                    not self.request.filter_groups_with_same_reward
-                    or np.std([rollout.reward for rollout in rollouts]) > 1e-6
-                )
-                if keep:
-                    first = completed[0]
-                    output_enqueued_at = time.monotonic()
-                    self._output_enqueued_at[
-                        (first.item.batch_id, first.item.index_in_batch)
-                    ] = output_enqueued_at
-                    await self.output_queue.put(
-                        RolloutGroup(
+                first = completed[0]
+                await self.filter_queue.put(
+                    _AssembledGroup(
+                        group=RolloutGroup(
                             rollouts=rollouts,
                             batch_id=first.item.batch_id,
                             index_in_batch=first.item.index_in_batch,
-                        )
+                        ),
+                        assembled_at=time.monotonic(),
                     )
+                )
+        finally:
+            self.filter_queue.shutdown()
+
+    async def stage_filter(self) -> None:
+        """Deliver assembled groups, regenerating any dropped by the reward filter."""
+        try:
+            while True:
+                try:
+                    assembled = await self.filter_queue.get()
+                except asyncio_QueueShutDown:
+                    break
+                dequeued_at = time.monotonic()
+                if assembled.assembled_at:
+                    self.filter_queue_dwell.append(dequeued_at - assembled.assembled_at)
+                group = assembled.group
+                if self._should_drop(group):
+                    self.filtered_count += 1
+                    try:
+                        await self._regenerate_group(group)
+                    except asyncio_QueueShutDown:
+                        # Intake closed mid-regeneration (teardown or prepare
+                        # failure): the slot can no longer be refilled.
+                        self._groups_in_flight -= 1
+                        self._maybe_close_intake()
+                    continue
+                self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
+                    time.monotonic()
+                )
+                await self.output_queue.put(group)
+                self._groups_in_flight -= 1
+                self._maybe_close_intake()
         finally:
             self.output_queue.shutdown()
+
+    def _should_drop(self, group: RolloutGroup) -> bool:
+        """A group with zero reward variance carries no learning signal."""
+        if not self.request.filter_groups_with_same_reward:
+            return False
+        return np.std([rollout.reward for rollout in group.rollouts]) <= 1e-6
+
+    async def _regenerate_group(self, dropped: RolloutGroup) -> None:
+        """Resubmit a replacement group for a dropped group's batch slot."""
+        group_id = self._next_regen_group_id
+        self._next_regen_group_id -= 1
+        await self._submit_group(
+            group_id=group_id, batch_id=dropped.batch_id, index_in_batch=dropped.index_in_batch
+        )
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
         """Record how long a group sat in output_queue before being yielded."""
@@ -511,12 +568,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:
-        """Return the params for one group's rollouts.
-
-        Called once per group by _RolloutPipeline.stage_prepare. The returned
-        build_rollout closure is invoked once per inference response in
-        _RolloutPipeline.stage_assemble.
-        """
+        """Return the params for one group's rollouts."""
         ...
 
     async def get_grouped_rollouts(
@@ -536,7 +588,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         stage_prepare_task = asyncio.create_task(pipeline.stage_prepare())
         infer_task = asyncio.create_task(pipeline.stage_infer())
         assemble_task = asyncio.create_task(pipeline.stage_assemble())
-        tasks = (stage_prepare_task, infer_task, assemble_task)
+        filter_task = asyncio.create_task(pipeline.stage_filter())
+        tasks = (stage_prepare_task, infer_task, assemble_task, filter_task)
 
         try:
             async for group in pipeline.stage_consume():
