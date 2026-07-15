@@ -1230,10 +1230,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
-                    continue
-                dst_tensors[key].copy_(tensors[key])
+            # For fp32 model params, main_param is an autograd-tracked view of
+            # the model param (built without detach() in
+            # _build_model_and_main_param_groups), so the in-place copy must
+            # run under no_grad.
+            with torch.no_grad():
+                for key in dst_tensors:
+                    if not isinstance(tensors[key], torch.Tensor):
+                        continue
+                    dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
