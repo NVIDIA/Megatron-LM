@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 
@@ -1056,17 +1055,6 @@ def validate_args(args, defaults={}):
         and not is_flashinfer_min_version("0.6.4")
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
-
-    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
-        try:
-            import flashinfer  # noqa: F401
-        except ImportError:
-            warnings.warn(
-                "--inference-dynamic-batching-sampling-backend=flashinfer was requested "
-                "but the flashinfer package is not installed; falling back to "
-                "--inference-dynamic-batching-sampling-backend=torch."
-            )
-            args.inference_dynamic_batching_sampling_backend = 'torch'
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
